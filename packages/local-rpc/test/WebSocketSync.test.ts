@@ -12,6 +12,7 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
@@ -91,7 +92,27 @@ const database = Layer.mergeAll(
   Reactivity.layer
 )
 
+const migration = {
+  retryDelay: "1 millis",
+  maximumAttempts: 8
+} satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
+const serverHistory = {
+  retainedHistoryEntries: 0,
+  maximumHistoryEntries: 10_000,
+  retainedReceipts: 0,
+  maximumReceipts: 10_000,
+  maximumSnapshotEntities: 10_000,
+  maximumSnapshotBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: 1_024,
+  pruneBatchSize: 1_000,
+  retainedSnapshots: 2,
+  maintenanceConcurrency: 1,
+  maintenanceSpaceBatchSize: 128,
+  migration
+}
+
 const store = ServerStore.layer({
+  ...serverHistory,
   definition,
   evolution,
   authorizeAccess: ({ principal, spaceId: requestedSpaceId }) =>
@@ -99,12 +120,8 @@ const store = ServerStore.layer({
       "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
       ? Effect.void
       : Effect.fail({ reason: "forbidden" }),
-  authorizeMutation: (input) => {
-    const SourceAuthorizationInput = Schema.Struct({ envelope: Protocol.MutationEnvelope })
-    const payload = Schema.is(SourceAuthorizationInput)(input)
-      ? input.envelope.payload
-      : input.mutation.payload
-    return Schema.is(AssignRoleV2.payloadSchema)(payload) && payload.role === "admin"
+  authorizeMutation: ({ mutation }) => {
+    return Schema.is(AssignRoleV2.payloadSchema)(mutation.payload) && mutation.payload.role === "admin"
       ? Effect.fail({ reason: "admin role requires elevated access" })
       : Effect.void
   },
@@ -174,6 +191,73 @@ const live = Layer.merge(client, revokedClient).pipe(
 )
 
 describe("WebSocket synchronization", () => {
+  it.effect("delivers an authorized bounded bootstrap through both RPC hops", () =>
+    Effect.gen(function*() {
+      const remote = yield* SyncEngine.SyncEngine
+      for (let sequence = 1; sequence <= 3; sequence++) {
+        const identity: Omit<Protocol.MutationEnvelope, "digest"> = {
+          spaceId,
+          clientId,
+          mutationId: Identity.MutationId.make(
+            `mut_00000000-0000-4000-8000-${String(90 + sequence).padStart(12, "0")}`
+          ),
+          localSequence: Identity.LocalSequence.make(sequence),
+          basis: Identity.ServerSequence.make(0),
+          name: PutTodo.name,
+          payload: { id: `bootstrap-${sequence}`, title: "s".repeat(250) },
+          digestVersion: 2,
+          sourceSchema: definition.schemaIdentity,
+          mutationVersion: PutTodo.version
+        }
+        const mutation = Protocol.MutationEnvelope.make({
+          ...identity,
+          digest: yield* Protocol.mutationDigest(identity)
+        })
+        yield* remote.submit({ envelope: mutation, schema: definition.schemaIdentity })
+      }
+      yield* (yield* ServerStore.ServerStore).maintain(spaceId)
+
+      const pulled = yield* remote.pull({
+        spaceId,
+        schema: definition.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      })
+      assert.isTrue("_tag" in pulled)
+      if (!("_tag" in pulled)) assert.fail("expected bootstrap")
+      const request = {
+        spaceId,
+        schema: definition.schemaIdentity,
+        snapshotId: pulled.manifest.snapshotId,
+        afterOrdinal: -1,
+        limit: 10
+      }
+      let page = yield* remote.bootstrap(request)
+      let entities = 0
+      let pages = 0
+      while (true) {
+        assert.isAbove(page.entities.length, 0)
+        assert.isAtMost(Protocol.encodedBytes(page), serverHistory.maximumBootstrapPageBytes)
+        entities += page.entities.length
+        pages += 1
+        if (!page.hasMore) break
+        const last = page.entities.at(-1)
+        assert.isDefined(last)
+        page = yield* remote.bootstrap({
+          ...request,
+          afterOrdinal: last.ordinal
+        })
+      }
+      assert.strictEqual(entities, 3)
+      assert.isAbove(pages, 1)
+
+      const denied = yield* (yield* RevokedSyncEngine).bootstrap(request).pipe(Effect.flip)
+      assert.strictEqual(denied._tag, "AuthorizationDenied")
+    }).pipe(
+      Effect.provide(Layer.mergeAll(live, store, database)),
+      Effect.provide(NodeCrypto.layer)
+    ))
+
   it.effect("reauthorizes exact retries without retaining mutation history in Cluster storage", () =>
     Effect.gen(function*() {
       const remote = yield* SyncEngine.SyncEngine
@@ -212,6 +296,7 @@ describe("WebSocket synchronization", () => {
         after: Identity.ServerSequence.make(0),
         limit: 10
       })
+      if ("_tag" in page) assert.fail("unexpected bootstrap")
       assert.deepStrictEqual(page.entries.map((entry) => entry.mutationId), [mutationId])
 
       const denied = yield* remote.pull({
@@ -366,6 +451,7 @@ describe("WebSocket synchronization", () => {
         after: Identity.ServerSequence.make(0),
         limit: 10
       })
+      if ("_tag" in page) assert.fail("unexpected bootstrap")
       assert.deepStrictEqual(page.entries, [])
     }).pipe(
       Effect.provide(live),

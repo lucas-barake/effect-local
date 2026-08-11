@@ -2,9 +2,10 @@
 
 Authenticated Effect RPC synchronization for Effect Local.
 
-One `SyncRpc.Rpcs` group carries mutation submission, ordered pulls, wake streams, presence publication, and presence
-watch streams over one WebSocket. `SyncServer.layer` keeps that public authenticated facade and routes each operation
-through `SpaceEntity.Client`. `SyncClient.layer` adapts the generated typed client to `SyncEngine`.
+One `SyncRpc.Rpcs` group carries mutation submission, ordered pulls, snapshot bootstrap pages, wake streams, presence
+publication, and presence watch streams over one WebSocket. `SyncServer.layer` keeps that public authenticated facade
+and routes each operation through `SpaceEntity.Client`. `SyncClient.layer` adapts the generated typed client to
+`SyncEngine`.
 
 `SpaceEntity` gives every space one Cluster routing key. All operations are explicitly volatile. The entity command lane
 is sequential. Read and stream handlers use `Rpc.fork`, so long lived watches do not block mutation commands. Options
@@ -19,10 +20,11 @@ does not select those deployment policies.
 The client pending row retains custody until Submit returns. `ServerStore` then retains the authoritative application
 event and receipt. A runner failure before admission makes the volatile entity call fail, so reconciliation resubmits the
 same identity. A lost reply after SQL commit is recovered from the stored receipt. Cluster mailbox persistence is not
-used because Effect beta 101 retains completed payloads and replies without per-request retention control. A custom
+used because Effect `4.0.0-beta.103` retains completed payloads and replies without per-request retention control. A custom
 `ServerStore` service can route by `spaceId` to database shards. The provided SQL layer uses the supplied `SqlClient` as
-one partition. Pulls are repeatable reads. Wake and presence streams are live hints routed through the current owner of
-the space.
+one partition. Pulls return either a bounded dense suffix or `BootstrapRequired`. Bootstrap pages repeat an immutable
+manifest and stay under the configured frame bound. Wake and presence streams are live hints routed through the
+current owner of the space.
 
 Authentication follows Effect RPC middleware conventions. The client reads redacted `Credentials` and writes a
 bearer header. The server uses `Authenticator` to provide a JSON `Principal`. `ServerStore.layer` requires explicit

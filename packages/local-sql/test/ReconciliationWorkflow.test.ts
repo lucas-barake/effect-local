@@ -7,6 +7,7 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
@@ -45,7 +46,35 @@ const definitionV2 = Definition.make({
   queries: Domain.definition.queries
 })
 
-const serverLayer = ServerStore.layerTrusted({ definition: Domain.definition }).pipe(
+const migration = {
+  retryDelay: "1 millis",
+  maximumAttempts: 8
+} satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
+const clientHistory = {
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  retainedHistoryEntries: 256,
+  maximumBootstrapEntities: 10_000,
+  maximumBootstrapBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: 4 * 1024 * 1024,
+  migration
+}
+const serverHistory = {
+  retainedHistoryEntries: 256,
+  maximumHistoryEntries: 10_000,
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  maximumSnapshotEntities: 10_000,
+  maximumSnapshotBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: 4 * 1024 * 1024,
+  pruneBatchSize: 1_000,
+  retainedSnapshots: 2,
+  maintenanceConcurrency: 1,
+  maintenanceSpaceBatchSize: 128,
+  migration
+}
+
+const serverLayer = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
   Layer.provide(runtime),
   Layer.provide(database())
 )
@@ -53,7 +82,12 @@ const serverLayer = ServerStore.layerTrusted({ definition: Domain.definition }).
 const directSync = (server: ServerStore.Service) =>
   Layer.succeed(
     SyncEngine.SyncEngine,
-    SyncEngine.SyncEngine.of({ submit: server.submit, pull: server.pull, watch: server.watch })
+    SyncEngine.SyncEngine.of({
+      submit: server.submit,
+      pull: server.pull,
+      bootstrap: server.bootstrap,
+      watch: server.watch
+    })
   )
 
 describe("reconciliation workflow", () => {
@@ -63,6 +97,7 @@ describe("reconciliation workflow", () => {
       const server = Context.get(serverContext, ServerStore.ServerStore)
       const workflowEngine = WorkflowEngine.layerMemory
       const replicaLayer = SqlReplica.layerWorkflow({
+        ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId,
@@ -91,19 +126,18 @@ describe("reconciliation workflow", () => {
       assert.strictEqual(execution.executionId, yield* ReconciliationWorkflow.executionId(payload))
       yield* ReconciliationWorkflow.make(payload).execute(payload).pipe(Effect.provide(context))
 
-      while (true) {
-        const generations = yield* local.reconciliationGenerations
-        if (generations.completed >= generations.requested) break
+      let completed = yield* local.reconciliationGenerations
+      while (completed.completed < completed.requested) {
         const nextPayload = ReconciliationWorkflow.Payload.make({
           schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
           spaceId,
           clientId,
-          generation: generations.requested
+          generation: completed.requested
         })
         yield* ReconciliationWorkflow.make(nextPayload).execute(nextPayload).pipe(Effect.provide(context))
+        completed = yield* local.reconciliationGenerations
       }
 
-      const completed = yield* local.reconciliationGenerations
       assert.strictEqual(completed.completed, completed.requested)
       assert.isAtLeast(completed.completed, requested)
       assert.strictEqual(yield* local.pendingCount, 0)
@@ -122,7 +156,12 @@ describe("reconciliation workflow", () => {
     Effect.gen(function*() {
       const serverContext = yield* Layer.build(serverLayer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
-      const replicaLayer = SqlReplica.layerWorkflow({ definition: Domain.definition, spaceId, clientId }).pipe(
+      const replicaLayer = SqlReplica.layerWorkflow({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId
+      }).pipe(
         Layer.provide(Domain.handlers),
         Layer.provide(database()),
         Layer.provide(directSync(server)),
@@ -133,7 +172,7 @@ describe("reconciliation workflow", () => {
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId: Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002"),
         clientId,
-        generation: 1
+        generation: 2
       })
       const error = yield* ReconciliationWorkflow.make({
         schemaIdentity: payload.schemaIdentity,
@@ -148,21 +187,23 @@ describe("reconciliation workflow", () => {
       const serverContext = yield* Layer.build(serverLayer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
       const replicaDatabase = database()
+      const runnerDatabase = database()
       const runner = SingleRunner.layer({ runnerStorage: "sql" }).pipe(
-        Layer.provide(replicaDatabase)
+        Layer.provide(runnerDatabase)
       )
       const workflowEngine = ClusterWorkflowEngine.layer.pipe(
         Layer.provideMerge(runner)
       )
       const replicaLayer = SqlReplica.layerWorkflow({
+        ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId,
         retryDelay: "1 millis"
       }).pipe(
         Layer.provide(Domain.handlers),
+        Layer.provide(replicaDatabase),
         Layer.provide(directSync(server)),
-        Layer.provideMerge(replicaDatabase),
         Layer.provideMerge(workflowEngine)
       )
       const context = yield* Layer.build(replicaLayer)
@@ -170,17 +211,30 @@ describe("reconciliation workflow", () => {
       const local = Context.get(context, LocalStore.Store)
 
       const mutation = yield* replica.mutate(Domain.PutTodo, Domain.todo("cluster"))
-      const generations = yield* local.reconciliationGenerations
+      const requested = (yield* local.reconciliationGenerations).requested
       const payload = ReconciliationWorkflow.Payload.make({
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
-        generation: generations.requested
+        generation: requested
       })
       yield* ReconciliationWorkflow.make(payload).execute(payload).pipe(Effect.provide(context))
 
+      let generations = yield* local.reconciliationGenerations
+      while (generations.completed < generations.requested) {
+        const nextPayload = ReconciliationWorkflow.Payload.make({
+          schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
+          spaceId,
+          clientId,
+          generation: generations.requested
+        })
+        yield* ReconciliationWorkflow.make(nextPayload).execute(nextPayload).pipe(Effect.provide(context))
+        generations = yield* local.reconciliationGenerations
+      }
+
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(mutation.envelope.mutationId))._tag, "Accepted")
+      assert.strictEqual(generations.completed, generations.requested)
     }))
 
   it.effect("uses the current handler after registering a new schema on one Cluster Workflow engine", () =>
@@ -198,7 +252,7 @@ describe("reconciliation workflow", () => {
       ) =>
         Effect.gen(function*() {
           const localContext = yield* Layer.build(
-            LocalStore.layer({ definition, spaceId, clientId }).pipe(
+            LocalStore.layer({ ...clientHistory, definition, spaceId, clientId }).pipe(
               Layer.provide(MutationRuntime.layer(definition).pipe(Layer.provide(Domain.handlers))),
               Layer.provide(database())
             )
@@ -207,6 +261,7 @@ describe("reconciliation workflow", () => {
           const remote = SyncEngine.SyncEngine.of({
             submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
             pull: () => Effect.succeed({ entries: [], hasMore: false }),
+            bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
             watch: () => Stream.never
           })
           const reconciliationContext = yield* Layer.build(
@@ -301,6 +356,7 @@ describe("reconciliation workflow", () => {
         Effect.gen(function*() {
           const localContext = yield* Layer.build(
             LocalStore.layer({
+              ...clientHistory,
               definition: Domain.definition,
               spaceId,
               clientId: registeredClientId
@@ -317,6 +373,7 @@ describe("reconciliation workflow", () => {
                 Effect.andThen(Deferred.succeed(pulled, undefined)),
                 Effect.as({ entries: [], hasMore: false })
               ),
+            bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
             watch: () => Stream.never
           })
           const reconciliationContext = yield* Layer.build(
@@ -371,7 +428,7 @@ describe("reconciliation workflow", () => {
     Effect.gen(function*() {
       const attempts = yield* Ref.make(0)
       const localContext = yield* Layer.build(
-        LocalStore.layer({ definition: Domain.definition, spaceId, clientId }).pipe(
+        LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
           Layer.provide(runtime),
           Layer.provide(database())
         )
@@ -383,6 +440,7 @@ describe("reconciliation workflow", () => {
             Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
           ),
         pull: () => Effect.succeed({ entries: [], hasMore: false }),
+        bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         watch: () => Stream.never
       })
       const reconciliationContext = yield* Layer.build(

@@ -19,10 +19,17 @@ export const ClientMetaRow = Schema.Struct({
   server_cursor: Identity.ServerSequence,
   visible_revision: Identity.VisibleRevision,
   requested_generation: NonNegativeInt,
-  completed_generation: NonNegativeInt
+  completed_generation: NonNegativeInt,
+  installed_snapshot_id: Schema.NullOr(Identity.SnapshotId),
+  installed_snapshot_sequence: Identity.ServerSequence,
+  installed_snapshot_terminal_sequence: Identity.TerminalSequence
 })
 
 export const EntityRow = Schema.Struct({ value_json: Schema.String })
+export const SizedEntityRow = Schema.Struct({
+  value_json: Schema.String,
+  entity_bytes: NonNegativeInt
+})
 
 const PendingRowFields = {
   mutation_id: Identity.MutationId,
@@ -49,6 +56,13 @@ export const PendingReceiptRow = Schema.Struct({
   entry_json: Schema.NullOr(Schema.String)
 })
 
+export const PendingLogRow = Schema.Struct({
+  ...PendingRowFields,
+  server_sequence: Identity.ServerSequence,
+  entry_mutation_id: Identity.MutationId,
+  entry_json: Schema.String
+})
+
 export const ReceiptRow = Schema.Struct({
   receipt_json: Schema.String
 })
@@ -61,10 +75,29 @@ export const ServerMetaRow = Schema.Struct({
   target_schema_version: Schema.NullOr(Identity.SchemaVersion),
   target_schema_hash: Schema.NullOr(Identity.SchemaHash),
   migration_hash: Schema.NullOr(Identity.SchemaHash),
-  next_server_sequence: PositiveInt
+  next_server_sequence: PositiveInt,
+  next_terminal_sequence: PositiveInt,
+  history_floor: Identity.ServerSequence,
+  receipt_floor: Identity.TerminalSequence,
+  retained_history_count: NonNegativeInt,
+  retained_receipt_count: NonNegativeInt,
+  entity_count: NonNegativeInt,
+  entity_bytes: NonNegativeInt,
+  snapshot_id: Schema.NullOr(Identity.SnapshotId),
+  snapshot_sequence: Identity.ServerSequence,
+  snapshot_terminal_sequence: Identity.TerminalSequence,
+  metadata_verified: Schema.Literals([0, 1])
 })
 
-export const ServerClientRow = Schema.Struct({ last_local_sequence: NonNegativeInt })
+export const ServerClientRow = Schema.Struct({
+  last_local_sequence: NonNegativeInt,
+  expired_local_sequence: NonNegativeInt
+})
+
+export const ServerCountRow = Schema.Struct({
+  history_count: NonNegativeInt,
+  receipt_count: NonNegativeInt
+})
 
 export const ServerReceiptRow = Schema.Struct({
   space_id: Identity.SpaceId,
@@ -78,6 +111,7 @@ export const ServerReceiptRow = Schema.Struct({
   mutation_name: Schema.NullOr(Schema.String),
   rejection_origin: Schema.NullOr(Protocol.RejectionOrigin),
   mutation_id: Identity.MutationId,
+  terminal_sequence: Identity.TerminalSequence,
   receipt_json: Schema.String,
   server_sequence: Schema.NullOr(Identity.ServerSequence)
 })
@@ -96,14 +130,71 @@ export const ServerLogMetadataRow = Schema.Struct({
 export const ServerLogRow = Schema.Struct({
   space_id: Identity.SpaceId,
   server_sequence: Identity.ServerSequence,
+  client_id: Identity.ClientId,
+  local_sequence: Identity.LocalSequence,
   mutation_id: Identity.MutationId,
+  digest: Protocol.MutationDigest,
   entry_bytes: PositiveInt,
   entry_json: Schema.String,
-  receipt_client_id: Identity.ClientId,
-  receipt_local_sequence: Identity.LocalSequence,
-  digest: Protocol.MutationDigest,
   source_schema_version: Identity.SchemaVersion,
   source_schema_hash: Identity.SchemaHash
+})
+
+export const ServerEntityRow = Schema.Struct({
+  model: Schema.String,
+  model_version: Identity.SchemaVersion,
+  entity_key: Schema.String,
+  value_json: Schema.String,
+  entity_bytes: NonNegativeInt
+})
+
+export const SnapshotManifestRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  snapshot_id: Identity.SnapshotId,
+  definition_hash: Schema.String,
+  schema_version: Identity.SchemaVersion,
+  schema_hash: Identity.SchemaHash,
+  server_sequence: Identity.ServerSequence,
+  terminal_sequence: Identity.TerminalSequence,
+  entity_count: NonNegativeInt,
+  content_bytes: NonNegativeInt,
+  digest: Protocol.SnapshotDigest
+})
+
+export const SnapshotEntityRow = Schema.Struct({
+  ordinal: NonNegativeInt,
+  model: Schema.String,
+  model_version: Identity.SchemaVersion,
+  entity_key: Schema.String,
+  value_json: Schema.String,
+  entity_bytes: PositiveInt
+})
+
+export const SnapshotEntityMetadataRow = Schema.Struct({
+  ordinal: NonNegativeInt,
+  wire_bytes: PositiveInt
+})
+
+export const SnapshotEntityWireRow = Schema.Struct({
+  ordinal: NonNegativeInt,
+  wire_json: Schema.String,
+  wire_bytes: PositiveInt
+})
+
+export const BootstrapRow = Schema.Struct({
+  snapshot_id: Identity.SnapshotId,
+  space_id: Identity.SpaceId,
+  definition_hash: Schema.String,
+  schema_version: Identity.SchemaVersion,
+  schema_hash: Identity.SchemaHash,
+  server_sequence: Identity.ServerSequence,
+  terminal_sequence: Identity.TerminalSequence,
+  entity_count: NonNegativeInt,
+  content_bytes: NonNegativeInt,
+  digest: Protocol.SnapshotDigest,
+  next_ordinal: NonNegativeInt,
+  received_bytes: NonNegativeInt,
+  rolling_digest: Protocol.SnapshotDigest
 })
 
 export const ChangeRow = Schema.Struct({
@@ -112,3 +203,18 @@ export const ChangeRow = Schema.Struct({
 })
 
 export const CountRow = Schema.Struct({ count: NonNegativeInt })
+export const SpaceIdRow = Schema.Struct({ space_id: Identity.SpaceId })
+export const SequenceRow = Schema.Struct({ server_sequence: Identity.ServerSequence })
+export const TerminalReceiptIdentityRow = Schema.Struct({
+  terminal_sequence: Identity.TerminalSequence,
+  client_id: Identity.ClientId,
+  local_sequence: Identity.LocalSequence
+})
+export const SnapshotIdRow = Schema.Struct({ snapshot_id: Identity.SnapshotId })
+export const MutationIdRow = Schema.Struct({ mutation_id: Identity.MutationId })
+export const EntityIdentityRow = Schema.Struct({
+  model: Schema.String,
+  model_version: Identity.SchemaVersion,
+  entity_key: Schema.String
+})
+export const OrdinalRow = Schema.Struct({ ordinal: NonNegativeInt })

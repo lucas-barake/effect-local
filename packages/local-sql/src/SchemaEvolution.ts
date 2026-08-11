@@ -263,7 +263,7 @@ export const migrateReceipt = (
   evolution: Evolution.Evolution
 ): Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError> =>
   Effect.gen(function*() {
-    if (receipt._tag === "Legacy") return receipt
+    if (receipt._tag === "Legacy" || receipt._tag === "Expired") return receipt
     const target = evolution.current.mutationByName.get(receipt.name)
     if (target === undefined) {
       return yield* new ReplicaError.SchemaEvolutionUnsupported({
@@ -516,7 +516,7 @@ export const client = (options: ClientOptions) =>
         if (groups.size > 1) {
           return yield* new ReplicaError.SchemaKeyCollision({ model, key: yield* Codec.stringify(migrated.key) })
         }
-        const root = aliases[0]!
+        const root = aliases[0]
         const lineageId = groups.values().next().value ?? Canonical.stringify({
           schemaIdentity: root.schemaIdentity,
           model,
@@ -1078,7 +1078,7 @@ export const server = (options: ServerOptions) =>
         }
         const targetKey = yield* Codec.stringify(migrated.key)
         if (groups.size > 1) return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
-        const root = aliases[0]!
+        const root = aliases[0]
         const lineageId = groups.values().next().value ?? Canonical.stringify({
           spaceId: options.spaceId,
           schemaIdentity: root.schemaIdentity,

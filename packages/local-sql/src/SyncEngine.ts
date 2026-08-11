@@ -6,7 +6,10 @@ import type * as Stream from "effect/Stream"
 
 export interface Service {
   readonly submit: (request: Protocol.SubmitRequest) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
-  readonly pull: (request: Protocol.PullRequest) => Effect.Effect<Protocol.PullPage, ReplicaError.ReplicaError>
+  readonly pull: (request: Protocol.PullRequest) => Effect.Effect<Protocol.PullResult, ReplicaError.ReplicaError>
+  readonly bootstrap: (
+    request: Protocol.BootstrapRequest
+  ) => Effect.Effect<Protocol.BootstrapPage, ReplicaError.ReplicaError>
   readonly watch: (request: Protocol.WatchRequest) => Stream.Stream<Protocol.Wake, ReplicaError.ReplicaError>
 }
 

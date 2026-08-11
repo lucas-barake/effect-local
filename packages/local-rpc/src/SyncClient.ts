@@ -12,6 +12,14 @@ import * as SyncRpc from "./SyncRpc.js"
 
 import type * as Authentication from "./Authentication.js"
 
+const transportError = (cause: unknown): ReplicaError.ReplicaError => {
+  if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
+  return new ReplicaError.ProtocolInvalid({
+    message: "The synchronization transport failed",
+    cause
+  })
+}
+
 export const layer: Layer.Layer<
   SyncEngine.SyncEngine,
   never,
@@ -23,14 +31,7 @@ export const layer: Layer.Layer<
     return SyncEngine.SyncEngine.of({
       submit: (request) =>
         client.Submit(request).pipe(
-          Effect.mapError((cause) =>
-            Schema.is(ReplicaError.ReplicaError)(cause)
-              ? cause
-              : new ReplicaError.ProtocolInvalid({
-                message: "The synchronization transport failed",
-                cause
-              })
-          ),
+          Effect.mapError(transportError),
           Effect.withSpan("SyncClient.submit", {
             attributes: {
               "space.id": request.envelope.spaceId,
@@ -40,28 +41,21 @@ export const layer: Layer.Layer<
         ),
       pull: (request) =>
         client.Pull(request).pipe(
-          Effect.mapError((cause) =>
-            Schema.is(ReplicaError.ReplicaError)(cause)
-              ? cause
-              : new ReplicaError.ProtocolInvalid({
-                message: "The synchronization transport failed",
-                cause
-              })
-          ),
+          Effect.mapError(transportError),
           Effect.withSpan("SyncClient.pull", {
             attributes: { "space.id": request.spaceId, "server.after": request.after }
           })
         ),
+      bootstrap: (request) =>
+        client.Bootstrap(request).pipe(
+          Effect.mapError(transportError),
+          Effect.withSpan("SyncClient.bootstrap", {
+            attributes: { "space.id": request.spaceId, "snapshot.id": request.snapshotId }
+          })
+        ),
       watch: (request) =>
         client.Watch(request).pipe(
-          Stream.mapError((cause) =>
-            Schema.is(ReplicaError.ReplicaError)(cause)
-              ? cause
-              : new ReplicaError.ProtocolInvalid({
-                message: "The synchronization transport failed",
-                cause
-              })
-          ),
+          Stream.mapError(transportError),
           Stream.withSpan("SyncClient.watch", {
             attributes: { "space.id": request.spaceId }
           })

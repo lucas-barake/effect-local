@@ -19,16 +19,20 @@ Client SQLite contains:
 - canonical entities from accepted server entries
 - visible entities after optimistic pending mutations
 - pending envelopes, results, and write sets ordered by local sequence
-- accepted server entries ordered by server sequence
-- terminal accepted and rejected receipts
+- a bounded accepted server suffix ordered by server sequence
+- bounded terminal accepted, rejected, and expired receipts
+- one resumable bootstrap stage and its verified entities
+- the installed snapshot identity, accepted sequence, and terminal fence
 
 Server SQL contains:
 
-- a definition hash and next accepted sequence per space
-- a last terminal local sequence per `(spaceId, clientId)`
-- immutable receipts keyed by both mutation identity and client sequence
-- accepted entries keyed by server sequence
-- authoritative materialized entities
+- a definition hash, accepted and terminal sequence heads, retained floors, exact row counters, and snapshot pointer per
+  space
+- a last processed and expired local sequence per `(spaceId, clientId)`
+- retained immutable receipts keyed by both mutation identity and client sequence
+- a retained dense accepted suffix keyed by server sequence
+- authoritative materialized entities with exact snapshot byte accounting
+- immutable snapshot manifests and deterministically ordered snapshot entities
 
 Workflow storage contains reconciliation execution control only. It does not contain mutation payloads, receipts, log
 entries, or canonical state. Cluster messages and publications are routed wake and presence signals. They are never
@@ -45,12 +49,16 @@ application data authority.
    next client sequence.
 5. A rejection is stored without advancing the accepted sequence. An acceptance appends public mutation identity and
    its exact write set at the next sequence. The success result remains only in the submitter's receipt.
-6. The client pulls from its durable cursor. It installs only contiguous entries into canonical state.
-7. The client removes settled pending mutations, restores touched visible entities from canonical state, and replays
+6. The client pulls from its durable cursor. It installs only contiguous entries into canonical state. A cursor below
+   the retained floor receives `BootstrapRequired` instead of a false gap or an unbounded replay.
+7. Bootstrap pages repeat the immutable manifest and are count and byte bounded. The client durably verifies identity,
+   order, Schema values, entity bytes, and the chained digest. Completion replaces canonical state and advances the
+   cursor in one transaction.
+8. The client removes settled pending mutations, restores touched visible entities from canonical state, and replays
    remaining pending mutations in local order.
-8. Successful reconciliation advances the completed generation idempotently. A newer requested generation starts a
+9. Successful reconciliation advances the completed generation idempotently. A newer requested generation starts a
    new finite Workflow.
-9. Effect `Reactivity` invalidates affected models, receipts, and status after the SQL transaction commits.
+10. Effect `Reactivity` invalidates affected models, receipts, and status after the SQL transaction commits.
 
 ## Handler contract
 
@@ -73,6 +81,8 @@ Mutation identity and accepted order are separate.
 - `serverSequence` is dense per space and exists only for accepted mutations.
 
 A terminal rejection advances the server's client sequence watermark but does not create a hole in the accepted log.
+Receipt reclamation advances an expired local sequence watermark atomically with deletion. A retry at or below that
+watermark returns `Expired` bound to a published snapshot fence and never executes again.
 
 ## Effect runtime
 
@@ -103,7 +113,14 @@ dependencies invalidate once per model.
 
 ## Capacity
 
-Protocol limits bound a mutation, a pull page by count and encoded bytes, and a presence update. Local pending count,
-server wake publication, presence publication, and in memory reconciler wakeup are bounded or sliding. Workflow
-generations coalesce durable requests. Pull pages contain authoritative entries. Streams and publications carry only
-notifications.
+Protocol limits bound a mutation, a pull page, a bootstrap page, and a presence update by count and encoded bytes.
+Server options set hard history, receipt, entity, snapshot byte, and bootstrap byte limits. Admission cross checks
+space counters against trigger maintained shadow counters under the lock before executing a handler and checks resulting snapshot capacity inside the handler
+savepoint. The client bounds pending mutations, retained receipts, accepted evidence, staged entities, staged bytes,
+and incoming page bytes. Server wake publication, presence publication, and in memory reconciler wakeup are bounded or
+sliding. Workflow generations coalesce durable requests. Streams and publications carry only notifications.
+
+History maintenance is an explicit service lifecycle. It reads one consistent bounded materialized state, builds an
+immutable manifest in memory, then locks the space and compares both sequence heads. Only an unchanged candidate is
+inserted and published. The same transaction advances logical floors before deleting bounded prefixes. A crash can
+leave surplus rows, but it cannot publish a floor without a complete recovery snapshot.

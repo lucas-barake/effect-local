@@ -5,7 +5,7 @@ local SQLite, works while offline, and reconciles with an authoritative server a
 returns. Effect Schema defines every domain, durable, and wire contract. Effect services, Layers, scopes, streams,
 and Atom own the runtime.
 
-The library targets Effect `4.0.0-beta.101`. It has not published a stable release. Durable and public contracts may
+The library targets Effect `4.0.0-beta.103`. It has not published a stable release. Durable and public contracts may
 change before v1.
 
 ## Architecture
@@ -36,9 +36,9 @@ contiguous accepted entries into canonical state and then replays its remaining 
 
 Effect Cluster owns deployment neutral routing and live ownership. One entity per space serializes mutation admission,
 holds wake and presence recipients, and routes them across runners. The actor does not retain mutation payloads or
-replies in Cluster message history. Server SQL stores the authoritative log and receipts. Clients retain pending
-mutations and durable cursors in SQLite. Effect Workflow owns durable client scheduling through finite reconciliation
-generations.
+replies in Cluster message history. Server SQL stores bounded authoritative history, bounded receipts, immutable state
+snapshots, and explicit retained floors. Clients retain pending mutations, a durable cursor, and resumable bootstrap
+staging in SQLite. Effect Workflow owns durable client scheduling through finite reconciliation generations.
 
 Ordinary fields store ordinary values. Applications that need concurrent intent for a specific field can use an
 explicit `Field.Semantics` such as a counter or grow only set. Every other model avoids causal metadata.
@@ -144,7 +144,17 @@ const DatabaseLive = Layer.mergeAll(
   NodeCrypto.layer
 )
 
-export const ReplicaLive = SqlReplica.layer({ definition, spaceId, clientId }).pipe(
+const history = {
+  retainedReceipts: 256,
+  maximumReceipts: 1_024,
+  retainedHistoryEntries: 256,
+  maximumBootstrapEntities: 100_000,
+  maximumBootstrapBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: 4 * 1024 * 1024,
+  migration: { retryDelay: "25 millis", maximumAttempts: 8 }
+} as const
+
+export const ReplicaLive = SqlReplica.layer({ definition, spaceId, clientId, ...history }).pipe(
   Layer.provide(DomainLive),
   Layer.provide(DatabaseLive),
   Layer.provide(SyncLive)
@@ -179,15 +189,23 @@ new generation after a terminal failure. `SqlReplica.layer` remains the explicit
 
 `ServerStore.layer` persists one dense accepted sequence per space, terminal receipts per client mutation, and the
 authoritative entity state. Its mutation path acquires the space row inside the SQL transaction, so handler execution,
-materialization, and sequence allocation share one order. SQLite and PostgreSQL both support the required
-`UPDATE ... RETURNING` operation.
+materialization, sequence allocation, and hard capacity checks share one order. Explicit history options set retained
+targets, hard admission caps, snapshot entity and byte limits, bootstrap page bytes, prune batch size, snapshot
+retention, migration retry, maintenance concurrency, and maintenance space page size.
+
+Call `ServerStore.maintain` or provide `ServerStore.layerMaintenance` in the server scope. Maintenance prepares a
+Schema checked immutable snapshot at the current accepted and terminal fences. It publishes that snapshot and the
+logical retained floors atomically before deleting bounded history and receipt prefixes. Admission returns
+`CapacityExceeded` before handler execution when a hard cap is reached, so the maintenance Layer is required in a
+long lived deployment. A client below the retained history floor receives `BootstrapRequired` and installs bounded,
+digest chained pages into durable staging before one atomic canonical replacement.
 
 `ServerStore.layer` requires `authorizeAccess`, `authorizeMutation`, and `authorizeRead`. Access authorization runs
 before retry receipt lookup. Mutation admission rejection consumes the client's local sequence and persists an exact
 retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted` is the explicit allow all Layer for
 tests and already trusted processes.
 
-`SyncRpc.Rpcs` multiplexes submit, pull, watch, and presence on one Effect RPC WebSocket. The server uses
+`SyncRpc.Rpcs` multiplexes submit, pull, bootstrap, watch, and presence on one Effect RPC WebSocket. The server uses
 `Authentication.layerServer`; the client uses `Authentication.layerClient`, which writes a redacted bearer credential
 to the request headers. The authenticated server facade sends all five operations to the Cluster entity for the
 requested space. Cluster supplies the unique live owner and cross runner stream routing. SQL stores the authoritative
@@ -253,7 +271,8 @@ pnpm bench
 - Pull entries expose only public mutation identity and canonical changes. Payloads and success results are not in the
   shared authoritative log.
 - A terminal rejection rolls back its optimistic write set and replays remaining pending mutations.
-- Queues, mutation payloads, presence payloads, pull counts, and pull bytes are bounded.
+- Queues, mutation payloads, presence payloads, pull pages, bootstrap pages, snapshots, receipts, and retained history
+  are bounded by explicit configuration.
 - Presence is best effort, bounded, TTL based, and never enters the durable mutation log.
 - Cluster routes each space to one live owner across runners. Entity operations are volatile. A failed submit remains
   in the client's pending SQLite outbox until exact resubmission returns the SQL backed terminal receipt. Pull and watch
@@ -262,5 +281,8 @@ pnpm bench
   a runner starts again.
 - The server is an authority, not a peer. Conflict behavior is arrival order unless a handler explicitly applies field
   semantics.
-- There is no protocol version negotiation, migration framework, compaction protocol, multi writer browser ownership
-  coordinator, encryption layer, or stable v1 compatibility promise yet.
+- SQL schemas advance through an ordered checksum validated migration catalog. Stop all old server writers before the
+  lifecycle migration. The migrated schema rejects their legacy write shape so mixed writer versions cannot silently
+  violate retention metadata. There is no backward migration,
+  protocol version negotiation, multi writer browser ownership coordinator, encryption layer, or stable v1
+  compatibility promise yet.

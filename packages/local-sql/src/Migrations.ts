@@ -2,11 +2,14 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as Configuration from "./internal/configuration.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 
 export type Catalog = "Client" | "Server"
@@ -16,8 +19,15 @@ export interface Migration {
   readonly name: string
   readonly checksum: Identity.SchemaHash
   readonly statements: ReadonlyArray<string>
-  readonly effect?: ((sql: SqlClient.SqlClient) => Effect.Effect<void, never, never>) | undefined
+  readonly effect?: ((sql: SqlClient.SqlClient) => Effect.Effect<void, ReplicaError.ReplicaError, never>) | undefined
 }
+
+export interface Options {
+  readonly retryDelay: Duration.Input
+  readonly maximumAttempts: number
+}
+
+const defaultOptions: Options = { retryDelay: "5 millis", maximumAttempts: 8 }
 
 const stableName = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/
 
@@ -27,7 +37,7 @@ export const makeMigration = (options: {
   readonly statements: ReadonlyArray<string>
   readonly effect?: {
     readonly id: string
-    readonly run: (sql: SqlClient.SqlClient) => Effect.Effect<void, never, never>
+    readonly run: (sql: SqlClient.SqlClient) => Effect.Effect<void, ReplicaError.ReplicaError, never>
   } | undefined
 }): Migration => {
   if (!Number.isSafeInteger(options.id) || options.id <= 0) {
@@ -59,6 +69,7 @@ const MigrationRow = Schema.Struct({
   name: Schema.String,
   checksum: Identity.SchemaHash
 })
+const CountRow = Schema.Struct({ count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) })
 
 const mismatch = (catalog: Catalog, message: string) => new ReplicaError.StorageMigrationMismatch({ catalog, message })
 
@@ -97,17 +108,27 @@ const serverLedger = `CREATE TABLE IF NOT EXISTS effect_local_server_migrations 
 
 export const runCatalog = (
   catalog: Catalog,
-  migrations: ReadonlyArray<Migration>
+  migrations: ReadonlyArray<Migration>,
+  options: Options = defaultOptions
 ): Effect.Effect<
   void,
-  ReplicaError.StorageMigrationMismatch | ReplicaError.StorageUnavailable | ReplicaError.StorageCorrupt,
+  ReplicaError.ReplicaError,
   SqlClient.SqlClient
 > =>
   Effect.gen(function*() {
     const invalid = validateCatalog(catalog, migrations)
     if (invalid !== undefined) return yield* invalid
+    if (!Number.isSafeInteger(options.maximumAttempts) || options.maximumAttempts <= 0) {
+      return yield* new ReplicaError.InvalidConfiguration({
+        option: "migration.maximumAttempts",
+        message: "migration.maximumAttempts must be a positive safe integer"
+      })
+    }
+    const retryDelayMillis = yield* Configuration.positiveFiniteDurationMillis(
+      "migration.retryDelay",
+      options.retryDelay
+    )
     const sql = yield* SqlClient.SqlClient
-    yield* sql.unsafe(catalog === "Client" ? clientLedger : serverLedger)
     const readClient = SqlSchema.findAll({
       Request: Schema.Void,
       Result: MigrationRow,
@@ -118,44 +139,62 @@ export const runCatalog = (
       Result: MigrationRow,
       execute: () => sql`SELECT id, name, checksum FROM effect_local_server_migrations ORDER BY id`
     })
-    yield* sql.withTransaction(Effect.gen(function*() {
-      const applied = yield* (catalog === "Client" ? readClient(undefined) : readServer(undefined)).pipe(
-        Effect.mapError((cause) =>
-          SqlError.isSqlError(cause)
-            ? StorageUnavailable.make(cause)
-            : new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause })
+    const migrate = Effect.gen(function*() {
+      yield* sql.unsafe(catalog === "Client" ? clientLedger : serverLedger)
+      yield* sql.withTransaction(Effect.gen(function*() {
+        const applied = yield* (catalog === "Client" ? readClient(undefined) : readServer(undefined)).pipe(
+          Effect.mapError((cause) =>
+            SqlError.isSqlError(cause)
+              ? StorageUnavailable.make(cause)
+              : new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause })
+          )
         )
-      )
-      if (applied.length > migrations.length) {
-        return yield* mismatch(
-          catalog,
-          `${catalog} catalog deleted ${applied.length - migrations.length} applied migration(s)`
-        )
-      }
-      for (let index = 0; index < applied.length; index++) {
-        const stored = applied[index]!
-        const expected = migrations[index]!
-        if (stored.id !== expected.id || stored.name !== expected.name || stored.checksum !== expected.checksum) {
+        if (applied.length > migrations.length) {
           return yield* mismatch(
             catalog,
-            `Applied migration ${stored.id}:${stored.name}:${stored.checksum} does not match ${expected.id}:${expected.name}:${expected.checksum}`
+            `${catalog} catalog deleted ${applied.length - migrations.length} applied migration(s)`
           )
         }
-      }
-      for (let index = applied.length; index < migrations.length; index++) {
-        const migration = migrations[index]!
-        yield* Effect.forEach(migration.statements, (statement) => sql.unsafe(statement), { discard: true })
-        if (migration.effect !== undefined) yield* migration.effect(sql)
-        if (catalog === "Client") {
-          yield* sql`INSERT INTO effect_local_client_migrations (id, name, checksum)
-          VALUES (${migration.id}, ${migration.name}, ${migration.checksum})`
-        } else {
-          yield* sql`INSERT INTO effect_local_server_migrations (id, name, checksum)
-          VALUES (${migration.id}, ${migration.name}, ${migration.checksum})`
+        for (let index = 0; index < applied.length; index++) {
+          const stored = applied[index]!
+          const expected = migrations[index]!
+          if (stored.id !== expected.id || stored.name !== expected.name || stored.checksum !== expected.checksum) {
+            return yield* mismatch(
+              catalog,
+              `Applied migration ${stored.id}:${stored.name}:${stored.checksum} does not match ${expected.id}:${expected.name}:${expected.checksum}`
+            )
+          }
         }
-      }
-    }))
-  }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        for (let index = applied.length; index < migrations.length; index++) {
+          const migration = migrations[index]!
+          yield* Effect.forEach(migration.statements, (statement) => sql.unsafe(statement), { discard: true })
+          if (migration.effect !== undefined) yield* migration.effect(sql)
+          if (catalog === "Client") {
+            yield* sql`INSERT INTO effect_local_client_migrations (id, name, checksum)
+          VALUES (${migration.id}, ${migration.name}, ${migration.checksum})`
+          } else {
+            yield* sql`INSERT INTO effect_local_server_migrations (id, name, checksum)
+          VALUES (${migration.id}, ${migration.name}, ${migration.checksum})`
+          }
+        }
+      }))
+    }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+
+    let attempt = 1
+    while (true) {
+      const result = yield* migrate.pipe(Effect.result)
+      if (Result.isSuccess(result)) return
+      const failure = result.failure
+      if (
+        failure._tag !== "StorageUnavailable" ||
+        !SqlError.isSqlError(failure.cause) ||
+        failure.cause.reason._tag !== "LockTimeoutError" ||
+        attempt >= options.maximumAttempts
+      ) return yield* failure
+      attempt += 1
+      yield* Effect.sleep(retryDelayMillis)
+    }
+  })
 
 const clientV1 = makeMigration({
   id: 1,
@@ -358,6 +397,41 @@ const clientV5 = makeMigration({
   ]
 })
 
+const clientV6 = makeMigration({
+  id: 6,
+  name: "bounded-history-and-snapshots",
+  statements: [
+    "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_id TEXT",
+    "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_sequence INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_terminal_sequence INTEGER NOT NULL DEFAULT 0",
+    `CREATE TABLE effect_local_bootstrap (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      snapshot_id TEXT NOT NULL,
+      space_id TEXT NOT NULL,
+      definition_hash TEXT NOT NULL,
+      schema_version INTEGER NOT NULL,
+      schema_hash TEXT NOT NULL,
+      server_sequence INTEGER NOT NULL,
+      terminal_sequence INTEGER NOT NULL,
+      entity_count INTEGER NOT NULL,
+      content_bytes INTEGER NOT NULL,
+      digest TEXT NOT NULL,
+      next_ordinal INTEGER NOT NULL,
+      received_bytes INTEGER NOT NULL,
+      rolling_digest TEXT NOT NULL
+    )`,
+    `CREATE TABLE effect_local_bootstrap_entities (
+      ordinal INTEGER PRIMARY KEY,
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL,
+      entity_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      entity_bytes INTEGER NOT NULL,
+      UNIQUE (model, entity_key)
+    )`
+  ]
+})
+
 const serverV1 = makeMigration({
   id: 1,
   name: "mutation-log",
@@ -497,17 +571,202 @@ const serverV4 = makeMigration({
   ]
 })
 
-export const clientCatalog = Object.freeze([clientV1, clientV2, clientV3, clientV4, clientV5])
-export const serverCatalog = Object.freeze([serverV1, serverV2, serverV3, serverV4])
+const serverV5 = makeMigration({
+  id: 5,
+  name: "bounded-history-and-snapshots",
+  statements: [
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN next_terminal_sequence INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN history_floor INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN receipt_floor INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN retained_history_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN retained_receipt_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN entity_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN entity_bytes INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN snapshot_id TEXT",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN snapshot_sequence INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN snapshot_terminal_sequence INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN metadata_verified INTEGER NOT NULL DEFAULT 0 CHECK (metadata_verified IN (0, 1))",
+    "ALTER TABLE effect_local_server_clients ADD COLUMN expired_local_sequence INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_receipts ADD COLUMN terminal_sequence INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_receipts ADD COLUMN server_sequence INTEGER",
+    "ALTER TABLE effect_local_authoritative_log ADD COLUMN client_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE effect_local_authoritative_log ADD COLUMN local_sequence INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_authoritative_log ADD COLUMN digest TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE effect_local_server_entities ADD COLUMN entity_bytes INTEGER NOT NULL DEFAULT 0",
+    `UPDATE effect_local_authoritative_log SET
+      client_id = COALESCE(json_extract(entry_json, '$.clientId'), ''),
+      local_sequence = COALESCE(json_extract(entry_json, '$.localSequence'), 0),
+      digest = COALESCE(json_extract(entry_json, '$.digest'), '')`,
+    `WITH ranked AS (
+      SELECT rowid AS receipt_rowid,
+        ROW_NUMBER() OVER (PARTITION BY space_id ORDER BY rowid) AS terminal_sequence
+      FROM effect_local_server_receipts
+    )
+    UPDATE effect_local_server_receipts SET
+      terminal_sequence = (
+        SELECT ranked.terminal_sequence FROM ranked
+        WHERE ranked.receipt_rowid = effect_local_server_receipts.rowid
+      ),
+      server_sequence = CASE
+        WHEN json_extract(receipt_json, '$._tag') = 'Accepted'
+        THEN json_extract(receipt_json, '$.serverSequence')
+        ELSE NULL
+      END`,
+    `UPDATE effect_local_server_receipts SET receipt_json =
+      json_set(receipt_json, '$.terminalSequence', terminal_sequence)
+      WHERE json_extract(receipt_json, '$._tag') IN ('Accepted', 'Rejected')`,
+    `UPDATE effect_local_server_spaces SET
+      next_terminal_sequence = COALESCE((
+        SELECT MAX(r.terminal_sequence) + 1 FROM effect_local_server_receipts AS r
+        WHERE r.space_id = effect_local_server_spaces.space_id
+      ), 1),
+      retained_history_count = (
+        SELECT COUNT(*) FROM effect_local_authoritative_log AS l
+        WHERE l.space_id = effect_local_server_spaces.space_id
+      ),
+      retained_receipt_count = (
+        SELECT COUNT(*) FROM effect_local_server_receipts AS r
+        WHERE r.space_id = effect_local_server_spaces.space_id
+      )`,
+    `CREATE TABLE effect_local_server_space_counts (
+      space_id TEXT PRIMARY KEY,
+      history_count INTEGER NOT NULL CHECK (history_count >= 0),
+      receipt_count INTEGER NOT NULL CHECK (receipt_count >= 0)
+    )`,
+    `INSERT INTO effect_local_server_space_counts (space_id, history_count, receipt_count)
+      SELECT space_id, retained_history_count, retained_receipt_count
+      FROM effect_local_server_spaces`,
+    `CREATE TABLE effect_local_server_snapshots (
+      space_id TEXT NOT NULL,
+      snapshot_id TEXT NOT NULL,
+      definition_hash TEXT NOT NULL,
+      schema_version INTEGER NOT NULL,
+      schema_hash TEXT NOT NULL,
+      server_sequence INTEGER NOT NULL,
+      terminal_sequence INTEGER NOT NULL,
+      entity_count INTEGER NOT NULL,
+      content_bytes INTEGER NOT NULL,
+      digest TEXT NOT NULL,
+      PRIMARY KEY (space_id, snapshot_id),
+      UNIQUE (space_id, server_sequence, terminal_sequence)
+    )`,
+    `CREATE TABLE effect_local_server_snapshot_entities (
+      space_id TEXT NOT NULL,
+      snapshot_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL,
+      entity_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      entity_bytes INTEGER NOT NULL,
+      wire_json TEXT NOT NULL,
+      wire_bytes INTEGER NOT NULL CHECK (wire_bytes > 0),
+      PRIMARY KEY (space_id, snapshot_id, ordinal),
+      UNIQUE (space_id, snapshot_id, model, entity_key)
+    )`,
+    `CREATE INDEX effect_local_server_history_terminal
+      ON effect_local_authoritative_log (space_id, server_sequence, mutation_id)`,
+    `CREATE INDEX effect_local_server_receipts_terminal
+      ON effect_local_server_receipts (space_id, terminal_sequence, client_id, local_sequence)`,
+    `CREATE INDEX effect_local_server_snapshots_latest
+      ON effect_local_server_snapshots (space_id, server_sequence DESC, terminal_sequence DESC)`,
+    `CREATE INDEX effect_local_server_entities_largest
+      ON effect_local_server_entities (space_id, entity_bytes DESC, model, entity_key)`,
+    `CREATE TRIGGER effect_local_count_history_insert AFTER INSERT ON effect_local_authoritative_log
+      BEGIN
+        UPDATE effect_local_server_spaces SET retained_history_count = retained_history_count + 1
+          WHERE space_id = NEW.space_id;
+        UPDATE effect_local_server_space_counts SET history_count = history_count + 1
+          WHERE space_id = NEW.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_count_history_delete AFTER DELETE ON effect_local_authoritative_log
+      BEGIN
+        UPDATE effect_local_server_spaces SET retained_history_count = retained_history_count - 1
+          WHERE space_id = OLD.space_id;
+        UPDATE effect_local_server_space_counts SET history_count = history_count - 1
+          WHERE space_id = OLD.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_count_receipt_insert AFTER INSERT ON effect_local_server_receipts
+      BEGIN
+        UPDATE effect_local_server_spaces SET retained_receipt_count = retained_receipt_count + 1
+          WHERE space_id = NEW.space_id;
+        UPDATE effect_local_server_space_counts SET receipt_count = receipt_count + 1
+          WHERE space_id = NEW.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_count_receipt_delete AFTER DELETE ON effect_local_server_receipts
+      BEGIN
+        UPDATE effect_local_server_spaces SET retained_receipt_count = retained_receipt_count - 1
+          WHERE space_id = OLD.space_id;
+        UPDATE effect_local_server_space_counts SET receipt_count = receipt_count - 1
+          WHERE space_id = OLD.space_id;
+      END`,
+    `UPDATE effect_local_server_spaces SET metadata_verified = 1 WHERE NOT EXISTS (
+      SELECT 1 FROM effect_local_server_entities AS e
+      WHERE e.space_id = effect_local_server_spaces.space_id
+    )`,
+    `CREATE TRIGGER effect_local_require_current_space_writer
+      BEFORE INSERT ON effect_local_server_spaces
+      WHEN NEW.metadata_verified = 0
+      BEGIN SELECT RAISE(ABORT, 'effect-local server writer upgrade required'); END`,
+    `CREATE TRIGGER effect_local_require_current_receipt_writer
+      BEFORE INSERT ON effect_local_server_receipts
+      WHEN NEW.terminal_sequence = 0
+      BEGIN SELECT RAISE(ABORT, 'effect-local server writer upgrade required'); END`,
+    `CREATE TRIGGER effect_local_require_current_history_writer
+      BEFORE INSERT ON effect_local_authoritative_log
+      WHEN NEW.client_id = '' OR NEW.local_sequence = 0 OR NEW.digest = ''
+      BEGIN SELECT RAISE(ABORT, 'effect-local server writer upgrade required'); END`
+  ],
+  effect: {
+    id: "validate-bounded-history-backfill",
+    run: (sql) =>
+      Effect.gen(function*() {
+        const row = yield* SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: CountRow,
+          execute: () =>
+            sql`SELECT
+            (SELECT COUNT(*) FROM effect_local_authoritative_log
+              WHERE json_valid(entry_json) = 0 OR client_id = '' OR local_sequence = 0 OR digest = '') +
+            (SELECT COUNT(*) FROM effect_local_server_receipts AS r
+              WHERE json_valid(r.receipt_json) = 0 OR r.terminal_sequence <= 0 OR
+                (json_extract(r.receipt_json, '$._tag') = 'Accepted' AND (
+                  r.server_sequence IS NULL OR NOT EXISTS (
+                    SELECT 1 FROM effect_local_authoritative_log AS l
+                    WHERE l.space_id = r.space_id AND l.mutation_id = r.mutation_id AND
+                      l.server_sequence = r.server_sequence
+                  )
+                )) OR
+                (json_extract(r.receipt_json, '$._tag') <> 'Accepted' AND r.server_sequence IS NOT NULL)
+            ) AS count`
+        })(undefined)
+        if (row.count !== 0) {
+          return yield* new ReplicaError.StorageCorrupt({
+            message: "Legacy server history contains invalid mutation identity"
+          })
+        }
+        return yield* Effect.void
+      }).pipe(
+        Effect.mapError((cause) => {
+          if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
+          return new ReplicaError.StorageCorrupt({ message: "Server history backfill validation failed", cause })
+        })
+      )
+  }
+})
+
+export const clientCatalog = Object.freeze([clientV1, clientV2, clientV3, clientV4, clientV5, clientV6])
+export const serverCatalog = Object.freeze([serverV1, serverV2, serverV3, serverV4, serverV5])
 
 export const client = (options: {
   readonly definition: Definition.Any
   readonly spaceId: Identity.SpaceId
   readonly clientId: Identity.ClientId
+  readonly migration?: Options
 }) =>
   Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
-    yield* runCatalog("Client", clientCatalog)
+    yield* runCatalog("Client", clientCatalog, options.migration)
     yield* sql`INSERT INTO effect_local_client_meta
     (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor, visible_revision,
       requested_generation, completed_generation)
@@ -515,4 +774,4 @@ export const client = (options: {
     ON CONFLICT (singleton) DO NOTHING`
   }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
-export const server = runCatalog("Server", serverCatalog)
+export const server = (options: Options = defaultOptions) => runCatalog("Server", serverCatalog, options)

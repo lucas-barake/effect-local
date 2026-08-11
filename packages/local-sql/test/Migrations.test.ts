@@ -1,11 +1,16 @@
+import { NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import * as FileSystem from "effect/FileSystem"
 import * as Schema from "effect/Schema"
+import * as TestClock from "effect/testing/TestClock"
+import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Migrations from "../src/Migrations.js"
 import * as Domain from "./Domain.js"
@@ -52,6 +57,47 @@ const probeCount = (sql: SqlClient.SqlClient) =>
   })(undefined)
 
 describe("storage migration catalogs", () => {
+  it.effect("creates covering lifecycle indexes and fences pre upgrade server writers", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrations.server()
+
+      const plan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
+        SELECT model, model_version, entity_key, value_json, entity_bytes
+        FROM effect_local_server_entities WHERE space_id = ${spaceId}
+        ORDER BY entity_bytes DESC, model, entity_key LIMIT 1`
+      assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")))
+
+      const error = yield* sql`INSERT INTO effect_local_server_spaces
+        (space_id, definition_hash, next_server_sequence) VALUES (${spaceId}, 'definition', 1)`.pipe(Effect.flip)
+      assert.isTrue(SqlError.isSqlError(error))
+    }).pipe(Effect.provide(database)))
+
+  it.effect("retries lock contention while initializing an existing server catalog", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const fs = yield* FileSystem.FileSystem
+        const directory = yield* fs.makeTempDirectoryScoped()
+        const filename = `${directory}/migration-contention.sqlite`
+        const lockClient = yield* SqliteClient.make({ filename })
+        const migratorClient = yield* SqliteClient.make({ filename })
+        yield* migratorClient`PRAGMA busy_timeout = 1`
+        yield* Migrations.server().pipe(Effect.provideService(SqlClient.SqlClient, migratorClient))
+
+        yield* lockClient`BEGIN IMMEDIATE`
+        const migrationFiber = yield* Migrations.server({
+          retryDelay: "1 second",
+          maximumAttempts: 2
+        }).pipe(
+          Effect.provideService(SqlClient.SqlClient, migratorClient),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* lockClient`ROLLBACK`
+        yield* TestClock.adjust("1 second")
+        yield* Fiber.join(migrationFiber)
+      }).pipe(Effect.provide([NodeFileSystem.layer, Reactivity.layer]))
+    ))
+
   it.effect("applies the complete client and server catalogs once", () =>
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
@@ -60,14 +106,14 @@ describe("storage migration catalogs", () => {
         spaceId,
         clientId
       })
-      yield* Migrations.server
+      yield* Migrations.server()
       yield* Migrations.client({
         definition: Domain.definition,
         spaceId,
         clientId
       })
 
-      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5])
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6])
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
         "effect_local_client_evolution",
@@ -78,6 +124,8 @@ describe("storage migration catalogs", () => {
         "effect_local_client_shadow_pending",
         "effect_local_client_shadow_receipts_v2",
         "effect_local_client_shadow_visible_entities",
+        "effect_local_bootstrap",
+        "effect_local_bootstrap_entities",
         "effect_local_server_evolution",
         "effect_local_server_key_lineage",
         "effect_local_server_key_lineage_groups",
@@ -142,10 +190,15 @@ describe("storage migration catalogs", () => {
   it.effect("upgrades the existing mutation log tables without stamping untrusted schema provenance", () =>
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
-      yield* Effect.forEach(Migrations.clientCatalog[0]!.statements, (statement) => sql.unsafe(statement), {
+      const clientInitial = Migrations.clientCatalog[0]
+      const serverInitial = Migrations.serverCatalog[0]
+      if (clientInitial === undefined || serverInitial === undefined) {
+        assert.fail("Migration catalogs must contain their initial schema")
+      }
+      yield* Effect.forEach(clientInitial.statements, (statement) => sql.unsafe(statement), {
         discard: true
       })
-      yield* Effect.forEach(Migrations.serverCatalog[0]!.statements, (statement) => sql.unsafe(statement), {
+      yield* Effect.forEach(serverInitial.statements, (statement) => sql.unsafe(statement), {
         discard: true
       })
       yield* sql`INSERT INTO effect_local_client_meta
@@ -160,7 +213,7 @@ describe("storage migration catalogs", () => {
       VALUES (${spaceId}, 'Todo', '"1"', '{"id":"1","title":"legacy"}')`
 
       yield* Migrations.client({ definition: Domain.definition, spaceId, clientId })
-      yield* Migrations.server
+      yield* Migrations.server()
 
       const clientRow = yield* SqlSchema.findOne({
         Request: Schema.Void,

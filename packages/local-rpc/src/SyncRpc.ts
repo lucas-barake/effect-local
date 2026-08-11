@@ -100,7 +100,14 @@ export class Submit extends Rpc.make("Submit", {
 
 export class Pull extends Rpc.make("Pull", {
   payload: Protocol.PullRequest.fields,
-  success: Protocol.PullPage,
+  success: Protocol.PullResult,
+  error: ReplicaError.ReplicaError,
+  defect: RemoteDefect
+}) {}
+
+export class Bootstrap extends Rpc.make("Bootstrap", {
+  payload: Protocol.BootstrapRequest.fields,
+  success: Protocol.BootstrapPage,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect
 }) {}
@@ -128,7 +135,7 @@ export class WatchPresence extends Rpc.make("WatchPresence", {
   stream: true
 }) {}
 
-export const Rpcs = RpcGroup.make(Submit, Pull, Watch, PublishPresence, WatchPresence).middleware(
+export const Rpcs = RpcGroup.make(Submit, Pull, Bootstrap, Watch, PublishPresence, WatchPresence).middleware(
   Authentication.Authentication
 )
 

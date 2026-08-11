@@ -21,11 +21,17 @@ export type ClientId = typeof ClientId.Type
 export const MutationId = identifier("MutationId", "mut")
 export type MutationId = typeof MutationId.Type
 
+export const SnapshotId = identifier("SnapshotId", "snp")
+export type SnapshotId = typeof SnapshotId.Type
+
 export const LocalSequence = sequence("LocalSequence", 1)
 export type LocalSequence = typeof LocalSequence.Type
 
 export const ServerSequence = sequence("ServerSequence", 0)
 export type ServerSequence = typeof ServerSequence.Type
+
+export const TerminalSequence = sequence("TerminalSequence", 0)
+export type TerminalSequence = typeof TerminalSequence.Type
 
 export const VisibleRevision = sequence("VisibleRevision", 0)
 export type VisibleRevision = typeof VisibleRevision.Type
@@ -50,3 +56,4 @@ const makeIdentifier = <A,>(schema: { readonly make: (value: string) => A }, pre
 export const makeSpaceId = makeIdentifier(SpaceId, "spc")
 export const makeClientId = makeIdentifier(ClientId, "cli")
 export const makeMutationId = makeIdentifier(MutationId, "mut")
+export const makeSnapshotId = makeIdentifier(SnapshotId, "snp")

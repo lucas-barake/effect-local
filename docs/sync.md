@@ -3,7 +3,8 @@
 `SyncEngine` is the transport neutral client contract:
 
 - `submit` sends one stable mutation envelope and returns its durable terminal receipt
-- `pull` reads accepted entries after a cursor with count and byte bounds
+- `pull` reads a bounded accepted suffix or returns the immutable snapshot manifest required for bootstrap
+- `bootstrap` reads one identity bound, ordered, count and byte bounded snapshot page
 - `watch` streams wake notifications for a space
 
 The reconciler does not trust notification delivery or ordering. A notification only requests another durable
@@ -15,9 +16,32 @@ waits for a later local mutation or server wake to request a new generation. Com
 the selected Workflow storage. The explicit in memory Layer uses the same sync pass with a sliding queue for
 lightweight processes and tests.
 
+## History lifecycle
+
+The server retains a configurable dense accepted suffix and a configurable terminal receipt suffix. Hard caps are
+larger than retained targets and apply backpressure before mutation handlers run. `ServerStore.layerMaintenance`
+periodically publishes recovery state and reclaims bounded prefixes. Deployments that use an external scheduler call
+the same `maintainAll` operation.
+
+Maintenance snapshots the current authoritative entities at accepted sequence `S` and terminal sequence `T`. The
+manifest binds space, definition, snapshot identity, both fences, entity count, content bytes, and a chained SHA 256
+digest. The publication transaction compares the observed heads, inserts the immutable snapshot, then publishes
+logical floors before deleting any rows. A concurrent admission causes preparation to be discarded and retried later.
+
+A client cursor inside the retained suffix continues incrementally. An older or fresh cursor receives
+`BootstrapRequired`. The client stages pages durably and atomically installs the verified snapshot at `S`, then pulls
+`S + 1` onward. A newer manifest supersedes an older partial stage. Snapshot pages contain only materialized entities.
+They never contain mutation payloads, private results, or receipt bodies.
+
+Receipt reclamation advances a per client expired local sequence watermark. A retry below that watermark returns
+`Expired`, bound to a covering published snapshot, and never reexecutes. The pending client mutation remains visible
+until that snapshot installs. If the durable cursor already covers the snapshot sequence, the accepted state is
+already canonical and the receipt can settle without replacing state. This preserves at most once execution after the
+full private result was reclaimed.
+
 ## WebSocket RPC
 
-`SyncRpc.Rpcs` uses one Effect RPC group for submit, pull, watch, presence publish, and presence watch. Effect's RPC
+`SyncRpc.Rpcs` uses one Effect RPC group for submit, pull, bootstrap, watch, presence publish, and presence watch. Effect's RPC
 Schema codecs define the external contract. `SyncServer.layer` is the authenticated facade. It routes each operation
 through the Effect Cluster entity named by the request's space. The entity validates that embedded space identity
 matches its Cluster address, then calls `ServerStore` or `PresenceHub`. `SyncClient.layer` maps the generated client
@@ -35,7 +59,7 @@ SQLite outbox. After admission, `ServerStore` keeps the terminal receipt and acc
 `effect_local_server_receipts` and `effect_local_authoritative_log`. If a runner fails before SQL commit, the entity call
 fails and the client resubmits. If SQL committed before the reply was lost, exact resubmission returns the stored receipt.
 
-This is the same store backed actor pattern as the former recipient relay. Persisting Submit through Effect beta 101
+This is the same store backed actor pattern as the former recipient relay. Persisting Submit through Effect beta.103
 `MessageStorage` would retain every completed request payload and reply with no per-request retention control. The
 authoritative mutation would then exist permanently in both Cluster history and the server log. Keeping entity calls
 volatile avoids that duplicate history while Cluster still supplies unique ownership, cross runner routing, and live
@@ -59,8 +83,9 @@ not replace an ingress payload limit.
 ## Reconnect and retry
 
 An interrupted socket may fail an active request even when the server committed it. The client retains the pending
-mutation and retries exactly. Server receipts deduplicate by mutation identity and client sequence. The accepted log,
-not an acknowledgement, changes client canonical state.
+mutation and retries exactly. Retained server receipts deduplicate by mutation identity and client sequence. After a
+receipt expires, the durable watermark prevents reexecution and directs the client to its covering snapshot. The
+accepted log or verified snapshot, not an acknowledgement, changes client canonical state.
 
 When a watch ends, its finalizer requests another reconciliation generation. The transport may reconnect
 independently. The durable cursor, pending queue, and generation counters contain everything required to resume.

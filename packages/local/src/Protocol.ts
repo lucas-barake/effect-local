@@ -10,6 +10,7 @@ export const maximumBatchBytes = 4 * 1024 * 1024
 export const maximumReceiptBytes = 4 * 1024 * 1024
 export const maximumPresenceBytes = 16 * 1024
 export const maximumPresenceTtlMillis = 60_000
+export const maximumBootstrapEntries = 1_000
 
 export const encodedBytes = (value: unknown): number => new TextEncoder().encode(Canonical.stringify(value)).byteLength
 
@@ -99,6 +100,7 @@ export const AcceptedReceipt = Schema.TaggedStruct("Accepted", {
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
   serverSequence: Identity.ServerSequence,
+  terminalSequence: Schema.optionalKey(Identity.TerminalSequence),
   result: Schema.Json
 })
 export type AcceptedReceipt = typeof AcceptedReceipt.Type
@@ -112,6 +114,7 @@ export const RejectedReceipt = Schema.TaggedStruct("Rejected", {
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
   origin: RejectionOrigin,
+  terminalSequence: Schema.optionalKey(Identity.TerminalSequence),
   rejection: Schema.Json
 })
 export type RejectedReceipt = typeof RejectedReceipt.Type
@@ -125,7 +128,18 @@ export const LegacyReceipt = Schema.TaggedStruct("Legacy", {
 })
 export type LegacyReceipt = typeof LegacyReceipt.Type
 
-export const Receipt = Schema.Union([AcceptedReceipt, RejectedReceipt, LegacyReceipt])
+export const ExpiredReceipt = Schema.TaggedStruct("Expired", {
+  ...ReceiptIdentity,
+  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  sourceSchema: Identity.SchemaIdentity,
+  mutationVersion: Identity.SchemaVersion,
+  snapshotId: Identity.SnapshotId,
+  snapshotSequence: Identity.ServerSequence,
+  terminalSequenceThrough: Identity.TerminalSequence
+})
+export type ExpiredReceipt = typeof ExpiredReceipt.Type
+
+export const Receipt = Schema.Union([AcceptedReceipt, RejectedReceipt, LegacyReceipt, ExpiredReceipt])
 export type Receipt = typeof Receipt.Type
 
 export const AcceptedMutation = Schema.Struct({
@@ -159,6 +173,57 @@ export const PullPage = Schema.Struct({
   hasMore: Schema.Boolean
 })
 export type PullPage = typeof PullPage.Type
+
+export const SnapshotDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
+export type SnapshotDigest = typeof SnapshotDigest.Type
+export const initialSnapshotDigest = SnapshotDigest.make("0".repeat(64))
+
+export const SnapshotManifest = Schema.Struct({
+  spaceId: Identity.SpaceId,
+  definitionHash: Schema.String,
+  schema: Identity.SchemaIdentity,
+  snapshotId: Identity.SnapshotId,
+  sequence: Identity.ServerSequence,
+  terminalSequenceThrough: Identity.TerminalSequence,
+  entityCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  contentBytes: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  digest: SnapshotDigest
+})
+export type SnapshotManifest = typeof SnapshotManifest.Type
+
+export const SnapshotEntity = Schema.Struct({
+  ordinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  model: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  modelVersion: Identity.SchemaVersion,
+  key: Schema.Json,
+  value: Schema.Json,
+  entityBytes: Schema.Int.check(Schema.isGreaterThan(0))
+})
+export type SnapshotEntity = typeof SnapshotEntity.Type
+
+export const BootstrapRequired = Schema.TaggedStruct("BootstrapRequired", {
+  manifest: SnapshotManifest
+})
+export type BootstrapRequired = typeof BootstrapRequired.Type
+
+export const PullResult = Schema.Union([PullPage, BootstrapRequired])
+export type PullResult = typeof PullResult.Type
+
+export const BootstrapRequest = Schema.Struct({
+  spaceId: Identity.SpaceId,
+  schema: Identity.SchemaIdentity,
+  snapshotId: Identity.SnapshotId,
+  afterOrdinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1)),
+  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBootstrapEntries))
+})
+export type BootstrapRequest = typeof BootstrapRequest.Type
+
+export const BootstrapPage = Schema.Struct({
+  manifest: SnapshotManifest,
+  entities: Schema.Array(SnapshotEntity).check(Schema.isMaxLength(maximumBootstrapEntries)),
+  hasMore: Schema.Boolean
+})
+export type BootstrapPage = typeof BootstrapPage.Type
 
 export const Wake = Schema.Struct({
   spaceId: Identity.SpaceId,

@@ -19,6 +19,10 @@ export const layerHandlers = SyncRpc.Rpcs.toLayer(Effect.gen(function*() {
       Authentication.Principal.pipe(
         Effect.flatMap((principal) => client.pull(request.spaceId, request, principal))
       ),
+    Bootstrap: (request) =>
+      Authentication.Principal.pipe(
+        Effect.flatMap((principal) => client.bootstrap(request.spaceId, request, principal))
+      ),
     Watch: (request) =>
       Stream.unwrap(Authentication.Principal.pipe(
         Effect.map((principal) => client.watch(request.spaceId, request, principal))

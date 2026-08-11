@@ -34,7 +34,16 @@ export class Pull extends Rpc.make("Pull", {
     request: Protocol.PullRequest,
     principal: Schema.Json
   },
-  success: Protocol.PullPage,
+  success: Protocol.PullResult,
+  error: ReplicaError.ReplicaError
+}).annotateMerge(volatileAnnotations) {}
+
+export class Bootstrap extends Rpc.make("Bootstrap", {
+  payload: {
+    request: Protocol.BootstrapRequest,
+    principal: Schema.Json
+  },
+  success: Protocol.BootstrapPage,
   error: ReplicaError.ReplicaError
 }).annotateMerge(volatileAnnotations) {}
 
@@ -63,6 +72,7 @@ export class WatchPresence extends Rpc.make("WatchPresence", {
 export const SpaceEntity = Entity.make("EffectLocal/Space", [
   Submit,
   Pull,
+  Bootstrap,
   Watch,
   PublishPresence,
   WatchPresence
@@ -78,7 +88,12 @@ export interface ClientService {
     spaceId: Identity.SpaceId,
     request: Protocol.PullRequest,
     principal: typeof Schema.Json.Type
-  ) => Effect.Effect<Protocol.PullPage, ReplicaError.ReplicaError>
+  ) => Effect.Effect<Protocol.PullResult, ReplicaError.ReplicaError>
+  readonly bootstrap: (
+    spaceId: Identity.SpaceId,
+    request: Protocol.BootstrapRequest,
+    principal: typeof Schema.Json.Type
+  ) => Effect.Effect<Protocol.BootstrapPage, ReplicaError.ReplicaError>
   readonly watch: (
     spaceId: Identity.SpaceId,
     request: Protocol.WatchRequest,
@@ -110,6 +125,14 @@ const mapClient = (makeClient: Effect.Success<typeof SpaceEntity.client>): Clien
     ),
   pull: (spaceId, request, principal) =>
     makeClient(spaceId).Pull({ request, principal }).pipe(
+      Effect.catchTags({
+        MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
+      })
+    ),
+  bootstrap: (spaceId, request, principal) =>
+    makeClient(spaceId).Bootstrap({ request, principal }).pipe(
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -176,6 +199,15 @@ export const layerHandlers = (options: HandlerOptions = {}) =>
             }
             return store.pullAuthorized(payload.request, payload.principal)
           })),
+        Bootstrap: ({ payload }) =>
+          Effect.suspend(() => {
+            if (spaceId === undefined || payload.request.spaceId !== spaceId) {
+              return Effect.fail(
+                new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
+              )
+            }
+            return store.bootstrapAuthorized(payload.request, payload.principal)
+          }),
         Watch: ({ payload }) =>
           Rpc.fork(
             spaceId === undefined || payload.request.spaceId !== spaceId

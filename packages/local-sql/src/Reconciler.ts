@@ -72,32 +72,123 @@ export const layerOnePass = (
         yield* setStatus({ _tag: "Online", pending, cursor })
       })
 
+      const bootstrap = (
+        manifest: Protocol.SnapshotManifest
+      ): Effect.Effect<void, ReplicaError.ReplicaError> =>
+        Effect.gen(function*() {
+          let afterOrdinal = yield* local.prepareBootstrap(manifest)
+          while (true) {
+            const page = yield* remote.bootstrap({
+              spaceId: options.spaceId,
+              schema: options.definition.schemaIdentity,
+              snapshotId: manifest.snapshotId,
+              afterOrdinal,
+              limit: pageSize
+            })
+            if (page.manifest.snapshotId !== manifest.snapshotId) {
+              yield* bootstrap(page.manifest)
+              return yield* Effect.void
+            }
+            const complete = yield* local.stageBootstrapPage(page)
+            if (complete) {
+              yield* local.installBootstrap(page.manifest)
+              return yield* Effect.void
+            }
+            afterOrdinal += page.entities.length
+          }
+        })
+
+      const bootstrapExpired = (receipt: Protocol.ExpiredReceipt) =>
+        Effect.gen(function*() {
+          const firstPage = yield* remote.bootstrap({
+            spaceId: options.spaceId,
+            schema: options.definition.schemaIdentity,
+            snapshotId: receipt.snapshotId,
+            afterOrdinal: -1,
+            limit: pageSize
+          })
+          if (
+            firstPage.manifest.sequence < receipt.snapshotSequence ||
+            firstPage.manifest.terminalSequenceThrough < receipt.terminalSequenceThrough
+          ) {
+            return yield* new ReplicaError.ProtocolInvalid({
+              message: `Snapshot ${receipt.snapshotId} does not cover expired receipt ${receipt.mutationId}`
+            })
+          }
+          let afterOrdinal = yield* local.prepareBootstrap(firstPage.manifest)
+          if (afterOrdinal < 0) {
+            const complete = yield* local.stageBootstrapPage(firstPage)
+            if (complete) {
+              yield* local.installBootstrap(firstPage.manifest)
+              return yield* Effect.void
+            }
+            afterOrdinal = firstPage.entities.length - 1
+          }
+          while (true) {
+            const page = yield* remote.bootstrap({
+              spaceId: options.spaceId,
+              schema: options.definition.schemaIdentity,
+              snapshotId: firstPage.manifest.snapshotId,
+              afterOrdinal,
+              limit: pageSize
+            })
+            if (page.manifest.snapshotId !== firstPage.manifest.snapshotId) {
+              yield* bootstrap(page.manifest)
+              return yield* Effect.void
+            }
+            const complete = yield* local.stageBootstrapPage(page)
+            if (complete) {
+              yield* local.installBootstrap(page.manifest)
+              return yield* Effect.void
+            }
+            afterOrdinal += page.entities.length
+          }
+        })
+
       const catchUp = Effect.gen(function*() {
-        let hasMore = true
-        while (hasMore) {
+        while (true) {
           const cursor = yield* local.cursor
-          const page = yield* remote.pull({
+          const result = yield* remote.pull({
             spaceId: options.spaceId,
             schema: options.definition.schemaIdentity,
             after: cursor,
             limit: pageSize
           })
-          yield* local.applyEntries(page.entries)
-          hasMore = page.hasMore
+          if ("_tag" in result) {
+            yield* bootstrap(result.manifest)
+            continue
+          }
+          yield* local.applyEntries(result.entries)
+          if (!result.hasMore) return
         }
       })
 
       const submitPending = Effect.gen(function*() {
-        const pending = yield* local.pending
-        for (const mutation of pending) {
-          yield* local.persistReceipt(
-            yield* remote.submit({
+        yield* local.settleReceipts
+        while (true) {
+          const pending = yield* local.pending
+          let installedExpiredSnapshot = false
+          for (const mutation of pending) {
+            const receipt = yield* remote.submit({
               envelope: mutation.envelope,
               schema: options.definition.schemaIdentity
             })
-          )
+            yield* local.persistReceipt(receipt)
+            if (receipt._tag === "Expired") {
+              yield* local.settleReceipts
+              const unresolved = (yield* local.pending).some(
+                (candidate) => candidate.envelope.mutationId === receipt.mutationId
+              )
+              if (!unresolved) continue
+              yield* bootstrapExpired(receipt)
+              installedExpiredSnapshot = true
+              break
+            }
+          }
+          if (installedExpiredSnapshot) continue
+          yield* local.settleReceipts
+          return
         }
-        yield* local.settleReceipts
       })
 
       const sync = gate.withPermit(Effect.gen(function*() {

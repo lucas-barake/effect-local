@@ -11,6 +11,7 @@ import * as Query from "@lucas-barake/effect-local/Query"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
+import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -24,7 +25,9 @@ import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as LocalStore from "../src/LocalStore.js"
+import * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryExecutor from "../src/QueryExecutor.js"
 import * as Reconciler from "../src/Reconciler.js"
@@ -71,8 +74,33 @@ const database = () =>
 
 const runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.handlers))
 
+const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
+const clientHistory = {
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  retainedHistoryEntries: 256,
+  maximumBootstrapEntities: 10_000,
+  maximumBootstrapBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: Protocol.maximumBatchBytes,
+  migration
+}
+const serverHistory = {
+  retainedHistoryEntries: 256,
+  maximumHistoryEntries: 10_000,
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  maximumSnapshotEntities: 10_000,
+  maximumSnapshotBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: Protocol.maximumBatchBytes,
+  pruneBatchSize: 1_000,
+  retainedSnapshots: 2,
+  maintenanceConcurrency: 1,
+  maintenanceSpaceBatchSize: 128,
+  migration
+}
+
 const localLayer = (id = clientId) =>
-  LocalStore.layer({ definition: Domain.definition, spaceId, clientId: id }).pipe(
+  LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId: id }).pipe(
     Layer.provide(runtime),
     Layer.provide(database())
   )
@@ -82,18 +110,22 @@ const serverLayer = (
     readonly mutation: MutationRuntime.CurrentMutationView
     readonly principal: Schema.Json
   }) => Effect.Effect<void, Schema.Json>
-) =>
-  (authorizeMutation === undefined
-    ? ServerStore.layerTrusted({ definition: Domain.definition })
-    : ServerStore.layer({
+) => {
+  let layer = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition })
+  if (authorizeMutation !== undefined) {
+    layer = ServerStore.layer({
       definition: Domain.definition,
+      ...serverHistory,
       authorizeAccess: () => Effect.void,
       authorizeMutation,
       authorizeRead: () => Effect.void
-    })).pipe(
-      Layer.provide(runtime),
-      Layer.provide(database())
-    )
+    })
+  }
+  return layer.pipe(
+    Layer.provide(runtime),
+    Layer.provide(database())
+  )
+}
 
 const service = <I, S, E, R,>(tag: Context.Service<I, S>, layer: Layer.Layer<I, E, R>) =>
   Layer.build(layer).pipe(Effect.map((context) => Context.get(context, tag)))
@@ -101,8 +133,18 @@ const service = <I, S, E, R,>(tag: Context.Service<I, S>, layer: Layer.Layer<I, 
 const directSync = (server: ServerStore.Service) =>
   Layer.succeed(
     SyncEngine.SyncEngine,
-    SyncEngine.SyncEngine.of({ submit: server.submit, pull: server.pull, watch: server.watch })
+    SyncEngine.SyncEngine.of({
+      submit: server.submit,
+      pull: server.pull,
+      bootstrap: server.bootstrap,
+      watch: server.watch
+    })
   )
+
+const incremental = (result: Protocol.PullResult): Protocol.PullPage => {
+  if ("_tag" in result) assert.fail(`Unexpected bootstrap ${result.manifest.snapshotId}`)
+  return result
+}
 
 const clientServices = (id: Identity.ClientId, server: ServerStore.Service) => {
   const local = localLayer(id)
@@ -114,6 +156,924 @@ const clientServices = (id: Identity.ClientId, server: ServerStore.Service) => {
 }
 
 describe("server reconciled mutation log", () => {
+  it.effect("falls forward to a covering snapshot when an expired receipt snapshot is retired", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const bounded = {
+          ...serverHistory,
+          retainedHistoryEntries: 0,
+          maximumHistoryEntries: 8,
+          retainedReceipts: 0,
+          maximumReceipts: 8,
+          retainedSnapshots: 1
+        }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const first = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("retired-snapshot-1"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8010-000000000001")
+        )
+        yield* server.submit(first)
+        yield* server.maintain(spaceId)
+        const expired = yield* server.submit(first)
+        if (expired._tag !== "Expired") assert.fail("expected expired receipt")
+
+        yield* server.submit(
+          yield* envelope(
+            Domain.PutTodo.name,
+            Domain.todo("retired-snapshot-2"),
+            2,
+            Identity.MutationId.make("mut_00000000-0000-4000-8010-000000000002")
+          )
+        )
+        yield* server.maintain(spaceId)
+
+        const page = yield* server.bootstrap({
+          spaceId,
+          snapshotId: expired.snapshotId,
+          afterOrdinal: -1,
+          limit: 10
+        })
+        assert.notStrictEqual(page.manifest.snapshotId, expired.snapshotId)
+        assert.isAtLeast(page.manifest.sequence, expired.snapshotSequence)
+        assert.isAtLeast(page.manifest.terminalSequenceThrough, expired.terminalSequenceThrough)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("publishes a snapshot before bounding history and receipts", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const serverDatabase = database()
+        const bounded = {
+          ...serverHistory,
+          retainedHistoryEntries: 1,
+          maximumHistoryEntries: 4,
+          retainedReceipts: 1,
+          maximumReceipts: 4
+        }
+        const live = ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(serverDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(live, serverDatabase))
+        const server = Context.get(context, ServerStore.ServerStore)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const submitted: Array<Protocol.MutationEnvelope> = []
+        for (let sequence = 1; sequence <= 4; sequence++) {
+          const item = yield* envelope(
+            Domain.PutTodo.name,
+            Domain.todo(`bounded-${sequence}`),
+            sequence,
+            Identity.MutationId.make(`mut_00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`)
+          )
+          submitted.push(item)
+          assert.strictEqual((yield* server.submit(item))._tag, "Accepted")
+        }
+
+        yield* sql`CREATE TRIGGER require_snapshot_before_history_delete
+          BEFORE DELETE ON effect_local_authoritative_log
+          WHEN NOT EXISTS (
+            SELECT 1 FROM effect_local_server_snapshots WHERE space_id = OLD.space_id
+          )
+          BEGIN SELECT RAISE(ABORT, 'snapshot required before history delete'); END`
+        yield* sql`CREATE TRIGGER require_snapshot_before_receipt_delete
+          BEFORE DELETE ON effect_local_server_receipts
+          WHEN NOT EXISTS (
+            SELECT 1 FROM effect_local_server_snapshots WHERE space_id = OLD.space_id
+          )
+          BEGIN SELECT RAISE(ABORT, 'snapshot required before receipt delete'); END`
+
+        yield* server.maintain(spaceId)
+
+        const countRows = SqlSchema.findOne({
+          Request: Schema.String,
+          Result: Schema.Struct({ history: Schema.Int, receipts: Schema.Int, snapshots: Schema.Int }),
+          execute: (requestedSpace) =>
+            sql`SELECT
+            (SELECT COUNT(*) FROM effect_local_authoritative_log WHERE space_id = ${requestedSpace}) AS history,
+            (SELECT COUNT(*) FROM effect_local_server_receipts WHERE space_id = ${requestedSpace}) AS receipts,
+            (SELECT COUNT(*) FROM effect_local_server_snapshots WHERE space_id = ${requestedSpace}) AS snapshots`
+        })
+        const counts = yield* countRows(spaceId)
+        assert.strictEqual(counts.history, 1)
+        assert.strictEqual(counts.receipts, 1)
+        assert.strictEqual(counts.snapshots, 1)
+
+        const pulled = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        assert.isTrue("_tag" in pulled)
+        if (!("_tag" in pulled)) assert.fail("expected bootstrap")
+        const page = yield* server.bootstrap({
+          spaceId,
+          snapshotId: pulled.manifest.snapshotId,
+          afterOrdinal: -1,
+          limit: 10
+        })
+        assert.strictEqual(page.entities.length, 4)
+        assert.isFalse(page.hasMore)
+        assert.isAtMost(Protocol.encodedBytes(page), bounded.maximumBootstrapPageBytes)
+
+        const expired = yield* server.submit(submitted[0])
+        assert.strictEqual(expired._tag, "Expired")
+        if (expired._tag === "Expired") {
+          assert.strictEqual(expired.snapshotId, pulled.manifest.snapshotId)
+          assert.isAtLeast(expired.terminalSequenceThrough, 3)
+        }
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("pages every space during global history maintenance", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const serverDatabase = database()
+        const live = ServerStore.layerTrusted({
+          ...serverHistory,
+          definition: Domain.definition,
+          maintenanceSpaceBatchSize: 2
+        }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(serverDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(live, serverDatabase))
+        const server = Context.get(context, ServerStore.ServerStore)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        for (let index = 1; index <= 3; index++) {
+          const requestedSpace = Identity.SpaceId.make(
+            `spc_00000000-0000-4000-8000-${String(index).padStart(12, "0")}`
+          )
+          const identity = {
+            spaceId: requestedSpace,
+            clientId,
+            mutationId: Identity.MutationId.make(
+              `mut_00000000-0000-4000-8002-${String(index).padStart(12, "0")}`
+            ),
+            localSequence: Identity.LocalSequence.make(1),
+            basis: Identity.ServerSequence.make(0),
+            name: Domain.PutTodo.name,
+            payload: Domain.todo(`maintain-${index}`),
+            digestVersion: 2 as const,
+            sourceSchema: Domain.definition.schemaIdentity,
+            mutationVersion: Domain.PutTodo.version
+          }
+          yield* server.submit(Protocol.MutationEnvelope.make({
+            ...identity,
+            digest: yield* Protocol.mutationDigest(identity)
+          }))
+        }
+
+        yield* server.maintainAll
+
+        const rows = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_snapshots`
+        assert.strictEqual(rows[0].count, 3)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("applies hard history backpressure until maintenance publishes recovery state", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const bounded = {
+          ...serverHistory,
+          retainedHistoryEntries: 0,
+          maximumHistoryEntries: 2,
+          retainedReceipts: 1,
+          maximumReceipts: 3
+        }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        for (let sequence = 1; sequence <= 2; sequence++) {
+          yield* server.submit(
+            yield* envelope(
+              Domain.PutTodo.name,
+              Domain.todo(`capacity-${sequence}`),
+              sequence,
+              Identity.MutationId.make(`mut_00000000-0000-4000-8001-${String(sequence).padStart(12, "0")}`)
+            )
+          )
+        }
+        const third = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("capacity-3"),
+          3,
+          Identity.MutationId.make("mut_00000000-0000-4000-8001-000000000003")
+        )
+        const blocked = yield* server.submit(third).pipe(Effect.flip)
+        assert.strictEqual(blocked._tag, "CapacityExceeded")
+        yield* server.maintain(spaceId)
+        assert.strictEqual((yield* server.submit(third))._tag, "Accepted")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects corrupted retained row counters before admission", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const serverDatabase = database()
+        const live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(serverDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(live, serverDatabase))
+        const server = Context.get(context, ServerStore.ServerStore)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        yield* server.submit(
+          yield* envelope(
+            Domain.PutTodo.name,
+            Domain.todo("counter-1"),
+            1,
+            Identity.MutationId.make("mut_00000000-0000-4000-8001-100000000001")
+          )
+        )
+        yield* sql`UPDATE effect_local_server_spaces SET retained_history_count = 0
+          WHERE space_id = ${spaceId}`
+
+        const error = yield* server.submit(
+          yield* envelope(
+            Domain.PutTodo.name,
+            Domain.todo("counter-2"),
+            2,
+            Identity.MutationId.make("mut_00000000-0000-4000-8001-100000000002")
+          )
+        ).pipe(Effect.flip)
+
+        assert.strictEqual(error._tag, "StorageCorrupt")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("bounds rejected receipts independently from accepted history", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const bounded = {
+          ...serverHistory,
+          retainedHistoryEntries: 0,
+          maximumHistoryEntries: 1,
+          retainedReceipts: 0,
+          maximumReceipts: 2
+        }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...bounded,
+            definition: Domain.definition,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.fail("denied"),
+            authorizeRead: () => Effect.void
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const submitted: Array<Protocol.MutationEnvelope> = []
+        for (let sequence = 1; sequence <= 3; sequence++) {
+          submitted.push(
+            yield* envelope(
+              Domain.PutTodo.name,
+              Domain.todo(`rejected-${sequence}`),
+              sequence,
+              Identity.MutationId.make(`mut_00000000-0000-4000-8004-${String(sequence).padStart(12, "0")}`)
+            )
+          )
+        }
+
+        assert.strictEqual((yield* server.submit(submitted[0]))._tag, "Rejected")
+        assert.strictEqual((yield* server.submit(submitted[1]))._tag, "Rejected")
+        const blocked = yield* server.submit(submitted[2]).pipe(Effect.flip)
+        assert.strictEqual(blocked._tag, "CapacityExceeded")
+
+        yield* server.maintain(spaceId)
+
+        assert.strictEqual((yield* server.submit(submitted[2]))._tag, "Rejected")
+        assert.strictEqual((yield* server.submit(submitted[0]))._tag, "Expired")
+        const pulled = incremental(
+          yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        )
+        assert.deepStrictEqual(pulled.entries, [])
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("terminally rejects state that cannot fit a future snapshot", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const serverDatabase = database()
+        const bounded = {
+          ...serverHistory,
+          maximumSnapshotBytes: 1
+        }
+        const live = ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(serverDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(live, serverDatabase))
+        const server = Context.get(context, ServerStore.ServerStore)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const item = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("snapshot-capacity"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8005-000000000001")
+        )
+
+        const receipt = yield* server.submit(item)
+        assert.strictEqual(receipt._tag, "Rejected")
+        if (receipt._tag !== "Rejected") assert.fail("expected terminal rejection")
+        assert.deepStrictEqual(receipt.rejection, {
+          _tag: "CapacityExceeded",
+          resource: "snapshot bytes",
+          limit: 1
+        })
+        assert.deepStrictEqual(yield* server.submit(item), receipt)
+
+        const count = yield* SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: Schema.Struct({ entities: Schema.Int, history: Schema.Int }),
+          execute: () =>
+            sql`SELECT
+              (SELECT COUNT(*) FROM effect_local_server_entities) AS entities,
+              (SELECT COUNT(*) FROM effect_local_authoritative_log) AS history`
+        })(undefined)
+        assert.deepStrictEqual(count, { entities: 0, history: 0 })
+        yield* server.maintain(spaceId)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("bootstraps a fresh client without replaying retained history", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const bounded = {
+          ...serverHistory,
+          retainedHistoryEntries: 1,
+          maximumHistoryEntries: 8,
+          retainedReceipts: 1,
+          maximumReceipts: 8
+        }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        for (let sequence = 1; sequence <= 4; sequence++) {
+          yield* server.submit(
+            yield* envelope(
+              Domain.PutTodo.name,
+              Domain.todo(`bootstrap-${sequence}`),
+              sequence,
+              Identity.MutationId.make(`mut_00000000-0000-4000-8002-${String(sequence).padStart(12, "0")}`)
+            )
+          )
+        }
+        yield* server.maintain(spaceId)
+
+        const freshClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000099")
+        const local = LocalStore.layer({
+          ...clientHistory,
+          definition: Domain.definition,
+          spaceId,
+          clientId: freshClientId
+        }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(database())
+        )
+        const reconciler = Reconciler.layerOnePass({ definition: Domain.definition, spaceId, pageSize: 2 }).pipe(
+          Layer.provide(local),
+          Layer.provide(directSync(server))
+        )
+        const context = yield* Layer.build(Layer.merge(local, reconciler))
+        const store = Context.get(context, LocalStore.Store)
+        yield* Context.get(context, Reconciler.Reconciliation).sync
+
+        assert.strictEqual(yield* store.cursor, 4)
+        for (let sequence = 1; sequence <= 4; sequence++) {
+          assert.deepStrictEqual(
+            Option.getOrThrow(yield* store.get(Domain.Todo, `bootstrap-${sequence}`)),
+            Domain.todo(`bootstrap-${sequence}`)
+          )
+        }
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("resumes a durable bootstrap stage after reopening the client database", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const fs = yield* FileSystem.FileSystem
+        const directory = yield* fs.makeTempDirectoryScoped()
+        const filename = `${directory}/bootstrap-resume.sqlite`
+        const persistentDatabase = () =>
+          Layer.mergeAll(
+            SqliteClient.layer({ filename, disableWAL: true }),
+            NodeCrypto.layer,
+            Reactivity.layer
+          )
+        const makeLocal = () =>
+          LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(persistentDatabase())
+          )
+        const bounded = {
+          ...serverHistory,
+          retainedHistoryEntries: 0,
+          maximumHistoryEntries: 8,
+          retainedReceipts: 0,
+          maximumReceipts: 8
+        }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        for (let sequence = 1; sequence <= 2; sequence++) {
+          yield* server.submit(
+            yield* envelope(
+              Domain.PutTodo.name,
+              Domain.todo(`resume-${sequence}`),
+              sequence,
+              Identity.MutationId.make(`mut_00000000-0000-4000-8006-${String(sequence).padStart(12, "0")}`)
+            )
+          )
+        }
+        yield* server.maintain(spaceId)
+        const pulled = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        if (!("_tag" in pulled)) assert.fail("expected bootstrap")
+        const first = yield* server.bootstrap({
+          spaceId,
+          snapshotId: pulled.manifest.snapshotId,
+          afterOrdinal: -1,
+          limit: 1
+        })
+        assert.isTrue(first.hasMore)
+
+        yield* Effect.scoped(Effect.gen(function*() {
+          const local = yield* service(LocalStore.Store, makeLocal())
+          assert.strictEqual(yield* local.prepareBootstrap(first.manifest), -1)
+          assert.isFalse(yield* local.stageBootstrapPage(first))
+        }))
+
+        yield* Effect.scoped(Effect.gen(function*() {
+          const local = yield* service(LocalStore.Store, makeLocal())
+          assert.strictEqual(yield* local.prepareBootstrap(first.manifest), 0)
+          const finalPage = yield* server.bootstrap({
+            spaceId,
+            snapshotId: first.manifest.snapshotId,
+            afterOrdinal: 0,
+            limit: 1
+          })
+          assert.isTrue(yield* local.stageBootstrapPage(finalPage))
+          yield* local.installBootstrap(finalPage.manifest)
+          assert.strictEqual(yield* local.cursor, 2)
+          assert.deepStrictEqual(
+            Option.getOrThrow(yield* local.get(Domain.Todo, "resume-1")),
+            Domain.todo("resume-1")
+          )
+          assert.deepStrictEqual(
+            Option.getOrThrow(yield* local.get(Domain.Todo, "resume-2")),
+            Domain.todo("resume-2")
+          )
+        }))
+      }).pipe(Effect.provide(NodeFileSystem.layer), Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("keeps canonical state unchanged when a bootstrap page is corrupt", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const bounded = {
+          ...serverHistory,
+          retainedHistoryEntries: 0,
+          maximumHistoryEntries: 4,
+          retainedReceipts: 0,
+          maximumReceipts: 4
+        }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const item = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("corrupt-bootstrap"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8003-000000000001")
+        )
+        yield* server.submit(item)
+        yield* server.maintain(spaceId)
+        const pulled = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        if (!("_tag" in pulled)) assert.fail("expected bootstrap")
+        const page = yield* server.bootstrap({
+          spaceId,
+          snapshotId: pulled.manifest.snapshotId,
+          afterOrdinal: -1,
+          limit: 10
+        })
+        const local = yield* service(LocalStore.Store, localLayer())
+        yield* local.prepareBootstrap(page.manifest)
+        const corrupt = Protocol.BootstrapPage.make({
+          ...page,
+          entities: page.entities.map((entity) => ({ ...entity, value: { corrupt: true } }))
+        })
+        const error = yield* local.stageBootstrapPage(corrupt).pipe(Effect.flip)
+        assert.strictEqual(error._tag, "ProtocolInvalid")
+        const stalled = yield* local.stageBootstrapPage(Protocol.BootstrapPage.make({
+          manifest: page.manifest,
+          entities: [],
+          hasMore: true
+        })).pipe(Effect.flip)
+        assert.strictEqual(stalled._tag, "ProtocolInvalid")
+        assert.strictEqual(yield* local.cursor, 0)
+        assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "corrupt-bootstrap")))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("settles an expired pending mutation only after installing its covering snapshot", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const bounded = {
+          ...serverHistory,
+          retainedHistoryEntries: 0,
+          maximumHistoryEntries: 8,
+          retainedReceipts: 0,
+          maximumReceipts: 8
+        }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const clientDatabase = database()
+        const localLayerWithDatabase = LocalStore.layer({
+          ...clientHistory,
+          retainedReceipts: 1,
+          definition: Domain.definition,
+          spaceId,
+          clientId
+        }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(clientDatabase)
+        )
+        const reconciler = Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(localLayerWithDatabase),
+          Layer.provide(directSync(server))
+        )
+        const context = yield* Layer.build(Layer.mergeAll(localLayerWithDatabase, reconciler, clientDatabase))
+        const local = Context.get(context, LocalStore.Store)
+        const sync = Context.get(context, Reconciler.Reconciliation)
+        const sql = Context.get(context, SqlClient.SqlClient)
+
+        yield* local.mutate(Domain.PutTodo, Domain.todo("expired-pending"))
+        yield* sync.sync
+        const increment = yield* local.mutate(Domain.IncrementTodo, { id: "expired-pending", delta: 1 })
+        assert.strictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "expired-pending")).count, 1)
+        assert.strictEqual((yield* server.submit(increment.envelope))._tag, "Accepted")
+        yield* server.maintain(spaceId)
+
+        const expired = yield* server.submit(increment.envelope)
+        assert.strictEqual(expired._tag, "Expired")
+        yield* local.persistReceipt(expired)
+        yield* local.settleReceipts
+
+        assert.strictEqual(yield* local.pendingCount, 1)
+        assert.strictEqual(Option.getOrThrow(yield* local.receipt(increment.envelope.mutationId))._tag, "Expired")
+        assert.strictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "expired-pending")).count, 1)
+
+        const required = yield* server.pull({ spaceId, after: yield* local.cursor, limit: 10 })
+        if (!("_tag" in required)) assert.fail("expected bootstrap")
+        const page = yield* server.bootstrap({
+          spaceId,
+          snapshotId: required.manifest.snapshotId,
+          afterOrdinal: -1,
+          limit: 10
+        })
+        yield* local.prepareBootstrap(page.manifest)
+        assert.isTrue(yield* local.stageBootstrapPage(page))
+        yield* local.installBootstrap(page.manifest)
+
+        assert.strictEqual(yield* local.pendingCount, 0)
+        const receipt = Option.getOrThrow(yield* local.receipt(increment.envelope.mutationId))
+        assert.strictEqual(receipt._tag, "Expired")
+        assert.strictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "expired-pending")).count, 1)
+        const countRows = SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: Schema.Struct({ receipts: Schema.Int, history: Schema.Int }),
+          execute: () =>
+            sql`SELECT
+              (SELECT COUNT(*) FROM effect_local_receipts) AS receipts,
+              (SELECT COUNT(*) FROM effect_local_server_log) AS history`
+        })
+        assert.deepStrictEqual(yield* countRows(undefined), { receipts: 1, history: 0 })
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("settles expired rejected history when the cursor already covers its snapshot", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const bounded = {
+          ...serverHistory,
+          retainedHistoryEntries: 0,
+          maximumHistoryEntries: 8,
+          retainedReceipts: 0,
+          maximumReceipts: 8
+        }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...bounded,
+            definition: Domain.definition,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: (input) => {
+              if (input.mutation.name === Domain.RenameTodo.name) return Effect.fail("denied")
+              return Effect.void
+            },
+            authorizeRead: () => Effect.void
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const localLive = LocalStore.layer({
+          ...clientHistory,
+          retainedReceipts: 2,
+          definition: Domain.definition,
+          spaceId,
+          clientId
+        }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(database())
+        )
+        const reconciliationLive = Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(localLive),
+          Layer.provide(directSync(server))
+        )
+        const context = yield* Layer.build(Layer.merge(localLive, reconciliationLive))
+        const local = Context.get(context, LocalStore.Store)
+        const reconciliation = Context.get(context, Reconciler.Reconciliation)
+
+        yield* local.mutate(Domain.PutTodo, Domain.todo("terminal-fence"))
+        yield* reconciliation.sync
+        yield* server.maintain(spaceId)
+        const firstRequired = yield* server.pull({
+          spaceId,
+          after: Identity.ServerSequence.make(0),
+          limit: 10
+        })
+        if (!("_tag" in firstRequired)) assert.fail("expected first snapshot")
+        const firstPage = yield* server.bootstrap({
+          spaceId,
+          snapshotId: firstRequired.manifest.snapshotId,
+          afterOrdinal: -1,
+          limit: 10
+        })
+        yield* local.prepareBootstrap(firstPage.manifest)
+        assert.isTrue(yield* local.stageBootstrapPage(firstPage))
+        yield* local.installBootstrap(firstPage.manifest)
+
+        const rejected = yield* local.mutate(Domain.RenameTodo, { id: "terminal-fence", title: "rejected-only" })
+        assert.strictEqual((yield* server.submit(rejected.envelope))._tag, "Rejected")
+        yield* server.maintain(spaceId)
+
+        yield* reconciliation.sync
+
+        assert.strictEqual(yield* local.pendingCount, 0)
+        assert.strictEqual(
+          Option.getOrThrow(yield* local.receipt(rejected.envelope.mutationId))._tag,
+          "Expired"
+        )
+        assert.strictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "terminal-fence")).title, "first")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("revalidates durable staged entities before snapshot installation", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const bounded = {
+          ...serverHistory,
+          retainedHistoryEntries: 0,
+          maximumHistoryEntries: 8,
+          retainedReceipts: 0,
+          maximumReceipts: 8
+        }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const clientDatabase = database()
+        const localLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(clientDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(localLive, clientDatabase))
+        const local = Context.get(context, LocalStore.Store)
+        const sql = Context.get(context, SqlClient.SqlClient)
+
+        const initial = yield* local.mutate(Domain.PutTodo, Domain.todo("staged-corruption", "old"))
+        const initialReceipt = yield* server.submit(initial.envelope)
+        yield* local.applyReceipt(initialReceipt)
+        yield* local.applyEntries(
+          incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })).entries
+        )
+        const rename = yield* envelope(
+          Domain.RenameTodo.name,
+          { id: "staged-corruption", title: "new" },
+          2,
+          Identity.MutationId.make("mut_00000000-0000-4000-8007-000000000002")
+        )
+        yield* server.submit(rename)
+        yield* server.maintain(spaceId)
+        const required = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(1), limit: 10 })
+        if (!("_tag" in required)) assert.fail("expected bootstrap")
+        const page = yield* server.bootstrap({
+          spaceId,
+          snapshotId: required.manifest.snapshotId,
+          afterOrdinal: -1,
+          limit: 10
+        })
+        yield* local.prepareBootstrap(page.manifest)
+        assert.isTrue(yield* local.stageBootstrapPage(page))
+        yield* sql`UPDATE effect_local_bootstrap_entities SET value_json = '{"corrupt":true}' WHERE ordinal = 0`
+
+        const error = yield* local.installBootstrap(page.manifest).pipe(Effect.flip)
+
+        assert.strictEqual(error._tag, "StorageCorrupt")
+        assert.strictEqual(yield* local.cursor, 1)
+        assert.strictEqual(
+          Option.getOrThrow(yield* local.get(Domain.Todo, "staged-corruption")).title,
+          "old"
+        )
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects mismatched durable receipt identity during snapshot installation", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const bounded = {
+          ...serverHistory,
+          retainedHistoryEntries: 0,
+          maximumHistoryEntries: 8,
+          retainedReceipts: 0,
+          maximumReceipts: 8
+        }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const clientDatabase = database()
+        const localLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(clientDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(localLive, clientDatabase))
+        const local = Context.get(context, LocalStore.Store)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const first = yield* local.mutate(Domain.PutTodo, Domain.todo("receipt-a"))
+        const second = yield* local.mutate(Domain.PutTodo, Domain.todo("receipt-b"))
+        yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+          spaceId,
+          clientId,
+          mutationId: first.envelope.mutationId,
+          localSequence: first.envelope.localSequence,
+          ...putTodoProvenance,
+          origin: "Mutation",
+          terminalSequence: Identity.TerminalSequence.make(1),
+          rejection: "denied"
+        }))
+        const corrupt = Protocol.RejectedReceipt.make({
+          spaceId,
+          clientId,
+          mutationId: second.envelope.mutationId,
+          localSequence: second.envelope.localSequence,
+          ...putTodoProvenance,
+          origin: "Mutation",
+          terminalSequence: Identity.TerminalSequence.make(1),
+          rejection: "denied"
+        })
+        yield* sql`UPDATE effect_local_receipts SET receipt_json = ${Canonical.stringify(corrupt)}
+          WHERE mutation_id = ${first.envelope.mutationId}`
+        const authoritative = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("snapshot-receipt-identity"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8008-000000000001")
+        )
+        yield* server.submit(authoritative)
+        yield* server.maintain(spaceId)
+        const required = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        if (!("_tag" in required)) assert.fail("expected bootstrap")
+        const page = yield* server.bootstrap({
+          spaceId,
+          snapshotId: required.manifest.snapshotId,
+          afterOrdinal: -1,
+          limit: 10
+        })
+        yield* local.prepareBootstrap(page.manifest)
+        assert.isTrue(yield* local.stageBootstrapPage(page))
+
+        const error = yield* local.installBootstrap(page.manifest).pipe(Effect.flip)
+
+        assert.strictEqual(error._tag, "StorageCorrupt")
+        assert.strictEqual(yield* local.pendingCount, 2)
+        assert.strictEqual(yield* local.cursor, 0)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("settles a durable legacy rejection before resubmitting pending work", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const local = yield* service(LocalStore.Store, localLayer())
+        const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("legacy-rejection"))
+        yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+          spaceId,
+          clientId,
+          mutationId: pending.envelope.mutationId,
+          localSequence: pending.envelope.localSequence,
+          ...putTodoProvenance,
+          origin: "Mutation",
+          rejection: "Rejected"
+        }))
+        const submissions = yield* Ref.make(0)
+        const remote = SyncEngine.SyncEngine.of({
+          submit: (submitted) =>
+            Ref.update(submissions, (count) => count + 1).pipe(
+              Effect.as(Protocol.RejectedReceipt.make({
+                spaceId,
+                clientId,
+                mutationId: submitted.envelope.mutationId,
+                localSequence: submitted.envelope.localSequence,
+                ...putTodoProvenance,
+                origin: "Mutation",
+                terminalSequence: Identity.TerminalSequence.make(1),
+                rejection: "Rejected"
+              }))
+            ),
+          pull: () => Effect.succeed(Protocol.PullPage.make({ entries: [], hasMore: false })),
+          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          watch: () => Stream.never
+        })
+        const reconciliation = yield* service(
+          Reconciler.Reconciliation,
+          Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+            Layer.provide(Layer.succeed(LocalStore.Store, local)),
+            Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
+          )
+        )
+
+        yield* reconciliation.sync
+
+        assert.strictEqual(yield* Ref.get(submissions), 0)
+        assert.strictEqual(yield* local.pendingCount, 0)
+        assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "legacy-rejection")))
+      })
+    ))
+
+  it.effect("rejects inconsistent durable installed snapshot metadata", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const databaseContext = yield* Layer.build(database())
+      const sql = Context.get(databaseContext, SqlClient.SqlClient)
+      yield* Migrations.client({ definition: Domain.definition, spaceId, clientId, migration }).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql)
+      )
+      yield* sql`UPDATE effect_local_client_meta
+        SET server_cursor = 0, installed_snapshot_id = NULL, installed_snapshot_sequence = 1
+        WHERE singleton = 1`
+      const services = Layer.mergeAll(
+        Layer.succeed(SqlClient.SqlClient, sql),
+        Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto)),
+        Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity))
+      )
+      const live = LocalStore.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId
+      }).pipe(
+        Layer.provide(runtime),
+        Layer.provide(services)
+      )
+
+      const error = yield* Layer.build(live).pipe(Effect.flip)
+
+      assert.strictEqual(error._tag, "StorageCorrupt")
+    })))
+
   it.effect("commits optimistically, admits in total order, and reconciles canonical state", () =>
     Effect.scoped(Effect.gen(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
@@ -125,7 +1085,7 @@ describe("server reconciled mutation log", () => {
 
       const receipt = yield* server.submit(pending.envelope)
       assert.strictEqual(receipt._tag, "Accepted")
-      const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
       assert.deepStrictEqual(page.entries.map((entry) => entry.sequence), [1])
       yield* local.applyReceipt(receipt)
       yield* local.applyEntries(page.entries)
@@ -159,7 +1119,7 @@ describe("server reconciled mutation log", () => {
       const first = yield* server.submit(pending.envelope)
       const retry = yield* server.submit(pending.envelope)
       assert.deepStrictEqual(retry, first)
-      const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
       assert.strictEqual(page.entries.length, 1)
     })))
 
@@ -168,6 +1128,7 @@ describe("server reconciled mutation log", () => {
       Effect.gen(function*() {
         const access = yield* Ref.make(true)
         const secured = ServerStore.layer({
+          ...serverHistory,
           definition: Domain.definition,
           authorizeAccess: () =>
             Ref.get(access).pipe(
@@ -203,8 +1164,8 @@ describe("server reconciled mutation log", () => {
       const receipt = yield* server.submit(pending.envelope)
       assert.strictEqual(receipt._tag, "Accepted")
 
-      const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
-      const entry = page.entries[0] as object
+      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
+      const entry = page.entries[0]
       assert.isFalse(Object.hasOwn(entry, "envelope"))
       assert.isFalse(Object.hasOwn(entry, "result"))
     })))
@@ -213,7 +1174,7 @@ describe("server reconciled mutation log", () => {
     Effect.scoped(
       Effect.gen(function*() {
         const serverDatabase = database()
-        const live = ServerStore.layerTrusted({ definition: Domain.definition }).pipe(
+        const live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
           Layer.provide(runtime),
           Layer.provide(serverDatabase)
         )
@@ -231,7 +1192,7 @@ describe("server reconciled mutation log", () => {
       SET receipt_json = ${"x".repeat(Protocol.maximumReceiptBytes)}
       WHERE space_id = ${spaceId} AND mutation_id = ${submitted.mutationId}`
 
-        const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
         assert.deepStrictEqual(page.entries.map((entry) => entry.mutationId), [submitted.mutationId])
         assert.strictEqual((yield* server.submit(submitted).pipe(Effect.flip))._tag, "StorageCorrupt")
       }).pipe(Effect.provide(NodeCrypto.layer))
@@ -243,7 +1204,7 @@ describe("server reconciled mutation log", () => {
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
       const receipt = yield* server.submit(pending.envelope)
-      const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
 
       yield* local.applyEntries(page.entries)
       assert.strictEqual(yield* local.pendingCount, 1)
@@ -259,10 +1220,11 @@ describe("server reconciled mutation log", () => {
     Effect.scoped(
       Effect.gen(function*() {
         const serverDatabase = database()
-        const serverLayerWithDatabase = ServerStore.layerTrusted({ definition: Domain.definition }).pipe(
-          Layer.provide(runtime),
-          Layer.provide(serverDatabase)
-        )
+        const serverLayerWithDatabase = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition })
+          .pipe(
+            Layer.provide(runtime),
+            Layer.provide(serverDatabase)
+          )
         const context = yield* Layer.build(Layer.merge(serverLayerWithDatabase, serverDatabase))
         const server = Context.get(context, ServerStore.ServerStore)
         const sql = Context.get(context, SqlClient.SqlClient)
@@ -344,7 +1306,7 @@ describe("server reconciled mutation log", () => {
         const receipt = yield* server.submit(next)
         assert.strictEqual(receipt._tag, "Accepted")
         if (receipt._tag === "Accepted") assert.strictEqual(receipt.serverSequence, 1)
-        const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
         assert.deepStrictEqual(page.entries.map((entry) => entry.sequence), [1])
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
@@ -372,7 +1334,7 @@ describe("server reconciled mutation log", () => {
             limit: Protocol.maximumReceiptBytes
           })
         }
-        const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+        const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
         assert.deepStrictEqual(page.entries, [])
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
@@ -409,7 +1371,7 @@ describe("server reconciled mutation log", () => {
     Effect.scoped(
       Effect.gen(function*() {
         const serverDatabase = database()
-        const live = ServerStore.layerTrusted({ definition: Domain.definition }).pipe(
+        const live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
           Layer.provide(runtime),
           Layer.provide(serverDatabase)
         )
@@ -448,7 +1410,7 @@ describe("server reconciled mutation log", () => {
     Effect.scoped(
       Effect.gen(function*() {
         const serverDatabase = database()
-        const live = ServerStore.layerTrusted({ definition: Domain.definition }).pipe(
+        const live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
           Layer.provide(runtime),
           Layer.provide(serverDatabase)
         )
@@ -483,7 +1445,7 @@ describe("server reconciled mutation log", () => {
     Effect.scoped(
       Effect.gen(function*() {
         const serverDatabase = database()
-        const live = ServerStore.layerTrusted({ definition: Domain.definition }).pipe(
+        const live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
           Layer.provide(runtime),
           Layer.provide(serverDatabase)
         )
@@ -518,7 +1480,7 @@ describe("server reconciled mutation log", () => {
     Effect.scoped(
       Effect.gen(function*() {
         const clientDatabase = database()
-        const live = LocalStore.layer({ definition: Domain.definition, spaceId, clientId }).pipe(
+        const live = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
           Layer.provide(runtime),
           Layer.provide(clientDatabase)
         )
@@ -558,6 +1520,7 @@ describe("server reconciled mutation log", () => {
             })
           }),
         pull: () => Effect.succeed(Protocol.PullPage.make({ entries: [], hasMore: false })),
+        bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         watch: () => Stream.never
       })
       const reconciler = yield* service(
@@ -578,7 +1541,7 @@ describe("server reconciled mutation log", () => {
   it.effect("invalidates the receipt dependency when a terminal receipt is stored", () =>
     Effect.scoped(Effect.gen(function*() {
       const clientDatabase = database()
-      const local = LocalStore.layer({ definition: Domain.definition, spaceId, clientId }).pipe(
+      const local = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
         Layer.provide(runtime),
         Layer.provide(clientDatabase)
       )
@@ -646,6 +1609,7 @@ describe("server reconciled mutation log", () => {
       const localError = yield* service(
         LocalStore.Store,
         LocalStore.layer({
+          ...clientHistory,
           definition: Domain.definition,
           spaceId,
           clientId,
@@ -662,7 +1626,7 @@ describe("server reconciled mutation log", () => {
 
       const wakeCapacityError = yield* service(
         ServerStore.ServerStore,
-        ServerStore.layerTrusted({ definition: Domain.definition, wakeCapacity: 0 }).pipe(
+        ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition, wakeCapacity: 0 }).pipe(
           Layer.provide(runtime),
           Layer.provide(database())
         )
@@ -743,7 +1707,7 @@ describe("server reconciled mutation log", () => {
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const first = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
       yield* server.submit(first.envelope)
-      const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
       yield* local.applyEntries([...page.entries, ...page.entries])
       assert.strictEqual(yield* local.cursor, 1)
       assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "1")), Domain.todo("1"))
@@ -755,8 +1719,8 @@ describe("server reconciled mutation log", () => {
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
       yield* server.submit(pending.envelope)
-      const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
-      const entry = page.entries[0]!
+      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
+      const entry = page.entries[0]
       yield* local.applyEntries(page.entries)
 
       const error = yield* local.applyEntries([{ ...entry, changes: [] }]).pipe(Effect.flip)
@@ -770,8 +1734,8 @@ describe("server reconciled mutation log", () => {
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
       yield* server.submit(pending.envelope)
-      const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
-      const entry = page.entries[0]!
+      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
+      const entry = page.entries[0]
       const error = yield* local.applyEntries([{
         ...entry,
         digest: "0".repeat(64)
@@ -791,6 +1755,7 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine.of({
           submit: () => Effect.die("unexpected submit"),
           pull: () => Effect.succeed({ entries: [], hasMore: false }),
+          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           watch: () =>
             Stream.unwrap(
               Ref.modify(subscriptions, (count) => [count, count + 1]).pipe(
@@ -851,6 +1816,7 @@ describe("server reconciled mutation log", () => {
               )
             }),
           pull: () => Effect.succeed(Protocol.PullPage.make({ entries: [], hasMore: false })),
+          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           watch: () => Stream.never
         })
       )
@@ -895,7 +1861,7 @@ describe("server reconciled mutation log", () => {
       Effect.gen(function*() {
         const server = yield* service(
           ServerStore.ServerStore,
-          ServerStore.layerTrusted({ definition: Domain.definition, wakeCapacity: 1 }).pipe(
+          ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition, wakeCapacity: 1 }).pipe(
             Layer.provide(runtime),
             Layer.provide(database())
           )
@@ -1015,7 +1981,7 @@ describe("server reconciled mutation log", () => {
           Reactivity.layer
         )
       const pairRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(handlers), Layer.provide(gate))
-      const local = LocalStore.layer({ definition, spaceId, clientId }).pipe(
+      const local = LocalStore.layer({ ...clientHistory, definition, spaceId, clientId }).pipe(
         Layer.provide(pairRuntime),
         Layer.provide(pairDatabase())
       )
@@ -1098,7 +2064,7 @@ describe("server reconciled mutation log", () => {
 
       assert.strictEqual(Option.getOrThrow(yield* first.get(Domain.Todo, "1")).count, 3)
       assert.strictEqual(Option.getOrThrow(yield* second.get(Domain.Todo, "1")).count, 3)
-      const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
+      const page = incremental(yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 }))
       assert.deepStrictEqual(page.entries.map((entry) => entry.sequence), [1, 2, 3])
     })))
 
@@ -1124,13 +2090,13 @@ describe("server reconciled mutation log", () => {
       )
       const workRuntime = MutationRuntime.layer(workDefinition).pipe(Layer.provide(workHandlers))
       const authoritativeDatabase = database()
-      const authoritativeLayer = ServerStore.layerTrusted({ definition: workDefinition }).pipe(
+      const authoritativeLayer = ServerStore.layerTrusted({ ...serverHistory, definition: workDefinition }).pipe(
         Layer.provide(workRuntime),
         Layer.provide(authoritativeDatabase)
       )
       const server = yield* service(ServerStore.ServerStore, authoritativeLayer)
       const replicaDatabase = database()
-      const local = LocalStore.layer({ definition: workDefinition, spaceId, clientId }).pipe(
+      const local = LocalStore.layer({ ...clientHistory, definition: workDefinition, spaceId, clientId }).pipe(
         Layer.provide(workRuntime),
         Layer.provide(replicaDatabase)
       )
@@ -1168,7 +2134,9 @@ describe("server reconciled mutation log", () => {
         )
         yield* server.submit(pending.envelope)
       }
-      const page = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 1_000 })
+      const page = incremental(
+        yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 1_000 })
+      )
       assert.isAtMost(Protocol.encodedBytes(page), Protocol.maximumBatchBytes)
       assert.isTrue(page.hasMore)
       assert.isBelow(page.entries.length, 24)
@@ -1188,7 +2156,7 @@ describe("server reconciled mutation log", () => {
           )
 
         const mutationId = yield* Effect.scoped(Effect.gen(function*() {
-          const layer = LocalStore.layer({ definition: Domain.definition, spaceId, clientId }).pipe(
+          const layer = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
             Layer.provide(runtime),
             Layer.provide(persistentDatabase())
           )
@@ -1198,7 +2166,7 @@ describe("server reconciled mutation log", () => {
         }))
 
         yield* Effect.scoped(Effect.gen(function*() {
-          const layer = LocalStore.layer({ definition: Domain.definition, spaceId, clientId }).pipe(
+          const layer = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
             Layer.provide(runtime),
             Layer.provide(persistentDatabase())
           )

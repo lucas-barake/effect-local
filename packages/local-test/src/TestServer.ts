@@ -31,12 +31,13 @@ export const layer: Layer.Layer<SyncEngine.SyncEngine, never, ServerStore.Server
           Effect.gen(function*() {
             yield* online
             const page = yield* server.pull(request)
-            if (!(yield* faults.takeDuplicatePage) || page.entries.length === 0) return page
+            if ("_tag" in page || !(yield* faults.takeDuplicatePage) || page.entries.length === 0) return page
             return {
-              entries: [page.entries[0]!, ...page.entries].slice(0, Protocol.maximumBatchEntries),
+              entries: [page.entries[0], ...page.entries].slice(0, Protocol.maximumBatchEntries),
               hasMore: page.hasMore
             }
           }),
+        bootstrap: (request) => online.pipe(Effect.andThen(server.bootstrap(request))),
         watch: (spaceId) =>
           server.watch(spaceId).pipe(
             Stream.filterEffect(() => faults.state.pipe(Effect.map((state) => state.online))),

@@ -11,6 +11,7 @@ import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Context from "effect/Context"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -32,6 +33,33 @@ const handlers = PutTodo.toLayer(({ payload, transaction }) =>
   transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
 )
 const runtime = MutationRuntime.layer(definition).pipe(Layer.provide(handlers))
+const migration = {
+  retryDelay: "1 millis",
+  maximumAttempts: 8
+} satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
+const clientHistory = {
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  retainedHistoryEntries: 256,
+  maximumBootstrapEntities: 10_000,
+  maximumBootstrapBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: 4 * 1024 * 1024,
+  migration
+}
+const serverHistory = {
+  retainedHistoryEntries: 256,
+  maximumHistoryEntries: 10_000,
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  maximumSnapshotEntities: 10_000,
+  maximumSnapshotBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: 4 * 1024 * 1024,
+  pruneBatchSize: 1_000,
+  retainedSnapshots: 2,
+  maintenanceConcurrency: 1,
+  maintenanceSpaceBatchSize: 128,
+  migration
+}
 const database = () =>
   Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
@@ -45,7 +73,7 @@ const service = <I, S, E, R,>(tag: Context.Service<I, S>, layer: Layer.Layer<I, 
 const makeServices = Effect.gen(function*() {
   const server = yield* service(
     ServerStore.ServerStore,
-    ServerStore.layerTrusted({ definition }).pipe(
+    ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
       Layer.provide(runtime),
       Layer.provide(database())
     )
@@ -60,7 +88,7 @@ const makeServices = Effect.gen(function*() {
   )
   const local = yield* service(
     LocalStore.Store,
-    LocalStore.layer({ definition, spaceId, clientId }).pipe(
+    LocalStore.layer({ ...clientHistory, definition, spaceId, clientId }).pipe(
       Layer.provide(runtime),
       Layer.provide(database())
     )
@@ -89,6 +117,7 @@ describe("test synchronization faults", () => {
         after: Identity.ServerSequence.make(0),
         limit: 10
       })
+      if ("_tag" in page) assert.fail("unexpected bootstrap")
       yield* local.applyEntries(page.entries)
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.strictEqual(yield* local.cursor, 1)
@@ -111,6 +140,7 @@ describe("test synchronization faults", () => {
         after: Identity.ServerSequence.make(0),
         limit: 10
       })
+      if ("_tag" in page) assert.fail("unexpected bootstrap")
       assert.strictEqual(page.entries.length, 1)
     }))
 
@@ -127,6 +157,7 @@ describe("test synchronization faults", () => {
         after: Identity.ServerSequence.make(0),
         limit: 10
       })
+      if ("_tag" in page) assert.fail("unexpected bootstrap")
       assert.deepStrictEqual(page.entries.map((entry) => entry.sequence), [1, 1])
       yield* local.applyEntries(page.entries)
       assert.strictEqual(yield* local.cursor, 1)

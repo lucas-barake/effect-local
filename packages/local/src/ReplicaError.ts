@@ -83,6 +83,10 @@ export class CursorGap extends Schema.TaggedErrorClass<CursorGap>(
   "@lucas-barake/effect-local/CursorGap"
 )("CursorGap", { expected: Schema.Number, actual: Schema.Number }) {}
 
+export class SnapshotUnavailable extends Schema.TaggedErrorClass<SnapshotUnavailable>(
+  "@lucas-barake/effect-local/SnapshotUnavailable"
+)("SnapshotUnavailable", { snapshotId: Schema.String }) {}
+
 export class CapacityExceeded extends Schema.TaggedErrorClass<CapacityExceeded>(
   "@lucas-barake/effect-local/CapacityExceeded"
 )("CapacityExceeded", { resource: Schema.String, limit: Schema.Number }) {}
@@ -126,6 +130,7 @@ export const ReplicaError = Schema.Union([
   MutationIdentityConflict,
   OutOfOrderMutation,
   CursorGap,
+  SnapshotUnavailable,
   CapacityExceeded,
   InvalidConfiguration,
   UnknownCommitOutcome,

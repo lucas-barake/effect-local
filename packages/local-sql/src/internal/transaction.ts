@@ -2,7 +2,8 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
-import type * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
@@ -14,14 +15,38 @@ import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
 import * as StorageUnavailable from "./storageUnavailable.js"
 
-const encodeEntity = <M extends Model.Any,>(model: M, key: Model.Key<M>, value?: Model.Value<M>) =>
-  Effect.gen(function*() {
+interface EncodedEntityKey<M extends Model.Any,> {
+  readonly encodedKey: M["key"]["Encoded"]
+  readonly keyJson: string
+}
+
+interface EncodedEntity<M extends Model.Any,> extends EncodedEntityKey<M> {
+  readonly encodedValue: M["schema"]["Encoded"]
+  readonly valueJson: string
+}
+
+function encodeEntity<M extends Model.Any,>(
+  model: M,
+  key: Model.Key<M>
+): Effect.Effect<EncodedEntityKey<M>, ReplicaError.StorageCorrupt>
+function encodeEntity<M extends Model.Any,>(
+  model: M,
+  key: Model.Key<M>,
+  value: Model.Value<M>
+): Effect.Effect<EncodedEntity<M>, ReplicaError.StorageCorrupt>
+function encodeEntity<M extends Model.Any,>(
+  model: M,
+  key: Model.Key<M>,
+  value?: Model.Value<M>
+): Effect.Effect<EncodedEntityKey<M> | EncodedEntity<M>, ReplicaError.StorageCorrupt> {
+  return Effect.gen(function*() {
     const encodedKey = yield* Codec.encode(model.key, key)
     const keyJson = yield* Codec.stringify(encodedKey)
-    if (value === undefined) return { encodedKey, keyJson } as const
+    if (value === undefined) return { encodedKey, keyJson }
     const encodedValue = yield* Codec.encode(model.schema, value)
-    return { encodedKey, keyJson, encodedValue, valueJson: yield* Codec.stringify(encodedValue) } as const
+    return { encodedKey, keyJson, encodedValue, valueJson: yield* Codec.stringify(encodedValue) }
   })
+}
 
 export const local = (options: {
   readonly sql: SqlClient.SqlClient
@@ -78,8 +103,8 @@ export const local = (options: {
         }
         options.changes?.push({
           _tag: "Upsert",
-          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey as any },
-          value: encoded.encodedValue as any
+          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
+          value: encoded.encodedValue
         })
       }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     delete: (model, key) =>
@@ -97,7 +122,7 @@ export const local = (options: {
         }
         options.changes?.push({
           _tag: "Delete",
-          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey as any }
+          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }
         })
       }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)
@@ -117,6 +142,13 @@ export const server = (options: {
       options.sql`SELECT value_json FROM effect_local_server_entities
       WHERE space_id = ${spaceId} AND model = ${model} AND entity_key = ${key}`
   })
+  const findSized = SqlSchema.findOneOption({
+    Request: Schema.Struct({ spaceId: Schema.String, model: Schema.String, key: Schema.String }),
+    Result: Rows.SizedEntityRow,
+    execute: ({ spaceId, model, key }) =>
+      options.sql`SELECT value_json, entity_bytes FROM effect_local_server_entities
+      WHERE space_id = ${spaceId} AND model = ${model} AND entity_key = ${key}`
+  })
   return {
     get: (model, key) =>
       Effect.gen(function*() {
@@ -133,25 +165,59 @@ export const server = (options: {
     set: (model, key, value) =>
       Effect.gen(function*() {
         const encoded = yield* encodeEntity(model, key, value)
+        const previous = yield* findSized({
+          spaceId: options.spaceId,
+          model: model.name,
+          key: encoded.keyJson
+        }).pipe(Effect.mapError(StorageUnavailable.make))
+        const entityBytes = yield* Protocol.encodedBytesEffect({
+          model: model.name,
+          modelVersion: model.version,
+          key: encoded.encodedKey,
+          value: encoded.encodedValue
+        })
         yield* options.sql`INSERT INTO effect_local_server_entities
-        (space_id, model, entity_key, value_json, model_version)
-        VALUES (${options.spaceId}, ${model.name}, ${encoded.keyJson}, ${encoded.valueJson}, ${model.version})
-        ON CONFLICT (space_id, model, entity_key) DO UPDATE SET
-          value_json = excluded.value_json, model_version = excluded.model_version`
+          (space_id, model, model_version, entity_key, value_json, entity_bytes)
+        VALUES (${options.spaceId}, ${model.name}, ${model.version}, ${encoded.keyJson}, ${encoded.valueJson}, ${entityBytes})
+        ON CONFLICT (space_id, model, entity_key) DO UPDATE
+          SET model_version = excluded.model_version, value_json = excluded.value_json,
+            entity_bytes = excluded.entity_bytes`
+        let entityCountDelta = 0
+        let previousEntityBytes = 0
+        if (Option.isNone(previous)) {
+          entityCountDelta = 1
+        } else {
+          previousEntityBytes = previous.value.entity_bytes
+        }
+        yield* options.sql`UPDATE effect_local_server_spaces SET
+          entity_count = entity_count + ${entityCountDelta},
+          entity_bytes = entity_bytes + ${entityBytes - previousEntityBytes}
+        WHERE space_id = ${options.spaceId}`
         options.changes.push({
           _tag: "Upsert",
-          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey as any },
-          value: encoded.encodedValue as any
+          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
+          value: encoded.encodedValue
         })
       }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     delete: (model, key) =>
       Effect.gen(function*() {
         const encoded = yield* encodeEntity(model, key)
+        const previous = yield* findSized({
+          spaceId: options.spaceId,
+          model: model.name,
+          key: encoded.keyJson
+        }).pipe(Effect.mapError(StorageUnavailable.make))
         yield* options.sql`DELETE FROM effect_local_server_entities
         WHERE space_id = ${options.spaceId} AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
+        if (Option.isSome(previous)) {
+          yield* options.sql`UPDATE effect_local_server_spaces SET
+            entity_count = entity_count - 1,
+            entity_bytes = entity_bytes - ${previous.value.entity_bytes}
+          WHERE space_id = ${options.spaceId}`
+        }
         options.changes.push({
           _tag: "Delete",
-          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey as any }
+          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }
         })
       }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)

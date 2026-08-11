@@ -6,6 +6,7 @@ import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as LocalStore from "./LocalStore.js"
+import type * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
 import * as QueryExecutor from "./QueryExecutor.js"
 import * as Reconciler from "./Reconciler.js"
@@ -18,6 +19,13 @@ export interface Options<D extends Definition.Any,> {
   readonly maximumPendingMutations?: number
   readonly evolution?: Evolution.Evolution
   readonly schemaEvolutionBatchSize?: number
+  readonly retainedReceipts: number
+  readonly maximumReceipts: number
+  readonly retainedHistoryEntries: number
+  readonly maximumBootstrapEntities: number
+  readonly maximumBootstrapBytes: number
+  readonly maximumBootstrapPageBytes: number
+  readonly migration: Migrations.Options
   readonly pageSize?: number
   readonly retryDelay?: Duration.Input
   readonly maximumRetryDelay?: Duration.Input

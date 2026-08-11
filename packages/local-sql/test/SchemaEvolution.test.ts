@@ -19,12 +19,42 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as LocalStore from "../src/LocalStore.js"
+import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as SchemaEvolution from "../src/SchemaEvolution.js"
 import * as ServerStore from "../src/ServerStore.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
+const clientHistory = {
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  retainedHistoryEntries: 256,
+  maximumBootstrapEntities: 10_000,
+  maximumBootstrapBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: Protocol.maximumBatchBytes,
+  migration
+}
+const serverHistory = {
+  retainedHistoryEntries: 256,
+  maximumHistoryEntries: 10_000,
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  maximumSnapshotEntities: 10_000,
+  maximumSnapshotBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: Protocol.maximumBatchBytes,
+  pruneBatchSize: 1_000,
+  retainedSnapshots: 2,
+  maintenanceConcurrency: 1,
+  maintenanceSpaceBatchSize: 128,
+  migration
+}
+
+const incremental = (result: Protocol.PullResult): Protocol.PullPage => {
+  if ("_tag" in result) assert.fail(`Unexpected bootstrap ${result.manifest.snapshotId}`)
+  return result
+}
 
 const TodoV1 = Model.make("Todo", {
   version: 1,
@@ -93,6 +123,7 @@ const buildStore = <D extends Definition.Any,>(
   const runtime = MutationRuntime.layer(definition, configuredEvolution).pipe(Layer.provide(handlers))
   return Layer.build(
     LocalStore.layer({
+      ...clientHistory,
       definition,
       spaceId,
       clientId,
@@ -112,6 +143,7 @@ const buildServer = <D extends Definition.Any,>(
   const runtime = MutationRuntime.layer(definition, configuredEvolution).pipe(Layer.provide(handlers))
   return Layer.build(
     ServerStore.layerTrusted({
+      ...serverHistory,
       definition,
       ...(configuredEvolution === undefined ? {} : { evolution: configuredEvolution }),
       schemaEvolutionBatchSize: 1
@@ -192,9 +224,9 @@ describe("client schema evolution", () => {
 
       const promotedPending = yield* v2.pending
       assert.strictEqual(promotedPending.length, 1)
-      assert.strictEqual(promotedPending[0]!.envelope.digest, pending.envelope.digest)
-      assert.deepStrictEqual(promotedPending[0]!.envelope.sourceSchema, definitionV1.schemaIdentity)
-      assert.deepStrictEqual(promotedPending[0]!.optimisticResult, {
+      assert.strictEqual(promotedPending[0].envelope.digest, pending.envelope.digest)
+      assert.deepStrictEqual(promotedPending[0].envelope.sourceSchema, definitionV1.schemaIdentity)
+      assert.deepStrictEqual(promotedPending[0].optimisticResult, {
         id: 2,
         title: "pending",
         done: false
@@ -226,7 +258,7 @@ describe("client schema evolution", () => {
         title: "resume",
         done: false
       })
-      assert.strictEqual((yield* v2.pending)[0]!.envelope.digest, pending.envelope.digest)
+      assert.strictEqual((yield* v2.pending)[0].envelope.digest, pending.envelope.digest)
     })).pipe(Effect.provide(database)))
 
   it.effect("rejects unrelated source keys that converge on one target", () =>
@@ -270,7 +302,7 @@ describe("client schema evolution", () => {
         after: Identity.ServerSequence.make(0),
         limit: 10
       })
-      assert.deepStrictEqual(historical.entries[0]!.sourceSchema, definitionV1.schemaIdentity)
+      assert.deepStrictEqual(incremental(historical).entries[0].sourceSchema, definitionV1.schemaIdentity)
 
       const offlineReceipt = yield* serverV2.submit({
         envelope: offline.envelope,
@@ -287,8 +319,8 @@ describe("client schema evolution", () => {
         after: Identity.ServerSequence.make(1),
         limit: 10
       })
-      assert.deepStrictEqual(current.entries[0]!.sourceSchema, definitionV2.schemaIdentity)
-      assert.deepStrictEqual(current.entries[0]!.changes[0], {
+      assert.deepStrictEqual(incremental(current).entries[0].sourceSchema, definitionV2.schemaIdentity)
+      assert.deepStrictEqual(incremental(current).entries[0].changes[0], {
         _tag: "Upsert",
         entity: { model: "Todo", modelVersion: TodoV2.version, key: 5 },
         value: { id: 5, title: "offline-old", done: false }
@@ -323,8 +355,8 @@ describe("client schema evolution", () => {
         after: Identity.ServerSequence.make(0),
         limit: 10
       })
-      assert.deepStrictEqual(page.entries[0]!.sourceSchema, definitionV1.schemaIdentity)
-      assert.deepStrictEqual(page.entries[0]!.changes[0], {
+      assert.deepStrictEqual(incremental(page).entries[0].sourceSchema, definitionV1.schemaIdentity)
+      assert.deepStrictEqual(incremental(page).entries[0].changes[0], {
         _tag: "Upsert",
         entity: { model: "Todo", modelVersion: TodoV1.version, key: "6" },
         value: { id: "6", title: "resume-server" }
@@ -396,6 +428,7 @@ describe("client schema evolution", () => {
       const runtime = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(handlersV2))
       const server = yield* Layer.build(
         ServerStore.layer({
+          ...serverHistory,
           definition: definitionV2,
           evolution,
           authorizeAccess: () => Effect.void,
@@ -416,6 +449,7 @@ describe("client schema evolution", () => {
       const runtime = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(handlersV2))
       const server = yield* Layer.build(
         ServerStore.layer({
+          ...serverHistory,
           definition: definitionV2,
           evolution,
           authorizeAccess: () => Effect.void,

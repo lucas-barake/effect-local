@@ -33,6 +33,13 @@ export interface Options {
   readonly maximumPendingMutations?: number
   readonly evolution?: Evolution.Evolution
   readonly schemaEvolutionBatchSize?: number
+  readonly retainedReceipts: number
+  readonly maximumReceipts: number
+  readonly retainedHistoryEntries: number
+  readonly maximumBootstrapEntities: number
+  readonly maximumBootstrapBytes: number
+  readonly maximumBootstrapPageBytes: number
+  readonly migration: Migrations.Options
 }
 
 export interface ReconciliationGenerations {
@@ -67,6 +74,15 @@ export interface Service {
   readonly applyReceipt: (receipt: Protocol.Receipt) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly persistReceipt: (receipt: Protocol.Receipt) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly settleReceipts: Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly prepareBootstrap: (
+    manifest: Protocol.SnapshotManifest
+  ) => Effect.Effect<number, ReplicaError.ReplicaError>
+  readonly stageBootstrapPage: (
+    page: Protocol.BootstrapPage
+  ) => Effect.Effect<boolean, ReplicaError.ReplicaError>
+  readonly installBootstrap: (
+    manifest: Protocol.SnapshotManifest
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly invalidateStatus: Effect.Effect<void>
 }
 
@@ -91,6 +107,55 @@ export const layer = (
         return yield* new ReplicaError.InvalidConfiguration({
           option: "maximumPendingMutations",
           message: "maximumPendingMutations must be a positive safe integer"
+        })
+      }
+      if (!Number.isSafeInteger(options.retainedReceipts) || options.retainedReceipts < 0) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "retainedReceipts",
+          message: "retainedReceipts must be a nonnegative safe integer"
+        })
+      }
+      if (!Number.isSafeInteger(options.maximumReceipts) || options.maximumReceipts <= 0) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "maximumReceipts",
+          message: "maximumReceipts must be a positive safe integer"
+        })
+      }
+      if (options.retainedReceipts >= options.maximumReceipts) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "retainedReceipts",
+          message: "retainedReceipts must be less than maximumReceipts"
+        })
+      }
+      if (options.maximumReceipts < maximumPending) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "maximumReceipts",
+          message: "maximumReceipts must be at least maximumPendingMutations"
+        })
+      }
+      if (!Number.isSafeInteger(options.retainedHistoryEntries) || options.retainedHistoryEntries < 0) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "retainedHistoryEntries",
+          message: "retainedHistoryEntries must be a nonnegative safe integer"
+        })
+      }
+      const bootstrapLimits: ReadonlyArray<readonly [string, number]> = [
+        ["maximumBootstrapEntities", options.maximumBootstrapEntities],
+        ["maximumBootstrapBytes", options.maximumBootstrapBytes],
+        ["maximumBootstrapPageBytes", options.maximumBootstrapPageBytes]
+      ]
+      for (const [option, value] of bootstrapLimits) {
+        if (!Number.isSafeInteger(value) || value <= 0) {
+          return yield* new ReplicaError.InvalidConfiguration({
+            option,
+            message: `${option} must be a positive safe integer`
+          })
+        }
+      }
+      if (options.maximumBootstrapPageBytes > Protocol.maximumBatchBytes) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "maximumBootstrapPageBytes",
+          message: `maximumBootstrapPageBytes must not exceed ${Protocol.maximumBatchBytes}`
         })
       }
       yield* Migrations.client(options)
@@ -122,13 +187,14 @@ export const layer = (
                 key: migrated.key
               }
               if (change._tag === "Delete") return Effect.succeed(Protocol.Delete.make({ entity }))
-              return migrated.value === undefined
-                ? Effect.fail(
+              if (migrated.value === undefined) {
+                return Effect.fail(
                   new ReplicaError.StorageCorrupt({
                     message: `Migrated upsert for ${change.entity.model} has no value`
                   })
                 )
-                : Effect.succeed(Protocol.Upsert.make({ entity, value: migrated.value }))
+              }
+              return Effect.succeed(Protocol.Upsert.make({ entity, value: migrated.value }))
             })
           ))
 
@@ -139,7 +205,8 @@ export const layer = (
           sql`SELECT space_id, client_id, definition_hash, schema_version, schema_hash, schema_generation,
           target_schema_version, target_schema_hash, migration_hash,
           next_local_sequence, server_cursor, visible_revision,
-          requested_generation, completed_generation
+          requested_generation, completed_generation, installed_snapshot_id, installed_snapshot_sequence,
+          installed_snapshot_terminal_sequence
         FROM effect_local_client_meta WHERE singleton = 1`
       })
       const findPending = SqlSchema.findAll({
@@ -189,6 +256,17 @@ export const layer = (
         WHERE p.local_sequence > ${after}
         ORDER BY p.local_sequence LIMIT 1`
       })
+      const findPendingLog = SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Rows.PendingLogRow,
+        execute: () =>
+          sql`SELECT p.mutation_id, p.local_sequence, p.basis, p.name, p.payload_json, p.digest,
+            p.optimistic_result_json, p.changes_json, l.server_sequence,
+            l.mutation_id AS entry_mutation_id, l.entry_json
+          FROM effect_local_pending AS p
+          INNER JOIN effect_local_server_log AS l ON l.mutation_id = p.mutation_id
+          ORDER BY p.local_sequence`
+      })
       const findLogEntry = SqlSchema.findOneOption({
         Request: Identity.ServerSequence,
         Result: Rows.ClientLogRow,
@@ -200,6 +278,49 @@ export const layer = (
         Request: Schema.Void,
         Result: Rows.CountRow,
         execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_pending`
+      })
+      const countReceipts = SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Rows.CountRow,
+        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_receipts`
+      })
+      const findPrunableReceipts = SqlSchema.findAll({
+        Request: Schema.Int,
+        Result: Rows.MutationIdRow,
+        execute: (limit) =>
+          sql`SELECT r.mutation_id FROM effect_local_receipts AS r
+          WHERE NOT EXISTS (
+            SELECT 1 FROM effect_local_pending AS p WHERE p.mutation_id = r.mutation_id
+          )
+          ORDER BY r.local_sequence LIMIT ${limit}`
+      })
+      const findBootstrap = SqlSchema.findOneOption({
+        Request: Schema.Void,
+        Result: Rows.BootstrapRow,
+        execute: () =>
+          sql`SELECT snapshot_id, space_id, definition_hash, schema_version, schema_hash,
+            server_sequence, terminal_sequence,
+            entity_count, content_bytes, digest, next_ordinal, received_bytes, rolling_digest
+          FROM effect_local_bootstrap WHERE singleton = 1`
+      })
+      const findStagedEntities = SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Rows.SnapshotEntityRow,
+        execute: () =>
+          sql`SELECT ordinal, model, model_version, entity_key, value_json, entity_bytes
+          FROM effect_local_bootstrap_entities ORDER BY ordinal`
+      })
+      const findStagedIdentities = SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Rows.EntityIdentityRow,
+        execute: () => sql`SELECT model, model_version, entity_key FROM effect_local_bootstrap_entities`
+      })
+      const findEntityIdentities = SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Rows.EntityIdentityRow,
+        execute: () =>
+          sql`SELECT model, model_version, entity_key FROM effect_local_visible_entities
+          UNION SELECT model, model_version, entity_key FROM effect_local_bootstrap_entities`
       })
 
       const meta = findMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
@@ -252,6 +373,16 @@ export const layer = (
           )
         }
         return Effect.void
+      }
+      if (
+        (initializedMeta.installed_snapshot_id === null &&
+          (initializedMeta.installed_snapshot_sequence !== 0 ||
+            initializedMeta.installed_snapshot_terminal_sequence !== 0)) ||
+        initializedMeta.installed_snapshot_sequence > initializedMeta.server_cursor
+      ) {
+        return yield* new ReplicaError.StorageCorrupt({
+          message: "Installed snapshot metadata conflicts with the durable server cursor"
+        })
       }
 
       const decodePendingRow = (row: typeof Rows.PendingRow.Type) =>
@@ -326,16 +457,17 @@ export const layer = (
                 SqlTransaction.local({ sql, definition: options.definition, table: "visible", changes }),
                 changes
               ).pipe(
-                Effect.flatMap((result) =>
-                  Result.isFailure(result)
-                    ? Effect.fail(
+                Effect.flatMap((executionResult) => {
+                  if (Result.isFailure(executionResult)) {
+                    return Effect.fail(
                       new TerminalRejection.TerminalRejection({
                         origin: "Mutation",
-                        rejection: result.failure
+                        rejection: executionResult.failure
                       })
                     )
-                    : Effect.succeed(result.success)
-                )
+                  }
+                  return Effect.succeed(executionResult.success)
+                })
               )
             ).pipe(
               Effect.map(Result.succeed),
@@ -365,17 +497,45 @@ export const layer = (
           new Map(entities.map((entity) => [SqlTransaction.entityKey(entity), entity])).values()
         )
         const uniqueReceiptIds = Array.from(new Set(receiptIds))
-        return (
-          reactivity.invalidate({
-            "effect-local:entities": uniqueEntities.map((entity) => [entity.model, entity.key]),
-            "effect-local:status": []
-          }).pipe(Effect.andThen(
-            uniqueReceiptIds.length === 0 ?
-              Effect.void :
-              reactivity.invalidate(uniqueReceiptIds.map((mutationId) => `effect-local:receipt:${mutationId}`))
-          ))
-        )
+        let invalidateReceipts = Effect.void
+        if (uniqueReceiptIds.length > 0) {
+          invalidateReceipts = reactivity.invalidate(
+            uniqueReceiptIds.map((mutationId) => `effect-local:receipt:${mutationId}`)
+          )
+        }
+        return reactivity.invalidate({
+          "effect-local:entities": uniqueEntities.map((entity) => [entity.model, entity.key]),
+          "effect-local:status": []
+        }).pipe(Effect.andThen(invalidateReceipts))
       }
+
+      const pruneReceipts = (target: number) =>
+        Effect.gen(function*() {
+          const count = yield* countReceipts(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const excess = Math.max(0, count.count - target)
+          if (excess === 0) return []
+          const rows = yield* findPrunableReceipts(excess).pipe(Effect.mapError(StorageUnavailable.make))
+          for (let offset = 0; offset < rows.length; offset += 500) {
+            const mutationIds = rows.slice(offset, offset + 500).map((row) => row.mutation_id)
+            yield* sql`DELETE FROM effect_local_receipts WHERE mutation_id IN ${sql.in(mutationIds)}`
+          }
+          return rows.map((row) => row.mutation_id)
+        })
+
+      const bootstrapMatches = (
+        row: typeof Rows.BootstrapRow.Type,
+        manifest: Protocol.SnapshotManifest
+      ) =>
+        row.snapshot_id === manifest.snapshotId &&
+        row.space_id === manifest.spaceId &&
+        row.definition_hash === manifest.definitionHash &&
+        row.schema_version === manifest.schema.version &&
+        row.schema_hash === manifest.schema.hash &&
+        row.server_sequence === manifest.sequence &&
+        row.terminal_sequence === manifest.terminalSequenceThrough &&
+        row.entity_count === manifest.entityCount &&
+        row.content_bytes === manifest.contentBytes &&
+        row.digest === manifest.digest
 
       const persistReceipt = (receipt: Protocol.Receipt) =>
         Effect.gen(function*() {
@@ -385,6 +545,7 @@ export const layer = (
             })
           }
           let inserted = false
+          let pruned: ReadonlyArray<Identity.MutationId> = []
           yield* sql.withTransaction(Effect.gen(function*() {
             yield* validateFence(yield* meta)
             if (receipt.spaceId !== options.spaceId || receipt.clientId !== options.clientId) {
@@ -404,7 +565,7 @@ export const layer = (
                   message: `Conflicting duplicate receipt ${receipt.mutationId}`
                 })
               }
-              return
+              return yield* Effect.void
             }
             const storedPending = yield* findPendingByMutation(receipt.mutationId).pipe(
               Effect.mapError(StorageUnavailable.make)
@@ -420,25 +581,52 @@ export const layer = (
                 message: `Receipt does not match pending mutation ${receipt.mutationId}`
               })
             }
+            pruned = yield* pruneReceipts(options.retainedReceipts)
+            const receiptCount = yield* countReceipts(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            if (receiptCount.count >= options.maximumReceipts) {
+              return yield* new ReplicaError.CapacityExceeded({
+                resource: "client receipts",
+                limit: options.maximumReceipts
+              })
+            }
+            const receiptSchema = receipt._tag === "Expired"
+              ? pendingMutation.envelope.sourceSchema
+              : receipt.sourceSchema
+            const receiptMutationVersion = receipt._tag === "Accepted" || receipt._tag === "Rejected"
+              ? receipt.mutationVersion
+              : receipt._tag === "Expired"
+              ? pendingMutation.envelope.mutationVersion
+              : null
+            const receiptName = receipt._tag === "Accepted" || receipt._tag === "Rejected"
+              ? receipt.name
+              : receipt._tag === "Expired"
+              ? pendingMutation.envelope.name
+              : null
             yield* sql`INSERT INTO effect_local_receipts
           (mutation_id, local_sequence, receipt_json, source_schema_version, source_schema_hash,
             mutation_version, mutation_name, rejection_origin)
           VALUES (${receipt.mutationId}, ${receipt.localSequence}, ${yield* Codec.stringify(receipt)},
-            ${receipt.sourceSchema.version}, ${receipt.sourceSchema.hash},
-            ${receipt._tag === "Legacy" ? null : receipt.mutationVersion},
-            ${receipt._tag === "Legacy" ? null : receipt.name},
+            ${receiptSchema.version}, ${receiptSchema.hash}, ${receiptMutationVersion}, ${receiptName},
             ${receipt._tag === "Rejected" ? receipt.origin : receipt._tag === "Legacy" ? "Legacy" : null})`
             inserted = true
+            return yield* Effect.void
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
-          if (inserted) yield* invalidate([], [receipt.mutationId])
+          if (inserted || pruned.length > 0) {
+            let receiptIds = pruned
+            if (inserted) receiptIds = [receipt.mutationId, ...pruned]
+            yield* invalidate([], receiptIds)
+          }
+          return yield* Effect.void
         }).pipe(Effect.withSpan("LocalStore.persistReceipt", {
           attributes: { "mutation.id": receipt.mutationId }
         }))
 
       const settleReceipts = Effect.gen(function*() {
         const touched = new Map<string, Protocol.EntityKey>()
+        let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
         yield* sql.withTransaction(Effect.gen(function*() {
-          yield* validateFence(yield* meta)
+          const installed = yield* meta
+          yield* validateFence(installed)
           let after = 0
           while (true) {
             const found = yield* findPendingReceipt({ after }).pipe(Effect.mapError(StorageUnavailable.make))
@@ -460,29 +648,42 @@ export const layer = (
               })
             }
             if (receipt._tag === "Accepted") {
-              if (row.entry_json === null) continue
-              if (row.server_sequence === null || row.entry_mutation_id === null) {
-                return yield* new ReplicaError.StorageCorrupt({
-                  message: `Authoritative entry metadata is incomplete for ${receipt.mutationId}`
-                })
+              if (row.entry_json === null) {
+                if (
+                  installed.installed_snapshot_id === null ||
+                  receipt.serverSequence > installed.installed_snapshot_sequence ||
+                  (receipt.terminalSequence !== undefined &&
+                    receipt.terminalSequence > installed.installed_snapshot_terminal_sequence)
+                ) continue
+              } else {
+                if (row.server_sequence === null || row.entry_mutation_id === null) {
+                  return yield* new ReplicaError.StorageCorrupt({
+                    message: `Authoritative entry metadata is incomplete for ${receipt.mutationId}`
+                  })
+                }
+                const entry = yield* Codec.parse(row.entry_json).pipe(
+                  Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
+                )
+                if (
+                  row.server_sequence !== entry.sequence ||
+                  row.entry_mutation_id !== entry.mutationId ||
+                  entry.spaceId !== receipt.spaceId ||
+                  entry.clientId !== receipt.clientId ||
+                  entry.mutationId !== receipt.mutationId ||
+                  entry.localSequence !== receipt.localSequence ||
+                  entry.sequence !== receipt.serverSequence ||
+                  entry.digest !== pendingMutation.envelope.digest
+                ) {
+                  return yield* new ReplicaError.ProtocolInvalid({
+                    message: `Accepted receipt conflicts with authoritative entry ${receipt.mutationId}`
+                  })
+                }
               }
-              const entry = yield* Codec.parse(row.entry_json).pipe(
-                Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
-              )
-              if (
-                row.server_sequence !== entry.sequence ||
-                row.entry_mutation_id !== entry.mutationId ||
-                entry.spaceId !== receipt.spaceId ||
-                entry.clientId !== receipt.clientId ||
-                entry.mutationId !== receipt.mutationId ||
-                entry.localSequence !== receipt.localSequence ||
-                entry.sequence !== receipt.serverSequence ||
-                entry.digest !== pendingMutation.envelope.digest
-              ) {
-                return yield* new ReplicaError.ProtocolInvalid({
-                  message: `Accepted receipt conflicts with authoritative entry ${receipt.mutationId}`
-                })
-              }
+            } else if (receipt._tag === "Expired") {
+              const coveredByInstalledSnapshot = installed.installed_snapshot_id !== null &&
+                receipt.snapshotSequence <= installed.installed_snapshot_sequence &&
+                receipt.terminalSequenceThrough <= installed.installed_snapshot_terminal_sequence
+              if (!coveredByInstalledSnapshot) continue
             }
             for (const change of pendingMutation.changes) {
               touched.set(SqlTransaction.entityKey(change.entity), change.entity)
@@ -492,10 +693,20 @@ export const layer = (
           if (touched.size > 0) {
             yield* restoreAndReplay(Array.from(touched.values()))
             yield* sql`UPDATE effect_local_client_meta
-          SET visible_revision = visible_revision + 1 WHERE singleton = 1`
+              SET visible_revision = visible_revision + 1 WHERE singleton = 1`
           }
+          const current = yield* meta
+          const logFloor = Math.max(0, current.server_cursor - options.retainedHistoryEntries)
+          yield* sql`DELETE FROM effect_local_server_log
+            WHERE server_sequence <= ${logFloor} AND NOT EXISTS (
+              SELECT 1 FROM effect_local_pending AS p
+              WHERE p.mutation_id = effect_local_server_log.mutation_id
+            )`
+          prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
+          return yield* Effect.void
         })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
         if (touched.size > 0) yield* invalidate(Array.from(touched.values()))
+        if (prunedReceiptIds.length > 0) yield* invalidate([], prunedReceiptIds)
       }).pipe(Effect.withSpan("LocalStore.settleReceipts"))
 
       const applyReceipts = (receipts: ReadonlyArray<Protocol.Receipt>) =>
@@ -506,6 +717,428 @@ export const layer = (
           attributes: { "receipt.count": receipts.length }
         }))
 
+      const validateManifest = (manifest: Protocol.SnapshotManifest) =>
+        Effect.gen(function*() {
+          if (manifest.spaceId !== options.spaceId) {
+            return yield* new ReplicaError.ProtocolInvalid({ message: "Snapshot space does not match this replica" })
+          }
+          if (manifest.definitionHash !== options.definition.hash) {
+            return yield* new ReplicaError.DefinitionMismatch({
+              expected: options.definition.hash,
+              actual: manifest.definitionHash
+            })
+          }
+          if (
+            manifest.schema.version !== options.definition.schemaIdentity.version ||
+            manifest.schema.hash !== options.definition.schemaIdentity.hash
+          ) {
+            return yield* new ReplicaError.StaleSchema({
+              expectedVersion: options.definition.schemaIdentity.version,
+              expectedHash: options.definition.schemaIdentity.hash,
+              actualVersion: manifest.schema.version,
+              actualHash: manifest.schema.hash
+            })
+          }
+          if (manifest.entityCount > options.maximumBootstrapEntities) {
+            return yield* new ReplicaError.CapacityExceeded({
+              resource: "bootstrap entities",
+              limit: options.maximumBootstrapEntities
+            })
+          }
+          if (manifest.contentBytes > options.maximumBootstrapBytes) {
+            return yield* new ReplicaError.CapacityExceeded({
+              resource: "bootstrap bytes",
+              limit: options.maximumBootstrapBytes
+            })
+          }
+          return yield* Effect.void
+        })
+
+      const prepareBootstrap = (manifest: Protocol.SnapshotManifest) =>
+        Effect.gen(function*() {
+          yield* validateManifest(manifest)
+          return yield* sql.withTransaction(Effect.gen(function*() {
+            yield* validateFence(yield* meta)
+            const current = yield* findBootstrap(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            if (Option.isSome(current) && bootstrapMatches(current.value, manifest)) {
+              return current.value.next_ordinal - 1
+            }
+            yield* sql`DELETE FROM effect_local_bootstrap_entities`
+            yield* sql`DELETE FROM effect_local_bootstrap WHERE singleton = 1`
+            yield* sql`INSERT INTO effect_local_bootstrap
+              (singleton, snapshot_id, space_id, definition_hash, schema_version, schema_hash,
+                server_sequence, terminal_sequence,
+                entity_count, content_bytes, digest, next_ordinal, received_bytes, rolling_digest)
+              VALUES (1, ${manifest.snapshotId}, ${manifest.spaceId}, ${manifest.definitionHash},
+                ${manifest.schema.version}, ${manifest.schema.hash},
+                ${manifest.sequence}, ${manifest.terminalSequenceThrough}, ${manifest.entityCount},
+                ${manifest.contentBytes}, ${manifest.digest}, 0, 0, ${Protocol.initialSnapshotDigest})`
+            return -1
+          }))
+        }).pipe(
+          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.withSpan("LocalStore.prepareBootstrap", { attributes: { "snapshot.id": manifest.snapshotId } })
+        )
+
+      const stageBootstrapPage = (page: Protocol.BootstrapPage) =>
+        Effect.gen(function*() {
+          yield* validateManifest(page.manifest)
+          if ((yield* Protocol.encodedBytesEffect(page)) > options.maximumBootstrapPageBytes) {
+            return yield* new ReplicaError.CapacityExceeded({
+              resource: "bootstrap page bytes",
+              limit: options.maximumBootstrapPageBytes
+            })
+          }
+          return yield* sql.withTransaction(Effect.gen(function*() {
+            yield* validateFence(yield* meta)
+            const found = yield* findBootstrap(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            if (Option.isNone(found) || !bootstrapMatches(found.value, page.manifest)) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Bootstrap page does not match the durable snapshot stage ${page.manifest.snapshotId}`
+              })
+            }
+            const stage = found.value
+            let nextOrdinal = stage.next_ordinal
+            let receivedBytes = stage.received_bytes
+            let rollingDigest = stage.rolling_digest
+            const stagedIdentities = yield* findStagedIdentities(undefined).pipe(
+              Effect.mapError(StorageUnavailable.make)
+            )
+            const stagedKeys = new Set(
+              stagedIdentities.map((row) => `${row.model}\u0000${row.entity_key}`)
+            )
+            const stagedRows: Array<{
+              readonly ordinal: number
+              readonly model: string
+              readonly model_version: number
+              readonly entity_key: string
+              readonly value_json: string
+              readonly entity_bytes: number
+            }> = []
+            for (const entity of page.entities) {
+              if (entity.ordinal !== nextOrdinal) {
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message:
+                    `Snapshot ${page.manifest.snapshotId} expected ordinal ${nextOrdinal} but found ${entity.ordinal}`
+                })
+              }
+              const model = options.definition.modelByName.get(entity.model)
+              if (model === undefined) {
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message: `Snapshot ${page.manifest.snapshotId} contains unknown model ${entity.model}`
+                })
+              }
+              if (entity.modelVersion !== model.version) {
+                return yield* new ReplicaError.StaleSchema({
+                  expectedVersion: options.definition.schemaIdentity.version,
+                  expectedHash: options.definition.schemaIdentity.hash,
+                  actualVersion: page.manifest.schema.version,
+                  actualHash: page.manifest.schema.hash
+                })
+              }
+              yield* Codec.decode(model.key, entity.key).pipe(
+                Effect.mapError((cause) =>
+                  new ReplicaError.ProtocolInvalid({
+                    message: `Snapshot ${page.manifest.snapshotId} contains an invalid entity key`,
+                    cause
+                  })
+                )
+              )
+              yield* Codec.decode(model.schema, entity.value).pipe(
+                Effect.mapError((cause) =>
+                  new ReplicaError.ProtocolInvalid({
+                    message: `Snapshot ${page.manifest.snapshotId} contains an invalid entity value`,
+                    cause
+                  })
+                )
+              )
+              const entityBytes = yield* Protocol.encodedBytesEffect({
+                model: entity.model,
+                modelVersion: entity.modelVersion,
+                key: entity.key,
+                value: entity.value
+              })
+              if (entity.entityBytes !== entityBytes) {
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message: `Snapshot ${page.manifest.snapshotId} entity ${entity.ordinal} has invalid byte metadata`
+                })
+              }
+              const keyJson = yield* Codec.stringify(entity.key)
+              const stagedKey = `${entity.model}\u0000${keyJson}`
+              if (stagedKeys.has(stagedKey)) {
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message: `Snapshot ${page.manifest.snapshotId} contains duplicate entity ${entity.model}`
+                })
+              }
+              stagedKeys.add(stagedKey)
+              receivedBytes += entityBytes
+              if (receivedBytes > page.manifest.contentBytes) {
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message: `Snapshot ${page.manifest.snapshotId} exceeds its declared bytes`
+                })
+              }
+              rollingDigest = Protocol.SnapshotDigest.make(
+                yield* Canonical.digest({
+                  previous: rollingDigest,
+                  entity
+                }).pipe(Effect.provideService(Crypto.Crypto, crypto))
+              )
+              stagedRows.push({
+                ordinal: entity.ordinal,
+                model: entity.model,
+                model_version: entity.modelVersion,
+                entity_key: keyJson,
+                value_json: yield* Codec.stringify(entity.value),
+                entity_bytes: entity.entityBytes
+              })
+              nextOrdinal += 1
+            }
+            for (let offset = 0; offset < stagedRows.length; offset += 100) {
+              yield* sql`INSERT INTO effect_local_bootstrap_entities
+                ${sql.insert(stagedRows.slice(offset, offset + 100))}`
+            }
+            if (nextOrdinal > page.manifest.entityCount) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Snapshot ${page.manifest.snapshotId} exceeds its declared entity count`
+              })
+            }
+            const complete = nextOrdinal === page.manifest.entityCount
+            if (!complete && page.entities.length === 0) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Snapshot ${page.manifest.snapshotId} page made no progress`
+              })
+            }
+            if (page.hasMore === complete) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Snapshot ${page.manifest.snapshotId} continuation disagrees with its entity count`
+              })
+            }
+            if (
+              complete &&
+              (receivedBytes !== page.manifest.contentBytes || rollingDigest !== page.manifest.digest)
+            ) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Snapshot ${page.manifest.snapshotId} does not match its manifest`
+              })
+            }
+            yield* sql`UPDATE effect_local_bootstrap SET
+              next_ordinal = ${nextOrdinal}, received_bytes = ${receivedBytes}, rolling_digest = ${rollingDigest}
+              WHERE singleton = 1`
+            return complete
+          }))
+        }).pipe(
+          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.withSpan("LocalStore.stageBootstrapPage", {
+            attributes: { "snapshot.id": page.manifest.snapshotId, "entity.count": page.entities.length }
+          })
+        )
+
+      const installBootstrap = (manifest: Protocol.SnapshotManifest) =>
+        Effect.gen(function*() {
+          yield* validateManifest(manifest)
+          const dirty = new Map<string, Protocol.EntityKey>()
+          let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
+          yield* sql.withTransaction(Effect.gen(function*() {
+            yield* validateFence(yield* meta)
+            const found = yield* findBootstrap(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            if (Option.isNone(found) || !bootstrapMatches(found.value, manifest)) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Snapshot ${manifest.snapshotId} is not staged for installation`
+              })
+            }
+            const stage = found.value
+            if (
+              stage.next_ordinal !== manifest.entityCount ||
+              stage.received_bytes !== manifest.contentBytes ||
+              stage.rolling_digest !== manifest.digest
+            ) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Snapshot ${manifest.snapshotId} is incomplete`
+              })
+            }
+            const stagedEntities = yield* findStagedEntities(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            if (stagedEntities.length !== manifest.entityCount) {
+              return yield* new ReplicaError.StorageCorrupt({
+                message: `Snapshot ${manifest.snapshotId} durable entity count is incomplete`
+              })
+            }
+            let receivedBytes = 0
+            let rollingDigest = Protocol.initialSnapshotDigest
+            const stagedKeys = new Set<string>()
+            for (let index = 0; index < stagedEntities.length; index++) {
+              const row = stagedEntities[index]
+              if (row.ordinal !== index) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Snapshot ${manifest.snapshotId} durable ordinals are not contiguous`
+                })
+              }
+              const model = options.definition.modelByName.get(row.model)
+              if (model === undefined) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Snapshot ${manifest.snapshotId} contains unknown durable model ${row.model}`
+                })
+              }
+              if (row.model_version !== model.version) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Snapshot ${manifest.snapshotId} durable model version does not match ${row.model}`
+                })
+              }
+              const key = yield* Codec.parse(row.entity_key).pipe(
+                Effect.flatMap((value) => Codec.decode(model.key, value))
+              )
+              const value = yield* Codec.parse(row.value_json).pipe(
+                Effect.flatMap((encodedValue) => Codec.decode(model.schema, encodedValue))
+              )
+              const keyJson = yield* Codec.stringify(key)
+              const valueJson = yield* Codec.stringify(value)
+              if (keyJson !== row.entity_key || valueJson !== row.value_json) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Snapshot ${manifest.snapshotId} contains noncanonical durable entity JSON`
+                })
+              }
+              const stagedKey = `${row.model}\u0000${keyJson}`
+              if (stagedKeys.has(stagedKey)) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Snapshot ${manifest.snapshotId} contains a duplicate durable entity`
+                })
+              }
+              stagedKeys.add(stagedKey)
+              const entityBytes = yield* Protocol.encodedBytesEffect({
+                model: row.model,
+                modelVersion: row.model_version,
+                key,
+                value
+              })
+              if (row.entity_bytes !== entityBytes) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Snapshot ${manifest.snapshotId} durable entity ${row.ordinal} has invalid byte metadata`
+                })
+              }
+              const entity = Protocol.SnapshotEntity.make({
+                ordinal: row.ordinal,
+                model: row.model,
+                modelVersion: row.model_version,
+                key,
+                value,
+                entityBytes
+              })
+              receivedBytes += entityBytes
+              rollingDigest = Protocol.SnapshotDigest.make(
+                yield* Canonical.digest({ previous: rollingDigest, entity }).pipe(
+                  Effect.provideService(Crypto.Crypto, crypto)
+                )
+              )
+            }
+            if (receivedBytes !== manifest.contentBytes || rollingDigest !== manifest.digest) {
+              return yield* new ReplicaError.StorageCorrupt({
+                message: `Snapshot ${manifest.snapshotId} durable entities do not match its manifest`
+              })
+            }
+            const current = yield* meta
+            if (manifest.sequence < current.server_cursor) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Snapshot ${manifest.snapshotId} is older than the local cursor`
+              })
+            }
+            const identities = yield* findEntityIdentities(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            for (const row of identities) {
+              const entity = yield* Codec.decode(Protocol.EntityKey, {
+                model: row.model,
+                modelVersion: row.model_version,
+                key: yield* Codec.parse(row.entity_key)
+              })
+              dirty.set(SqlTransaction.entityKey(entity), entity)
+            }
+
+            let after = 0
+            while (true) {
+              const pendingReceipt = yield* findPendingReceipt({ after }).pipe(Effect.mapError(StorageUnavailable.make))
+              if (Option.isNone(pendingReceipt)) break
+              const row = pendingReceipt.value
+              after = row.local_sequence
+              const receipt = yield* Codec.parse(row.receipt_json).pipe(
+                Effect.flatMap((value) => Codec.decode(Protocol.Receipt, value))
+              )
+              const pendingMutation = yield* decodePendingRow(row)
+              if (
+                receipt.spaceId !== pendingMutation.envelope.spaceId ||
+                receipt.clientId !== pendingMutation.envelope.clientId ||
+                receipt.mutationId !== pendingMutation.envelope.mutationId ||
+                receipt.localSequence !== pendingMutation.envelope.localSequence
+              ) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Receipt does not match durable pending mutation ${row.mutation_id}`
+                })
+              }
+              let covered = false
+              if (receipt._tag === "Accepted") {
+                covered = receipt.serverSequence <= manifest.sequence &&
+                  (receipt.terminalSequence === undefined ||
+                    receipt.terminalSequence <= manifest.terminalSequenceThrough)
+              } else if (receipt._tag === "Rejected") {
+                covered = receipt.terminalSequence !== undefined &&
+                  receipt.terminalSequence <= manifest.terminalSequenceThrough
+              } else if (receipt._tag === "Expired") {
+                covered = receipt.snapshotSequence <= manifest.sequence &&
+                  receipt.terminalSequenceThrough <= manifest.terminalSequenceThrough
+              } else {
+                covered = true
+              }
+              if (covered) yield* sql`DELETE FROM effect_local_pending WHERE mutation_id = ${row.mutation_id}`
+            }
+
+            const pendingLogs = yield* findPendingLog(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            for (const row of pendingLogs) {
+              const pendingMutation = yield* decodePendingRow(row)
+              const entry = yield* Codec.parse(row.entry_json).pipe(
+                Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
+              )
+              if (
+                row.server_sequence !== entry.sequence ||
+                row.entry_mutation_id !== entry.mutationId ||
+                entry.mutationId !== pendingMutation.envelope.mutationId ||
+                entry.clientId !== options.clientId ||
+                entry.localSequence !== pendingMutation.envelope.localSequence ||
+                entry.digest !== pendingMutation.envelope.digest
+              ) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Pending mutation ${row.mutation_id} has conflicting accepted log evidence`
+                })
+              }
+              if (entry.sequence <= manifest.sequence) {
+                yield* sql`DELETE FROM effect_local_pending WHERE mutation_id = ${row.mutation_id}`
+              }
+            }
+
+            yield* sql`DELETE FROM effect_local_canonical_entities`
+            yield* sql`INSERT INTO effect_local_canonical_entities (model, model_version, entity_key, value_json)
+              SELECT model, model_version, entity_key, value_json
+              FROM effect_local_bootstrap_entities ORDER BY ordinal`
+            yield* sql`DELETE FROM effect_local_server_log WHERE server_sequence <= ${manifest.sequence}`
+            yield* sql`DELETE FROM effect_local_visible_entities`
+            yield* sql`INSERT INTO effect_local_visible_entities (model, model_version, entity_key, value_json)
+              SELECT model, model_version, entity_key, value_json FROM effect_local_canonical_entities`
+            yield* restoreAndReplay([])
+            yield* sql`UPDATE effect_local_client_meta SET
+              server_cursor = ${manifest.sequence},
+              installed_snapshot_id = ${manifest.snapshotId},
+              installed_snapshot_sequence = ${manifest.sequence},
+              installed_snapshot_terminal_sequence = ${manifest.terminalSequenceThrough},
+              visible_revision = visible_revision + 1
+              WHERE singleton = 1`
+            yield* sql`DELETE FROM effect_local_bootstrap_entities`
+            yield* sql`DELETE FROM effect_local_bootstrap WHERE singleton = 1`
+            prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
+            return yield* Effect.void
+          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          yield* invalidate(Array.from(dirty.values()), prunedReceiptIds)
+        }).pipe(
+          Effect.uninterruptible,
+          Effect.withSpan("LocalStore.installBootstrap", {
+            attributes: { "snapshot.id": manifest.snapshotId, "server.sequence": manifest.sequence }
+          })
+        )
+
       const reconciliationGenerations = sql.withTransaction(Effect.gen(function*() {
         const row = yield* meta
         yield* validateFence(row)
@@ -513,14 +1146,15 @@ export const layer = (
       })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const nextReconciliationGeneration = (requested: number) =>
-        requested >= Number.MAX_SAFE_INTEGER
-          ? Effect.fail(
-            new ReplicaError.CapacityExceeded({
+        Effect.gen(function*() {
+          if (requested >= Number.MAX_SAFE_INTEGER) {
+            return yield* new ReplicaError.CapacityExceeded({
               resource: "reconciliation generations",
               limit: Number.MAX_SAFE_INTEGER
             })
-          )
-          : Effect.succeed(requested + 1)
+          }
+          return requested + 1
+        })
 
       const requestReconciliation = sql.withTransaction(
         Effect.gen(function*() {
@@ -555,7 +1189,9 @@ export const layer = (
             yield* sql`UPDATE effect_local_client_meta
             SET completed_generation = MAX(completed_generation, ${generation})
             WHERE singleton = 1`
+            return yield* Effect.void
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          return yield* Effect.void
         }).pipe(Effect.withSpan("LocalStore.completeReconciliation", {
           attributes: { "reconciliation.generation": generation }
         }))
@@ -567,6 +1203,12 @@ export const layer = (
               const storedMeta = yield* meta
               yield* validateFence(storedMeta)
               yield* nextReconciliationGeneration(storedMeta.requested_generation)
+              if (storedMeta.next_local_sequence >= Number.MAX_SAFE_INTEGER) {
+                return yield* new ReplicaError.CapacityExceeded({
+                  resource: "local sequence",
+                  limit: Number.MAX_SAFE_INTEGER - 1
+                })
+              }
               const count = yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))
               if (count.count >= maximumPending) {
                 return yield* new ReplicaError.CapacityExceeded({
@@ -612,7 +1254,7 @@ export const layer = (
               )
               if (Result.isFailure(executed)) {
                 const rejection = yield* Codec.decode(mutation.rejectionSchema, executed.failure)
-                return yield* Effect.fail(rejection as Mutation.Rejection<typeof mutation>)
+                return yield* Effect.fail(rejection)
               }
               const pendingMutation: Protocol.PendingMutation = {
                 envelope,
@@ -680,9 +1322,10 @@ export const layer = (
         completeReconciliation,
         applyEntries: (entries) =>
           Effect.gen(function*() {
-            if (entries.length === 0) return
+            if (entries.length === 0) return yield* Effect.void
             const touched: Array<Protocol.EntityKey> = []
             const settledReceiptIds: Array<Identity.MutationId> = []
+            let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
             yield* sql.withTransaction(Effect.gen(function*() {
               const currentMeta = yield* meta
               yield* validateFence(currentMeta)
@@ -778,10 +1421,18 @@ export const layer = (
               yield* restoreAndReplay(touched)
               yield* sql`UPDATE effect_local_client_meta
             SET server_cursor = ${cursor}, visible_revision = visible_revision + 1 WHERE singleton = 1`
+              const logFloor = Math.max(0, cursor - options.retainedHistoryEntries)
+              yield* sql`DELETE FROM effect_local_server_log
+                WHERE server_sequence <= ${logFloor} AND NOT EXISTS (
+                  SELECT 1 FROM effect_local_pending AS p
+                  WHERE p.mutation_id = effect_local_server_log.mutation_id
+                )`
+              prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
+              return yield* Effect.void
             })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
             yield* invalidate(
               touched,
-              settledReceiptIds
+              [...settledReceiptIds, ...prunedReceiptIds]
             )
           }).pipe(Effect.withSpan("LocalStore.applyEntries", {
             attributes: { "entry.count": entries.length, "space.id": options.spaceId }
@@ -790,6 +1441,9 @@ export const layer = (
         applyReceipt: (receipt) => applyReceipts([receipt]),
         persistReceipt,
         settleReceipts,
+        prepareBootstrap,
+        stageBootstrapPage,
+        installBootstrap,
         invalidateStatus: reactivity.invalidate(["effect-local:status"])
       }
       return Store.of(service)

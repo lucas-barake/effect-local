@@ -41,17 +41,57 @@ const database = Layer.mergeAll(
   NodeCrypto.layer
 )
 const mutationRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(handlers))
-const server = ServerStore.layerTrusted({ definition }).pipe(
+const migration = {
+  retryDelay: "1 millis",
+  maximumAttempts: 8
+} satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
+const clientHistory = {
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  retainedHistoryEntries: 256,
+  maximumBootstrapEntities: 10_000,
+  maximumBootstrapBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: 4 * 1024 * 1024,
+  migration
+}
+const server = ServerStore.layerTrusted({
+  definition,
+  retainedHistoryEntries: 256,
+  maximumHistoryEntries: 10_000,
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  maximumSnapshotEntities: 10_000,
+  maximumSnapshotBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: 4 * 1024 * 1024,
+  pruneBatchSize: 1_000,
+  retainedSnapshots: 2,
+  maintenanceConcurrency: 1,
+  maintenanceSpaceBatchSize: 128,
+  migration
+}).pipe(
   Layer.provide(mutationRuntime),
   Layer.provide(database)
 )
 const sync = Layer.effect(
   SyncEngine.SyncEngine,
   ServerStore.ServerStore.pipe(
-    Effect.map((store) => SyncEngine.SyncEngine.of({ submit: store.submit, pull: store.pull, watch: store.watch }))
+    Effect.map((store) =>
+      SyncEngine.SyncEngine.of({
+        submit: store.submit,
+        pull: store.pull,
+        bootstrap: store.bootstrap,
+        watch: store.watch
+      })
+    )
   )
 ).pipe(Layer.provide(server))
-const replica = SqlReplica.layer({ definition, spaceId, clientId, retryDelay: "10 millis" }).pipe(
+const replica = SqlReplica.layer({
+  ...clientHistory,
+  definition,
+  spaceId,
+  clientId,
+  retryDelay: "10 millis"
+}).pipe(
   Layer.provide(sync),
   Layer.provide(database),
   Layer.provide(handlers)
