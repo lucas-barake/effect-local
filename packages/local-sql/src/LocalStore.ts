@@ -22,6 +22,7 @@ import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as IndexStore from "./IndexStore.js"
 import * as ClientLineage from "./internal/clientLineage.js"
+import * as ClientMetrics from "./internal/clientMetrics.js"
 import * as Codec from "./internal/codec.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
@@ -515,6 +516,7 @@ export const layer = (
       }
       const schemaGeneration = initializedMeta.schema_generation
       const activeGeneration = initializedMeta.active_schema_generation
+      const metrics = yield* ClientMetrics.make
       const indexAddress = (current: typeof Rows.ClientMetaRow.Type): IndexStore.Address => ({
         spaceId: options.spaceId,
         schemaGeneration: current.active_schema_generation,
@@ -563,6 +565,12 @@ export const layer = (
         }
         return Effect.void
       }
+      const refreshPendingMetric = metrics.refreshPending(
+        sql.withTransaction(Effect.gen(function*() {
+          yield* validateFence(yield* meta)
+          return (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
+        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      )
       if (
         (initializedMeta.installed_snapshot_id === null &&
           (initializedMeta.installed_snapshot_sequence !== 0 ||
@@ -1231,6 +1239,7 @@ export const layer = (
           prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
           return yield* Effect.void
         })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        yield* refreshPendingMetric
         const entities = Array.from(touched.values())
         let indexPoints: ReadonlyArray<IndexStore.Point> = []
         if (entities.length > 0) indexPoints = yield* rebuildWithIndexPoints(entities)
@@ -1372,6 +1381,7 @@ export const layer = (
               WHERE space_id = ${options.spaceId} AND mutation_id = ${receipt.mutationId}`
             return { canceledReplacement, touched: Array.from(canceledTouched.values()), receiptIds: pruned }
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          yield* refreshPendingMetric
           yield* deferInvalidation(
             transactionResult.touched,
             [receipt.mutationId, ...transactionResult.receiptIds]
@@ -1813,6 +1823,8 @@ export const layer = (
             prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
             return yield* Effect.void
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          yield* metrics.recordBootstrapInstall
+          yield* refreshPendingMetric
           const entities = Array.from(dirty.values())
           const indexPoints = yield* rebuildWithIndexPoints(entities)
           yield* reactivity.withBatch(invalidate(entities, prunedReceiptIds, indexPoints))
@@ -2050,6 +2062,7 @@ export const layer = (
               VALUES (${options.spaceId}, ${mutationId}, ${mutationResult.pendingMutation.envelope.mutationId})`
             return mutationResult
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          yield* refreshPendingMetric
           yield* reactivity.withBatch(
             invalidate(result.pendingMutation.changes.map((change) => change.entity), [], result.indexPoints)
           )
@@ -2060,6 +2073,7 @@ export const layer = (
 
       yield* projectionGate.withPermit(rebuildProjection)
       indexes = yield* IndexStore.install(sql, options.definition, indexAddress(yield* meta))
+      yield* refreshPendingMetric
 
       const service: Service = {
         membershipIncarnation: initializedMeta.membership_incarnation,
@@ -2069,6 +2083,7 @@ export const layer = (
             const result = yield* sql.withTransaction(mutateInTransaction(mutation, payloadValue)).pipe(
               Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
             )
+            yield* refreshPendingMetric
             yield* reactivity.withBatch(
               invalidate(
                 result.pendingMutation.changes.map((change) => change.entity),
@@ -2257,6 +2272,7 @@ export const layer = (
               prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
               return yield* Effect.void
             })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            yield* refreshPendingMetric
             yield* deferInvalidation(
               touched,
               [...settledReceiptIds, ...prunedReceiptIds]
