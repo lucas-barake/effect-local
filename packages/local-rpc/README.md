@@ -67,8 +67,9 @@ per space update queue depth. Excess presence streams fail with `CapacityExceede
 limit }` and release their allowance on interruption or authorization failure. The live population is exported as
 `effect_local_server_presence_watcher_count`.
 
-`ServerStore.maximumWatchersPerSpace` separately caps sync streams. One accepted mutation publishes one shared wake
-after SQL commit. Delivering it performs no SQLite transaction or space row write per watcher. The benchmark at
+`ServerStore.maximumWatchersPerSpace` separately caps sync streams. Accepted admissions publish a shared wake at
+least once after commit. An exact retry may republish the retained receipt to repair a lost postcommit publication.
+Delivering it performs no SQLite transaction or space row write per watcher. The benchmark at
 `bench/Fanout.bench.ts` exercises the production composed path with 64, 256, and 1,024 watchers.
 
 Use `SyncRpc.layerJson` for the WebSocket serialization Layer. It bounds each complete UTF-8 JSON frame and makes

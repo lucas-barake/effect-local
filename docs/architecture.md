@@ -99,7 +99,8 @@ immutable snapshot Bootstrap pages. `SpaceWatchEntity` forks long lived sync and
 `SpacePresencePublishEntity` runs bounded concurrent presence publications. Each entity has its own required finite
 mailbox, so a paused Bootstrap page or a full watch lane cannot occupy mutation admission.
 
-An accepted mutation publishes one in memory wake after its SQL transaction commits. Subscribers read that publication
+An accepted admission publishes a shared in memory wake after its SQL transaction commits. Exact retries may republish
+the retained receipt to repair lost postcommit publication. Subscribers read that publication
 from the per space hub. Fanout does not acquire a SQLite transaction or write a space row for each watcher. Pull remains
 the durable repair path when a wake is lost.
 

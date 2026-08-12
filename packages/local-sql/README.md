@@ -82,7 +82,8 @@ configured interval. If no fresh success is available at the current success exp
 stream fails with `AuthorizationDenied`. `readAuthorizationRefreshInterval` is therefore the fail closed worst case
 revocation bound. Pull and Bootstrap perform uncached one shot read authorization.
 
-Each accepted mutation publishes one shared wake after its transaction commits. Watchers do not perform a SQLite
+Each accepted admission publishes a shared wake after its transaction commits. An exact retry may republish the
+retained receipt so a lost postcommit publication is repaired. Watchers do not perform a SQLite
 transaction or space row write per publication. `wakeCapacity` is the optional sliding wake queue depth, while
 `maximumWatchersPerSpace` is the separate live watcher allowance. Excess streams fail with typed
 `CapacityExceeded { resource: "sync watchers", limit }`.

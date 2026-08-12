@@ -296,8 +296,9 @@ to the request headers. The authenticated server facade uses four Cluster entity
 concurrent bootstrap pages. `SpaceWatchEntity` owns forked long lived sync and presence streams.
 `SpacePresencePublishEntity` bounds presence publication concurrency. Required `SpaceEntity.HandlerOptions` provide a
 finite mailbox for every lane plus the bootstrap and presence publication concurrency limits. Cluster supplies unique
-live ownership and cross runner stream routing. SQL stores the authoritative accepted log and terminal receipts. One
-accepted mutation publishes one in memory wake after commit. Watch fanout performs no SQLite write or transaction per
+live ownership and cross runner stream routing. SQL stores the authoritative accepted log and terminal receipts.
+Accepted admissions publish a shared in memory wake after commit. Exact retries may republish the retained receipt to
+repair lost postcommit publication. Watch fanout performs no SQLite write or transaction per
 watcher.
 
 `ServerStore.maximumWatchersPerSpace` caps live sync watches. `PresenceHub.maximumWatchersPerSpace` independently caps
