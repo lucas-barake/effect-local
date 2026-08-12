@@ -27,7 +27,12 @@ const readerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000000
 const membershipIncarnation = Identity.MembershipIncarnation.make(
   "inc_00000000-0000-4000-8000-000000000001"
 )
-const scope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
+const fullScope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
+const windowedScope = Protocol.ReplicationScope.make({
+  models: [],
+  windows: [Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "byChat", count: 50 })]
+})
+const chats = 100
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 
 const envelope = (name: string, payload: typeof Protocol.MutationEnvelope.Type["payload"], sequence: number) =>
@@ -58,7 +63,7 @@ interface Environment {
   nextSequence: number
 }
 
-const makeEnvironment = (entityCount: number): Environment => {
+const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
   const database = Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
@@ -130,7 +135,7 @@ const makeEnvironment = (entityCount: number): Environment => {
   }
 }
 
-const seed = (environment: Environment, entityCount: number) =>
+const seedTodos = (environment: Environment, entityCount: number) =>
   environment.runtime.runPromise(Effect.gen(function*() {
     const server = yield* ServerStore.ServerStore
     const reconciler = yield* Reconciler.Reconciliation
@@ -139,11 +144,22 @@ const seed = (environment: Environment, entityCount: number) =>
       yield* envelope(Domain.PutManyTodos.name, { count: entityCount }, environment.nextSequence++)
     )
     yield* reconciler.sync
-    assert.isTrue(Option.isSome(yield* local.get(Domain.Todo, "bulk-0")))
     assert.isTrue(Option.isSome(yield* local.get(Domain.Todo, `bulk-${entityCount - 1}`)))
   }))
 
-const syncOneMessage = (environment: Environment) =>
+const seedMessages = (environment: Environment, entityCount: number) =>
+  environment.runtime.runPromise(Effect.gen(function*() {
+    const server = yield* ServerStore.ServerStore
+    const reconciler = yield* Reconciler.Reconciliation
+    const local = yield* LocalStore.Store
+    yield* server.submit(
+      yield* envelope(Domain.PutManyMessages.name, { count: entityCount, chats }, environment.nextSequence++)
+    )
+    yield* reconciler.sync
+    assert.isTrue(Option.isSome(yield* local.get(Domain.Message, `bulk-${entityCount - 1}`)))
+  }))
+
+const syncOneTodo = (environment: Environment) =>
   environment.runtime.runPromise(Effect.gen(function*() {
     const server = yield* ServerStore.ServerStore
     const reconciler = yield* Reconciler.Reconciliation
@@ -155,13 +171,34 @@ const syncOneMessage = (environment: Environment) =>
     assert.isTrue(Option.isSome(yield* local.get(Domain.Todo, id)))
   }))
 
+const syncOneMessage = (environment: Environment) =>
+  environment.runtime.runPromise(Effect.gen(function*() {
+    const server = yield* ServerStore.ServerStore
+    const reconciler = yield* Reconciler.Reconciliation
+    const local = yield* LocalStore.Store
+    const sequence = environment.nextSequence++
+    const id = `live-${String(sequence).padStart(8, "0")}`
+    yield* server.submit(
+      yield* envelope(
+        Domain.PutMessage.name,
+        { id, chatId: "chat-0", sentAt: 10_000_000 + sequence, body: `body-${id}` },
+        sequence
+      )
+    )
+    yield* reconciler.sync
+    assert.isTrue(Option.isSome(yield* local.get(Domain.Message, id)))
+  }))
+
 const configurations = [
-  { entityCount: 1_000, iterations: 10 },
-  { entityCount: 10_000, iterations: 5 },
-  { entityCount: 100_000, iterations: 3 }
+  { label: "full scope, space of 1000 entities", scope: fullScope, entityCount: 1_000, iterations: 10 },
+  { label: "full scope, space of 10000 entities", scope: fullScope, entityCount: 10_000, iterations: 5 },
+  { label: "full scope, space of 100000 entities", scope: fullScope, entityCount: 100_000, iterations: 3 },
+  { label: "windowed scope, space of 1000 entities", scope: windowedScope, entityCount: 1_000, iterations: 10 },
+  { label: "windowed scope, space of 10000 entities", scope: windowedScope, entityCount: 10_000, iterations: 10 },
+  { label: "windowed scope, space of 100000 entities", scope: windowedScope, entityCount: 100_000, iterations: 10 }
 ]
 
-const environments = new Map<number, Environment>()
+const environments = new Map<string, Environment>()
 
 afterAll(async () => {
   for (const environment of environments.values()) {
@@ -170,15 +207,18 @@ afterAll(async () => {
 })
 
 describe("per-message sync cost by space size", () => {
-  for (const { entityCount, iterations } of configurations) {
-    bench(`space of ${entityCount} entities`, async () => {
-      let environment = environments.get(entityCount)
+  for (const { entityCount, iterations, label, scope } of configurations) {
+    const windowed = scope === windowedScope
+    bench(label, async () => {
+      let environment = environments.get(label)
       if (environment === undefined) {
-        environment = makeEnvironment(entityCount)
-        environments.set(entityCount, environment)
-        await seed(environment, entityCount)
+        environment = makeEnvironment(scope)
+        environments.set(label, environment)
+        if (windowed) await seedMessages(environment, entityCount)
+        else await seedTodos(environment, entityCount)
       }
-      await syncOneMessage(environment)
+      if (windowed) await syncOneMessage(environment)
+      else await syncOneTodo(environment)
     }, { iterations, time: 0, warmupIterations: 1, warmupTime: 0, throws: true })
   }
 })
