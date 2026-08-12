@@ -43,7 +43,8 @@ const remote = Layer.succeed(
   SyncEngine.SyncEngine,
   SyncEngine.SyncEngine.of({
     submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-    pull: () => Effect.succeed({ entries: [], hasMore: false }),
+    discard: () => Effect.die("unexpected discard"),
+    pull: () => Effect.succeed({ entries: [], hasMore: false, serverSchema: Domain.definition.schemaIdentity }),
     bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
     watch: () => Stream.never
   })
@@ -196,7 +197,8 @@ describe("multi space Replica", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-          pull: () => Effect.succeed({ entries: [], hasMore: false }),
+          discard: () => Effect.die("unexpected discard"),
+          pull: () => Effect.succeed({ entries: [], hasMore: false, serverSchema: Domain.definition.schemaIdentity }),
           bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           watch: () =>
             Stream.unwrap(Effect.acquireRelease(
@@ -401,6 +403,7 @@ describe("multi space Replica", () => {
         SyncEngine.SyncEngine.of({
           submit: () =>
             Effect.fail(new ReplicaError.ServerUnavailable()),
+          discard: () => Effect.die("unexpected discard"),
           pull: () =>
             Effect.acquireUseRelease(
               Ref.updateAndGet(current, (count) => count + 1).pipe(
@@ -410,7 +413,10 @@ describe("multi space Replica", () => {
                   return Effect.void
                 })
               ),
-              () => Deferred.await(release).pipe(Effect.as({ entries: [], hasMore: false } as const)),
+              () =>
+                Deferred.await(release).pipe(
+                  Effect.as({ entries: [], hasMore: false, serverSchema: Domain.definition.schemaIdentity } as const)
+                ),
               () => Ref.update(current, (count) => count - 1)
             ),
           bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
