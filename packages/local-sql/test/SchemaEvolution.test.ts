@@ -7,6 +7,8 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -16,6 +18,7 @@ import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
@@ -25,6 +28,8 @@ import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as SchemaEvolution from "../src/SchemaEvolution.js"
 import * as ServerStore from "../src/ServerStore.js"
+import * as SqlReplica from "../src/SqlReplica.js"
+import * as SyncEngine from "../src/SyncEngine.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
@@ -67,7 +72,8 @@ const TodoV1 = Model.make("Todo", {
 const PutTodoV1 = Mutation.make("PutTodo", {
   version: 1,
   payload: TodoV1.schema,
-  success: TodoV1.schema
+  success: TodoV1.schema,
+  rejection: Schema.String
 })
 const definitionV1 = Definition.make({ version: 1, models: [TodoV1], mutations: [PutTodoV1] })
 const handlersV1 = PutTodoV1.toLayer(({ payload, transaction }) =>
@@ -82,12 +88,14 @@ const TodoV2 = Model.make("Todo", {
 const PutTodoV2 = Mutation.make("PutTodo", {
   version: 2,
   payload: TodoV2.schema,
-  success: TodoV2.schema
+  success: TodoV2.schema,
+  rejection: Schema.String
 })
 const definitionV2 = Definition.make({ version: 2, models: [TodoV2], mutations: [PutTodoV2] })
 const handlersV2 = PutTodoV2.toLayer(({ payload, transaction }) =>
   transaction.set(TodoV2, payload.id, payload).pipe(Effect.as(payload))
 )
+const rejectingHandlersV2 = PutTodoV2.toLayer(() => Effect.fail("schema-policy-rejected"))
 
 const TodoV3 = Model.make("Todo", {
   version: 3,
@@ -97,12 +105,88 @@ const TodoV3 = Model.make("Todo", {
 const PutTodoV3 = Mutation.make("PutTodo", {
   version: 3,
   payload: TodoV3.schema,
-  success: TodoV3.schema
+  success: TodoV3.schema,
+  rejection: Schema.String
 })
 const definitionV3 = Definition.make({ version: 3, models: [TodoV3], mutations: [PutTodoV3] })
 const handlersV3 = PutTodoV3.toLayer(({ payload, transaction }) =>
   transaction.set(TodoV3, payload.id, payload).pipe(Effect.as(payload))
 )
+const rejectingHandlersV3 = PutTodoV3.toLayer(() => Effect.fail("schema-policy-rejected-v3"))
+
+const ExpandedV1 = Model.make("Expanded", {
+  version: 1,
+  key: Schema.String,
+  schema: Schema.Struct({ id: Schema.String, text: Schema.String })
+})
+const ExpandedV2 = Model.make("Expanded", {
+  version: 2,
+  key: Schema.String,
+  schema: Schema.Struct({ id: Schema.String, compact: Schema.String })
+})
+const PutExpanded = Mutation.make("PutExpanded", {
+  version: 1,
+  payload: ExpandedV2.schema,
+  success: Schema.Null,
+  rejection: Schema.String
+})
+const expandedDefinitionV1 = Definition.make({ version: 1, models: [ExpandedV1], mutations: [PutExpanded] })
+const expandedDefinitionV2 = Definition.make({ version: 2, models: [ExpandedV2], mutations: [PutExpanded] })
+const expandedHandlers = PutExpanded.toLayer(({ payload, transaction }) =>
+  transaction.set(ExpandedV2, payload.id, payload).pipe(Effect.as(null))
+)
+const expandingEvolution = Evolution.make({
+  current: expandedDefinitionV2,
+  steps: [Evolution.step({
+    id: "expanded/1-to-2",
+    from: expandedDefinitionV1,
+    to: expandedDefinitionV2,
+    models: [Evolution.model({
+      id: "expanded-model/1-to-2",
+      from: ExpandedV1,
+      to: ExpandedV2,
+      value: ({ value }) => ({ id: value.id, compact: value.text }),
+      downgradeValue: ({ value }) => ({ id: value.id, text: value.compact.repeat(80) })
+    })]
+  })]
+})
+
+const CompactV1 = Model.make("Large", {
+  version: 1,
+  key: Schema.String,
+  schema: Schema.Struct({ id: Schema.String, summary: Schema.String })
+})
+const LargeV2 = Model.make("Large", {
+  version: 2,
+  key: Schema.String,
+  schema: Schema.Struct({ id: Schema.String, text: Schema.String })
+})
+const PutLarge = Mutation.make("PutLarge", {
+  version: 1,
+  payload: Schema.Struct({ id: Schema.String }),
+  success: Schema.Null,
+  rejection: Schema.String
+})
+const compactDefinitionV1 = Definition.make({ version: 1, models: [CompactV1], mutations: [PutLarge] })
+const largeDefinitionV2 = Definition.make({ version: 2, models: [LargeV2], mutations: [PutLarge] })
+const largeHandlers = PutLarge.toLayer(({ payload, transaction }) =>
+  transaction.set(LargeV2, payload.id, { id: payload.id, text: "x".repeat(2_200_000) }).pipe(Effect.as(null))
+)
+const compactingEvolution = Evolution.make({
+  current: largeDefinitionV2,
+  steps: [Evolution.step({
+    id: "large/1-to-2",
+    from: compactDefinitionV1,
+    to: largeDefinitionV2,
+    models: [Evolution.model({
+      id: "large-model/1-to-2",
+      from: CompactV1,
+      to: LargeV2,
+      value: ({ value }) => ({ id: value.id, text: value.summary }),
+      downgradeValue: ({ value }) => ({ id: value.id, summary: value.text.slice(0, 8) })
+    })]
+  })]
+})
 
 const evolution = Evolution.make({
   current: definitionV2,
@@ -115,10 +199,64 @@ const evolution = Evolution.make({
       from: TodoV1,
       to: TodoV2,
       key: Number,
-      value: ({ value }) => ({ id: Number(value.id), title: value.title, done: false })
+      value: ({ value }) => ({ id: Number(value.id), title: value.title, done: false }),
+      downgradeKey: String,
+      downgradeValue: ({ value }) => ({ id: String(value.id), title: value.title })
     })],
     mutations: [Evolution.mutation({
       id: "put-todo/1-to-2",
+      from: PutTodoV1,
+      to: PutTodoV2,
+      payload: (payload) => ({ id: Number(payload.id), title: payload.title, done: false }),
+      success: (success) => ({ id: Number(success.id), title: success.title, done: false }),
+      downgradePayload: ({ id, title }) => ({ id: String(id), title }),
+      downgradeSuccess: ({ id, title }) => ({ id: String(id), title })
+    })]
+  })]
+})
+
+const collidingProjectionEvolution = Evolution.make({
+  current: definitionV2,
+  steps: [Evolution.step({
+    id: "definition/1-to-2-colliding-projection",
+    from: definitionV1,
+    to: definitionV2,
+    models: [Evolution.model({
+      id: "todo/1-to-2-colliding-projection",
+      from: TodoV1,
+      to: TodoV2,
+      key: Number,
+      value: ({ value }) => ({ id: Number(value.id), title: value.title, done: false }),
+      downgradeKey: () => "shared",
+      downgradeValue: ({ value }) => ({ id: String(value.id), title: value.title })
+    })],
+    mutations: [Evolution.mutation({
+      id: "put-todo/1-to-2-colliding-projection",
+      from: PutTodoV1,
+      to: PutTodoV2,
+      payload: (payload) => ({ id: Number(payload.id), title: payload.title, done: false }),
+      success: (success) => ({ id: Number(success.id), title: success.title, done: false }),
+      downgradePayload: ({ id, title }) => ({ id: String(id), title }),
+      downgradeSuccess: ({ id, title }) => ({ id: String(id), title })
+    })]
+  })]
+})
+
+const forwardOnlyEvolution = Evolution.make({
+  current: definitionV2,
+  steps: [Evolution.step({
+    id: "definition/1-to-2-forward-only",
+    from: definitionV1,
+    to: definitionV2,
+    models: [Evolution.model({
+      id: "todo/1-to-2-forward-only",
+      from: TodoV1,
+      to: TodoV2,
+      key: Number,
+      value: ({ value }) => ({ id: Number(value.id), title: value.title, done: false })
+    })],
+    mutations: [Evolution.mutation({
+      id: "put-todo/1-to-2-forward-only",
       from: PutTodoV1,
       to: PutTodoV2,
       payload: (payload) => ({ id: Number(payload.id), title: payload.title, done: false }),
@@ -139,14 +277,17 @@ const evolutionV3 = Evolution.make({
         id: "todo/2-to-3",
         from: TodoV2,
         to: TodoV3,
-        value: ({ value }) => ({ ...value, priority: 0 })
+        value: ({ value }) => ({ ...value, priority: 0 }),
+        downgradeValue: ({ value }) => ({ id: value.id, title: value.title, done: value.done })
       })],
       mutations: [Evolution.mutation({
         id: "put-todo/2-to-3",
         from: PutTodoV2,
         to: PutTodoV3,
         payload: (payload) => ({ ...payload, priority: 0 }),
-        success: (success) => ({ ...success, priority: 0 })
+        success: (success) => ({ ...success, priority: 0 }),
+        downgradePayload: ({ id, title, done }) => ({ id, title, done }),
+        downgradeSuccess: ({ id, title, done }) => ({ id, title, done })
       })]
     })
   ]
@@ -183,7 +324,8 @@ const buildStore = <D extends Definition.Any,>(
 const buildServer = <D extends Definition.Any,>(
   definition: D,
   handlers: Layer.Layer<MutationRuntime.Handlers<D>>,
-  configuredEvolution?: Evolution.Evolution
+  configuredEvolution?: Evolution.Evolution,
+  serverOptions?: Partial<Pick<ServerStore.Options, "acceptedSchemaVersions" | "retainedHistoryEntries">>
 ) => {
   const runtime = MutationRuntime.layer(definition, configuredEvolution).pipe(Layer.provide(handlers))
   let options: Parameters<typeof ServerStore.layerTrusted>[0] = {
@@ -192,12 +334,59 @@ const buildServer = <D extends Definition.Any,>(
     schemaEvolutionBatchSize: 1
   }
   if (configuredEvolution !== undefined) options = { ...options, evolution: configuredEvolution }
+  if (serverOptions !== undefined) {
+    options = { ...options, ...serverOptions }
+  }
   return Layer.build(
     ServerStore.layerTrusted(options).pipe(Layer.provide(runtime))
   ).pipe(
     Effect.map((context) => Context.get(context, ServerStore.ServerStore))
   )
 }
+
+const buildReplica = <D extends Definition.Any,>(
+  definition: D,
+  handlers: Layer.Layer<MutationRuntime.Handlers<D>>,
+  remote: SyncEngine.Service,
+  configuredEvolution?: Evolution.Evolution
+) => {
+  let options: SqlReplica.Options<D> = {
+    ...clientHistory,
+    definition,
+    clientId,
+    initialSpaces: [spaceId],
+    schemaEvolutionBatchSize: 1
+  }
+  if (configuredEvolution !== undefined) options = { ...options, evolution: configuredEvolution }
+  return Layer.build(
+    SqlReplica.layer(options).pipe(
+      Layer.provide(handlers),
+      Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
+    )
+  ).pipe(Effect.flatMap((context) => Context.get(context, Replica.Replica).space(spaceId)))
+}
+
+const unavailableSync = SyncEngine.SyncEngine.of({
+  submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+  discard: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+  pull: () =>
+    Effect.succeed(Protocol.PullPage.make({
+      entries: [],
+      hasMore: false,
+      serverSchema: definitionV2.schemaIdentity
+    })),
+  bootstrap: () => Effect.die("unexpected bootstrap"),
+  watch: () => Stream.never
+})
+
+const serverSync = (server: ServerStore.Service) =>
+  SyncEngine.SyncEngine.of({
+    submit: server.submit,
+    discard: (request) => server.discard(request, null),
+    pull: server.pull,
+    bootstrap: server.bootstrap,
+    watch: server.watch
+  })
 
 const v1Envelope = (
   envelopeClientId: Identity.ClientId,
@@ -759,6 +948,648 @@ describe("client schema evolution", () => {
         entity: { model: "Todo", modelVersion: TodoV2.version, key: 5 },
         value: { id: 5, title: "offline-old", done: false }
       })
+    })).pipe(Effect.provide(database)))
+
+  it.effect("starts after quarantining a pending mutation rejected during promotion", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const pending = yield* v1.mutate(PutTodoV1, { id: "42", title: "rejected-on-upgrade" })
+
+      const v2 = yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
+      const quarantined = yield* v2.quarantine
+      assert.strictEqual(quarantined.length, 1)
+      assert.strictEqual(quarantined[0].envelope.mutationId, pending.envelope.mutationId)
+      assert.deepStrictEqual(quarantined[0].rejection, "schema-policy-rejected")
+      assert.strictEqual((yield* v2.pending).length, 0)
+
+      const server = yield* buildServer(definitionV2, handlersV2, evolution)
+      const discarded = yield* server.discard({
+        envelope: quarantined[0].envelope,
+        schema: definitionV2.schemaIdentity
+      }, null)
+      assert.strictEqual(discarded._tag, "Rejected")
+      if (discarded._tag === "Rejected") assert.strictEqual(discarded.origin, "Quarantine")
+      yield* v2.resolveQuarantine(discarded)
+      assert.deepStrictEqual(yield* v2.quarantine, [])
+
+      const writableV2 = yield* buildStore(definitionV2, handlersV2, evolution)
+      const replacement = yield* writableV2.mutate(PutTodoV2, {
+        id: 42,
+        title: "corrected",
+        done: false
+      })
+      assert.strictEqual(replacement.envelope.localSequence, 2)
+      assert.strictEqual(
+        (yield* server.submit({
+          envelope: replacement.envelope,
+          schema: definitionV2.schemaIdentity
+        }))._tag,
+        "Accepted"
+      )
+    })).pipe(Effect.provide(database)))
+
+  it.effect("keeps quarantine durable when receipt persistence fails during disposition", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const pending = yield* v1.mutate(PutTodoV1, { id: "43", title: "atomic-disposition" })
+      const v2 = yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
+      const quarantined = yield* v2.quarantine
+      const server = yield* buildServer(definitionV2, handlersV2, evolution)
+      const receipt = yield* server.discard({
+        envelope: quarantined[0].envelope,
+        schema: definitionV2.schemaIdentity
+      }, null)
+
+      yield* sql`CREATE TRIGGER fail_quarantine_receipt BEFORE INSERT ON effect_local_client_receipts_data
+        BEGIN SELECT RAISE(ABORT, 'receipt persistence failed'); END`
+      assert.strictEqual((yield* v2.resolveQuarantine(receipt).pipe(Effect.flip))._tag, "StorageUnavailable")
+      yield* sql`DROP TRIGGER fail_quarantine_receipt`
+
+      const reopened = yield* buildStore(definitionV2, handlersV2, evolution)
+      assert.deepStrictEqual((yield* reopened.quarantine).map((item) => item.envelope.mutationId), [
+        pending.envelope.mutationId
+      ])
+      assert.deepStrictEqual(yield* reopened.pending, [])
+    })).pipe(Effect.provide(database)))
+
+  it.effect("keeps a quarantined mutation inspectable when its replacement rejects", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const original = yield* v1.mutate(PutTodoV1, { id: "44", title: "retryable-resubmit" })
+      const rejecting = yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
+      const item = (yield* rejecting.quarantine)[0]
+      const server = yield* buildServer(definitionV2, handlersV2, evolution)
+      const receipt = yield* server.discard({ envelope: item.envelope, schema: definitionV2.schemaIdentity }, null)
+
+      assert.strictEqual(
+        yield* rejecting.ensureQuarantineResubmission(original.envelope.mutationId, PutTodoV2, {
+          id: 44,
+          title: "still-rejected",
+          done: false
+        }).pipe(Effect.flip),
+        "schema-policy-rejected"
+      )
+      assert.deepStrictEqual((yield* rejecting.quarantine).map(({ envelope }) => envelope.mutationId), [
+        original.envelope.mutationId
+      ])
+
+      const writable = yield* buildStore(definitionV2, handlersV2, evolution)
+      const replacement = yield* writable.ensureQuarantineResubmission(original.envelope.mutationId, PutTodoV2, {
+        id: 44,
+        title: "corrected",
+        done: false
+      })
+      const retry = yield* writable.ensureQuarantineResubmission(original.envelope.mutationId, PutTodoV2, {
+        id: 44,
+        title: "corrected",
+        done: false
+      })
+      assert.strictEqual(retry.envelope.mutationId, replacement.envelope.mutationId)
+      yield* writable.resolveQuarantine(receipt)
+      assert.deepStrictEqual(yield* writable.quarantine, [])
+      assert.deepStrictEqual((yield* writable.pending).map(({ envelope }) => envelope.mutationId), [
+        replacement.envelope.mutationId
+      ])
+    })).pipe(Effect.provide(database)))
+
+  it.effect("cancels a staged public resubmission when the original is later discarded", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const original = yield* v1.mutate(PutTodoV1, { id: "45", title: "original" })
+      yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
+      const stagingStore = yield* buildStore(definitionV2, handlersV2, evolution)
+      const firstError = yield* Effect.scoped(
+        buildReplica(definitionV2, handlersV2, unavailableSync, evolution).pipe(
+          Effect.flatMap((replica) =>
+            replica.resubmitQuarantined(
+              original.envelope.mutationId,
+              PutTodoV2,
+              { id: 45, title: "staged", done: false }
+            ).pipe(Effect.flip)
+          )
+        )
+      )
+      assert.isTrue(Schema.is(ReplicaError.ServerUnavailable)(firstError))
+
+      assert.strictEqual(yield* stagingStore.pendingCount, 1)
+      const staged = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Schema.Struct({ replacement_mutation_id: Identity.MutationId }),
+        execute: () =>
+          sql`SELECT replacement_mutation_id
+            FROM effect_local_client_quarantine_resubmissions
+            WHERE original_mutation_id = ${original.envelope.mutationId}`
+      })(undefined)
+      assert.deepStrictEqual(
+        Option.getOrThrow(yield* stagingStore.get(TodoV2, 45)),
+        { id: 45, title: "staged", done: false }
+      )
+      const conflict = yield* Effect.scoped(
+        buildReplica(definitionV2, handlersV2, unavailableSync, evolution).pipe(
+          Effect.flatMap((replica) =>
+            replica.resubmitQuarantined(
+              original.envelope.mutationId,
+              PutTodoV2,
+              { id: 45, title: "different", done: false }
+            ).pipe(Effect.flip)
+          )
+        )
+      )
+      assert.isTrue(Schema.is(ReplicaError.QuarantineResubmissionConflict)(conflict))
+
+      const reactivity = yield* Reactivity.Reactivity
+      const invalidations = { entity: 0, status: 0, originalReceipt: 0, replacementReceipt: 0 }
+      const spaceKey = `effect-local:space:${spaceId}`
+      const cancelEntity = reactivity.registerUnsafe(
+        { [`${spaceKey}:entities`]: [[TodoV2.name, 45]] },
+        () => invalidations.entity++
+      )
+      const cancelStatus = reactivity.registerUnsafe([`${spaceKey}:status`], () => invalidations.status++)
+      const cancelOriginalReceipt = reactivity.registerUnsafe(
+        [`${spaceKey}:receipt:${original.envelope.mutationId}`],
+        () => invalidations.originalReceipt++
+      )
+      const cancelReplacementReceipt = reactivity.registerUnsafe(
+        [`${spaceKey}:receipt:${staged.replacement_mutation_id}`],
+        () => invalidations.replacementReceipt++
+      )
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          cancelEntity()
+          cancelStatus()
+          cancelOriginalReceipt()
+          cancelReplacementReceipt()
+        })
+      )
+
+      const server = yield* buildServer(definitionV2, handlersV2, evolution)
+      const replica = yield* buildReplica(definitionV2, handlersV2, serverSync(server), evolution)
+      const receipt = yield* replica.discardQuarantined(original.envelope.mutationId)
+      assert.strictEqual(receipt._tag, "Rejected")
+      assert.deepStrictEqual(yield* replica.quarantine, [])
+      assert.deepStrictEqual(yield* stagingStore.pending, [])
+      assert.isTrue(Option.isNone(yield* stagingStore.get(TodoV2, 45)))
+      assert.deepStrictEqual(
+        incremental(
+          yield* server.pull({
+            spaceId,
+            schema: definitionV2.schemaIdentity,
+            after: Identity.ServerSequence.make(0),
+            limit: 10
+          })
+        ).entries,
+        []
+      )
+      assert.isAtLeast(invalidations.entity, 1)
+      assert.isAtLeast(invalidations.status, 1)
+      assert.isAtLeast(invalidations.originalReceipt, 1)
+      assert.isAtLeast(invalidations.replacementReceipt, 1)
+    })).pipe(Effect.provide(database)))
+
+  it.effect("submits intervening pending mutations before discarding a staged replacement", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const original = yield* v1.mutate(PutTodoV1, { id: "49", title: "original" })
+      yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
+      const writable = yield* buildStore(definitionV2, handlersV2, evolution)
+      const intervening = yield* writable.mutate(PutTodoV2, {
+        id: 50,
+        title: "intervening",
+        done: false
+      })
+      const staged = yield* Effect.scoped(
+        buildReplica(definitionV2, handlersV2, unavailableSync, evolution).pipe(
+          Effect.flatMap((replica) =>
+            replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
+              id: 49,
+              title: "staged",
+              done: false
+            }).pipe(Effect.flip)
+          )
+        )
+      )
+      assert.isTrue(Schema.is(ReplicaError.ServerUnavailable)(staged))
+
+      const server = yield* buildServer(definitionV2, handlersV2, evolution)
+      const replica = yield* buildReplica(definitionV2, handlersV2, serverSync(server), evolution)
+      yield* replica.discardQuarantined(original.envelope.mutationId)
+
+      assert.deepStrictEqual(yield* replica.quarantine, [])
+      assert.deepStrictEqual(yield* writable.pending, [])
+      const page = incremental(
+        yield* server.pull({
+          spaceId,
+          schema: definitionV2.schemaIdentity,
+          after: Identity.ServerSequence.make(0),
+          limit: 10
+        })
+      )
+      assert.deepStrictEqual(page.entries.map(({ mutationId }) => mutationId), [intervening.envelope.mutationId])
+    })).pipe(Effect.provide(database)))
+
+  it.effect("resumes staged replacement cancellation after an intervening submit failure", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const original = yield* v1.mutate(PutTodoV1, { id: "51", title: "original" })
+      yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
+      const writable = yield* buildStore(definitionV2, handlersV2, evolution)
+      const intervening = yield* writable.mutate(PutTodoV2, {
+        id: 52,
+        title: "intervening",
+        done: false
+      })
+      const staged = yield* Effect.scoped(
+        buildReplica(definitionV2, handlersV2, unavailableSync, evolution).pipe(
+          Effect.flatMap((replica) =>
+            replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
+              id: 51,
+              title: "staged",
+              done: false
+            }).pipe(Effect.flip)
+          )
+        )
+      )
+      assert.isTrue(Schema.is(ReplicaError.ServerUnavailable)(staged))
+
+      const server = yield* buildServer(definitionV2, handlersV2, evolution)
+      const live = serverSync(server)
+      const failSubmit = yield* Ref.make(true)
+      const failOnce = SyncEngine.SyncEngine.of({
+        ...live,
+        submit: (request) =>
+          Effect.gen(function*() {
+            const shouldFail = yield* Ref.modify(failSubmit, (current) => [current, false])
+            if (shouldFail) return yield* new ReplicaError.ServerUnavailable()
+            return yield* live.submit(request)
+          })
+      })
+      const replica = yield* buildReplica(definitionV2, handlersV2, failOnce, evolution)
+      const firstError = yield* replica.discardQuarantined(original.envelope.mutationId).pipe(Effect.flip)
+      assert.strictEqual(firstError._tag, "ServerUnavailable")
+
+      const receipt = yield* replica.discardQuarantined(original.envelope.mutationId)
+      assert.strictEqual(receipt._tag, "Rejected")
+      assert.deepStrictEqual(yield* replica.quarantine, [])
+      assert.deepStrictEqual(yield* writable.pending, [])
+      const page = incremental(
+        yield* server.pull({
+          spaceId,
+          schema: definitionV2.schemaIdentity,
+          after: Identity.ServerSequence.make(0),
+          limit: 10
+        })
+      )
+      assert.deepStrictEqual(page.entries.map(({ mutationId }) => mutationId), [intervening.envelope.mutationId])
+    })).pipe(Effect.provide(database)))
+
+  it.effect("resubmits a quarantined mutation through the public replica composition", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const original = yield* v1.mutate(PutTodoV1, { id: "48", title: "original" })
+      yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
+      const writable = yield* buildStore(definitionV2, handlersV2, evolution)
+      const server = yield* buildServer(definitionV2, handlersV2, evolution)
+      const replica = yield* buildReplica(definitionV2, handlersV2, serverSync(server), evolution)
+
+      const result = yield* replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
+        id: 48,
+        title: "replacement",
+        done: false
+      })
+
+      assert.strictEqual(result._tag, "Resubmitted")
+      if (result._tag !== "Resubmitted") return
+      assert.deepStrictEqual(yield* replica.quarantine, [])
+      assert.deepStrictEqual((yield* writable.pending).map(({ envelope }) => envelope.mutationId), [
+        result.pending.envelope.mutationId
+      ])
+      assert.deepStrictEqual(
+        Option.getOrThrow(yield* replica.get(TodoV2, 48)),
+        { id: 48, title: "replacement", done: false }
+      )
+    })).pipe(Effect.provide(database)))
+
+  it.effect("keeps the original recoverable when its replacement is quarantined by promotion", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const original = yield* v1.mutate(PutTodoV1, { id: "46", title: "original" })
+      yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
+      yield* buildStore(definitionV2, handlersV2, evolution)
+      const firstError = yield* Effect.scoped(
+        buildReplica(definitionV2, handlersV2, unavailableSync, evolution).pipe(
+          Effect.flatMap((replica) =>
+            replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
+              id: 46,
+              title: "replacement",
+              done: false
+            }).pipe(Effect.flip)
+          )
+        )
+      )
+      assert.isTrue(Schema.is(ReplicaError.ServerUnavailable)(firstError))
+
+      const v3 = yield* buildStore(definitionV3, rejectingHandlersV3, evolutionV3)
+      const quarantined = yield* v3.quarantine
+      assert.strictEqual(quarantined.length, 2)
+      const replacement = quarantined.find(({ envelope }) => envelope.mutationId !== original.envelope.mutationId)
+      assert.isDefined(replacement)
+      if (replacement === undefined) return
+      assert.deepStrictEqual(replacement.envelope, {
+        ...replacement.envelope,
+        name: PutTodoV2.name,
+        payload: { id: 46, title: "replacement", done: false },
+        mutationVersion: PutTodoV2.version,
+        sourceSchema: definitionV2.schemaIdentity
+      })
+      assert.strictEqual(
+        yield* v3.ensureQuarantineResubmission(original.envelope.mutationId, PutTodoV2, {
+          id: 46,
+          title: "replacement",
+          done: false
+        }).pipe(Effect.flip),
+        "schema-policy-rejected-v3"
+      )
+      assert.isTrue(Option.isSome(yield* v3.quarantineByMutation(original.envelope.mutationId)))
+
+      const server = yield* buildServer(definitionV3, handlersV3, evolutionV3)
+      const currentReplica = yield* buildReplica(definitionV3, handlersV3, serverSync(server), evolutionV3)
+      yield* currentReplica.discardQuarantined(original.envelope.mutationId)
+      assert.deepStrictEqual(yield* currentReplica.quarantine, [])
+      assert.deepStrictEqual(yield* v3.pending, [])
+    })).pipe(Effect.provide(database)))
+
+  it.effect("does not invalidate quarantine dependencies before the outer disposition commits", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const reactivity = yield* Reactivity.Reactivity
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const original = yield* v1.mutate(PutTodoV1, { id: "47", title: "atomic-invalidation" })
+      const v2 = yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
+      const item = Option.getOrThrow(yield* v2.quarantineByMutation(original.envelope.mutationId))
+      const server = yield* buildServer(definitionV2, handlersV2, evolution)
+      const receipt = yield* server.discard({ envelope: item.envelope, schema: v2.schema }, null)
+      let invalidations = 0
+      const cancel = reactivity.registerUnsafe([
+        `effect-local:space:${spaceId}:receipt:${original.envelope.mutationId}`
+      ], () => invalidations++)
+      yield* Effect.addFinalizer(() => Effect.sync(cancel))
+      yield* sql`CREATE TRIGGER fail_quarantine_delete BEFORE DELETE ON effect_local_client_quarantine
+        BEGIN SELECT RAISE(ABORT, 'quarantine delete failed'); END`
+
+      assert.strictEqual((yield* v2.resolveQuarantine(receipt).pipe(Effect.flip))._tag, "StorageUnavailable")
+      assert.strictEqual(invalidations, 0)
+      assert.isTrue(Option.isSome(yield* v2.quarantineByMutation(original.envelope.mutationId)))
+    })).pipe(Effect.provide(database)))
+
+  it.effect("serves submit and pull to the immediately previous schema inside the configured window", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const server = yield* buildServer(definitionV2, handlersV2, evolution, {
+        acceptedSchemaVersions: 1,
+        retainedHistoryEntries: 0
+      })
+      const envelope = yield* v1Envelope(
+        clientId,
+        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000160"),
+        1,
+        { id: "42", title: "mixed-version" }
+      )
+
+      const receipt = yield* server.admit({ envelope, schema: definitionV1.schemaIdentity }, "principal")
+      assert.strictEqual(receipt._tag, "Accepted")
+      if (receipt._tag === "Accepted") {
+        assert.deepStrictEqual(receipt.sourceSchema, definitionV1.schemaIdentity)
+        assert.strictEqual(receipt.mutationVersion, PutTodoV1.version)
+        assert.deepStrictEqual(receipt.result, { id: "42", title: "mixed-version" })
+      }
+
+      const result = incremental(
+        yield* server.pullAuthorized({
+          spaceId,
+          schema: definitionV1.schemaIdentity,
+          after: Identity.ServerSequence.make(0),
+          limit: 10
+        }, "principal")
+      )
+      assert.strictEqual(result.entries.length, 1)
+      assert.deepStrictEqual(result.entries[0].sourceSchema, definitionV1.schemaIdentity)
+      assert.deepStrictEqual(result.entries[0].changes, [{
+        _tag: "Upsert",
+        entity: { model: "Todo", modelVersion: TodoV1.version, key: "42" },
+        value: { id: "42", title: "mixed-version" }
+      }])
+
+      yield* server.maintain(spaceId)
+      const compacted = yield* server.pullAuthorized({
+        spaceId,
+        schema: definitionV1.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      }, "principal")
+      assert.isTrue("_tag" in compacted)
+      if (!("_tag" in compacted)) assert.fail("expected a projected bootstrap manifest")
+      assert.deepStrictEqual(compacted.manifest.schema, definitionV1.schemaIdentity)
+      assert.strictEqual(compacted.manifest.definitionHash, definitionV1.hash)
+      const page = yield* server.bootstrapAuthorized({
+        spaceId,
+        schema: definitionV1.schemaIdentity,
+        snapshotId: compacted.manifest.snapshotId,
+        afterOrdinal: -1,
+        limit: 10
+      }, "principal")
+      assert.deepStrictEqual(page.manifest, compacted.manifest)
+      assert.deepStrictEqual(page.entities.map(({ entityBytes: _, ...entity }) => entity), [{
+        ordinal: 0,
+        model: "Todo",
+        modelVersion: TodoV1.version,
+        key: "42",
+        value: { id: "42", title: "mixed-version" }
+      }])
+      assert.isFalse(page.hasMore)
+      const ProjectionCounts = Schema.Struct({ manifests: Schema.Number, entities: Schema.Number })
+      const projectionCounts = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: ProjectionCounts,
+        execute: () =>
+          sql`SELECT
+          (SELECT COUNT(*) FROM effect_local_server_snapshot_projections) AS manifests,
+          (SELECT COUNT(*) FROM effect_local_server_snapshot_projection_entities) AS entities`
+      })(undefined)
+      assert.deepStrictEqual(projectionCounts, { manifests: 1, entities: 1 })
+
+      const serverV3 = yield* buildServer(definitionV3, handlersV3, evolutionV3, { acceptedSchemaVersions: 1 })
+      const stale = yield* serverV3.pullAuthorized({
+        spaceId,
+        schema: definitionV1.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      }, "principal").pipe(Effect.flip)
+      assert.strictEqual(stale._tag, "StaleSchema")
+    })).pipe(Effect.provide(database)))
+
+  it.effect("rejects an accepted schema window without complete downgrade transforms", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const error = yield* buildServer(definitionV2, handlersV2, forwardOnlyEvolution, {
+        acceptedSchemaVersions: 1
+      }).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "InvalidConfiguration")
+      if (error._tag === "InvalidConfiguration") assert.strictEqual(error.option, "acceptedSchemaVersions")
+    })).pipe(Effect.provide(database)))
+
+  it.effect("paginates pull by the projected wire representation", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const server = yield* buildServer(expandedDefinitionV2, expandedHandlers, expandingEvolution, {
+        acceptedSchemaVersions: 1
+      })
+      for (let sequence = 1; sequence <= 2; sequence++) {
+        const mutationId = Identity.MutationId.make(`mut_00000000-0000-4000-8000-00000000017${sequence}`)
+        const identity = {
+          spaceId,
+          clientId,
+          mutationId,
+          localSequence: Identity.LocalSequence.make(sequence),
+          basis: Identity.ServerSequence.make(sequence - 1),
+          name: PutExpanded.name,
+          payload: { id: String(sequence), compact: "x".repeat(30_000) },
+          digestVersion: 3 as const,
+          membershipIncarnation,
+          sourceSchema: expandedDefinitionV2.schemaIdentity,
+          mutationVersion: PutExpanded.version
+        }
+        const envelope = Protocol.MutationEnvelope.make({
+          ...identity,
+          digest: yield* Protocol.mutationDigest(identity)
+        })
+        assert.strictEqual(
+          (yield* server.submit({ envelope, schema: expandedDefinitionV2.schemaIdentity }))._tag,
+          "Accepted"
+        )
+      }
+
+      const first = incremental(
+        yield* server.pull({
+          spaceId,
+          schema: expandedDefinitionV1.schemaIdentity,
+          after: Identity.ServerSequence.make(0),
+          limit: 10
+        })
+      )
+      assert.strictEqual(first.entries.length, 1)
+      assert.isTrue(first.hasMore)
+      assert.isAtMost(yield* Protocol.encodedBytesEffect(first), Protocol.maximumBatchBytes)
+
+      const second = incremental(
+        yield* server.pull({
+          spaceId,
+          schema: expandedDefinitionV1.schemaIdentity,
+          after: first.entries[0].sequence,
+          limit: 10
+        })
+      )
+      assert.strictEqual(second.entries.length, 1)
+      assert.isFalse(second.hasMore)
+    })).pipe(Effect.provide(database)))
+
+  it.effect("caps source log bytes before loading entries that project smaller", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const server = yield* buildServer(largeDefinitionV2, largeHandlers, compactingEvolution, {
+        acceptedSchemaVersions: 1
+      })
+      for (let sequence = 1; sequence <= 2; sequence++) {
+        const identity = {
+          spaceId,
+          clientId,
+          mutationId: Identity.MutationId.make(`mut_00000000-0000-4000-8000-00000000018${sequence}`),
+          localSequence: Identity.LocalSequence.make(sequence),
+          basis: Identity.ServerSequence.make(sequence - 1),
+          name: PutLarge.name,
+          payload: { id: String(sequence) },
+          digestVersion: 3 as const,
+          membershipIncarnation,
+          sourceSchema: largeDefinitionV2.schemaIdentity,
+          mutationVersion: PutLarge.version
+        }
+        const envelope = Protocol.MutationEnvelope.make({
+          ...identity,
+          digest: yield* Protocol.mutationDigest(identity)
+        })
+        assert.strictEqual(
+          (yield* server.submit({ envelope, schema: largeDefinitionV2.schemaIdentity }))._tag,
+          "Accepted"
+        )
+      }
+
+      const first = incremental(
+        yield* server.pull({
+          spaceId,
+          schema: compactDefinitionV1.schemaIdentity,
+          after: Identity.ServerSequence.make(0),
+          limit: 10
+        })
+      )
+      assert.strictEqual(first.entries.length, 1)
+      assert.isTrue(first.hasMore)
+
+      const second = incremental(
+        yield* server.pull({
+          spaceId,
+          schema: compactDefinitionV1.schemaIdentity,
+          after: first.entries[0].sequence,
+          limit: 10
+        })
+      )
+      assert.strictEqual(second.entries.length, 1)
+      assert.isFalse(second.hasMore)
+    })).pipe(Effect.provide(database)))
+
+  it.effect("reports durable snapshot projection key conflicts as schema collisions", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const server = yield* buildServer(definitionV2, handlersV2, collidingProjectionEvolution, {
+        acceptedSchemaVersions: 1,
+        retainedHistoryEntries: 0
+      })
+      for (let sequence = 1; sequence <= 2; sequence++) {
+        const identity = {
+          spaceId,
+          clientId,
+          mutationId: Identity.MutationId.make(`mut_00000000-0000-4000-8000-00000000019${sequence}`),
+          localSequence: Identity.LocalSequence.make(sequence),
+          basis: Identity.ServerSequence.make(sequence - 1),
+          name: PutTodoV2.name,
+          payload: { id: sequence, title: `collision-${sequence}`, done: false },
+          digestVersion: 3 as const,
+          membershipIncarnation,
+          sourceSchema: definitionV2.schemaIdentity,
+          mutationVersion: PutTodoV2.version
+        }
+        const envelope = Protocol.MutationEnvelope.make({
+          ...identity,
+          digest: yield* Protocol.mutationDigest(identity)
+        })
+        assert.strictEqual((yield* server.submit({ envelope, schema: definitionV2.schemaIdentity }))._tag, "Accepted")
+      }
+      yield* server.maintain(spaceId)
+
+      const error = yield* server.pull({
+        spaceId,
+        schema: definitionV1.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      }).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "SchemaKeyCollision")
+      const ProjectionCounts = Schema.Struct({ manifests: Schema.Number, entities: Schema.Number })
+      const projectionCounts = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: ProjectionCounts,
+        execute: () =>
+          sql`SELECT
+          (SELECT COUNT(*) FROM effect_local_server_snapshot_projections) AS manifests,
+          (SELECT COUNT(*) FROM effect_local_server_snapshot_projection_entities) AS entities`
+      })(undefined)
+      assert.deepStrictEqual(projectionCounts, { manifests: 0, entities: 0 })
     })).pipe(Effect.provide(database)))
 
   it.effect("resumes a server promotion after interruption", () =>

@@ -80,6 +80,7 @@ const sync = Layer.effect(
     Effect.map((store) =>
       SyncEngine.SyncEngine.of({
         submit: store.submit,
+        discard: (request) => store.discard(request, null),
         pull: store.pull,
         bootstrap: store.bootstrap,
         watch: store.watch

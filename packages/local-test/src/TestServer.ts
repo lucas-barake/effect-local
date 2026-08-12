@@ -28,6 +28,7 @@ export const layer: Layer.Layer<SyncEngine.SyncEngine, never, ServerStore.Server
             }
             return receipt
           }),
+        discard: (request) => online(request.envelope.spaceId).pipe(Effect.andThen(server.discard(request, null))),
         pull: (request) =>
           Effect.gen(function*() {
             yield* online(request.spaceId)
@@ -39,7 +40,8 @@ export const layer: Layer.Layer<SyncEngine.SyncEngine, never, ServerStore.Server
             ) return page
             return {
               entries: [page.entries[0], ...page.entries].slice(0, Protocol.maximumBatchEntries),
-              hasMore: page.hasMore
+              hasMore: page.hasMore,
+              serverSchema: page.serverSchema
             }
           }),
         bootstrap: (request) => online(request.spaceId).pipe(Effect.andThen(server.bootstrap(request))),

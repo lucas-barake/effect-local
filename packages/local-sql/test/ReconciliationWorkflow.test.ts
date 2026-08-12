@@ -87,6 +87,7 @@ const directSync = (server: ServerStore.Service) =>
     SyncEngine.SyncEngine,
     SyncEngine.SyncEngine.of({
       submit: server.submit,
+      discard: (request) => server.discard(request, null),
       pull: server.pull,
       bootstrap: server.bootstrap,
       watch: server.watch
@@ -187,6 +188,7 @@ describe("reconciliation workflow", () => {
       const blockedSync = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: () =>
             Deferred.succeed(pullEntered, undefined).pipe(
@@ -326,8 +328,9 @@ describe("reconciliation workflow", () => {
           )
           const local = Context.get(localContext, LocalStore.Store)
           const remote = SyncEngine.SyncEngine.of({
+            discard: () => Effect.die("unexpected discard"),
             submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-            pull: () => Effect.succeed({ entries: [], hasMore: false }),
+            pull: () => Effect.succeed({ entries: [], hasMore: false, serverSchema: definition.schemaIdentity }),
             bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
             watch: () => Stream.never
           })
@@ -439,11 +442,16 @@ describe("reconciliation workflow", () => {
           )
           const local = Context.get(localContext, LocalStore.Store)
           const remote = SyncEngine.SyncEngine.of({
+            discard: () => Effect.die("unexpected discard"),
             submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
             pull: () =>
               Ref.update(pulls, (count) => count + 1).pipe(
                 Effect.andThen(Deferred.succeed(pulled, undefined)),
-                Effect.as({ entries: [], hasMore: false })
+                Effect.as({
+                  entries: [],
+                  hasMore: false,
+                  serverSchema: Domain.definition.schemaIdentity
+                })
               ),
             bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
             watch: () => Stream.never
@@ -510,11 +518,17 @@ describe("reconciliation workflow", () => {
       )
       const local = Context.get(localContext, LocalStore.Store)
       const remote = SyncEngine.SyncEngine.of({
+        discard: () => Effect.die("unexpected discard"),
         submit: () =>
           Ref.update(attempts, (count) => count + 1).pipe(
             Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
           ),
-        pull: () => Effect.succeed({ entries: [], hasMore: false }),
+        pull: () =>
+          Effect.succeed({
+            entries: [],
+            hasMore: false,
+            serverSchema: Domain.definition.schemaIdentity
+          }),
         bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         watch: () => Stream.never
       })
@@ -582,6 +596,7 @@ describe("reconciliation workflow", () => {
         actualHash: "actual"
       })
       const remote = SyncEngine.SyncEngine.of({
+        discard: () => Effect.die("unexpected discard"),
         submit: () => Effect.die("unexpected submit"),
         pull: () =>
           Ref.update(attempts, (count) => count + 1).pipe(

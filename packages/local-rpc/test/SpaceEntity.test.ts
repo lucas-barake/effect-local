@@ -230,7 +230,8 @@ describe("SpaceEntity", () => {
           digest: Protocol.initialSnapshotDigest
         },
         entities: [],
-        hasMore: false
+        hasMore: false,
+        serverSchema: definition.schemaIdentity
       })
       const wrapped = ServerStore.ServerStore.of({
         ...actual,

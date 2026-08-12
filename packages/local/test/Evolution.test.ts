@@ -40,7 +40,9 @@ const todoMigration = Evolution.model({
   from: TodoV1,
   to: TodoV2,
   key: Number,
-  value: ({ value }) => ({ ...value, done: false })
+  value: ({ value }) => ({ ...value, done: false }),
+  downgradeKey: String,
+  downgradeValue: ({ value }) => ({ id: value.id, title: value.title })
 })
 const putTodoMigration = Evolution.mutation({
   id: "put-todo/1-2",
@@ -48,7 +50,13 @@ const putTodoMigration = Evolution.mutation({
   to: PutTodoV2,
   payload: (payload) => ({ ...payload, done: false }),
   success: (success) => ({ ...success, done: false }),
-  rejection: (rejection) => rejection
+  rejection: (rejection) => rejection,
+  downgradePayload: ({ id, title }) => ({ id, title }),
+  downgradeSuccess: ({ id, title }) => ({ id, title }),
+  downgradeRejection: (rejection) => {
+    if (rejection === "Forbidden") return "Missing"
+    return rejection
+  }
 })
 const oneToTwo = Evolution.step({
   id: "definition/1-2",
@@ -146,6 +154,56 @@ describe("schema evolution", () => {
         mutationVersion: Identity.SchemaVersion.make(1),
         value: "Missing"
       })
+      assert.strictEqual(rejection.value, "Missing")
+    }))
+
+  it.effect("projects models and mutation outcomes to an explicit older definition", () =>
+    Effect.gen(function*() {
+      const model = yield* Evolution.migrateModelTo({
+        evolution,
+        source: definitionV2.schemaIdentity,
+        target: definitionV1.schemaIdentity,
+        model: "Todo",
+        modelVersion: Identity.SchemaVersion.make(2),
+        key: 42,
+        value: { id: "42", title: "new", done: true }
+      })
+      assert.deepStrictEqual(model.schemaIdentity, definitionV1.schemaIdentity)
+      assert.strictEqual(model.key, "42")
+      assert.deepStrictEqual(model.value, { id: "42", title: "new" })
+      assert.deepStrictEqual(model.aliases.map((alias) => alias.key), [42, "42"])
+
+      const payload = yield* Evolution.migrateMutationPayloadTo({
+        evolution,
+        source: definitionV2.schemaIdentity,
+        target: definitionV1.schemaIdentity,
+        mutation: "PutTodo",
+        mutationVersion: Identity.SchemaVersion.make(2),
+        value: { id: "42", title: "new", done: true }
+      })
+      assert.deepStrictEqual(payload.schemaIdentity, definitionV1.schemaIdentity)
+      assert.deepStrictEqual(payload.value, { id: "42", title: "new" })
+
+      const success = yield* Evolution.migrateMutationSuccessTo({
+        evolution,
+        source: definitionV2.schemaIdentity,
+        target: definitionV1.schemaIdentity,
+        mutation: "PutTodo",
+        mutationVersion: Identity.SchemaVersion.make(2),
+        value: { id: "42", title: "new", done: true }
+      })
+      assert.deepStrictEqual(success.schemaIdentity, definitionV1.schemaIdentity)
+      assert.deepStrictEqual(success.value, { id: "42", title: "new" })
+
+      const rejection = yield* Evolution.migrateMutationRejectionTo({
+        evolution,
+        source: definitionV2.schemaIdentity,
+        target: definitionV1.schemaIdentity,
+        mutation: "PutTodo",
+        mutationVersion: Identity.SchemaVersion.make(2),
+        value: "Forbidden"
+      })
+      assert.deepStrictEqual(rejection.schemaIdentity, definitionV1.schemaIdentity)
       assert.strictEqual(rejection.value, "Missing")
     }))
 

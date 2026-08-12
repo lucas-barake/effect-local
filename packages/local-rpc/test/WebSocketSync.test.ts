@@ -32,6 +32,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "../src/Authentication.js"
 import * as PresenceClient from "../src/PresenceClient.js"
 import * as PresenceHub from "../src/PresenceHub.js"
+import * as ProtocolSession from "../src/ProtocolSession.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
 import * as SyncClient from "../src/SyncClient.js"
 import * as SyncRpc from "../src/SyncRpc.js"
@@ -233,6 +234,82 @@ const singleClientLive = client.pipe(
   Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
 )
 
+const incompatibleServer = SyncServer.layerWithOptions({ supportedProtocolVersions: [2] }).pipe(
+  Layer.provideMerge(websocketProtocol),
+  Layer.provide(cluster),
+  Layer.provide(authenticationServer),
+  Layer.provide(HttpRouter.serve(websocketProtocol, { disableListenLog: true, disableLogger: true }))
+)
+const incompatibleClient = SyncClient.layerWithOptions({ supportedProtocolVersions: [1] }).pipe(
+  Layer.provide(clientProtocol),
+  Layer.provide(authenticationClient)
+)
+const incompatibleLive = incompatibleClient.pipe(
+  Layer.provideMerge(incompatibleServer),
+  Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
+)
+const invalidProtocolClient = SyncClient.layerWithOptions({ supportedProtocolVersions: [] }).pipe(
+  Layer.provide(clientProtocol),
+  Layer.provide(authenticationClient)
+)
+const invalidProtocolLive = invalidProtocolClient.pipe(
+  Layer.provideMerge(websocketServer),
+  Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
+)
+
+type ProtocolObservation =
+  | { readonly _tag: "Negotiate" }
+  | { readonly _tag: "Pull"; readonly version: Protocol.ProtocolVersion }
+  | { readonly _tag: "PublishPresence"; readonly version: Protocol.ProtocolVersion }
+
+const protocolObservations = MutableRef.make<Array<ProtocolObservation>>([])
+const observingAuthenticationServer = Layer.effect(
+  Authentication.Authentication,
+  Authentication.Authentication.pipe(
+    Effect.map((authenticate) =>
+      Authentication.Authentication.of((effect, options) =>
+        Effect.sync(() => {
+          const payload = options.payload
+          if (options.rpc._tag === "Negotiate") {
+            MutableRef.update(protocolObservations, (observations) => [
+              ...observations,
+              { _tag: "Negotiate" as const }
+            ])
+          } else if (options.rpc._tag === "Pull" && Schema.is(Protocol.VersionedPullRequest)(payload)) {
+            MutableRef.update(protocolObservations, (observations) => [
+              ...observations,
+              { _tag: "Pull" as const, version: payload.protocolVersion }
+            ])
+          } else if (
+            options.rpc._tag === "PublishPresence" && Schema.is(Protocol.VersionedPresenceUpdate)(payload)
+          ) {
+            MutableRef.update(protocolObservations, (observations) => [
+              ...observations,
+              { _tag: "PublishPresence" as const, version: payload.protocolVersion }
+            ])
+          }
+        }).pipe(Effect.andThen(authenticate(effect, options)))
+      )
+    )
+  )
+).pipe(Layer.provide(authenticationServer))
+const protocol2Server = SyncServer.layerWithOptions({ supportedProtocolVersions: [1, 2] }).pipe(
+  Layer.provideMerge(websocketProtocol),
+  Layer.provide(cluster),
+  Layer.provide(observingAuthenticationServer),
+  Layer.provide(HttpRouter.serve(websocketProtocol, { disableListenLog: true, disableLogger: true }))
+)
+const configurableProtocolSession = ProtocolSession.layerWithOptions({ supportedProtocolVersions: [1, 2] })
+const configurableClient = Layer.merge(SyncClient.layerFromSession, PresenceClient.layerFromSession).pipe(
+  Layer.provide(configurableProtocolSession),
+  Layer.provide(clientProtocol),
+  Layer.provide(authenticationClient)
+)
+const configurableLive = configurableClient.pipe(
+  Layer.provideMerge(protocol2Server),
+  Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
+)
+
 describe("WebSocket synchronization", () => {
   it.effect("multiplexes two Replica spaces through exactly one WebSocket", () =>
     Effect.gen(function*() {
@@ -277,6 +354,50 @@ describe("WebSocket synchronization", () => {
       assert.strictEqual(MutableRef.get(webSocketConstructions), 1)
       assert.strictEqual(MutableRef.get(liveWebSockets), 1)
     }).pipe(Effect.provide(NodeCrypto.layer)))
+
+  it.effect("rejects an empty protocol version configuration at layer construction", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const error = yield* Layer.build(invalidProtocolLive).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "InvalidConfiguration")
+    })))
+
+  it.effect("returns UpgradeRequired when protocol versions do not intersect", () =>
+    Effect.gen(function*() {
+      const remote = yield* SyncEngine.SyncEngine
+      const error = yield* remote.pull({
+        spaceId,
+        schema: definition.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      }).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "UpgradeRequired")
+    }).pipe(Effect.provide(incompatibleLive)))
+
+  it.effect("shares one negotiated protocol version across configurable sync and presence clients", () =>
+    Effect.gen(function*() {
+      MutableRef.set(protocolObservations, [])
+      const remote = yield* SyncEngine.SyncEngine
+      const presence = yield* PresenceClient.PresenceClient
+
+      yield* remote.pull({
+        spaceId,
+        schema: definition.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      })
+      yield* presence.publish({
+        spaceId,
+        clientId,
+        value: { cursor: 3 },
+        ttlMillis: 5_000
+      })
+
+      assert.deepStrictEqual(MutableRef.get(protocolObservations), [
+        { _tag: "Negotiate" },
+        { _tag: "Pull", version: Protocol.ProtocolVersion.make(2) },
+        { _tag: "PublishPresence", version: Protocol.ProtocolVersion.make(2) }
+      ])
+    }).pipe(Effect.provide(configurableLive)))
 
   it.effect("delivers an authorized bounded bootstrap through both RPC hops", () =>
     Effect.gen(function*() {
