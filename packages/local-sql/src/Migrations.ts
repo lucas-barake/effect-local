@@ -1657,6 +1657,36 @@ const serverV10 = makeMigration({
   ]
 })
 
+const serverV11 = makeMigration({
+  id: 11,
+  name: "server-secondary-indexes",
+  statements: [
+    `CREATE TABLE effect_local_server_index_catalog (
+      model TEXT NOT NULL,
+      index_name TEXT NOT NULL,
+      descriptor_hash TEXT NOT NULL,
+      table_name TEXT NOT NULL UNIQUE,
+      scan_index_name TEXT NOT NULL UNIQUE,
+      PRIMARY KEY (model, index_name, descriptor_hash)
+    )`,
+    `CREATE TABLE effect_local_server_index_state (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
+      descriptor_hash TEXT NOT NULL,
+      built INTEGER NOT NULL DEFAULT 0 CHECK (built IN (0, 1)),
+      PRIMARY KEY (space_id, schema_generation, descriptor_hash)
+    )`,
+    `CREATE TABLE effect_local_server_index_partition_log (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
+      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
+      descriptor_hash TEXT NOT NULL,
+      partition_json TEXT NOT NULL CHECK (json_valid(partition_json)),
+      PRIMARY KEY (space_id, server_sequence, descriptor_hash, partition_json)
+    )`
+  ]
+})
+
 export const serverCatalog = Object.freeze([
   serverV1,
   serverV2,
@@ -1667,7 +1697,8 @@ export const serverCatalog = Object.freeze([
   serverV7,
   serverV8,
   serverV9,
-  serverV10
+  serverV10,
+  serverV11
 ])
 
 export const client = (options: {

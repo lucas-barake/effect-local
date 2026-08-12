@@ -34,6 +34,45 @@ export const Todo = Model.make("Todo", {
   }
 })
 
+const MessageSchema = Schema.Struct({
+  id: Schema.String,
+  chatId: Schema.String,
+  sentAt: Schema.Number,
+  body: Schema.String
+})
+export const Message = Model.make("Message", {
+  version: 1,
+  key: Schema.String,
+  schema: MessageSchema,
+  indexes: {
+    byChat: {
+      version: 1,
+      partition: [{
+        name: "chatId",
+        affinity: "text",
+        schema: Schema.String,
+        extract: (message: typeof MessageSchema.Type) => message.chatId
+      }],
+      sort: [{
+        name: "sentAt",
+        affinity: "real",
+        schema: Schema.Number,
+        extract: (message: typeof MessageSchema.Type) => message.sentAt
+      }]
+    }
+  }
+})
+
+export const PutMessage = Mutation.make("PutMessage", {
+  version: 1,
+  payload: Message.schema
+})
+
+export const DeleteMessage = Mutation.make("DeleteMessage", {
+  version: 1,
+  payload: { id: Schema.String }
+})
+
 export const PutTodo = Mutation.make("PutTodo", {
   version: 1,
   payload: Todo.schema,
@@ -104,8 +143,10 @@ export const ReadCountIndex = Query.make("ReadCountIndex", {
 
 export const definition = Definition.make({
   version: 1,
-  models: [Todo],
+  models: [Todo, Message],
   mutations: [
+    PutMessage,
+    DeleteMessage,
     PutTodo,
     RenameTodo,
     DeleteTodo,
@@ -128,6 +169,8 @@ const getTodo = (transaction: Parameters<ReturnType<typeof RenameTodo.of>>[0]["t
   )
 
 export const handlers = Layer.mergeAll(
+  PutMessage.toLayer(({ payload, transaction }) => transaction.set(Message, payload.id, payload)),
+  DeleteMessage.toLayer(({ payload, transaction }) => transaction.delete(Message, payload.id)),
   PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
   RenameTodo.toLayer(({ payload, transaction }) =>
     Effect.gen(function*() {

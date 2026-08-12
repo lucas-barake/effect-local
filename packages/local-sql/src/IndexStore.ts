@@ -13,6 +13,7 @@ import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import type * as Statement from "effect/unstable/sql/Statement"
 import * as Codec from "./internal/codec.js"
+import { affinitySql, encodeComponent } from "./internal/indexComponents.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 
 type SqlValue = string | number
@@ -117,7 +118,6 @@ const CursorPayload = Schema.Struct({
 })
 
 const CursorFromString = Schema.fromJsonString(CursorPayload)
-const affinitySql = { text: "TEXT", real: "REAL", integer: "INTEGER" } as const
 const backfillPageSize = 128
 const maximumCursorBytes = 16 * 1024
 
@@ -188,37 +188,6 @@ const makeDescriptor = (model: Model.Any, indexName: string, index: SecondaryInd
 const descriptors = (definition: Definition.Any): ReadonlyArray<Descriptor> =>
   definition.models.flatMap((model) =>
     Object.entries(model.indexes).map(([indexName, index]) => makeDescriptor(model, indexName, index))
-  )
-
-const encodeComponent = (
-  component: SecondaryIndex.ComponentInput,
-  value: unknown
-): Effect.Effect<SqlValue, ReplicaError.StorageCorrupt> =>
-  Schema.encodeUnknownEffect(component.schema)(value).pipe(
-    Effect.mapError((cause) =>
-      new ReplicaError.StorageCorrupt({
-        message: `Index component ${component.name} failed Schema encoding`,
-        cause
-      })
-    ),
-    Effect.flatMap((encoded): Effect.Effect<SqlValue, ReplicaError.StorageCorrupt> => {
-      if (component.affinity === "text" && typeof encoded === "string") return Effect.succeed<SqlValue>(encoded)
-      if (component.affinity === "real" && typeof encoded === "number" && Number.isFinite(encoded)) {
-        return Effect.succeed<SqlValue>(encoded)
-      }
-      if (component.affinity === "integer") {
-        if (typeof encoded === "boolean") {
-          if (encoded) return Effect.succeed<SqlValue>(1)
-          return Effect.succeed<SqlValue>(0)
-        }
-        if (typeof encoded === "number" && Number.isSafeInteger(encoded)) return Effect.succeed<SqlValue>(encoded)
-      }
-      return Effect.fail(
-        new ReplicaError.StorageCorrupt({
-          message: `Index component ${component.name} encoded outside its SQLite affinity`
-        })
-      )
-    })
   )
 
 const encodedComponents = (

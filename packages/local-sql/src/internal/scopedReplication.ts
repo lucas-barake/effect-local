@@ -26,6 +26,32 @@ export interface Authorization {
   ) => Effect.Effect<boolean>
 }
 
+export interface WindowRuntime {
+  readonly membership: (
+    spaceId: Identity.SpaceId,
+    schemaGeneration: number,
+    window: Protocol.ReplicationWindow
+  ) => Effect.Effect<ReadonlySet<string>, ReplicaError.ReplicaError>
+  readonly partitionMembership: (
+    spaceId: Identity.SpaceId,
+    schemaGeneration: number,
+    window: Protocol.ReplicationWindow,
+    partitions: ReadonlyArray<ReadonlyArray<string | number>>
+  ) => Effect.Effect<ReadonlySet<string>, ReplicaError.ReplicaError>
+  readonly partitionsOf: (
+    spaceId: Identity.SpaceId,
+    schemaGeneration: number,
+    window: Protocol.ReplicationWindow,
+    entityKeys: ReadonlyArray<string>
+  ) => Effect.Effect<ReadonlyMap<string, ReadonlyArray<string | number>>, ReplicaError.ReplicaError>
+  readonly affectedPartitions: (
+    spaceId: Identity.SpaceId,
+    schemaGeneration: number,
+    window: Protocol.ReplicationWindow,
+    afterSequence: number
+  ) => Effect.Effect<ReadonlyArray<ReadonlyArray<string | number>>, ReplicaError.ReplicaError>
+}
+
 export interface Options {
   readonly sql: SqlClient.SqlClient
   readonly crypto: Crypto.Crypto
@@ -34,6 +60,7 @@ export interface Options {
   readonly maximumSnapshotBytes: number
   readonly maximumBootstrapPageBytes: number
   readonly authorization: Authorization
+  readonly windows: WindowRuntime
   readonly resolveDefinition: (
     schema: Identity.SchemaIdentity
   ) => Effect.Effect<Definition.Any, ReplicaError.ReplicaError>
@@ -352,18 +379,54 @@ export const make = (options: Options) => {
       return all
     })
 
+  const emptyWindowSelection: ReadonlyMap<string, ReadonlySet<string>> = new Map()
+
+  const windowSelection = (
+    spaceId: Identity.SpaceId,
+    schemaGeneration: number,
+    scope: Protocol.ReplicationScope
+  ): Effect.Effect<ReadonlyMap<string, ReadonlySet<string>>, ReplicaError.ReplicaError> =>
+    Effect.gen(function*() {
+      if (scope.windows === undefined || scope.windows.length === 0) return emptyWindowSelection
+      const selection = new Map<string, Set<string>>()
+      for (const window of scope.windows) {
+        const members = yield* options.windows.membership(spaceId, schemaGeneration, window)
+        let keys = selection.get(window.model)
+        if (keys === undefined) {
+          keys = new Set()
+          selection.set(window.model, keys)
+        }
+        for (const key of members) keys.add(key)
+      }
+      return selection
+    })
+
+  const windowsByModel = (scope: Protocol.ReplicationScope) => {
+    const map = new Map<string, Array<Protocol.ReplicationWindow>>()
+    for (const window of scope.windows ?? []) {
+      const existing = map.get(window.model) ?? []
+      existing.push(window)
+      map.set(window.model, existing)
+    }
+    return map
+  }
+
   const projectVisible = (
     request: Protocol.PullRequest | Protocol.BootstrapRequest,
     principal: typeof Schema.Json.Type,
     source: ReadonlyMap<string, MaterializedEntity>,
-    targetDefinition: Definition.Any
+    targetDefinition: Definition.Any,
+    windowKeys: ReadonlyMap<string, ReadonlySet<string>>
   ) =>
     Effect.gen(function*() {
       const all = yield* projectAll(source, targetDefinition)
       const selected = new Set(request.scope.models)
       const target = new Map<string, MaterializedEntity>()
       for (const materialized of all.values()) {
-        if (!selected.has(materialized.entity.model)) continue
+        if (
+          !selected.has(materialized.entity.model) &&
+          !(windowKeys.get(materialized.entity.model)?.has(materialized.entityKey) ?? false)
+        ) continue
         if (
           yield* options.authorization.entity(
             request,
@@ -493,7 +556,14 @@ export const make = (options: Options) => {
         })
       }
       const source = yield* authoritative(request.spaceId)
-      const projected = yield* projectVisible({ ...request, scope: normalized }, principal, source, targetDefinition)
+      const selection = yield* windowSelection(request.spaceId, space.active_schema_generation, normalized)
+      const projected = yield* projectVisible(
+        { ...request, scope: normalized },
+        principal,
+        source,
+        targetDefinition,
+        selection
+      )
       const visibleEntities = Array.from(projected.target.values())
       const orderedEntities = visibleEntities.toSorted((left, right) => {
         if (left.identity < right.identity) return -1
@@ -655,7 +725,7 @@ export const make = (options: Options) => {
         const current = all.get(identityOf(change.entity.model, key))
         if (change._tag === "Upsert") {
           if (
-            current === undefined || !request.scope.models.includes(current.entity.model) ||
+            current === undefined || !Protocol.replicationScopeCoversModel(request.scope, current.entity.model) ||
             change.entity.modelVersion !== current.entity.modelVersion ||
             (yield* Codec.stringify(change.value)) !== current.valueJson ||
             !(yield* options.authorization.entity(request, principal, current.sourceEntity, current.sourceValue))
@@ -896,39 +966,127 @@ export const make = (options: Options) => {
       )
       const current = yield* materializeByIdentity(request.spaceId, [...changed.values()])
       const selected = new Set(normalized.models)
+      const windowed = windowsByModel(normalized)
       const changes = new Map<string, Protocol.ViewChange>()
-      for (const identity of changed.keys()) {
-        const materialized = current.get(identity)
-        const ackedRow = ackedByIdentity.get(identity)
-        let authorized = false
-        if (materialized !== undefined && selected.has(materialized.entity.model)) {
-          authorized = yield* options.authorization.entity(
-            request,
-            principal,
-            materialized.sourceEntity,
-            materialized.sourceValue
-          )
-        }
-        if (authorized) {
-          const entity = materialized!
-          if (ackedRow?.disposition !== "Upsert" || ackedRow.value_json !== entity.valueJson) {
-            changes.set(identity, Protocol.Upsert.make({ entity: entity.entity, value: entity.value }))
+      const processed = new Set<string>()
+      const diffCandidate = (
+        identity: string,
+        materialized: MaterializedEntity | undefined,
+        inScope: boolean
+      ) =>
+        Effect.gen(function*() {
+          processed.add(identity)
+          const ackedRow = ackedByIdentity.get(identity)
+          let authorized = false
+          if (materialized !== undefined && inScope) {
+            authorized = yield* options.authorization.entity(
+              request,
+              principal,
+              materialized.sourceEntity,
+              materialized.sourceValue
+            )
           }
+          if (authorized) {
+            const entity = materialized!
+            if (ackedRow?.disposition !== "Upsert" || ackedRow.value_json !== entity.valueJson) {
+              changes.set(identity, Protocol.Upsert.make({ entity: entity.entity, value: entity.value }))
+            }
+            return
+          }
+          if (ackedRow === undefined) return
+          const ackedEntity = Protocol.EntityKey.make({
+            model: ackedRow.model,
+            modelVersion: ackedRow.model_version,
+            key: yield* Codec.parse(ackedRow.entity_key)
+          })
+          let disposition: Protocol.ViewChange = Protocol.Delete.make({ entity: ackedEntity })
+          if (materialized !== undefined) disposition = Protocol.Retract.make({ entity: ackedEntity })
+          if (ackedRow.disposition !== disposition._tag) changes.set(identity, disposition)
+        })
+      for (const [identity, reference] of changed) {
+        if (windowed.has(reference.model)) continue
+        if (!selected.has(reference.model)) {
+          processed.add(identity)
           continue
         }
-        if (ackedRow === undefined) continue
-        const ackedEntity = Protocol.EntityKey.make({
-          model: ackedRow.model,
-          modelVersion: ackedRow.model_version,
-          key: yield* Codec.parse(ackedRow.entity_key)
-        })
-        let disposition: Protocol.ViewChange = Protocol.Delete.make({ entity: ackedEntity })
-        if (materialized !== undefined) disposition = Protocol.Retract.make({ entity: ackedEntity })
-        if (ackedRow.disposition !== disposition._tag) changes.set(identity, disposition)
+        yield* diffCandidate(identity, current.get(identity), true)
+      }
+      const generation = space.active_schema_generation
+      for (const [model, windows] of windowed) {
+        const candidateKeys = new Set<string>()
+        for (const reference of changed.values()) {
+          if (reference.model === model) candidateKeys.add(reference.key)
+        }
+        const ackedKeys: Array<string> = []
+        for (const row of acknowledged) {
+          if (row.model === model) ackedKeys.push(row.entity_key)
+        }
+        const windowStates: Array<{
+          readonly window: Protocol.ReplicationWindow
+          readonly affectedLabels: ReadonlySet<string>
+          readonly members: Set<string>
+        }> = []
+        for (const window of windows) {
+          const affected = yield* options.windows.affectedPartitions(
+            request.spaceId,
+            generation,
+            window,
+            view.delivered_sequence
+          )
+          const affectedLabels = new Set(affected.map((values) => Canonical.stringify(values)))
+          const members = new Set(
+            yield* options.windows.partitionMembership(request.spaceId, generation, window, affected)
+          )
+          const ackedPartitions = yield* options.windows.partitionsOf(
+            request.spaceId,
+            generation,
+            window,
+            ackedKeys
+          )
+          for (const [key, values] of ackedPartitions) {
+            if (affectedLabels.has(Canonical.stringify(values))) candidateKeys.add(key)
+          }
+          for (const key of members) candidateKeys.add(key)
+          windowStates.push({ window, affectedLabels, members })
+        }
+        const candidateList = [...candidateKeys]
+        for (const state of windowStates) {
+          const partitions = yield* options.windows.partitionsOf(
+            request.spaceId,
+            generation,
+            state.window,
+            candidateList
+          )
+          const extra = new Map<string, ReadonlyArray<string | number>>()
+          for (const values of partitions.values()) {
+            const label = Canonical.stringify(values)
+            if (!state.affectedLabels.has(label)) extra.set(label, values)
+          }
+          if (extra.size > 0) {
+            const more = yield* options.windows.partitionMembership(
+              request.spaceId,
+              generation,
+              state.window,
+              [...extra.values()]
+            )
+            for (const key of more) state.members.add(key)
+          }
+        }
+        const missing: Array<{ readonly model: string; readonly key: string }> = []
+        for (const key of candidateList) {
+          if (!current.has(identityOf(model, key))) missing.push({ model, key })
+        }
+        const fetched = yield* materializeByIdentity(request.spaceId, missing)
+        for (const key of candidateList) {
+          const identity = identityOf(model, key)
+          const materialized = current.get(identity) ?? fetched.get(identity)
+          const inWindow = windowStates.some((state) => state.members.has(key))
+          yield* diffCandidate(identity, materialized, inWindow)
+        }
       }
       for (const row of acknowledged) {
         const identity = identityOf(row.model, row.entity_key)
-        if (changed.has(identity)) continue
+        if (processed.has(identity) || changed.has(identity)) continue
         if (row.disposition !== "Upsert" || row.value_json === null) continue
         const entity = Protocol.EntityKey.make({
           model: row.model,
@@ -961,6 +1119,13 @@ export const make = (options: Options) => {
       yield* validatePreparedSpace(expectedGeneration, space)
       const targetDefinition = yield* options.resolveDefinition(request.schema)
       const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
+      const schemaIsCurrent = request.schema.version === options.definition.schemaIdentity.version &&
+        request.schema.hash === options.definition.schemaIdentity.hash
+      if (normalized.windows !== undefined && !schemaIsCurrent) {
+        return yield* new ReplicaError.ProtocolInvalid({
+          message: "Windowed replication scope requires the current server schema"
+        })
+      }
       const normalizedDigest = yield* scopeDigest(normalized)
       const principalHash = yield* principalDigest(principal)
       const stored = yield* findView({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
@@ -1006,8 +1171,6 @@ export const make = (options: Options) => {
           message: "Replication scope changed without advancing scope generation"
         })
       }
-      const schemaIsCurrent = request.schema.version === options.definition.schemaIdentity.version &&
-        request.schema.hash === options.definition.schemaIdentity.hash
       const pageRow = yield* findPage({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
         Effect.mapError(StorageUnavailable.make)
       )
@@ -1044,7 +1207,13 @@ export const make = (options: Options) => {
             all = yield* materializeByIdentity(request.spaceId, identities)
           } else {
             const source = yield* authoritative(request.spaceId)
-            all = (yield* projectVisible({ ...request, scope: normalized }, principal, source, targetDefinition)).all
+            all = (yield* projectVisible(
+              { ...request, scope: normalized },
+              principal,
+              source,
+              targetDefinition,
+              emptyWindowSelection
+            )).all
           }
           if (!(yield* pageSafe({ ...request, scope: normalized }, principal, page, all))) {
             return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
@@ -1075,11 +1244,13 @@ export const make = (options: Options) => {
       }
       if (changes === undefined) {
         const source = yield* authoritative(request.spaceId)
+        const selection = yield* windowSelection(request.spaceId, space.active_schema_generation, normalized)
         const projected = yield* projectVisible(
           { ...request, scope: normalized },
           principal,
           source,
-          targetDefinition
+          targetDefinition,
+          selection
         )
         const acknowledged = yield* findViewEntities({
           spaceId: request.spaceId,
@@ -1116,6 +1287,15 @@ export const make = (options: Options) => {
       yield* validatePreparedSpace(expectedGeneration, space)
       const targetDefinition = yield* options.resolveDefinition(request.schema)
       const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
+      if (
+        normalized.windows !== undefined &&
+        (request.schema.version !== options.definition.schemaIdentity.version ||
+          request.schema.hash !== options.definition.schemaIdentity.hash)
+      ) {
+        return yield* new ReplicaError.ProtocolInvalid({
+          message: "Windowed replication scope requires the current server schema"
+        })
+      }
       const normalizedDigest = yield* scopeDigest(normalized)
       const principalHash = yield* principalDigest(principal)
       let stored = yield* findSnapshot(request.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
@@ -1206,7 +1386,7 @@ export const make = (options: Options) => {
         if (
           entry.change._tag !== "Upsert" || current === undefined ||
           current.valueJson !== storedEntry.sourceValueJson || Option.isNone(projected) ||
-          !normalized.models.includes(projected.value.entity.model) ||
+          !Protocol.replicationScopeCoversModel(normalized, projected.value.entity.model) ||
           entry.change.entity.model !== projected.value.entity.model ||
           entry.change.entity.modelVersion !== projected.value.entity.modelVersion ||
           (yield* Codec.stringify(entry.change.entity.key)) !== projectedKey ||

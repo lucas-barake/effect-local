@@ -29,6 +29,7 @@ import * as Configuration from "./internal/configuration.js"
 import * as ReadAuthorization from "./internal/readAuthorization.js"
 import * as Rows from "./internal/rows.js"
 import * as ScopedReplication from "./internal/scopedReplication.js"
+import * as ServerIndex from "./internal/serverIndex.js"
 import * as ServerMetrics from "./internal/serverMetrics.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as TerminalRejection from "./internal/TerminalRejection.js"
@@ -306,6 +307,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         })
       }
       yield* Migrations.server(options.migration)
+      const serverIndexes = yield* ServerIndex.make(sql, options.definition)
       const metrics = ServerMetrics.make({
         history: options.maximumHistoryEntries,
         receipts: options.maximumReceipts
@@ -1337,6 +1339,12 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                     ${envelope.mutationId}, ${envelope.digest}, ${entryBytes}, ${entryJson},
                     ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash},
                     ${mutation.mutationVersion})`
+                yield* serverIndexes.apply(
+                  envelope.spaceId,
+                  storedSpace.active_schema_generation,
+                  entry.sequence,
+                  entry.changes
+                )
                 wakeChanges = entry.changes
                 receipt = executed.success.receipt
               }
@@ -1680,6 +1688,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 const through = history.at(-1)!.server_sequence
                 yield* sql`DELETE FROM effect_local_authoritative_log
                   WHERE space_id = ${candidate.manifest.spaceId} AND server_sequence <= ${through}`
+                yield* sql`DELETE FROM effect_local_server_index_partition_log
+                  WHERE space_id = ${candidate.manifest.spaceId} AND server_sequence <= ${through}`
               }
               const receipts = yield* findReceiptPrune({
                 spaceId: candidate.manifest.spaceId,
@@ -1801,7 +1811,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           entity: authorizeReadEntity
         },
         resolveDefinition: validateCallerSchema,
-        projectEntity: projectScopedEntity
+        projectEntity: projectScopedEntity,
+        windows: serverIndexes
       })
       const preauthorizedScopedReplication = ScopedReplication.make({
         sql,
@@ -1815,7 +1826,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           entity: authorizeReadEntity
         },
         resolveDefinition: validateCallerSchema,
-        projectEntity: projectScopedEntity
+        projectEntity: projectScopedEntity,
+        windows: serverIndexes
       })
       const countAcknowledgedEntities = SqlSchema.findOne({
         Request: Schema.Struct({
@@ -1848,7 +1860,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         changes: ReadonlyArray<Protocol.EntityChange>
       ) =>
         Effect.gen(function*() {
-          const scoped = changes.filter((change) => request.scope.models.includes(change.entity.model))
+          const scoped = changes.filter((change) =>
+            Protocol.replicationScopeCoversModel(request.scope, change.entity.model)
+          )
           if (scoped.length === 0) return false
           const identities = yield* Effect.forEach(scoped, (change) =>
             Codec.stringify(change.entity.key).pipe(

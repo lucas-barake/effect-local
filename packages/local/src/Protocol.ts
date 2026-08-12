@@ -112,16 +112,74 @@ export type ViewChange = typeof ViewChange.Type
 
 const ReplicationModelName = Schema.NonEmptyString.check(Schema.isMaxLength(256))
 
+const WindowComponentValue = Schema.Union([Schema.String, Schema.Number, Schema.Boolean])
+export type WindowComponentValue = typeof WindowComponentValue.Type
+
+export const ReplicationWindowBounds = Schema.Struct({
+  gt: Schema.optionalKey(WindowComponentValue),
+  gte: Schema.optionalKey(WindowComponentValue),
+  lt: Schema.optionalKey(WindowComponentValue),
+  lte: Schema.optionalKey(WindowComponentValue)
+})
+export type ReplicationWindowBounds = typeof ReplicationWindowBounds.Type
+
+export const ReplicationWindowPartition = Schema.Struct({
+  key: Schema.Array(WindowComponentValue),
+  count: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
+  bounds: Schema.optionalKey(ReplicationWindowBounds)
+})
+export type ReplicationWindowPartition = typeof ReplicationWindowPartition.Type
+
+export const ReplicationWindow = Schema.Struct({
+  model: ReplicationModelName,
+  index: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  count: Schema.Int.check(Schema.isGreaterThan(0)),
+  partitions: Schema.optionalKey(Schema.Array(ReplicationWindowPartition))
+})
+export type ReplicationWindow = typeof ReplicationWindow.Type
+
 export const ReplicationScope = Schema.Struct({
-  models: Schema.Array(ReplicationModelName).check(Schema.isUnique())
+  models: Schema.Array(ReplicationModelName).check(Schema.isUnique()),
+  windows: Schema.optionalKey(Schema.Array(ReplicationWindow))
 })
 export type ReplicationScope = typeof ReplicationScope.Type
 
 export const replicationScopeDigest = (scope: ReplicationScope) =>
   Canonical.digest({ format: 1, scope }).pipe(Effect.map((value) => MutationDigest.make(value)))
 
-export const normalizeReplicationScope = (scope: ReplicationScope): ReplicationScope =>
-  ReplicationScope.make({ models: scope.models.toSorted() })
+const comparePartitionKeys = (left: ReplicationWindowPartition, right: ReplicationWindowPartition) => {
+  const leftKey = Canonical.stringify(left.key)
+  const rightKey = Canonical.stringify(right.key)
+  if (leftKey < rightKey) return -1
+  if (leftKey > rightKey) return 1
+  return 0
+}
+
+export const normalizeReplicationScope = (scope: ReplicationScope): ReplicationScope => {
+  if (scope.windows === undefined || scope.windows.length === 0) {
+    return ReplicationScope.make({ models: scope.models.toSorted() })
+  }
+  const windows = scope.windows.map((window) => {
+    if (window.partitions === undefined) return window
+    const partitions = window.partitions.toSorted(comparePartitionKeys)
+    return ReplicationWindow.make({ ...window, partitions })
+  }).toSorted((left, right) => {
+    if (left.model < right.model) return -1
+    if (left.model > right.model) return 1
+    if (left.index < right.index) return -1
+    if (left.index > right.index) return 1
+    return 0
+  })
+  return ReplicationScope.make({ models: scope.models.toSorted(), windows })
+}
+
+const affinityMatches = (
+  affinity: "text" | "real" | "integer",
+  value: WindowComponentValue
+): boolean => {
+  if (affinity === "text") return typeof value === "string"
+  return typeof value === "number" || typeof value === "boolean"
+}
 
 export const validateReplicationScope = (
   definition: Definition.Any,
@@ -133,8 +191,83 @@ export const validateReplicationScope = (
       return Effect.fail(new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${model}` }))
     }
   }
+  if (normalized.windows === undefined) return Effect.succeed(normalized)
+  const seen = new Set<string>()
+  for (const window of normalized.windows) {
+    const label = `${window.model}/${window.index}`
+    if (normalized.models.includes(window.model)) {
+      return Effect.fail(
+        new ReplicaError.ProtocolInvalid({
+          message: `Model ${window.model} cannot be both fully replicated and windowed`
+        })
+      )
+    }
+    if (seen.has(label)) {
+      return Effect.fail(
+        new ReplicaError.ProtocolInvalid({ message: `Duplicate replication window: ${label}` })
+      )
+    }
+    seen.add(label)
+    const model = definition.modelByName.get(window.model)
+    if (model === undefined) {
+      return Effect.fail(
+        new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${window.model}` })
+      )
+    }
+    const index = model.indexes[window.index]
+    if (index === undefined) {
+      return Effect.fail(
+        new ReplicaError.ProtocolInvalid({ message: `Unknown replication window index: ${label}` })
+      )
+    }
+    if (index.sort.length === 0) {
+      return Effect.fail(
+        new ReplicaError.ProtocolInvalid({ message: `Replication window index ${label} has no sort component` })
+      )
+    }
+    for (const partition of window.partitions ?? []) {
+      if (partition.key.length !== index.partition.length) {
+        return Effect.fail(
+          new ReplicaError.ProtocolInvalid({
+            message: `Replication window partition for ${label} expects ${index.partition.length} key components`
+          })
+        )
+      }
+      for (let component = 0; component < partition.key.length; component++) {
+        if (!affinityMatches(index.partition[component].affinity, partition.key[component])) {
+          return Effect.fail(
+            new ReplicaError.ProtocolInvalid({
+              message: `Replication window partition key for ${label} does not match the index component types`
+            })
+          )
+        }
+      }
+      if (partition.bounds !== undefined) {
+        for (
+          const bound of [
+            partition.bounds.gt,
+            partition.bounds.gte,
+            partition.bounds.lt,
+            partition.bounds.lte
+          ]
+        ) {
+          if (bound !== undefined && !affinityMatches(index.sort[0].affinity, bound)) {
+            return Effect.fail(
+              new ReplicaError.ProtocolInvalid({
+                message: `Replication window bounds for ${label} do not match the leading sort component type`
+              })
+            )
+          }
+        }
+      }
+    }
+  }
   return Effect.succeed(normalized)
 }
+
+export const replicationScopeCoversModel = (scope: ReplicationScope, model: string): boolean =>
+  scope.models.includes(model) ||
+  (scope.windows !== undefined && scope.windows.some((window) => window.model === model))
 
 export const ReplicationCursor = Schema.Struct({
   viewId: Identity.ReplicationViewId,
