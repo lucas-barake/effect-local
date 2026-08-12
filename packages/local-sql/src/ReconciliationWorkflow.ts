@@ -32,10 +32,7 @@ const PayloadFields = {
   schemaIdentity: Schema.String,
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
-  membershipIncarnation: Identity.MembershipIncarnation.pipe(
-    Schema.withDecodingDefaultKey(Effect.succeed(Identity.legacyMembershipIncarnation)),
-    Schema.withConstructorDefault(Effect.succeed(Identity.legacyMembershipIncarnation))
-  ),
+  membershipIncarnation: Identity.MembershipIncarnation,
   generation: ReconciliationGeneration
 } as const
 
@@ -104,29 +101,6 @@ export const make = ({
           payload.membershipIncarnation,
           payload.generation
         ])
-    }
-  )
-
-const LegacyV2PayloadFields = {
-  schemaIdentity: Schema.String,
-  spaceId: Identity.SpaceId,
-  clientId: Identity.ClientId,
-  generation: ReconciliationGeneration
-} as const
-
-export const makeLegacyV2 = ({
-  clientId,
-  schemaIdentity: workflowSchemaIdentity,
-  spaceId
-}: Pick<Payload, "schemaIdentity" | "spaceId" | "clientId">) =>
-  Workflow.make(
-    `effect-local/ReconcileReplica/v2/${encodeJson([workflowSchemaIdentity, spaceId, clientId])}`,
-    {
-      payload: LegacyV2PayloadFields,
-      success: Schema.Void,
-      error: ReplicaError.ReplicaError,
-      idempotencyKey: (payload) =>
-        encodeJson([payload.schemaIdentity, payload.spaceId, payload.clientId, payload.generation])
     }
   )
 
@@ -338,22 +312,6 @@ const layerRegistrationWithConfiguration = (
         }),
         handler(options, configuration, registrationState)
       ).pipe(Scope.provide(registrationScope))
-      if (local.membershipIncarnation === Identity.legacyMembershipIncarnation) {
-        yield* engine.register(
-          makeLegacyV2({
-            schemaIdentity: schemaIdentityKey(options.definition),
-            spaceId: options.spaceId,
-            clientId: options.clientId
-          }),
-          (payload) =>
-            handler(options, configuration, registrationState)(
-              Payload.make({
-                ...payload,
-                membershipIncarnation: Identity.legacyMembershipIncarnation
-              })
-            )
-        ).pipe(Scope.provide(registrationScope))
-      }
       const registered = registrationState.schemas.get(replicaKey)
       if (
         registered !== undefined &&
@@ -396,57 +354,6 @@ const layerRegistrationWithConfiguration = (
               })
             })
         ).pipe(Scope.provide(registrationScope))
-        if (local.membershipIncarnation === Identity.legacyMembershipIncarnation) {
-          yield* engine.register(
-            makeLegacyV2({
-              schemaIdentity: legacyIdentity,
-              spaceId: options.spaceId,
-              clientId: options.clientId
-            }),
-            () =>
-              Effect.gen(function*() {
-                const current = registrationState.schemas.get(replicaKey) ?? options.definition.schemaIdentity
-                return yield* new ReplicaError.StaleSchema({
-                  expectedVersion: current.version,
-                  expectedHash: current.hash,
-                  actualVersion: definition.schemaIdentity.version,
-                  actualHash: definition.schemaIdentity.hash
-                })
-              })
-          ).pipe(Scope.provide(registrationScope))
-        }
-      }
-      const legacyDefinitions = new Map<string, Definition.Any>()
-      for (const step of evolution.steps) legacyDefinitions.set(step.from.hash, step.from)
-      for (const baseline of evolution.legacyBaselines) {
-        legacyDefinitions.set(baseline.hash, baseline.definition)
-      }
-      legacyDefinitions.delete(options.definition.hash)
-      for (const [definitionHash, definition] of legacyDefinitions) {
-        const legacy = Workflow.make(
-          `effect-local/ReconcileReplica/${encodeJson([definitionHash, options.spaceId, options.clientId])}`,
-          {
-            payload: {
-              definitionHash: Schema.String,
-              spaceId: Identity.SpaceId,
-              clientId: Identity.ClientId,
-              generation: ReconciliationGeneration
-            },
-            success: Schema.Void,
-            error: ReplicaError.ReplicaError,
-            idempotencyKey: ({ generation }) => String(generation)
-          }
-        )
-        yield* engine.register(legacy, () =>
-          Effect.gen(function*() {
-            const current = registrationState.schemas.get(replicaKey) ?? options.definition.schemaIdentity
-            return yield* new ReplicaError.StaleSchema({
-              expectedVersion: current.version,
-              expectedHash: current.hash,
-              actualVersion: definition.schemaIdentity.version,
-              actualHash: definition.schemaIdentity.hash
-            })
-          })).pipe(Scope.provide(registrationScope))
       }
       return Layer.succeed(Registration, Registration.of({ registered: true }))
     })
@@ -501,7 +408,7 @@ const layerSchedulerWithConfiguration = (
                   generation: generations.requested
                 })
                 const workflow = make(payload)
-                const activeExecutionId = yield* executionId(payload)
+                const activeExecutionId = yield* workflow.executionId(payload)
                 yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
                 yield* workflow.execute(payload).pipe(
                   Effect.ensuring(Ref.set(activeExecution, Option.none()))

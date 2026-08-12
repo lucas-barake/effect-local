@@ -292,7 +292,7 @@ describe("WebSocket synchronization", () => {
           basis: Identity.ServerSequence.make(0),
           name: PutTodo.name,
           payload: { id: `bootstrap-${sequence}`, title: "s".repeat(250) },
-          digestVersion: 2,
+          digestVersion: 3,
           membershipIncarnation: Identity.legacyMembershipIncarnation,
           sourceSchema: definition.schemaIdentity,
           mutationVersion: PutTodo.version
@@ -357,7 +357,7 @@ describe("WebSocket synchronization", () => {
         basis: Identity.ServerSequence.make(0),
         name: PutTodo.name,
         payload: { id: "1", title: "socket" },
-        digestVersion: 2 as const,
+        digestVersion: 3 as const,
         membershipIncarnation: Identity.legacyMembershipIncarnation,
         sourceSchema: definition.schemaIdentity,
         mutationVersion: PutTodo.version
@@ -436,7 +436,7 @@ describe("WebSocket synchronization", () => {
         basis: Identity.ServerSequence.make(0),
         name: PutTodo.name,
         payload: { id: "1", title: "socket" },
-        digestVersion: 2 as const,
+        digestVersion: 3 as const,
         membershipIncarnation: Identity.legacyMembershipIncarnation,
         sourceSchema: definition.schemaIdentity,
         mutationVersion: PutTodo.version
@@ -467,7 +467,7 @@ describe("WebSocket synchronization", () => {
         basis: Identity.ServerSequence.make(0),
         name: AssignRoleV1.name,
         payload: { account: "victim" },
-        digestVersion: 2 as const,
+        digestVersion: 3 as const,
         membershipIncarnation: Identity.legacyMembershipIncarnation,
         sourceSchema: definitionV1.schemaIdentity,
         mutationVersion: AssignRoleV1.version
@@ -517,7 +517,7 @@ describe("WebSocket synchronization", () => {
         basis: Identity.ServerSequence.make(0),
         name: ReturnHugeResult.name,
         payload: null,
-        digestVersion: 2 as const,
+        digestVersion: 3 as const,
         membershipIncarnation: Identity.legacyMembershipIncarnation,
         sourceSchema: definition.schemaIdentity,
         mutationVersion: ReturnHugeResult.version

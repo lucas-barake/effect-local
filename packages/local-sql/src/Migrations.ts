@@ -1,7 +1,6 @@
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -11,7 +10,6 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 
@@ -1018,19 +1016,6 @@ const clientV8 = makeMigration({
       projection_replay_generation INTEGER,
       projection_replay_cursor TEXT
     )`,
-    `INSERT INTO effect_local_client_meta (singleton, client_id)
-      SELECT singleton, client_id FROM effect_local_client_meta_v7`,
-    `INSERT INTO effect_local_client_spaces
-      (space_id, membership_incarnation, definition_hash, schema_version, schema_hash, schema_generation,
-        active_schema_generation, active_projection_generation, projection_schema_generation,
-        target_schema_version, target_schema_hash, migration_hash, next_local_sequence, server_cursor,
-        visible_revision, requested_generation, completed_generation, installed_snapshot_id,
-        installed_snapshot_sequence, installed_snapshot_terminal_sequence)
-      SELECT space_id, '${Identity.legacyMembershipIncarnation}', definition_hash, schema_version, schema_hash,
-        schema_generation, active_schema_generation, 0, active_schema_generation, target_schema_version,
-        target_schema_hash, migration_hash, next_local_sequence, server_cursor, visible_revision,
-        requested_generation, completed_generation, installed_snapshot_id, installed_snapshot_sequence,
-        installed_snapshot_terminal_sequence FROM effect_local_client_meta_v7`,
     "ALTER TABLE effect_local_server_log RENAME TO effect_local_server_log_v7",
     `CREATE TABLE effect_local_server_log (
       space_id TEXT NOT NULL,
@@ -1045,11 +1030,6 @@ const clientV8 = makeMigration({
       UNIQUE (space_id, mutation_id),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    `INSERT INTO effect_local_server_log
-      SELECT m.space_id, '${Identity.legacyMembershipIncarnation}', l.server_sequence, l.mutation_id,
-        json_set(l.entry_json, '$.membershipIncarnation', '${Identity.legacyMembershipIncarnation}'),
-        l.source_schema_version, l.source_schema_hash, l.mutation_version
-      FROM effect_local_server_log_v7 AS l CROSS JOIN effect_local_client_meta_v7 AS m`,
     "ALTER TABLE effect_local_client_pending_data RENAME TO effect_local_client_pending_data_v7",
     `CREATE TABLE effect_local_client_pending_data (
       space_id TEXT NOT NULL,
@@ -1061,7 +1041,7 @@ const clientV8 = makeMigration({
       name TEXT NOT NULL,
       payload_json TEXT NOT NULL,
       digest TEXT NOT NULL,
-      digest_version INTEGER NOT NULL CHECK (digest_version IN (1, 2, 3)),
+      digest_version INTEGER NOT NULL CHECK (digest_version = 3),
       source_schema_version INTEGER,
       source_schema_hash TEXT,
       mutation_version INTEGER,
@@ -1071,12 +1051,6 @@ const clientV8 = makeMigration({
       UNIQUE (space_id, schema_generation, local_sequence),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    `INSERT INTO effect_local_client_pending_data
-      SELECT m.space_id, p.generation, '${Identity.legacyMembershipIncarnation}', p.mutation_id,
-        p.local_sequence, p.basis, p.name, p.payload_json, p.digest, p.digest_version,
-        p.source_schema_version, p.source_schema_hash, p.mutation_version, p.optimistic_result_json,
-        p.changes_json FROM effect_local_client_pending_data_v7 AS p
-        CROSS JOIN effect_local_client_meta_v7 AS m`,
     "ALTER TABLE effect_local_client_receipts_data RENAME TO effect_local_client_receipts_data_v7",
     `CREATE TABLE effect_local_client_receipts_data (
       space_id TEXT NOT NULL,
@@ -1094,13 +1068,6 @@ const clientV8 = makeMigration({
       UNIQUE (space_id, schema_generation, local_sequence),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    `INSERT INTO effect_local_client_receipts_data
-      SELECT m.space_id, r.generation, '${Identity.legacyMembershipIncarnation}', r.mutation_id,
-        r.local_sequence, json_set(r.receipt_json, '$.membershipIncarnation',
-          '${Identity.legacyMembershipIncarnation}'),
-        r.source_schema_version, r.source_schema_hash, r.mutation_version, r.rejection_origin,
-        r.mutation_name FROM effect_local_client_receipts_data_v7 AS r
-        CROSS JOIN effect_local_client_meta_v7 AS m`,
     "ALTER TABLE effect_local_client_canonical_entities_data RENAME TO effect_local_client_canonical_entities_data_v7",
     `CREATE TABLE effect_local_client_canonical_entities_data (
       space_id TEXT NOT NULL,
@@ -1112,10 +1079,6 @@ const clientV8 = makeMigration({
       PRIMARY KEY (space_id, schema_generation, model, entity_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    `INSERT INTO effect_local_client_canonical_entities_data
-      SELECT m.space_id, e.generation, e.model, e.entity_key, e.value_json, e.model_version
-      FROM effect_local_client_canonical_entities_data_v7 AS e
-      CROSS JOIN effect_local_client_meta_v7 AS m`,
     "ALTER TABLE effect_local_client_visible_entities_data RENAME TO effect_local_client_visible_entities_data_v7",
     `CREATE TABLE effect_local_client_visible_entities_data (
       space_id TEXT NOT NULL,
@@ -1128,9 +1091,6 @@ const clientV8 = makeMigration({
       PRIMARY KEY (space_id, schema_generation, projection_generation, model, entity_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    `INSERT INTO effect_local_client_visible_entities_data
-      SELECT m.space_id, e.generation, 0, e.model, e.entity_key, e.value_json, e.model_version
-      FROM effect_local_client_visible_entities_data_v7 AS e CROSS JOIN effect_local_client_meta_v7 AS m`,
     "ALTER TABLE effect_local_client_evolution RENAME TO effect_local_client_evolution_v7",
     `CREATE TABLE effect_local_client_evolution (
       space_id TEXT PRIMARY KEY,
@@ -1149,11 +1109,6 @@ const clientV8 = makeMigration({
       cursor_sequence INTEGER,
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    `INSERT INTO effect_local_client_evolution
-      SELECT m.space_id, e.source_schema_version, e.source_schema_hash, e.target_schema_version,
-        e.target_schema_hash, e.migration_hash, e.generation, e.source_generation, 0, 0, e.phase,
-        e.cursor_model, e.cursor_key, e.cursor_sequence FROM effect_local_client_evolution_v7 AS e
-        CROSS JOIN effect_local_client_meta_v7 AS m`,
     "ALTER TABLE effect_local_client_key_lineage RENAME TO effect_local_client_key_lineage_v7",
     `CREATE TABLE effect_local_client_key_lineage (
       space_id TEXT NOT NULL,
@@ -1168,8 +1123,6 @@ const clientV8 = makeMigration({
       PRIMARY KEY (space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    `INSERT INTO effect_local_client_key_lineage SELECT m.space_id, l.*
-      FROM effect_local_client_key_lineage_v7 AS l CROSS JOIN effect_local_client_meta_v7 AS m`,
     "ALTER TABLE effect_local_client_key_lineage_groups RENAME TO effect_local_client_key_lineage_groups_v7",
     `CREATE TABLE effect_local_client_key_lineage_groups (
       space_id TEXT NOT NULL,
@@ -1182,8 +1135,6 @@ const clientV8 = makeMigration({
       PRIMARY KEY (space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    `INSERT INTO effect_local_client_key_lineage_groups SELECT m.space_id, l.*
-      FROM effect_local_client_key_lineage_groups_v7 AS l CROSS JOIN effect_local_client_meta_v7 AS m`,
     "ALTER TABLE effect_local_client_key_lineage_targets RENAME TO effect_local_client_key_lineage_targets_v7",
     `CREATE TABLE effect_local_client_key_lineage_targets (
       space_id TEXT NOT NULL,
@@ -1194,8 +1145,6 @@ const clientV8 = makeMigration({
       PRIMARY KEY (space_id, target_model, target_model_version, target_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    `INSERT INTO effect_local_client_key_lineage_targets SELECT m.space_id, l.*
-      FROM effect_local_client_key_lineage_targets_v7 AS l CROSS JOIN effect_local_client_meta_v7 AS m`,
     "ALTER TABLE effect_local_bootstrap RENAME TO effect_local_bootstrap_v7",
     `CREATE TABLE effect_local_bootstrap (
       space_id TEXT PRIMARY KEY,
@@ -1213,9 +1162,6 @@ const clientV8 = makeMigration({
       rolling_digest TEXT NOT NULL,
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    `INSERT INTO effect_local_bootstrap SELECT space_id, snapshot_id, definition_hash, schema_version,
-      schema_hash, server_sequence, terminal_sequence, entity_count, content_bytes, digest, next_ordinal,
-      received_bytes, rolling_digest FROM effect_local_bootstrap_v7`,
     "ALTER TABLE effect_local_bootstrap_entities RENAME TO effect_local_bootstrap_entities_v7",
     `CREATE TABLE effect_local_bootstrap_entities (
       space_id TEXT NOT NULL,
@@ -1229,9 +1175,6 @@ const clientV8 = makeMigration({
       UNIQUE (space_id, model, entity_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_bootstrap(space_id) ON DELETE CASCADE
     )`,
-    `INSERT INTO effect_local_bootstrap_entities SELECT b.space_id, e.ordinal, e.model, e.model_version,
-      e.entity_key, e.value_json, e.entity_bytes FROM effect_local_bootstrap_entities_v7 AS e
-      CROSS JOIN effect_local_bootstrap_v7 AS b`,
     "DROP TABLE effect_local_client_shadow_entities",
     "DROP TABLE effect_local_client_shadow_receipts",
     "DROP TABLE effect_local_client_shadow_visible_entities",
@@ -1369,21 +1312,6 @@ const serverV7 = makeMigration({
   ]
 })
 
-const ServerV8ReceiptRow = Schema.Struct({
-  space_id: Identity.SpaceId,
-  client_id: Identity.ClientId,
-  membership_incarnation: Identity.MembershipIncarnation,
-  local_sequence: Identity.LocalSequence,
-  receipt_json: Schema.String
-})
-
-const ServerV8EntryRow = Schema.Struct({
-  space_id: Identity.SpaceId,
-  server_sequence: Identity.ServerSequence,
-  membership_incarnation: Identity.MembershipIncarnation,
-  entry_json: Schema.String
-})
-
 const serverV8 = makeMigration({
   id: 8,
   name: "membership-incarnation-lineage",
@@ -1413,7 +1341,7 @@ const serverV8 = makeMigration({
       mutation_id TEXT NOT NULL,
       digest TEXT NOT NULL,
       receipt_json TEXT NOT NULL,
-      digest_version INTEGER NOT NULL CHECK (digest_version IN (1, 2, 3)),
+      digest_version INTEGER NOT NULL CHECK (digest_version = 3),
       source_schema_version INTEGER,
       source_schema_hash TEXT,
       mutation_version INTEGER,
@@ -1440,24 +1368,6 @@ const serverV8 = makeMigration({
       PRIMARY KEY (space_id, server_sequence),
       UNIQUE (space_id, mutation_id)
     )`,
-    `INSERT INTO effect_local_server_clients
-      (space_id, client_id, membership_incarnation, last_local_sequence, expired_local_sequence)
-      SELECT space_id, client_id, '${Identity.legacyMembershipIncarnation}',
-        last_local_sequence, expired_local_sequence FROM effect_local_server_clients_v7`,
-    `INSERT INTO effect_local_server_receipts
-      (space_id, client_id, membership_incarnation, local_sequence, mutation_id, digest, receipt_json,
-        digest_version, source_schema_version, source_schema_hash, mutation_version, rejection_origin,
-        terminal_sequence, server_sequence, mutation_name)
-      SELECT space_id, client_id, '${Identity.legacyMembershipIncarnation}', local_sequence, mutation_id,
-        digest, receipt_json, digest_version, source_schema_version, source_schema_hash, mutation_version,
-        rejection_origin, terminal_sequence, server_sequence, mutation_name
-      FROM effect_local_server_receipts_v7`,
-    `INSERT INTO effect_local_authoritative_log
-      (space_id, server_sequence, mutation_id, entry_bytes, entry_json, source_schema_version,
-        source_schema_hash, mutation_version, client_id, local_sequence, digest, membership_incarnation)
-      SELECT space_id, server_sequence, mutation_id, entry_bytes, entry_json, source_schema_version,
-        source_schema_hash, mutation_version, client_id, local_sequence, digest,
-        '${Identity.legacyMembershipIncarnation}' FROM effect_local_authoritative_log_v7`,
     "DROP TABLE effect_local_server_clients_v7",
     "DROP TABLE effect_local_server_receipts_v7",
     "DROP TABLE effect_local_authoritative_log_v7",
@@ -1502,84 +1412,7 @@ const serverV8 = makeMigration({
       BEFORE INSERT ON effect_local_authoritative_log
       WHEN NEW.client_id = '' OR NEW.local_sequence = 0 OR NEW.digest = ''
       BEGIN SELECT RAISE(ABORT, 'effect-local server writer upgrade required'); END`
-  ],
-  effect: {
-    id: "canonicalize-membership-lineage",
-    run: (sql) =>
-      Effect.gen(function*() {
-        const readReceipts = SqlSchema.findAll({
-          Request: Schema.Struct({
-            spaceId: Schema.String,
-            clientId: Schema.String,
-            membershipIncarnation: Schema.String,
-            localSequence: Schema.Int
-          }),
-          Result: ServerV8ReceiptRow,
-          execute: (cursor) =>
-            sql`SELECT space_id, client_id, membership_incarnation, local_sequence, receipt_json
-            FROM effect_local_server_receipts
-            WHERE (space_id, client_id, membership_incarnation, local_sequence) >
-              (${cursor.spaceId}, ${cursor.clientId}, ${cursor.membershipIncarnation}, ${cursor.localSequence})
-            ORDER BY space_id, client_id, membership_incarnation, local_sequence LIMIT 256`
-        })
-        const readEntries = SqlSchema.findAll({
-          Request: Schema.Struct({ spaceId: Schema.String, serverSequence: Schema.Int }),
-          Result: ServerV8EntryRow,
-          execute: (cursor) =>
-            sql`SELECT space_id, server_sequence, membership_incarnation, entry_json
-            FROM effect_local_authoritative_log
-            WHERE (space_id, server_sequence) > (${cursor.spaceId}, ${cursor.serverSequence})
-            ORDER BY space_id, server_sequence LIMIT 256`
-        })
-        const decodeRows = <A, E,>(effect: Effect.Effect<A, E | SqlError.SqlError>) =>
-          effect.pipe(Effect.mapError((cause) => {
-            if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
-            return new ReplicaError.StorageCorrupt({ message: "Server migration 8 row is corrupt", cause })
-          }))
-        let receiptCursor = { spaceId: "", clientId: "", membershipIncarnation: "", localSequence: -1 }
-        while (true) {
-          const receipts = yield* decodeRows(readReceipts(receiptCursor))
-          for (const row of receipts) {
-            const receipt = yield* Codec.parse(row.receipt_json).pipe(
-              Effect.flatMap((value) => Codec.decode(Protocol.Receipt, value))
-            )
-            const normalized = { ...receipt, membershipIncarnation: row.membership_incarnation }
-            yield* sql`UPDATE effect_local_server_receipts SET receipt_json = ${yield* Codec.stringify(normalized)}
-              WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
-                AND membership_incarnation = ${row.membership_incarnation}
-                AND local_sequence = ${row.local_sequence}`
-          }
-          if (receipts.length < 256) break
-          const last = receipts[receipts.length - 1]
-          receiptCursor = {
-            spaceId: last.space_id,
-            clientId: last.client_id,
-            membershipIncarnation: last.membership_incarnation,
-            localSequence: last.local_sequence
-          }
-        }
-        let entryCursor = { spaceId: "", serverSequence: -1 }
-        while (true) {
-          const entries = yield* decodeRows(readEntries(entryCursor))
-          for (const row of entries) {
-            const entry = yield* Codec.parse(row.entry_json).pipe(
-              Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
-            )
-            const normalized = { ...entry, membershipIncarnation: row.membership_incarnation }
-            const entryJson = yield* Codec.stringify(normalized)
-            const entryBytes = yield* Protocol.encodedBytesEffect(normalized)
-            yield* sql`UPDATE effect_local_authoritative_log
-              SET entry_json = ${entryJson}, entry_bytes = ${entryBytes}
-              WHERE space_id = ${row.space_id} AND server_sequence = ${row.server_sequence}`
-          }
-          if (entries.length < 256) break
-          const last = entries[entries.length - 1]
-          entryCursor = { spaceId: last.space_id, serverSequence: last.server_sequence }
-        }
-      }).pipe(
-        Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
-      )
-  }
+  ]
 })
 
 export const serverCatalog = Object.freeze([

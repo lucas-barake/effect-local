@@ -155,12 +155,6 @@ const validateOptions = (options: HistoryOptions) =>
     return yield* Effect.void
   })
 
-const LegacySpaceRow = Schema.Struct({
-  definition_hash: Schema.String,
-  legacy_schema_version: Schema.NullOr(Identity.SchemaVersion),
-  legacy_schema_hash: Schema.NullOr(Identity.SchemaHash)
-})
-
 export const layer = <R = never,>(options: Options<R>): Layer.Layer<
   ServerStore,
   ReplicaError.ReplicaError,
@@ -384,68 +378,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           WHERE space_id = ${spaceId} AND terminal_sequence <= ${through}
           ORDER BY terminal_sequence LIMIT ${limit}`
       })
-      const findLegacySpace = SqlSchema.findOneOption({
-        Request: Schema.String,
-        Result: LegacySpaceRow,
-        execute: (spaceId) =>
-          sql`SELECT definition_hash, legacy_schema_version, legacy_schema_hash
-          FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
-      })
-      const resolveLegacyEnvelope = (envelope: Protocol.MutationEnvelope) =>
-        Effect.gen(function*() {
-          if (envelope.digestVersion !== 1) return envelope
-          const stored = yield* findLegacySpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-          let sourceDefinition: Definition.Any | undefined
-          if (Option.isSome(stored)) {
-            const incompleteBaseline = (stored.value.legacy_schema_version === null) !==
-              (stored.value.legacy_schema_hash === null)
-            if (incompleteBaseline) {
-              return yield* new ReplicaError.StorageCorrupt({
-                message: `Space ${envelope.spaceId} has incomplete legacy schema metadata`
-              })
-            }
-            if (stored.value.legacy_schema_version !== null && stored.value.legacy_schema_hash !== null) {
-              sourceDefinition = evolution.definitionByIdentity.get(
-                `${stored.value.legacy_schema_version}:${stored.value.legacy_schema_hash}`
-              )
-              if (sourceDefinition === undefined) {
-                return yield* new ReplicaError.ProtocolInvalid({
-                  message:
-                    `Persisted legacy schema ${stored.value.legacy_schema_version}:${stored.value.legacy_schema_hash} is not configured`
-                })
-              }
-            } else {
-              sourceDefinition = evolution.legacyBaselineByHash.get(stored.value.definition_hash)?.definition
-            }
-          }
-          if (sourceDefinition === undefined) {
-            const identities = new Map<string, Definition.Any>()
-            for (const baseline of evolution.legacyBaselines) {
-              identities.set(
-                `${baseline.definition.schemaIdentity.version}:${baseline.definition.schemaIdentity.hash}`,
-                baseline.definition
-              )
-            }
-            if (identities.size !== 1) {
-              return yield* new ReplicaError.ProtocolInvalid({
-                message: "Legacy mutation digest has no unambiguous configured schema baseline"
-              })
-            }
-            sourceDefinition = identities.values().next().value
-          }
-          const mutation = sourceDefinition?.mutationByName.get(envelope.name)
-          if (sourceDefinition === undefined || mutation === undefined) {
-            return yield* new ReplicaError.ProtocolInvalid({
-              message: `Legacy mutation ${envelope.name} has no configured schema baseline`
-            })
-          }
-          return Protocol.MutationEnvelope.make({
-            ...envelope,
-            sourceSchema: sourceDefinition.schemaIdentity,
-            mutationVersion: mutation.version
-          })
-        })
-
       const manifestFromRow = (row: typeof Rows.SnapshotManifestRow.Type) =>
         Protocol.SnapshotManifest.make({
           spaceId: row.space_id,
@@ -506,7 +438,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           if (
             row.space_id !== envelope.spaceId ||
             row.client_id !== envelope.clientId ||
-            row.membership_incarnation !== Protocol.membershipIncarnationForEnvelope(envelope) ||
+            row.membership_incarnation !== envelope.membershipIncarnation ||
             row.local_sequence !== envelope.localSequence ||
             row.mutation_id !== envelope.mutationId ||
             receipt.spaceId !== row.space_id ||
@@ -548,7 +480,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           const receipt = Protocol.RejectedReceipt.make({
             spaceId: envelope.spaceId,
             clientId: envelope.clientId,
-            membershipIncarnation: Protocol.membershipIncarnationForEnvelope(envelope),
+            membershipIncarnation: envelope.membershipIncarnation,
             mutationId: envelope.mutationId,
             localSequence: envelope.localSequence,
             name: mutation.name,
@@ -561,7 +493,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           return Protocol.RejectedReceipt.make({
             spaceId: envelope.spaceId,
             clientId: envelope.clientId,
-            membershipIncarnation: Protocol.membershipIncarnationForEnvelope(envelope),
+            membershipIncarnation: envelope.membershipIncarnation,
             mutationId: envelope.mutationId,
             localSequence: envelope.localSequence,
             name: mutation.name,
@@ -811,29 +743,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution))
             )
           }
-          const envelope = yield* resolveLegacyEnvelope(submittedEnvelope)
-          const membershipIncarnation = Protocol.membershipIncarnationForEnvelope(envelope)
+          const envelope = submittedEnvelope
+          const membershipIncarnation = envelope.membershipIncarnation
           yield* prepareSpace(envelope.spaceId, request.schema)
-          if (envelope.digestVersion === 1) {
-            yield* sql`UPDATE effect_local_server_spaces SET
-              legacy_schema_version = COALESCE(legacy_schema_version, ${envelope.sourceSchema.version}),
-              legacy_schema_hash = COALESCE(legacy_schema_hash, ${envelope.sourceSchema.hash})
-              WHERE space_id = ${envelope.spaceId}`
-          }
-          let sizeInput: unknown = envelope
-          if (envelope.digestVersion === 1) {
-            sizeInput = {
-              spaceId: envelope.spaceId,
-              clientId: envelope.clientId,
-              mutationId: envelope.mutationId,
-              localSequence: envelope.localSequence,
-              basis: envelope.basis,
-              name: envelope.name,
-              payload: envelope.payload,
-              digest: envelope.digest
-            }
-          }
-          if ((yield* Protocol.encodedBytesEffect(sizeInput)) > Protocol.maximumMutationBytes) {
+          if ((yield* Protocol.encodedBytesEffect(envelope)) > Protocol.maximumMutationBytes) {
             return yield* new ReplicaError.CapacityExceeded({
               resource: "mutation bytes",
               limit: Protocol.maximumMutationBytes

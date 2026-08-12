@@ -28,6 +28,7 @@ import * as ServerStore from "../src/ServerStore.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const membershipIncarnation = Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
   retainedReceipts: 256,
@@ -126,25 +127,6 @@ const evolution = Evolution.make({
   })]
 })
 
-const legacyBaselineV1 = Evolution.legacyBaseline({
-  id: "legacy-v1",
-  hash: "1111111111111111",
-  definition: definitionV1
-})
-const evolutionWithLegacyBaseline = Evolution.make({
-  current: definitionV2,
-  steps: evolution.steps,
-  legacyBaselines: [legacyBaselineV1]
-})
-const ambiguousLegacyEvolution = Evolution.make({
-  current: definitionV2,
-  steps: evolution.steps,
-  legacyBaselines: [
-    legacyBaselineV1,
-    Evolution.legacyBaseline({ id: "legacy-v2", hash: "2222222222222222", definition: definitionV2 })
-  ]
-})
-
 const evolutionV3 = Evolution.make({
   current: definitionV3,
   steps: [
@@ -232,140 +214,13 @@ const v1Envelope = (
       basis: Identity.ServerSequence.make(0),
       name: PutTodoV1.name,
       payload,
-      digestVersion: 2 as const,
+      digestVersion: 3 as const,
+      membershipIncarnation,
       sourceSchema: definitionV1.schemaIdentity,
       mutationVersion: PutTodoV1.version
     }
     return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
   })
-
-const legacyV1Envelope = (
-  mutationId: Identity.MutationId,
-  payload: typeof TodoV1.schema.Type,
-  localSequence = 1
-) =>
-  Effect.gen(function*() {
-    const identity = {
-      spaceId,
-      clientId,
-      mutationId,
-      localSequence: Identity.LocalSequence.make(localSequence),
-      basis: Identity.ServerSequence.make(0),
-      name: PutTodoV1.name,
-      payload,
-      digestVersion: 1 as const,
-      sourceSchema: definitionV1.schemaIdentity,
-      mutationVersion: PutTodoV1.version
-    }
-    return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
-  })
-
-describe("mutation digest evolution", () => {
-  it.effect("normalizes legacy protocol identity and binds membership incarnation in version 3", () =>
-    Effect.gen(function*() {
-      const common = {
-        spaceId,
-        clientId,
-        mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000211"),
-        localSequence: Identity.LocalSequence.make(1),
-        basis: Identity.ServerSequence.make(0),
-        name: PutTodoV1.name,
-        payload: { id: "1", title: "incarnation" },
-        sourceSchema: definitionV1.schemaIdentity,
-        mutationVersion: PutTodoV1.version
-      }
-      const legacyIdentity = { ...common, digestVersion: 2 as const }
-      const legacyWire = {
-        ...legacyIdentity,
-        digest: yield* Protocol.mutationDigest(legacyIdentity)
-      }
-      const decodedLegacy = Schema.decodeUnknownSync(Protocol.MutationEnvelope)(legacyWire)
-      assert.strictEqual(decodedLegacy.membershipIncarnation, Identity.legacyMembershipIncarnation)
-
-      const firstIncarnation = Identity.MembershipIncarnation.make(
-        "inc_00000000-0000-4000-8000-000000000001"
-      )
-      const secondIncarnation = Identity.MembershipIncarnation.make(
-        "inc_00000000-0000-4000-8000-000000000002"
-      )
-      const firstV3 = { ...common, digestVersion: 3 as const, membershipIncarnation: firstIncarnation }
-      const secondV3 = { ...common, digestVersion: 3 as const, membershipIncarnation: secondIncarnation }
-      const firstDigest = yield* Protocol.mutationDigest(firstV3)
-      const secondDigest = yield* Protocol.mutationDigest(secondV3)
-      assert.notStrictEqual(firstDigest, secondDigest)
-
-      const decodedReceipt = Schema.decodeUnknownSync(Protocol.Receipt)({
-        _tag: "Accepted",
-        spaceId,
-        clientId,
-        mutationId: common.mutationId,
-        localSequence: common.localSequence,
-        name: common.name,
-        sourceSchema: common.sourceSchema,
-        mutationVersion: common.mutationVersion,
-        serverSequence: 1,
-        result: null
-      })
-      assert.strictEqual(decodedReceipt.membershipIncarnation, Identity.legacyMembershipIncarnation)
-      assert.strictEqual(
-        Schema.encodeSync(Protocol.Receipt)(decodedReceipt).membershipIncarnation,
-        Identity.legacyMembershipIncarnation
-      )
-
-      const decodedEntry = Schema.decodeUnknownSync(Protocol.AcceptedMutation)({
-        sequence: 1,
-        spaceId,
-        clientId,
-        mutationId: common.mutationId,
-        localSequence: common.localSequence,
-        sourceSchema: common.sourceSchema,
-        digest: legacyWire.digest,
-        changes: []
-      })
-      assert.strictEqual(decodedEntry.membershipIncarnation, Identity.legacyMembershipIncarnation)
-    }).pipe(Effect.provide(NodeCrypto.layer)))
-
-  it.effect("preserves legacy digests and binds schema provenance in version 2", () =>
-    Effect.gen(function*() {
-      const common = {
-        spaceId,
-        clientId,
-        mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000201"),
-        localSequence: Identity.LocalSequence.make(1),
-        basis: Identity.ServerSequence.make(0),
-        name: PutTodoV1.name,
-        payload: { id: "1", title: "digest" }
-      }
-      const legacyV1 = yield* Protocol.mutationDigest({
-        ...common,
-        digestVersion: 1,
-        sourceSchema: definitionV1.schemaIdentity,
-        mutationVersion: PutTodoV1.version
-      })
-      const legacyV2 = yield* Protocol.mutationDigest({
-        ...common,
-        digestVersion: 1,
-        sourceSchema: definitionV2.schemaIdentity,
-        mutationVersion: PutTodoV2.version
-      })
-      const currentV1 = yield* Protocol.mutationDigest({
-        ...common,
-        digestVersion: 2,
-        sourceSchema: definitionV1.schemaIdentity,
-        mutationVersion: PutTodoV1.version
-      })
-      const currentV2 = yield* Protocol.mutationDigest({
-        ...common,
-        digestVersion: 2,
-        sourceSchema: definitionV2.schemaIdentity,
-        mutationVersion: PutTodoV2.version
-      })
-
-      assert.strictEqual(legacyV1, legacyV2)
-      assert.notStrictEqual(currentV1, currentV2)
-      assert.match(currentV1, /^[0-9a-f]{64}$/)
-    }).pipe(Effect.provide(NodeCrypto.layer)))
-})
 
 describe("client schema evolution", () => {
   it.effect("atomically promotes canonical state, receipts, and replayed pending mutations", () =>
@@ -438,6 +293,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(1),
         spaceId,
         clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+        membershipIncarnation,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000201"),
         localSequence: Identity.LocalSequence.make(1),
         sourceSchema: definitionV2.schemaIdentity,
@@ -496,6 +352,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(1),
         spaceId,
         clientId: remoteClientId,
+        membershipIncarnation,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000202"),
         localSequence: Identity.LocalSequence.make(1),
         sourceSchema: definitionV1.schemaIdentity,
@@ -510,6 +367,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(2),
         spaceId,
         clientId: remoteClientId,
+        membershipIncarnation,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000203"),
         localSequence: Identity.LocalSequence.make(2),
         sourceSchema: definitionV1.schemaIdentity,
@@ -569,6 +427,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(1),
         spaceId,
         clientId: remoteClientId,
+        membershipIncarnation,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000204"),
         localSequence: Identity.LocalSequence.make(1),
         sourceSchema: definitionV1.schemaIdentity,
@@ -599,6 +458,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(1),
         spaceId,
         clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+        membershipIncarnation,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000202"),
         localSequence: Identity.LocalSequence.make(1),
         sourceSchema: definitionV1.schemaIdentity,
@@ -747,6 +607,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(1),
         spaceId,
         clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+        membershipIncarnation,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000207"),
         localSequence: Identity.LocalSequence.make(1),
         sourceSchema: definitionV1.schemaIdentity,
@@ -898,102 +759,6 @@ describe("client schema evolution", () => {
         entity: { model: "Todo", modelVersion: TodoV2.version, key: 5 },
         value: { id: 5, title: "offline-old", done: false }
       })
-    })).pipe(Effect.provide(database)))
-
-  it.effect("rejects a first legacy digest when configured baselines have distinct schema identities", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const server = yield* buildServer(definitionV2, handlersV2, ambiguousLegacyEvolution)
-      const envelope = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000205"),
-        { id: "7", title: "ambiguous" }
-      )
-
-      assert.strictEqual((yield* server.submit(envelope).pipe(Effect.flip))._tag, "ProtocolInvalid")
-    })).pipe(Effect.provide(database)))
-
-  it.effect("keeps the legacy mutation byte limit for a digest version one envelope", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000206")
-      const legacyWithoutTitle = {
-        spaceId,
-        clientId,
-        mutationId,
-        localSequence: Identity.LocalSequence.make(1),
-        basis: Identity.ServerSequence.make(0),
-        name: PutTodoV1.name,
-        payload: { id: "8", title: "" },
-        digest: "0".repeat(64)
-      }
-      const title = "x".repeat(Protocol.maximumMutationBytes - Protocol.encodedBytes(legacyWithoutTitle))
-      const envelope = yield* legacyV1Envelope(mutationId, { id: "8", title })
-      const legacyWire = { ...legacyWithoutTitle, digest: envelope.digest, payload: envelope.payload }
-      assert.strictEqual(Protocol.encodedBytes(legacyWire), Protocol.maximumMutationBytes)
-      assert.isAbove(Protocol.encodedBytes(envelope), Protocol.maximumMutationBytes)
-
-      const server = yield* buildServer(definitionV2, handlersV2, evolutionWithLegacyBaseline)
-      assert.strictEqual((yield* server.submit(envelope))._tag, "Accepted")
-    })).pipe(Effect.provide(database)))
-
-  it.effect("retains the legacy baseline for exact retries and later offline mutations", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const first = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000207"),
-        { id: "9", title: "retry" }
-      )
-      const serverV1 = yield* buildServer(
-        definitionV1,
-        handlersV1,
-        Evolution.make({ current: definitionV1, legacyBaselines: [legacyBaselineV1] })
-      )
-      assert.strictEqual((yield* serverV1.submit(first))._tag, "Accepted")
-
-      const serverV2 = yield* buildServer(definitionV2, handlersV2, ambiguousLegacyEvolution)
-      yield* serverV2.pull({
-        spaceId,
-        schema: definitionV2.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
-      assert.strictEqual(
-        (yield* serverV2.submit({ envelope: first, schema: definitionV2.schemaIdentity }))._tag,
-        "Accepted"
-      )
-
-      const second = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000208"),
-        { id: "10", title: "offline" },
-        2
-      )
-      assert.strictEqual(
-        (yield* serverV2.submit({ envelope: second, schema: definitionV2.schemaIdentity }))._tag,
-        "Accepted"
-      )
-    })).pipe(Effect.provide(database)))
-
-  it.effect("does not replace a persisted legacy identity with another configured baseline", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const first = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000209"),
-        { id: "11", title: "first" }
-      )
-      const server = yield* buildServer(definitionV2, handlersV2, evolutionWithLegacyBaseline)
-      assert.strictEqual((yield* server.submit(first))._tag, "Accepted")
-
-      const droppedV1 = Evolution.make({
-        current: definitionV2,
-        legacyBaselines: [Evolution.legacyBaseline({
-          id: "legacy-v2-only",
-          hash: "3333333333333333",
-          definition: definitionV2
-        })]
-      })
-      const restarted = yield* buildServer(definitionV2, handlersV2, droppedV1)
-      const second = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000210"),
-        { id: "12", title: "second" },
-        2
-      )
-      assert.strictEqual((yield* restarted.submit(second).pipe(Effect.flip))._tag, "ProtocolInvalid")
     })).pipe(Effect.provide(database)))
 
   it.effect("resumes a server promotion after interruption", () =>

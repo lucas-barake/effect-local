@@ -79,7 +79,8 @@ const envelope = (spaceId: Identity.SpaceId) => {
     basis: Identity.ServerSequence.make(0),
     name: PutTodo.name,
     payload: { id: "1", title: "cluster" },
-    digestVersion: 2 as const,
+    digestVersion: 3 as const,
+    membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001"),
     sourceSchema: definition.schemaIdentity,
     mutationVersion: PutTodo.version
   }

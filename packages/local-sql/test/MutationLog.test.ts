@@ -37,6 +37,9 @@ import * as Domain from "./Domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const defaultMembershipIncarnation = Identity.MembershipIncarnation.make(
+  "inc_00000000-0000-4000-8000-000000000001"
+)
 const putTodoProvenance = {
   name: Domain.PutTodo.name,
   sourceSchema: Domain.definition.schemaIdentity,
@@ -48,11 +51,9 @@ const envelope = (
   payload: Schema.Json,
   localSequence: number,
   mutationId: Identity.MutationId,
-  membershipIncarnation: Identity.MembershipIncarnation = Identity.legacyMembershipIncarnation
+  membershipIncarnation: Identity.MembershipIncarnation = defaultMembershipIncarnation
 ) =>
   Effect.gen(function*() {
-    let digestVersion: Protocol.MutationDigestVersion = 3
-    if (membershipIncarnation === Identity.legacyMembershipIncarnation) digestVersion = 2
     const identity = {
       spaceId,
       clientId,
@@ -61,7 +62,7 @@ const envelope = (
       basis: Identity.ServerSequence.make(0),
       name,
       payload,
-      digestVersion,
+      digestVersion: 3 as const,
       membershipIncarnation,
       sourceSchema: Domain.definition.schemaIdentity,
       mutationVersion: Domain.definition.mutationByName.get(name)?.version ?? Identity.SchemaVersion.make(1)
@@ -321,8 +322,8 @@ describe("server reconciled mutation log", () => {
             basis: Identity.ServerSequence.make(0),
             name: Domain.PutTodo.name,
             payload: Domain.todo(`maintain-${index}`),
-            digestVersion: 2,
-            membershipIncarnation: Identity.legacyMembershipIncarnation,
+            digestVersion: 3,
+            membershipIncarnation: defaultMembershipIncarnation,
             sourceSchema: Domain.definition.schemaIdentity,
             mutationVersion: Domain.PutTodo.version
           }
@@ -2067,7 +2068,8 @@ describe("server reconciled mutation log", () => {
               localSequence: Identity.LocalSequence.make(localSequence),
               basis: Identity.ServerSequence.make(0),
               payload: Domain.todo(`${targetSpaceId}:${localSequence}`),
-              digestVersion: 2 as const,
+              digestVersion: 3 as const,
+              membershipIncarnation: defaultMembershipIncarnation,
               ...putTodoProvenance
             }
             return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
