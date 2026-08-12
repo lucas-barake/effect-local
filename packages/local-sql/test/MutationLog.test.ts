@@ -745,7 +745,8 @@ describe("server reconciled mutation log", () => {
         const stalled = yield* local.stageBootstrapPage(Protocol.BootstrapPage.make({
           manifest: page.manifest,
           entities: [],
-          hasMore: true
+          hasMore: true,
+          serverSchema: page.serverSchema
         })).pipe(Effect.flip)
         assert.strictEqual(stalled._tag, "ProtocolInvalid")
         assert.strictEqual(yield* local.cursor, 0)
@@ -1086,7 +1087,12 @@ describe("server reconciled mutation log", () => {
                 rejection: "Rejected"
               }))
             ),
-          pull: () => Effect.succeed(Protocol.PullPage.make({ entries: [], hasMore: false })),
+          pull: () =>
+            Effect.succeed(Protocol.PullPage.make({
+              entries: [],
+              hasMore: false,
+              serverSchema: Domain.definition.schemaIdentity
+            })),
           bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           watch: () => Stream.never
         })
@@ -1646,7 +1652,12 @@ describe("server reconciled mutation log", () => {
               rejection: "denied"
             })
           }),
-        pull: () => Effect.succeed(Protocol.PullPage.make({ entries: [], hasMore: false })),
+        pull: () =>
+          Effect.succeed(Protocol.PullPage.make({
+            entries: [],
+            hasMore: false,
+            serverSchema: Domain.definition.schemaIdentity
+          })),
         bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         watch: () => Stream.never
       })
@@ -1884,7 +1895,12 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine.of({
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
-          pull: () => Effect.succeed({ entries: [], hasMore: false }),
+          pull: () =>
+            Effect.succeed({
+              entries: [],
+              hasMore: false,
+              serverSchema: Domain.definition.schemaIdentity
+            }),
           bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           watch: () =>
             Stream.unwrap(
@@ -2030,7 +2046,12 @@ describe("server reconciled mutation log", () => {
                 }))
               )
             }),
-          pull: () => Effect.succeed(Protocol.PullPage.make({ entries: [], hasMore: false })),
+          pull: () =>
+            Effect.succeed(Protocol.PullPage.make({
+              entries: [],
+              hasMore: false,
+              serverSchema: Domain.definition.schemaIdentity
+            })),
           bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           watch: () => Stream.never
         })

@@ -29,8 +29,7 @@ const makeLayerHandlers = (options?: Options) => {
       )
     )
     const supportedVersions = [...decoded.supportedVersions].toSorted((left, right) => right - left)
-    const requireVersion = (protocolVersion: Protocol.ProtocolVersion | undefined) => {
-      const version = protocolVersion ?? Protocol.legacyProtocolVersion
+    const requireVersion = (version: Protocol.ProtocolVersion) => {
       if (supportedVersions.includes(version)) return Effect.void
       return Effect.fail(new ReplicaError.ProtocolVersionRejected({ version, serverVersions: supportedVersions }))
     }

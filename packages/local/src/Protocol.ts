@@ -14,7 +14,6 @@ export const maximumBootstrapEntries = 1_000
 
 export const ProtocolVersion = Schema.Int.check(Schema.isGreaterThan(0))
 export type ProtocolVersion = typeof ProtocolVersion.Type
-export const legacyProtocolVersion = ProtocolVersion.make(1)
 export const currentProtocolVersion = ProtocolVersion.make(1)
 export const NegotiateRequest = Schema.Struct({
   supportedVersions: Schema.Array(ProtocolVersion).check(Schema.isMinLength(1))
@@ -60,17 +59,23 @@ export type MutationDigestIdentity = Omit<MutationEnvelope, "digest">
 
 export const SubmitRequest = Schema.Struct({
   envelope: MutationEnvelope,
-  schema: Identity.SchemaIdentity,
-  protocolVersion: Schema.optionalKey(ProtocolVersion)
+  schema: Identity.SchemaIdentity
 })
 export type SubmitRequest = typeof SubmitRequest.Type
+export const VersionedSubmitRequest = Schema.Struct({
+  ...SubmitRequest.fields,
+  protocolVersion: ProtocolVersion
+})
 
 export const DiscardRequest = Schema.Struct({
   envelope: MutationEnvelope,
-  schema: Identity.SchemaIdentity,
-  protocolVersion: Schema.optionalKey(ProtocolVersion)
+  schema: Identity.SchemaIdentity
 })
 export type DiscardRequest = typeof DiscardRequest.Type
+export const VersionedDiscardRequest = Schema.Struct({
+  ...DiscardRequest.fields,
+  protocolVersion: ProtocolVersion
+})
 
 export const mutationDigestInput = (envelope: MutationDigestIdentity): unknown => {
   return {
@@ -178,22 +183,28 @@ export const PullRequest = Schema.Struct({
   spaceId: Identity.SpaceId,
   schema: Identity.SchemaIdentity,
   after: Identity.ServerSequence,
-  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBatchEntries)),
-  protocolVersion: Schema.optionalKey(ProtocolVersion)
+  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBatchEntries))
 })
 export type PullRequest = typeof PullRequest.Type
+export const VersionedPullRequest = Schema.Struct({
+  ...PullRequest.fields,
+  protocolVersion: ProtocolVersion
+})
 
 export const WatchRequest = Schema.Struct({
   spaceId: Identity.SpaceId,
-  schema: Identity.SchemaIdentity,
-  protocolVersion: Schema.optionalKey(ProtocolVersion)
+  schema: Identity.SchemaIdentity
 })
 export type WatchRequest = typeof WatchRequest.Type
+export const VersionedWatchRequest = Schema.Struct({
+  ...WatchRequest.fields,
+  protocolVersion: ProtocolVersion
+})
 
 export const PullPage = Schema.Struct({
   entries: Schema.Array(AcceptedMutation).check(Schema.isMaxLength(maximumBatchEntries)),
   hasMore: Schema.Boolean,
-  serverSchema: Schema.optionalKey(Identity.SchemaIdentity)
+  serverSchema: Identity.SchemaIdentity
 })
 export type PullPage = typeof PullPage.Type
 
@@ -226,7 +237,7 @@ export type SnapshotEntity = typeof SnapshotEntity.Type
 
 export const BootstrapRequired = Schema.TaggedStruct("BootstrapRequired", {
   manifest: SnapshotManifest,
-  serverSchema: Schema.optionalKey(Identity.SchemaIdentity)
+  serverSchema: Identity.SchemaIdentity
 })
 export type BootstrapRequired = typeof BootstrapRequired.Type
 
@@ -238,16 +249,19 @@ export const BootstrapRequest = Schema.Struct({
   schema: Identity.SchemaIdentity,
   snapshotId: Identity.SnapshotId,
   afterOrdinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1)),
-  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBootstrapEntries)),
-  protocolVersion: Schema.optionalKey(ProtocolVersion)
+  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBootstrapEntries))
 })
 export type BootstrapRequest = typeof BootstrapRequest.Type
+export const VersionedBootstrapRequest = Schema.Struct({
+  ...BootstrapRequest.fields,
+  protocolVersion: ProtocolVersion
+})
 
 export const BootstrapPage = Schema.Struct({
   manifest: SnapshotManifest,
   entities: Schema.Array(SnapshotEntity).check(Schema.isMaxLength(maximumBootstrapEntries)),
   hasMore: Schema.Boolean,
-  serverSchema: Schema.optionalKey(Identity.SchemaIdentity)
+  serverSchema: Identity.SchemaIdentity
 })
 export type BootstrapPage = typeof BootstrapPage.Type
 
@@ -264,10 +278,18 @@ export const PresenceUpdate = Schema.Struct({
   ttlMillis: Schema.Int.check(
     Schema.isGreaterThan(0),
     Schema.isLessThanOrEqualTo(maximumPresenceTtlMillis)
-  ),
-  protocolVersion: Schema.optionalKey(ProtocolVersion)
+  )
 })
 export type PresenceUpdate = typeof PresenceUpdate.Type
+export const VersionedPresenceUpdate = Schema.Struct({
+  ...PresenceUpdate.fields,
+  protocolVersion: ProtocolVersion
+})
+
+export const VersionedWatchPresenceRequest = Schema.Struct({
+  spaceId: Identity.SpaceId,
+  protocolVersion: ProtocolVersion
+})
 
 export const PendingMutation = Schema.Struct({
   envelope: MutationEnvelope,

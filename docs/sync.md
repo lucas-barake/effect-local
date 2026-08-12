@@ -89,7 +89,8 @@ not replace an ingress payload limit.
 ## Reconnect and retry
 
 The first operation on a logical client session negotiates the highest shared protocol version. Every later sync and
-presence operation carries that selected version. An operation rejected after reconnect clears the cached selection,
+presence operation must carry that selected version. There is no implicit protocol version for an omitted field. An
+operation rejected after reconnect clears the cached selection,
 negotiates against the new peer, and retries once. No shared version returns typed `UpgradeRequired`. Reconciliation
 treats it as terminal. Transport loss and `ServerUnavailable` remain retryable. A malformed frame remains
 `ProtocolInvalid`; it is not used as a version signal.

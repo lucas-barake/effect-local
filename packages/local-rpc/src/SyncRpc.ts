@@ -113,14 +113,14 @@ export const layerJson = (options?: {
   )
 
 export class Submit extends Rpc.make("Submit", {
-  payload: Protocol.SubmitRequest.fields,
+  payload: Protocol.VersionedSubmitRequest.fields,
   success: Protocol.Receipt,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect
 }) {}
 
 export class Discard extends Rpc.make("Discard", {
-  payload: Protocol.DiscardRequest.fields,
+  payload: Protocol.VersionedDiscardRequest.fields,
   success: Protocol.Receipt,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect
@@ -134,21 +134,21 @@ export class Negotiate extends Rpc.make("Negotiate", {
 }) {}
 
 export class Pull extends Rpc.make("Pull", {
-  payload: Protocol.PullRequest.fields,
+  payload: Protocol.VersionedPullRequest.fields,
   success: Protocol.PullResult,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect
 }) {}
 
 export class Bootstrap extends Rpc.make("Bootstrap", {
-  payload: Protocol.BootstrapRequest.fields,
+  payload: Protocol.VersionedBootstrapRequest.fields,
   success: Protocol.BootstrapPage,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect
 }) {}
 
 export class Watch extends Rpc.make("Watch", {
-  payload: Protocol.WatchRequest.fields,
+  payload: Protocol.VersionedWatchRequest.fields,
   success: Protocol.Wake,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect,
@@ -156,17 +156,14 @@ export class Watch extends Rpc.make("Watch", {
 }) {}
 
 export class PublishPresence extends Rpc.make("PublishPresence", {
-  payload: Protocol.PresenceUpdate.fields,
+  payload: Protocol.VersionedPresenceUpdate.fields,
   success: Schema.Null,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect
 }) {}
 
 export class WatchPresence extends Rpc.make("WatchPresence", {
-  payload: {
-    spaceId: Protocol.PullRequest.fields.spaceId,
-    protocolVersion: Schema.optionalKey(Protocol.ProtocolVersion)
-  },
+  payload: Protocol.VersionedWatchPresenceRequest.fields,
   success: Protocol.PresenceUpdate,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect,

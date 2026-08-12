@@ -290,8 +290,7 @@ export const layerOnePass = (
           yield* setStatus({ _tag: "Online", pending, cursor })
         }
       })
-      const observeServerSchema = (serverSchema: Identity.SchemaIdentity | undefined) => {
-        if (serverSchema === undefined) return Effect.void
+      const observeServerSchema = (serverSchema: Identity.SchemaIdentity) => {
         if (
           serverSchema.version === options.definition.schemaIdentity.version &&
           serverSchema.hash === options.definition.schemaIdentity.hash

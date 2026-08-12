@@ -259,8 +259,8 @@ const invalidProtocolLive = invalidProtocolClient.pipe(
 
 type ProtocolObservation =
   | { readonly _tag: "Negotiate" }
-  | { readonly _tag: "Pull"; readonly version: Protocol.ProtocolVersion | undefined }
-  | { readonly _tag: "PublishPresence"; readonly version: Protocol.ProtocolVersion | undefined }
+  | { readonly _tag: "Pull"; readonly version: Protocol.ProtocolVersion }
+  | { readonly _tag: "PublishPresence"; readonly version: Protocol.ProtocolVersion }
 
 const protocolObservations = MutableRef.make<Array<ProtocolObservation>>([])
 const observingAuthenticationServer = Layer.effect(
@@ -275,13 +275,13 @@ const observingAuthenticationServer = Layer.effect(
               ...observations,
               { _tag: "Negotiate" as const }
             ])
-          } else if (options.rpc._tag === "Pull" && Schema.is(Protocol.PullRequest)(payload)) {
+          } else if (options.rpc._tag === "Pull" && Schema.is(Protocol.VersionedPullRequest)(payload)) {
             MutableRef.update(protocolObservations, (observations) => [
               ...observations,
               { _tag: "Pull" as const, version: payload.protocolVersion }
             ])
           } else if (
-            options.rpc._tag === "PublishPresence" && Schema.is(Protocol.PresenceUpdate)(payload)
+            options.rpc._tag === "PublishPresence" && Schema.is(Protocol.VersionedPresenceUpdate)(payload)
           ) {
             MutableRef.update(protocolObservations, (observations) => [
               ...observations,

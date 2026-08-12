@@ -26,7 +26,8 @@ const page: Protocol.PullPage = {
       value: { id: String(index), title: "x".repeat(512) }
     }]
   })),
-  hasMore: true
+  hasMore: true,
+  serverSchema: sourceSchema
 }
 const codec = Schema.toCodecJson(Protocol.PullPage)
 const encode = Schema.encodeSync(codec)

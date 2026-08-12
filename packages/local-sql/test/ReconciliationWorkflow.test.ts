@@ -329,7 +329,7 @@ describe("reconciliation workflow", () => {
           const remote = SyncEngine.SyncEngine.of({
             discard: () => Effect.die("unexpected discard"),
             submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-            pull: () => Effect.succeed({ entries: [], hasMore: false }),
+            pull: () => Effect.succeed({ entries: [], hasMore: false, serverSchema: definition.schemaIdentity }),
             bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
             watch: () => Stream.never
           })
@@ -446,7 +446,11 @@ describe("reconciliation workflow", () => {
             pull: () =>
               Ref.update(pulls, (count) => count + 1).pipe(
                 Effect.andThen(Deferred.succeed(pulled, undefined)),
-                Effect.as({ entries: [], hasMore: false })
+                Effect.as({
+                  entries: [],
+                  hasMore: false,
+                  serverSchema: Domain.definition.schemaIdentity
+                })
               ),
             bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
             watch: () => Stream.never
@@ -518,7 +522,12 @@ describe("reconciliation workflow", () => {
           Ref.update(attempts, (count) => count + 1).pipe(
             Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
           ),
-        pull: () => Effect.succeed({ entries: [], hasMore: false }),
+        pull: () =>
+          Effect.succeed({
+            entries: [],
+            hasMore: false,
+            serverSchema: Domain.definition.schemaIdentity
+          }),
         bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         watch: () => Stream.never
       })

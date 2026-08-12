@@ -1365,7 +1365,11 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                       })
                       const entryBytes = yield* Protocol.encodedBytesEffect(entry)
                       if (
-                        (yield* Protocol.encodedBytesEffect({ entries: [entry], hasMore: false })) >
+                        (yield* Protocol.encodedBytesEffect(Protocol.PullPage.make({
+                          entries: [entry],
+                          hasMore: false,
+                          serverSchema: options.definition.schemaIdentity
+                        }))) >
                           Protocol.maximumBatchBytes
                       ) {
                         return yield* new TerminalRejection.TerminalRejection({
