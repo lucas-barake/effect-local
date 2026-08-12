@@ -4,9 +4,11 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Metric from "effect/Metric"
 import * as PubSub from "effect/PubSub"
 import * as RcMap from "effect/RcMap"
 import * as Schema from "effect/Schema"
+import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 
 export const PublishAuthorization = Schema.TaggedStruct("Publish", {
@@ -40,6 +42,7 @@ export class PresenceHub extends Context.Service<PresenceHub, Service>()(
 
 export const layer = <R = never,>(options: {
   readonly capacity?: number
+  readonly maximumWatchersPerSpace: number
   readonly authorize: (
     input: AuthorizationInput
   ) => Effect.Effect<void, typeof Schema.Json.Type, R>
@@ -55,11 +58,22 @@ export const layer = <R = never,>(options: {
           message: "capacity must be a positive safe integer"
         })
       }
+      if (!Number.isSafeInteger(options.maximumWatchersPerSpace) || options.maximumWatchersPerSpace <= 0) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "maximumWatchersPerSpace",
+          message: "maximumWatchersPerSpace must be a positive safe integer"
+        })
+      }
+      const watcherCount = Metric.gauge("effect_local_server_presence_watcher_count")
       const updates = yield* RcMap.make({
         lookup: () =>
           Effect.acquireRelease(
-            PubSub.sliding<Protocol.PresenceUpdate>(capacity),
-            PubSub.shutdown
+            Effect.gen(function*() {
+              const channel = yield* PubSub.sliding<Protocol.PresenceUpdate>(capacity)
+              const watcherPermits = yield* Semaphore.make(options.maximumWatchersPerSpace)
+              return { channel, watcherPermits } as const
+            }),
+            ({ channel }) => PubSub.shutdown(channel)
           )
       })
       return PresenceHub.of({
@@ -84,7 +98,7 @@ export const layer = <R = never,>(options: {
               }
               if (yield* RcMap.has(updates, spaceId)) {
                 yield* RcMap.get(updates, spaceId).pipe(
-                  Effect.flatMap((channel) => PubSub.publish(channel, update)),
+                  Effect.flatMap(({ channel }) => PubSub.publish(channel, update)),
                   Effect.scoped
                 )
               }
@@ -102,11 +116,27 @@ export const layer = <R = never,>(options: {
         watch: (spaceId, principal) =>
           Stream.unwrap(
             Effect.gen(function*() {
+              const { channel, watcherPermits } = yield* RcMap.get(updates, spaceId)
+              yield* Effect.acquireRelease(
+                Effect.gen(function*() {
+                  if (!(yield* Semaphore.takeIfAvailable(watcherPermits, 1))) {
+                    yield* new ReplicaError.CapacityExceeded({
+                      resource: "presence watchers",
+                      limit: options.maximumWatchersPerSpace
+                    })
+                  }
+                  yield* Metric.modify(watcherCount, 1)
+                }),
+                () =>
+                  Effect.all([
+                    Semaphore.release(watcherPermits, 1),
+                    Metric.modify(watcherCount, -1)
+                  ], { discard: true })
+              )
               yield* options.authorize(WatchAuthorization.make({ spaceId, principal })).pipe(
                 Effect.provide(context),
                 Effect.mapError((reason) => new ReplicaError.AuthorizationDenied({ reason }))
               )
-              const channel = yield* RcMap.get(updates, spaceId)
               const subscription = yield* PubSub.subscribe(channel)
               return Stream.fromSubscription(subscription)
             })
@@ -119,8 +149,9 @@ export const layer = <R = never,>(options: {
     })
   )
 
-export const layerTrusted = (options?: {
+export const layerTrusted = (options: {
   readonly capacity?: number
+  readonly maximumWatchersPerSpace: number
 }): Layer.Layer<PresenceHub, ReplicaError.InvalidConfiguration> =>
   layer({
     ...options,

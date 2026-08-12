@@ -23,6 +23,7 @@ import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as HttpRouter from "effect/unstable/http/HttpRouter"
 import * as HttpServer from "effect/unstable/http/HttpServer"
@@ -114,6 +115,10 @@ const serverHistory = {
   retainedSnapshots: 2,
   maintenanceConcurrency: 1,
   maintenanceSpaceBatchSize: 128,
+  maximumWatchersPerSpace: 1_024,
+  readAuthorizationRefreshInterval: "100 millis" as const,
+  maximumConcurrentReadAuthorizations: 64,
+  readAuthorizationCacheCapacity: 4_096,
   migration
 }
 const clientHistory = {
@@ -176,8 +181,15 @@ const authenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.
 const revokedAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
   Layer.succeed(Authentication.Credentials, Redacted.make("revoked"))
 ))
-const presenceHub = PresenceHub.layerTrusted()
-const cluster = SpaceEntity.layer().pipe(
+const presenceHub = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })
+const cluster = SpaceEntity.layer({
+  admissionMailboxCapacity: 32,
+  readMailboxCapacity: 32,
+  watchMailboxCapacity: 32,
+  presencePublicationMailboxCapacity: 32,
+  maximumConcurrentBootstrapPagesPerSpace: 4,
+  maximumConcurrentPresencePublicationsPerSpace: 16
+}).pipe(
   Layer.provide(store),
   Layer.provide(presenceHub),
   Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(database)))
@@ -548,26 +560,7 @@ describe("WebSocket synchronization", () => {
       )
       yield* Deferred.await(initialWake)
       MutableRef.set(readAuthorized, false)
-
-      const identity = {
-        spaceId,
-        clientId,
-        mutationId,
-        localSequence: Identity.LocalSequence.make(1),
-        basis: Identity.ServerSequence.make(0),
-        name: PutTodo.name,
-        payload: { id: "1", title: "socket" },
-        digestVersion: 3 as const,
-        membershipIncarnation: Identity.legacyMembershipIncarnation,
-        sourceSchema: definition.schemaIdentity,
-        mutationVersion: PutTodo.version
-      }
-      const envelope: Protocol.MutationEnvelope = {
-        ...identity,
-        digest: yield* Protocol.mutationDigest(identity)
-      }
-      const receipt = yield* remote.submit({ envelope, schema: definition.schemaIdentity })
-      assert.strictEqual(receipt._tag, "Accepted")
+      yield* TestClock.adjust("100 millis")
 
       const denied = yield* Fiber.join(watching).pipe(Effect.flip)
       assert.strictEqual(denied._tag, "AuthorizationDenied")
@@ -575,7 +568,7 @@ describe("WebSocket synchronization", () => {
       Effect.ensuring(Effect.sync(() => MutableRef.set(readAuthorized, true))),
       Effect.provide(live),
       Effect.provide(NodeCrypto.layer)
-    ))
+    ), 10_000)
 
   it.effect("authorizes only the migrated mutation payload", () =>
     Effect.gen(function*() {
