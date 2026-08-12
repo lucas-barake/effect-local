@@ -6,3 +6,5 @@ export const entity = (spaceId: Identity.SpaceId, model: string, key: unknown): 
 
 export const query = (spaceId: Identity.SpaceId, name: string, payload: unknown): string =>
   `effect-local:query:${Canonical.hash({ spaceId, name, payload })}`
+
+export const pending = (spaceId: Identity.SpaceId): string => `effect-local:space:${spaceId}:pending`

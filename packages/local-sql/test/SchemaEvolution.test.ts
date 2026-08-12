@@ -20,6 +20,7 @@ import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
@@ -39,6 +40,7 @@ const membershipIncarnation = Identity.MembershipIncarnation.make("inc_00000000-
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
   retainedReceipts: 256,
+  settlementCapacity: 64,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
   maximumBootstrapEntities: 10_000,
@@ -415,6 +417,35 @@ const v1Envelope = (
   })
 
 describe("client schema evolution", () => {
+  it.effect("rejects same-name mutation descriptors that are not registered in the definition", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const server = yield* buildServer(definitionV2, handlersV2, evolution)
+      const replica = yield* buildReplica(definitionV2, handlersV2, serverSync(server), evolution)
+      const counterfeit = Mutation.make("PutTodo", {
+        version: 2,
+        payload: Schema.String,
+        success: Schema.Json,
+        rejection: Schema.Json
+      })
+      const unknownMutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000990")
+
+      assert.strictEqual((yield* replica.pendingFor(counterfeit).pipe(Effect.flip))._tag, "ProtocolInvalid")
+      assert.strictEqual(
+        (yield* replica.receipt(counterfeit, unknownMutationId).pipe(Effect.flip))._tag,
+        "ProtocolInvalid"
+      )
+
+      const counterfeitSettlement = yield* replica.settlementsFor(counterfeit).pipe(
+        Stream.runHead,
+        Effect.result,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* replica.mutate(PutTodoV2, { id: 990, title: "registered", done: false })
+      const invalid = yield* Fiber.join(counterfeitSettlement)
+      assert.isTrue(Result.isFailure(invalid))
+      if (Result.isFailure(invalid)) assert.strictEqual(invalid.failure._tag, "ProtocolInvalid")
+    })).pipe(Effect.provide(database)))
+
   it.effect("atomically promotes canonical state, receipts, and replayed pending mutations", () =>
     Effect.scoped(Effect.gen(function*() {
       const v1 = yield* buildStore(definitionV1, handlersV1)
@@ -463,7 +494,7 @@ describe("client schema evolution", () => {
         assert.deepStrictEqual(promotedReceipt.result, { id: 1, title: "accepted", done: false })
       }
 
-      const promotedPending = yield* v2.pending
+      const promotedPending = yield* v2.pendingToSubmit
       assert.strictEqual(promotedPending.length, 1)
       assert.strictEqual(promotedPending[0].envelope.digest, pending.envelope.digest)
       assert.deepStrictEqual(promotedPending[0].envelope.sourceSchema, definitionV1.schemaIdentity)
@@ -474,6 +505,110 @@ describe("client schema evolution", () => {
       })
       assert.strictEqual(yield* v2.cursor, 1)
       assert.strictEqual((yield* v1.get(TodoV1, "1").pipe(Effect.flip))._tag, "SchemaGenerationConflict")
+    })).pipe(Effect.provide(database)))
+
+  it.effect("preserves AwaitingReceipt across promotion without replaying its optimistic changes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const pending = yield* v1.mutate(PutTodoV1, { id: "90", title: "optimistic" })
+      yield* v1.markSubmitting(pending.envelope.mutationId)
+      yield* v1.applyEntries([Protocol.AcceptedMutation.make({
+        sequence: Identity.ServerSequence.make(1),
+        spaceId,
+        clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
+        mutationId: pending.envelope.mutationId,
+        localSequence: pending.envelope.localSequence,
+        sourceSchema: definitionV1.schemaIdentity,
+        digest: pending.envelope.digest,
+        changes: [Protocol.Upsert.make({
+          entity: { model: TodoV1.name, modelVersion: TodoV1.version, key: "90" },
+          value: { id: "90", title: "authoritative" }
+        })]
+      })])
+      yield* sql`UPDATE effect_local_client_pending_data SET submission_state = 'AwaitingReceipt'
+        WHERE space_id = ${spaceId} AND mutation_id = ${pending.envelope.mutationId}`
+      const awaiting = (yield* v1.pending)[0]
+      assert.strictEqual(awaiting.submissionState, "AwaitingReceipt")
+      assert.strictEqual(awaiting.attempts, 1)
+      assert.strictEqual(Option.getOrThrow(yield* v1.get(TodoV1, "90")).title, "authoritative")
+
+      const v2 = yield* buildStore(definitionV2, handlersV2, evolution)
+
+      const promoted = (yield* v2.pending)[0]
+      assert.strictEqual(promoted.submissionState, "AwaitingReceipt")
+      assert.strictEqual(promoted.attempts, 1)
+      assert.deepStrictEqual(promoted.changes, [Protocol.Upsert.make({
+        entity: { model: TodoV2.name, modelVersion: TodoV2.version, key: 90 },
+        value: { id: 90, title: "optimistic", done: false }
+      })])
+      assert.strictEqual(Option.getOrThrow(yield* v2.get(TodoV2, 90)).title, "authoritative")
+    })).pipe(Effect.provide(database)))
+
+  it.effect("promotes receipt-backed pending without replaying and settles after projection recovery", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const pending = yield* v1.mutate(PutTodoV1, { id: "92", title: "receipt-backed" })
+      yield* v1.markSubmitting(pending.envelope.mutationId)
+      const receipt = Protocol.RejectedReceipt.make({
+        spaceId,
+        clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
+        mutationId: pending.envelope.mutationId,
+        localSequence: pending.envelope.localSequence,
+        name: PutTodoV1.name,
+        sourceSchema: definitionV1.schemaIdentity,
+        mutationVersion: PutTodoV1.version,
+        origin: "Mutation" as const,
+        rejection: "server-rejected"
+      })
+      yield* v1.persistReceipt(receipt)
+      yield* sql`CREATE TRIGGER fail_projection_promotion BEFORE UPDATE OF active_projection_generation
+        ON effect_local_client_spaces
+        WHEN NEW.active_projection_generation <> OLD.active_projection_generation
+        BEGIN SELECT RAISE(ABORT, 'projection failed'); END`
+
+      const failedSettlement = yield* v1.settleReceipts.pipe(Effect.result)
+      assert.isTrue(Result.isFailure(failedSettlement))
+      const durablePending = (yield* v1.pending)[0]
+      assert.strictEqual(durablePending.submissionState, "Submitted")
+      assert.strictEqual(durablePending.attempts, 1)
+      assert.isTrue(Option.isSome(yield* v1.receipt(pending.envelope.mutationId)))
+
+      yield* sql`DROP TRIGGER fail_projection_promotion`
+      const rejectingV2 = yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
+      const promoted = (yield* rejectingV2.pending)[0]
+      assert.strictEqual(promoted.submissionState, "Submitted")
+      assert.strictEqual(promoted.attempts, 1)
+      assert.deepStrictEqual(yield* rejectingV2.quarantine, [])
+      const promotedReceipt = Option.getOrThrow(yield* rejectingV2.receipt(pending.envelope.mutationId))
+      assert.strictEqual(promotedReceipt._tag, "Rejected")
+      if (promotedReceipt._tag === "Rejected") {
+        assert.deepStrictEqual(promotedReceipt.sourceSchema, definitionV2.schemaIdentity)
+        assert.strictEqual(promotedReceipt.mutationVersion, PutTodoV2.version)
+      }
+
+      const settlementFiber = yield* rejectingV2.settlements.pipe(
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* rejectingV2.settleReceipts
+      const delivered = Option.getOrThrow(yield* Fiber.join(settlementFiber))
+      assert.strictEqual(delivered.pending.envelope.mutationId, pending.envelope.mutationId)
+      assert.deepStrictEqual(yield* rejectingV2.pending, [])
+      assert.deepStrictEqual(yield* rejectingV2.quarantine, [])
+      assert.isTrue(Option.isSome(yield* rejectingV2.receipt(pending.envelope.mutationId)))
+      const duplicate = yield* rejectingV2.settlements.pipe(
+        Stream.runHead,
+        Effect.timeoutOption("1 second"),
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* rejectingV2.settleReceipts
+      yield* TestClock.adjust("1 second")
+      assert.isTrue(Option.isNone(yield* Fiber.join(duplicate)))
+      assert.deepStrictEqual(yield* rejectingV2.pending, [])
     })).pipe(Effect.provide(database)))
 
   it.effect("replays an old pending envelope after applying a current accepted entry", () =>
@@ -516,7 +651,7 @@ describe("client schema evolution", () => {
       yield* buildStore(definitionV2, handlersV2, evolution)
       const v3 = yield* buildStore(definitionV3, handlersV3, evolutionV3)
 
-      assert.deepStrictEqual((yield* v3.pending)[0].envelope, pending.envelope)
+      assert.deepStrictEqual((yield* v3.pendingToSubmit)[0].envelope, pending.envelope)
       assert.deepStrictEqual(Option.getOrThrow(yield* v3.get(TodoV3, 3)), {
         id: 3,
         title: "multi-hop",
@@ -989,6 +1124,36 @@ describe("client schema evolution", () => {
         }))._tag,
         "Accepted"
       )
+    })).pipe(Effect.provide(database)))
+
+  it.effect("keeps quarantine intact when disposition receipt identity or provenance is invalid", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      const pending = yield* v1.mutate(PutTodoV1, { id: "91", title: "quarantined" })
+      const v2 = yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
+      const item = Option.getOrThrow(yield* v2.quarantineByMutation(pending.envelope.mutationId))
+      const server = yield* buildServer(definitionV2, handlersV2, evolution)
+      const valid = yield* server.discard({ envelope: item.envelope, schema: v2.schema }, null)
+      if (valid._tag !== "Rejected") assert.fail("expected rejected quarantine receipt")
+      const invalidReceipts = [
+        Protocol.RejectedReceipt.make({ ...valid, name: "DifferentMutation" }),
+        Protocol.RejectedReceipt.make({
+          ...valid,
+          sourceSchema: { ...definitionV2.schemaIdentity, hash: Identity.SchemaHash.make("0".repeat(16)) }
+        }),
+        Protocol.RejectedReceipt.make({
+          ...valid,
+          mutationVersion: Identity.SchemaVersion.make(valid.mutationVersion + 1)
+        })
+      ]
+
+      for (const receipt of invalidReceipts) {
+        const error = yield* v2.resolveQuarantine(receipt).pipe(Effect.flip)
+        assert.strictEqual(error._tag, "ProtocolInvalid")
+        assert.isTrue(Option.isSome(yield* v2.quarantineByMutation(pending.envelope.mutationId)))
+        assert.deepStrictEqual(yield* v2.pending, [])
+        assert.isTrue(Option.isNone(yield* v2.receipt(pending.envelope.mutationId)))
+      }
     })).pipe(Effect.provide(database)))
 
   it.effect("keeps quarantine durable when receipt persistence fails during disposition", () =>

@@ -1047,6 +1047,10 @@ const clientV8 = makeMigration({
       mutation_version INTEGER,
       optimistic_result_json TEXT NOT NULL,
       changes_json TEXT NOT NULL,
+      submission_state TEXT NOT NULL DEFAULT 'Queued' CHECK (
+        submission_state IN ('Queued', 'Submitting', 'Retrying', 'Submitted', 'AwaitingReceipt')
+      ),
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
       PRIMARY KEY (space_id, schema_generation, mutation_id),
       UNIQUE (space_id, schema_generation, local_sequence),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE

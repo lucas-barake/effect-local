@@ -118,6 +118,7 @@ const serverHistory = {
 }
 const clientHistory = {
   retainedReceipts: 256,
+  settlementCapacity: 64,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
   maximumBootstrapEntities: 10_000,
@@ -339,7 +340,7 @@ describe("WebSocket synchronization", () => {
       const awaitReceipt = (space: Replica.Space, id: Identity.MutationId) =>
         Effect.gen(function*() {
           while (true) {
-            const receipt = yield* space.receipt(id)
+            const receipt = yield* space.receipt(PutTodo, id)
             if (Option.isSome(receipt)) return receipt.value
             yield* Effect.yieldNow
           }

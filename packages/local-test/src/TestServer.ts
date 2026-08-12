@@ -14,18 +14,28 @@ export const layer: Layer.Layer<SyncEngine.SyncEngine, never, ServerStore.Server
       const server = yield* ServerStore.ServerStore
       const faults = yield* FaultInjection.FaultInjection
       const online = (spaceId: Protocol.SubmitRequest["envelope"]["spaceId"]) =>
-        faults.state(spaceId).pipe(Effect.filterOrFail(
-          (state) => state.online,
-          () => new ReplicaError.ServerUnavailable()
-        ))
+        Effect.gen(function*() {
+          if (!(yield* faults.state(spaceId)).online) {
+            yield* faults.emit({ _tag: "RequestRejectedOffline", spaceId })
+            yield* new ReplicaError.ServerUnavailable()
+          }
+        })
       return SyncEngine.SyncEngine.of({
         submit: (request) =>
           Effect.gen(function*() {
             yield* online(request.envelope.spaceId)
             const receipt = yield* server.submit(request)
+            yield* faults.emit({ _tag: "ReceiptCommitted", spaceId: request.envelope.spaceId, receipt })
             if (yield* faults.takeDroppedReceipt(request.envelope.spaceId)) {
+              yield* faults.emit({ _tag: "ReceiptDropped", spaceId: request.envelope.spaceId, receipt })
               return yield* new ReplicaError.ServerUnavailable()
             }
+            yield* faults.awaitReceiptRelease(request.envelope.spaceId)
+            if (yield* faults.takePartitionAfterReceipt(request.envelope.spaceId)) {
+              yield* faults.partition(request.envelope.spaceId)
+            }
+            yield* faults.emit({ _tag: "ReceiptReturned", spaceId: request.envelope.spaceId, receipt })
+            yield* faults.markReceiptReturned(request.envelope.spaceId)
             return receipt
           }),
         discard: (request) => online(request.envelope.spaceId).pipe(Effect.andThen(server.discard(request, null))),
@@ -33,6 +43,12 @@ export const layer: Layer.Layer<SyncEngine.SyncEngine, never, ServerStore.Server
           Effect.gen(function*() {
             yield* online(request.spaceId)
             const page = yield* server.pull(request)
+            if (yield* faults.takePostReceiptPull(request.spaceId)) {
+              yield* faults.emit({ _tag: "PullCompletedAfterReceipt", spaceId: request.spaceId })
+            }
+            if (!("_tag" in page) && (yield* faults.shouldWithholdPullEvidence(request.spaceId))) {
+              return { ...page, entries: [], hasMore: false }
+            }
             if (
               "_tag" in page ||
               !(yield* faults.takeDuplicatePage(request.spaceId)) ||
