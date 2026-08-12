@@ -120,12 +120,6 @@ export type ReadAuthorizationInput =
     readonly value: typeof Schema.Json.Type
   }
 
-interface InternalWake {
-  readonly spaceId: Identity.SpaceId
-  readonly sequence: Identity.ServerSequence
-  readonly changes: ReadonlyArray<Protocol.EntityChange>
-}
-
 interface GlobalSnapshotManifest {
   readonly spaceId: Identity.SpaceId
   readonly definitionHash: string
@@ -257,7 +251,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
       yield* Migrations.server(options.migration)
       const wakes = yield* RcMap.make({
         lookup: (_spaceId: Identity.SpaceId) =>
-          Effect.acquireRelease(PubSub.sliding<InternalWake>(wakeCapacity), PubSub.shutdown)
+          Effect.acquireRelease(PubSub.sliding<ReadonlyArray<Protocol.EntityChange>>(wakeCapacity), PubSub.shutdown)
       })
       const findReceiptByMutation = SqlSchema.findOneOption({
         Request: Schema.Struct({ spaceId: Identity.SpaceId, mutationId: Identity.MutationId }),
@@ -1206,13 +1200,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                     )
                     yield* Effect.scoped(
                       RcMap.get(wakes, submittedEnvelope.spaceId).pipe(
-                        Effect.flatMap((channel) =>
-                          PubSub.publish(channel, {
-                            spaceId: submittedEnvelope.spaceId,
-                            sequence: receipt.serverSequence,
-                            changes: entry.changes
-                          })
-                        )
+                        Effect.flatMap((channel) => PubSub.publish(channel, entry.changes))
                       )
                     )
                     return yield* Effect.void
@@ -1624,10 +1612,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
       const mutationWakeVisible = (
         request: Protocol.WatchRequest,
         principal: typeof Schema.Json.Type,
-        wake: InternalWake
+        changes: ReadonlyArray<Protocol.EntityChange>
       ) =>
         Effect.gen(function*() {
-          const scoped = wake.changes.filter((change) => request.scope.models.includes(change.entity.model))
+          const scoped = changes.filter((change) => request.scope.models.includes(change.entity.model))
           if (scoped.length === 0) return false
           const identities = yield* Effect.forEach(scoped, (change) =>
             Codec.stringify(change.entity.key).pipe(
@@ -1657,7 +1645,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 Stream.drop(1),
                 Stream.map(() => Option.none())
               )
-              return Stream.succeed(Option.none<InternalWake>()).pipe(
+              return Stream.succeed(Option.none<ReadonlyArray<Protocol.EntityChange>>()).pipe(
                 Stream.concat(Stream.merge(mutations, refreshes)),
                 Stream.filterEffect((signal) =>
                   Effect.gen(function*() {

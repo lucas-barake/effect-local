@@ -4,6 +4,7 @@ import { assert, describe, it } from "@effect/vitest"
 import * as LocalStore from "@lucas-barake/effect-local-sql/LocalStore"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
+import * as Reconciler from "@lucas-barake/effect-local-sql/Reconciler"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
@@ -122,34 +123,13 @@ const pullRequest = (state: LocalStore.ReplicationState) =>
   })
 
 const synchronize = (local: LocalStore.Service, sync: SyncEngine.Service) =>
-  Effect.gen(function*() {
-    const state = yield* local.replicationState
-    const result = yield* sync.pull(pullRequest(state))
-    if (!("_tag" in result)) {
-      yield* local.applyViewPage(result)
-      return result
-    }
-    yield* local.prepareBootstrap(result.manifest)
-    let afterOrdinal = -1
-    while (true) {
-      const page = yield* sync.bootstrap({
-        spaceId,
-        clientId: state.clientId,
-        schema: definition.schemaIdentity,
-        scope: state.scope,
-        scopeGeneration: state.scopeGeneration,
-        cursor: result.manifest.cursor,
-        snapshotId: result.manifest.snapshotId,
-        afterOrdinal,
-        limit: 10
-      })
-      if (yield* local.stageBootstrapPage(page)) {
-        yield* local.installBootstrap(page.manifest)
-        return page
-      }
-      afterOrdinal += page.entries.length
-    }
-  })
+  service(
+    Reconciler.Reconciliation,
+    Reconciler.layerOnePass({ definition, spaceId, pageSize: 10 }).pipe(
+      Layer.provide(Layer.succeed(LocalStore.Store, local)),
+      Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
+    )
+  ).pipe(Effect.flatMap((reconciliation) => reconciliation.sync))
 
 describe("test synchronization faults", () => {
   it.effect("partitions and consumes one-shot faults by space", () =>

@@ -309,11 +309,12 @@ export const layerOnePass = (
         return Ref.set(updateAvailable, serverSchema)
       }
 
-      const bootstrap = (
-        manifest: Protocol.SnapshotManifest
+      const continueBootstrap = (
+        manifest: Protocol.SnapshotManifest,
+        initialAfterOrdinal: number
       ): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.gen(function*() {
-          let afterOrdinal = yield* local.prepareBootstrap(manifest)
+          let afterOrdinal = initialAfterOrdinal
           while (true) {
             const state = yield* local.replicationState
             const page = yield* remote.bootstrap({
@@ -329,7 +330,8 @@ export const layerOnePass = (
             })
             yield* observeServerSchema(page.serverSchema)
             if (page.manifest.snapshotId !== manifest.snapshotId) {
-              yield* bootstrap(page.manifest)
+              const nextAfterOrdinal = yield* local.prepareBootstrap(page.manifest)
+              yield* continueBootstrap(page.manifest, nextAfterOrdinal)
               return yield* Effect.void
             }
             const complete = yield* local.stageBootstrapPage(page)
@@ -340,6 +342,13 @@ export const layerOnePass = (
             afterOrdinal += page.entries.length
           }
         })
+
+      const bootstrap = (
+        manifest: Protocol.SnapshotManifest
+      ): Effect.Effect<void, ReplicaError.ReplicaError> =>
+        local.prepareBootstrap(manifest).pipe(
+          Effect.flatMap((afterOrdinal) => continueBootstrap(manifest, afterOrdinal))
+        )
 
       const bootstrapExpired = (receipt: Protocol.ExpiredReceipt) =>
         Effect.gen(function*() {
@@ -378,31 +387,7 @@ export const layerOnePass = (
             }
             afterOrdinal = firstPage.entries.length - 1
           }
-          while (true) {
-            const current = yield* local.replicationState
-            const page = yield* remote.bootstrap({
-              spaceId: options.spaceId,
-              clientId: current.clientId,
-              schema: options.definition.schemaIdentity,
-              scope: current.scope,
-              scopeGeneration: current.scopeGeneration,
-              cursor: firstPage.manifest.cursor,
-              snapshotId: firstPage.manifest.snapshotId,
-              afterOrdinal,
-              limit: pageSize
-            })
-            yield* observeServerSchema(page.serverSchema)
-            if (page.manifest.snapshotId !== firstPage.manifest.snapshotId) {
-              yield* bootstrap(page.manifest)
-              return yield* Effect.void
-            }
-            const complete = yield* local.stageBootstrapPage(page)
-            if (complete) {
-              yield* local.installBootstrap(page.manifest)
-              return yield* Effect.void
-            }
-            afterOrdinal += page.entries.length
-          }
+          return yield* continueBootstrap(firstPage.manifest, afterOrdinal)
         })
 
       const catchUp = Effect.gen(function*() {

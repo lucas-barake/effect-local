@@ -211,12 +211,16 @@ export const AcceptedMutation = Schema.Struct({
 })
 export type AcceptedMutation = typeof AcceptedMutation.Type
 
-export const PullRequest = Schema.Struct({
+const ReplicationRequestContext = {
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
   schema: Identity.SchemaIdentity,
   scope: ReplicationScope,
-  scopeGeneration: Identity.ReplicationScopeGeneration,
+  scopeGeneration: Identity.ReplicationScopeGeneration
+}
+
+export const PullRequest = Schema.Struct({
+  ...ReplicationRequestContext,
   cursor: Schema.NullOr(ReplicationCursor),
   limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBatchEntries))
 })
@@ -224,11 +228,7 @@ export type PullRequest = typeof PullRequest.Type
 export const VersionedPullRequest = PullRequest.pipe(withProtocolVersion)
 
 export const WatchRequest = Schema.Struct({
-  spaceId: Identity.SpaceId,
-  clientId: Identity.ClientId,
-  schema: Identity.SchemaIdentity,
-  scope: ReplicationScope,
-  scopeGeneration: Identity.ReplicationScopeGeneration,
+  ...ReplicationRequestContext,
   cursor: Schema.NullOr(ReplicationCursor)
 })
 export type WatchRequest = typeof WatchRequest.Type
@@ -300,11 +300,7 @@ export const PullResult = Schema.Union([PullPage, BootstrapRequired])
 export type PullResult = typeof PullResult.Type
 
 export const BootstrapRequest = Schema.Struct({
-  spaceId: Identity.SpaceId,
-  clientId: Identity.ClientId,
-  schema: Identity.SchemaIdentity,
-  scope: ReplicationScope,
-  scopeGeneration: Identity.ReplicationScopeGeneration,
+  ...ReplicationRequestContext,
   cursor: ReplicationCursor,
   snapshotId: Identity.SnapshotId,
   afterOrdinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1)),

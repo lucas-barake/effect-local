@@ -1,8 +1,8 @@
-import * as Canonical from "@lucas-barake/effect-local/Canonical"
+import { NodeCrypto } from "@effect/platform-node"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
-import { createHash } from "node:crypto"
 import { bench } from "vitest"
 
 const changes: ReadonlyArray<Protocol.ViewChange> = Array.from({ length: 256 }, (_, index) =>
@@ -14,9 +14,10 @@ const changes: ReadonlyArray<Protocol.ViewChange> = Array.from({ length: 256 }, 
     }),
     value: { id: String(index), title: "x".repeat(512) }
   }))
-const digest = createHash("sha256")
-  .update(Canonical.stringify({ format: 1, changes }))
-  .digest("hex")
+const digest = Protocol.viewChangesDigest(changes).pipe(
+  Effect.provide(NodeCrypto.layer),
+  Effect.runSync
+)
 const page = Protocol.PullPage.make({
   scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
   cursor: Protocol.ReplicationCursor.make({
@@ -26,7 +27,7 @@ const page = Protocol.PullPage.make({
   serverSequence: Identity.ServerSequence.make(256),
   changes,
   contentBytes: Protocol.encodedBytes(changes),
-  digest: Protocol.MutationDigest.make(digest),
+  digest,
   hasMore: true,
   serverSchema: Identity.SchemaIdentity.make({
     version: Identity.SchemaVersion.make(1),
