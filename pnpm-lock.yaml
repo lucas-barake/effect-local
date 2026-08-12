@@ -8,6 +8,9 @@ overrides:
   '@effect/platform-node-shared': 4.0.0-beta.103
 
 patchedDependencies:
+  effect@4.0.0-beta.103:
+    hash: 0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53
+    path: patches/effect@4.0.0-beta.103.patch
   oxlint-plugin-effect@0.6.0:
     hash: 55c4f51bf62afe6d847c6efc5831643232c37d8231111f23ce967e8ad084ced5
     path: patches/oxlint-plugin-effect@0.6.0.patch
@@ -27,7 +30,7 @@ importers:
         version: 0.87.2
       '@effect/vitest':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(vitest@4.1.10)
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))(vitest@4.1.10)
       '@types/node':
         specifier: ^25.7.0
         version: 25.9.5
@@ -42,7 +45,7 @@ importers:
         version: 0.55.2
       effect:
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103
+        version: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
       glob:
         specifier: ^13.0.6
         version: 13.0.6
@@ -57,7 +60,7 @@ importers:
         version: 1.77.0(oxlint-tsgolint@7.0.2001)
       oxlint-plugin-effect:
         specifier: 0.6.0
-        version: 0.6.0(patch_hash=55c4f51bf62afe6d847c6efc5831643232c37d8231111f23ce967e8ad084ced5)(effect@4.0.0-beta.103)
+        version: 0.6.0(patch_hash=55c4f51bf62afe6d847c6efc5831643232c37d8231111f23ce967e8ad084ced5)(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))
       oxlint-tsgolint:
         specifier: 7.0.2001
         version: 7.0.2001
@@ -72,7 +75,7 @@ importers:
     devDependencies:
       effect:
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103
+        version: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
 
   packages/local-browser:
     dependencies:
@@ -85,16 +88,16 @@ importers:
     devDependencies:
       '@effect/platform-browser':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))
       '@effect/platform-node':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))(ioredis@5.11.1)
       '@effect/sql-sqlite-node':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))
       '@effect/sql-sqlite-wasm':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(@effect/wa-sqlite@0.1.2)(effect@4.0.0-beta.103)
+        version: 4.0.0-beta.103(@effect/wa-sqlite@0.1.2)(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))
       '@effect/wa-sqlite':
         specifier: 0.1.2
         version: 0.1.2
@@ -103,7 +106,7 @@ importers:
         version: link:../local-test
       effect:
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103
+        version: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
 
   packages/local-rpc:
     dependencies:
@@ -116,13 +119,13 @@ importers:
     devDependencies:
       '@effect/platform-node':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))(ioredis@5.11.1)
       '@effect/sql-sqlite-node':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))
       effect:
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103
+        version: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
 
   packages/local-sql:
     dependencies:
@@ -132,25 +135,25 @@ importers:
     devDependencies:
       '@effect/platform-node':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))(ioredis@5.11.1)
       '@effect/sql-sqlite-node':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))
       effect:
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103
+        version: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
 
   packages/local-test:
     dependencies:
       '@effect/platform-node':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))(ioredis@5.11.1)
       '@effect/platform-node-shared':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))
       '@effect/sql-sqlite-node':
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))
       '@lucas-barake/effect-local':
         specifier: workspace:^
         version: link:../local
@@ -160,7 +163,7 @@ importers:
     devDependencies:
       effect:
         specifier: 4.0.0-beta.103
-        version: 4.0.0-beta.103
+        version: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
 
 packages:
 
@@ -2797,24 +2800,24 @@ snapshots:
 
   '@effect/language-service@0.87.2': {}
 
-  '@effect/platform-browser@4.0.0-beta.103(effect@4.0.0-beta.103)':
+  '@effect/platform-browser@4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))':
     dependencies:
-      effect: 4.0.0-beta.103
+      effect: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
       multipasta: 0.2.8
 
-  '@effect/platform-node-shared@4.0.0-beta.103(effect@4.0.0-beta.103)':
+  '@effect/platform-node-shared@4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))':
     dependencies:
       '@types/ws': 8.18.1
-      effect: 4.0.0-beta.103
+      effect: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
       ws: 8.21.1
     transitivePeerDependencies:
       - bufferutil
       - utf-8-validate
 
-  '@effect/platform-node@4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)':
+  '@effect/platform-node@4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))(ioredis@5.11.1)':
     dependencies:
-      '@effect/platform-node-shared': 4.0.0-beta.103(effect@4.0.0-beta.103)
-      effect: 4.0.0-beta.103
+      '@effect/platform-node-shared': 4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))
+      effect: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
       ioredis: 5.11.1
       mime: 4.1.0
       undici: 8.8.0
@@ -2822,18 +2825,18 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@effect/sql-sqlite-node@4.0.0-beta.103(effect@4.0.0-beta.103)':
+  '@effect/sql-sqlite-node@4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))':
     dependencies:
-      effect: 4.0.0-beta.103
+      effect: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
 
-  '@effect/sql-sqlite-wasm@4.0.0-beta.103(@effect/wa-sqlite@0.1.2)(effect@4.0.0-beta.103)':
+  '@effect/sql-sqlite-wasm@4.0.0-beta.103(@effect/wa-sqlite@0.1.2)(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))':
     dependencies:
       '@effect/wa-sqlite': 0.1.2
-      effect: 4.0.0-beta.103
+      effect: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
 
-  '@effect/vitest@4.0.0-beta.103(effect@4.0.0-beta.103)(vitest@4.1.10)':
+  '@effect/vitest@4.0.0-beta.103(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53))(vitest@4.1.10)':
     dependencies:
-      effect: 4.0.0-beta.103
+      effect: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
       vitest: 4.1.10(@types/node@25.9.5)(@vitest/coverage-v8@4.1.10)(vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0))
 
   '@effect/wa-sqlite@0.1.2': {}
@@ -3759,7 +3762,7 @@ snapshots:
       '@dprint/win32-arm64': 0.55.2
       '@dprint/win32-x64': 0.55.2
 
-  effect@4.0.0-beta.103:
+  effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53):
     dependencies:
       '@standard-schema/spec': 1.1.0
       fast-check: 4.9.0
@@ -4280,10 +4283,10 @@ snapshots:
       '@oxc-resolver/binding-win32-arm64-msvc': 11.24.2
       '@oxc-resolver/binding-win32-x64-msvc': 11.24.2
 
-  oxlint-plugin-effect@0.6.0(patch_hash=55c4f51bf62afe6d847c6efc5831643232c37d8231111f23ce967e8ad084ced5)(effect@4.0.0-beta.103):
+  oxlint-plugin-effect@0.6.0(patch_hash=55c4f51bf62afe6d847c6efc5831643232c37d8231111f23ce967e8ad084ced5)(effect@4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)):
     dependencies:
       '@oxlint/plugins': 1.78.0
-      effect: 4.0.0-beta.103
+      effect: 4.0.0-beta.103(patch_hash=0f749b3ebb15af1b64010c7a4a484fc1d1c854c4cfeb3d5ccd959c6978630a53)
 
   oxlint-tsgolint@7.0.2001:
     optionalDependencies:

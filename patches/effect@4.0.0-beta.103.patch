@@ -1,0 +1,26 @@
+diff --git a/src/unstable/rpc/RpcClient.ts b/src/unstable/rpc/RpcClient.ts
+index 8b25aec..7cc02f8 100644
+--- a/src/unstable/rpc/RpcClient.ts
++++ b/src/unstable/rpc/RpcClient.ts
+@@ -1142,6 +1142,8 @@ export const makeProtocolSocket = (options?: {
+         }
+         if (request._tag === "Request") {
+           requestClientMap.set(request.id, clientId)
++        } else if (request._tag === "Interrupt") {
++          requestClientMap.delete(request.requestId)
+         }
+         const encoded = parser.encode(request)
+         if (encoded === undefined) return Effect.void
+diff --git a/dist/unstable/rpc/RpcClient.js b/dist/unstable/rpc/RpcClient.js
+index b2dc963..82d5e56 100644
+--- a/dist/unstable/rpc/RpcClient.js
++++ b/dist/unstable/rpc/RpcClient.js
+@@ -677,6 +677,8 @@ const makeProtocolSocket = options => Protocol.make(Effect.fnUntraced(function*
+       }
+       if (request._tag === "Request") {
+         requestClientMap.set(request.id, clientId);
++      } else if (request._tag === "Interrupt") {
++        requestClientMap.delete(request.requestId);
+       }
+       const encoded = parser.encode(request);
+       if (encoded === undefined) return Effect.void;
