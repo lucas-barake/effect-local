@@ -983,6 +983,34 @@ export const layer = (
         row.content_bytes === manifest.contentBytes &&
         row.digest === manifest.digest
 
+      const insertReceipt = (receipt: Protocol.Receipt, envelope: Protocol.MutationEnvelope) =>
+        Effect.gen(function*() {
+          let receiptSchema = receipt.sourceSchema
+          if (receipt._tag === "Expired") receiptSchema = envelope.sourceSchema
+          let receiptMutationVersion: Identity.SchemaVersion | null = null
+          if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
+            receiptMutationVersion = receipt.mutationVersion
+          } else if (receipt._tag === "Expired") {
+            receiptMutationVersion = envelope.mutationVersion
+          }
+          let receiptName: string | null = null
+          if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
+            receiptName = receipt.name
+          } else if (receipt._tag === "Expired") {
+            receiptName = envelope.name
+          }
+          let rejectionOrigin: string | null = null
+          if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
+          else if (receipt._tag === "Legacy") rejectionOrigin = "Legacy"
+          yield* sql`INSERT INTO effect_local_client_receipts_data
+            (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, receipt_json,
+              source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin)
+            VALUES (${options.spaceId}, ${activeGeneration}, ${receipt.membershipIncarnation},
+              ${receipt.mutationId}, ${receipt.localSequence}, ${yield* Codec.stringify(receipt)},
+              ${receiptSchema.version}, ${receiptSchema.hash}, ${receiptMutationVersion}, ${receiptName},
+              ${rejectionOrigin})`
+        })
+
       const persistReceipt = (receipt: Protocol.Receipt) =>
         Effect.gen(function*() {
           if ((yield* Protocol.encodedBytesEffect(receipt)) > Protocol.maximumReceiptBytes) {
@@ -1040,31 +1068,7 @@ export const layer = (
                 limit: options.maximumReceipts
               })
             }
-            let receiptSchema = receipt.sourceSchema
-            if (receipt._tag === "Expired") receiptSchema = pendingMutation.envelope.sourceSchema
-            let receiptMutationVersion: Identity.SchemaVersion | null = null
-            if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
-              receiptMutationVersion = receipt.mutationVersion
-            } else if (receipt._tag === "Expired") {
-              receiptMutationVersion = pendingMutation.envelope.mutationVersion
-            }
-            let receiptName: string | null = null
-            if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
-              receiptName = receipt.name
-            } else if (receipt._tag === "Expired") {
-              receiptName = pendingMutation.envelope.name
-            }
-            let rejectionOrigin: string | null = null
-            if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
-            else if (receipt._tag === "Legacy") rejectionOrigin = "Legacy"
-            yield* sql`INSERT INTO effect_local_client_receipts_data
-              (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, receipt_json,
-                source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin)
-              VALUES (${options.spaceId}, ${activeGeneration}, ${receipt.membershipIncarnation},
-                ${receipt.mutationId}, ${receipt.localSequence},
-                ${yield* Codec.stringify(receipt)},
-            ${receiptSchema.version}, ${receiptSchema.hash}, ${receiptMutationVersion}, ${receiptName},
-            ${rejectionOrigin})`
+            yield* insertReceipt(receipt, pendingMutation.envelope)
             inserted = true
             return yield* Effect.void
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
@@ -1296,27 +1300,7 @@ export const layer = (
                 limit: options.maximumReceipts
               })
             }
-            let receiptSchema = receipt.sourceSchema
-            if (receipt._tag === "Expired") receiptSchema = item.envelope.sourceSchema
-            let receiptMutationVersion: Identity.SchemaVersion | null = null
-            if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
-              receiptMutationVersion = receipt.mutationVersion
-            } else if (receipt._tag === "Expired") {
-              receiptMutationVersion = item.envelope.mutationVersion
-            }
-            let receiptName: string | null = null
-            if (receipt._tag === "Accepted" || receipt._tag === "Rejected") receiptName = receipt.name
-            else if (receipt._tag === "Expired") receiptName = item.envelope.name
-            let rejectionOrigin: string | null = null
-            if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
-            else if (receipt._tag === "Legacy") rejectionOrigin = "Legacy"
-            yield* sql`INSERT INTO effect_local_client_receipts_data
-              (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, receipt_json,
-                source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin)
-              VALUES (${options.spaceId}, ${activeGeneration}, ${receipt.membershipIncarnation},
-                ${receipt.mutationId}, ${receipt.localSequence}, ${yield* Codec.stringify(receipt)},
-                ${receiptSchema.version}, ${receiptSchema.hash}, ${receiptMutationVersion}, ${receiptName},
-                ${rejectionOrigin})`
+            yield* insertReceipt(receipt, item.envelope)
             yield* sql`DELETE FROM effect_local_client_quarantine_resubmissions
               WHERE space_id = ${options.spaceId} AND original_mutation_id = ${receipt.mutationId}`
             yield* sql`DELETE FROM effect_local_client_quarantine

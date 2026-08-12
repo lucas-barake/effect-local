@@ -43,7 +43,7 @@ export const SizedEntityRow = Schema.Struct({
   entity_bytes: NonNegativeInt
 })
 
-const PendingRowFields = {
+const MutationRowFields = {
   membership_incarnation: Identity.MembershipIncarnation,
   mutation_id: Identity.MutationId,
   local_sequence: Identity.LocalSequence,
@@ -54,7 +54,11 @@ const PendingRowFields = {
   digest_version: Protocol.MutationDigestVersion,
   source_schema_version: Identity.SchemaVersion,
   source_schema_hash: Identity.SchemaHash,
-  mutation_version: Identity.SchemaVersion,
+  mutation_version: Identity.SchemaVersion
+}
+
+const PendingRowFields = {
+  ...MutationRowFields,
   optimistic_result_json: Schema.String,
   changes_json: Schema.String
 }
@@ -63,17 +67,7 @@ export const PendingRow = Schema.Struct(PendingRowFields)
 
 export const QuarantineRow = Schema.Struct({
   space_id: Identity.SpaceId,
-  membership_incarnation: Identity.MembershipIncarnation,
-  mutation_id: Identity.MutationId,
-  local_sequence: Identity.LocalSequence,
-  basis: Identity.ServerSequence,
-  name: Schema.String,
-  payload_json: Schema.String,
-  digest: Protocol.MutationDigest,
-  digest_version: Protocol.MutationDigestVersion,
-  source_schema_version: Identity.SchemaVersion,
-  source_schema_hash: Identity.SchemaHash,
-  mutation_version: Identity.SchemaVersion,
+  ...MutationRowFields,
   rejection_json: Schema.String,
   target_schema_version: Identity.SchemaVersion,
   target_schema_hash: Identity.SchemaHash

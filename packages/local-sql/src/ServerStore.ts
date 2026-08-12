@@ -187,11 +187,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           message: "acceptedSchemaVersions exceeds the configured evolution history"
         })
       }
-      const acceptedDefinitions = new Map<string, Definition.Any>()
-      acceptedDefinitions.set(
-        `${options.definition.schemaIdentity.version}:${options.definition.schemaIdentity.hash}`,
-        options.definition
-      )
+      const minimumAcceptedSchemaVersion = options.definition.version - acceptedSchemaVersions
       if (acceptedSchemaVersions > 0) {
         for (const entry of evolution.steps.slice(-acceptedSchemaVersions)) {
           yield* Evolution.validateDowngradeTarget(evolution, entry.from.schemaIdentity).pipe(
@@ -203,7 +199,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               })
             )
           )
-          acceptedDefinitions.set(`${entry.from.schemaIdentity.version}:${entry.from.schemaIdentity.hash}`, entry.from)
         }
       }
       const context = yield* Effect.context<R>()
@@ -623,8 +618,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         )
 
       const validateCallerSchema = (schema: Identity.SchemaIdentity) => {
-        const accepted = acceptedDefinitions.get(`${schema.version}:${schema.hash}`)
-        if (accepted !== undefined) return Effect.succeed(accepted)
+        const definition = evolution.definitionByIdentity.get(`${schema.version}:${schema.hash}`)
+        if (definition !== undefined && definition.version >= minimumAcceptedSchemaVersion) {
+          return Effect.succeed(definition)
+        }
         return Effect.fail(
           new ReplicaError.StaleSchema({
             expectedVersion: options.definition.schemaIdentity.version,

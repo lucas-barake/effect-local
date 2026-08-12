@@ -1,5 +1,4 @@
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
-import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -10,6 +9,7 @@ import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import type * as Socket from "effect/unstable/socket/Socket"
 import type * as Authentication from "./Authentication.js"
+import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSession from "./ProtocolSession.js"
 
 export interface Options extends ProtocolSession.Options {}
@@ -23,49 +23,9 @@ export const layerFromSession: Layer.Layer<
   Effect.gen(function*() {
     const session = yield* ProtocolSession.ProtocolSession
     const client = session.client
-    const run = <A,>(
-      execute: (version: Protocol.ProtocolVersion) => Effect.Effect<A, ReplicaError.ReplicaError>
-    ) =>
-      Effect.gen(function*() {
-        const version = yield* session.version
-        const first = yield* execute(version).pipe(Effect.result)
-        if (first._tag === "Success") return first.success
-        if (first.failure._tag !== "ProtocolVersionRejected") return yield* first.failure
-        return yield* execute(yield* session.rejected(version))
-      })
-    const watch = (request: Parameters<SyncEngine.Service["watch"]>[0]) =>
-      Stream.unwrap(session.version.pipe(
-        Effect.map((version) =>
-          client.Watch({ ...request, protocolVersion: version }).pipe(
-            Stream.mapError((cause) => {
-              if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
-              return new ReplicaError.ProtocolInvalid({
-                message: "The synchronization transport failed",
-                cause
-              })
-            }),
-            Stream.catchTag("ProtocolVersionRejected", () =>
-              Stream.unwrap(
-                session.rejected(version).pipe(
-                  Effect.map((replacement) =>
-                    client.Watch({ ...request, protocolVersion: replacement }).pipe(
-                      Stream.mapError((cause) => {
-                        if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
-                        return new ReplicaError.ProtocolInvalid({
-                          message: "The synchronization transport failed",
-                          cause
-                        })
-                      })
-                    )
-                  )
-                )
-              ))
-          )
-        )
-      ))
     return SyncEngine.SyncEngine.of({
       submit: (request) =>
-        run((version) =>
+        ProtocolSessionRetry.run(session, (version) =>
           client.Submit({ ...request, protocolVersion: version }).pipe(
             Effect.mapError((cause) => {
               if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
@@ -74,17 +34,16 @@ export const layerFromSession: Layer.Layer<
                 cause
               })
             })
-          )
-        ).pipe(
-          Effect.withSpan("SyncClient.submit", {
-            attributes: {
-              "space.id": request.envelope.spaceId,
-              "mutation.id": request.envelope.mutationId
-            }
-          })
-        ),
+          )).pipe(
+            Effect.withSpan("SyncClient.submit", {
+              attributes: {
+                "space.id": request.envelope.spaceId,
+                "mutation.id": request.envelope.mutationId
+              }
+            })
+          ),
       discard: (request) =>
-        run((version) =>
+        ProtocolSessionRetry.run(session, (version) =>
           client.Discard({ ...request, protocolVersion: version }).pipe(
             Effect.mapError((cause) => {
               if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
@@ -93,17 +52,16 @@ export const layerFromSession: Layer.Layer<
                 cause
               })
             })
-          )
-        ).pipe(
-          Effect.withSpan("SyncClient.discard", {
-            attributes: {
-              "space.id": request.envelope.spaceId,
-              "mutation.id": request.envelope.mutationId
-            }
-          })
-        ),
+          )).pipe(
+            Effect.withSpan("SyncClient.discard", {
+              attributes: {
+                "space.id": request.envelope.spaceId,
+                "mutation.id": request.envelope.mutationId
+              }
+            })
+          ),
       pull: (request) =>
-        run((version) =>
+        ProtocolSessionRetry.run(session, (version) =>
           client.Pull({ ...request, protocolVersion: version }).pipe(
             Effect.mapError((cause) => {
               if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
@@ -112,15 +70,14 @@ export const layerFromSession: Layer.Layer<
                 cause
               })
             })
-          )
-        )
+          ))
           .pipe(
             Effect.withSpan("SyncClient.pull", {
               attributes: { "space.id": request.spaceId, "server.after": request.after }
             })
           ),
       bootstrap: (request) =>
-        run((version) =>
+        ProtocolSessionRetry.run(session, (version) =>
           client.Bootstrap({ ...request, protocolVersion: version }).pipe(
             Effect.mapError((cause) => {
               if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
@@ -129,14 +86,25 @@ export const layerFromSession: Layer.Layer<
                 cause
               })
             })
-          )
-        ).pipe(
-          Effect.withSpan("SyncClient.bootstrap", {
-            attributes: { "space.id": request.spaceId, "snapshot.id": request.snapshotId }
-          })
-        ),
+          )).pipe(
+            Effect.withSpan("SyncClient.bootstrap", {
+              attributes: { "space.id": request.spaceId, "snapshot.id": request.snapshotId }
+            })
+          ),
       watch: (request) =>
-        watch(request).pipe(
+        ProtocolSessionRetry.runStream(
+          session,
+          (version) =>
+            client.Watch({ ...request, protocolVersion: version }).pipe(
+              Stream.mapError((cause) => {
+                if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
+                return new ReplicaError.ProtocolInvalid({
+                  message: "The synchronization transport failed",
+                  cause
+                })
+              })
+            )
+        ).pipe(
           Stream.withSpan("SyncClient.watch", {
             attributes: { "space.id": request.spaceId }
           })
