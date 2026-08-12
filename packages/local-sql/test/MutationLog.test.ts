@@ -84,6 +84,7 @@ const runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Doma
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
   retainedReceipts: 256,
+  settlementCapacity: 64,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
   maximumBootstrapEntities: 10_000,
@@ -1098,7 +1099,7 @@ describe("server reconciled mutation log", () => {
           mutationId: first.envelope.mutationId,
           localSequence: first.envelope.localSequence,
           ...putTodoProvenance,
-          origin: "Mutation",
+          origin: "Legacy",
           terminalSequence: Identity.TerminalSequence.make(1),
           rejection: "denied"
         }))
@@ -1109,7 +1110,7 @@ describe("server reconciled mutation log", () => {
           mutationId: second.envelope.mutationId,
           localSequence: second.envelope.localSequence,
           ...putTodoProvenance,
-          origin: "Mutation",
+          origin: "Legacy",
           terminalSequence: Identity.TerminalSequence.make(1),
           rejection: "denied"
         })
@@ -1154,7 +1155,7 @@ describe("server reconciled mutation log", () => {
           mutationId: pending.envelope.mutationId,
           localSequence: pending.envelope.localSequence,
           ...putTodoProvenance,
-          origin: "Mutation",
+          origin: "Legacy",
           rejection: "Rejected"
         }))
         const submissions = yield* Ref.make(0)
@@ -1169,7 +1170,7 @@ describe("server reconciled mutation log", () => {
                 mutationId: submitted.envelope.mutationId,
                 localSequence: submitted.envelope.localSequence,
                 ...putTodoProvenance,
-                origin: "Mutation",
+                origin: "Legacy",
                 terminalSequence: Identity.TerminalSequence.make(1),
                 rejection: "Rejected"
               }))

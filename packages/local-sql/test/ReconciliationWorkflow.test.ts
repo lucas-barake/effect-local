@@ -57,6 +57,7 @@ const migration = {
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const clientHistory = {
   retainedReceipts: 256,
+  settlementCapacity: 64,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
   maximumBootstrapEntities: 10_000,
@@ -133,8 +134,14 @@ describe("reconciliation workflow", () => {
       assert.strictEqual(execution.executionId, yield* ReconciliationWorkflow.executionId(payload))
       yield* ReconciliationWorkflow.make(payload).execute(payload).pipe(Effect.provide(context))
 
-      assert.strictEqual(Option.getOrThrow(yield* space.receipt(first.envelope.mutationId))._tag, "Accepted")
-      assert.strictEqual(Option.getOrThrow(yield* space.receipt(second.envelope.mutationId))._tag, "Accepted")
+      assert.strictEqual(
+        Option.getOrThrow(yield* space.receipt(Domain.PutTodo, first.envelope.mutationId))._tag,
+        "Accepted"
+      )
+      assert.strictEqual(
+        Option.getOrThrow(yield* space.receipt(Domain.PutTodo, second.envelope.mutationId))._tag,
+        "Accepted"
+      )
       assert.deepStrictEqual(Option.getOrThrow(yield* space.get(Domain.Todo, "2")), Domain.todo("2"))
       assert.deepStrictEqual(Object.keys(payload).toSorted(), [
         "clientId",
@@ -298,7 +305,7 @@ describe("reconciliation workflow", () => {
       })
       yield* ReconciliationWorkflow.make(payload).execute(payload).pipe(Effect.provide(context))
 
-      const storedReceipt = yield* space.receipt(mutation.envelope.mutationId)
+      const storedReceipt = yield* space.receipt(Domain.PutTodo, mutation.envelope.mutationId)
       assert.strictEqual(Option.getOrThrow(storedReceipt)._tag, "Accepted")
       yield* replica.leave(spaceId)
     }))

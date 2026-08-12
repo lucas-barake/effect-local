@@ -17,6 +17,7 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
+import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
@@ -48,6 +49,7 @@ export interface Options<D extends Definition.Any,> {
   readonly maximumBootstrapEntities: number
   readonly maximumBootstrapBytes: number
   readonly maximumBootstrapPageBytes: number
+  readonly settlementCapacity: number
   readonly migration: Migrations.Options
   readonly pageSize?: number
   readonly reconciliationConcurrency?: number
@@ -277,7 +279,23 @@ const makeLayer = <D extends Definition.Any, R,>(
                 admit(local.mutate(mutation, payload).pipe(Effect.tap(() => reconciler.notify))),
               get: (model, key) => admit(local.get(model, key)),
               query: (query, payload) => admit(queries.execute(query, payload)),
-              receipt: (mutationId) => admit(local.receipt(mutationId)),
+              receipt: (mutation, mutationId) => admit(local.receiptFor(mutation, mutationId)),
+              pending: admit(local.pending),
+              pendingFor: (mutation) =>
+                admit(local.pending).pipe(
+                  Effect.map((pending) =>
+                    pending.flatMap((item) => {
+                      if (item.envelope.name !== mutation.name) return []
+                      return [{ ...item } satisfies Replica.PendingMutation<typeof mutation>]
+                    })
+                  )
+                ),
+              settlements: local.settlements,
+              settlementsFor: (mutation) =>
+                Stream.filter(
+                  local.settlements,
+                  (settlement) => settlement.pending.envelope.name === mutation.name
+                ),
               quarantine: admit(local.quarantine),
               discardQuarantined: (mutationId) => admit(discardQuarantined(mutationId)),
               resubmitQuarantined: <M extends Mutation.Any,>(

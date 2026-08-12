@@ -44,6 +44,7 @@ const migration = {
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const clientHistory = {
   retainedReceipts: 256,
+  settlementCapacity: 64,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
   maximumBootstrapEntities: 10_000,
@@ -154,7 +155,7 @@ describe("test synchronization faults", () => {
       const awaitReceipt = (space: Replica.Space, mutationId: Identity.MutationId) =>
         Effect.gen(function*() {
           while (true) {
-            const receipt = yield* space.receipt(mutationId)
+            const receipt = yield* space.receipt(PutTodo, mutationId)
             if (Option.isSome(receipt)) return receipt.value
             yield* Effect.yieldNow
           }
@@ -170,7 +171,7 @@ describe("test synchronization faults", () => {
 
       const secondReceipt = yield* awaitReceipt(second, secondPending.envelope.mutationId)
       assert.strictEqual(secondReceipt._tag, "Accepted")
-      assert.isTrue(Option.isNone(yield* first.receipt(firstPending.envelope.mutationId)))
+      assert.isTrue(Option.isNone(yield* first.receipt(PutTodo, firstPending.envelope.mutationId)))
       yield* awaitStatus(first, "Offline")
       yield* awaitStatus(second, "Online")
 

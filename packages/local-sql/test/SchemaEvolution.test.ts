@@ -39,6 +39,7 @@ const membershipIncarnation = Identity.MembershipIncarnation.make("inc_00000000-
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
   retainedReceipts: 256,
+  settlementCapacity: 64,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
   maximumBootstrapEntities: 10_000,
@@ -463,7 +464,7 @@ describe("client schema evolution", () => {
         assert.deepStrictEqual(promotedReceipt.result, { id: 1, title: "accepted", done: false })
       }
 
-      const promotedPending = yield* v2.pending
+      const promotedPending = yield* v2.pendingToSubmit
       assert.strictEqual(promotedPending.length, 1)
       assert.strictEqual(promotedPending[0].envelope.digest, pending.envelope.digest)
       assert.deepStrictEqual(promotedPending[0].envelope.sourceSchema, definitionV1.schemaIdentity)
@@ -516,7 +517,7 @@ describe("client schema evolution", () => {
       yield* buildStore(definitionV2, handlersV2, evolution)
       const v3 = yield* buildStore(definitionV3, handlersV3, evolutionV3)
 
-      assert.deepStrictEqual((yield* v3.pending)[0].envelope, pending.envelope)
+      assert.deepStrictEqual((yield* v3.pendingToSubmit)[0].envelope, pending.envelope)
       assert.deepStrictEqual(Option.getOrThrow(yield* v3.get(TodoV3, 3)), {
         id: 3,
         title: "multi-hop",

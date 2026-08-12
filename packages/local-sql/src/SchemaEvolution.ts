@@ -102,7 +102,9 @@ const PendingBatchRow = Schema.Struct({
   source_schema_hash: NullableSchemaHash,
   mutation_version: NullableSchemaVersion,
   optimistic_result_json: Schema.String,
-  changes_json: Schema.String
+  changes_json: Schema.String,
+  submission_state: Protocol.SubmissionState,
+  attempt_count: NonNegativeInt
 })
 
 const SequenceBytesRow = Schema.Struct({
@@ -717,7 +719,7 @@ export const client = (options: ClientOptions) =>
       execute: ({ generation, after, limit }) =>
         sql`SELECT membership_incarnation, mutation_id, local_sequence, basis, name, payload_json, digest,
         digest_version, source_schema_version, source_schema_hash, mutation_version,
-        optimistic_result_json, changes_json FROM effect_local_client_pending_data
+        optimistic_result_json, changes_json, submission_state, attempt_count FROM effect_local_client_pending_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND local_sequence > ${after}
         ORDER BY local_sequence LIMIT ${limit}`
@@ -1104,13 +1106,13 @@ export const client = (options: ClientOptions) =>
             yield* sql`INSERT INTO effect_local_client_pending_data
               (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, basis, name,
                 payload_json, digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
-                optimistic_result_json, changes_json)
+                optimistic_result_json, changes_json, submission_state, attempt_count)
               VALUES (${options.spaceId}, ${state.generation}, ${envelope.membershipIncarnation},
                 ${envelope.mutationId}, ${envelope.localSequence}, ${envelope.basis},
                 ${envelope.name}, ${yield* Codec.stringify(envelope.payload)}, ${envelope.digest},
                 ${envelope.digestVersion}, ${envelope.sourceSchema.version}, ${envelope.sourceSchema.hash},
                 ${envelope.mutationVersion}, ${yield* Codec.stringify(executed.success.result)},
-                ${yield* Codec.stringify(changes)})`
+                ${yield* Codec.stringify(changes)}, ${row.submission_state}, ${row.attempt_count})`
           }
           if (rows.length === 0) {
             yield* sql`UPDATE effect_local_client_evolution SET phase = 'Flip', cursor_sequence = NULL

@@ -60,7 +60,9 @@ const MutationRowFields = {
 const PendingRowFields = {
   ...MutationRowFields,
   optimistic_result_json: Schema.String,
-  changes_json: Schema.String
+  changes_json: Schema.String,
+  submission_state: Protocol.SubmissionState,
+  attempt_count: NonNegativeInt
 }
 
 export const PendingRow = Schema.Struct(PendingRowFields)

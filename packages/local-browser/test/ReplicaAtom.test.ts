@@ -13,6 +13,7 @@ import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
@@ -95,6 +96,7 @@ const migration = {
   maximumAttempts: 8
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const clientHistory = {
+  settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
@@ -148,6 +150,46 @@ const replica = SqlReplica.layer({
 )
 
 describe("Replica Atom graph", () => {
+  it.effect("reacts to pending mutation submission and settlement", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const graph = BrowserReplica.make(replica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const pending = graph.pendingFor(spaceId, PutTodo)
+      const mutation = graph.mutation(spaceId, PutTodo)
+      const unmountPending = registry.mount(pending)
+      const unmountMutation = registry.mount(mutation)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountMutation()
+          unmountPending()
+        })
+      )
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, pending), [])
+
+      const id = `pending-atom-${Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")}`
+      const observed = yield* AtomRegistry.toStreamResult(registry, pending).pipe(
+        Stream.filter((items) => items.some((item) => item.payload.id === id)),
+        Stream.runHead,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Effect.yieldNow
+      registry.set(mutation, { id, title: "0-pending" })
+      const pendingItems = Option.getOrThrow(yield* Fiber.join(observed))
+      const item = pendingItems.find((candidate) => candidate.payload.id === id)
+      assert.isDefined(item)
+      assert.deepStrictEqual(item.payload, { id, title: "0-pending" })
+      assert.isAtLeast(item.attempts, 0)
+
+      const settled = Option.getOrThrow(
+        yield* AtomRegistry.toStreamResult(registry, pending).pipe(
+          Stream.filter((items) => !items.some((candidate) => candidate.payload.id === id)),
+          Stream.runHead
+        )
+      )
+      assert.isFalse(settled.some((candidate) => candidate.payload.id === id))
+    })))
+
   it.live("reruns only an indexed query whose result range can change", () =>
     Effect.gen(function*() {
       rangeReads.clear()
@@ -282,7 +324,11 @@ describe("Replica Atom graph", () => {
     assert.strictEqual(graph.entity(spaceId, Todo)("1").idleTTL, 17)
     assert.strictEqual(graph.query(spaceId, ListTodos)(undefined).idleTTL, 17)
     assert.strictEqual(
-      graph.receipt(spaceId, Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")).idleTTL,
+      graph.receipt(
+        spaceId,
+        PutTodo,
+        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
+      ).idleTTL,
       17
     )
     assert.strictEqual(reads, readsAfterConstruction)
@@ -321,7 +367,7 @@ describe("Replica Atom graph", () => {
           title: "atom"
         })
         assert.strictEqual(pending.envelope.name, PutTodo.name)
-        const receipt = graph.receipt(spaceId, pending.envelope.mutationId)
+        const receipt = graph.receipt(spaceId, PutTodo, pending.envelope.mutationId)
         const accepted = Option.getOrThrow(Option.getOrThrow(
           yield* AtomRegistry.toStreamResult(registry, receipt).pipe(
             Stream.filter(Option.isSome),
@@ -388,7 +434,7 @@ describe("Replica Atom graph", () => {
       )
 
       const awaitReceipt = (address: Identity.SpaceId, mutationId: Identity.MutationId) =>
-        AtomRegistry.toStreamResult(registry, graph.receipt(address, mutationId)).pipe(
+        AtomRegistry.toStreamResult(registry, graph.receipt(address, PutTodo, mutationId)).pipe(
           Stream.filter(Option.isSome),
           Stream.runHead,
           Effect.map(Option.getOrThrow),
