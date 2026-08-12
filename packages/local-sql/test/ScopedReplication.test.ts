@@ -372,6 +372,40 @@ describe("scoped replication", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
+  it.effect("delivers a widened scope larger than the page limit completely across pulls", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        const empty = Protocol.ReplicationScope.make({ models: [] })
+        yield* server.submit(yield* putManyEnvelope(250, 1))
+        const required = yield* server.pullAuthorized(pullRequest(null, empty, 1), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(
+          Protocol.BootstrapRequest.make({ ...bootstrapRequest(required.manifest), scope: empty }),
+          "reader"
+        )
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor, empty, 1), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        assert.deepStrictEqual(settled.changes, [])
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor, empty, 1), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        let cursor = acknowledged.cursor
+        const delivered = new Set<string>()
+        for (let round = 0; round < 10; round++) {
+          const page = yield* server.pullAuthorized(pullRequest(cursor, scope, 2), "reader")
+          if ("_tag" in page) assert.fail("expected incremental page")
+          for (const change of page.changes) {
+            assert.strictEqual(change._tag, "Upsert")
+            delivered.add(yield* Codec.stringify(change.entity.key))
+          }
+          cursor = page.cursor
+          if (!page.hasMore && page.changes.length === 0) break
+        }
+        assert.strictEqual(delivered.size, 250)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("retracts an acknowledged entity when authorization is revoked without a change", () =>
     Effect.scoped(
       Effect.gen(function*() {
@@ -635,6 +669,50 @@ describe("scoped replication", () => {
           withheld.changes.map((change) => [change._tag, change.entity.key]),
           [["Retract", "open-1"]]
         )
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects a replication window naming an inherited index property", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        yield* server.submit(yield* envelope("public", 1))
+        const windowed = Protocol.ReplicationScope.make({
+          models: [],
+          windows: [
+            Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "constructor", count: 1 })
+          ]
+        })
+        const outcome = yield* server.pullAuthorized(pullRequest(null, windowed, 1), "reader").pipe(Effect.result)
+        if (outcome._tag !== "Failure") assert.fail("expected a protocol rejection")
+        assert.strictEqual(outcome.failure._tag, "ProtocolInvalid")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects a replication window bound whose type does not match the sort component", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        yield* server.submit(yield* envelope("public", 1))
+        const windowed = Protocol.ReplicationScope.make({
+          models: [],
+          windows: [
+            Protocol.ReplicationWindow.make({
+              model: Domain.Message.name,
+              index: "byChat",
+              count: 1,
+              partitions: [
+                Protocol.ReplicationWindowPartition.make({
+                  key: ["chat-a"],
+                  bounds: Protocol.ReplicationWindowBounds.make({ gt: true })
+                })
+              ]
+            })
+          ]
+        })
+        const outcome = yield* server.pullAuthorized(pullRequest(null, windowed, 1), "reader").pipe(Effect.result)
+        if (outcome._tag !== "Failure") assert.fail("expected a protocol rejection")
+        assert.strictEqual(outcome.failure._tag, "ProtocolInvalid")
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 

@@ -1016,7 +1016,6 @@ describe("server reconciled mutation log", () => {
         yield* server.pull(pullRequest((yield* local.replicationState).cursor))
       )
       const pull = yield* Stream.toPull(local.settlements)
-
       yield* local.persistReceipt(receipt)
       yield* local.applyViewPage({ ...page, hasMore: true })
       yield* server.maintain(spaceId)
@@ -1077,8 +1076,10 @@ describe("server reconciled mutation log", () => {
       const page = incremental(
         yield* server.pull(pullRequest((yield* local.replicationState).cursor))
       )
-      const pull = yield* Stream.toPull(local.settlements)
-
+      const settlementFiber = yield* local.settlements.pipe(
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
       yield* local.persistReceipt(receipt)
       yield* Ref.set(failPreparation, true)
       const failed = yield* local.applyViewPage(page).pipe(Effect.exit)
@@ -1089,10 +1090,8 @@ describe("server reconciled mutation log", () => {
       yield* local.applyViewPage(incremental(
         yield* server.pull(pullRequest((yield* local.replicationState).cursor))
       ))
-      assert.deepStrictEqual(
-        (yield* pull).map((settlement) => settlement.pending.envelope.mutationId),
-        [pending.envelope.mutationId]
-      )
+      const delivered = Option.getOrThrow(yield* Fiber.join(settlementFiber))
+      assert.strictEqual(delivered.pending.envelope.mutationId, pending.envelope.mutationId)
       assert.strictEqual(yield* local.pendingCount, 0)
     })))
 

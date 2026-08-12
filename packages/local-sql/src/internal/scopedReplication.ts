@@ -795,8 +795,7 @@ export const make = (options: Options) => {
             AND principal_digest = ${principalHash} AND view_id = ${page.cursor.viewId}`
       } else {
         yield* sql`UPDATE effect_local_server_replication_views SET
-          view_revision = ${page.cursor.revision}, scope_generation = ${page.scopeGeneration},
-          scope_json = ${scopeJson}, scope_digest = ${scopeHash}, server_sequence = ${page.serverSequence}
+          view_revision = ${page.cursor.revision}, server_sequence = ${page.serverSequence}
           WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}
             AND principal_digest = ${principalHash} AND view_id = ${page.cursor.viewId}`
       }
@@ -899,10 +898,6 @@ export const make = (options: Options) => {
           ${view.view_revision}, ${page.cursor.revision}, ${request.scopeGeneration}, ${scopeJson},
           ${normalizedDigest}, ${serverSequence}, ${yield* Codec.stringify(selected)}, ${contentBytes},
           ${page.digest}, ${hasMore}, ${readAuthEpoch})`
-      yield* sql`UPDATE effect_local_server_replication_views SET
-        scope_generation = ${request.scopeGeneration}, scope_json = ${scopeJson},
-        scope_digest = ${normalizedDigest}
-        WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}`
       return page
     })
 
