@@ -936,53 +936,7 @@ const clientV7 = makeMigration({
         DELETE FROM effect_local_client_${kind}_entities_data
         WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
           AND model = OLD.model AND entity_key = OLD.entity_key; END`
-    ]),
-    "ALTER TABLE effect_local_client_meta ADD COLUMN replication_view_id TEXT",
-    "ALTER TABLE effect_local_client_meta ADD COLUMN replication_view_revision INTEGER NOT NULL DEFAULT 0 CHECK (replication_view_revision >= 0)",
-    `ALTER TABLE effect_local_client_meta ADD COLUMN desired_scope_json TEXT NOT NULL DEFAULT '{"models":[]}'
-      CHECK (json_valid(desired_scope_json))`,
-    `ALTER TABLE effect_local_client_meta ADD COLUMN desired_scope_digest TEXT NOT NULL
-      DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'
-      CHECK (length(desired_scope_digest) = 64)`,
-    "ALTER TABLE effect_local_client_meta ADD COLUMN scope_generation INTEGER NOT NULL DEFAULT 0 CHECK (scope_generation >= 0)",
-    `CREATE TABLE effect_local_client_retractions (
-      generation INTEGER NOT NULL CHECK (generation >= 0),
-      model TEXT NOT NULL,
-      model_version INTEGER NOT NULL CHECK (model_version > 0),
-      entity_key TEXT NOT NULL,
-      PRIMARY KEY (generation, model, entity_key)
-    )`,
-    `CREATE TABLE effect_local_client_scoped_bootstrap (
-      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-      snapshot_id TEXT NOT NULL,
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      definition_hash TEXT NOT NULL,
-      schema_version INTEGER NOT NULL,
-      schema_hash TEXT NOT NULL,
-      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
-      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
-      view_id TEXT NOT NULL,
-      view_revision INTEGER NOT NULL CHECK (view_revision >= 0),
-      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
-      terminal_sequence INTEGER NOT NULL CHECK (terminal_sequence >= 0),
-      entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
-      content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
-      digest TEXT NOT NULL CHECK (length(digest) = 64),
-      next_ordinal INTEGER NOT NULL CHECK (next_ordinal >= 0),
-      received_bytes INTEGER NOT NULL CHECK (received_bytes >= 0),
-      rolling_digest TEXT NOT NULL CHECK (length(rolling_digest) = 64)
-    )`,
-    `CREATE TABLE effect_local_client_scoped_bootstrap_entries (
-      snapshot_id TEXT NOT NULL,
-      ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-      model TEXT NOT NULL,
-      entity_key TEXT NOT NULL,
-      change_json TEXT NOT NULL CHECK (json_valid(change_json)),
-      entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
-      PRIMARY KEY (snapshot_id, ordinal),
-      UNIQUE (snapshot_id, model, entity_key)
-    )`
+    ])
   ]
 })
 
@@ -1173,9 +1127,6 @@ const clientV8 = makeMigration({
       PRIMARY KEY (space_id, target_model, target_model_version, target_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    "DROP TABLE effect_local_client_scoped_bootstrap_entries",
-    "DROP TABLE effect_local_client_scoped_bootstrap",
-    "DROP TABLE effect_local_client_retractions",
     `CREATE TABLE effect_local_client_retractions (
       space_id TEXT NOT NULL,
       generation INTEGER NOT NULL CHECK (generation >= 0),
