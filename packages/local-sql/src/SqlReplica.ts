@@ -2,6 +2,7 @@ import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
+import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Quarantine from "@lucas-barake/effect-local/Quarantine"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -17,11 +18,13 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
+import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as LocalStore from "./LocalStore.js"
@@ -36,6 +39,7 @@ import * as SyncEngine from "./SyncEngine.js"
 export interface Options<D extends Definition.Any,> {
   readonly definition: D
   readonly clientId: Identity.ClientId
+  readonly scope: Protocol.ReplicationScope
   readonly initialSpaces?: Iterable<Identity.SpaceId>
   readonly spaceId?: Identity.SpaceId
   readonly maximumPendingMutations?: number
@@ -48,6 +52,7 @@ export interface Options<D extends Definition.Any,> {
   readonly maximumBootstrapEntities: number
   readonly maximumBootstrapBytes: number
   readonly maximumBootstrapPageBytes: number
+  readonly settlementCapacity: number
   readonly migration: Migrations.Options
   readonly pageSize?: number
   readonly reconciliationConcurrency?: number
@@ -214,6 +219,9 @@ const makeLayer = <D extends Definition.Any, R,>(
               if (options.retryDelay !== undefined) {
                 managedSpace = { ...managedSpace, retryDelay: options.retryDelay }
               }
+              if (options.maximumRetryDelay !== undefined) {
+                managedSpace = { ...managedSpace, maximumRetryDelay: options.maximumRetryDelay }
+              }
               yield* Effect.acquireRelease(
                 manager.register(managedSpace),
                 () => manager.unregister(spaceId, generation)
@@ -277,7 +285,28 @@ const makeLayer = <D extends Definition.Any, R,>(
                 admit(local.mutate(mutation, payload).pipe(Effect.tap(() => reconciler.notify))),
               get: (model, key) => admit(local.get(model, key)),
               query: (query, payload) => admit(queries.execute(query, payload)),
-              receipt: (mutationId) => admit(local.receipt(mutationId)),
+              receipt: (mutation, mutationId) => admit(local.receiptFor(mutation, mutationId)),
+              pending: admit(local.pending),
+              pendingFor: (mutation) =>
+                admit(MutationDescriptor.validate(options.definition, mutation).pipe(Effect.andThen(local.pending)))
+                  .pipe(
+                    Effect.map((pending) =>
+                      pending.flatMap((item) => {
+                        if (item.envelope.name !== mutation.name) return []
+                        return [{ ...item } satisfies Replica.PendingMutation<typeof mutation>]
+                      })
+                    )
+                  ),
+              settlements: local.settlements,
+              settlementsFor: (mutation) =>
+                Stream.fromEffect(admit(MutationDescriptor.validate(options.definition, mutation))).pipe(
+                  Stream.flatMap(() =>
+                    Stream.filter(
+                      local.settlements,
+                      (settlement) => settlement.pending.envelope.name === mutation.name
+                    )
+                  )
+                ),
               quarantine: admit(local.quarantine),
               discardQuarantined: (mutationId) => admit(discardQuarantined(mutationId)),
               resubmitQuarantined: <M extends Mutation.Any,>(
@@ -376,7 +405,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const evictMembership = (spaceId: Identity.SpaceId) =>
         sql.withTransaction(sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`).pipe(
           Effect.asVoid,
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
         )
 
       const reserveLeave = (
@@ -409,29 +438,32 @@ const makeLayer = <D extends Definition.Any, R,>(
               yield* restore(Deferred.await(decision.completion))
               return yield* Effect.void
             }
-            let scopeClosed = false
-            const result = yield* restore(decision.entry.operationGate.withPermit(
-              decision.entry.interruptReconciliation.pipe(
-                Effect.andThen(Effect.uninterruptible(
-                  Scope.close(decision.entry.scope, Exit.void).pipe(
-                    Effect.andThen(Effect.sync(() => {
-                      scopeClosed = true
-                    }))
-                  )
-                )),
-                Effect.andThen(evictMembership(spaceId))
-              )
-            )).pipe(Effect.exit)
-            if (result._tag === "Success") {
-              entries.delete(spaceId)
-              yield* Deferred.succeed(decision.completion, undefined)
-              yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
-              return yield* Effect.void
-            }
-            if (scopeClosed) entries.delete(spaceId)
-            else entries.set(spaceId, decision.entry)
-            yield* Deferred.done(decision.completion, result)
-            return yield* result
+            yield* decision.entry.local.shutdownSettlements
+            yield* Effect.gen(function*() {
+              let scopeClosed = false
+              const result = yield* decision.entry.operationGate.withPermit(
+                decision.entry.interruptReconciliation.pipe(
+                  Effect.andThen(Effect.uninterruptible(
+                    Scope.close(decision.entry.scope, Exit.void).pipe(
+                      Effect.andThen(Effect.sync(() => {
+                        scopeClosed = true
+                      }))
+                    )
+                  )),
+                  Effect.andThen(evictMembership(spaceId))
+                )
+              ).pipe(Effect.exit)
+              if (result._tag === "Success") {
+                entries.delete(spaceId)
+                yield* Deferred.succeed(decision.completion, undefined)
+                yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
+                return
+              }
+              if (scopeClosed) entries.delete(spaceId)
+              else entries.set(spaceId, decision.entry)
+              yield* Deferred.done(decision.completion, result)
+            }).pipe(Effect.forkIn(parentScope, { startImmediately: true }))
+            return yield* restore(Deferred.await(decision.completion))
           })
         )
 

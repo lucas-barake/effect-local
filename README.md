@@ -24,22 +24,23 @@ flowchart LR
   S --> O["Authoritative total order"]
   O --> W
   W --> L
-  L --> C["Canonical state"]
+  L --> C["Scoped canonical state"]
   C --> V
 ```
 
 One local transaction allocates a stable mutation identity, runs the handler, stores the pending envelope and write
 set, and updates visible state. The server authenticates and authorizes the mutation, deduplicates exact retries,
-executes the same handler, and either stores a terminal rejection or appends public mutation identity plus canonical
-changes at the next dense sequence. The submitting client's result remains in its private receipt. A client installs
-contiguous accepted entries into canonical state and then replays its remaining pending mutations over that state.
+executes the same handler, and either stores a terminal rejection or advances the space's dense mutation sequence.
+The submitting client's result remains in its private receipt. Replication sends only the current entities selected
+for that client. The client applies those view changes to canonical state and then replays its remaining pending
+mutations over that state.
 
-Effect Cluster owns deployment neutral routing and live ownership. Separate entities per space serialize mutation
-admission, fork reads and immutable snapshot pages, own long lived sync and presence watches, and bound presence
-publication. Each lane has a finite mailbox. The actors do not retain mutation payloads or replies in Cluster message
-history. Server SQL stores bounded authoritative history, bounded receipts, immutable state snapshots, and explicit
-retained floors. Clients retain pending mutations, a durable cursor, and resumable bootstrap staging in SQLite. Effect
-Workflow owns durable client scheduling through finite reconciliation generations.
+Effect Cluster owns deployment neutral routing and live ownership. One entity per space serializes mutation admission,
+holds wake and presence recipients, and routes them across runners. The actor does not retain mutation payloads or
+replies in Cluster message history. Server SQL stores authoritative entities, bounded mutation history and receipts,
+and a materialized replication view per client. Clients retain pending mutations, a dense view cursor, the global
+mutation watermark, durable retractions, and resumable scoped bootstrap staging in SQLite. Effect Workflow owns
+durable client scheduling through finite reconciliation generations.
 
 Ordinary fields store ordinary values. Applications that need concurrent intent for a specific field can use an
 explicit `Field.Semantics` such as a counter or grow only set. Every other model avoids causal metadata.
@@ -197,6 +198,7 @@ import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -204,6 +206,7 @@ import { definition, DomainLive, ListTasks, PutTask, Task } from "./domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const scope = Protocol.ReplicationScope.make({ models: [Task.name] })
 
 const DatabaseLive = Layer.mergeAll(
   SqliteClient.layer({ filename: "tasks.sqlite" }),
@@ -211,6 +214,7 @@ const DatabaseLive = Layer.mergeAll(
 )
 
 const history = {
+  settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 1_024,
   retainedHistoryEntries: 256,
@@ -223,6 +227,7 @@ const history = {
 export const ReplicaLive = SqlReplica.layer({
   definition,
   clientId,
+  scope,
   initialSpaces: [spaceId],
   reconciliationConcurrency: 8,
   ...history
@@ -240,15 +245,17 @@ const program = Replica.Replica.use((replica) =>
       title: "Ship the mutation log",
       completed: false
     })
+    const inFlight = yield* space.pendingFor(PutTask)
     const task = yield* space.get(Task, "task-1")
     const tasks = yield* space.query(ListTasks, { completed: false })
-    return { pending, task, tasks }
+    return { pending, inFlight, task, tasks }
   })
 ).pipe(Effect.provide(ReplicaLive), Effect.scoped)
 ```
 
 Call `replica.join(spaceId)` to add membership, `replica.leave(spaceId)` to evict that space, and `replica.spaces` to
-list the current handles. Each handle scopes mutation, entity, query, receipt, cursor, and status state to its space.
+list the current handles. Each handle scopes mutation, entity, query, pending, settlement, receipt, cursor, and status
+state to its space.
 Leaving cascades through every client table without changing the durable client identity or any other space. A stale
 handle returns `SpaceUnavailable`, including after the same space is joined again with a fresh membership incarnation.
 
@@ -259,57 +266,124 @@ Per space status is available on each handle. `replica.status` returns the sorte
 The explicit Workflow composition persists only reconciliation execution control. Application data stays in the same
 SQLite tables used by the in memory composition.
 
+`space.mutate` still completes at the local optimistic commit. It never waits for the server and its error channel
+contains only failures from that local run. Use `space.pending` to inspect every in flight mutation, including its
+decoded payload, submission state, and attempt count. Use `space.pendingFor(PutTask)` when the mutation specific type
+matters. `space.settlements` is a bounded live Stream of terminal `{ pending, receipt }` values. A current subscriber
+receives each terminal settlement once after rollback and pending replay have completed. The Stream has no
+history. Durable recovery remains `space.receipt(PutTask, mutationId)`. Mutation rejections from either surface are
+decoded through `PutTask.rejectionSchema`; authorization, capacity, legacy, and quarantine rejections remain distinct
+origin tagged JSON branches. `settlementCapacity` bounds each space's live feed. A subscriber that does not keep up
+backpressures settlement delivery and reconciliation, but never the local `mutate` commit. Leaving the space or closing
+the replica scope shuts down its settlement Stream.
+
 Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect Workflow. Supply
 `ClusterWorkflowEngine.layer` and the official runner Layer separately. For one SQLite owner this is normally
 `SingleRunner.layer({ runnerStorage: "sql" })`. Configure `retryDelay`, `maximumRetryDelay`, and `maximumAttempts` on
 `layerWorkflow` to bound one execution's exponential retry history. A later local mutation or server wake creates a
 new generation after a terminal failure. `SqlReplica.layer` remains the explicit lightweight in memory choice.
 
+## Replication scope and read authorization
+
+`scope` is the model subscription for the replica. It applies to every joined space. The current scope shape is an
+explicit set of model names. An empty set is valid. Key ranges, rolling time windows, lazy fetches, and time based
+eviction are not part of this contract. When a replica starts with a changed configured scope, it advances a durable
+scope generation. Widening backfills newly selected entities through ordinary pull pages. Narrowing sends `Retract`
+changes so excluded entities disappear locally without replacing the database or doing a full bootstrap.
+
+The server computes effective visibility as the intersection of the requested scope and `authorizeRead`. It first
+calls the policy with `_tag: "Scope"`, before disclosing space or schema state. It then calls the policy with
+`_tag: "Entity"` for every candidate entity. The entity key and value are Schema encoded JSON. A candidate that fails
+either check never enters a pull or bootstrap page. Wakes contain no entity payload.
+
+The option callback and a Context service compose directly. The Effect returned by `authorizeRead` may require
+services. Those requirements propagate to `ServerStore.layer`, where normal Layer composition supplies them:
+
+```ts
+import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
+import * as Context from "effect/Context"
+import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
+
+class ReadPolicy extends Context.Service<ReadPolicy, {
+  readonly authorize: (
+    input: ServerStore.ReadAuthorizationInput
+  ) => Effect.Effect<void, typeof Schema.Json.Type>
+}>()("app/ReadPolicy") {}
+
+const StoreLive = ServerStore.layer({
+  ...serverHistory,
+  definition,
+  readAuthorizationRefreshInterval: "30 seconds",
+  authorizeAccess: ({ clientId, principal, spaceId }) => authorizeClient({ clientId, principal, spaceId }),
+  authorizeMutation: ({ mutation, principal }) => authorizeMutation({ mutation, principal }),
+  authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
+}).pipe(Layer.provide(ReadPolicyLive))
+```
+
+`Delete` means the authoritative entity no longer exists. `Retract` means it still exists but no longer belongs to the
+client's scope or visibility. A retraction removes canonical and visible state and leaves a durable fence so an old
+optimistic mutation cannot resurrect revoked data. Later authorization can send an `Upsert` and clear the fence.
+Watches carry only wake hints. Pull rechecks the policy. `readAuthorizationRefreshInterval` supplies periodic hints so
+a policy-only revocation is eventually retracted even when no mutation changes that entity.
+
 ## Server and WebSocket RPC
 
-`ServerStore.layer` persists one dense accepted sequence per space, terminal receipts per client mutation, and the
-authoritative entity state. Its mutation path acquires the space row inside the SQL transaction, so handler execution,
-materialization, sequence allocation, and hard capacity checks share one order. Explicit history options set retained
-targets, hard admission caps, snapshot entity and byte limits, bootstrap page bytes, prune batch size, snapshot
-retention, migration retry, maintenance concurrency, and maintenance space page size.
+`ServerStore.layer` persists one dense mutation sequence per space, terminal receipts per client mutation, the
+authoritative entity state, and principal bound client views. Its mutation path acquires the space row inside the SQL
+transaction, so handler execution, materialization, sequence allocation, and hard capacity checks share one order.
+The dense space sequence remains the mutation basis. A separate dense view cursor orders the subset visible to one
+client.
 
-Call `ServerStore.maintain` or provide `ServerStore.layerMaintenance` in the server scope. Maintenance prepares a
-Schema checked immutable snapshot at the current accepted and terminal fences. It publishes that snapshot and the
-logical retained floors atomically before deleting bounded history and receipt prefixes. Admission returns
-`CapacityExceeded` before handler execution when a hard cap is reached, so the maintenance Layer is required in a
-long lived deployment. A client below the retained history floor receives `BootstrapRequired` and installs bounded,
-digest chained pages into durable staging before one atomic canonical replacement.
+Call `ServerStore.maintain` or provide `ServerStore.layerMaintenance` in the server scope. Maintenance prepares the
+global recovery snapshot used to expire old mutation and receipt evidence, then reclaims bounded prefixes. Admission
+returns `CapacityExceeded` before handler execution when a hard cap is reached, so the maintenance Layer is required
+in a long lived deployment. A fresh or invalid client view receives `BootstrapRequired` and installs client, scope,
+schema, and principal bound pages into durable staging before one atomic canonical replacement.
 
 `ServerStore.layer` requires `authorizeAccess`, `authorizeMutation`, and `authorizeRead`. Access authorization runs
 before retry receipt lookup. Mutation admission rejection consumes the client's local sequence and persists an exact
 retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted` is the explicit allow all Layer for
-tests and already trusted processes. Sync watch authorization successes are shared by structural space and principal,
-bounded by `readAuthorizationCacheCapacity`, and executed behind `maximumConcurrentReadAuthorizations`. Denials are not
-cached. Each live watch starts refreshing halfway through `readAuthorizationRefreshInterval` and closes its resources
-at the existing success expiry if refresh does not succeed. This interval is the explicit worst case revocation bound.
-Pull and bootstrap authorization remain one shot checks.
+tests and already trusted processes.
 
-`SyncRpc.Rpcs` multiplexes submit, discard, pull, bootstrap, watch, and presence on one Effect RPC WebSocket. The server uses
-`Authentication.layerServer`; the client uses `Authentication.layerClient`, which writes a redacted bearer credential
-to the request headers. The authenticated server facade uses four Cluster entity types for the requested space.
-`SpaceAdmissionEntity` serializes Submit and Discard. `SpaceReadEntity` forks Pull and Bootstrap while bounding
-concurrent bootstrap pages. `SpaceWatchEntity` owns forked long lived sync and presence streams.
-`SpacePresencePublishEntity` bounds presence publication concurrency. Required `SpaceEntity.HandlerOptions` provide a
-finite mailbox for every lane plus the bootstrap and presence publication concurrency limits. Cluster supplies unique
-live ownership and cross runner stream routing. SQL stores the authoritative accepted log and terminal receipts.
-Accepted admissions publish a shared in memory wake after commit. Exact retries may republish the retained receipt to
-repair lost postcommit publication. Watch fanout performs no SQLite write or transaction per
-watcher.
+`SyncRpc.Rpcs` multiplexes submit, pull, bootstrap, watch, and presence on one Effect RPC WebSocket. The server uses
+`Authentication.layerServer`. The client uses `Authentication.layerClient` with an application supplied
+`CredentialProvider`. Its `acquire` Effect runs for every RPC and returns a redacted bearer credential plus its
+nonnegative generation. `awaitChange(rejectedGeneration)` signals when `acquire` can return a different generation.
+A rejected credential changes the space to `NeedsAuthentication` and pauses that generation. Publishing a new
+generation resumes synchronization through the same replica and WebSocket.
 
-`ServerStore.maximumWatchersPerSpace` caps live sync watches. `PresenceHub.maximumWatchersPerSpace` independently caps
-live presence watches. `PresenceHub.capacity` is the sliding update queue depth, not a watcher allowance. Its default is
-1,024. Excess sync watchers, presence watchers, and bootstrap pages fail with typed `CapacityExceeded { resource,
-limit }`. Full Cluster mailboxes map to `ServerUnavailable`.
+`CredentialRejected` is a credential problem. `AuthenticatorUnavailable` is a verifier outage and remains retryable.
+`AuthorizationDenied` means an authenticated principal lacks permission and is terminal. `OperationTimeout` identifies
+the bounded session or RPC operation that expired. Session acquisition, unary RPCs, and stream acquisition default to
+10 second timeouts and accept `Duration.Input`. Established watch streams may remain idle. Transient reconciliation
+failures use capped exponential backoff from `retryDelay`, default 1 second, through `maximumRetryDelay`, default 1
+minute. See [synchronization](docs/sync.md) and the
+[`effect-local-rpc` guide](packages/local-rpc/README.md) for the provider contract and socket retry policy.
 
-The application chooses Effect's runner storage, message storage, runner transport, and deployment Layers. It also
-remains responsible for its HTTP server, WebSocket path, TLS, Origin policy, credential verification, and tenant
-authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. A reverse proxy
-or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
+The authenticated server facade sends all operations to the Cluster entity for the requested space. Cluster supplies
+the unique live owner and cross runner stream routing. SQL stores the authoritative accepted log and terminal
+receipts. The application chooses Effect's runner storage, message storage, runner transport, and deployment Layers.
+It also remains responsible for its HTTP server, WebSocket path, TLS, Origin policy, credential verification, and
+tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. A
+reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
+
+The facade uses four space entities with required finite limits. `SpaceAdmissionEntity` serializes Submit and Discard.
+`SpaceReadEntity` forks Pull and bounds concurrent immutable Bootstrap pages. `SpaceWatchEntity` owns long lived sync
+and presence streams. `SpacePresencePublishEntity` bounds presence publication. Their separate mailboxes keep a paused
+Bootstrap page or a full watch lane from blocking mutation admission.
+
+`ServerStore.maximumWatchersPerSpace` and `PresenceHub.maximumWatchersPerSpace` independently cap active streams.
+Their sliding queue capacities bound queued hints per subscriber, not subscriber count. Sync authorization successes
+are cached by the complete normalized space, client, scope, and principal input. The refresh interval is the fail closed
+revocation bound. Lookup concurrency and completed successes have separate required limits. Accepted mutations publish
+one shared postcommit wake. Delivery performs no SQLite transaction or space row write per watcher.
+
+Effect metrics cover admission and rejection classes, history and receipt depth beside their limits, sync and presence
+watcher populations, wake fanout duration, durable bootstrap installs, maintenance and prune volume, and client pending
+depth. Labels use bounded categories and never include space or principal identifiers. The production composition
+benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1,024 watchers.
 
 ## Effect Atom
 
@@ -321,6 +395,8 @@ export const graph = BrowserReplica.make(ReplicaLive)
 export const taskAtom = graph.entity(spaceId, Task)("task-1")
 export const tasksAtom = graph.query(spaceId, ListTasks)({ completed: false })
 export const putTaskAtom = graph.mutation(spaceId, PutTask)
+export const pendingTasksAtom = graph.pendingFor(spaceId, PutTask)
+export const taskSettlementsAtom = graph.settlementsFor(spaceId, PutTask)
 export const spaceStatusAtom = graph.status(spaceId)
 export const replicaStatusAtom = graph.aggregateStatus
 export const spacesAtom = graph.spaces
@@ -330,30 +406,11 @@ export const leaveAtom = graph.leave
 
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
 atoms register exact space addressed keys. Query atoms also retain the entity keys and index ranges their handler
-actually read. Local commits and reconciliation batches refresh only affected mounted reads. Mutation, receipt, and
-status atoms also require a space address. The membership and aggregate atoms
-share the same runtime. Mutation atoms are concurrent and preserve their typed result. Pass an application factory
-with `options.factory` when the application already owns a deliberate custom runtime.
-
-## Capacity signals
-
-Effect metrics expose bounded load without labels for space, client, mutation, or principal identifiers:
-
-| Metric                                                                                 | Meaning                                                              |
-| -------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `effect_local_server_admission`                                                        | Completed admission attempts by `outcome`                            |
-| `effect_local_server_rejection`                                                        | Rejections by stable receipt origin or typed error `_tag` in `class` |
-| `effect_local_server_history_depth`, `effect_local_server_receipt_depth`               | Maximum retained rows in any one space                               |
-| `effect_local_server_history_limit`, `effect_local_server_receipt_limit`               | Configured per space hard limits                                     |
-| `effect_local_server_sync_watcher_count`, `effect_local_server_presence_watcher_count` | Current live watcher populations                                     |
-| `effect_local_server_wake_fanout_duration`                                             | Accepted wake publication to one subscriber delivery                 |
-| `effect_local_server_maintenance`                                                      | Maintenance runs by `outcome`                                        |
-| `effect_local_server_pruned`                                                           | Committed deleted rows by `resource`                                 |
-| `effect_local_client_bootstrap_install`                                                | Durably installed client snapshots                                   |
-| `effect_local_client_pending_mutation_count`                                           | Pending mutations across active local stores                         |
-
-Compare retained depth with its limit, watcher count with its configured allowance, and pending mutation count with
-client status. The fanout benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1,024 watchers.
+actually read. Local commits and reconciliation batches refresh only affected mounted reads. Mutation, pending,
+receipt, and status atoms also require a space address. A settlement atom resolves to the lazy live Stream. Mounting
+the atom does not consume or replay events. Materializing that Stream owns one scoped subscription. The membership and
+aggregate atoms share the same runtime. Mutation atoms are concurrent and preserve their typed result. Pass an
+application factory with `options.factory` when the application already owns a deliberate custom runtime.
 
 ## Selective field semantics
 
@@ -445,38 +502,20 @@ window is missing a required downgrade transform.
 ```ts
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 
-const serverHistory = {
-  retainedHistoryEntries: 10_000,
-  maximumHistoryEntries: 20_000,
-  retainedReceipts: 10_000,
-  maximumReceipts: 20_000,
-  maximumSnapshotEntities: 100_000,
-  maximumSnapshotBytes: 64 * 1024 * 1024,
-  maximumBootstrapPageBytes: 4 * 1024 * 1024,
-  pruneBatchSize: 1_000,
-  retainedSnapshots: 2,
-  maintenanceConcurrency: 4,
-  maintenanceSpaceBatchSize: 128,
-  migration: { retryDelay: "25 millis", maximumAttempts: 8 }
-} as const
-
 export const ServerLive = ServerStore.layer({
   ...serverHistory,
   definition: definitionV2,
   evolution,
   acceptedSchemaVersions: 1,
-  maximumWatchersPerSpace: 1_024,
-  readAuthorizationRefreshInterval: "30 seconds",
-  maximumConcurrentReadAuthorizations: 64,
-  readAuthorizationCacheCapacity: 4_096,
   authorizeAccess: ({ clientId, principal, spaceId }) => authorizeClient({ clientId, principal, spaceId }),
   authorizeMutation: ({ mutation, principal }) => authorizeMutation({ mutation, principal }),
-  authorizeRead: ({ principal, spaceId }) => authorizeRead({ principal, spaceId })
+  authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
 })
 ```
 
-The authorization functions above are application Effects. `ServerStore.layerTrusted` remains for tests and already
-trusted processes. Do not use a digest as authorization. Client and space ownership belongs in `authorizeAccess`.
+The authorization functions above are application Effects. Their requirements propagate to the server Layer.
+`ServerStore.layerTrusted` remains for tests and already trusted processes. Do not use a digest as authorization.
+Client and space ownership belongs in `authorizeAccess`.
 
 ### Negotiate one protocol for sync and presence
 
@@ -495,12 +534,13 @@ export const ServerRpcLive = SyncServer.layerWithOptions({
 })
 
 const session = ProtocolSession.layerWithOptions({
-  supportedProtocolVersions: [1, 2]
+  supportedProtocolVersions: [1, 2],
+  sessionAcquisitionTimeout: "10 seconds"
 })
 
 export const ClientRpcLive = Layer.merge(
-  SyncClient.layerFromSession,
-  PresenceClient.layerFromSession
+  SyncClient.layerFromSession({ rpcTimeout: "10 seconds" }),
+  PresenceClient.layerFromSession({ rpcTimeout: "10 seconds" })
 ).pipe(
   Layer.provide(session),
   Layer.provide(RpcProtocolLive),
@@ -583,8 +623,8 @@ The complete deployment sequence is:
 - Pull entries expose only public mutation identity and canonical changes. Payloads and success results are not in the
   shared authoritative log.
 - A terminal rejection rolls back its optimistic write set and replays remaining pending mutations.
-- Entity mailboxes, active watchers, authorization lookups and cached successes, mutation and presence payloads, pull
-  pages, concurrent bootstrap pages, snapshots, receipts, and retained history are bounded by explicit configuration.
+- Queues, mutation payloads, presence payloads, pull pages, bootstrap pages, snapshots, receipts, and retained history
+  are bounded by explicit configuration.
 - Presence is best effort, bounded, TTL based, and never enters the durable mutation log.
 - Cluster routes each space to one live owner across runners. Entity operations are volatile. A failed submit remains
   in the client's pending SQLite outbox until exact resubmission returns the SQL backed terminal receipt. Pull and watch

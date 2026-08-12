@@ -98,6 +98,9 @@ importers:
       '@effect/wa-sqlite':
         specifier: 0.1.2
         version: 0.1.2
+      '@lucas-barake/effect-local-test':
+        specifier: workspace:^
+        version: link:../local-test
       effect:
         specifier: 4.0.0-beta.103
         version: 4.0.0-beta.103

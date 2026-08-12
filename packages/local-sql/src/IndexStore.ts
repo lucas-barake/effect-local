@@ -10,7 +10,6 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import type * as Statement from "effect/unstable/sql/Statement"
 import * as Codec from "./internal/codec.js"
@@ -299,7 +298,7 @@ const upsertRows = (
       ON CONFLICT (space_id, index_schema_generation, index_projection_generation, index_entity_key)
       DO UPDATE SET ${assignments}`,
     { discard: true }
-  ).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+  ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 }
 
 const writeEntity = (
@@ -328,7 +327,7 @@ const writeEntity = (
     const old = yield* findOld({ ...address, entityKey }).pipe(
       Effect.catchTag("SchemaError", (cause) =>
         Effect.fail(new ReplicaError.StorageCorrupt({ message: "Stored secondary index row is invalid", cause }))),
-      Effect.catchIf(SqlError.isSqlError, (cause) =>
+      Effect.catchTag("SqlError", (cause) =>
         Effect.fail(StorageUnavailable.make(cause)))
     )
     const points: Array<Point> = []
@@ -351,7 +350,7 @@ const writeEntity = (
     points.push(point(address, descriptor, entityKey, encoded.values))
     return points
   }).pipe(
-    Effect.catchIf(SqlError.isSqlError, (cause) =>
+    Effect.catchTag("SqlError", (cause) =>
       Effect.fail(StorageUnavailable.make(cause))),
     Effect.withSpan("IndexStore.writeEntity", {
       attributes: { "index.model": descriptor.model.name, "index.name": descriptor.indexName }
@@ -379,7 +378,7 @@ const readPoint = (
       (cause) =>
         Effect.fail(new ReplicaError.StorageCorrupt({ message: "Stored secondary index row is invalid", cause }))
     ),
-    Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+    Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
     Effect.flatMap(Option.match({
       onNone: () => Effect.succeed([]),
       onSome: (row) =>
@@ -487,7 +486,7 @@ const ensureCatalog = (
     }
     return yield* Effect.void
   })).pipe(
-    Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+    Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
     Effect.withSpan("IndexStore.ensureCatalog", {
       attributes: { "index.model": descriptor.model.name, "index.name": descriptor.indexName }
     })
@@ -504,7 +503,7 @@ const findGeneration = (sql: SqlClient.SqlClient, spaceId: Identity.SpaceId) =>
   })({ spaceId }).pipe(
     Effect.catchTag("SchemaError", (cause) =>
       Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client generation metadata is invalid", cause }))),
-    Effect.catchIf(SqlError.isSqlError, (cause) =>
+    Effect.catchTag("SqlError", (cause) =>
       Effect.fail(StorageUnavailable.make(cause))),
     Effect.catchTag("NoSuchElementError", () =>
       Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client generation metadata is missing" })))
@@ -675,7 +674,7 @@ const backfill = (
       }
     }
   }).pipe(
-    Effect.catchIf(SqlError.isSqlError, (cause) =>
+    Effect.catchTag("SqlError", (cause) =>
       Effect.fail(StorageUnavailable.make(cause))),
     Effect.withSpan("IndexStore.backfill", {
       attributes: { "index.model": descriptor.model.name, "index.name": descriptor.indexName }
@@ -709,7 +708,7 @@ const cleanupObsolete = (
               AND descriptor_hash = ${row.descriptor_hash}`
         }), { discard: true }))
     }),
-    Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+    Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
     Effect.withSpan("IndexStore.cleanupObsolete")
   )
 
@@ -780,7 +779,7 @@ export const install = (
               (cause) =>
                 Effect.fail(new ReplicaError.StorageCorrupt({ message: "Indexed entity row is invalid", cause }))
             ),
-            Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+            Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
           )
           let value: unknown
           if (Option.isSome(found)) value = yield* decodeEntity(model, found.value.value_json)
@@ -903,7 +902,7 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
     })({ ...address, model: model.name, indexName, hash: descriptor.hash }).pipe(
       Effect.catchTag("SchemaError", (cause) =>
         Effect.fail(new ReplicaError.StorageCorrupt({ message: "Secondary index readiness row is invalid", cause }))),
-      Effect.catchIf(SqlError.isSqlError, (cause) =>
+      Effect.catchTag("SqlError", (cause) =>
         Effect.fail(StorageUnavailable.make(cause)))
     )
     if (
@@ -1052,7 +1051,7 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
     const rows = yield* findRows(undefined).pipe(
       Effect.catchTag("SchemaError", (cause) =>
         Effect.fail(new ReplicaError.StorageCorrupt({ message: "Secondary index query row is invalid", cause }))),
-      Effect.catchIf(SqlError.isSqlError, (cause) =>
+      Effect.catchTag("SqlError", (cause) =>
         Effect.fail(StorageUnavailable.make(cause)))
     )
     const pageRows = rows.slice(0, state.limit)
@@ -1091,7 +1090,6 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
     }
     return { items, next }
   }).pipe(
-    Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
     Effect.withSpan("IndexStore.queryPage", {
       attributes: { "index.model": model.name, "index.name": indexName }
     })

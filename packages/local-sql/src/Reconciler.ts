@@ -5,11 +5,13 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
-import * as Duration from "effect/Duration"
+import * as Deferred from "effect/Deferred"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as FiberMap from "effect/FiberMap"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import type * as Scope from "effect/Scope"
@@ -22,6 +24,7 @@ import * as SyncEngine from "./SyncEngine.js"
 export interface ReconciliationService {
   readonly sync: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly failed: (error: ReplicaError.ReplicaError) => Effect.Effect<void>
+  readonly watchFailed: (error: ReplicaError.ReplicaError) => Effect.Effect<void>
   readonly succeeded: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly status: Effect.Effect<ReplicaStatus.ReplicaStatus>
 }
@@ -46,6 +49,7 @@ export interface Options {
   readonly spaceId: Identity.SpaceId
   readonly pageSize?: number
   readonly retryDelay?: Duration.Input
+  readonly maximumRetryDelay?: Duration.Input
 }
 
 export interface ManagedSpace {
@@ -54,10 +58,11 @@ export interface ManagedSpace {
   readonly definition: Definition.Any
   readonly local: Pick<
     LocalStore.Service,
-    "requestReconciliation" | "reconciliationGenerations" | "completeReconciliation"
+    "requestReconciliation" | "reconciliationGenerations" | "completeReconciliation" | "replicationState"
   >
   readonly reconciliation: ReconciliationService
   readonly retryDelay?: Duration.Input
+  readonly maximumRetryDelay?: Duration.Input
 }
 
 export interface ManagerService {
@@ -76,8 +81,14 @@ export class Manager extends Context.Service<Manager, ManagerService>()(
 
 interface ManagedState extends ManagedSpace {
   readonly retryDelayMillis: number
+  readonly maximumRetryDelayMillis: number
   queued: boolean
   running: boolean
+  retryAttempt: number
+  retrying: boolean
+  halted: boolean
+  authenticationGate: Deferred.Deferred<void> | undefined
+  authenticationEpoch: number
   dirtyEpoch: number
 }
 
@@ -87,6 +98,11 @@ interface Work {
 }
 
 const managedKey = (spaceId: Identity.SpaceId, generation: number) => `${spaceId}:${generation}`
+
+const isTransientFailure = (error: ReplicaError.ReplicaError) =>
+  error._tag === "AuthenticatorUnavailable" ||
+  error._tag === "ServerUnavailable" ||
+  error._tag === "OperationTimeout"
 
 export const makeManager = (options: {
   readonly concurrency?: number
@@ -110,6 +126,8 @@ export const makeManager = (options: {
     )
     const turns = yield* FiberMap.make<string, void, never>()
     const watches = yield* FiberMap.make<string, void, never>()
+    const retries = yield* FiberMap.make<string, void, never>()
+    const authenticationWaiters = yield* FiberMap.make<string, void, never>()
     const spaces = new Map<Identity.SpaceId, ManagedState>()
 
     const lookup = (spaceId: Identity.SpaceId) =>
@@ -134,13 +152,107 @@ export const makeManager = (options: {
             return
           }
           admitted.dirtyEpoch += 1
-          if (admitted.queued || admitted.running) return
+          admitted.halted = false
+          if (
+            admitted.queued ||
+            admitted.running ||
+            admitted.retrying ||
+            admitted.authenticationGate !== undefined
+          ) return
           admitted.queued = true
           yield* Queue.offer(queue, { spaceId: admitted.spaceId, generation: admitted.generation })
         })
       )
 
     const notify = (spaceId: Identity.SpaceId) => lookup(spaceId).pipe(Effect.flatMap(enqueue))
+
+    const admitCredentialPause = (space: ManagedState, error: ReplicaError.CredentialRejected) =>
+      Effect.gen(function*() {
+        if (error.credentialGeneration === undefined) {
+          space.halted = true
+          return undefined
+        }
+        if (space.authenticationGate !== undefined) {
+          return { gate: space.authenticationGate, generation: error.credentialGeneration, owner: false }
+        }
+        const gate = yield* Deferred.make<void>()
+        space.authenticationGate = gate
+        space.authenticationEpoch += 1
+        return { gate, generation: error.credentialGeneration, owner: true }
+      })
+
+    const startCredentialWait = (
+      space: ManagedState,
+      admission: { readonly gate: Deferred.Deferred<void>; readonly generation: number; readonly owner: boolean }
+    ) => {
+      if (!admission.owner) return Effect.void
+      const gate = admission.gate
+      return Effect.gen(function*() {
+        const key = managedKey(space.spaceId, space.generation)
+        yield* FiberMap.run(
+          authenticationWaiters,
+          key,
+          remote.waitForCredentialChange(admission.generation).pipe(
+            Effect.andThen(Effect.uninterruptible(Effect.gen(function*() {
+              const current = spaces.get(space.spaceId)
+              if (current !== space || current.authenticationGate !== gate) return
+              current.authenticationGate = undefined
+              current.retryAttempt = 0
+              yield* Deferred.succeed(gate, undefined)
+              yield* enqueue(current)
+            }))),
+            Effect.orDie,
+            Effect.catchCause((cause) => {
+              if (Cause.hasInterruptsOnly(cause)) return Effect.void
+              return Effect.failCause(cause)
+            })
+          )
+        )
+      })
+    }
+
+    const scheduleRetry = (space: ManagedState) =>
+      Effect.gen(function*() {
+        space.retryAttempt += 1
+        const delay = Configuration.retryMillis(space, space.retryAttempt)
+        space.retrying = true
+        yield* FiberMap.run(
+          retries,
+          managedKey(space.spaceId, space.generation),
+          Effect.sleep(delay).pipe(
+            Effect.andThen(Effect.uninterruptible(Effect.gen(function*() {
+              const current = spaces.get(space.spaceId)
+              if (current !== space) return
+              current.retrying = false
+              yield* enqueue(current)
+            }))),
+            Effect.orDie,
+            Effect.catchCause((cause) => {
+              if (Cause.hasInterruptsOnly(cause)) return Effect.void
+              return Effect.failCause(cause)
+            })
+          )
+        )
+      })
+
+    const handleFailure = (space: ManagedState, error: ReplicaError.ReplicaError) => {
+      if (error._tag === "CredentialRejected") {
+        return Effect.gen(function*() {
+          const admission = yield* admitCredentialPause(space, error)
+          yield* space.reconciliation.failed(error)
+          if (admission !== undefined) yield* startCredentialWait(space, admission)
+        })
+      }
+      let policy: Effect.Effect<void>
+      if (isTransientFailure(error)) {
+        policy = scheduleRetry(space)
+      } else {
+        policy = Effect.sync(() => {
+          space.halted = true
+        })
+      }
+      return space.reconciliation.failed(error).pipe(Effect.andThen(policy))
+    }
 
     const runTurn = (space: ManagedState, epoch: number) =>
       Effect.gen(function*() {
@@ -149,19 +261,20 @@ export const makeManager = (options: {
         yield* space.reconciliation.sync
         yield* space.local.completeReconciliation(generations.requested)
         yield* space.reconciliation.succeeded
+        space.retryAttempt = 0
       }).pipe(
-        Effect.catch((error) =>
-          space.reconciliation.failed(error).pipe(
-            Effect.andThen(Effect.sleep(space.retryDelayMillis)),
-            Effect.andThen(enqueue(space)),
-            Effect.catch(() => Effect.void)
-          )
-        ),
+        Effect.catch((error) => handleFailure(space, error).pipe(Effect.catch(() => Effect.void))),
         Effect.ensuring(Effect.uninterruptible(Effect.gen(function*() {
           const current = spaces.get(space.spaceId)
           if (current !== space) return
           current.running = false
-          if (current.dirtyEpoch <= epoch || current.queued) return
+          if (
+            current.dirtyEpoch <= epoch ||
+            current.queued ||
+            current.retrying ||
+            current.halted ||
+            current.authenticationGate !== undefined
+          ) return
           current.queued = true
           yield* Queue.offer(queue, { spaceId: current.spaceId, generation: current.generation })
         })))
@@ -195,35 +308,86 @@ export const makeManager = (options: {
 
     const register = (space: ManagedSpace) =>
       Effect.gen(function*() {
-        const retryDelayMillis = yield* Configuration.positiveFiniteDurationMillis(
-          "retryDelay",
-          space.retryDelay ?? Duration.seconds(1)
-        )
+        const retryTiming = yield* Configuration.retryTiming(space)
         const state: ManagedState = {
           ...space,
-          retryDelayMillis,
+          ...retryTiming,
           queued: false,
           running: false,
+          retryAttempt: 0,
+          retrying: false,
+          halted: false,
+          authenticationGate: undefined,
+          authenticationEpoch: 0,
           dirtyEpoch: 0
         }
         spaces.set(space.spaceId, state)
+        let watchAttempt = 0
+        const watch = (): Effect.Effect<void> =>
+          Effect.suspend(() => {
+            const authenticationGate = state.authenticationGate
+            if (authenticationGate !== undefined) {
+              return Deferred.await(authenticationGate).pipe(Effect.andThen(watch()))
+            }
+            const watchEpoch = state.authenticationEpoch
+            return Stream.unwrap(space.local.replicationState.pipe(
+              Effect.map((replication) =>
+                remote.watch({
+                  spaceId: space.spaceId,
+                  clientId: replication.clientId,
+                  schema: space.definition.schemaIdentity,
+                  scope: replication.scope,
+                  scopeGeneration: replication.scopeGeneration,
+                  cursor: replication.cursor
+                })
+              )
+            )).pipe(
+              Stream.runForEach(() => {
+                watchAttempt = 0
+                return enqueue(state)
+              }),
+              Effect.matchEffect({
+                onSuccess: () => {
+                  watchAttempt += 1
+                  const delay = Configuration.retryMillis(retryTiming, watchAttempt)
+                  return Effect.sleep(delay).pipe(Effect.andThen(watch()))
+                },
+                onFailure: (error) => {
+                  if (watchEpoch !== state.authenticationEpoch) return watch()
+                  const activeAuthenticationGate = state.authenticationGate
+                  if (activeAuthenticationGate !== undefined && error._tag !== "CredentialRejected") {
+                    return Deferred.await(activeAuthenticationGate).pipe(Effect.andThen(watch()))
+                  }
+                  let policy: Effect.Effect<void>
+                  if (error._tag === "CredentialRejected") {
+                    return Effect.gen(function*() {
+                      const admission = yield* admitCredentialPause(state, error)
+                      yield* state.reconciliation.watchFailed(error)
+                      if (admission === undefined) return
+                      yield* startCredentialWait(state, admission)
+                      yield* Deferred.await(admission.gate)
+                      yield* watch()
+                    })
+                  } else if (isTransientFailure(error)) {
+                    policy = Effect.suspend(() => {
+                      watchAttempt += 1
+                      const delay = Configuration.retryMillis(retryTiming, watchAttempt)
+                      return Effect.sleep(delay).pipe(Effect.andThen(watch()))
+                    })
+                  } else {
+                    policy = Effect.void
+                  }
+                  return state.reconciliation.watchFailed(error).pipe(Effect.andThen(policy))
+                }
+              })
+            )
+          })
         yield* FiberMap.run(
           watches,
           managedKey(space.spaceId, space.generation),
-          Effect.forever(
-            remote.watch({ spaceId: space.spaceId, schema: space.definition.schemaIdentity }).pipe(
-              Stream.runForEach(() => enqueue(state)),
-              Effect.catch((error) =>
-                state.reconciliation.failed(error).pipe(
-                  Effect.andThen(enqueue(state)),
-                  Effect.catch(() => Effect.void)
-                )
-              ),
-              Effect.andThen(Effect.sleep(retryDelayMillis))
-            )
-          )
+          watch()
         )
-        yield* enqueue(state)
+        return yield* enqueue(state)
       }).pipe(Effect.onError(() => unregister(space.spaceId, space.generation)))
 
     const unregister = (spaceId: Identity.SpaceId, generation: number) =>
@@ -233,6 +397,8 @@ export const makeManager = (options: {
         const key = managedKey(spaceId, generation)
         yield* FiberMap.remove(watches, key)
         yield* FiberMap.remove(turns, key)
+        yield* FiberMap.remove(retries, key)
+        yield* FiberMap.remove(authenticationWaiters, key)
       })
 
     const sync = (spaceId: Identity.SpaceId) =>
@@ -269,18 +435,34 @@ export const layerOnePass = (
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
       const setStatus = (value: ReplicaStatus.ReplicaStatus) =>
         Ref.set(status, value).pipe(Effect.andThen(local.invalidateStatus))
-      const failed = (error: ReplicaError.ReplicaError) =>
+      const reportFailure = (error: ReplicaError.ReplicaError, preserveConnecting: boolean) =>
         local.pendingCount.pipe(
           Effect.catch(() => Effect.succeed(0)),
-          Effect.flatMap((pending) => {
-            if (error._tag === "AuthorizationDenied") {
-              return setStatus({ _tag: "NeedsAuthentication", pending })
-            }
-            if (error._tag === "ServerUnavailable") return setStatus({ _tag: "Offline", pending })
-            return setStatus({ _tag: "Failed", pending, message: error._tag })
-          })
+          Effect.flatMap((pending) =>
+            Ref.modify(status, (current): readonly [boolean, ReplicaStatus.ReplicaStatus] => {
+              if (error._tag === "CredentialRejected") return [true, { _tag: "NeedsAuthentication", pending }]
+              if (current._tag === "NeedsAuthentication") return [false, current]
+              if (preserveConnecting && current._tag === "Connecting" && isTransientFailure(error)) {
+                return [false, current]
+              }
+              if (
+                error._tag === "AuthenticatorUnavailable" ||
+                error._tag === "ServerUnavailable" ||
+                error._tag === "OperationTimeout"
+              ) return [true, { _tag: "Offline", pending }]
+              return [true, { _tag: "Failed", pending, message: error._tag }]
+            }).pipe(
+              Effect.flatMap((changed) => {
+                if (changed) return local.invalidateStatus
+                return Effect.void
+              })
+            )
+          )
         )
+      const failed = (error: ReplicaError.ReplicaError) => reportFailure(error, false)
+      const watchFailed = (error: ReplicaError.ReplicaError) => reportFailure(error, true)
       const succeeded = Effect.gen(function*() {
+        if ((yield* Ref.get(status))._tag !== "Connecting") return
         const pending = yield* local.pendingCount
         const cursor = yield* local.cursor
         const serverSchema = yield* Ref.get(updateAvailable)
@@ -298,22 +480,29 @@ export const layerOnePass = (
         return Ref.set(updateAvailable, serverSchema)
       }
 
-      const bootstrap = (
-        manifest: Protocol.SnapshotManifest
+      const continueBootstrap = (
+        manifest: Protocol.SnapshotManifest,
+        initialAfterOrdinal: number
       ): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.gen(function*() {
-          let afterOrdinal = yield* local.prepareBootstrap(manifest)
+          let afterOrdinal = initialAfterOrdinal
           while (true) {
+            const state = yield* local.replicationState
             const page = yield* remote.bootstrap({
               spaceId: options.spaceId,
+              clientId: state.clientId,
               schema: options.definition.schemaIdentity,
+              scope: state.scope,
+              scopeGeneration: state.scopeGeneration,
+              cursor: manifest.cursor,
               snapshotId: manifest.snapshotId,
               afterOrdinal,
               limit: pageSize
             })
             yield* observeServerSchema(page.serverSchema)
             if (page.manifest.snapshotId !== manifest.snapshotId) {
-              yield* bootstrap(page.manifest)
+              const nextAfterOrdinal = yield* local.prepareBootstrap(page.manifest)
+              yield* continueBootstrap(page.manifest, nextAfterOrdinal)
               return yield* Effect.void
             }
             const complete = yield* local.stageBootstrapPage(page)
@@ -321,15 +510,32 @@ export const layerOnePass = (
               yield* local.installBootstrap(page.manifest)
               return yield* Effect.void
             }
-            afterOrdinal += page.entities.length
+            afterOrdinal += page.entries.length
           }
         })
 
+      const bootstrap = (
+        manifest: Protocol.SnapshotManifest
+      ): Effect.Effect<void, ReplicaError.ReplicaError> =>
+        local.prepareBootstrap(manifest).pipe(
+          Effect.flatMap((afterOrdinal) => continueBootstrap(manifest, afterOrdinal))
+        )
+
       const bootstrapExpired = (receipt: Protocol.ExpiredReceipt) =>
         Effect.gen(function*() {
+          const state = yield* local.replicationState
+          if (state.cursor === null) {
+            return yield* new ReplicaError.ProtocolInvalid({
+              message: "Expired receipt recovery requires an installed replication view"
+            })
+          }
           const firstPage = yield* remote.bootstrap({
             spaceId: options.spaceId,
+            clientId: state.clientId,
             schema: options.definition.schemaIdentity,
+            scope: state.scope,
+            scopeGeneration: state.scopeGeneration,
+            cursor: state.cursor,
             snapshotId: receipt.snapshotId,
             afterOrdinal: -1,
             limit: pageSize
@@ -350,37 +556,21 @@ export const layerOnePass = (
               yield* local.installBootstrap(firstPage.manifest)
               return yield* Effect.void
             }
-            afterOrdinal = firstPage.entities.length - 1
+            afterOrdinal = firstPage.entries.length - 1
           }
-          while (true) {
-            const page = yield* remote.bootstrap({
-              spaceId: options.spaceId,
-              schema: options.definition.schemaIdentity,
-              snapshotId: firstPage.manifest.snapshotId,
-              afterOrdinal,
-              limit: pageSize
-            })
-            yield* observeServerSchema(page.serverSchema)
-            if (page.manifest.snapshotId !== firstPage.manifest.snapshotId) {
-              yield* bootstrap(page.manifest)
-              return yield* Effect.void
-            }
-            const complete = yield* local.stageBootstrapPage(page)
-            if (complete) {
-              yield* local.installBootstrap(page.manifest)
-              return yield* Effect.void
-            }
-            afterOrdinal += page.entities.length
-          }
-        })
+          return yield* continueBootstrap(firstPage.manifest, afterOrdinal)
+        }).pipe(Effect.tapErrorTag("AuthorizationDenied", () => local.revokeReplication))
 
       const catchUp = Effect.gen(function*() {
         while (true) {
-          const cursor = yield* local.cursor
+          const state = yield* local.replicationState
           const result = yield* remote.pull({
             spaceId: options.spaceId,
+            clientId: state.clientId,
             schema: options.definition.schemaIdentity,
-            after: cursor,
+            scope: state.scope,
+            scopeGeneration: state.scopeGeneration,
+            cursor: state.cursor,
             limit: pageSize
           })
           yield* observeServerSchema(result.serverSchema)
@@ -388,25 +578,29 @@ export const layerOnePass = (
             yield* bootstrap(result.manifest)
             continue
           }
-          yield* local.applyEntries(result.entries, { publishProjection: !result.hasMore })
+          yield* local.applyViewPage(result)
           if (!result.hasMore) return
         }
-      })
+      }).pipe(Effect.tapErrorTag("AuthorizationDenied", () => local.revokeReplication))
 
       const submitPending = Effect.gen(function*() {
         yield* local.settleReceipts
         while (true) {
-          const pending = yield* local.pending
+          const pending = yield* local.pendingToSubmit
           let installedExpiredSnapshot = false
           for (const mutation of pending) {
-            const receipt = yield* remote.submit({
-              envelope: mutation.envelope,
-              schema: options.definition.schemaIdentity
-            })
-            yield* local.persistReceipt(receipt)
+            const receipt = yield* Effect.gen(function*() {
+              yield* local.markSubmitting(mutation.envelope.mutationId)
+              const remoteReceipt = yield* remote.submit({
+                envelope: mutation.envelope,
+                schema: options.definition.schemaIdentity
+              })
+              yield* local.persistReceipt(remoteReceipt)
+              return remoteReceipt
+            }).pipe(Effect.tapError(() => local.markRetrying(mutation.envelope.mutationId)))
             if (receipt._tag === "Expired") {
               yield* local.settleReceipts
-              const unresolved = (yield* local.pending).some(
+              const unresolved = (yield* local.pendingToSubmit).some(
                 (candidate) => candidate.envelope.mutationId === receipt.mutationId
               )
               if (!unresolved) continue
@@ -427,18 +621,19 @@ export const layerOnePass = (
         yield* catchUp
         yield* submitPending
         yield* catchUp
+        yield* local.settleReceipts
         yield* succeeded
       })).pipe(
         Effect.tapError(failed),
         Effect.withSpan("Reconciliation.sync")
       )
 
-      return Reconciliation.of({ sync, failed, succeeded, status: Ref.get(status) })
+      return Reconciliation.of({ sync, failed, watchFailed, succeeded, status: Ref.get(status) })
     })
   )
 
 export const layerInMemoryScheduler = (
-  options: Pick<Options, "definition" | "spaceId" | "retryDelay">
+  options: Pick<Options, "definition" | "spaceId" | "retryDelay" | "maximumRetryDelay">
 ): Layer.Layer<
   Reconciler,
   ReplicaError.ReplicaError,
@@ -447,18 +642,68 @@ export const layerInMemoryScheduler = (
   Layer.effect(
     Reconciler,
     Effect.gen(function*() {
-      const retryDelayMillis = yield* Configuration.positiveFiniteDurationMillis(
-        "retryDelay",
-        options.retryDelay ?? Duration.seconds(1)
-      )
+      const retryTiming = yield* Configuration.retryTiming(options)
       const local = yield* LocalStore.Store
       const reconciliation = yield* Reconciliation
       const remote = yield* SyncEngine.SyncEngine
       const wake = yield* Queue.sliding<void>(1)
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
+      const authenticationPause = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(Option.none())
+      let authenticationEpoch = 0
+      const awaitAuthenticationChange = Ref.get(authenticationPause).pipe(
+        Effect.flatMap(Option.match({
+          onNone: () => Effect.void,
+          onSome: Deferred.await
+        }))
+      )
+      const admitCredentialPause = Effect.uninterruptible(Effect.gen(function*() {
+        const candidate = yield* Deferred.make<void>()
+        const admission = yield* Ref.modify(authenticationPause, (
+          current
+        ): readonly [
+          { readonly gate: Deferred.Deferred<void>; readonly owner: boolean },
+          Option.Option<Deferred.Deferred<void>>
+        ] =>
+          Option.match(current, {
+            onNone: () => [{ gate: candidate, owner: true }, Option.some(candidate)],
+            onSome: (gate) => [{ gate, owner: false }, Option.some(gate)]
+          }))
+        if (admission.owner) authenticationEpoch += 1
+        return admission
+      }))
+      const startCredentialWait = (
+        generation: number,
+        admission: { readonly gate: Deferred.Deferred<void>; readonly owner: boolean }
+      ) => {
+        if (!admission.owner) return Effect.void
+        return remote.waitForCredentialChange(generation).pipe(
+          Effect.andThen(Effect.uninterruptible(Effect.gen(function*() {
+            const owned = yield* Ref.modify(authenticationPause, (current) => {
+              if (Option.isSome(current) && current.value === admission.gate) {
+                return [true, Option.none()] as const
+              }
+              return [false, current] as const
+            })
+            if (owned) yield* Deferred.succeed(admission.gate, undefined)
+          }))),
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) return Effect.void
+            return Effect.failCause(cause)
+          }),
+          Effect.forkScoped,
+          Effect.asVoid
+        )
+      }
+      let retryAttempt = 0
+      const retryAfterBackoff = Effect.suspend(() => {
+        retryAttempt += 1
+        const delay = Configuration.retryMillis(retryTiming, retryAttempt)
+        return Effect.sleep(delay).pipe(Effect.andThen(notify))
+      })
       const worker = Effect.forever(
         Queue.take(wake).pipe(
+          Effect.andThen(awaitAuthenticationChange),
           Effect.andThen(local.reconciliationGenerations),
           Effect.flatMap((generations) => {
             if (generations.completed >= generations.requested) return Effect.void
@@ -472,45 +717,99 @@ export const layerInMemoryScheduler = (
                 return exit
               }),
               Effect.andThen(local.completeReconciliation(generations.requested)),
-              Effect.andThen(reconciliation.succeeded)
+              Effect.andThen(reconciliation.succeeded),
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  retryAttempt = 0
+                })
+              )
             )
           }),
-          Effect.catch((error) => {
-            if (error._tag === "StaleSchema" || error._tag === "UpgradeRequired") {
-              return reconciliation.failed(error)
-            }
-            return Effect.logWarning("Reconciliation failed", error).pipe(
-              Effect.andThen(Effect.sleep(retryDelayMillis)),
-              Effect.andThen(notify)
-            )
-          })
+          Effect.catch((error) =>
+            Effect.gen(function*() {
+              if (error._tag === "CredentialRejected") {
+                if (error.credentialGeneration === undefined) return yield* reconciliation.failed(error)
+                const admission = yield* admitCredentialPause
+                yield* reconciliation.failed(error)
+                yield* startCredentialWait(error.credentialGeneration, admission)
+                yield* Deferred.await(admission.gate)
+                retryAttempt = 0
+                return yield* notify
+              }
+              const pause = yield* Ref.get(authenticationPause)
+              if (Option.isSome(pause)) {
+                yield* Deferred.await(pause.value)
+                return yield* notify
+              }
+              if (!isTransientFailure(error)) return yield* reconciliation.failed(error)
+              return yield* reconciliation.failed(error).pipe(
+                Effect.andThen(Effect.logWarning("Reconciliation failed", error)),
+                Effect.andThen(retryAfterBackoff)
+              )
+            })
+          )
         )
       )
       const workerFiber = yield* Effect.forkScoped(worker)
-      const watchFiber = yield* Effect.forkScoped(
-        Effect.forever(
-          remote.watch({ spaceId: options.spaceId, schema: options.definition.schemaIdentity }).pipe(
-            Stream.runForEach(() => requestAndNotify),
-            Effect.matchEffect({
-              onFailure: (error) => {
-                if (error._tag === "StaleSchema" || error._tag === "UpgradeRequired") return Effect.fail(error)
-                return Effect.logWarning("Sync watch ended", error).pipe(
-                  Effect.andThen(requestAndNotify),
-                  Effect.catch((wakeError) =>
-                    Effect.logWarning("Could not persist a reconciliation wake", wakeError).pipe(
-                      Effect.andThen(notify)
+      let watchAttempt = 0
+      const watch = (): Effect.Effect<void, never, Scope.Scope> =>
+        Effect.suspend(() => {
+          const watchEpoch = authenticationEpoch
+          return awaitAuthenticationChange.pipe(Effect.andThen(
+            Stream.unwrap(local.replicationState.pipe(
+              Effect.map((state) =>
+                remote.watch({
+                  spaceId: options.spaceId,
+                  clientId: state.clientId,
+                  schema: options.definition.schemaIdentity,
+                  scope: state.scope,
+                  scopeGeneration: state.scopeGeneration,
+                  cursor: state.cursor
+                })
+              )
+            )).pipe(
+              Stream.runForEach(() => {
+                watchAttempt = 0
+                return requestAndNotify
+              }),
+              Effect.matchEffect({
+                onFailure: (error) =>
+                  Effect.gen(function*() {
+                    if (watchEpoch !== authenticationEpoch) return yield* watch()
+                    if (error._tag === "CredentialRejected") {
+                      if (error.credentialGeneration === undefined) return yield* reconciliation.failed(error)
+                      const admission = yield* admitCredentialPause
+                      yield* reconciliation.watchFailed(error)
+                      yield* startCredentialWait(error.credentialGeneration, admission)
+                      yield* Deferred.await(admission.gate)
+                      watchAttempt = 0
+                      return yield* watch()
+                    }
+                    const pause = yield* Ref.get(authenticationPause)
+                    if (Option.isSome(pause)) {
+                      yield* Deferred.await(pause.value)
+                      return yield* watch()
+                    }
+                    if (!isTransientFailure(error)) return yield* reconciliation.watchFailed(error)
+                    watchAttempt += 1
+                    const delay = Configuration.retryMillis(retryTiming, watchAttempt)
+                    return yield* reconciliation.watchFailed(error).pipe(
+                      Effect.andThen(Effect.logWarning("Sync watch ended", error)),
+                      Effect.andThen(Effect.sleep(delay)),
+                      Effect.andThen(watch())
                     )
-                  )
-                )
-              },
-              onSuccess: () => requestAndNotify
-            }),
-            Effect.andThen(Effect.sleep(retryDelayMillis))
-          )
-        ).pipe(Effect.catchTags({
-          StaleSchema: reconciliation.failed,
-          UpgradeRequired: reconciliation.failed
-        }))
+                  }),
+                onSuccess: () => {
+                  watchAttempt += 1
+                  const delay = Configuration.retryMillis(retryTiming, watchAttempt)
+                  return Effect.sleep(delay).pipe(Effect.andThen(watch()))
+                }
+              })
+            )
+          ))
+        })
+      const watchFiber = yield* Effect.forkScoped(
+        watch()
       )
       yield* requestAndNotify
       yield* Effect.addFinalizer(() =>

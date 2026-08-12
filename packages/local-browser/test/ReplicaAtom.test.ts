@@ -5,14 +5,21 @@ import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
+import * as FaultInjection from "@lucas-barake/effect-local-test/FaultInjection"
+import * as TestReplica from "@lucas-barake/effect-local-test/TestReplica"
+import * as TestServer from "@lucas-barake/effect-local-test/TestServer"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
@@ -95,6 +102,8 @@ const migration = {
   maximumAttempts: 8
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const clientHistory = {
+  scope: Protocol.ReplicationScope.make({ models: [Todo.name, Numbered.name] }),
+  settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
@@ -105,6 +114,10 @@ const clientHistory = {
 }
 const server = ServerStore.layerTrusted({
   definition,
+  readAuthorizationRefreshInterval: "30 seconds" as const,
+  maximumWatchersPerSpace: 1_024,
+  maximumConcurrentReadAuthorizations: 64,
+  readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,
@@ -116,10 +129,6 @@ const server = ServerStore.layerTrusted({
   retainedSnapshots: 2,
   maintenanceConcurrency: 1,
   maintenanceSpaceBatchSize: 128,
-  maximumWatchersPerSpace: 1_024,
-  readAuthorizationRefreshInterval: "30 seconds" as const,
-  maximumConcurrentReadAuthorizations: 64,
-  readAuthorizationCacheCapacity: 4_096,
   migration
 }).pipe(
   Layer.provide(mutationRuntime),
@@ -130,6 +139,7 @@ const sync = Layer.effect(
   ServerStore.ServerStore.pipe(
     Effect.map((store) =>
       SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
         submit: store.submit,
         discard: (request) => store.discard(request, null),
         pull: store.pull,
@@ -151,7 +161,77 @@ const replica = SqlReplica.layer({
   Layer.provide(handlers)
 )
 
+const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) => {
+  const faults = FaultInjection.layer.pipe(
+    Layer.tap((context) => Deferred.succeed(faultsReady, Context.get(context, FaultInjection.FaultInjection)))
+  )
+  const faultedSync = TestServer.layer.pipe(
+    Layer.provide(server),
+    Layer.provide(faults),
+    Layer.provide(NodeCrypto.layer)
+  )
+  return TestReplica.layer({
+    ...clientHistory,
+    definition,
+    initialSpaces: [spaceId],
+    clientId,
+    retryDelay: "10 millis"
+  }).pipe(
+    Layer.provide(faultedSync),
+    Layer.provide(database),
+    Layer.provide(handlers)
+  )
+}
+
 describe("Replica Atom graph", () => {
+  it.effect("reacts to pending mutation submission and settlement", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const faultsReady = yield* Deferred.make<FaultInjection.Service>()
+      const graph = BrowserReplica.make(faultedReplica(faultsReady))
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const pending = graph.pendingFor(spaceId, PutTodo)
+      const mutation = graph.mutation(spaceId, PutTodo)
+      const unmountPending = registry.mount(pending)
+      const unmountMutation = registry.mount(mutation)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountMutation()
+          unmountPending()
+        })
+      )
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, pending), [])
+      const faults = yield* Deferred.await(faultsReady)
+
+      const id = `pending-atom-${Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")}`
+      yield* faults.holdNextReceipt(spaceId)
+      const submitted = yield* AtomRegistry.toStreamResult(registry, pending).pipe(
+        Stream.filter((items) =>
+          items.some((item) => item.payload.id === id && item.submissionState === "Submitting" && item.attempts > 0)
+        ),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      registry.set(mutation, { id, title: "0-pending" })
+      yield* faults.awaitReceiptCommitted(spaceId)
+      const pendingItems = Option.getOrThrow(yield* Fiber.join(submitted))
+      const item = pendingItems.find((candidate) => candidate.payload.id === id)
+      assert.isDefined(item)
+      assert.deepStrictEqual(item.payload, { id, title: "0-pending" })
+      assert.strictEqual(item.submissionState, "Submitting")
+      assert.strictEqual(item.attempts, 1)
+
+      const settled = yield* AtomRegistry.toStreamResult(registry, pending).pipe(
+        Stream.filter((items) => !items.some((candidate) => candidate.payload.id === id)),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* faults.releaseHeldReceipt(spaceId)
+      yield* faults.awaitReceiptReturned(spaceId)
+      const settledItems = Option.getOrThrow(yield* Fiber.join(settled))
+      assert.isFalse(settledItems.some((candidate) => candidate.payload.id === id))
+    })))
+
   it.live("reruns only an indexed query whose result range can change", () =>
     Effect.gen(function*() {
       rangeReads.clear()
@@ -286,7 +366,11 @@ describe("Replica Atom graph", () => {
     assert.strictEqual(graph.entity(spaceId, Todo)("1").idleTTL, 17)
     assert.strictEqual(graph.query(spaceId, ListTodos)(undefined).idleTTL, 17)
     assert.strictEqual(
-      graph.receipt(spaceId, Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")).idleTTL,
+      graph.receipt(
+        spaceId,
+        PutTodo,
+        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
+      ).idleTTL,
       17
     )
     assert.strictEqual(reads, readsAfterConstruction)
@@ -296,7 +380,9 @@ describe("Replica Atom graph", () => {
     "runs mutation, entity, query, receipt, and status state through one reactive runtime",
     () =>
       Effect.gen(function*() {
-        const graph = BrowserReplica.make(replica)
+        const graph = BrowserReplica.make(replica, {
+          factory: Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
+        })
         const registry = AtomRegistry.make()
         yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
         const entity = graph.entity(spaceId, Todo)("1")
@@ -325,7 +411,7 @@ describe("Replica Atom graph", () => {
           title: "atom"
         })
         assert.strictEqual(pending.envelope.name, PutTodo.name)
-        const receipt = graph.receipt(spaceId, pending.envelope.mutationId)
+        const receipt = graph.receipt(spaceId, PutTodo, pending.envelope.mutationId)
         const accepted = Option.getOrThrow(Option.getOrThrow(
           yield* AtomRegistry.toStreamResult(registry, receipt).pipe(
             Stream.filter(Option.isSome),
@@ -392,7 +478,7 @@ describe("Replica Atom graph", () => {
       )
 
       const awaitReceipt = (address: Identity.SpaceId, mutationId: Identity.MutationId) =>
-        AtomRegistry.toStreamResult(registry, graph.receipt(address, mutationId)).pipe(
+        AtomRegistry.toStreamResult(registry, graph.receipt(address, PutTodo, mutationId)).pipe(
           Stream.filter(Option.isSome),
           Stream.runHead,
           Effect.map(Option.getOrThrow),

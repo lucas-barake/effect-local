@@ -26,8 +26,34 @@ export const ClientMetaRow = Schema.Struct({
   installed_snapshot_id: Schema.NullOr(Identity.SnapshotId),
   installed_snapshot_sequence: Identity.ServerSequence,
   installed_snapshot_terminal_sequence: Identity.TerminalSequence,
+  replication_view_id: Schema.NullOr(Identity.ReplicationViewId),
+  replication_view_revision: Identity.ReplicationViewRevision,
+  desired_scope_json: Schema.String,
+  desired_scope_digest: Protocol.MutationDigest,
+  scope_generation: Identity.ReplicationScopeGeneration,
   projection_replay_generation: Schema.NullOr(NonNegativeInt),
   projection_replay_cursor: Schema.NullOr(Schema.String)
+})
+
+export const ClientScopedBootstrapRow = Schema.Struct({
+  snapshot_id: Identity.SnapshotId,
+  space_id: Identity.SpaceId,
+  client_id: Identity.ClientId,
+  definition_hash: Schema.String,
+  schema_version: Identity.SchemaVersion,
+  schema_hash: Identity.SchemaHash,
+  scope_digest: Protocol.MutationDigest,
+  scope_generation: Identity.ReplicationScopeGeneration,
+  view_id: Identity.ReplicationViewId,
+  view_revision: Identity.ReplicationViewRevision,
+  server_sequence: Identity.ServerSequence,
+  terminal_sequence: Identity.TerminalSequence,
+  entry_count: NonNegativeInt,
+  content_bytes: NonNegativeInt,
+  digest: Protocol.SnapshotDigest,
+  next_ordinal: NonNegativeInt,
+  received_bytes: NonNegativeInt,
+  rolling_digest: Protocol.SnapshotDigest
 })
 
 export const EntityRow = Schema.Struct({ value_json: Schema.String })
@@ -60,7 +86,9 @@ const MutationRowFields = {
 const PendingRowFields = {
   ...MutationRowFields,
   optimistic_result_json: Schema.String,
-  changes_json: Schema.String
+  changes_json: Schema.String,
+  submission_state: Protocol.SubmissionState,
+  attempt_count: NonNegativeInt
 }
 
 export const PendingRow = Schema.Struct(PendingRowFields)
@@ -135,6 +163,19 @@ export const ServerClientRow = Schema.Struct({
 export const ServerCountRow = Schema.Struct({
   history_count: NonNegativeInt,
   receipt_count: NonNegativeInt
+})
+
+export const ReplicationSpaceRow = Schema.Struct({
+  definition_hash: Schema.String,
+  schema_version: Identity.SchemaVersion,
+  schema_hash: Identity.SchemaHash,
+  schema_generation: NonNegativeInt,
+  active_schema_generation: NonNegativeInt,
+  target_schema_version: Schema.NullOr(Identity.SchemaVersion),
+  target_schema_hash: Schema.NullOr(Identity.SchemaHash),
+  migration_hash: Schema.NullOr(Identity.SchemaHash),
+  next_server_sequence: PositiveInt,
+  next_terminal_sequence: PositiveInt
 })
 
 export const ServerReceiptRow = Schema.Struct({
@@ -233,20 +274,78 @@ export const SnapshotProjectionRow = Schema.Struct({
   digest: Protocol.SnapshotDigest
 })
 
-export const BootstrapRow = Schema.Struct({
-  snapshot_id: Identity.SnapshotId,
+export const ReplicationViewRow = Schema.Struct({
   space_id: Identity.SpaceId,
+  client_id: Identity.ClientId,
+  principal_digest: Protocol.MutationDigest,
+  view_id: Identity.ReplicationViewId,
+  view_revision: Identity.ReplicationViewRevision,
+  scope_generation: Identity.ReplicationScopeGeneration,
+  scope_json: Schema.String,
+  scope_digest: Protocol.MutationDigest,
   definition_hash: Schema.String,
   schema_version: Identity.SchemaVersion,
   schema_hash: Identity.SchemaHash,
+  server_sequence: Identity.ServerSequence
+})
+
+export const ReplicationViewEntityRow = Schema.Struct({
+  model: Schema.String,
+  model_version: Identity.SchemaVersion,
+  entity_key: Schema.String,
+  disposition: Schema.Literals(["Upsert", "Delete", "Retract"]),
+  value_json: Schema.NullOr(Schema.String)
+})
+
+export const ReplicationPageRow = Schema.Struct({
+  principal_digest: Protocol.MutationDigest,
+  view_id: Identity.ReplicationViewId,
+  base_revision: Identity.ReplicationViewRevision,
+  target_revision: Identity.ReplicationViewRevision,
+  scope_generation: Identity.ReplicationScopeGeneration,
+  scope_json: Schema.String,
+  scope_digest: Protocol.MutationDigest,
+  server_sequence: Identity.ServerSequence,
+  changes_json: Schema.String,
+  content_bytes: NonNegativeInt,
+  digest: Protocol.MutationDigest,
+  has_more: Schema.Literals([0, 1])
+})
+
+export const ScopedSnapshotManifestRow = Schema.Struct({
+  snapshot_id: Identity.SnapshotId,
+  space_id: Identity.SpaceId,
+  client_id: Identity.ClientId,
+  principal_digest: Protocol.MutationDigest,
+  definition_hash: Schema.String,
+  schema_version: Identity.SchemaVersion,
+  schema_hash: Identity.SchemaHash,
+  scope_json: Schema.String,
+  scope_digest: Protocol.MutationDigest,
+  scope_generation: Identity.ReplicationScopeGeneration,
+  view_id: Identity.ReplicationViewId,
+  view_revision: Identity.ReplicationViewRevision,
   server_sequence: Identity.ServerSequence,
   terminal_sequence: Identity.TerminalSequence,
-  entity_count: NonNegativeInt,
+  entry_count: NonNegativeInt,
   content_bytes: NonNegativeInt,
-  digest: Protocol.SnapshotDigest,
-  next_ordinal: NonNegativeInt,
-  received_bytes: NonNegativeInt,
-  rolling_digest: Protocol.SnapshotDigest
+  digest: Protocol.SnapshotDigest
+})
+
+export const ScopedSnapshotEntryRow = Schema.Struct({
+  ordinal: NonNegativeInt,
+  change_json: Schema.String,
+  entry_bytes: PositiveInt
+})
+
+export const ServerScopedSnapshotEntryRow = Schema.Struct({
+  ordinal: NonNegativeInt,
+  change_json: Schema.String,
+  entry_bytes: PositiveInt,
+  source_model: Schema.String,
+  source_model_version: Identity.SchemaVersion,
+  source_entity_key: Schema.String,
+  source_value_json: Schema.String
 })
 
 export const ChangeRow = Schema.Struct({

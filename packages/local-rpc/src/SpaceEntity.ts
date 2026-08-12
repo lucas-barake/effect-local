@@ -16,6 +16,7 @@ import * as Entity from "effect/unstable/cluster/Entity"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as PresenceHub from "./PresenceHub.js"
+import * as PrincipalAssertion from "./PrincipalAssertion.js"
 
 const volatileAnnotations = Context.make(ClusterSchema.Persisted, false).pipe(
   Context.add(ClusterSchema.WithTransaction, false),
@@ -25,7 +26,7 @@ const volatileAnnotations = Context.make(ClusterSchema.Persisted, false).pipe(
 export class Submit extends Rpc.make("Submit", {
   payload: {
     request: Protocol.SubmitRequest,
-    principal: Schema.Json
+    assertion: PrincipalAssertion.PrincipalAssertion
   },
   success: Protocol.Receipt,
   error: ReplicaError.ReplicaError
@@ -34,7 +35,7 @@ export class Submit extends Rpc.make("Submit", {
 export class Discard extends Rpc.make("Discard", {
   payload: {
     request: Protocol.DiscardRequest,
-    principal: Schema.Json
+    assertion: PrincipalAssertion.PrincipalAssertion
   },
   success: Protocol.Receipt,
   error: ReplicaError.ReplicaError
@@ -43,7 +44,7 @@ export class Discard extends Rpc.make("Discard", {
 export class Pull extends Rpc.make("Pull", {
   payload: {
     request: Protocol.PullRequest,
-    principal: Schema.Json
+    assertion: PrincipalAssertion.PrincipalAssertion
   },
   success: Protocol.PullResult,
   error: ReplicaError.ReplicaError
@@ -52,14 +53,14 @@ export class Pull extends Rpc.make("Pull", {
 export class Bootstrap extends Rpc.make("Bootstrap", {
   payload: {
     request: Protocol.BootstrapRequest,
-    principal: Schema.Json
+    assertion: PrincipalAssertion.PrincipalAssertion
   },
   success: Protocol.BootstrapPage,
   error: ReplicaError.ReplicaError
 }).annotateMerge(volatileAnnotations) {}
 
 export class Watch extends Rpc.make("Watch", {
-  payload: { request: Protocol.WatchRequest, principal: Schema.Json },
+  payload: { request: Protocol.WatchRequest, assertion: PrincipalAssertion.PrincipalAssertion },
   success: Protocol.Wake,
   error: ReplicaError.ReplicaError,
   stream: true
@@ -68,13 +69,13 @@ export class Watch extends Rpc.make("Watch", {
 export class PublishPresence extends Rpc.make("PublishPresence", {
   payload: {
     update: Protocol.PresenceUpdate,
-    principal: Schema.Json
+    assertion: PrincipalAssertion.PrincipalAssertion
   },
   error: ReplicaError.ReplicaError
 }).annotateMerge(volatileAnnotations) {}
 
 export class WatchPresence extends Rpc.make("WatchPresence", {
-  payload: { principal: Schema.Json },
+  payload: { assertion: PrincipalAssertion.PrincipalAssertion },
   success: Protocol.PresenceUpdate,
   error: ReplicaError.ReplicaError,
   stream: true
@@ -103,36 +104,36 @@ export interface ClientService {
   readonly submit: (
     spaceId: Identity.SpaceId,
     request: Protocol.SubmitRequest,
-    principal: typeof Schema.Json.Type
+    assertion: PrincipalAssertion.PrincipalAssertion
   ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
   readonly discard: (
     spaceId: Identity.SpaceId,
     request: Protocol.DiscardRequest,
-    principal: typeof Schema.Json.Type
+    assertion: PrincipalAssertion.PrincipalAssertion
   ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
   readonly pull: (
     spaceId: Identity.SpaceId,
     request: Protocol.PullRequest,
-    principal: typeof Schema.Json.Type
+    assertion: PrincipalAssertion.PrincipalAssertion
   ) => Effect.Effect<Protocol.PullResult, ReplicaError.ReplicaError>
   readonly bootstrap: (
     spaceId: Identity.SpaceId,
     request: Protocol.BootstrapRequest,
-    principal: typeof Schema.Json.Type
+    assertion: PrincipalAssertion.PrincipalAssertion
   ) => Effect.Effect<Protocol.BootstrapPage, ReplicaError.ReplicaError>
   readonly watch: (
     spaceId: Identity.SpaceId,
     request: Protocol.WatchRequest,
-    principal: typeof Schema.Json.Type
+    assertion: PrincipalAssertion.PrincipalAssertion
   ) => Stream.Stream<Protocol.Wake, ReplicaError.ReplicaError>
   readonly publishPresence: (
     spaceId: Identity.SpaceId,
     update: Protocol.PresenceUpdate,
-    principal: typeof Schema.Json.Type
+    assertion: PrincipalAssertion.PrincipalAssertion
   ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly watchPresence: (
     spaceId: Identity.SpaceId,
-    principal: typeof Schema.Json.Type
+    assertion: PrincipalAssertion.PrincipalAssertion
   ) => Stream.Stream<Protocol.PresenceUpdate, ReplicaError.ReplicaError>
 }
 
@@ -146,56 +147,56 @@ const mapClient = (
   makeWatchClient: Effect.Success<typeof SpaceWatchEntity.client>,
   makePresencePublishClient: Effect.Success<typeof SpacePresencePublishEntity.client>
 ): ClientService => ({
-  submit: (spaceId, request, principal) =>
-    makeAdmissionClient(spaceId).Submit({ request, principal }).pipe(
+  submit: (spaceId, request, assertion) =>
+    makeAdmissionClient(spaceId).Submit({ request, assertion }).pipe(
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
-  discard: (spaceId, request, principal) =>
-    makeAdmissionClient(spaceId).Discard({ request, principal }).pipe(
+  discard: (spaceId, request, assertion) =>
+    makeAdmissionClient(spaceId).Discard({ request, assertion }).pipe(
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
-  pull: (spaceId, request, principal) =>
-    makeReadClient(spaceId).Pull({ request, principal }).pipe(
+  pull: (spaceId, request, assertion) =>
+    makeReadClient(spaceId).Pull({ request, assertion }).pipe(
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
-  bootstrap: (spaceId, request, principal) =>
-    makeReadClient(spaceId).Bootstrap({ request, principal }).pipe(
+  bootstrap: (spaceId, request, assertion) =>
+    makeReadClient(spaceId).Bootstrap({ request, assertion }).pipe(
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
-  watch: (spaceId, request, principal) =>
-    makeWatchClient(spaceId).Watch({ request, principal }).pipe(
+  watch: (spaceId, request, assertion) =>
+    makeWatchClient(spaceId).Watch({ request, assertion }).pipe(
       Stream.catchTags({
         MailboxFull: () => Stream.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Stream.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Stream.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
-  publishPresence: (spaceId, update, principal) =>
-    makePresencePublishClient(spaceId).PublishPresence({ update, principal }).pipe(
+  publishPresence: (spaceId, update, assertion) =>
+    makePresencePublishClient(spaceId).PublishPresence({ update, assertion }).pipe(
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
-  watchPresence: (spaceId, principal) =>
-    makeWatchClient(spaceId).WatchPresence({ principal }).pipe(
+  watchPresence: (spaceId, assertion) =>
+    makeWatchClient(spaceId).WatchPresence({ assertion }).pipe(
       Stream.catchTags({
         MailboxFull: () => Stream.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Stream.fail(new ReplicaError.ServerUnavailable()),
@@ -278,6 +279,7 @@ export const layerHandlers = (options: HandlerOptions) =>
         Effect.gen(function*() {
           const address = yield* Entity.CurrentAddress
           const store = yield* ServerStore.ServerStore
+          const verifier = yield* PrincipalAssertion.Verifier
           let spaceId: Identity.SpaceId | undefined
           if (Schema.is(Identity.SpaceId)(address.entityId)) spaceId = address.entityId
 
@@ -288,7 +290,9 @@ export const layerHandlers = (options: HandlerOptions) =>
                   new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
                 )
               }
-              return store.admit(payload.request, payload.principal)
+              return verifier.verify(payload.assertion).pipe(
+                Effect.flatMap((principal) => store.admit(payload.request, principal))
+              )
             },
             Discard: ({ payload }) => {
               if (spaceId === undefined || payload.request.envelope.spaceId !== spaceId) {
@@ -296,7 +300,9 @@ export const layerHandlers = (options: HandlerOptions) =>
                   new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
                 )
               }
-              return store.discard(payload.request, payload.principal)
+              return verifier.verify(payload.assertion).pipe(
+                Effect.flatMap((principal) => store.discard(payload.request, principal))
+              )
             }
           })
         }),
@@ -307,6 +313,7 @@ export const layerHandlers = (options: HandlerOptions) =>
         Effect.gen(function*() {
           const address = yield* Entity.CurrentAddress
           const store = yield* ServerStore.ServerStore
+          const verifier = yield* PrincipalAssertion.Verifier
           const bootstrapPages = yield* Semaphore.make(options.maximumConcurrentBootstrapPagesPerSpace)
           let spaceId: Identity.SpaceId | undefined
           if (Schema.is(Identity.SpaceId)(address.entityId)) spaceId = address.entityId
@@ -319,7 +326,9 @@ export const layerHandlers = (options: HandlerOptions) =>
                     new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
                   )
                 }
-                return store.pullAuthorized(payload.request, payload.principal)
+                return verifier.verify(payload.assertion).pipe(
+                  Effect.flatMap((principal) => store.pullAuthorized(payload.request, principal))
+                )
               })),
             Bootstrap: ({ payload }) =>
               Rpc.fork(
@@ -332,7 +341,9 @@ export const layerHandlers = (options: HandlerOptions) =>
                   const result = yield* Semaphore.withPermitsIfAvailable(
                     bootstrapPages,
                     1,
-                    store.bootstrapAuthorized(payload.request, payload.principal)
+                    verifier.verify(payload.assertion).pipe(
+                      Effect.flatMap((principal) => store.bootstrapAuthorized(payload.request, principal))
+                    )
                   )
                   if (Option.isSome(result)) return result.value
                   return yield* new ReplicaError.CapacityExceeded({
@@ -351,6 +362,7 @@ export const layerHandlers = (options: HandlerOptions) =>
           const address = yield* Entity.CurrentAddress
           const store = yield* ServerStore.ServerStore
           const presence = yield* PresenceHub.PresenceHub
+          const verifier = yield* PrincipalAssertion.Verifier
           let spaceId: Identity.SpaceId | undefined
           if (Schema.is(Identity.SpaceId)(address.entityId)) spaceId = address.entityId
 
@@ -361,7 +373,11 @@ export const layerHandlers = (options: HandlerOptions) =>
                   Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
                 )
               }
-              return Rpc.fork(Stream.unwrap(store.watchAuthorized(payload.request, payload.principal)))
+              return Rpc.fork(Stream.unwrap(
+                verifier.verify(payload.assertion).pipe(
+                  Effect.flatMap((principal) => store.watchAuthorized(payload.request, principal))
+                )
+              ))
             },
             WatchPresence: ({ payload }) => {
               if (spaceId === undefined) {
@@ -369,7 +385,11 @@ export const layerHandlers = (options: HandlerOptions) =>
                   Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
                 )
               }
-              return Rpc.fork(presence.watch(spaceId, payload.principal))
+              return Rpc.fork(Stream.unwrap(
+                verifier.verify(payload.assertion).pipe(
+                  Effect.map((principal) => presence.watch(spaceId, principal))
+                )
+              ))
             }
           })
         }),
@@ -380,6 +400,7 @@ export const layerHandlers = (options: HandlerOptions) =>
         Effect.gen(function*() {
           const address = yield* Entity.CurrentAddress
           const presence = yield* PresenceHub.PresenceHub
+          const verifier = yield* PrincipalAssertion.Verifier
           let spaceId: Identity.SpaceId | undefined
           if (Schema.is(Identity.SpaceId)(address.entityId)) spaceId = address.entityId
 
@@ -391,7 +412,9 @@ export const layerHandlers = (options: HandlerOptions) =>
                     new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
                   )
                 }
-                return presence.publish(payload.update, payload.principal)
+                return verifier.verify(payload.assertion).pipe(
+                  Effect.flatMap((principal) => presence.publish(payload.update, principal))
+                )
               })
           })
         }),

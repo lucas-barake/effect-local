@@ -1,8 +1,11 @@
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -33,6 +36,8 @@ const PayloadFields = {
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
   membershipIncarnation: Identity.MembershipIncarnation,
+  scope: Protocol.ReplicationScope,
+  scopeGeneration: Identity.ReplicationScopeGeneration,
   generation: ReconciliationGeneration
 } as const
 
@@ -86,7 +91,7 @@ export const make = ({
   spaceId
 }: ReplicaIdentity) =>
   Workflow.make(
-    `effect-local/ReconcileReplica/v3/${
+    `effect-local/ReconcileReplica/v4/${
       encodeJson([workflowSchemaIdentity, spaceId, clientId, membershipIncarnation])
     }`,
     {
@@ -99,6 +104,8 @@ export const make = ({
           payload.spaceId,
           payload.clientId,
           payload.membershipIncarnation,
+          payload.scope,
+          payload.scopeGeneration,
           payload.generation
         ])
     }
@@ -188,24 +195,12 @@ const layerRetryConfiguration = (options: Options) =>
           message: "maximumAttempts must be a positive safe integer"
         })
       }
+      const retryTiming = yield* Configuration.retryTiming(options)
       return RetryConfiguration.of({
-        retryDelayMillis: yield* Configuration.positiveFiniteDurationMillis(
-          "retryDelay",
-          options.retryDelay ?? Duration.seconds(1)
-        ),
-        maximumRetryDelayMillis: yield* Configuration.positiveFiniteDurationMillis(
-          "maximumRetryDelay",
-          options.maximumRetryDelay ?? Duration.minutes(1)
-        ),
+        ...retryTiming,
         maximumAttempts
       })
     })
-  )
-
-const retryMillis = (configuration: RetryConfigurationService, attempt: number) =>
-  Math.min(
-    configuration.maximumRetryDelayMillis,
-    configuration.retryDelayMillis * 2 ** Math.min(attempt - 1, 52)
   )
 
 const handler = (
@@ -245,6 +240,24 @@ const handler = (
       })
     }
     const reconciliation = yield* Reconciler.Reconciliation
+    const validateScope = Effect.gen(function*() {
+      const state = yield* local.replicationState
+      if (state.scopeGeneration !== payload.scopeGeneration) {
+        return yield* new ReplicaError.StaleReplicationScope({
+          expected: state.scopeGeneration,
+          actual: payload.scopeGeneration
+        })
+      }
+      if (
+        state.scope.models.length !== payload.scope.models.length ||
+        state.scope.models.some((model, index) => model !== payload.scope.models[index])
+      ) {
+        return yield* new ReplicaError.ProtocolInvalid({
+          message: "Reconciliation workflow scope does not match its durable generation"
+        })
+      }
+      return yield* Effect.void
+    })
     const runActivity = (name: string, execute: Effect.Effect<void, ReplicaError.ReplicaError>) =>
       Effect.gen(function*() {
         let attempt = 1
@@ -257,9 +270,13 @@ const handler = (
           if (Result.isSuccess(result)) return
           yield* reconciliation.failed(result.failure)
           if (
+            result.failure._tag === "CredentialRejected" ||
+            result.failure._tag === "ProtocolInvalid" ||
             result.failure._tag === "StaleSchema" ||
             result.failure._tag === "SpaceUnavailable" ||
+            result.failure._tag === "StaleReplicationScope" ||
             result.failure._tag === "UpgradeRequired" ||
+            result.failure._tag === "AuthorizationDenied" ||
             attempt >= configuration.maximumAttempts
           ) {
             yield* result.failure
@@ -267,15 +284,18 @@ const handler = (
           }
           yield* DurableClock.sleep({
             name: `${name}-retry/${attempt}`,
-            duration: retryMillis(configuration, attempt),
+            duration: Configuration.retryMillis(configuration, attempt),
             inMemoryThreshold: Duration.zero
           })
           attempt += 1
         }
       })
 
-    yield* runActivity("sync", reconciliation.sync)
-    yield* runActivity("complete", local.completeReconciliation(payload.generation))
+    yield* runActivity("sync", validateScope.pipe(Effect.andThen(reconciliation.sync), Effect.andThen(validateScope)))
+    yield* runActivity(
+      "complete",
+      validateScope.pipe(Effect.andThen(local.completeReconciliation(payload.generation)))
+    )
     yield* reconciliation.succeeded
     return undefined
   })
@@ -393,54 +413,188 @@ const layerSchedulerWithConfiguration = (
       >(Option.none())
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
-
-      const supervise = Effect.forever(
-        Queue.take(wake).pipe(
-          Effect.andThen(
-            Effect.gen(function*() {
-              while (true) {
-                const generations = yield* local.reconciliationGenerations
-                if (generations.completed >= generations.requested) return
-                const payload = Payload.make({
-                  schemaIdentity: schemaIdentityKey(options.definition),
-                  spaceId: options.spaceId,
-                  clientId: options.clientId,
-                  membershipIncarnation: local.membershipIncarnation,
-                  generation: generations.requested
-                })
-                const workflow = make(payload)
-                const activeExecutionId = yield* workflow.executionId(payload)
-                yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
-                yield* workflow.execute(payload).pipe(
-                  Effect.ensuring(Ref.set(activeExecution, Option.none()))
-                )
-              }
-            })
-          ),
-          Effect.catch((error) =>
-            reconciliation.failed(error).pipe(
-              Effect.andThen(Effect.logWarning("Reconciliation supervisor failed", error))
-            )
-          )
-        )
+      const authenticationPause = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(Option.none())
+      let authenticationEpoch = 0
+      const awaitAuthenticationChange = Ref.get(authenticationPause).pipe(
+        Effect.flatMap(Option.match({
+          onNone: () => Effect.void,
+          onSome: Deferred.await
+        }))
       )
+      const admitCredentialPause = Effect.uninterruptible(Effect.gen(function*() {
+        const candidate = yield* Deferred.make<void>()
+        const admission = yield* Ref.modify(authenticationPause, (
+          current
+        ): readonly [
+          { readonly gate: Deferred.Deferred<void>; readonly owner: boolean },
+          Option.Option<Deferred.Deferred<void>>
+        ] =>
+          Option.match(current, {
+            onNone: () => [{ gate: candidate, owner: true }, Option.some(candidate)],
+            onSome: (gate) => [{ gate, owner: false }, Option.some(gate)]
+          }))
+        if (admission.owner) authenticationEpoch += 1
+        return admission
+      }))
+      const startCredentialWait = (
+        generation: number,
+        admission: { readonly gate: Deferred.Deferred<void>; readonly owner: boolean }
+      ) => {
+        if (!admission.owner) return Effect.void
+        return remote.waitForCredentialChange(generation).pipe(
+          Effect.andThen(Effect.uninterruptible(Effect.gen(function*() {
+            const owned = yield* Ref.modify(authenticationPause, (current) => {
+              if (Option.isSome(current) && current.value === admission.gate) {
+                return [true, Option.none()] as const
+              }
+              return [false, current] as const
+            })
+            if (owned) yield* Deferred.succeed(admission.gate, undefined)
+          }))),
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) return Effect.void
+            return Effect.failCause(cause)
+          }),
+          Effect.forkScoped,
+          Effect.asVoid
+        )
+      }
+
+      const supervise = Effect.gen(function*() {
+        let retryAttempt = 0
+        while (true) {
+          yield* Queue.take(wake)
+          yield* awaitAuthenticationChange
+          const result = yield* Effect.gen(function*() {
+            while (true) {
+              yield* awaitAuthenticationChange
+              const generations = yield* local.reconciliationGenerations
+              if (generations.completed >= generations.requested) return
+              const state = yield* local.replicationState
+              const payload = Payload.make({
+                schemaIdentity: schemaIdentityKey(options.definition),
+                spaceId: options.spaceId,
+                clientId: options.clientId,
+                membershipIncarnation: local.membershipIncarnation,
+                scope: state.scope,
+                scopeGeneration: state.scopeGeneration,
+                generation: generations.requested
+              })
+              const workflow = make(payload)
+              const activeExecutionId = yield* workflow.executionId(payload)
+              yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
+              yield* workflow.execute(payload).pipe(
+                Effect.ensuring(Ref.set(activeExecution, Option.none()))
+              )
+              retryAttempt = 0
+            }
+          }).pipe(Effect.result)
+          if (Result.isSuccess(result)) continue
+          const error = result.failure
+          if (error._tag === "CredentialRejected") {
+            if (error.credentialGeneration === undefined) {
+              yield* reconciliation.failed(error)
+              yield* Effect.logWarning("Rejected credential did not include its generation")
+              return
+            }
+            const admission = yield* admitCredentialPause
+            yield* reconciliation.failed(error)
+            yield* startCredentialWait(error.credentialGeneration, admission)
+            yield* Deferred.await(admission.gate)
+            retryAttempt = 0
+            yield* requestAndNotify
+            continue
+          }
+          const pause = yield* Ref.get(authenticationPause)
+          if (Option.isSome(pause)) {
+            yield* Deferred.await(pause.value)
+            yield* requestAndNotify
+            continue
+          }
+          yield* reconciliation.failed(error)
+          if (
+            error._tag === "AuthenticatorUnavailable" ||
+            error._tag === "ServerUnavailable" ||
+            error._tag === "OperationTimeout"
+          ) {
+            retryAttempt += 1
+            yield* Effect.logWarning("Reconciliation supervisor will retry", error)
+            yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
+            yield* requestAndNotify
+            continue
+          }
+          yield* Effect.logWarning("Reconciliation supervisor stopped", error)
+          continue
+        }
+      })
 
       const supervisorFiber = yield* Effect.forkScoped(supervise)
-      const watchFiber = yield* Effect.forkScoped(
-        Effect.forever(
-          remote.watch({ spaceId: options.spaceId, schema: options.definition.schemaIdentity }).pipe(
-            Stream.runForEach(() => requestAndNotify),
-            Effect.matchEffect({
-              onFailure: (error) => {
-                if (error._tag === "StaleSchema") return Effect.fail(error)
-                return Effect.logWarning("Sync watch ended", error).pipe(Effect.andThen(notify))
-              },
-              onSuccess: () => requestAndNotify
+      const watch = Effect.gen(function*() {
+        let retryAttempt = 0
+        while (true) {
+          yield* awaitAuthenticationChange
+          const watchEpoch = authenticationEpoch
+          const result = yield* Stream.unwrap(local.replicationState.pipe(
+            Effect.map((state) =>
+              remote.watch({
+                spaceId: options.spaceId,
+                clientId: options.clientId,
+                schema: options.definition.schemaIdentity,
+                scope: state.scope,
+                scopeGeneration: state.scopeGeneration,
+                cursor: state.cursor
+              })
+            )
+          )).pipe(
+            Stream.runForEach(() => {
+              retryAttempt = 0
+              return requestAndNotify
             }),
-            Effect.andThen(Effect.sleep(configuration.retryDelayMillis))
+            Effect.result
           )
-        ).pipe(Effect.catchTag("StaleSchema", reconciliation.failed))
-      )
+          if (Result.isSuccess(result)) {
+            retryAttempt += 1
+            yield* requestAndNotify
+            yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
+            continue
+          }
+          const error = result.failure
+          if (watchEpoch !== authenticationEpoch) continue
+          const pause = yield* Ref.get(authenticationPause)
+          if (Option.isSome(pause) && error._tag !== "CredentialRejected") {
+            yield* Deferred.await(pause.value)
+            continue
+          }
+          if (error._tag === "CredentialRejected") {
+            if (error.credentialGeneration === undefined) {
+              yield* reconciliation.watchFailed(error)
+              yield* Effect.logWarning("Rejected watch credential did not include its generation")
+              return
+            }
+            const admission = yield* admitCredentialPause
+            yield* reconciliation.watchFailed(error)
+            yield* startCredentialWait(error.credentialGeneration, admission)
+            yield* Deferred.await(admission.gate)
+            retryAttempt = 0
+            continue
+          }
+          yield* reconciliation.watchFailed(error)
+          if (
+            error._tag === "AuthenticatorUnavailable" ||
+            error._tag === "ServerUnavailable" ||
+            error._tag === "OperationTimeout"
+          ) {
+            retryAttempt += 1
+            yield* Effect.logWarning("Sync watch will retry", error)
+            yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
+            yield* notify
+            continue
+          }
+          yield* Effect.logWarning("Sync watch stopped", error)
+          return
+        }
+      })
+      const watchFiber = yield* Effect.forkScoped(watch)
       yield* requestAndNotify
       yield* Effect.addFinalizer(() =>
         Fiber.interruptAll([supervisorFiber, watchFiber]).pipe(

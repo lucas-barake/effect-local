@@ -99,16 +99,58 @@ export const make = <E,>(
       { concurrent: true }
     )
 
-  const receipt = (spaceId: Identity.SpaceId, mutationId: Identity.MutationId) =>
+  const receipt = <M extends Mutation.Any,>(
+    spaceId: Identity.SpaceId,
+    definition: M,
+    mutationId: Identity.MutationId
+  ) =>
     runtime.atom(
       Replica.Replica.use((replica) =>
-        replica.space(spaceId).pipe(Effect.flatMap((space) => space.receipt(mutationId)))
+        replica.space(spaceId).pipe(Effect.flatMap((space) => space.receipt(definition, mutationId)))
       )
     ).pipe(
       factory.withReactivity([
         spaceKey(spaceId),
         `${spaceKey(spaceId)}:receipt:${mutationId}`
       ]),
+      Atom.setIdleTTL(idleTTL)
+    )
+
+  const pending = Atom.family((spaceId: Identity.SpaceId) =>
+    runtime.atom(
+      Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.pending)))
+    ).pipe(
+      factory.withReactivity([spaceKey(spaceId), ReactivityKey.pending(spaceId)]),
+      Atom.setIdleTTL(idleTTL)
+    )
+  )
+
+  const pendingFor = <M extends Mutation.Any,>(spaceId: Identity.SpaceId, definition: M) =>
+    runtime.atom(
+      Replica.Replica.use((replica) =>
+        replica.space(spaceId).pipe(Effect.flatMap((space) => space.pendingFor(definition)))
+      )
+    ).pipe(
+      factory.withReactivity([spaceKey(spaceId), ReactivityKey.pending(spaceId)]),
+      Atom.setIdleTTL(idleTTL)
+    )
+
+  const settlements = Atom.family((spaceId: Identity.SpaceId) =>
+    runtime.atom(
+      Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.map((space) => space.settlements)))
+    ).pipe(
+      factory.withReactivity([spaceKey(spaceId)]),
+      Atom.setIdleTTL(idleTTL)
+    )
+  )
+
+  const settlementsFor = <M extends Mutation.Any,>(spaceId: Identity.SpaceId, definition: M) =>
+    runtime.atom(
+      Replica.Replica.use((replica) =>
+        replica.space(spaceId).pipe(Effect.map((space) => space.settlementsFor(definition)))
+      )
+    ).pipe(
+      factory.withReactivity([spaceKey(spaceId)]),
       Atom.setIdleTTL(idleTTL)
     )
 
@@ -139,6 +181,10 @@ export const make = <E,>(
     query,
     mutation,
     receipt,
+    pending,
+    pendingFor,
+    settlements,
+    settlementsFor,
     status,
     spaces,
     aggregateStatus,

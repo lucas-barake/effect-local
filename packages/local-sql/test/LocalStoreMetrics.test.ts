@@ -22,6 +22,8 @@ const firstClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000
 const secondClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const options = {
+  scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
+  settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
@@ -208,8 +210,15 @@ describe("LocalStore metrics", () => {
       yield* store.mutate(Domain.PutTodo, Domain.todo("pending"))
       const manifest = Protocol.SnapshotManifest.make({
         spaceId,
+        clientId: firstClientId,
         definitionHash: Domain.definition.hash,
         schema: Domain.definition.schemaIdentity,
+        scopeDigest: yield* Protocol.replicationScopeDigest(options.scope).pipe(Effect.provide(NodeCrypto.layer)),
+        scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+        cursor: {
+          viewId: Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000001"),
+          revision: Identity.ReplicationViewRevision.make(0)
+        },
         snapshotId: Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000001"),
         sequence: Identity.ServerSequence.make(1),
         terminalSequenceThrough: Identity.TerminalSequence.make(0),
@@ -220,7 +229,7 @@ describe("LocalStore metrics", () => {
       yield* store.prepareBootstrap(manifest)
       yield* store.stageBootstrapPage(Protocol.BootstrapPage.make({
         manifest,
-        entities: [],
+        entries: [],
         hasMore: false,
         serverSchema: Domain.definition.schemaIdentity
       }))

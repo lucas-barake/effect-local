@@ -93,6 +93,10 @@ export class CursorGap extends Schema.TaggedErrorClass<CursorGap>(
   "@lucas-barake/effect-local/CursorGap"
 )("CursorGap", { expected: Schema.Number, actual: Schema.Number }) {}
 
+export class StaleReplicationScope extends Schema.TaggedErrorClass<StaleReplicationScope>(
+  "@lucas-barake/effect-local/StaleReplicationScope"
+)("StaleReplicationScope", { expected: Schema.Number, actual: Schema.Number }) {}
+
 export class SnapshotUnavailable extends Schema.TaggedErrorClass<SnapshotUnavailable>(
   "@lucas-barake/effect-local/SnapshotUnavailable"
 )("SnapshotUnavailable", { snapshotId: Schema.String }) {}
@@ -131,6 +135,23 @@ export class ServerUnavailable extends Schema.TaggedErrorClass<ServerUnavailable
   "@lucas-barake/effect-local/ServerUnavailable"
 )("ServerUnavailable", {}) {}
 
+export class CredentialRejected extends Schema.TaggedErrorClass<CredentialRejected>(
+  "@lucas-barake/effect-local/CredentialRejected"
+)("CredentialRejected", {
+  credentialGeneration: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
+}) {}
+
+export class AuthenticatorUnavailable extends Schema.TaggedErrorClass<AuthenticatorUnavailable>(
+  "@lucas-barake/effect-local/AuthenticatorUnavailable"
+)("AuthenticatorUnavailable", {}) {}
+
+export class OperationTimeout extends Schema.TaggedErrorClass<OperationTimeout>(
+  "@lucas-barake/effect-local/OperationTimeout"
+)("OperationTimeout", {
+  operation: Schema.String,
+  timeoutMillis: Schema.Int.check(Schema.isGreaterThan(0))
+}) {}
+
 export class AuthorizationDenied extends Schema.TaggedErrorClass<AuthorizationDenied>(
   "@lucas-barake/effect-local/AuthorizationDenied"
 )("AuthorizationDenied", { reason: Schema.Json }) {}
@@ -157,6 +178,7 @@ export const ReplicaError = Schema.Union([
   QuarantineResubmissionConflict,
   OutOfOrderMutation,
   CursorGap,
+  StaleReplicationScope,
   SnapshotUnavailable,
   CapacityExceeded,
   InvalidConfiguration,
@@ -165,6 +187,9 @@ export const ReplicaError = Schema.Union([
   UpgradeRequired,
   ProtocolVersionRejected,
   ServerUnavailable,
+  CredentialRejected,
+  AuthenticatorUnavailable,
+  OperationTimeout,
   AuthorizationDenied
 ])
 export type ReplicaError = typeof ReplicaError.Type

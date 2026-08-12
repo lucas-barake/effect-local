@@ -19,6 +19,7 @@ import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { afterAll, assert, beforeAll, bench } from "vitest"
 import * as PresenceHub from "../src/PresenceHub.js"
+import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
 
 /* oxlint-disable effect/noTestLifecycleHooks, effect/noAsyncFunction, effect/noGlobals -- Vitest owns benchmark fixture setup, timing callbacks, teardown, and validation overrides. */
@@ -83,6 +84,8 @@ const store = ServerStore.layerTrusted({
   Layer.provide(database)
 )
 const presenceHub = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })
+const assertion = PrincipalAssertion.PrincipalAssertion.make("fanout-benchmark")
+const assertionVerifier = PrincipalAssertion.layerVerifier(() => Effect.succeed(null))
 const cluster = SpaceEntity.layer({
   admissionMailboxCapacity: 32,
   readMailboxCapacity: 32,
@@ -93,6 +96,7 @@ const cluster = SpaceEntity.layer({
 }).pipe(
   Layer.provide(store),
   Layer.provide(presenceHub),
+  Layer.provide(assertionVerifier),
   Layer.provide(
     SingleRunner.layer({
       runnerStorage: "memory",
@@ -138,19 +142,22 @@ const fanoutBench = Layer.effect(
       const wakes: Array<Queue.Queue<Protocol.Wake>> = []
       const watchRequest: Protocol.WatchRequest = {
         spaceId: fixture.spaceId,
-        schema: definition.schemaIdentity
+        clientId: fixture.clientId,
+        schema: definition.schemaIdentity,
+        scope: Protocol.ReplicationScope.make({ models: [Todo.name] }),
+        scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+        cursor: null
       }
       for (let index = 0; index < fixture.watcherCount; index++) {
         const queue = yield* Effect.acquireRelease(Queue.unbounded<Protocol.Wake>(), Queue.shutdown)
         wakes.push(queue)
-        yield* client.watch(fixture.spaceId, watchRequest, null).pipe(
+        yield* client.watch(fixture.spaceId, watchRequest, assertion).pipe(
           Stream.runForEach((wake) => Queue.offer(queue, wake)),
           Effect.ensuring(Queue.shutdown(queue)),
           Effect.forkScoped({ startImmediately: true })
         )
         assert.deepStrictEqual(yield* Queue.take(queue), {
-          spaceId: fixture.spaceId,
-          sequence: Identity.ServerSequence.make(0)
+          spaceId: fixture.spaceId
         })
       }
 
@@ -189,12 +196,11 @@ const fanoutBench = Layer.effect(
             const receipt = yield* client.submit(
               fixture.spaceId,
               { envelope, schema: definition.schemaIdentity },
-              null
+              assertion
             )
             assert(receipt._tag === "Accepted")
             const expected = {
-              spaceId: fixture.spaceId,
-              sequence: receipt.serverSequence
+              spaceId: fixture.spaceId
             }
             for (const wake of wakes) assert.deepStrictEqual(yield* Queue.take(wake), expected)
           })
