@@ -1642,7 +1642,7 @@ describe("client schema evolution", () => {
       assert.isTrue(Option.isSome(yield* v2.quarantineByMutation(original.envelope.mutationId)))
     })).pipe(Effect.provide(database)))
 
-  it.effect("serves submit and pull to the immediately previous schema inside the configured window", () =>
+  it.effect("serves schemas inside the configured window across source schema evolution", () =>
     Effect.scoped(Effect.gen(function*() {
       const server = yield* buildServer(definitionV2, handlersV2, evolution, {
         acceptedSchemaVersions: 1,
@@ -1682,9 +1682,22 @@ describe("client schema evolution", () => {
       }])
       assert.isFalse(page.hasMore)
 
-      const serverV3 = yield* buildServer(definitionV3, handlersV3, evolutionV3, { acceptedSchemaVersions: 1 })
-      const stale = yield* serverV3.pullAuthorized(pullRequest(definitionV1), "principal").pipe(Effect.flip)
-      assert.strictEqual(stale._tag, "StaleSchema")
+      const serverV3 = yield* buildServer(definitionV3, handlersV3, evolutionV3, { acceptedSchemaVersions: 2 })
+      const replacement = yield* serverV3.pullAuthorized(pullRequest(definitionV1), "principal")
+      if (!("_tag" in replacement)) assert.fail("expected a replacement bootstrap manifest")
+      assert.notStrictEqual(replacement.manifest.snapshotId, required.manifest.snapshotId)
+      assert.deepStrictEqual(replacement.serverSchema, definitionV3.schemaIdentity)
+      const replacementPage = yield* serverV3.bootstrapAuthorized(
+        bootstrapRequest(definitionV1, replacement.manifest, TodoV1.name),
+        "principal"
+      )
+      assert.deepStrictEqual(replacementPage.entries.map(({ entryBytes: _, ...entry }) => entry), [{
+        ordinal: 0,
+        change: Protocol.Upsert.make({
+          entity: Protocol.EntityKey.make({ model: TodoV1.name, modelVersion: TodoV1.version, key: "42" }),
+          value: { id: "42", title: "mixed-version" }
+        })
+      }])
     })).pipe(Effect.provide(database)))
 
   it.effect("rejects an accepted schema window without complete downgrade transforms", () =>

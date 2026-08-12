@@ -361,21 +361,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           FROM effect_local_server_entities WHERE space_id = ${spaceId}
           ORDER BY entity_bytes DESC, model, entity_key LIMIT 1`
       })
-      const findLogEntries = SqlSchema.findAll({
-        Request: Schema.Struct({
-          spaceId: Identity.SpaceId,
-          after: Identity.ServerSequence,
-          through: Identity.ServerSequence
-        }),
-        Result: Rows.ServerLogRow,
-        execute: ({ spaceId, after, through }) =>
-          sql`SELECT space_id, server_sequence, client_id, membership_incarnation,
-            local_sequence, mutation_id, digest,
-            entry_bytes, entry_json, source_schema_version, source_schema_hash
-          FROM effect_local_authoritative_log
-          WHERE space_id = ${spaceId} AND server_sequence > ${after} AND server_sequence <= ${through}
-          ORDER BY server_sequence`
-      })
       const findSnapshot = SqlSchema.findOneOption({
         Request: Schema.Struct({ spaceId: Identity.SpaceId, snapshotId: Identity.SnapshotId }),
         Result: Rows.SnapshotManifestRow,
@@ -859,6 +844,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
 
       const admit = (request: Protocol.SubmitRequest, principal: typeof Schema.Json.Type) => {
         const submittedEnvelope = request.envelope
+        let wakeChanges: ReadonlyArray<Protocol.EntityChange> | undefined
         return Effect.gen(function*() {
           yield* authorizeAccess(submittedEnvelope, principal)
           const callerDefinition = yield* validateCallerSchema(request.schema)
@@ -1146,6 +1132,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                     ${envelope.mutationId}, ${envelope.digest}, ${entryBytes}, ${entryJson},
                     ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash},
                     ${mutation.mutationVersion})`
+                wakeChanges = entry.changes
                 receipt = executed.success.receipt
               }
             }
@@ -1179,32 +1166,16 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               Effect.fail(new ReplicaError.UnknownCommitOutcome({ mutationId: submittedEnvelope.mutationId, cause }))
           ),
           Effect.tap((receipt) => {
-            if (receipt._tag !== "Accepted") return Effect.void
+            const changes = wakeChanges
+            if (receipt._tag !== "Accepted" || changes === undefined) return Effect.void
             return RcMap.has(wakes, submittedEnvelope.spaceId).pipe(
               Effect.flatMap((hasWatchers) => {
                 if (hasWatchers) {
-                  return Effect.gen(function*() {
-                    const rows = yield* findLogEntries({
-                      spaceId: submittedEnvelope.spaceId,
-                      after: Identity.ServerSequence.make(receipt.serverSequence - 1),
-                      through: receipt.serverSequence
-                    }).pipe(Effect.mapError(StorageUnavailable.make))
-                    const row = rows[0]
-                    if (row === undefined) {
-                      return yield* new ReplicaError.StorageCorrupt({
-                        message: `Accepted mutation ${submittedEnvelope.mutationId} has no authoritative entry`
-                      })
-                    }
-                    const entry = yield* Codec.parse(row.entry_json).pipe(
-                      Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
+                  return Effect.scoped(
+                    RcMap.get(wakes, submittedEnvelope.spaceId).pipe(
+                      Effect.flatMap((channel) => PubSub.publish(channel, changes))
                     )
-                    yield* Effect.scoped(
-                      RcMap.get(wakes, submittedEnvelope.spaceId).pipe(
-                        Effect.flatMap((channel) => PubSub.publish(channel, entry.changes))
-                      )
-                    )
-                    return yield* Effect.void
-                  })
+                  )
                 }
                 return Effect.void
               }),

@@ -14,7 +14,9 @@ import * as Result from "effect/Result"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as Codec from "../src/internal/codec.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -391,8 +393,11 @@ describe("scoped replication", () => {
   it.effect("does not disclose another principal's private mutations through watch wakes", () =>
     Effect.scoped(
       Effect.gen(function*() {
-        const publicCheckStarted = yield* Deferred.make<void>()
-        const releasePublicCheck = yield* Deferred.make<void>()
+        const readerChecks = yield* Ref.make(0)
+        const firstReaderCheckStarted = yield* Deferred.make<void>()
+        const releaseFirstReaderCheck = yield* Deferred.make<void>()
+        const secondReaderCheckStarted = yield* Deferred.make<void>()
+        const releaseSecondReaderCheck = yield* Deferred.make<void>()
         const wakeCount = yield* Ref.make(0)
         const firstWake = yield* Deferred.make<void>()
         const secondWake = yield* Deferred.make<void>()
@@ -400,11 +405,18 @@ describe("scoped replication", () => {
           ServerStore.ServerStore,
           makeServer((input) => {
             if (input._tag !== "Entity") return Effect.void
-            if (input.entity.key === "private" && input.principal !== "owner") return Effect.fail("private")
-            if (input.entity.key === "public" && input.principal === "reader") {
-              return Deferred.succeed(publicCheckStarted, undefined).pipe(
-                Effect.andThen(Deferred.await(releasePublicCheck))
-              )
+            if (input.entity.key === "private" && input.principal === "reader") {
+              return Effect.gen(function*() {
+                const check = yield* Ref.updateAndGet(readerChecks, (count) => count + 1)
+                if (check === 1) {
+                  yield* Deferred.succeed(firstReaderCheckStarted, undefined)
+                  yield* Deferred.await(releaseFirstReaderCheck)
+                  return yield* Effect.fail("private")
+                }
+                yield* Deferred.succeed(secondReaderCheckStarted, undefined)
+                yield* Deferred.await(releaseSecondReaderCheck)
+                return yield* Effect.fail("private")
+              })
             }
             return Effect.void
           })
@@ -442,12 +454,15 @@ describe("scoped replication", () => {
         )
         yield* Deferred.await(firstWake)
         yield* server.submit(yield* envelope("private", 2, "changed"))
-        yield* server.submit(yield* envelope("public", 3))
-        yield* Deferred.await(publicCheckStarted)
+        yield* Deferred.await(firstReaderCheckStarted)
+        yield* server.submit(yield* envelope("private", 3, "changed again"))
+        yield* Deferred.succeed(releaseFirstReaderCheck, undefined)
+        yield* Deferred.await(secondReaderCheckStarted)
         assert.strictEqual(yield* Ref.get(wakeCount), 1)
-
-        yield* Deferred.succeed(releasePublicCheck, undefined)
+        yield* Deferred.succeed(releaseSecondReaderCheck, undefined)
+        yield* server.submit(yield* envelope("public", 4))
         yield* Deferred.await(secondWake)
+        assert.strictEqual(yield* Ref.get(wakeCount), 2)
         yield* Fiber.interrupt(watcher)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
@@ -484,6 +499,46 @@ describe("scoped replication", () => {
         yield* server.submit(yield* putManyEnvelope(999, 1))
         const wakes = yield* Fiber.join(watcher)
         assert.strictEqual(wakes.length, 2)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("returns a retained accepted receipt while a watcher is active", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer(defaultAuthorizeRead, { retainedHistoryEntries: 0 })
+        )
+        const firstWake = yield* Deferred.make<void>()
+        const watcher = yield* server.watchAuthorized(
+          Protocol.WatchRequest.make({
+            spaceId,
+            clientId: readerId,
+            schema: Domain.definition.schemaIdentity,
+            scope,
+            scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+            cursor: null
+          }),
+          "reader"
+        ).pipe(
+          Effect.map((stream) =>
+            stream.pipe(
+              Stream.tap(() => Deferred.succeed(firstWake, undefined)),
+              Stream.runDrain
+            )
+          ),
+          Effect.flatMap(Effect.forkChild({ startImmediately: true }))
+        )
+        yield* Deferred.await(firstWake)
+
+        const submitted = yield* envelope("public", 1)
+        const first = yield* server.submit(submitted)
+        yield* server.maintain(spaceId)
+        const retry = yield* server.submit(submitted).pipe(Effect.result)
+
+        yield* Fiber.interrupt(watcher)
+        assert.strictEqual(first._tag, "Accepted")
+        assert.deepStrictEqual(retry, Result.succeed(first))
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
@@ -831,6 +886,76 @@ describe("scoped replication", () => {
         yield* server.submit(yield* envelope("public", 3, "public-current"))
         const retried = yield* server.pullAuthorized(pullRequest(initial.manifest.cursor), "reader")
         assert.isTrue("_tag" in retried)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects a changed durable page payload before acknowledging its membership", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const context = yield* Layer.build(
+          ServerStore.layer({
+            ...history,
+            definition: Domain.definition,
+            readAuthorizationRefreshInterval: "1 second",
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => Effect.void
+          }).pipe(Layer.provide(runtime), Layer.provideMerge(database))
+        )
+        const server = Context.get(context, ServerStore.ServerStore)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const request = (cursor: Protocol.ReplicationCursor | null) =>
+          Protocol.PullRequest.make({ ...pullRequest(cursor), limit: 1 })
+        const initial = yield* server.pullAuthorized(request(null), "reader")
+        if (!("_tag" in initial)) assert.fail("expected bootstrap")
+
+        yield* server.submit(yield* envelope("a", 1))
+        yield* server.submit(yield* envelope("b", 2))
+        const delivered = yield* server.pullAuthorized(request(initial.manifest.cursor), "reader")
+        if ("_tag" in delivered) assert.fail("expected incremental page")
+        assert.deepStrictEqual(delivered.changes.map((change) => change.entity.key), ["a"])
+
+        const changedPayload = [Protocol.Upsert.make({
+          entity: Protocol.EntityKey.make({ model: Domain.Todo.name, modelVersion: Domain.Todo.version, key: "b" }),
+          value: Domain.todo("b")
+        })]
+        yield* sql`UPDATE effect_local_server_replication_pages
+          SET changes_json = ${yield* Codec.stringify(changedPayload)}
+          WHERE space_id = ${spaceId} AND client_id = ${readerId}`
+
+        const outcome = yield* server.pullAuthorized(request(delivered.cursor), "reader").pipe(Effect.result)
+        assert.isTrue(Result.isFailure(outcome))
+        if (Result.isFailure(outcome)) assert.strictEqual(outcome.failure._tag, "StorageCorrupt")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects a durable page watermark beyond the authoritative head", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const context = yield* Layer.build(
+          ServerStore.layer({
+            ...history,
+            definition: Domain.definition,
+            readAuthorizationRefreshInterval: "1 second",
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => Effect.void
+          }).pipe(Layer.provide(runtime), Layer.provideMerge(database))
+        )
+        const server = Context.get(context, ServerStore.ServerStore)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const initial = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in initial)) assert.fail("expected bootstrap")
+
+        yield* server.submit(yield* envelope("a", 1))
+        const delivered = yield* server.pullAuthorized(pullRequest(initial.manifest.cursor), "reader")
+        if ("_tag" in delivered) assert.fail("expected incremental page")
+        yield* sql`UPDATE effect_local_server_replication_pages SET server_sequence = 100
+          WHERE space_id = ${spaceId} AND client_id = ${readerId}`
+
+        const outcome = yield* server.pullAuthorized(pullRequest(initial.manifest.cursor), "reader").pipe(Effect.result)
+        assert.isTrue(Result.isFailure(outcome))
+        if (Result.isFailure(outcome)) assert.strictEqual(outcome.failure._tag, "StorageCorrupt")
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 

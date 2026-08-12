@@ -70,6 +70,20 @@ interface StoredSnapshotEntry {
 
 const identityOf = (model: string, entityKey: string) => `${model}\u0000${entityKey}`
 
+const largestPagePrefix = (
+  maximumLength: number,
+  fits: (length: number) => boolean
+): number => {
+  let lower = 0
+  let upper = maximumLength
+  while (lower < upper) {
+    const length = Math.ceil((lower + upper) / 2)
+    if (fits(length)) lower = length
+    else upper = length - 1
+  }
+  return lower
+}
+
 export const make = (options: Options) => {
   const { sql } = options
   const findSpace = SqlSchema.findOne({
@@ -94,11 +108,13 @@ export const make = (options: Options) => {
     execute: ({ spaceId, entitiesJson }) =>
       sql`SELECT entity.model, entity.model_version, entity.entity_key, entity.value_json, entity.entity_bytes
       FROM effect_local_server_entities AS entity
-      WHERE entity.space_id = ${spaceId} AND EXISTS(
-        SELECT 1 FROM json_each(${entitiesJson}) AS requested
-        WHERE entity.model = json_extract(requested.value, '$.model')
-          AND entity.entity_key = json_extract(requested.value, '$.key')
-      ) ORDER BY entity.model, entity.entity_key`
+      WHERE entity.space_id = ${spaceId}
+        AND (entity.model, entity.entity_key) IN (
+          SELECT json_extract(requested.value, '$.model'),
+            json_extract(requested.value, '$.key')
+          FROM json_each(${entitiesJson}) AS requested
+        )
+      ORDER BY entity.model, entity.entity_key`
   })
   const findView = SqlSchema.findOneOption({
     Request: Schema.Struct({ spaceId: Identity.SpaceId, clientId: Identity.ClientId }),
@@ -590,16 +606,27 @@ export const make = (options: Options) => {
   const pageFromRow = (row: typeof Rows.ReplicationPageRow.Type) =>
     Codec.parse(row.changes_json).pipe(
       Effect.flatMap((value) => Codec.decode(Schema.Array(Protocol.ViewChange), value)),
-      Effect.map((changes) =>
-        Protocol.PullPage.make({
-          scopeGeneration: row.scope_generation,
-          cursor: Protocol.ReplicationCursor.make({ viewId: row.view_id, revision: row.target_revision }),
-          serverSequence: row.server_sequence,
-          changes,
-          contentBytes: row.content_bytes,
-          digest: row.digest,
-          hasMore: row.has_more === 1,
-          serverSchema: options.definition.schemaIdentity
+      Effect.flatMap((changes) =>
+        Effect.gen(function*() {
+          const contentBytes = yield* Protocol.encodedBytesEffect(changes)
+          const pageDigest = yield* Protocol.viewChangesDigest(changes).pipe(
+            Effect.provideService(Crypto.Crypto, options.crypto)
+          )
+          if (contentBytes !== row.content_bytes || pageDigest !== row.digest) {
+            return yield* new ReplicaError.StorageCorrupt({
+              message: "Durable replication page does not match its byte metadata or digest"
+            })
+          }
+          return Protocol.PullPage.make({
+            scopeGeneration: row.scope_generation,
+            cursor: Protocol.ReplicationCursor.make({ viewId: row.view_id, revision: row.target_revision }),
+            serverSequence: row.server_sequence,
+            changes,
+            contentBytes: row.content_bytes,
+            digest: row.digest,
+            hasMore: row.has_more === 1,
+            serverSchema: options.definition.schemaIdentity
+          })
         })
       )
     )
@@ -734,11 +761,8 @@ export const make = (options: Options) => {
         viewId: view.view_id,
         revision: Identity.ReplicationViewRevision.make(view.view_revision + 1)
       })
-      let lower = 0
-      let upper = Math.min(request.limit, changes.length)
-      while (lower < upper) {
-        const length = Math.ceil((lower + upper) / 2)
-        const candidate = changes.slice(0, length)
+      const length = largestPagePrefix(Math.min(request.limit, changes.length), (candidateLength) => {
+        const candidate = changes.slice(0, candidateLength)
         const candidatePage = Protocol.PullPage.make({
           scopeGeneration: request.scopeGeneration,
           cursor,
@@ -749,10 +773,9 @@ export const make = (options: Options) => {
           hasMore: candidate.length < changes.length,
           serverSchema: options.definition.schemaIdentity
         })
-        if (Protocol.encodedBytes(candidatePage) <= Protocol.maximumBatchBytes) lower = length
-        else upper = length - 1
-      }
-      const selected = changes.slice(0, lower)
+        return Protocol.encodedBytes(candidatePage) <= Protocol.maximumBatchBytes
+      })
+      const selected = changes.slice(0, length)
       if (changes.length > 0 && selected.length === 0) {
         return yield* new ReplicaError.CapacityExceeded({
           resource: "replication page bytes",
@@ -856,6 +879,14 @@ export const make = (options: Options) => {
         if (
           row.principal_digest !== principalHash || row.view_id !== view.view_id
         ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
+        if (
+          row.server_sequence < view.server_sequence ||
+          row.server_sequence > space.next_server_sequence - 1
+        ) {
+          return yield* new ReplicaError.StorageCorrupt({
+            message: "Durable replication page has an invalid server watermark"
+          })
+        }
         const page = yield* pageFromRow(row)
         const acknowledgesPriorGeneration = request.cursor.revision === row.target_revision &&
           request.scopeGeneration > row.scope_generation
@@ -970,20 +1001,16 @@ export const make = (options: Options) => {
         after: number,
         entries: ReadonlyArray<StoredSnapshotEntry>
       ) => {
-        let lower = 0
-        let upper = Math.min(request.limit, entries.length)
-        while (lower < upper) {
-          const length = Math.ceil((lower + upper) / 2)
+        const length = largestPagePrefix(Math.min(request.limit, entries.length), (candidateLength) => {
           const candidate = Protocol.BootstrapPage.make({
             manifest: manifestFromRow(snapshot),
-            entries: entries.slice(0, length).map((snapshotEntry) => snapshotEntry.entry),
-            hasMore: after + length + 1 < snapshot.entry_count,
+            entries: entries.slice(0, candidateLength).map((snapshotEntry) => snapshotEntry.entry),
+            hasMore: after + candidateLength + 1 < snapshot.entry_count,
             serverSchema: options.definition.schemaIdentity
           })
-          if (Protocol.encodedBytes(candidate) <= options.maximumBootstrapPageBytes) lower = length
-          else upper = length - 1
-        }
-        return entries.slice(0, lower)
+          return Protocol.encodedBytes(candidate) <= options.maximumBootstrapPageBytes
+        })
+        return entries.slice(0, length)
       }
       let remaining = yield* loadEntries(row, afterOrdinal)
       let selected = selectEntries(row, afterOrdinal, remaining)
