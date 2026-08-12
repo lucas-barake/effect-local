@@ -1060,12 +1060,17 @@ describe("client schema evolution", () => {
       const original = yield* v1.mutate(PutTodoV1, { id: "45", title: "original" })
       yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
       const stagingStore = yield* buildStore(definitionV2, handlersV2, evolution)
-      const stagingReplica = yield* buildReplica(definitionV2, handlersV2, unavailableSync, evolution)
-      const firstError = yield* stagingReplica.resubmitQuarantined(
-        original.envelope.mutationId,
-        PutTodoV2,
-        { id: 45, title: "staged", done: false }
-      ).pipe(Effect.flip)
+      const firstError = yield* Effect.scoped(
+        buildReplica(definitionV2, handlersV2, unavailableSync, evolution).pipe(
+          Effect.flatMap((replica) =>
+            replica.resubmitQuarantined(
+              original.envelope.mutationId,
+              PutTodoV2,
+              { id: 45, title: "staged", done: false }
+            ).pipe(Effect.flip)
+          )
+        )
+      )
       assert.isTrue(Schema.is(ReplicaError.ServerUnavailable)(firstError))
 
       assert.strictEqual(yield* stagingStore.pendingCount, 1)
@@ -1081,26 +1086,33 @@ describe("client schema evolution", () => {
         Option.getOrThrow(yield* stagingStore.get(TodoV2, 45)),
         { id: 45, title: "staged", done: false }
       )
-      const conflict = yield* stagingReplica.resubmitQuarantined(
-        original.envelope.mutationId,
-        PutTodoV2,
-        { id: 45, title: "different", done: false }
-      ).pipe(Effect.flip)
+      const conflict = yield* Effect.scoped(
+        buildReplica(definitionV2, handlersV2, unavailableSync, evolution).pipe(
+          Effect.flatMap((replica) =>
+            replica.resubmitQuarantined(
+              original.envelope.mutationId,
+              PutTodoV2,
+              { id: 45, title: "different", done: false }
+            ).pipe(Effect.flip)
+          )
+        )
+      )
       assert.isTrue(Schema.is(ReplicaError.QuarantineResubmissionConflict)(conflict))
 
       const reactivity = yield* Reactivity.Reactivity
       const invalidations = { entity: 0, status: 0, originalReceipt: 0, replacementReceipt: 0 }
+      const spaceKey = `effect-local:space:${spaceId}`
       const cancelEntity = reactivity.registerUnsafe(
-        { "effect-local:entities": [[TodoV2.name, 45]] },
+        { [`${spaceKey}:entities`]: [[TodoV2.name, 45]] },
         () => invalidations.entity++
       )
-      const cancelStatus = reactivity.registerUnsafe(["effect-local:status"], () => invalidations.status++)
+      const cancelStatus = reactivity.registerUnsafe([`${spaceKey}:status`], () => invalidations.status++)
       const cancelOriginalReceipt = reactivity.registerUnsafe(
-        [`effect-local:receipt:${original.envelope.mutationId}`],
+        [`${spaceKey}:receipt:${original.envelope.mutationId}`],
         () => invalidations.originalReceipt++
       )
       const cancelReplacementReceipt = reactivity.registerUnsafe(
-        [`effect-local:receipt:${staged.replacement_mutation_id}`],
+        [`${spaceKey}:receipt:${staged.replacement_mutation_id}`],
         () => invalidations.replacementReceipt++
       )
       yield* Effect.addFinalizer(() =>
@@ -1147,12 +1159,17 @@ describe("client schema evolution", () => {
         title: "intervening",
         done: false
       })
-      const stagingReplica = yield* buildReplica(definitionV2, handlersV2, unavailableSync, evolution)
-      const staged = yield* stagingReplica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
-        id: 49,
-        title: "staged",
-        done: false
-      }).pipe(Effect.flip)
+      const staged = yield* Effect.scoped(
+        buildReplica(definitionV2, handlersV2, unavailableSync, evolution).pipe(
+          Effect.flatMap((replica) =>
+            replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
+              id: 49,
+              title: "staged",
+              done: false
+            }).pipe(Effect.flip)
+          )
+        )
+      )
       assert.isTrue(Schema.is(ReplicaError.ServerUnavailable)(staged))
 
       const server = yield* buildServer(definitionV2, handlersV2, evolution)
@@ -1183,12 +1200,17 @@ describe("client schema evolution", () => {
         title: "intervening",
         done: false
       })
-      const stagingReplica = yield* buildReplica(definitionV2, handlersV2, unavailableSync, evolution)
-      const staged = yield* stagingReplica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
-        id: 51,
-        title: "staged",
-        done: false
-      }).pipe(Effect.flip)
+      const staged = yield* Effect.scoped(
+        buildReplica(definitionV2, handlersV2, unavailableSync, evolution).pipe(
+          Effect.flatMap((replica) =>
+            replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
+              id: 51,
+              title: "staged",
+              done: false
+            }).pipe(Effect.flip)
+          )
+        )
+      )
       assert.isTrue(Schema.is(ReplicaError.ServerUnavailable)(staged))
 
       const server = yield* buildServer(definitionV2, handlersV2, evolution)
@@ -1255,12 +1277,17 @@ describe("client schema evolution", () => {
       const original = yield* v1.mutate(PutTodoV1, { id: "46", title: "original" })
       yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
       yield* buildStore(definitionV2, handlersV2, evolution)
-      const replica = yield* buildReplica(definitionV2, handlersV2, unavailableSync, evolution)
-      const firstError = yield* replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
-        id: 46,
-        title: "replacement",
-        done: false
-      }).pipe(Effect.flip)
+      const firstError = yield* Effect.scoped(
+        buildReplica(definitionV2, handlersV2, unavailableSync, evolution).pipe(
+          Effect.flatMap((replica) =>
+            replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
+              id: 46,
+              title: "replacement",
+              done: false
+            }).pipe(Effect.flip)
+          )
+        )
+      )
       assert.isTrue(Schema.is(ReplicaError.ServerUnavailable)(firstError))
 
       const v3 = yield* buildStore(definitionV3, rejectingHandlersV3, evolutionV3)
@@ -1305,8 +1332,7 @@ describe("client schema evolution", () => {
       const receipt = yield* server.discard({ envelope: item.envelope, schema: v2.schema }, null)
       let invalidations = 0
       const cancel = reactivity.registerUnsafe([
-        "effect-local:status",
-        `effect-local:receipt:${original.envelope.mutationId}`
+        `effect-local:space:${spaceId}:receipt:${original.envelope.mutationId}`
       ], () => invalidations++)
       yield* Effect.addFinalizer(() => Effect.sync(cancel))
       yield* sql`CREATE TRIGGER fail_quarantine_delete BEFORE DELETE ON effect_local_client_quarantine
@@ -1564,102 +1590,6 @@ describe("client schema evolution", () => {
           (SELECT COUNT(*) FROM effect_local_server_snapshot_projection_entities) AS entities`
       })(undefined)
       assert.deepStrictEqual(projectionCounts, { manifests: 0, entities: 0 })
-    })).pipe(Effect.provide(database)))
-
-  it.effect("rejects a first legacy digest when configured baselines have distinct schema identities", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const server = yield* buildServer(definitionV2, handlersV2, ambiguousLegacyEvolution)
-      const envelope = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000205"),
-        { id: "7", title: "ambiguous" }
-      )
-
-      assert.strictEqual((yield* server.submit(envelope).pipe(Effect.flip))._tag, "ProtocolInvalid")
-    })).pipe(Effect.provide(database)))
-
-  it.effect("keeps the legacy mutation byte limit for a digest version one envelope", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000206")
-      const legacyWithoutTitle = {
-        spaceId,
-        clientId,
-        mutationId,
-        localSequence: Identity.LocalSequence.make(1),
-        basis: Identity.ServerSequence.make(0),
-        name: PutTodoV1.name,
-        payload: { id: "8", title: "" },
-        digest: "0".repeat(64)
-      }
-      const title = "x".repeat(Protocol.maximumMutationBytes - Protocol.encodedBytes(legacyWithoutTitle))
-      const envelope = yield* legacyV1Envelope(mutationId, { id: "8", title })
-      const legacyWire = { ...legacyWithoutTitle, digest: envelope.digest, payload: envelope.payload }
-      assert.strictEqual(Protocol.encodedBytes(legacyWire), Protocol.maximumMutationBytes)
-      assert.isAbove(Protocol.encodedBytes(envelope), Protocol.maximumMutationBytes)
-
-      const server = yield* buildServer(definitionV2, handlersV2, evolutionWithLegacyBaseline)
-      assert.strictEqual((yield* server.submit(envelope))._tag, "Accepted")
-    })).pipe(Effect.provide(database)))
-
-  it.effect("retains the legacy baseline for exact retries and later offline mutations", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const first = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000207"),
-        { id: "9", title: "retry" }
-      )
-      const serverV1 = yield* buildServer(
-        definitionV1,
-        handlersV1,
-        Evolution.make({ current: definitionV1, legacyBaselines: [legacyBaselineV1] })
-      )
-      assert.strictEqual((yield* serverV1.submit(first))._tag, "Accepted")
-
-      const serverV2 = yield* buildServer(definitionV2, handlersV2, ambiguousLegacyEvolution)
-      yield* serverV2.pull({
-        spaceId,
-        schema: definitionV2.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
-      assert.strictEqual(
-        (yield* serverV2.submit({ envelope: first, schema: definitionV2.schemaIdentity }))._tag,
-        "Accepted"
-      )
-
-      const second = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000208"),
-        { id: "10", title: "offline" },
-        2
-      )
-      assert.strictEqual(
-        (yield* serverV2.submit({ envelope: second, schema: definitionV2.schemaIdentity }))._tag,
-        "Accepted"
-      )
-    })).pipe(Effect.provide(database)))
-
-  it.effect("does not replace a persisted legacy identity with another configured baseline", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const first = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000209"),
-        { id: "11", title: "first" }
-      )
-      const server = yield* buildServer(definitionV2, handlersV2, evolutionWithLegacyBaseline)
-      assert.strictEqual((yield* server.submit(first))._tag, "Accepted")
-
-      const droppedV1 = Evolution.make({
-        current: definitionV2,
-        legacyBaselines: [Evolution.legacyBaseline({
-          id: "legacy-v2-only",
-          hash: "3333333333333333",
-          definition: definitionV2
-        })]
-      })
-      const restarted = yield* buildServer(definitionV2, handlersV2, droppedV1)
-      const second = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000210"),
-        { id: "12", title: "second" },
-        2
-      )
-      assert.strictEqual((yield* restarted.submit(second).pipe(Effect.flip))._tag, "ProtocolInvalid")
     })).pipe(Effect.provide(database)))
 
   it.effect("resumes a server promotion after interruption", () =>

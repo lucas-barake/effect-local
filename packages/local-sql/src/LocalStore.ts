@@ -1078,7 +1078,7 @@ export const layer = (
           attributes: { "mutation.id": receipt.mutationId }
         }))
 
-      const settleReceipts = withProjectionGate(Effect.gen(function*() {
+      const settleReceiptsInGate = Effect.gen(function*() {
         const touched = new Map<string, Protocol.EntityKey>()
         let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
         yield* sql.withTransaction(Effect.gen(function*() {
@@ -1168,7 +1168,10 @@ export const layer = (
         if (touched.size > 0) yield* rebuildProjection
         if (touched.size > 0) yield* invalidate(Array.from(touched.values()))
         if (prunedReceiptIds.length > 0) yield* invalidate([], prunedReceiptIds)
-      })).pipe(Effect.withSpan("LocalStore.settleReceipts"))
+      })
+      const settleReceipts = withProjectionGate(settleReceiptsInGate).pipe(
+        Effect.withSpan("LocalStore.settleReceipts")
+      )
 
       const applyReceipts = (receipts: ReadonlyArray<Protocol.Receipt>) =>
         Effect.gen(function*() {
@@ -1179,7 +1182,7 @@ export const layer = (
         }))
 
       const resolveQuarantine = (receipt: Protocol.Receipt, disposition: QuarantineDisposition = "Resubmit") =>
-        Effect.gen(function*() {
+        withProjectionGate(Effect.gen(function*() {
           const transactionResult = yield* sql.withTransaction(Effect.gen(function*() {
             yield* validateFence(yield* meta)
             const found = yield* findQuarantineByMutation(receipt.mutationId).pipe(
@@ -1320,10 +1323,10 @@ export const layer = (
               WHERE space_id = ${options.spaceId} AND mutation_id = ${receipt.mutationId}`
             return { canceledReplacement, touched: Array.from(canceledTouched.values()), receiptIds: pruned }
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
-          yield* settleReceipts
+          yield* settleReceiptsInGate
           yield* invalidate(transactionResult.touched, [receipt.mutationId, ...transactionResult.receiptIds])
           return transactionResult.canceledReplacement
-        }).pipe(Effect.withSpan("LocalStore.resolveQuarantine", {
+        })).pipe(Effect.withSpan("LocalStore.resolveQuarantine", {
           attributes: { "mutation.id": receipt.mutationId, "quarantine.disposition": disposition }
         }))
 
