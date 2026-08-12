@@ -27,3 +27,36 @@ export const positiveFiniteDurationMillis = (
       )
     }
   })
+
+export interface RetryTiming {
+  readonly retryDelayMillis: number
+  readonly maximumRetryDelayMillis: number
+}
+
+export const retryTiming = (options: {
+  readonly retryDelay?: Duration.Input
+  readonly maximumRetryDelay?: Duration.Input
+}): Effect.Effect<RetryTiming, ReplicaError.InvalidConfiguration> =>
+  Effect.gen(function*() {
+    const retryDelayMillis = yield* positiveFiniteDurationMillis(
+      "retryDelay",
+      options.retryDelay ?? Duration.seconds(1)
+    )
+    const maximumRetryDelayMillis = yield* positiveFiniteDurationMillis(
+      "maximumRetryDelay",
+      options.maximumRetryDelay ?? Duration.minutes(1)
+    )
+    if (maximumRetryDelayMillis < retryDelayMillis) {
+      return yield* new ReplicaError.InvalidConfiguration({
+        option: "maximumRetryDelay",
+        message: "maximumRetryDelay must be greater than or equal to retryDelay"
+      })
+    }
+    return { retryDelayMillis, maximumRetryDelayMillis }
+  })
+
+export const retryMillis = (timing: RetryTiming, attempt: number) =>
+  Math.min(
+    timing.maximumRetryDelayMillis,
+    timing.retryDelayMillis * 2 ** Math.min(attempt - 1, 52)
+  )

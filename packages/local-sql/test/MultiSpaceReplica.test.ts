@@ -234,6 +234,7 @@ describe("multi space Replica", () => {
       const reconciliation = Reconciler.Reconciliation.of({
         sync: Effect.void,
         failed: () => Effect.void,
+        watchFailed: () => Effect.void,
         succeeded: Effect.void,
         status: Effect.succeed({ _tag: "Offline", pending: 0 })
       })

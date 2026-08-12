@@ -377,7 +377,9 @@ describe("Replica Atom graph", () => {
     "runs mutation, entity, query, receipt, and status state through one reactive runtime",
     () =>
       Effect.gen(function*() {
-        const graph = BrowserReplica.make(replica)
+        const graph = BrowserReplica.make(replica, {
+          factory: Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
+        })
         const registry = AtomRegistry.make()
         yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
         const entity = graph.entity(spaceId, Todo)("1")

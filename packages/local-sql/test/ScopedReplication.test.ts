@@ -1128,6 +1128,7 @@ describe("scoped replication", () => {
         const reconciliation = Reconciler.Reconciliation.of({
           sync: Ref.update(syncCalls, (count) => count + 1),
           failed: () => Effect.void,
+          watchFailed: () => Effect.void,
           succeeded: Effect.void,
           status: Effect.succeed({ _tag: "Offline", pending: 0 })
         })
