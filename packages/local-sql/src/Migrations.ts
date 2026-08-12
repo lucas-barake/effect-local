@@ -1630,6 +1630,17 @@ const serverV9 = makeMigration({
   ]
 })
 
+const serverV10 = makeMigration({
+  id: 10,
+  name: "delta-replication-watermarks",
+  statements: [
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_replication_views ADD COLUMN delivered_sequence INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_replication_views ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_server_replication_pages ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0"
+  ]
+})
+
 export const serverCatalog = Object.freeze([
   serverV1,
   serverV2,
@@ -1639,7 +1650,8 @@ export const serverCatalog = Object.freeze([
   serverV6,
   serverV7,
   serverV8,
-  serverV9
+  serverV9,
+  serverV10
 ])
 
 export const client = (options: {

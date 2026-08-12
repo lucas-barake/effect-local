@@ -137,7 +137,10 @@ describe("storage migration catalogs", () => {
         (yield* clientLedger(sql)).map((row) => row.id),
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
       )
-      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8, 9])
+      assert.deepStrictEqual(
+        (yield* serverMigrationLedger(sql)).map((row) => row.id),
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+      )
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
         "effect_local_client_evolution",

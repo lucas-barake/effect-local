@@ -90,7 +90,8 @@ export const make = (options: Options) => {
     Result: Rows.ReplicationSpaceRow,
     execute: (spaceId) =>
       sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
-        target_schema_version, target_schema_hash, migration_hash, next_server_sequence, next_terminal_sequence
+        target_schema_version, target_schema_hash, migration_hash, next_server_sequence, next_terminal_sequence,
+        read_auth_epoch
       FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
   })
   const findEntities = SqlSchema.findAll({
@@ -120,7 +121,8 @@ export const make = (options: Options) => {
     Result: Rows.ReplicationViewRow,
     execute: ({ spaceId, clientId }) =>
       sql`SELECT space_id, client_id, principal_digest, view_id, view_revision, scope_generation,
-        scope_json, scope_digest, definition_hash, schema_version, schema_hash, server_sequence
+        scope_json, scope_digest, definition_hash, schema_version, schema_hash, server_sequence,
+        delivered_sequence, read_auth_epoch
       FROM effect_local_server_replication_views
       WHERE space_id = ${spaceId} AND client_id = ${clientId}`
   })
@@ -142,9 +144,18 @@ export const make = (options: Options) => {
     Result: Rows.ReplicationPageRow,
     execute: ({ spaceId, clientId }) =>
       sql`SELECT principal_digest, view_id, base_revision, target_revision, scope_generation,
-        scope_json, scope_digest, server_sequence, changes_json, content_bytes, digest, has_more
+        scope_json, scope_digest, server_sequence, changes_json, content_bytes, digest, has_more,
+        read_auth_epoch
       FROM effect_local_server_replication_pages
       WHERE space_id = ${spaceId} AND client_id = ${clientId}`
+  })
+  const findLogSuffix = SqlSchema.findAll({
+    Request: Schema.Struct({ spaceId: Identity.SpaceId, after: Identity.ServerSequence, limit: Schema.Int }),
+    Result: Schema.Struct({ server_sequence: Identity.ServerSequence, entry_json: Schema.String }),
+    execute: ({ after, limit, spaceId }) =>
+      sql`SELECT server_sequence, entry_json FROM effect_local_authoritative_log
+      WHERE space_id = ${spaceId} AND server_sequence > ${after}
+      ORDER BY server_sequence LIMIT ${limit}`
   })
   const findSnapshot = SqlSchema.findOneOption({
     Request: Identity.SnapshotId,
@@ -529,17 +540,19 @@ export const make = (options: Options) => {
         WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}`
       yield* sql`INSERT INTO effect_local_server_replication_views
         (space_id, client_id, principal_digest, view_id, view_revision, scope_generation,
-          scope_json, scope_digest, definition_hash, schema_version, schema_hash, server_sequence)
+          scope_json, scope_digest, definition_hash, schema_version, schema_hash, server_sequence,
+          delivered_sequence, read_auth_epoch)
         VALUES (${request.spaceId}, ${request.clientId}, ${principalHash}, ${viewId}, 0,
           ${request.scopeGeneration}, ${yield* Codec.stringify(normalized)}, ${normalizedDigest},
           ${targetDefinition.hash}, ${targetDefinition.schemaIdentity.version}, ${targetDefinition.schemaIdentity.hash},
-          ${space.next_server_sequence - 1})
+          ${space.next_server_sequence - 1}, ${space.next_server_sequence - 1}, ${space.read_auth_epoch})
         ON CONFLICT (space_id, client_id) DO UPDATE SET principal_digest = excluded.principal_digest,
           view_id = excluded.view_id, view_revision = excluded.view_revision,
           scope_generation = excluded.scope_generation, scope_json = excluded.scope_json,
           scope_digest = excluded.scope_digest, definition_hash = excluded.definition_hash,
           schema_version = excluded.schema_version, schema_hash = excluded.schema_hash,
-          server_sequence = excluded.server_sequence`
+          server_sequence = excluded.server_sequence, delivered_sequence = excluded.delivered_sequence,
+          read_auth_epoch = excluded.read_auth_epoch`
       yield* replaceViewEntities(request, principalHash, cursor, visibleEntities)
       yield* sql`INSERT INTO effect_local_server_scoped_snapshots
         (snapshot_id, space_id, client_id, principal_digest, definition_hash, schema_version,
@@ -664,10 +677,11 @@ export const make = (options: Options) => {
     request: Protocol.PullRequest,
     principalHash: Protocol.MutationDigest,
     page: Protocol.PullPage,
-    scopeJson: string,
-    scopeHash: Protocol.MutationDigest
+    row: typeof Rows.ReplicationPageRow.Type
   ) =>
     Effect.gen(function*() {
+      const scopeJson = row.scope_json
+      const scopeHash = row.scope_digest
       const upserts: Array<Record<string, unknown>> = []
       const removals: Array<{ readonly model: string; readonly key: string }> = []
       for (const change of page.changes) {
@@ -702,11 +716,20 @@ export const make = (options: Options) => {
             AND view_id = ${page.cursor.viewId}
             AND ${sql.or(batch.map((entity) => sql`(model = ${entity.model} AND entity_key = ${entity.key})`))}`
       }
-      yield* sql`UPDATE effect_local_server_replication_views SET
-        view_revision = ${page.cursor.revision}, scope_generation = ${page.scopeGeneration},
-        scope_json = ${scopeJson}, scope_digest = ${scopeHash}, server_sequence = ${page.serverSequence}
-        WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}
-          AND principal_digest = ${principalHash} AND view_id = ${page.cursor.viewId}`
+      if (row.has_more === 0) {
+        yield* sql`UPDATE effect_local_server_replication_views SET
+          view_revision = ${page.cursor.revision}, scope_generation = ${page.scopeGeneration},
+          scope_json = ${scopeJson}, scope_digest = ${scopeHash}, server_sequence = ${page.serverSequence},
+          delivered_sequence = ${page.serverSequence}, read_auth_epoch = ${row.read_auth_epoch}
+          WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}
+            AND principal_digest = ${principalHash} AND view_id = ${page.cursor.viewId}`
+      } else {
+        yield* sql`UPDATE effect_local_server_replication_views SET
+          view_revision = ${page.cursor.revision}, scope_generation = ${page.scopeGeneration},
+          scope_json = ${scopeJson}, scope_digest = ${scopeHash}, server_sequence = ${page.serverSequence}
+          WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}
+            AND principal_digest = ${principalHash} AND view_id = ${page.cursor.viewId}`
+      }
       yield* sql`DELETE FROM effect_local_server_replication_pages
         WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}`
     })
@@ -753,7 +776,8 @@ export const make = (options: Options) => {
     changes: ReadonlyArray<Protocol.ViewChange>,
     serverSequence: Identity.ServerSequence,
     normalized: Protocol.ReplicationScope,
-    normalizedDigest: Protocol.MutationDigest
+    normalizedDigest: Protocol.MutationDigest,
+    readAuthEpoch: number
   ) =>
     Effect.gen(function*() {
       const cursor = Protocol.ReplicationCursor.make({
@@ -800,16 +824,130 @@ export const make = (options: Options) => {
       yield* sql`INSERT INTO effect_local_server_replication_pages
         (space_id, client_id, principal_digest, view_id, base_revision, target_revision,
           scope_generation, scope_json, scope_digest, server_sequence, changes_json,
-          content_bytes, digest, has_more)
+          content_bytes, digest, has_more, read_auth_epoch)
         VALUES (${request.spaceId}, ${request.clientId}, ${principalHash}, ${view.view_id},
           ${view.view_revision}, ${page.cursor.revision}, ${request.scopeGeneration}, ${scopeJson},
           ${normalizedDigest}, ${serverSequence}, ${yield* Codec.stringify(selected)}, ${contentBytes},
-          ${page.digest}, ${hasMore})`
+          ${page.digest}, ${hasMore}, ${readAuthEpoch})`
       yield* sql`UPDATE effect_local_server_replication_views SET
         scope_generation = ${request.scopeGeneration}, scope_json = ${scopeJson},
         scope_digest = ${normalizedDigest}
         WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}`
       return page
+    })
+
+  const materializeByIdentity = (
+    spaceId: Identity.SpaceId,
+    entities: ReadonlyArray<{ readonly model: string; readonly key: string }>
+  ) =>
+    Effect.gen(function*() {
+      if (entities.length === 0) return new Map<string, MaterializedEntity>()
+      const rows = yield* findEntitiesByIdentity({
+        spaceId,
+        entitiesJson: yield* Codec.stringify(entities)
+      }).pipe(Effect.mapError(StorageUnavailable.make))
+      return yield* decodeAuthoritative(spaceId, rows)
+    })
+
+  const deriveDeltaChanges = (
+    request: Protocol.PullRequest,
+    principal: typeof Schema.Json.Type,
+    normalized: Protocol.ReplicationScope,
+    view: typeof Rows.ReplicationViewRow.Type,
+    space: typeof Rows.ReplicationSpaceRow.Type
+  ) =>
+    Effect.gen(function*() {
+      const head = space.next_server_sequence - 1
+      if (view.delivered_sequence > head) return Option.none()
+      let suffix: ReadonlyArray<{ readonly server_sequence: number; readonly entry_json: string }> = []
+      if (view.delivered_sequence < head) {
+        suffix = yield* findLogSuffix({
+          spaceId: request.spaceId,
+          after: view.delivered_sequence,
+          limit: options.maximumSnapshotEntities + 1
+        }).pipe(Effect.mapError(StorageUnavailable.make))
+        if (
+          suffix.length === 0 || suffix.length > options.maximumSnapshotEntities ||
+          suffix[0].server_sequence !== view.delivered_sequence + 1 ||
+          suffix[suffix.length - 1].server_sequence !== view.delivered_sequence + suffix.length ||
+          suffix[suffix.length - 1].server_sequence !== head
+        ) return Option.none()
+      }
+      const changed = new Map<string, { readonly model: string; readonly key: string }>()
+      for (const row of suffix) {
+        const entry = yield* Codec.parse(row.entry_json).pipe(
+          Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
+        )
+        for (const change of entry.changes) {
+          const keyJson = yield* Codec.stringify(change.entity.key)
+          changed.set(identityOf(change.entity.model, keyJson), {
+            model: change.entity.model,
+            key: keyJson
+          })
+        }
+      }
+      const acknowledged = yield* findViewEntities({
+        spaceId: request.spaceId,
+        clientId: request.clientId,
+        viewId: view.view_id
+      }).pipe(Effect.mapError(StorageUnavailable.make))
+      const ackedByIdentity = new Map(
+        acknowledged.map((row) => [identityOf(row.model, row.entity_key), row] as const)
+      )
+      const current = yield* materializeByIdentity(request.spaceId, [...changed.values()])
+      const selected = new Set(normalized.models)
+      const changes = new Map<string, Protocol.ViewChange>()
+      for (const identity of changed.keys()) {
+        const materialized = current.get(identity)
+        const ackedRow = ackedByIdentity.get(identity)
+        let authorized = false
+        if (materialized !== undefined && selected.has(materialized.entity.model)) {
+          authorized = yield* options.authorization.entity(
+            request,
+            principal,
+            materialized.sourceEntity,
+            materialized.sourceValue
+          )
+        }
+        if (authorized) {
+          const entity = materialized!
+          if (ackedRow?.disposition !== "Upsert" || ackedRow.value_json !== entity.valueJson) {
+            changes.set(identity, Protocol.Upsert.make({ entity: entity.entity, value: entity.value }))
+          }
+          continue
+        }
+        if (ackedRow === undefined) continue
+        const ackedEntity = Protocol.EntityKey.make({
+          model: ackedRow.model,
+          modelVersion: ackedRow.model_version,
+          key: yield* Codec.parse(ackedRow.entity_key)
+        })
+        let disposition: Protocol.ViewChange = Protocol.Delete.make({ entity: ackedEntity })
+        if (materialized !== undefined) disposition = Protocol.Retract.make({ entity: ackedEntity })
+        if (ackedRow.disposition !== disposition._tag) changes.set(identity, disposition)
+      }
+      for (const row of acknowledged) {
+        const identity = identityOf(row.model, row.entity_key)
+        if (changed.has(identity)) continue
+        if (row.disposition !== "Upsert" || row.value_json === null) continue
+        const entity = Protocol.EntityKey.make({
+          model: row.model,
+          modelVersion: row.model_version,
+          key: yield* Codec.parse(row.entity_key)
+        })
+        const value = yield* Codec.parse(row.value_json).pipe(
+          Effect.flatMap((parsed) => Codec.decode(Schema.Json, parsed))
+        )
+        const authorized = yield* options.authorization.entity(request, principal, entity, value)
+        if (!authorized) changes.set(identity, Protocol.Retract.make({ entity }))
+      }
+      const ordered = [...changes.entries()].toSorted(([left], [right]) => {
+        if (left < right) return -1
+        if (left > right) return 1
+        return 0
+      })
+        .map(([, change]) => change)
+      return Option.some(ordered)
     })
 
   const pull = (
@@ -868,11 +1006,11 @@ export const make = (options: Options) => {
           message: "Replication scope changed without advancing scope generation"
         })
       }
+      const schemaIsCurrent = request.schema.version === options.definition.schemaIdentity.version &&
+        request.schema.hash === options.definition.schemaIdentity.hash
       const pageRow = yield* findPage({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
         Effect.mapError(StorageUnavailable.make)
       )
-      const source = yield* authoritative(request.spaceId)
-      const projected = yield* projectVisible({ ...request, scope: normalized }, principal, source, targetDefinition)
       if (Option.isSome(pageRow)) {
         const row = pageRow.value
         if (
@@ -894,7 +1032,21 @@ export const make = (options: Options) => {
           (row.scope_generation !== request.scopeGeneration || row.scope_digest !== normalizedDigest)
         ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
         if (request.cursor.revision === row.base_revision) {
-          if (!(yield* pageSafe({ ...request, scope: normalized }, principal, page, projected.all))) {
+          let all: ReadonlyMap<string, MaterializedEntity>
+          if (schemaIsCurrent) {
+            const identities: Array<{ readonly model: string; readonly key: string }> = []
+            for (const change of page.changes) {
+              identities.push({
+                model: change.entity.model,
+                key: yield* Codec.stringify(change.entity.key)
+              })
+            }
+            all = yield* materializeByIdentity(request.spaceId, identities)
+          } else {
+            const source = yield* authoritative(request.spaceId)
+            all = (yield* projectVisible({ ...request, scope: normalized }, principal, source, targetDefinition)).all
+          }
+          if (!(yield* pageSafe({ ...request, scope: normalized }, principal, page, all))) {
             return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
           }
           return page
@@ -902,7 +1054,7 @@ export const make = (options: Options) => {
         if (request.cursor.revision !== row.target_revision) {
           return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
         }
-        yield* applyAcknowledgedPage(request, principalHash, page, row.scope_json, row.scope_digest)
+        yield* applyAcknowledgedPage(request, principalHash, page, row)
       } else if (request.cursor.revision !== view.view_revision) {
         return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
       }
@@ -913,17 +1065,34 @@ export const make = (options: Options) => {
           onSome: Effect.succeed
         }))
       )
-      const acknowledged = yield* findViewEntities({
-        spaceId: request.spaceId,
-        clientId: request.clientId,
-        viewId: currentView.view_id
-      }).pipe(Effect.mapError(StorageUnavailable.make))
-      const changes = yield* diff(
-        { ...request, scope: normalized },
-        acknowledged,
-        projected.all,
-        projected.target
-      )
+      let changes: ReadonlyArray<Protocol.ViewChange> | undefined
+      if (
+        schemaIsCurrent && currentView.scope_digest === normalizedDigest &&
+        currentView.read_auth_epoch === space.read_auth_epoch
+      ) {
+        const delta = yield* deriveDeltaChanges(request, principal, normalized, currentView, space)
+        if (Option.isSome(delta)) changes = delta.value
+      }
+      if (changes === undefined) {
+        const source = yield* authoritative(request.spaceId)
+        const projected = yield* projectVisible(
+          { ...request, scope: normalized },
+          principal,
+          source,
+          targetDefinition
+        )
+        const acknowledged = yield* findViewEntities({
+          spaceId: request.spaceId,
+          clientId: request.clientId,
+          viewId: currentView.view_id
+        }).pipe(Effect.mapError(StorageUnavailable.make))
+        changes = yield* diff(
+          { ...request, scope: normalized },
+          acknowledged,
+          projected.all,
+          projected.target
+        )
+      }
       return yield* persistNextPage(
         request,
         principalHash,
@@ -931,7 +1100,8 @@ export const make = (options: Options) => {
         changes,
         Identity.ServerSequence.make(space.next_server_sequence - 1),
         normalized,
-        normalizedDigest
+        normalizedDigest,
+        space.read_auth_epoch
       )
     })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 

@@ -175,7 +175,8 @@ export const ReplicationSpaceRow = Schema.Struct({
   target_schema_hash: Schema.NullOr(Identity.SchemaHash),
   migration_hash: Schema.NullOr(Identity.SchemaHash),
   next_server_sequence: PositiveInt,
-  next_terminal_sequence: PositiveInt
+  next_terminal_sequence: PositiveInt,
+  read_auth_epoch: NonNegativeInt
 })
 
 export const ServerReceiptRow = Schema.Struct({
@@ -286,7 +287,9 @@ export const ReplicationViewRow = Schema.Struct({
   definition_hash: Schema.String,
   schema_version: Identity.SchemaVersion,
   schema_hash: Identity.SchemaHash,
-  server_sequence: Identity.ServerSequence
+  server_sequence: Identity.ServerSequence,
+  delivered_sequence: Identity.ServerSequence,
+  read_auth_epoch: NonNegativeInt
 })
 
 export const ReplicationViewEntityRow = Schema.Struct({
@@ -309,7 +312,8 @@ export const ReplicationPageRow = Schema.Struct({
   changes_json: Schema.String,
   content_bytes: NonNegativeInt,
   digest: Protocol.MutationDigest,
-  has_more: Schema.Literals([0, 1])
+  has_more: Schema.Literals([0, 1]),
+  read_auth_epoch: NonNegativeInt
 })
 
 export const ScopedSnapshotManifestRow = Schema.Struct({

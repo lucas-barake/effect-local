@@ -300,6 +300,182 @@ describe("scoped replication", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
+  it.effect("authorizes only changed and acknowledged entities on a steady pull", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let entityAuthorizations = 0
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer((input) => {
+            if (input._tag !== "Entity") return Effect.void
+            entityAuthorizations++
+            if (
+              typeof input.entity.key === "string" && input.entity.key.startsWith("hidden-") &&
+              input.principal !== "owner"
+            ) {
+              return Effect.fail("hidden")
+            }
+            return Effect.void
+          })
+        )
+        for (let index = 0; index < 28; index++) {
+          yield* server.submit(yield* envelope(`hidden-${index}`, index + 1))
+        }
+        yield* server.submit(yield* envelope("visible-a", 29))
+        yield* server.submit(yield* envelope("visible-b", 30))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        const bootstrap = yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        assert.isFalse(bootstrap.hasMore)
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        assert.deepStrictEqual(settled.changes, [])
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        yield* server.submit(yield* envelope("visible-a", 31, "renamed"))
+        entityAuthorizations = 0
+        const page = yield* server.pullAuthorized(pullRequest(acknowledged.cursor), "reader")
+        if ("_tag" in page) assert.fail("expected incremental page")
+        assert.deepStrictEqual(page.changes.map((change) => change._tag), ["Upsert"])
+        assert.isAtMost(entityAuthorizations, 10)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("delivers a diff larger than the page limit completely across pulls", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        yield* server.submit(yield* envelope("seed", 1))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        yield* server.submit(yield* putManyEnvelope(250, 2))
+        let cursor = acknowledged.cursor
+        const delivered = new Map<string, string>()
+        for (let round = 0; round < 10; round++) {
+          const page = yield* server.pullAuthorized(pullRequest(cursor), "reader")
+          if ("_tag" in page) assert.fail("expected incremental page")
+          for (const change of page.changes) {
+            assert.strictEqual(change._tag, "Upsert")
+            delivered.set(yield* Codec.stringify(change.entity.key), change._tag)
+          }
+          cursor = page.cursor
+          if (!page.hasMore && page.changes.length === 0) break
+        }
+        assert.strictEqual(delivered.size, 250)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("retracts an acknowledged entity when authorization is revoked without a change", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let secondVisible = true
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer((input) => {
+            if (input._tag === "Entity" && input.entity.key === "second" && !secondVisible) {
+              return Effect.fail("revoked")
+            }
+            return Effect.void
+          })
+        )
+        yield* server.submit(yield* envelope("first", 1))
+        yield* server.submit(yield* envelope("second", 2))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        secondVisible = false
+        const revoked = yield* server.pullAuthorized(pullRequest(acknowledged.cursor), "reader")
+        if ("_tag" in revoked) assert.fail("expected incremental page")
+        assert.deepStrictEqual(
+          revoked.changes.map((change) => [change._tag, change.entity.key]),
+          [["Retract", "second"]]
+        )
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("reveals an unchanged entity only after read authorization is invalidated", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let hiddenVisible = false
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer((input) => {
+            if (input._tag === "Entity" && input.entity.key === "hidden" && !hiddenVisible) {
+              return Effect.fail("hidden")
+            }
+            return Effect.void
+          })
+        )
+        yield* server.submit(yield* envelope("open", 1))
+        yield* server.submit(yield* envelope("hidden", 2))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        hiddenVisible = true
+        const unchanged = yield* server.pullAuthorized(pullRequest(acknowledged.cursor), "reader")
+        if ("_tag" in unchanged) assert.fail("expected incremental page")
+        assert.deepStrictEqual(unchanged.changes, [])
+
+        yield* server.invalidateReadAuthorization(spaceId)
+        const revealed = yield* server.pullAuthorized(pullRequest(unchanged.cursor), "reader")
+        if ("_tag" in revealed) assert.fail("expected incremental page")
+        assert.deepStrictEqual(
+          revealed.changes.map((change) => [change._tag, change.entity.key]),
+          [["Upsert", "hidden"]]
+        )
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("falls back to a full derive when the log suffix is pruned", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer(defaultAuthorizeRead, { retainedHistoryEntries: 0 })
+        )
+        yield* server.submit(yield* envelope("seed", 1))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        yield* server.submit(yield* envelope("late-a", 2))
+        yield* server.submit(yield* envelope("late-b", 3))
+        yield* server.maintain(spaceId)
+
+        const recovered = yield* server.pullAuthorized(pullRequest(acknowledged.cursor), "reader")
+        if ("_tag" in recovered) assert.fail("expected incremental page")
+        const labels: Array<string> = []
+        for (const change of recovered.changes) {
+          labels.push(`${change._tag}:${yield* Codec.stringify(change.entity.key)}`)
+        }
+        assert.deepStrictEqual(
+          labels.toSorted((left, right) => left.localeCompare(right)),
+          ["Upsert:\"late-a\"", "Upsert:\"late-b\""]
+        )
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("emits a periodic revocation hint", () =>
     Effect.scoped(
       Effect.gen(function*() {

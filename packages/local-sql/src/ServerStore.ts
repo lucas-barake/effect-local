@@ -91,6 +91,9 @@ export interface Service {
   >
   readonly maintain: (spaceId: Identity.SpaceId) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly maintainAll: Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly invalidateReadAuthorization: (
+    spaceId: Identity.SpaceId
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly watchAuthorized: (
     request: Protocol.WatchRequest,
     principal: typeof Schema.Json.Type
@@ -2085,6 +2088,13 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         prepareBootstrapAuthorized,
         maintain,
         maintainAll,
+        invalidateReadAuthorization: (spaceId) =>
+          sql`UPDATE effect_local_server_spaces SET read_auth_epoch = read_auth_epoch + 1
+            WHERE space_id = ${spaceId}`.pipe(
+            Effect.asVoid,
+            Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+            Effect.withSpan("ServerStore.invalidateReadAuthorization", { attributes: { "space.id": spaceId } })
+          ),
         watch: (request) => {
           return Stream.unwrap(
             Protocol.validateReplicationScope(options.definition, request.scope).pipe(
