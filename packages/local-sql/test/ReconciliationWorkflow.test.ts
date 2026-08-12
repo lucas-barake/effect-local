@@ -99,6 +99,7 @@ const directSync = (server: ServerStore.Service) =>
   Layer.succeed(
     SyncEngine.SyncEngine,
     SyncEngine.SyncEngine.of({
+      waitForCredentialChange: () => Effect.never,
       submit: server.submit,
       discard: (request) => server.discard(request, null),
       pull: server.pull,
@@ -213,6 +214,7 @@ describe("reconciliation workflow", () => {
       const blockedSync = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: () =>
@@ -360,6 +362,7 @@ describe("reconciliation workflow", () => {
           const serverContext = yield* Layer.build(serverLayerFor(definition))
           const server = Context.get(serverContext, ServerStore.ServerStore)
           let remote = SyncEngine.SyncEngine.of({
+            waitForCredentialChange: () => Effect.never,
             discard: (request) => server.discard(request, null),
             submit: server.submit,
             pull: server.pull,
@@ -368,6 +371,7 @@ describe("reconciliation workflow", () => {
           })
           if (definition.hash !== Domain.definition.hash) {
             remote = SyncEngine.SyncEngine.of({
+              waitForCredentialChange: () => Effect.never,
               discard: (request) => server.discard(request, null),
               submit: server.submit,
               pull: (request) => {
@@ -512,6 +516,7 @@ describe("reconciliation workflow", () => {
           )
           const local = Context.get(localContext, LocalStore.Store)
           const remote = SyncEngine.SyncEngine.of({
+            waitForCredentialChange: () => Effect.never,
             discard: () => Effect.die("unexpected discard"),
             submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
             pull: (request) =>
@@ -590,6 +595,7 @@ describe("reconciliation workflow", () => {
       const serverContext = yield* Layer.build(serverLayer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
       const remote = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
         submit: () =>
           Ref.update(attempts, (count) => count + 1).pipe(
@@ -665,6 +671,7 @@ describe("reconciliation workflow", () => {
         actualHash: "actual"
       })
       const remote = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
         submit: () => Effect.die("unexpected submit"),
         pull: () =>

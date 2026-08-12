@@ -136,6 +136,7 @@ const sync = Layer.effect(
   ServerStore.ServerStore.pipe(
     Effect.map((store) =>
       SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
         submit: store.submit,
         discard: (request) => store.discard(request, null),
         pull: store.pull,

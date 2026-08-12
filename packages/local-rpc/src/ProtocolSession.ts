@@ -1,6 +1,7 @@
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Ref from "effect/Ref"
@@ -9,6 +10,7 @@ import * as Semaphore from "effect/Semaphore"
 import type * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import type * as Authentication from "./Authentication.js"
+import { positiveFiniteDurationMillis } from "./internal/configuration.js"
 import * as SyncRpc from "./SyncRpc.js"
 
 type Client = Effect.Success<typeof SyncRpc.makeRpcClient>
@@ -27,6 +29,7 @@ export class ProtocolSession extends Context.Service<ProtocolSession, Service>()
 
 export interface Options {
   readonly supportedProtocolVersions?: ReadonlyArray<number>
+  readonly sessionAcquisitionTimeout?: Duration.Input
 }
 
 export const layerWithOptions = (options?: Options): Layer.Layer<
@@ -37,6 +40,10 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
   Layer.effect(
     ProtocolSession,
     Effect.gen(function*() {
+      const sessionAcquisitionTimeoutMillis = yield* positiveFiniteDurationMillis(
+        "sessionAcquisitionTimeout",
+        options?.sessionAcquisitionTimeout ?? "10 seconds"
+      )
       const configured = options?.supportedProtocolVersions ?? [Protocol.currentProtocolVersion]
       const request = yield* Schema.decodeUnknownEffect(Protocol.NegotiateRequest)({
         supportedVersions: configured
@@ -55,25 +62,74 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
         const cached = yield* Ref.get(selected)
         if (cached !== undefined) return cached
         const negotiated = yield* client.Negotiate(request).pipe(
-          Effect.mapError((cause) => {
-            if (Schema.is(ReplicaError.ReplicaError)(cause)) return cause
-            return new ReplicaError.ProtocolInvalid({
-              message: "The protocol negotiation failed",
-              cause
-            })
-          }),
+          Effect.catchTag(
+            "RpcClientError",
+            (error): Effect.Effect<never, ReplicaError.ServerUnavailable | ReplicaError.ProtocolInvalid> => {
+              switch (error.reason._tag) {
+                case "WorkerSpawnError":
+                case "WorkerSendError":
+                case "WorkerReceiveError":
+                case "WorkerUnknownError":
+                case "SocketReadError":
+                case "SocketWriteError":
+                case "SocketOpenError":
+                case "SocketCloseError":
+                  return Effect.fail(new ReplicaError.ServerUnavailable())
+                case "HttpError":
+                  if (error.reason.kind === "TransportError") {
+                    return Effect.fail(new ReplicaError.ServerUnavailable())
+                  }
+                  return Effect.fail(
+                    new ReplicaError.ProtocolInvalid({
+                      message: "The protocol negotiation failed",
+                      cause: error
+                    })
+                  )
+                case "RpcClientDefect":
+                  return Effect.fail(
+                    new ReplicaError.ProtocolInvalid({
+                      message: "The protocol negotiation failed",
+                      cause: error
+                    })
+                  )
+              }
+              return Effect.die(error)
+            }
+          ),
           Effect.withSpan("ProtocolSession.negotiate")
         )
         yield* Ref.set(selected, negotiated.version)
         return negotiated.version
       })
-      const version = gate.withPermit(negotiateUnlocked)
+      const version = gate.withPermit(negotiateUnlocked).pipe(
+        Effect.timeoutOrElse({
+          duration: sessionAcquisitionTimeoutMillis,
+          orElse: () =>
+            Effect.fail(
+              new ReplicaError.OperationTimeout({
+                operation: "Negotiate",
+                timeoutMillis: sessionAcquisitionTimeoutMillis
+              })
+            )
+        })
+      )
       const rejected = (rejectedVersion: Protocol.ProtocolVersion) =>
         gate.withPermit(Effect.gen(function*() {
           const cached = yield* Ref.get(selected)
           if (cached === rejectedVersion) yield* Ref.set(selected, undefined)
           return yield* negotiateUnlocked
-        }))
+        })).pipe(
+          Effect.timeoutOrElse({
+            duration: sessionAcquisitionTimeoutMillis,
+            orElse: () =>
+              Effect.fail(
+                new ReplicaError.OperationTimeout({
+                  operation: "Negotiate",
+                  timeoutMillis: sessionAcquisitionTimeoutMillis
+                })
+              )
+          })
+        )
       return ProtocolSession.of({ client, version, rejected })
     })
   )

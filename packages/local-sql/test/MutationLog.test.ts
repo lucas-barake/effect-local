@@ -149,6 +149,7 @@ const directSync = (server: ServerStore.Service) =>
   Layer.succeed(
     SyncEngine.SyncEngine,
     SyncEngine.SyncEngine.of({
+      waitForCredentialChange: () => Effect.never,
       submit: server.submit,
       discard: (request) => server.discard(request, null),
       pull: server.pull,
@@ -1579,6 +1580,7 @@ describe("server reconciled mutation log", () => {
         const submissions = yield* Ref.make(0)
         const server = yield* service(ServerStore.ServerStore, serverLayer())
         const remote = SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: (submitted) =>
             Ref.update(submissions, (count) => count + 1).pipe(
@@ -2146,6 +2148,7 @@ describe("server reconciled mutation log", () => {
       let submissions = 0
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
         submit: ({ envelope: submitted }) =>
           Effect.gen(function*() {
@@ -2394,7 +2397,7 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual(yield* local.cursor, 0)
     })))
 
-  it.effect("resubscribes after a watch stream terminates", () =>
+  it.effect("does not resubscribe after a permanent watch failure", () =>
     Effect.scoped(Effect.gen(function*() {
       const subscriptions = yield* Ref.make(0)
       const firstSubscribed = yield* Latch.make()
@@ -2402,6 +2405,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: server.pull,
@@ -2433,9 +2437,9 @@ describe("server reconciled mutation log", () => {
       )
       yield* service(Reconciler.Reconciler, reconciler)
       yield* firstSubscribed.await
-      yield* TestClock.adjust("1 second")
+      yield* TestClock.adjust("1 minute")
       yield* Effect.yieldNow
-      assert.strictEqual(yield* Ref.get(subscriptions), 2)
+      assert.strictEqual(yield* Ref.get(subscriptions), 1)
     })))
 
   it.effect("does not retry a permanently stale reconciliation runtime", () =>
@@ -2452,6 +2456,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: () => Ref.update(pulls, (count) => count + 1).pipe(Effect.andThen(Effect.fail(stale))),
@@ -2494,6 +2499,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: (request) =>
@@ -2531,6 +2537,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: ({ envelope: submitted }) =>
             Effect.suspend(() => {

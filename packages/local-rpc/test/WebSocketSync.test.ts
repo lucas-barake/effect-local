@@ -21,9 +21,12 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as MutableRef from "effect/MutableRef"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
+import * as SubscriptionRef from "effect/SubscriptionRef"
+import * as TestClock from "effect/testing/TestClock"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as HttpRouter from "effect/unstable/http/HttpRouter"
 import * as HttpServer from "effect/unstable/http/HttpServer"
@@ -181,7 +184,7 @@ const authenticator = Layer.succeed(
     authenticate: (credential) => {
       if (Redacted.value(credential) === "secret") return Effect.succeed({ subject: "test" })
       if (Redacted.value(credential) === "revoked") return Effect.succeed({ subject: "revoked" })
-      return Effect.fail(new Authentication.AuthenticationFailure())
+      return Effect.fail(new ReplicaError.CredentialRejected())
     }
   })
 )
@@ -199,10 +202,22 @@ const assertionVerifier = PrincipalAssertion.layerVerifier((assertion) =>
   )
 )
 const authenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
-  Layer.succeed(Authentication.Credentials, Redacted.make("secret"))
+  Layer.succeed(
+    Authentication.CredentialProvider,
+    Authentication.CredentialProvider.of({
+      acquire: Effect.succeed({ generation: 0, bearer: Redacted.make("secret") }),
+      awaitChange: () => Effect.never
+    })
+  )
 ))
 const revokedAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
-  Layer.succeed(Authentication.Credentials, Redacted.make("revoked"))
+  Layer.succeed(
+    Authentication.CredentialProvider,
+    Authentication.CredentialProvider.of({
+      acquire: Effect.succeed({ generation: 0, bearer: Redacted.make("revoked") }),
+      awaitChange: () => Effect.never
+    })
+  )
 ))
 const presenceHub = PresenceHub.layerTrusted()
 const cluster = SpaceEntity.layer().pipe(
@@ -332,7 +347,7 @@ const protocol2Server = SyncServer.layerWithOptions({ supportedProtocolVersions:
   Layer.provide(HttpRouter.serve(websocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const configurableProtocolSession = ProtocolSession.layerWithOptions({ supportedProtocolVersions: [1, 2] })
-const configurableClient = Layer.merge(SyncClient.layerFromSession, PresenceClient.layerFromSession).pipe(
+const configurableClient = Layer.merge(SyncClient.layerFromSession(), PresenceClient.layerFromSession()).pipe(
   Layer.provide(configurableProtocolSession),
   Layer.provide(clientProtocol),
   Layer.provide(authenticationClient)
@@ -342,7 +357,361 @@ const configurableLive = configurableClient.pipe(
   Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
 )
 
+type AuthenticatorMode = "Available" | "Rejected" | "Unavailable"
+
+const awaitStatus = (
+  reactivity: Reactivity.Reactivity["Service"],
+  space: Replica.Space,
+  tag: "Online" | "Offline" | "NeedsAuthentication"
+) =>
+  reactivity.stream([`effect-local:space:${space.spaceId}:status`], space.status).pipe(
+    Stream.filter((status) => status._tag === tag),
+    Stream.runHead,
+    Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
+  )
+
+const makeLifecycleHarness = (options?: {
+  readonly rpcTimeout?: Duration.Input
+  readonly sessionAcquisitionTimeout?: Duration.Input
+}) =>
+  Effect.gen(function*() {
+    const credentials = yield* SubscriptionRef.make<Authentication.Credential>({
+      generation: 0,
+      bearer: Redacted.make("secret")
+    })
+    const refreshWaitStarted = yield* Deferred.make<number>()
+    const attempts = yield* Queue.unbounded<{
+      readonly mode: AuthenticatorMode
+      readonly rpc: string
+    }>()
+    const applications = yield* Queue.unbounded<string>()
+    const watchStarted = yield* Deferred.make<void>()
+    const pullEntered = yield* Deferred.make<void>()
+    const pullRelease = yield* Deferred.make<void>()
+    const pullInterrupted = yield* Deferred.make<void>()
+    const mode = MutableRef.make<AuthenticatorMode>("Available")
+    const blockPull = MutableRef.make(false)
+    const lifecycleWebSocketConstructions = MutableRef.make(0)
+
+    const provider = Authentication.CredentialProvider.of({
+      acquire: SubscriptionRef.get(credentials),
+      awaitChange: (generation) =>
+        Deferred.succeed(refreshWaitStarted, generation).pipe(
+          Effect.andThen(
+            SubscriptionRef.changes(credentials).pipe(
+              Stream.filter((credential) => credential.generation !== generation),
+              Stream.runHead,
+              Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
+            )
+          )
+        )
+    })
+    const clientAuthentication = Authentication.layerClient.pipe(
+      Layer.provide(Layer.succeed(Authentication.CredentialProvider, provider))
+    )
+    const dynamicAuthenticator = Layer.succeed(
+      Authentication.Authenticator,
+      Authentication.Authenticator.of({
+        authenticate: (credential) => {
+          const current = MutableRef.get(mode)
+          if (current === "Unavailable") return Effect.fail(new ReplicaError.AuthenticatorUnavailable())
+          if (current === "Rejected") return Effect.fail(new ReplicaError.CredentialRejected())
+          const bearer = Redacted.value(credential)
+          if (bearer === "secret" || bearer === "refreshed") return Effect.succeed({ subject: "test" })
+          return Effect.fail(new ReplicaError.CredentialRejected())
+        }
+      })
+    )
+    const baseAuthenticationServer = Authentication.layerServer.pipe(Layer.provide(dynamicAuthenticator))
+    const observedAuthenticationServer = Layer.effect(
+      Authentication.Authentication,
+      Authentication.Authentication.pipe(
+        Effect.map((authenticate) =>
+          Authentication.Authentication.of((effect, request) =>
+            Queue.offer(attempts, {
+              mode: MutableRef.get(mode),
+              rpc: request.rpc._tag
+            }).pipe(
+              Effect.andThen(Effect.suspend(() => {
+                if (request.rpc._tag === "Watch") return Deferred.succeed(watchStarted, undefined)
+                return Effect.void
+              })),
+              Effect.andThen(authenticate(effect, request))
+            )
+          )
+        )
+      )
+    ).pipe(Layer.provide(baseAuthenticationServer))
+
+    const lifecycleHandlers = Layer.mergeAll(
+      PutTodo.toLayer(({ payload, transaction }) =>
+        transaction.set(Todo, payload.id, payload).pipe(
+          Effect.tap(() => Queue.offer(applications, payload.id)),
+          Effect.as(payload)
+        )
+      ),
+      ReturnHugeResult.toLayer(() => Effect.succeed("x".repeat(SyncRpc.maximumFrameBytes))),
+      AssignRoleV2.toLayer(({ payload }) => Effect.succeed(payload.role))
+    )
+    const lifecycleRuntime = MutationRuntime.layer(definition, evolution).pipe(Layer.provide(lifecycleHandlers))
+    const lifecycleStore = ServerStore.layer({
+      ...serverHistory,
+      definition,
+      evolution,
+      authorizeAccess: ({ principal, spaceId: requestedSpaceId }) => {
+        if (
+          principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
+          "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
+        ) return Effect.void
+        return Effect.fail({ reason: "forbidden" })
+      },
+      authorizeMutation: () => Effect.void,
+      authorizeRead: () => {
+        if (!MutableRef.get(blockPull)) return Effect.void
+        return Deferred.succeed(pullEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(pullRelease)),
+          Effect.ensuring(Deferred.succeed(pullInterrupted, undefined))
+        )
+      }
+    }).pipe(Layer.provide(lifecycleRuntime), Layer.provide(database))
+    const lifecycleCluster = SpaceEntity.layer().pipe(
+      Layer.provide(lifecycleStore),
+      Layer.provide(PresenceHub.layerTrusted()),
+      Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(database)))
+    )
+    const lifecycleWebSocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(
+      Layer.provide(HttpRouter.layer)
+    )
+    const lifecycleServer = SyncServer.layer.pipe(
+      Layer.provideMerge(lifecycleWebSocketProtocol),
+      Layer.provide(lifecycleCluster),
+      Layer.provide(observedAuthenticationServer),
+      Layer.provide(HttpRouter.serve(lifecycleWebSocketProtocol, {
+        disableListenLog: true,
+        disableLogger: true
+      }))
+    )
+    const lifecycleConstructor = Layer.effect(
+      Socket.WebSocketConstructor,
+      Socket.WebSocketConstructor.pipe(Effect.map((makeWebSocket) =>
+      (
+        url: string,
+        protocols?: string | Array<string>
+      ) => {
+        MutableRef.update(lifecycleWebSocketConstructions, (count) => count + 1)
+        return makeWebSocket(url, protocols)
+      }))
+    ).pipe(Layer.provide(NodeSocket.layerWebSocketConstructor))
+    const lifecycleSocket = Effect.gen(function*() {
+      const server = yield* HttpServer.HttpServer
+      const address = server.address
+      if (address._tag === "UnixAddress") return yield* Effect.die("Expected a TCP test server")
+      return yield* Socket.makeWebSocket(`http://127.0.0.1:${address.port}/sync`)
+    }).pipe(Layer.effect(Socket.Socket), Layer.provide(lifecycleConstructor))
+    const lifecycleClientProtocol = SyncClient.layerProtocolSocket().pipe(Layer.provide(lifecycleSocket))
+    const lifecycleClient = SyncClient.layerWithOptions(options).pipe(
+      Layer.provide(lifecycleClientProtocol),
+      Layer.provide(clientAuthentication)
+    )
+    const lifecycleLive = lifecycleClient.pipe(
+      Layer.provideMerge(lifecycleServer),
+      Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
+    )
+
+    return {
+      applications,
+      attempts,
+      blockPull,
+      credentials,
+      database,
+      handlers: lifecycleHandlers,
+      live: lifecycleLive,
+      webSocketConstructions: lifecycleWebSocketConstructions,
+      mode,
+      pullEntered,
+      pullInterrupted,
+      pullRelease,
+      refreshWaitStarted,
+      watchStarted
+    }
+  })
+
 describe("WebSocket synchronization", () => {
+  it.effect("pauses a rejected credential generation at NeedsAuthentication", () =>
+    Effect.gen(function*() {
+      const harness = yield* makeLifecycleHarness()
+      const replicaContext = yield* Layer.build(
+        SqlReplica.layer({
+          ...clientHistory,
+          definition,
+          evolution,
+          clientId,
+          initialSpaces: [spaceId],
+          retryDelay: "1 second",
+          maximumRetryDelay: "4 seconds"
+        }).pipe(
+          Layer.provide(harness.handlers),
+          Layer.provideMerge(harness.database),
+          Layer.provide(harness.live)
+        )
+      )
+      const replica = Context.get(replicaContext, Replica.Replica)
+      const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
+      const space = yield* replica.space(spaceId)
+      yield* Effect.all([
+        awaitStatus(reactivity, space, "Online"),
+        Deferred.await(harness.watchStarted)
+      ], { discard: true, concurrency: "unbounded" })
+      yield* Queue.takeAll(harness.attempts)
+
+      const needsAuthentication = yield* awaitStatus(reactivity, space, "NeedsAuthentication").pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      MutableRef.set(harness.mode, "Rejected")
+      yield* space.mutate(PutTodo, { id: "expired", title: "expired credential" })
+      assert.strictEqual(yield* Deferred.await(harness.refreshWaitStarted), 0)
+      assert.strictEqual((yield* Fiber.join(needsAuthentication))._tag, "NeedsAuthentication")
+      yield* Queue.takeAll(harness.attempts)
+
+      yield* TestClock.adjust("1 minute")
+      yield* space.mutate(PutTodo, { id: "still-expired", title: "must stay local" })
+      yield* Effect.yieldNow
+      assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
+    }))
+
+  it.effect("resumes synchronization after a credential refresh without rebuilding the replica", () =>
+    Effect.gen(function*() {
+      const harness = yield* makeLifecycleHarness()
+      const replicaContext = yield* Layer.build(
+        SqlReplica.layer({
+          ...clientHistory,
+          definition,
+          evolution,
+          clientId,
+          initialSpaces: [spaceId],
+          retryDelay: "1 second",
+          maximumRetryDelay: "4 seconds"
+        }).pipe(
+          Layer.provide(harness.handlers),
+          Layer.provideMerge(harness.database),
+          Layer.provide(harness.live)
+        )
+      )
+      const replica = Context.get(replicaContext, Replica.Replica)
+      const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
+      const space = yield* replica.space(spaceId)
+      yield* Effect.all([
+        awaitStatus(reactivity, space, "Online"),
+        Deferred.await(harness.watchStarted)
+      ], { discard: true, concurrency: "unbounded" })
+
+      MutableRef.set(harness.mode, "Rejected")
+      const needsAuthentication = yield* awaitStatus(reactivity, space, "NeedsAuthentication").pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* space.mutate(PutTodo, { id: "refresh", title: "rotated credential" })
+      assert.strictEqual(yield* Deferred.await(harness.refreshWaitStarted), 0)
+      yield* Fiber.join(needsAuthentication)
+      const online = yield* awaitStatus(reactivity, space, "Online").pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+
+      MutableRef.set(harness.mode, "Available")
+      yield* SubscriptionRef.set(harness.credentials, {
+        generation: 1,
+        bearer: Redacted.make("refreshed")
+      })
+
+      assert.strictEqual(yield* Queue.take(harness.applications), "refresh")
+      assert.strictEqual((yield* Fiber.join(online))._tag, "Online")
+      assert.strictEqual(Context.get(replicaContext, Replica.Replica), replica)
+      assert.strictEqual(MutableRef.get(harness.webSocketConstructions), 1)
+    }))
+
+  it.effect("backs off an unavailable authenticator and recovers", () =>
+    Effect.gen(function*() {
+      const harness = yield* makeLifecycleHarness()
+      const replicaContext = yield* Layer.build(
+        SqlReplica.layer({
+          ...clientHistory,
+          definition,
+          evolution,
+          clientId,
+          initialSpaces: [spaceId],
+          retryDelay: "1 second",
+          maximumRetryDelay: "2 seconds"
+        }).pipe(
+          Layer.provide(harness.handlers),
+          Layer.provideMerge(harness.database),
+          Layer.provide(harness.live)
+        )
+      )
+      const replica = Context.get(replicaContext, Replica.Replica)
+      const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
+      const space = yield* replica.space(spaceId)
+      yield* Effect.all([
+        awaitStatus(reactivity, space, "Online"),
+        Deferred.await(harness.watchStarted)
+      ], { discard: true, concurrency: "unbounded" })
+      yield* Queue.takeAll(harness.attempts)
+
+      const offline = yield* awaitStatus(reactivity, space, "Offline").pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      MutableRef.set(harness.mode, "Unavailable")
+      yield* space.mutate(PutTodo, { id: "outage", title: "backoff" })
+      assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
+      assert.strictEqual((yield* Fiber.join(offline))._tag, "Offline")
+      yield* Effect.yieldNow
+
+      yield* TestClock.adjust("999 millis")
+      assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
+      yield* TestClock.adjust("1 millis")
+      assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
+      yield* Effect.yieldNow
+
+      yield* TestClock.adjust("1999 millis")
+      assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
+      yield* TestClock.adjust("1 millis")
+      assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
+      yield* Effect.yieldNow
+
+      const online = yield* awaitStatus(reactivity, space, "Online").pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      MutableRef.set(harness.mode, "Available")
+      yield* TestClock.adjust("2 seconds")
+      assert.strictEqual(yield* Queue.take(harness.applications), "outage")
+      assert.strictEqual((yield* Fiber.join(online))._tag, "Online")
+    }))
+
+  it.effect("interrupts a hung RPC at rpcTimeout", () =>
+    Effect.gen(function*() {
+      const harness = yield* makeLifecycleHarness({ rpcTimeout: "1 second" })
+      yield* Effect.addFinalizer(() => Deferred.succeed(harness.pullRelease, undefined))
+      const context = yield* Layer.build(harness.live)
+      const remote = Context.get(context, SyncEngine.SyncEngine)
+      const request = {
+        spaceId,
+        schema: definition.schemaIdentity,
+        after: Identity.ServerSequence.make(0),
+        limit: 10
+      }
+      yield* remote.pull(request)
+      MutableRef.set(harness.blockPull, true)
+      const pulling = yield* remote.pull(request).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.await(harness.pullEntered)
+
+      yield* TestClock.adjust("1 second")
+      const error = yield* Fiber.join(pulling).pipe(Effect.flip)
+      assert.strictEqual(error._tag, "OperationTimeout")
+      if (error._tag === "OperationTimeout") {
+        assert.strictEqual(error.operation, "Pull")
+        assert.strictEqual(error.timeoutMillis, 1_000)
+      }
+      yield* Deferred.await(harness.pullInterrupted)
+    }))
+
   it.effect("multiplexes two Replica spaces through exactly one WebSocket", () =>
     Effect.gen(function*() {
       MutableRef.set(webSocketConstructions, 0)
@@ -652,7 +1021,7 @@ describe("WebSocket synchronization", () => {
       yield* presence.publish(update)
       const value = yield* Fiber.join(received)
       assert.deepStrictEqual(Option.getOrUndefined(value), update)
-    }).pipe(Effect.provide(live)))
+    }).pipe(TestClock.withLive, Effect.provide(live)))
 
   it.effect("returns and replays a bounded terminal rejection for an oversized private result", () =>
     Effect.gen(function*() {

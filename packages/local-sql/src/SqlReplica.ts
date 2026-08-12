@@ -219,6 +219,9 @@ const makeLayer = <D extends Definition.Any, R,>(
               if (options.retryDelay !== undefined) {
                 managedSpace = { ...managedSpace, retryDelay: options.retryDelay }
               }
+              if (options.maximumRetryDelay !== undefined) {
+                managedSpace = { ...managedSpace, maximumRetryDelay: options.maximumRetryDelay }
+              }
               yield* Effect.acquireRelease(
                 manager.register(managedSpace),
                 () => manager.unregister(spaceId, generation)

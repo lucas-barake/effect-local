@@ -46,6 +46,7 @@ const clientHistory = {
 const remote = Layer.succeed(
   SyncEngine.SyncEngine,
   SyncEngine.SyncEngine.of({
+    waitForCredentialChange: () => Effect.never,
     submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
     discard: () => Effect.die("unexpected discard"),
     pull: () => Effect.never,
@@ -200,6 +201,7 @@ describe("multi space Replica", () => {
       const countedRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           discard: () => Effect.die("unexpected discard"),
           pull: () => Effect.never,
@@ -411,8 +413,9 @@ describe("multi space Replica", () => {
       const blockedRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
-          submit: () =>
-            Effect.fail(new ReplicaError.ServerUnavailable()),
+          waitForCredentialChange: () =>
+            Effect.never,
+          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           discard: () => Effect.die("unexpected discard"),
           pull: () =>
             Effect.acquireUseRelease(

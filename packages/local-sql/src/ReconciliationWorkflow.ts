@@ -280,10 +280,13 @@ const handler = (
           if (Result.isSuccess(result)) return
           yield* reconciliation.failed(result.failure)
           if (
+            result.failure._tag === "CredentialRejected" ||
+            result.failure._tag === "ProtocolInvalid" ||
             result.failure._tag === "StaleSchema" ||
             result.failure._tag === "SpaceUnavailable" ||
             result.failure._tag === "StaleReplicationScope" ||
             result.failure._tag === "UpgradeRequired" ||
+            result.failure._tag === "AuthorizationDenied" ||
             attempt >= configuration.maximumAttempts
           ) {
             yield* result.failure
@@ -420,67 +423,115 @@ const layerSchedulerWithConfiguration = (
       >(Option.none())
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
+      const supervisorRetryAttempt = yield* Ref.make(0)
+      const watchRetryAttempt = yield* Ref.make(0)
 
-      const supervise = Effect.forever(
-        Queue.take(wake).pipe(
-          Effect.andThen(
-            Effect.gen(function*() {
-              while (true) {
-                const generations = yield* local.reconciliationGenerations
-                if (generations.completed >= generations.requested) return
-                const state = yield* local.replicationState
-                const payload = Payload.make({
-                  schemaIdentity: schemaIdentityKey(options.definition),
-                  spaceId: options.spaceId,
-                  clientId: options.clientId,
-                  membershipIncarnation: local.membershipIncarnation,
-                  scope: state.scope,
-                  scopeGeneration: state.scopeGeneration,
-                  generation: generations.requested
-                })
-                const workflow = make(payload)
-                const activeExecutionId = yield* workflow.executionId(payload)
-                yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
-                yield* workflow.execute(payload).pipe(
-                  Effect.ensuring(Ref.set(activeExecution, Option.none()))
-                )
-              }
-            })
-          ),
-          Effect.catch((error) =>
-            reconciliation.failed(error).pipe(
-              Effect.andThen(Effect.logWarning("Reconciliation supervisor failed", error))
-            )
-          )
-        )
-      )
+      const supervise = Effect.gen(function*() {
+        while (true) {
+          yield* Queue.take(wake)
+          const result = yield* Effect.gen(function*() {
+            while (true) {
+              const generations = yield* local.reconciliationGenerations
+              if (generations.completed >= generations.requested) return
+              const state = yield* local.replicationState
+              const payload = Payload.make({
+                schemaIdentity: schemaIdentityKey(options.definition),
+                spaceId: options.spaceId,
+                clientId: options.clientId,
+                membershipIncarnation: local.membershipIncarnation,
+                scope: state.scope,
+                scopeGeneration: state.scopeGeneration,
+                generation: generations.requested
+              })
+              const workflow = make(payload)
+              const activeExecutionId = yield* workflow.executionId(payload)
+              yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
+              yield* workflow.execute(payload).pipe(
+                Effect.ensuring(Ref.set(activeExecution, Option.none()))
+              )
+              yield* Ref.set(supervisorRetryAttempt, 0)
+            }
+          }).pipe(Effect.result)
+          if (Result.isSuccess(result)) continue
+          const error = result.failure
+          yield* reconciliation.failed(error)
+          if (error._tag === "CredentialRejected") {
+            if (error.credentialGeneration === undefined) {
+              yield* Effect.logWarning("Rejected credential did not include its generation")
+              return
+            }
+            yield* remote.waitForCredentialChange(error.credentialGeneration)
+            yield* Ref.set(supervisorRetryAttempt, 0)
+            yield* requestAndNotify
+            continue
+          }
+          if (
+            error._tag === "AuthenticatorUnavailable" ||
+            error._tag === "ServerUnavailable" ||
+            error._tag === "OperationTimeout"
+          ) {
+            const attempt = yield* Ref.getAndUpdate(supervisorRetryAttempt, (current) => current + 1)
+            yield* Effect.logWarning("Reconciliation supervisor will retry", error)
+            yield* Effect.sleep(retryMillis(configuration, attempt + 1))
+            yield* requestAndNotify
+            continue
+          }
+          yield* Effect.logWarning("Reconciliation supervisor stopped", error)
+          return
+        }
+      })
 
       const supervisorFiber = yield* Effect.forkScoped(supervise)
-      const watchFiber = yield* Effect.forkScoped(
-        Effect.forever(
-          local.replicationState.pipe(
-            Effect.map((state) => ({
-              spaceId: options.spaceId,
-              clientId: options.clientId,
-              schema: options.definition.schemaIdentity,
-              scope: state.scope,
-              scopeGeneration: state.scopeGeneration,
-              cursor: state.cursor
-            })),
-            Effect.map(remote.watch),
-            Stream.unwrap,
-            Stream.runForEach(() => requestAndNotify),
-            Effect.matchEffect({
-              onFailure: (error) => {
-                if (error._tag === "StaleSchema") return Effect.fail(error)
-                return Effect.logWarning("Sync watch ended", error).pipe(Effect.andThen(notify))
-              },
-              onSuccess: () => requestAndNotify
-            }),
-            Effect.andThen(Effect.sleep(configuration.retryDelayMillis))
+      const watch = Effect.gen(function*() {
+        while (true) {
+          const result = yield* Stream.unwrap(local.replicationState.pipe(
+            Effect.map((state) =>
+              remote.watch({
+                spaceId: options.spaceId,
+                clientId: options.clientId,
+                schema: options.definition.schemaIdentity,
+                scope: state.scope,
+                scopeGeneration: state.scopeGeneration,
+                cursor: state.cursor
+              })
+            )
+          )).pipe(
+            Stream.runForEach(() => Ref.set(watchRetryAttempt, 0).pipe(Effect.andThen(requestAndNotify))),
+            Effect.result
           )
-        ).pipe(Effect.catchTag("StaleSchema", reconciliation.failed))
-      )
+          if (Result.isSuccess(result)) {
+            const attempt = yield* Ref.getAndUpdate(watchRetryAttempt, (current) => current + 1)
+            yield* requestAndNotify
+            yield* Effect.sleep(retryMillis(configuration, attempt + 1))
+            continue
+          }
+          const error = result.failure
+          yield* reconciliation.failed(error)
+          if (error._tag === "CredentialRejected") {
+            if (error.credentialGeneration === undefined) {
+              yield* Effect.logWarning("Rejected watch credential did not include its generation")
+              return
+            }
+            yield* remote.waitForCredentialChange(error.credentialGeneration)
+            yield* Ref.set(watchRetryAttempt, 0)
+            continue
+          }
+          if (
+            error._tag === "AuthenticatorUnavailable" ||
+            error._tag === "ServerUnavailable" ||
+            error._tag === "OperationTimeout"
+          ) {
+            const attempt = yield* Ref.getAndUpdate(watchRetryAttempt, (current) => current + 1)
+            yield* Effect.logWarning("Sync watch will retry", error)
+            yield* Effect.sleep(retryMillis(configuration, attempt + 1))
+            yield* notify
+            continue
+          }
+          yield* Effect.logWarning("Sync watch stopped", error)
+          return
+        }
+      })
+      const watchFiber = yield* Effect.forkScoped(watch)
       yield* requestAndNotify
       yield* Effect.addFinalizer(() =>
         Fiber.interruptAll([supervisorFiber, watchFiber]).pipe(
