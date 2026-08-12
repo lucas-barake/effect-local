@@ -18,6 +18,7 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
+import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
@@ -57,6 +58,7 @@ const store = ServerStore.layerTrusted({
   readAuthorizationRefreshInterval: "1 second" as const,
   maximumWatchersPerSpace: 1_024,
   maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
   readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
@@ -95,6 +97,7 @@ const handlerOptions = {
   readMailboxCapacity: 32,
   watchMailboxCapacity: 32,
   presencePublicationMailboxCapacity: 32,
+  maximumConcurrentBootstrapAuthorizations: 4,
   maximumConcurrentBootstrapPagesPerSpace: 1,
   maximumConcurrentPresencePublicationsPerSpace: 4
 } satisfies SpaceEntity.HandlerOptions
@@ -335,12 +338,14 @@ describe("SpaceEntity", () => {
             Effect.andThen(actual.admit(request, principal)),
             Effect.onExit((exit) => Deferred.succeed(submitCompleted, exit))
           ),
-        bootstrapAuthorized: () =>
-          Effect.gen(function*() {
-            yield* Deferred.succeed(firstEntered, undefined)
-            yield* Deferred.await(releaseFirst)
-            return page
-          })
+        prepareBootstrapAuthorized: () =>
+          Effect.succeed(
+            Effect.gen(function*() {
+              yield* Deferred.succeed(firstEntered, undefined)
+              yield* Deferred.await(releaseFirst)
+              return page
+            })
+          )
       })
       const cluster = SpaceEntity.layer(handlerOptions).pipe(
         Layer.provide(assertionVerifier),
@@ -373,11 +378,7 @@ describe("SpaceEntity", () => {
         const first = yield* client.bootstrap(spaceA, request, assertionOf(null)).pipe(
           Effect.forkChild({ startImmediately: true })
         )
-        const started = yield* Effect.race(
-          Deferred.await(firstEntered).pipe(Effect.as(true)),
-          Fiber.await(first).pipe(Effect.as(false))
-        )
-        if (!started) yield* Fiber.join(first)
+        yield* Deferred.await(firstEntered)
         const submitted = yield* envelope(spaceA)
         const submit = yield* client.submit(
           spaceA,
@@ -393,6 +394,245 @@ describe("SpaceEntity", () => {
         yield* Deferred.succeed(releaseFirst, undefined)
         yield* Fiber.join(first)
         yield* Fiber.join(submit)
+      }).pipe(Effect.provide(cluster))
+    })).pipe(
+      TestClock.withLive,
+      Effect.provide(shardingConfig),
+      Effect.provide(NodeCrypto.layer)
+    ))
+
+  it.effect("does not reveal Bootstrap page occupancy to a denied principal", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const actual = yield* Layer.build(store).pipe(
+        Effect.map((context) => Context.get(context, ServerStore.ServerStore))
+      )
+      const firstEntered = yield* Deferred.make<void>()
+      const releaseFirst = yield* Deferred.make<void>()
+      const snapshotId = Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000001")
+      const page = Protocol.BootstrapPage.make({
+        manifest: {
+          spaceId: spaceA,
+          clientId,
+          definitionHash: definition.hash,
+          schema: definition.schemaIdentity,
+          scopeDigest: Protocol.MutationDigest.make("0".repeat(64)),
+          scopeGeneration,
+          cursor: {
+            viewId: Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000001"),
+            revision: Identity.ReplicationViewRevision.make(0)
+          },
+          snapshotId,
+          sequence: Identity.ServerSequence.make(0),
+          terminalSequenceThrough: Identity.TerminalSequence.make(0),
+          entityCount: 0,
+          contentBytes: 0,
+          digest: Protocol.initialSnapshotDigest
+        },
+        entries: [],
+        hasMore: false,
+        serverSchema: definition.schemaIdentity
+      })
+      const wrapped = ServerStore.ServerStore.of({
+        ...actual,
+        prepareBootstrapAuthorized: (_request, principal) => {
+          if (principal === "denied") {
+            return Effect.fail(new ReplicaError.AuthorizationDenied({ reason: "policy denied" }))
+          }
+          return Effect.succeed(
+            Deferred.succeed(firstEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseFirst)),
+              Effect.as(page)
+            )
+          )
+        }
+      })
+      const cluster = SpaceEntity.layer(handlerOptions).pipe(
+        Layer.provide(assertionVerifier),
+        Layer.provide(Layer.succeed(ServerStore.ServerStore, wrapped)),
+        Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+        Layer.provide(
+          SingleRunner.layer({
+            runnerStorage: "memory",
+            shardingConfig: {
+              entityTerminationTimeout: 0,
+              entityMessagePollInterval: 5_000,
+              sendRetryInterval: 100
+            }
+          }).pipe(Layer.provide(database))
+        )
+      )
+      const request: Protocol.BootstrapRequest = {
+        spaceId: spaceA,
+        clientId,
+        schema: definition.schemaIdentity,
+        scope,
+        scopeGeneration,
+        cursor: page.manifest.cursor,
+        snapshotId,
+        afterOrdinal: -1,
+        limit: 10
+      }
+      yield* Effect.gen(function*() {
+        const client = yield* SpaceEntity.Client
+        const first = yield* client.bootstrap(spaceA, request, assertionOf("allowed")).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(firstEntered)
+
+        const denied = yield* client.bootstrap(spaceA, request, assertionOf("denied")).pipe(Effect.flip)
+        assert.strictEqual(denied._tag, "AuthorizationDenied")
+
+        yield* Deferred.succeed(releaseFirst, undefined)
+        yield* Fiber.join(first)
+      }).pipe(Effect.provide(cluster))
+    })).pipe(
+      TestClock.withLive,
+      Effect.provide(shardingConfig),
+      Effect.provide(NodeCrypto.layer)
+    ))
+
+  it.effect("bounds Bootstrap assertion and preparation work across spaces", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const actual = yield* Layer.build(store).pipe(
+        Effect.map((context) => Context.get(context, ServerStore.ServerStore))
+      )
+      const activePreflights = yield* Ref.make(0)
+      const maximumActivePreflights = yield* Ref.make(0)
+      const assertionEntered = yield* Deferred.make<void>()
+      const releaseAssertion = yield* Deferred.make<void>()
+      const preparationEntered = yield* Deferred.make<void>()
+      const releasePreparation = yield* Deferred.make<void>()
+      const snapshotId = Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000001")
+      const page = Protocol.BootstrapPage.make({
+        manifest: {
+          spaceId: spaceA,
+          clientId,
+          definitionHash: definition.hash,
+          schema: definition.schemaIdentity,
+          scopeDigest: Protocol.MutationDigest.make("0".repeat(64)),
+          scopeGeneration,
+          cursor: {
+            viewId: Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000001"),
+            revision: Identity.ReplicationViewRevision.make(0)
+          },
+          snapshotId,
+          sequence: Identity.ServerSequence.make(0),
+          terminalSequenceThrough: Identity.TerminalSequence.make(0),
+          entityCount: 0,
+          contentBytes: 0,
+          digest: Protocol.initialSnapshotDigest
+        },
+        entries: [],
+        hasMore: false,
+        serverSchema: definition.schemaIdentity
+      })
+      const trackPreflight = <A, E, R,>(effect: Effect.Effect<A, E, R>) =>
+        Effect.acquireUseRelease(
+          Ref.updateAndGet(activePreflights, (active) => active + 1).pipe(
+            Effect.tap((active) => Ref.update(maximumActivePreflights, (maximum) => Math.max(maximum, active)))
+          ),
+          () => effect,
+          () => Ref.update(activePreflights, (active) => active - 1)
+        )
+      const verifier = PrincipalAssertion.layerVerifier((assertion) =>
+        Schema.decodeUnknownEffect(assertionCodec)(assertion).pipe(
+          Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" })),
+          Effect.flatMap((principal) => {
+            if (principal !== "first") return trackPreflight(Effect.succeed(principal))
+            return trackPreflight(
+              Deferred.succeed(assertionEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseAssertion)),
+                Effect.as(principal)
+              )
+            )
+          })
+        )
+      )
+      const wrapped = ServerStore.ServerStore.of({
+        ...actual,
+        prepareBootstrapAuthorized: (_request, principal) => {
+          if (principal !== "first") return trackPreflight(Effect.succeed(Effect.succeed(page)))
+          return trackPreflight(
+            Deferred.succeed(preparationEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releasePreparation)),
+              Effect.as(Effect.succeed(page))
+            )
+          )
+        }
+      })
+      const cluster = SpaceEntity.layer({
+        ...handlerOptions,
+        maximumConcurrentBootstrapAuthorizations: 1
+      }).pipe(
+        Layer.provide(verifier),
+        Layer.provide(Layer.succeed(ServerStore.ServerStore, wrapped)),
+        Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+        Layer.provide(
+          SingleRunner.layer({
+            runnerStorage: "memory",
+            shardingConfig: {
+              entityTerminationTimeout: 0,
+              entityMessagePollInterval: 5_000,
+              sendRetryInterval: 100
+            }
+          }).pipe(Layer.provide(database))
+        )
+      )
+      const request: Protocol.BootstrapRequest = {
+        spaceId: spaceA,
+        clientId,
+        schema: definition.schemaIdentity,
+        scope,
+        scopeGeneration,
+        cursor: page.manifest.cursor,
+        snapshotId,
+        afterOrdinal: -1,
+        limit: 10
+      }
+      yield* Effect.gen(function*() {
+        const client = yield* SpaceEntity.Client
+        const first = yield* client.bootstrap(spaceA, request, assertionOf("first")).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(assertionEntered)
+
+        const assertionOverflow = yield* client.bootstrap(
+          spaceB,
+          { ...request, spaceId: spaceB },
+          assertionOf("second")
+        ).pipe(
+          Effect.flip
+        )
+        assert.deepStrictEqual(
+          assertionOverflow,
+          new ReplicaError.CapacityExceeded({
+            resource: "bootstrap authorizations",
+            limit: 1
+          })
+        )
+
+        yield* Deferred.succeed(releaseAssertion, undefined)
+        yield* Deferred.await(preparationEntered)
+
+        const preparationOverflow = yield* client.bootstrap(
+          spaceB,
+          { ...request, spaceId: spaceB },
+          assertionOf("third")
+        ).pipe(
+          Effect.flip
+        )
+        assert.deepStrictEqual(
+          preparationOverflow,
+          new ReplicaError.CapacityExceeded({
+            resource: "bootstrap authorizations",
+            limit: 1
+          })
+        )
+        assert.strictEqual(yield* Ref.get(maximumActivePreflights), 1)
+
+        yield* Deferred.succeed(releasePreparation, undefined)
+        yield* Fiber.join(first)
+        assert.strictEqual(yield* Ref.get(activePreflights), 0)
       }).pipe(Effect.provide(cluster))
     })).pipe(
       TestClock.withLive,

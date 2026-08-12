@@ -316,6 +316,9 @@ const StoreLive = ServerStore.layer({
   ...serverHistory,
   definition,
   readAuthorizationRefreshInterval: "30 seconds",
+  maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
+  readAuthorizationCacheCapacity: 4_096,
   authorizeAccess: ({ clientId, principal, spaceId }) => authorizeClient({ clientId, principal, spaceId }),
   authorizeMutation: ({ mutation, principal }) => authorizeMutation({ mutation, principal }),
   authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
@@ -370,15 +373,19 @@ tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and s
 reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
 
 The facade uses four space entities with required finite limits. `SpaceAdmissionEntity` serializes Submit and Discard.
-`SpaceReadEntity` forks Pull and bounds concurrent immutable Bootstrap pages. `SpaceWatchEntity` owns long lived sync
+`SpaceReadEntity` forks Pull and Bootstrap. A Layer wide fail fast allowance bounds Bootstrap assertion verification
+and preparation. A separate per space allowance bounds immutable page reads. `SpaceWatchEntity` owns long lived sync
 and presence streams. `SpacePresencePublishEntity` bounds presence publication. Their separate mailboxes keep a paused
-Bootstrap page or a full watch lane from blocking mutation admission.
+Bootstrap page or a full watch lane from blocking mutation admission. Saturated Bootstrap work fails with typed
+`CapacityExceeded` resource `bootstrap authorizations` or `bootstrap pages`.
 
 `ServerStore.maximumWatchersPerSpace` and `PresenceHub.maximumWatchersPerSpace` independently cap active streams.
 Their sliding queue capacities bound queued hints per subscriber, not subscriber count. Sync authorization successes
 are cached by the complete normalized space, client, scope, and principal input. The refresh interval is the fail closed
-revocation bound. Lookup concurrency and completed successes have separate required limits. Accepted mutations publish
-one shared postcommit wake. Delivery performs no SQLite transaction or space row write per watcher.
+revocation bound. Executing policy calls, live authorization callers and owner lookups, completed successes, and active
+watchers have separate required limits. The same pending allowance also bounds per-wake visibility work. Pending overflow fails with typed
+`CapacityExceeded { resource: "read authorizations", limit }`. Accepted mutations publish one shared postcommit wake.
+Delivery performs no SQLite transaction or space row write per watcher.
 
 Effect metrics cover admission and rejection classes, history and receipt depth beside their limits, sync and presence
 watcher populations, wake fanout duration, durable bootstrap installs, maintenance and prune volume, and client pending

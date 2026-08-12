@@ -29,6 +29,7 @@ const SpaceLive = SpaceEntity.layer({
   readMailboxCapacity: 64,
   watchMailboxCapacity: 2_048,
   presencePublicationMailboxCapacity: 256,
+  maximumConcurrentBootstrapAuthorizations: 64,
   maximumConcurrentBootstrapPagesPerSpace: 8,
   maximumConcurrentPresencePublicationsPerSpace: 64
 }).pipe(
@@ -38,8 +39,10 @@ const SpaceLive = SpaceEntity.layer({
 )
 ```
 
-All six numeric `SpaceEntity` options are required positive safe integers. A full mailbox maps to `ServerUnavailable`.
-Bootstrap concurrency is fail fast and reports typed `CapacityExceeded { resource: "bootstrap pages", limit }`.
+All seven numeric `SpaceEntity` options are required positive safe integers. A full mailbox maps to `ServerUnavailable`.
+Bootstrap concurrency is fail fast. `maximumConcurrentBootstrapAuthorizations` bounds assertion verification and
+bootstrap preparation across the Layer. `maximumConcurrentBootstrapPagesPerSpace` bounds published page reads per
+space. Saturation reports typed `CapacityExceeded` with resource `bootstrap authorizations` or `bootstrap pages`.
 
 For one process, provide `SingleRunner.layer` with the selected runner storage. A Node multi runner deployment provides
 `SocketRunner.layer` with `NodeClusterSocket.layerSocketServer` and `NodeClusterSocket.layerClientProtocol`, then supplies

@@ -16,6 +16,7 @@ import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
 import * as Latch from "effect/Latch"
@@ -104,6 +105,7 @@ const serverHistory = {
   readAuthorizationRefreshInterval: "1 second" as const,
   maximumWatchersPerSpace: 1_024,
   maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
   readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
@@ -385,6 +387,278 @@ describe("server reconciled mutation log", () => {
         Effect.provide(NodeCrypto.layer),
         Effect.provideService(Metric.MetricRegistry, new Map())
       )
+    ))
+
+  it.effect("keeps watcher admission available when its metric update defects", () => {
+    const registry = new Map<string, Metric.Metric.Metadata<any, any>>()
+    return Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 2
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const firstReady = yield* Deferred.make<void>()
+        const first = yield* server.watch(watchRequest()).pipe(
+          Stream.tap(() => Deferred.succeed(firstReady, undefined)),
+          Stream.runDrain,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(firstReady)
+
+        const metadata = Array.from(registry.values()).find(
+          (entry) => entry.id === "effect_local_server_sync_watcher_count"
+        )
+        assert.isDefined(metadata)
+        const modify = metadata.hooks.modify.bind(metadata.hooks)
+        let defectNextIncrement = true
+        Object.defineProperty(metadata.hooks, "modify", {
+          configurable: true,
+          value: (input: number, context: never) => {
+            if (input === 1 && defectNextIncrement) {
+              defectNextIncrement = false
+              assert.fail("metric registry defect")
+            }
+            return modify(input, context)
+          }
+        })
+
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+        yield* Fiber.interrupt(first)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ).pipe(Effect.provideService(Metric.MetricRegistry, registry))
+  })
+
+  it.effect("returns accepted and retry receipts when admission metrics defect after recording", () => {
+    const registry = new Map<string, Metric.Metric.Metadata<any, any>>()
+    return Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        yield* Metric.update(
+          Metric.withAttributes(
+            Metric.counter("effect_local_server_admission", { incremental: true }),
+            { outcome: "accepted" }
+          ),
+          0
+        )
+        const metadata = Array.from(registry.values()).find((entry) =>
+          entry.id === "effect_local_server_admission" && entry.attributes?.outcome === "accepted"
+        )
+        assert.isDefined(metadata)
+        const update = metadata.hooks.update.bind(metadata.hooks)
+        Object.defineProperty(metadata.hooks, "update", {
+          configurable: true,
+          value: (input: number, context: never) => {
+            update(input, context)
+            assert.fail("admission metric defect")
+          }
+        })
+        const submitted = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("metric-defect-receipt"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8021-000000000001")
+        )
+
+        const accepted = yield* server.submit(submitted)
+        const retry = yield* server.submit(submitted)
+
+        assert.strictEqual(accepted._tag, "Accepted")
+        assert.deepStrictEqual(retry, accepted)
+        const admissions = yield* Metric.snapshot
+        const acceptedMetric = admissions.find((snapshot) =>
+          snapshot.id === "effect_local_server_admission" && snapshot.attributes?.outcome === "accepted"
+        )
+        const failedMetric = admissions.find((snapshot) =>
+          snapshot.id === "effect_local_server_admission" && snapshot.attributes?.outcome === "failed"
+        )
+        assert.strictEqual(acceptedMetric?.type, "Counter")
+        if (acceptedMetric?.type === "Counter") assert.strictEqual(acceptedMetric.state.count, 2)
+        assert.isUndefined(failedMetric)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ).pipe(Effect.provideService(Metric.MetricRegistry, registry))
+  })
+
+  it.effect("preserves a refresh defect and releases the sync watcher slot", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let lookups = 0
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => {
+              lookups++
+              if (lookups === 1) return Effect.void
+              return Effect.die("refresh defect")
+            }
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const initial = yield* Deferred.make<void>()
+        const watching = yield* server.watchAuthorized(watchRequest(), "reader").pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.tap(() => Deferred.succeed(initial, undefined)),
+              Stream.runDrain
+            )
+          ),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(initial)
+        yield* TestClock.adjust("500 millis")
+
+        const exit = yield* Fiber.await(watching)
+        assert.isTrue(Exit.isFailure(exit))
+        if (Exit.isFailure(exit)) {
+          assert.deepStrictEqual(
+            exit.cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect),
+            ["refresh defect"]
+          )
+        }
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("preserves a refresh policy denial and releases the sync watcher slot", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let lookups = 0
+        const denial = { reason: "read revoked" }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => {
+              lookups++
+              if (lookups === 1) return Effect.void
+              return Effect.fail(denial)
+            }
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const initial = yield* Deferred.make<void>()
+        const watching = yield* server.watchAuthorized(watchRequest(), "reader").pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.tap(() => Deferred.succeed(initial, undefined)),
+              Stream.runDrain
+            )
+          ),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(initial)
+        yield* TestClock.adjust("500 millis")
+
+        const error = yield* Fiber.join(watching).pipe(Effect.flip)
+        assert.deepStrictEqual(error, new ReplicaError.AuthorizationDenied({ reason: denial }))
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("preserves refresh interruption and releases the sync watcher slot", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let lookups = 0
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => {
+              lookups++
+              if (lookups === 1) return Effect.void
+              return Effect.interrupt
+            }
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const initial = yield* Deferred.make<void>()
+        const watching = yield* server.watchAuthorized(watchRequest(), "reader").pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.tap(() => Deferred.succeed(initial, undefined)),
+              Stream.runDrain
+            )
+          ),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(initial)
+        yield* TestClock.adjust("500 millis")
+
+        const exit = yield* Fiber.await(watching)
+        assert.isTrue(Exit.isFailure(exit))
+        if (Exit.isFailure(exit)) assert.isTrue(Cause.hasInterrupts(exit.cause))
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects excess pending read authorizations with typed capacity", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumConcurrentReadAuthorizations: 1,
+            maximumPendingReadAuthorizations: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release))
+              )
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const pending = yield* server.watchAuthorized(watchRequest(), "first").pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(entered)
+
+        const error = yield* server.watchAuthorized(watchRequest(), "second").pipe(Effect.flip)
+        assert.deepStrictEqual(
+          error,
+          new ReplicaError.CapacityExceeded({ resource: "read authorizations", limit: 1 })
+        )
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(pending)
+      }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
   it.effect("does not reuse authorization after a caller mutates its principal", () =>
@@ -2044,6 +2318,26 @@ describe("server reconciled mutation log", () => {
       if (first._tag === "Accepted") assert.strictEqual(first.serverSequence, 1)
     })))
 
+  it.effect("republishes an accepted retry from its durable authoritative entry", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const local = yield* service(LocalStore.Store, localLayer())
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      const wakes = yield* Queue.unbounded<Protocol.Wake>()
+      const watcher = yield* server.watch(watchRequest()).pipe(
+        Stream.runForEach((wake) => Queue.offer(wakes, wake)),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Queue.take(wakes)
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("retry-wake"))
+      const first = yield* server.submit(pending.envelope)
+      assert.strictEqual(first._tag, "Accepted")
+      yield* Queue.take(wakes)
+
+      assert.deepStrictEqual(yield* server.submit(pending.envelope), first)
+      assert.deepStrictEqual(yield* Queue.take(wakes), Protocol.Wake.make({ spaceId }))
+      yield* Fiber.interrupt(watcher)
+    })))
+
   it.effect("reauthorizes an exact retry before returning its durable receipt", () =>
     Effect.scoped(
       Effect.gen(function*() {
@@ -2571,6 +2865,22 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual(wakeCapacityError._tag, "InvalidConfiguration")
       if (wakeCapacityError._tag === "InvalidConfiguration") {
         assert.strictEqual(wakeCapacityError.option, "wakeCapacity")
+      }
+
+      const pendingReadAuthorizationError = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layerTrusted({
+          ...serverHistory,
+          definition: Domain.definition,
+          maximumPendingReadAuthorizations: 0
+        }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(database())
+        )
+      ).pipe(Effect.flip)
+      assert.strictEqual(pendingReadAuthorizationError._tag, "InvalidConfiguration")
+      if (pendingReadAuthorizationError._tag === "InvalidConfiguration") {
+        assert.strictEqual(pendingReadAuthorizationError.option, "maximumPendingReadAuthorizations")
       }
 
       const server = yield* service(ServerStore.ServerStore, serverLayer())

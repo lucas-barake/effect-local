@@ -38,6 +38,7 @@ const store = ServerStore.layer({
   readAuthorizationRefreshInterval: "1 second",
   maximumWatchersPerSpace: 1_024,
   maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
   readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
@@ -73,6 +74,7 @@ describe("principal assertions", () => {
         readMailboxCapacity: 32,
         watchMailboxCapacity: 32,
         presencePublicationMailboxCapacity: 32,
+        maximumConcurrentBootstrapAuthorizations: 16,
         maximumConcurrentBootstrapPagesPerSpace: 4,
         maximumConcurrentPresencePublicationsPerSpace: 16
       }).pipe(

@@ -123,6 +123,7 @@ const serverHistory = {
   readAuthorizationRefreshInterval: "1 second" as const,
   maximumWatchersPerSpace: 1_024,
   maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
   readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 0,
   maximumHistoryEntries: 10_000,
@@ -142,6 +143,7 @@ const entityOptions = {
   readMailboxCapacity: 64,
   watchMailboxCapacity: 64,
   presencePublicationMailboxCapacity: 64,
+  maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
   maximumConcurrentPresencePublicationsPerSpace: 16
 } satisfies SpaceEntity.HandlerOptions

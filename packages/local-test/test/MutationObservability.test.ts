@@ -76,6 +76,7 @@ const serverHistory = {
   readAuthorizationRefreshInterval: "1 second" as const,
   maximumWatchersPerSpace: 1_024,
   maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
   readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,

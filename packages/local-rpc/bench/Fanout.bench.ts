@@ -9,6 +9,7 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
@@ -75,8 +76,9 @@ const store = ServerStore.layerTrusted({
   maintenanceConcurrency: 1,
   maintenanceSpaceBatchSize: 128,
   maximumWatchersPerSpace: 1_024,
-  readAuthorizationRefreshInterval: "30 seconds",
+  readAuthorizationRefreshInterval: Duration.days(1),
   maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
   readAuthorizationCacheCapacity: 4_096,
   migration: { retryDelay: "1 millis", maximumAttempts: 8 }
 }).pipe(
@@ -91,6 +93,7 @@ const cluster = SpaceEntity.layer({
   readMailboxCapacity: 32,
   watchMailboxCapacity: 1_024,
   presencePublicationMailboxCapacity: 32,
+  maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
   maximumConcurrentPresencePublicationsPerSpace: 16
 }).pipe(
@@ -193,6 +196,7 @@ const fanoutBench = Layer.effect(
           const envelope = submissions[nextSubmission++]
           if (envelope === undefined) return Effect.die("Fanout benchmark exhausted its prepared submissions")
           return Effect.gen(function*() {
+            for (const wake of wakes) assert.strictEqual(Queue.sizeUnsafe(wake), 0)
             const receipt = yield* client.submit(
               fixture.spaceId,
               { envelope, schema: definition.schemaIdentity },
@@ -202,7 +206,10 @@ const fanoutBench = Layer.effect(
             const expected = {
               spaceId: fixture.spaceId
             }
-            for (const wake of wakes) assert.deepStrictEqual(yield* Queue.take(wake), expected)
+            for (const wake of wakes) {
+              assert.deepStrictEqual(yield* Queue.take(wake), expected)
+              assert.strictEqual(Queue.sizeUnsafe(wake), 0)
+            }
           })
         })
       )

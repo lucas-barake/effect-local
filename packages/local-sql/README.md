@@ -82,15 +82,19 @@ retries, deduplicates stable mutation identities, stores terminal rejections, as
 accepted mutations, and materializes authoritative state in the same SQL transaction. Its required history options
 set retained targets, hard admission caps, snapshot capacity, bootstrap page capacity, prune batches, retained
 snapshots, migration retry, maintenance concurrency, and the keyset page size used to enumerate spaces. The required
-`maximumWatchersPerSpace`, `readAuthorizationRefreshInterval`, `maximumConcurrentReadAuthorizations`, and
-`readAuthorizationCacheCapacity` options bound live sync streams and their policy work. `ServerStore.layerTrusted` is
-the explicit allow all composition.
+`maximumWatchersPerSpace`, `readAuthorizationRefreshInterval`, `maximumConcurrentReadAuthorizations`,
+`maximumPendingReadAuthorizations`, and `readAuthorizationCacheCapacity` options bound live sync streams and their
+policy work. `ServerStore.layerTrusted` is the explicit allow all composition.
 
-Sync watch authorization shares successful structural `(spaceId, clientId, normalized scope, principal)` checks. Completed successes are finite,
-pending equal checks use one lookup, and denials are not cached. Each watcher starts refresh halfway through the
-configured interval. If no fresh success is available at the current success expiry, the watcher scope closes and its
-stream fails with `AuthorizationDenied`. `readAuthorizationRefreshInterval` is therefore the fail closed worst case
-revocation bound. Pull and Bootstrap perform uncached one shot read authorization.
+Sync watch authorization shares successful structural `(spaceId, clientId, normalized scope, principal)` checks.
+`maximumConcurrentReadAuthorizations` bounds executing policy calls. `maximumPendingReadAuthorizations` independently
+bounds all live authorization callers and distinct owner lookups. It also bounds distinct per-wake visibility work
+waiting for execution. `readAuthorizationCacheCapacity` bounds completed successes. Active watchers have their own
+limit. Equal checks use one lookup within the caller allowance and denials are not cached. Overflow fails with typed
+`CapacityExceeded { resource: "read authorizations", limit }`. Each watcher starts refresh halfway through the configured
+interval. If no fresh success is available at the current success expiry, the watcher scope closes and its stream fails
+with `AuthorizationDenied`. `readAuthorizationRefreshInterval` is therefore the fail closed worst case revocation bound.
+Pull and Bootstrap perform uncached one shot read authorization.
 
 Each accepted admission publishes a shared wake after its transaction commits. Watchers do not perform a SQLite
 transaction or space row write per publication. `wakeCapacity` is the optional sliding wake queue depth, while
@@ -123,6 +127,9 @@ const StoreLive = ServerStore.layer({
   ...serverHistory,
   definition,
   readAuthorizationRefreshInterval: "30 seconds",
+  maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
+  readAuthorizationCacheCapacity: 4_096,
   authorizeAccess,
   authorizeMutation,
   authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
@@ -157,6 +164,7 @@ const StoreLive = ServerStore.layer({
   maximumWatchersPerSpace: 1_024,
   readAuthorizationRefreshInterval: "30 seconds",
   maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
   readAuthorizationCacheCapacity: 4_096,
   migration: { retryDelay: "25 millis", maximumAttempts: 8 }
 })

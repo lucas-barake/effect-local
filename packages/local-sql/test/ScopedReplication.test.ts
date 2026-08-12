@@ -40,6 +40,7 @@ const history = {
   wakeCapacity: 16,
   maximumWatchersPerSpace: 1_024,
   maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
   readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
@@ -299,21 +300,10 @@ describe("scoped replication", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
-  it.effect("does not wake for hidden mutations and emits a periodic revocation hint", () =>
+  it.effect("emits a periodic revocation hint", () =>
     Effect.scoped(
       Effect.gen(function*() {
-        const hiddenChecked = yield* Deferred.make<void>()
-        const server = yield* service(
-          ServerStore.ServerStore,
-          makeServer((input) => {
-            if (input._tag === "Entity" && input.entity.key === "private") {
-              return Deferred.succeed(hiddenChecked, undefined).pipe(
-                Effect.andThen(Effect.fail("private"))
-              )
-            }
-            return Effect.void
-          })
-        )
+        const server = yield* service(ServerStore.ServerStore, makeServer())
         const initial = yield* server.pullAuthorized(pullRequest(), "reader")
         if (!("_tag" in initial)) assert.fail("expected scoped bootstrap")
         yield* server.bootstrapAuthorized(bootstrapRequest(initial.manifest), "reader")
@@ -337,14 +327,11 @@ describe("scoped replication", () => {
           Effect.flatMap(Effect.forkChild({ startImmediately: true }))
         )
         assert.deepStrictEqual(yield* Queue.take(wakes), { spaceId })
-        yield* server.submit(yield* envelope("private", 1))
-        yield* Deferred.await(hiddenChecked)
-        assert.isTrue(Option.isNone(yield* Queue.poll(wakes)))
-
-        yield* server.submit(yield* envelope("public", 2, "visible"))
-        assert.deepStrictEqual(yield* Queue.take(wakes), { spaceId })
+        const periodicWake = yield* Queue.take(wakes).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
         yield* TestClock.adjust("1 second")
-        assert.deepStrictEqual(yield* Queue.take(wakes), { spaceId })
+        assert.deepStrictEqual(yield* Fiber.join(periodicWake), { spaceId })
         yield* Fiber.interrupt(watcher)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))

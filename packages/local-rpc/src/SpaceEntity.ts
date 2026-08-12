@@ -210,6 +210,7 @@ export interface HandlerOptions {
   readonly readMailboxCapacity: number
   readonly watchMailboxCapacity: number
   readonly presencePublicationMailboxCapacity: number
+  readonly maximumConcurrentBootstrapAuthorizations: number
   readonly maximumConcurrentBootstrapPagesPerSpace: number
   readonly maximumConcurrentPresencePublicationsPerSpace: number
   readonly maxIdleTime?: Duration.Input
@@ -256,6 +257,15 @@ export const layerHandlers = (options: HandlerOptions) =>
         })
       }
       if (
+        !Number.isSafeInteger(options.maximumConcurrentBootstrapAuthorizations) ||
+        options.maximumConcurrentBootstrapAuthorizations <= 0
+      ) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "maximumConcurrentBootstrapAuthorizations",
+          message: "maximumConcurrentBootstrapAuthorizations must be a positive safe integer"
+        })
+      }
+      if (
         !Number.isSafeInteger(options.maximumConcurrentBootstrapPagesPerSpace) ||
         options.maximumConcurrentBootstrapPagesPerSpace <= 0
       ) {
@@ -275,6 +285,7 @@ export const layerHandlers = (options: HandlerOptions) =>
       }
 
       const common = commonHandlerOptions(options)
+      const bootstrapAuthorizations = yield* Semaphore.make(options.maximumConcurrentBootstrapAuthorizations)
       const admission = SpaceAdmissionEntity.toLayer(
         Effect.gen(function*() {
           const address = yield* Entity.CurrentAddress
@@ -338,12 +349,23 @@ export const layerHandlers = (options: HandlerOptions) =>
                       message: "The routed space does not match the payload"
                     })
                   }
+                  const prepared = yield* Semaphore.withPermitsIfAvailable(
+                    bootstrapAuthorizations,
+                    1,
+                    verifier.verify(payload.assertion).pipe(
+                      Effect.flatMap((principal) => store.prepareBootstrapAuthorized(payload.request, principal))
+                    )
+                  )
+                  if (Option.isNone(prepared)) {
+                    return yield* new ReplicaError.CapacityExceeded({
+                      resource: "bootstrap authorizations",
+                      limit: options.maximumConcurrentBootstrapAuthorizations
+                    })
+                  }
                   const result = yield* Semaphore.withPermitsIfAvailable(
                     bootstrapPages,
                     1,
-                    verifier.verify(payload.assertion).pipe(
-                      Effect.flatMap((principal) => store.bootstrapAuthorized(payload.request, principal))
-                    )
+                    prepared.value
                   )
                   if (Option.isSome(result)) return result.value
                   return yield* new ReplicaError.CapacityExceeded({

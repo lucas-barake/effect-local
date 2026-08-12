@@ -1,6 +1,5 @@
 import * as Clock from "effect/Clock"
 import * as Deferred from "effect/Deferred"
-import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as MutableHashMap from "effect/MutableHashMap"
@@ -16,6 +15,7 @@ export interface Success<out A,> {
 
 export interface Snapshot {
   readonly pending: number
+  readonly requesting: number
   readonly completed: number
 }
 
@@ -34,10 +34,12 @@ export interface Coordinator<K, A, E,> {
 }
 
 export interface Options<E,> {
-  readonly refreshInterval: Duration.Input
-  readonly lookupTimeout: Duration.Input
+  readonly refreshIntervalNanos: bigint
+  readonly lookupTimeoutNanos: bigint
   readonly onLookupTimeout: () => E
   readonly maximumConcurrentLookups: number
+  readonly maximumPendingLookups: number
+  readonly onPendingCapacityExceeded: () => E
   readonly completedCacheCapacity: number
 }
 
@@ -49,6 +51,7 @@ type Registration<A, E,> =
   | { readonly _tag: "Cached"; readonly success: Success<A> }
   | { readonly _tag: "Follower"; readonly pending: Pending<A, E> }
   | { readonly _tag: "Leader"; readonly pending: Pending<A, E> }
+  | { readonly _tag: "AtCapacity" }
 
 const pruneCompleted = <K, A,>(
   completed: MutableHashMap.MutableHashMap<K, Success<A>>,
@@ -71,11 +74,10 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
     const ownerScope = yield* Effect.scope
     const clock = yield* Clock.Clock
     const semaphore = yield* Semaphore.make(options.maximumConcurrentLookups)
-    const refreshIntervalNanos = Duration.toNanosUnsafe(options.refreshInterval)
-    const lookupTimeoutNanos = Duration.toNanosUnsafe(options.lookupTimeout)
     const pending = MutableHashMap.empty<K, Pending<A, E>>()
     const completed = MutableHashMap.empty<K, Success<A>>()
     let nextGeneration = 0n
+    let requesting = 0
 
     yield* Scope.addFinalizer(
       ownerScope,
@@ -98,6 +100,7 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
         }
         const active = MutableHashMap.get(pending, key)
         if (Option.isSome(active)) return { _tag: "Follower", pending: active.value }
+        if (MutableHashMap.size(pending) >= options.maximumPendingLookups) return { _tag: "AtCapacity" }
         const created: Pending<A, E> = { deferred: Deferred.makeUnsafe<Success<A>, E>() }
         MutableHashMap.set(pending, key, created)
         return { _tag: "Leader", pending: created }
@@ -106,6 +109,7 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
     const complete = (
       key: K,
       registered: Pending<A, E>,
+      afterGeneration: bigint | undefined,
       exit: Exit.Exit<A, E>
     ): Effect.Effect<void> =>
       Effect.sync(() => {
@@ -120,13 +124,19 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
           const success: Success<A> = {
             value: exit.value,
             generation: nextGeneration++,
-            expiresAtNanos: nowNanos + refreshIntervalNanos
+            expiresAtNanos: nowNanos + options.refreshIntervalNanos
           }
           MutableHashMap.remove(completed, key)
           MutableHashMap.set(completed, key, success)
           pruneCompleted(completed, nowNanos, options.completedCacheCapacity)
           sharedExit = Exit.succeed(success)
         } else {
+          if (afterGeneration !== undefined) {
+            const cached = MutableHashMap.get(completed, key)
+            if (Option.isSome(cached) && cached.value.generation === afterGeneration) {
+              MutableHashMap.remove(completed, key)
+            }
+          }
           sharedExit = Exit.failCause(exit.cause)
         }
         Deferred.doneUnsafe(registered.deferred, sharedExit)
@@ -134,13 +144,14 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
 
     const run = (
       key: K,
+      afterGeneration: bigint | undefined,
       lookup: (key: K) => Effect.Effect<A, E>,
       registered: Pending<A, E>
     ): Effect.Effect<void> =>
       Effect.uninterruptibleMask((restore) =>
         restore(
           Effect.suspend(() => {
-            const expiresAtNanos = clock.monotonicTimeNanosUnsafe() + lookupTimeoutNanos
+            const expiresAtNanos = clock.monotonicTimeNanosUnsafe() + options.lookupTimeoutNanos
             return Semaphore.withPermit(
               semaphore,
               Effect.suspend(() => {
@@ -150,7 +161,7 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
                 return lookup(key)
               })
             ).pipe(
-              Effect.timeoutOption(options.lookupTimeout),
+              Effect.timeoutOption(options.lookupTimeoutNanos),
               Effect.flatMap(Option.match({
                 onNone: () => Effect.fail(options.onLookupTimeout()),
                 onSome: Effect.succeed
@@ -159,7 +170,7 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
           })
         ).pipe(
           Effect.exit,
-          Effect.flatMap((exit) => complete(key, registered, exit))
+          Effect.flatMap((exit) => complete(key, registered, afterGeneration, exit))
         )
       )
 
@@ -169,16 +180,29 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
       lookup: (key: K) => Effect.Effect<A, E>
     ): Effect.Effect<Success<A>, E> =>
       Effect.uninterruptibleMask((restore) =>
-        register(key, afterGeneration).pipe(
-          Effect.flatMap((registration) => {
-            if (registration._tag === "Cached") return Effect.succeed(registration.success)
-            if (registration._tag === "Leader") {
-              return run(key, lookup, registration.pending).pipe(
-                Effect.forkIn(ownerScope, { startImmediately: true }),
-                Effect.andThen(restore(Deferred.await(registration.pending.deferred)))
-              )
-            }
-            return restore(Deferred.await(registration.pending.deferred))
+        Effect.sync(() => {
+          if (requesting >= options.maximumPendingLookups) return false
+          requesting++
+          return true
+        }).pipe(
+          Effect.flatMap((admitted) => {
+            if (!admitted) return Effect.fail(options.onPendingCapacityExceeded())
+            return register(key, afterGeneration).pipe(
+              Effect.flatMap((registration) => {
+                if (registration._tag === "Cached") return Effect.succeed(registration.success)
+                if (registration._tag === "AtCapacity") return Effect.fail(options.onPendingCapacityExceeded())
+                if (registration._tag === "Leader") {
+                  return run(key, afterGeneration, lookup, registration.pending).pipe(
+                    Effect.forkIn(ownerScope, { startImmediately: true }),
+                    Effect.andThen(restore(Deferred.await(registration.pending.deferred)))
+                  )
+                }
+                return restore(Deferred.await(registration.pending.deferred))
+              }),
+              Effect.ensuring(Effect.sync(() => {
+                requesting--
+              }))
+            )
           })
         )
       )
@@ -195,6 +219,7 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
         pruneCompleted(completed, clock.monotonicTimeNanosUnsafe(), options.completedCacheCapacity)
         return {
           pending: MutableHashMap.size(pending),
+          requesting,
           completed: MutableHashMap.size(completed)
         }
       })

@@ -148,8 +148,10 @@ publications carry only notifications.
 
 `SpaceEntity.HandlerOptions` requires positive finite `admissionMailboxCapacity`, `readMailboxCapacity`,
 `watchMailboxCapacity`, and `presencePublicationMailboxCapacity` values. It also requires
-`maximumConcurrentBootstrapPagesPerSpace` and `maximumConcurrentPresencePublicationsPerSpace`. Bootstrap fails fast
-with `CapacityExceeded { resource: "bootstrap pages", limit }` when its work allowance is full.
+`maximumConcurrentBootstrapAuthorizations`, `maximumConcurrentBootstrapPagesPerSpace`, and
+`maximumConcurrentPresencePublicationsPerSpace`. Bootstrap assertion verification and preparation share one fail fast
+Layer wide allowance. Published page reads use a separate per space allowance. Saturation reports `CapacityExceeded`
+with resource `bootstrap authorizations` or `bootstrap pages`.
 
 `ServerStore.maximumWatchersPerSpace` is the active sync watcher allowance. `PresenceHub.maximumWatchersPerSpace` is a
 separate active presence watcher allowance. `ServerStore.wakeCapacity` and `PresenceHub.capacity` are sliding
@@ -158,11 +160,14 @@ watchers` or `presence watchers`. Interrupted, denied, and revoked streams relea
 
 Sync watch authorization successes share one structural `(spaceId, clientId, normalized scope, principal)` lookup and expire after
 `readAuthorizationRefreshInterval`. `maximumConcurrentReadAuthorizations` bounds policy work and
-`readAuthorizationCacheCapacity` bounds completed successes. Pending equal lookups share one result and denials are not
-cached. Each watch begins refresh halfway through the interval. If a fresh success is not available at the existing
-success expiry, the watcher scope closes and the stream fails with `AuthorizationDenied`. The configured interval is
-therefore the fail closed revocation bound even when policy work hangs or the client stops pulling. Pull and Bootstrap
-perform uncached one shot authorization checks.
+`maximumPendingReadAuthorizations` independently bounds all live authorization callers and distinct owner lookups. It
+also bounds distinct per-wake visibility evaluations waiting for policy execution. `readAuthorizationCacheCapacity`
+bounds completed successes. These limits are independent of the active watcher allowance. Equal lookups share one result
+within the caller allowance and denials are not cached. Overflow fails with typed
+`CapacityExceeded { resource: "read authorizations", limit }`. Each watch begins refresh halfway
+through the interval. If a fresh success is not available at the existing success expiry, the watcher scope closes and
+the stream fails with `AuthorizationDenied`. The configured interval is therefore the fail closed revocation bound even
+when policy work hangs or the client stops pulling. Pull and Bootstrap perform uncached one shot authorization checks.
 
 Capacity failures use the Schema tagged `CapacityExceeded { resource, limit }` error across SQL, presence, and RPC
 boundaries. Full Cluster mailboxes map to `ServerUnavailable` because the request did not enter its domain handler.
