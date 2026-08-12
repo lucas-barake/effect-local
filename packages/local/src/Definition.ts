@@ -20,6 +20,7 @@ export interface Definition<
   readonly version: Identity.SchemaVersion
   readonly schemaIdentity: Identity.SchemaIdentity
   readonly hash: string
+  readonly indexLayoutHash: string
 }
 
 const indexed = <A extends { readonly name: string },>(kind: string, values: ReadonlyArray<A>) => {
@@ -58,13 +59,6 @@ export function make(options: {
   const mutationByName = indexed("mutation", options.mutations)
   const queryByName = indexed("query", queries)
   const version = Identity.SchemaVersion.make(options.version)
-  for (const query of queries) {
-    for (const dependency of query.dependsOn) {
-      if (modelByName.get(dependency.name) !== dependency) {
-        return Defect.invalid(`Query ${query.name} depends on an unregistered model: ${dependency.name}`)
-      }
-    }
-  }
   const models = options.models.map((model) => ({
     name: model.name,
     version: model.version,
@@ -89,9 +83,34 @@ export function make(options: {
       name: query.name,
       payload: SchemaDescriptor.make(query.payloadSchema),
       success: SchemaDescriptor.make(query.successSchema),
-      error: SchemaDescriptor.make(query.errorSchema),
-      dependsOn: query.dependsOn.map((model) => model.name).toSorted()
+      error: SchemaDescriptor.make(query.errorSchema)
     })).toSorted(byName)
+  })
+  const indexLayoutHash = Canonical.hash({
+    format: 1,
+    indexes: options.models.flatMap((model) =>
+      Object.entries(model.indexes).map(([name, index]) => ({
+        model: model.name,
+        name,
+        version: index.version,
+        partition: index.partition.map((component) => ({
+          name: component.name,
+          affinity: component.affinity,
+          schema: SchemaDescriptor.make(component.schema)
+        })),
+        sort: index.sort.map((component) => ({
+          name: component.name,
+          affinity: component.affinity,
+          schema: SchemaDescriptor.make(component.schema)
+        }))
+      }))
+    ).toSorted((left, right) => {
+      const leftName = `${left.model}\u0000${left.name}`
+      const rightName = `${right.model}\u0000${right.name}`
+      if (leftName < rightName) return -1
+      if (leftName > rightName) return 1
+      return 0
+    })
   })
   return Object.freeze({
     models: Object.freeze([...options.models]),
@@ -102,7 +121,8 @@ export function make(options: {
     queryByName,
     version,
     schemaIdentity,
-    hash
+    hash,
+    indexLayoutHash
   })
 }
 

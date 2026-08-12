@@ -4,6 +4,7 @@ import type * as Schema from "effect/Schema"
 import type * as Field from "./Field.js"
 import type * as Model from "./Model.js"
 import type * as ReplicaError from "./ReplicaError.js"
+import type * as SecondaryIndex from "./SecondaryIndex.js"
 
 export interface Transaction {
   readonly get: <M extends Model.Any,>(
@@ -25,7 +26,8 @@ export interface Transaction {
 
 export interface Query {
   readonly get: Transaction["get"]
-  readonly all: <M extends Model.Any,>(
-    model: M
-  ) => Effect.Effect<ReadonlyArray<Model.Value<M>>, ReplicaError.StorageError>
+  readonly from: <M extends Model.Any, Name extends keyof Model.Indexes<M> & string,>(
+    model: M,
+    index: Name
+  ) => SecondaryIndex.Builder<M["name"], Name, Model.Value<M>, Model.Indexes<M>[Name]>
 }
