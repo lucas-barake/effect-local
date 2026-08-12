@@ -9,7 +9,6 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as IndexStore from "./IndexStore.js"
 import * as Codec from "./internal/codec.js"
@@ -174,7 +173,7 @@ export const layer = <D extends Definition.Any,>(
           yield* queryReactivity.record(key, reads)
           return value
         })).pipe(
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
           Effect.withSpan("QueryExecutor.execute", {
             attributes: { "query.name": query.name }
           })

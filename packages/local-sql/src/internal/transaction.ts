@@ -9,7 +9,6 @@ import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
@@ -114,7 +113,7 @@ export const local = (options: {
           entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
           value: encoded.encodedValue
         })
-      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     delete: (model, key) =>
       Effect.gen(function*() {
         const encoded = yield* encodeEntity(model, key)
@@ -135,7 +134,7 @@ export const local = (options: {
           _tag: "Delete",
           entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }
         })
-      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)
   }
 }
@@ -189,7 +188,7 @@ export const server = (options: {
           entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
           value: encoded.encodedValue
         })
-      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     delete: (model, key) =>
       Effect.gen(function*() {
         const encoded = yield* encodeEntity(model, key)
@@ -200,7 +199,7 @@ export const server = (options: {
           _tag: "Delete",
           entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }
         })
-      }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)
   }
 }
@@ -226,6 +225,6 @@ export const applyCanonicalChange = (
           ${change.entity.modelVersion})
         ON CONFLICT (space_id, schema_generation, model, entity_key) DO UPDATE SET
           value_json = excluded.value_json, model_version = excluded.model_version`
-  }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+  }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const entityKey = (entity: Protocol.EntityKey) => `${entity.model}\u0000${Canonical.stringify(entity.key)}`

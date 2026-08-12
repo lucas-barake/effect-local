@@ -206,7 +206,7 @@ export const runCatalog = (
         }
         return yield* Effect.void
       }))
-    }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
     let attempt = 1
     while (true) {
@@ -1721,6 +1721,6 @@ export const client = (options: {
         ON CONFLICT (space_id) DO NOTHING`
     }
     return undefined
-  }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+  }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const server = (options: Options = defaultOptions) => runCatalog("Server", serverCatalog, options)

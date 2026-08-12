@@ -16,7 +16,6 @@ import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
@@ -677,7 +676,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             evolutionOptions = { ...evolutionOptions, batchBytes: options.schemaEvolutionBatchBytes }
           }
           return yield* SchemaEvolution.server(evolutionOptions).pipe(Effect.provideService(SqlClient.SqlClient, sql))
-        }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const bootstrapEntityFits = (spaceId: Identity.SpaceId, entity: Protocol.SnapshotEntity) =>
         Effect.gen(function*() {
@@ -1160,20 +1159,21 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             return yield* projectReceipt(receipt, callerDefinition)
           }))
         }).pipe(
-          Effect.catchIf(
-            SqlError.isSqlError,
-            (cause) =>
-              Effect.fail(new ReplicaError.UnknownCommitOutcome({ mutationId: submittedEnvelope.mutationId, cause }))
-          ),
+          Effect.catchTag("SqlError", (cause) =>
+            Effect.fail(new ReplicaError.UnknownCommitOutcome({ mutationId: submittedEnvelope.mutationId, cause }))),
           Effect.tap((receipt) => {
             const changes = wakeChanges
-            if (receipt._tag !== "Accepted" || changes === undefined) return Effect.void
+            if (receipt._tag !== "Accepted" || changes === undefined) {
+              return Effect.void
+            }
             return RcMap.has(wakes, submittedEnvelope.spaceId).pipe(
               Effect.flatMap((hasWatchers) => {
                 if (hasWatchers) {
                   return Effect.scoped(
                     RcMap.get(wakes, submittedEnvelope.spaceId).pipe(
-                      Effect.flatMap((channel) => PubSub.publish(channel, changes))
+                      Effect.flatMap((channel) =>
+                        PubSub.publish(channel, changes)
+                      )
                     )
                   )
                 }
@@ -1320,16 +1320,13 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             return yield* projectReceipt(receipt, callerDefinition)
           }))
         }).pipe(
-          Effect.catchIf(
-            SqlError.isSqlError,
-            (cause) =>
-              Effect.fail(
-                new ReplicaError.UnknownCommitOutcome({
-                  mutationId: submittedEnvelope.mutationId,
-                  cause
-                })
-              )
-          ),
+          Effect.catchTag("SqlError", (cause) =>
+            Effect.fail(
+              new ReplicaError.UnknownCommitOutcome({
+                mutationId: submittedEnvelope.mutationId,
+                cause
+              })
+            )),
           Effect.withSpan("ServerStore.discard", {
             attributes: { "mutation.id": submittedEnvelope.mutationId, "space.id": submittedEnvelope.spaceId }
           })
@@ -1376,7 +1373,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             },
             entities: decoded.entities
           })
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const publishAndPrune = (
         prepared: Option.Option<
@@ -1493,7 +1490,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   ORDER BY server_sequence DESC, terminal_sequence DESC
                   LIMIT -1 OFFSET ${options.retainedSnapshots}
                 )`
-            })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         })
 
       const maintain = (spaceId: Identity.SpaceId) =>

@@ -8,7 +8,6 @@ import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
@@ -934,7 +933,7 @@ export const make = (options: Options) => {
         normalized,
         normalizedDigest
       )
-    })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
   const bootstrap = (
     request: Protocol.BootstrapRequest,
@@ -1071,7 +1070,7 @@ export const make = (options: Options) => {
         hasMore: afterOrdinal + selected.length + 1 < row.entry_count,
         serverSchema: options.definition.schemaIdentity
       })
-    })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
   return { pull, bootstrap } as const
 }

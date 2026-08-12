@@ -10,7 +10,6 @@ import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as Codec from "./internal/codec.js"
@@ -1411,7 +1410,7 @@ export const client = (options: ClientOptions) =>
       if (options.afterBatch !== undefined) yield* options.afterBatch
     }
   }).pipe(
-    Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+    Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
     Effect.withSpan("SchemaEvolution.client", {
       attributes: { "space.id": options.spaceId, "client.id": options.clientId }
     })
@@ -2162,6 +2161,6 @@ export const server = (options: ServerOptions) =>
       if (options.afterBatch !== undefined) yield* options.afterBatch
     }
   }).pipe(
-    Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+    Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
     Effect.withSpan("SchemaEvolution.server", { attributes: { "space.id": options.spaceId } })
   )

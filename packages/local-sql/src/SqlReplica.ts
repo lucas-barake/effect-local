@@ -402,7 +402,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const evictMembership = (spaceId: Identity.SpaceId) =>
         sql.withTransaction(sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`).pipe(
           Effect.asVoid,
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
         )
 
       const reserveLeave = (

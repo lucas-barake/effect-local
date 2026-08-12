@@ -22,7 +22,6 @@ import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as IndexStore from "./IndexStore.js"
 import * as ClientLineage from "./internal/clientLineage.js"
@@ -639,7 +638,7 @@ export const layer = (
       yield* sql`UPDATE effect_local_client_pending_data SET submission_state = 'Retrying'
         WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
           AND submission_state = 'Submitting'`.pipe(
-        Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+        Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
       )
       const indexAddress = (current: typeof Rows.ClientMetaRow.Type): IndexStore.Address => ({
         spaceId: options.spaceId,
@@ -856,7 +855,7 @@ export const layer = (
           }
           return deletedSettlements
         })).pipe(
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
         )
       }
 
@@ -928,7 +927,7 @@ export const layer = (
           Effect.mapError(StorageUnavailable.make),
           Effect.flatMap(Effect.forEach(decodePendingRow))
         )
-      })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const pending = sql.withTransaction(Effect.gen(function*() {
         yield* validateFence(yield* meta)
@@ -936,7 +935,7 @@ export const layer = (
           Effect.mapError(StorageUnavailable.make),
           Effect.flatMap(Effect.forEach((row) => decodePendingRow(row).pipe(Effect.flatMap(decodeClientPending))))
         )
-      })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const markSubmitting = (mutationId: Identity.MutationId) =>
         Effect.gen(function*() {
@@ -961,7 +960,7 @@ export const layer = (
                   AND mutation_id = ${mutationId}`
               changed = true
             }
-          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
           if (changed) yield* invalidate([], [], [], true)
         })
 
@@ -978,7 +977,7 @@ export const layer = (
                   AND mutation_id = ${mutationId}`
               changed = true
             }
-          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
           if (changed) yield* invalidate([], [], [], true)
         })
 
@@ -988,7 +987,7 @@ export const layer = (
           Effect.mapError(StorageUnavailable.make),
           Effect.flatMap(Effect.forEach(decodeQuarantineRow))
         )
-      })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const quarantineByMutation = (mutationId: Identity.MutationId) =>
         sql.withTransaction(Effect.gen(function*() {
@@ -996,7 +995,7 @@ export const layer = (
           const found = yield* findQuarantineByMutation(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
           if (Option.isNone(found)) return Option.none()
           return Option.some(yield* decodeQuarantineRow(found.value))
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const quarantineCancellation = (mutationId: Identity.MutationId) =>
         sql.withTransaction(Effect.gen(function*() {
@@ -1014,7 +1013,7 @@ export const layer = (
             })
           }
           return Option.some(yield* decodeQuarantineRow(found.value))
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const prepareInvalidation = (
         entities: ReadonlyArray<Protocol.EntityKey>,
@@ -1253,7 +1252,7 @@ export const layer = (
 
       const rebuildProjection = Effect.gen(function*() {
         let current = yield* sql.withTransaction(meta).pipe(
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
         )
         if (current.projection_replay_generation === null) return yield* Effect.void
         yield* validateFence(current)
@@ -1263,7 +1262,7 @@ export const layer = (
           yield* sql.withTransaction(sql`UPDATE effect_local_client_spaces
             SET projection_replay_generation = ${target}, projection_replay_cursor = NULL
             WHERE space_id = ${options.spaceId}`).pipe(
-            Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+            Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
           )
           current = { ...current, projection_replay_generation: target, projection_replay_cursor: null }
         }
@@ -1292,7 +1291,7 @@ export const layer = (
               yield* sql`DELETE FROM effect_local_client_visible_entities_data
                 WHERE rowid IN ${sql.in(ids.map((id) => id.row_id))}`
               return true
-            })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
             if (!deleted) break
             yield* Effect.yieldNow
           }
@@ -1319,7 +1318,7 @@ export const layer = (
                 return false
               }
               return true
-            })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) =>
+            })).pipe(Effect.catchTag("SqlError", (cause) =>
               Effect.fail(StorageUnavailable.make(cause))))
             if (!copied) break
             yield* Effect.yieldNow
@@ -1353,7 +1352,7 @@ export const layer = (
             yield* sql`UPDATE effect_local_client_spaces SET projection_replay_cursor = ${`pending:${next}`}
               WHERE space_id = ${options.spaceId}`
             return next
-          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
           if (replayed === null) break
           after = replayed
           yield* Effect.yieldNow
@@ -1376,7 +1375,7 @@ export const layer = (
             visible_revision = visible_revision + 1
             WHERE space_id = ${options.spaceId}`
           return yield* Effect.void
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
         while (true) {
           const deleted = yield* sql.withTransaction(Effect.gen(function*() {
@@ -1390,7 +1389,7 @@ export const layer = (
             yield* sql`DELETE FROM effect_local_client_visible_entities_data
               WHERE rowid IN ${sql.in(ids.map((id) => id.row_id))}`
             return true
-          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
           if (!deleted) break
           yield* Effect.yieldNow
         }
@@ -1584,7 +1583,7 @@ export const layer = (
                 AND mutation_id = ${receipt.mutationId} AND submission_state <> 'AwaitingReceipt'`
             inserted = true
             return yield* Effect.void
-          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
           if (inserted || pruned.length > 0) {
             let receiptIds = pruned
             if (inserted) receiptIds = [receipt.mutationId, ...pruned]
@@ -1681,7 +1680,7 @@ export const layer = (
             )`
           prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
           return yield* Effect.void
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         const entities = Array.from(touched.values())
         let indexPoints: ReadonlyArray<IndexStore.Point> = []
         if (entities.length > 0) indexPoints = yield* rebuildWithIndexPoints(entities)
@@ -1747,7 +1746,7 @@ export const layer = (
           scopeGeneration: Identity.ReplicationScopeGeneration.make(current.scope_generation),
           cursor
         }
-      })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const setScope = (scope: Protocol.ReplicationScope) =>
         Effect.gen(function*() {
@@ -1781,7 +1780,7 @@ export const layer = (
             return yield* Effect.void
           }))
         }).pipe(
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
           Effect.withSpan("LocalStore.setScope")
         )
 
@@ -1915,7 +1914,7 @@ export const layer = (
               yield* sql`DELETE FROM effect_local_client_quarantine
               WHERE space_id = ${options.spaceId} AND mutation_id = ${receipt.mutationId}`
               return { canceledReplacement, touched: Array.from(canceledTouched.values()), receiptIds: pruned }
-            })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
             yield* deferInvalidation(
               transactionResult.touched,
               [receipt.mutationId, ...transactionResult.receiptIds],
@@ -2078,7 +2077,7 @@ export const layer = (
             return -1
           }))
         }).pipe(
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
           Effect.withSpan("LocalStore.prepareBootstrap", { attributes: { "snapshot.id": manifest.snapshotId } })
         )
 
@@ -2193,7 +2192,7 @@ export const layer = (
             return complete
           }))
         }).pipe(
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
           Effect.withSpan("LocalStore.stageBootstrapPage", {
             attributes: { "snapshot.id": page.manifest.snapshotId, "entry.count": page.entries.length }
           })
@@ -2400,7 +2399,7 @@ export const layer = (
             yield* sql`DELETE FROM effect_local_client_scoped_bootstrap WHERE space_id = ${options.spaceId}`
             prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
             return yield* Effect.void
-          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
           const entities = Array.from(dirty.values())
           const indexPoints = yield* rebuildWithIndexPoints(entities)
           const deletedSettlements = yield* deleteSettledPending(settlements)
@@ -2470,7 +2469,7 @@ export const layer = (
             }
             if (touched.size > 0) yield* requestProjectionReplay(yield* meta)
             return yield* Effect.void
-          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
           if (page.hasMore) {
             yield* deferInvalidation(Array.from(touched.values()), [])
             return []
@@ -2489,7 +2488,6 @@ export const layer = (
         withProjectionPermitThen(applyViewPageInGate(page), publishSettlements).pipe(
           Effect.asVoid,
           Effect.uninterruptible,
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
           Effect.withSpan("LocalStore.applyViewPage", {
             attributes: { "change.count": page.changes.length, "server.sequence": page.serverSequence }
           })
@@ -2523,13 +2521,12 @@ export const layer = (
             replication_view_id = NULL, replication_view_revision = 0
             WHERE space_id = ${options.spaceId}`
           yield* requestProjectionReplay(yield* meta)
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         yield* rebuildProjection
         yield* invalidate(Array.from(dirty.values()))
       }).pipe(
         Semaphore.withPermit(projectionGate),
         Effect.uninterruptible,
-        Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
         Effect.withSpan("LocalStore.revokeReplication")
       )
 
@@ -2537,7 +2534,7 @@ export const layer = (
         const row = yield* meta
         yield* validateFence(row)
         return { requested: row.requested_generation, completed: row.completed_generation }
-      })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const nextReconciliationGeneration = (requested: number) =>
         Effect.gen(function*() {
@@ -2561,7 +2558,7 @@ export const layer = (
           return requested
         })
       ).pipe(
-        Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+        Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
         Effect.withSpan("LocalStore.requestReconciliation")
       )
 
@@ -2584,7 +2581,7 @@ export const layer = (
             SET completed_generation = MAX(completed_generation, ${generation})
             WHERE space_id = ${options.spaceId}`
             return yield* Effect.void
-          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
           return yield* Effect.void
         }).pipe(Effect.withSpan("LocalStore.completeReconciliation", {
           attributes: { "reconciliation.generation": generation }
@@ -2761,7 +2758,7 @@ export const layer = (
               (space_id, original_mutation_id, replacement_mutation_id)
               VALUES (${options.spaceId}, ${mutationId}, ${mutationResult.pendingMutation.envelope.mutationId})`
             return mutationResult
-          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
           yield* reactivity.withBatch(
             invalidate(result.pendingMutation.changes.map((change) => change.entity), [], result.indexPoints, true)
           )
@@ -2783,7 +2780,7 @@ export const layer = (
               Effect.flatMap((value) => Codec.decode(Protocol.Receipt, value))
             )
           )
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const service: Service = {
         membershipIncarnation: initializedMeta.membership_incarnation,
@@ -2791,7 +2788,7 @@ export const layer = (
         mutate: (mutation, payloadValue) =>
           withProjectionGate(Effect.gen(function*() {
             const result = yield* sql.withTransaction(mutateInTransaction(mutation, payloadValue)).pipe(
-              Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+              Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
             )
             yield* reactivity.withBatch(
               invalidate(
@@ -2823,7 +2820,7 @@ export const layer = (
               model,
               key
             )
-          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
         pendingToSubmit,
         pending,
         settlements: Stream.fromPubSub(settlementPubSub),
@@ -2848,7 +2845,7 @@ export const layer = (
           const row = yield* meta
           yield* validateFence(row)
           return Identity.ServerSequence.make(row.server_cursor)
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
         replicationState,
         setScope,
         applyViewPage,
@@ -2856,7 +2853,7 @@ export const layer = (
         pendingCount: sql.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
           return (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
         reconciliationGenerations,
         requestReconciliation,
         completeReconciliation,
@@ -2991,7 +2988,7 @@ export const layer = (
                 )`
                 prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
                 return yield* Effect.void
-              })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+              })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
               deferredSettlements.push(...pageSettlements)
               yield* deferInvalidation(
                 touched,
