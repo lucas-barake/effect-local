@@ -29,6 +29,7 @@ export const layer: Layer.Layer<
         }
       })
     return SyncEngine.SyncEngine.of({
+      waitForCredentialChange: () => Effect.never,
       submit: (request) =>
         Effect.gen(function*() {
           yield* online(request.envelope.spaceId)

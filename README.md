@@ -348,14 +348,26 @@ retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted
 tests and already trusted processes.
 
 `SyncRpc.Rpcs` multiplexes submit, pull, bootstrap, watch, and presence on one Effect RPC WebSocket. The server uses
-`Authentication.layerServer`; the client uses `Authentication.layerClient`, which writes a redacted bearer credential
-to the request headers. The authenticated server facade sends all five operations to the Cluster entity for the
-requested space. Cluster supplies the unique live owner and cross runner stream routing. SQL stores the authoritative
-accepted log and terminal receipts. The application chooses Effect's runner storage, message storage, runner transport, and
-deployment Layers. It also remains responsible for its HTTP server, WebSocket path, TLS, Origin policy, credential
-verification, and tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete
-JSON frames. A reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload
-limit.
+`Authentication.layerServer`. The client uses `Authentication.layerClient` with an application supplied
+`CredentialProvider`. Its `acquire` Effect runs for every RPC and returns a redacted bearer credential plus its
+nonnegative generation. `awaitChange(rejectedGeneration)` signals when `acquire` can return a different generation.
+A rejected credential changes the space to `NeedsAuthentication` and pauses that generation. Publishing a new
+generation resumes synchronization through the same replica and WebSocket.
+
+`CredentialRejected` is a credential problem. `AuthenticatorUnavailable` is a verifier outage and remains retryable.
+`AuthorizationDenied` means an authenticated principal lacks permission and is terminal. `OperationTimeout` identifies
+the bounded session or RPC operation that expired. Session acquisition, unary RPCs, and stream acquisition default to
+10 second timeouts and accept `Duration.Input`. Established watch streams may remain idle. Transient reconciliation
+failures use capped exponential backoff from `retryDelay`, default 1 second, through `maximumRetryDelay`, default 1
+minute. See [synchronization](docs/sync.md) and the
+[`effect-local-rpc` guide](packages/local-rpc/README.md) for the provider contract and socket retry policy.
+
+The authenticated server facade sends all operations to the Cluster entity for the requested space. Cluster supplies
+the unique live owner and cross runner stream routing. SQL stores the authoritative accepted log and terminal
+receipts. The application chooses Effect's runner storage, message storage, runner transport, and deployment Layers.
+It also remains responsible for its HTTP server, WebSocket path, TLS, Origin policy, credential verification, and
+tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. A
+reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
 
 ## Effect Atom
 
@@ -506,12 +518,13 @@ export const ServerRpcLive = SyncServer.layerWithOptions({
 })
 
 const session = ProtocolSession.layerWithOptions({
-  supportedProtocolVersions: [1, 2]
+  supportedProtocolVersions: [1, 2],
+  sessionAcquisitionTimeout: "10 seconds"
 })
 
 export const ClientRpcLive = Layer.merge(
-  SyncClient.layerFromSession,
-  PresenceClient.layerFromSession
+  SyncClient.layerFromSession({ rpcTimeout: "10 seconds" }),
+  PresenceClient.layerFromSession({ rpcTimeout: "10 seconds" })
 ).pipe(
   Layer.provide(session),
   Layer.provide(RpcProtocolLive),

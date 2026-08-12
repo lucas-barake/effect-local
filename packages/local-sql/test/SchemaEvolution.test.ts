@@ -403,6 +403,7 @@ const buildReplica = <D extends Definition.Any,>(
 }
 
 const unavailableSync = SyncEngine.SyncEngine.of({
+  waitForCredentialChange: () => Effect.never,
   submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
   discard: () => Effect.fail(new ReplicaError.ServerUnavailable()),
   pull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -412,6 +413,7 @@ const unavailableSync = SyncEngine.SyncEngine.of({
 
 const serverSync = (server: ServerStore.Service) =>
   SyncEngine.SyncEngine.of({
+    waitForCredentialChange: () => Effect.never,
     submit: server.submit,
     discard: (request) => server.discard(request, null),
     pull: server.pull,

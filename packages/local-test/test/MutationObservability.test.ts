@@ -184,7 +184,7 @@ describe("mutation observability", () => {
       const firstReturned = yield* faults.awaitReceiptReturned(spaceId)
       yield* faults.awaitRequestRejectedOffline(spaceId)
       yield* faults.heal(spaceId)
-      yield* TestClock.adjust("1 millis")
+      yield* TestClock.adjust("2 millis")
       const duplicateReturned = yield* faults.awaitReceiptReturned(spaceId)
       assert.strictEqual(firstReturned.receipt.mutationId, pending.envelope.mutationId)
       assert.strictEqual(duplicateReturned.receipt.mutationId, pending.envelope.mutationId)

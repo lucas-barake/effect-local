@@ -149,6 +149,7 @@ const directSync = (server: ServerStore.Service) =>
   Layer.succeed(
     SyncEngine.SyncEngine,
     SyncEngine.SyncEngine.of({
+      waitForCredentialChange: () => Effect.never,
       submit: server.submit,
       discard: (request) => server.discard(request, null),
       pull: server.pull,
@@ -1579,6 +1580,7 @@ describe("server reconciled mutation log", () => {
         const submissions = yield* Ref.make(0)
         const server = yield* service(ServerStore.ServerStore, serverLayer())
         const remote = SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: (submitted) =>
             Ref.update(submissions, (count) => count + 1).pipe(
@@ -2146,6 +2148,7 @@ describe("server reconciled mutation log", () => {
       let submissions = 0
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
         submit: ({ envelope: submitted }) =>
           Effect.gen(function*() {
@@ -2394,7 +2397,7 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual(yield* local.cursor, 0)
     })))
 
-  it.effect("resubscribes after a watch stream terminates", () =>
+  it.effect("does not resubscribe after a permanent watch failure", () =>
     Effect.scoped(Effect.gen(function*() {
       const subscriptions = yield* Ref.make(0)
       const firstSubscribed = yield* Latch.make()
@@ -2402,6 +2405,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: server.pull,
@@ -2433,9 +2437,199 @@ describe("server reconciled mutation log", () => {
       )
       yield* service(Reconciler.Reconciler, reconciler)
       yield* firstSubscribed.await
+      yield* TestClock.adjust("1 minute")
+      assert.strictEqual(yield* Ref.get(subscriptions), 1)
+    })))
+
+  it.effect("does not resubscribe a transient watch while authentication is paused", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const local = yield* service(LocalStore.Store, localLayer())
+      const subscriptions = yield* Ref.make(0)
+      const watchFailed = yield* Deferred.make<void>()
+      const releasePull = yield* Deferred.make<void>()
+      const credentialWaitStarted = yield* Deferred.make<void>()
+      const remote = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () =>
+            Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
+          discard: () => Effect.die("unexpected discard"),
+          submit: () => Effect.die("unexpected submit"),
+          pull: () =>
+            Deferred.await(releasePull).pipe(
+              Effect.andThen(Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 0 })))
+            ),
+          bootstrap: () => Effect.die("unexpected bootstrap"),
+          watch: () =>
+            Stream.unwrap(
+              Ref.updateAndGet(subscriptions, (count) => count + 1).pipe(
+                Effect.flatMap((count) => {
+                  if (count === 1) {
+                    return Deferred.succeed(watchFailed, undefined).pipe(
+                      Effect.as(Stream.fail(new ReplicaError.ServerUnavailable()))
+                    )
+                  }
+                  return Effect.succeed(Stream.never)
+                })
+              )
+            )
+        })
+      )
+      const reconciliationContext = yield* Layer.build(
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(Layer.succeed(LocalStore.Store, local)),
+          Layer.provide(remote)
+        )
+      )
+      const manager = yield* Reconciler.makeManager().pipe(Effect.provide(remote))
+      yield* manager.register({
+        spaceId,
+        generation: 1,
+        definition: Domain.definition,
+        local,
+        reconciliation: Context.get(reconciliationContext, Reconciler.Reconciliation),
+        retryDelay: "1 second"
+      })
+      yield* Deferred.await(watchFailed)
+      yield* Deferred.succeed(releasePull, undefined)
+      yield* Deferred.await(credentialWaitStarted)
+
       yield* TestClock.adjust("1 second")
-      yield* Effect.yieldNow
-      assert.strictEqual(yield* Ref.get(subscriptions), 2)
+
+      assert.strictEqual(yield* Ref.get(subscriptions), 1)
+    })))
+
+  it.effect("keeps an active authentication pause when the in-memory watch fails", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const subscriptions = yield* Ref.make(0)
+      const watchSubscribed = yield* Deferred.make<void>()
+      const releaseWatch = yield* Deferred.make<void>()
+      const releasePull = yield* Deferred.make<void>()
+      const credentialWaitStarted = yield* Deferred.make<void>()
+      const remote = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () =>
+            Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
+          discard: () => Effect.die("unexpected discard"),
+          submit: () => Effect.die("unexpected submit"),
+          pull: () =>
+            Deferred.await(releasePull).pipe(
+              Effect.andThen(Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 0 })))
+            ),
+          bootstrap: () => Effect.die("unexpected bootstrap"),
+          watch: () =>
+            Stream.unwrap(
+              Ref.updateAndGet(subscriptions, (count) => count + 1).pipe(
+                Effect.andThen(Deferred.succeed(watchSubscribed, undefined)),
+                Effect.andThen(Deferred.await(releaseWatch)),
+                Effect.as(Stream.fail(new ReplicaError.ServerUnavailable()))
+              )
+            )
+        })
+      )
+      const scheduler = yield* service(
+        Reconciler.Reconciler,
+        Reconciler.layer({ definition: Domain.definition, spaceId, retryDelay: "1 second" }).pipe(
+          Layer.provide(localLayer()),
+          Layer.provide(remote)
+        )
+      )
+      yield* Deferred.await(watchSubscribed)
+      yield* Deferred.succeed(releasePull, undefined)
+      yield* Deferred.await(credentialWaitStarted)
+      assert.strictEqual((yield* scheduler.status)._tag, "NeedsAuthentication")
+
+      yield* Deferred.succeed(releaseWatch, undefined)
+      yield* TestClock.adjust("1 second")
+
+      assert.strictEqual(yield* Ref.get(subscriptions), 1)
+      assert.strictEqual((yield* scheduler.status)._tag, "NeedsAuthentication")
+    })))
+
+  it.effect("ignores a stale watch failure after authentication recovery starts", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const watchSubscribed = yield* Deferred.make<void>()
+      const releaseWatch = yield* Deferred.make<void>()
+      const releaseRejectedPull = yield* Deferred.make<void>()
+      const credentialWaitStarted = yield* Deferred.make<void>()
+      const credentialChanged = yield* Deferred.make<void>()
+      const recoveryPullEntered = yield* Deferred.make<void>()
+      const releaseRecoveryPull = yield* Deferred.make<void>()
+      const recoverySucceeded = yield* Deferred.make<void>()
+      const pulls = yield* Ref.make(0)
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      const remote = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () =>
+            Deferred.succeed(credentialWaitStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(credentialChanged))
+            ),
+          discard: () => Effect.die("unexpected discard"),
+          submit: () => Effect.die("unexpected submit"),
+          pull: (request) =>
+            Ref.updateAndGet(pulls, (count) => count + 1).pipe(
+              Effect.flatMap((attempt) => {
+                if (attempt === 1) {
+                  return Deferred.await(releaseRejectedPull).pipe(
+                    Effect.andThen(Effect.fail(
+                      new ReplicaError.CredentialRejected({ credentialGeneration: 0 })
+                    ))
+                  )
+                }
+                return Deferred.succeed(recoveryPullEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseRecoveryPull)),
+                  Effect.andThen(server.pull(request))
+                )
+              })
+            ),
+          bootstrap: server.bootstrap,
+          watch: () =>
+            Stream.unwrap(
+              Deferred.succeed(watchSubscribed, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseWatch)),
+                Effect.as(Stream.fail(new ReplicaError.ServerUnavailable()))
+              )
+            )
+        })
+      )
+      const local = yield* service(LocalStore.Store, localLayer())
+      const reconciliationContext = yield* Layer.build(
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(Layer.succeed(LocalStore.Store, local)),
+          Layer.provide(remote)
+        )
+      )
+      const baseReconciliation = Context.get(reconciliationContext, Reconciler.Reconciliation)
+      const reconciliation = Reconciler.Reconciliation.of({
+        ...baseReconciliation,
+        succeeded: baseReconciliation.succeeded.pipe(
+          Effect.andThen(Deferred.succeed(recoverySucceeded, undefined))
+        )
+      })
+      const scheduler = yield* service(
+        Reconciler.Reconciler,
+        Reconciler.layerInMemoryScheduler({
+          definition: Domain.definition,
+          spaceId,
+          retryDelay: "1 second"
+        }).pipe(
+          Layer.provide(Layer.succeed(LocalStore.Store, local)),
+          Layer.provide(Layer.succeed(Reconciler.Reconciliation, reconciliation)),
+          Layer.provide(remote)
+        )
+      )
+      yield* Deferred.await(watchSubscribed)
+      yield* Deferred.succeed(releaseRejectedPull, undefined)
+      yield* Deferred.await(credentialWaitStarted)
+      yield* Deferred.succeed(credentialChanged, undefined)
+      yield* Deferred.await(recoveryPullEntered)
+      yield* Deferred.succeed(releaseWatch, undefined)
+      yield* Deferred.succeed(releaseRecoveryPull, undefined)
+      yield* Deferred.await(recoverySucceeded)
+
+      assert.strictEqual((yield* scheduler.status)._tag, "Online")
     })))
 
   it.effect("does not retry a permanently stale reconciliation runtime", () =>
@@ -2452,6 +2646,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: () => Ref.update(pulls, (count) => count + 1).pipe(Effect.andThen(Effect.fail(stale))),
@@ -2494,6 +2689,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: (request) =>
@@ -2522,6 +2718,104 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual((yield* reconciliation.status)._tag, "Online")
     })))
 
+  it.effect("keeps authentication status when an earlier sync completes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const pullEntered = yield* Deferred.make<void>()
+      const releasePull = yield* Deferred.make<void>()
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      const remote = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
+          discard: () => Effect.die("unexpected discard"),
+          submit: () => Effect.die("unexpected submit"),
+          pull: (request) =>
+            Deferred.succeed(pullEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releasePull)),
+              Effect.andThen(server.pull(request))
+            ),
+          bootstrap: server.bootstrap,
+          watch: () => Stream.never
+        })
+      )
+      const context = yield* Layer.build(
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(localLayer()),
+          Layer.provide(remote)
+        )
+      )
+      const reconciliation = Context.get(context, Reconciler.Reconciliation)
+      const syncing = yield* reconciliation.sync.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.await(pullEntered)
+      yield* reconciliation.failed(new ReplicaError.CredentialRejected({ credentialGeneration: 0 }))
+      yield* Deferred.succeed(releasePull, undefined)
+      yield* Fiber.join(syncing)
+
+      assert.strictEqual((yield* reconciliation.status)._tag, "NeedsAuthentication")
+    })))
+
+  it.effect("keeps authentication status when a transient failure arrives later", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      const context = yield* Layer.build(
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(localLayer()),
+          Layer.provide(Layer.succeed(
+            SyncEngine.SyncEngine,
+            SyncEngine.SyncEngine.of({
+              waitForCredentialChange: () => Effect.never,
+              discard: () => Effect.die("unexpected discard"),
+              submit: () => Effect.die("unexpected submit"),
+              pull: server.pull,
+              bootstrap: server.bootstrap,
+              watch: () => Stream.never
+            })
+          ))
+        )
+      )
+      const reconciliation = Context.get(context, Reconciler.Reconciliation)
+      yield* reconciliation.failed(new ReplicaError.CredentialRejected({ credentialGeneration: 0 }))
+      yield* reconciliation.failed(new ReplicaError.ServerUnavailable())
+
+      assert.strictEqual((yield* reconciliation.status)._tag, "NeedsAuthentication")
+    })))
+
+  it.effect("keeps a permanent failure when an earlier sync completes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const pullEntered = yield* Deferred.make<void>()
+      const releasePull = yield* Deferred.make<void>()
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      const remote = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
+          discard: () => Effect.die("unexpected discard"),
+          submit: () => Effect.die("unexpected submit"),
+          pull: (request) =>
+            Deferred.succeed(pullEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releasePull)),
+              Effect.andThen(server.pull(request))
+            ),
+          bootstrap: server.bootstrap,
+          watch: () => Stream.never
+        })
+      )
+      const context = yield* Layer.build(
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(localLayer()),
+          Layer.provide(remote)
+        )
+      )
+      const reconciliation = Context.get(context, Reconciler.Reconciliation)
+      const syncing = yield* reconciliation.sync.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.await(pullEntered)
+      yield* reconciliation.watchFailed(new ReplicaError.ProtocolInvalid({ message: "watch stopped" }))
+      yield* Deferred.succeed(releasePull, undefined)
+      yield* Fiber.join(syncing)
+
+      assert.strictEqual((yield* reconciliation.status)._tag, "Failed")
+    })))
+
   it.effect("retries pending mutations after an interrupted submit", () =>
     Effect.scoped(Effect.gen(function*() {
       const firstAttempt = yield* Deferred.make<void>()
@@ -2531,6 +2825,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: ({ envelope: submitted }) =>
             Effect.suspend(() => {

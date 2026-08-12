@@ -995,6 +995,7 @@ describe("scoped replication", () => {
         const remote = Layer.succeed(
           SyncEngine.SyncEngine,
           SyncEngine.SyncEngine.of({
+            waitForCredentialChange: () => Effect.never,
             discard: (request) => server.discard(request, "reader"),
             submit: server.submit,
             pull: (request) => server.pullAuthorized(request, "reader"),
@@ -1078,6 +1079,7 @@ describe("scoped replication", () => {
         const remote = Layer.succeed(
           SyncEngine.SyncEngine,
           SyncEngine.SyncEngine.of({
+            waitForCredentialChange: () => Effect.never,
             discard: (request) => server.discard(request, "reader"),
             submit: (request) => server.admit(request, "reader"),
             pull: (request) => server.pullAuthorized(request, "reader"),
@@ -1126,6 +1128,7 @@ describe("scoped replication", () => {
         const reconciliation = Reconciler.Reconciliation.of({
           sync: Ref.update(syncCalls, (count) => count + 1),
           failed: () => Effect.void,
+          watchFailed: () => Effect.void,
           succeeded: Effect.void,
           status: Effect.succeed({ _tag: "Offline", pending: 0 })
         })

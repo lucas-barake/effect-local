@@ -10,10 +10,13 @@ export const run = <A,>(
 ) =>
   Effect.gen(function*() {
     const version = yield* self.version
-    const first = yield* execute(version).pipe(Effect.result)
-    if (first._tag === "Success") return first.success
-    if (first.failure._tag !== "ProtocolVersionRejected") return yield* first.failure
-    return yield* execute(yield* self.rejected(version))
+    return yield* execute(version).pipe(
+      Effect.catchTag(
+        "ProtocolVersionRejected",
+        () => self.rejected(version).pipe(Effect.flatMap(execute)),
+        Effect.fail
+      )
+    )
   })
 
 export const runStream = <A,>(

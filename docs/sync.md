@@ -73,15 +73,35 @@ through the Effect Cluster entity named by the request's space. The entity valid
 matches its Cluster address, then calls `ServerStore` or `PresenceHub`. `SyncClient.layer` maps the generated client
 to `SyncEngine` while preserving typed replica failures.
 
-Authentication is RPC middleware. The client reads a redacted credential and sets an `Authorization: Bearer` header.
-The server authenticates it into a JSON principal for each request. The authenticated facade issues an opaque principal
-assertion for the internal Cluster hop. The space entity verifies that assertion before deriving a principal and
-calling storage or presence services. Raw caller supplied JSON never confers authority inside the cluster.
-`ServerStore.layer` requires access, mutation admission, and read policies. Read policy receives a tagged scope check
-before schema or space disclosure, then a separate check for every candidate entity. Pull and every bootstrap page
-recheck entity visibility before sending data. Receipt retries recheck current access before reading durable state. `PresenceHub.layer`
-requires a tagged publish or watch policy that can bind the claimed presence client ID to the principal. The explicit
-`layerTrusted` constructors are reserved for tests and already trusted processes.
+Authentication is RPC middleware. `CredentialProvider.acquire` is evaluated for every request and returns a redacted
+bearer credential with a nonnegative generation. The server authenticates it into a JSON principal for that request.
+The authenticated facade issues an opaque principal assertion for the internal Cluster hop. The space entity verifies
+that assertion before deriving a principal and calling storage or presence services. Raw caller supplied JSON never
+confers authority inside the cluster. `ServerStore.layer` applies access, mutation admission, and read policies. Read
+policy receives a tagged scope check before schema or space disclosure, then a separate check for every candidate
+entity. Pull and every bootstrap page recheck entity visibility before sending data. Receipt retries recheck current
+access before reading durable state. `PresenceHub.layer` requires a tagged publish or watch policy that can bind the
+claimed presence client ID to the principal. The explicit `layerTrusted` constructors are reserved for tests and
+already trusted processes.
+
+The generation identifies the credential used for a request. When the server returns `CredentialRejected`, the client
+attaches that generation to the typed failure. Reconciliation reports `NeedsAuthentication` and stops both turns and
+watches from retrying it. `CredentialProvider.awaitChange(rejectedGeneration)` must complete only after `acquire` can
+return a different generation. Completion requests a new reconciliation generation, so synchronization resumes on the
+same replica and WebSocket. Rotating a bearer credential does not require rebuilding either Layer.
+
+Authentication and authorization failures remain distinct:
+
+| Failure                    | Meaning                                                         | Reconciliation status and policy                 |
+| -------------------------- | --------------------------------------------------------------- | ------------------------------------------------ |
+| `CredentialRejected`       | The bearer credential is missing, invalid, revoked, or expired  | `NeedsAuthentication`. Wait for a new generation |
+| `AuthenticatorUnavailable` | The identity verifier or one of its dependencies is unavailable | `Offline`. Retry with capped exponential backoff |
+| `AuthorizationDenied`      | The authenticated principal may not perform the operation       | `Failed`. Do not retry automatically             |
+| `OperationTimeout`         | Session acquisition or an RPC exceeded its configured bound     | `Offline`. Retry with capped exponential backoff |
+| `ServerUnavailable`        | The RPC transport or server is unavailable                      | `Offline`. Retry with capped exponential backoff |
+
+Other terminal protocol, schema, capacity, and storage failures report `Failed`. Presence operations expose the same
+typed failures directly, but presence is outside reconciliation and does not change replica status.
 
 The space entity is the single live owner and relay for a space. Its operations are deliberately volatile. A wire wake
 contains only the space ID. Entity changes wake a client only when they are currently in scope and visible, or could
@@ -117,10 +137,26 @@ not replace an ingress payload limit.
 
 The first operation on a logical client session negotiates the highest shared protocol version. Every later sync and
 presence operation must carry that selected version. There is no implicit protocol version for an omitted field. An
-operation rejected after reconnect clears the cached selection,
-negotiates against the new peer, and retries once. No shared version returns typed `UpgradeRequired`. Reconciliation
-treats it as terminal. Transport loss and `ServerUnavailable` remain retryable. A malformed frame remains
-`ProtocolInvalid`; it is not used as a version signal.
+operation rejected after reconnect clears the cached selection, negotiates against the new peer, and retries once. No
+shared version returns typed `UpgradeRequired`. Reconciliation treats it as terminal. Transport loss and
+`ServerUnavailable` remain retryable. A malformed frame remains `ProtocolInvalid`. It is not used as a version signal.
+
+`sessionAcquisitionTimeout` bounds negotiation and renegotiation. `rpcTimeout` bounds every unary sync and presence
+RPC plus stream acquisition. Both accept `Duration.Input` and default to 10 seconds. Expiry interrupts the operation
+and returns `OperationTimeout` with the operation name and configured `timeoutMillis`. An established watch may remain
+idle indefinitely. Socket ping and reconnect behavior detect a dead connection without treating healthy inactivity as
+an RPC timeout.
+
+The in memory and Workflow reconcilers start transient retries at `retryDelay`, defaulting to 1 second, then double
+the delay up to `maximumRetryDelay`, defaulting to 1 minute. A successful reconciliation resets the attempt count.
+`maximumRetryDelay` must be greater than or equal to `retryDelay`. Workflow also uses `maximumAttempts` to bound one
+durable execution. Its supervisor can start another finite execution after a transient failure.
+
+`SyncClient.layerProtocolSocket` passes `retryPolicy` and `retryTransientErrors` to Effect's socket protocol. This
+socket reconnect schedule is independent from reconciliation backoff. With `retryTransientErrors: true`, socket open
+errors stay internal while the policy continues. If a finite `retryPolicy` exhausts, that protocol instance stops
+opening the socket. Outstanding RPCs remain bounded by their configured timeout, but restarting socket acquisition
+requires rebuilding the protocol Layer.
 
 An interrupted socket may fail an active request even when the server committed it. The client retains the pending
 mutation and retries exactly. Retained server receipts deduplicate by mutation identity and client sequence. After a
