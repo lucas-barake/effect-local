@@ -261,9 +261,12 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           COALESCE(MAX(receipt_count), 0) AS receipts
           FROM effect_local_server_space_counts`
       })
-      const refreshMetricDepths = readMetricDepths(undefined).pipe(
-        Effect.flatMap((depths) => metrics.initializeDepths(depths.history, depths.receipts)),
-        Effect.mapError(StorageUnavailable.make)
+      const metricDepthRefreshes = yield* Semaphore.make(1)
+      const refreshMetricDepths = metricDepthRefreshes.withPermit(
+        readMetricDepths(undefined).pipe(
+          Effect.flatMap((depths) => metrics.initializeDepths(depths.history, depths.receipts)),
+          Effect.mapError(StorageUnavailable.make)
+        )
       )
       yield* refreshMetricDepths
       interface ReadAuthorizationKey {
@@ -2204,9 +2207,16 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           after = spaces.at(-1)!.space_id
         }
       })
-      const readAuthorizationLookup = (key: ReadAuthorizationKey) => authorizeRead(key.spaceId, key.principal)
       const readAuthorizationExpired = () =>
         new ReplicaError.AuthorizationDenied({ reason: { _tag: "ReadAuthorizationExpired" } })
+      const readAuthorizationLookup = (key: ReadAuthorizationKey) =>
+        authorizeRead(key.spaceId, key.principal).pipe(
+          Effect.timeoutOption(Duration.millis(readAuthorizationRefreshMillis / 2)),
+          Effect.flatMap(Option.match({
+            onNone: () => Effect.fail(readAuthorizationExpired()),
+            onSome: () => Effect.void
+          }))
+        )
       const watch = (request: Protocol.WatchRequest, principal: typeof Schema.Json.Type) =>
         Stream.unwrap(
           Effect.gen(function*() {
@@ -2215,6 +2225,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             yield* Effect.addFinalizer(() => Scope.close(childScope, Exit.void))
             const state = yield* RcMap.get(wakes, request.spaceId).pipe(Scope.provide(childScope))
             if (!(yield* state.watchers.takeIfAvailable(1))) {
+              yield* metrics.recordRejection("CapacityExceeded")
               return yield* new ReplicaError.CapacityExceeded({
                 resource: "sync watchers",
                 limit: options.maximumWatchersPerSpace

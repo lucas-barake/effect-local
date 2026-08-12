@@ -277,11 +277,19 @@ describe("server reconciled mutation log", () => {
             limit: 1
           })
         )
+        const rejection = (yield* Metric.snapshot).find((snapshot) =>
+          snapshot.id === "effect_local_server_rejection" && snapshot.attributes?.class === "CapacityExceeded"
+        )
+        assert.strictEqual(rejection?.type, "Counter")
+        if (rejection?.type === "Counter") assert.strictEqual(rejection.state.count, 1)
 
         yield* Fiber.interrupt(first)
         const replacement = yield* server.watch(spaceId).pipe(Stream.runHead)
         assert.isTrue(Option.isSome(replacement))
-      }).pipe(Effect.provide(NodeCrypto.layer))
+      }).pipe(
+        Effect.provide(NodeCrypto.layer),
+        Effect.provideService(Metric.MetricRegistry, new Map())
+      )
     ))
 
   it.effect("records server capacity metrics in the active registry", () =>
@@ -315,25 +323,40 @@ describe("server reconciled mutation log", () => {
         yield* server.maintain(spaceId)
 
         const snapshots = yield* Metric.snapshot
-        const byId = new Map(snapshots.map((snapshot) => [snapshot.id, snapshot]))
-        const required = [
-          "effect_local_server_admission",
-          "effect_local_server_history_depth",
-          "effect_local_server_history_limit",
-          "effect_local_server_receipt_depth",
-          "effect_local_server_receipt_limit",
-          "effect_local_server_sync_watcher_count",
-          "effect_local_server_wake_fanout_duration",
-          "effect_local_server_maintenance"
-        ]
-        for (const id of required) assert.isTrue(byId.has(id), `missing metric ${id}`)
-        const watcherCount = byId.get("effect_local_server_sync_watcher_count")
+        const find = (id: string, attributes?: Readonly<Record<string, string>>) =>
+          snapshots.find((snapshot) =>
+            snapshot.id === id &&
+            (attributes === undefined ||
+              Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value))
+          )
+        const watcherCount = find("effect_local_server_sync_watcher_count")
         assert.strictEqual(watcherCount?.type, "Gauge")
         if (watcherCount?.type === "Gauge") assert.strictEqual(watcherCount.state.value, 1)
-        const fanout = byId.get("effect_local_server_wake_fanout_duration")
+        const fanout = find("effect_local_server_wake_fanout_duration")
         assert.strictEqual(fanout?.type, "Histogram")
         if (fanout?.type === "Histogram") assert.strictEqual(fanout.state.count, 1)
-
+        const admission = find("effect_local_server_admission", { outcome: "accepted" })
+        assert.strictEqual(admission?.type, "Counter")
+        if (admission?.type === "Counter") assert.strictEqual(admission.state.count, 1)
+        const maintenance = find("effect_local_server_maintenance", { outcome: "completed" })
+        assert.strictEqual(maintenance?.type, "Counter")
+        if (maintenance?.type === "Counter") assert.strictEqual(maintenance.state.count, 1)
+        const historyDepth = find("effect_local_server_history_depth")
+        assert.strictEqual(historyDepth?.type, "Gauge")
+        if (historyDepth?.type === "Gauge") assert.strictEqual(historyDepth.state.value, 1)
+        const receiptDepth = find("effect_local_server_receipt_depth")
+        assert.strictEqual(receiptDepth?.type, "Gauge")
+        if (receiptDepth?.type === "Gauge") assert.strictEqual(receiptDepth.state.value, 1)
+        const historyLimit = find("effect_local_server_history_limit")
+        assert.strictEqual(historyLimit?.type, "Gauge")
+        if (historyLimit?.type === "Gauge") {
+          assert.strictEqual(historyLimit.state.value, serverHistory.maximumHistoryEntries)
+        }
+        const receiptLimit = find("effect_local_server_receipt_limit")
+        assert.strictEqual(receiptLimit?.type, "Gauge")
+        if (receiptLimit?.type === "Gauge") {
+          assert.strictEqual(receiptLimit.state.value, serverHistory.maximumReceipts)
+        }
         yield* Fiber.interrupt(watcher)
         const afterRelease = (yield* Metric.snapshot).find((snapshot) =>
           snapshot.id === "effect_local_server_sync_watcher_count"
@@ -538,6 +561,17 @@ describe("server reconciled mutation log", () => {
         assert.strictEqual(counts.history, 1)
         assert.strictEqual(counts.receipts, 1)
         assert.strictEqual(counts.snapshots, 1)
+        const metrics = yield* Metric.snapshot
+        const prunedHistory = metrics.find((snapshot) =>
+          snapshot.id === "effect_local_server_pruned" && snapshot.attributes?.resource === "history"
+        )
+        assert.strictEqual(prunedHistory?.type, "Counter")
+        if (prunedHistory?.type === "Counter") assert.strictEqual(prunedHistory.state.count, 3)
+        const prunedReceipt = metrics.find((snapshot) =>
+          snapshot.id === "effect_local_server_pruned" && snapshot.attributes?.resource === "receipt"
+        )
+        assert.strictEqual(prunedReceipt?.type, "Counter")
+        if (prunedReceipt?.type === "Counter") assert.strictEqual(prunedReceipt.state.count, 3)
 
         const pulled = yield* server.pull({ spaceId, after: Identity.ServerSequence.make(0), limit: 10 })
         assert.isTrue("_tag" in pulled)
@@ -558,7 +592,10 @@ describe("server reconciled mutation log", () => {
           assert.strictEqual(expired.snapshotId, pulled.manifest.snapshotId)
           assert.isAtLeast(expired.terminalSequenceThrough, 3)
         }
-      }).pipe(Effect.provide(NodeCrypto.layer))
+      }).pipe(
+        Effect.provide(NodeCrypto.layer),
+        Effect.provideService(Metric.MetricRegistry, new Map())
+      )
     ))
 
   it.effect("pages every space during global history maintenance", () =>

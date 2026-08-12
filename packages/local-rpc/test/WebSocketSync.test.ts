@@ -93,6 +93,7 @@ const handlers = Layer.mergeAll(
 )
 const runtime = MutationRuntime.layer(definition, evolution).pipe(Layer.provide(handlers))
 const readAuthorized = MutableRef.make(true)
+const hangReadAuthorization = MutableRef.make(false)
 const database = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   NodeCrypto.layer,
@@ -117,7 +118,7 @@ const serverHistory = {
   maintenanceSpaceBatchSize: 128,
   maximumWatchersPerSpace: 1_024,
   readAuthorizationRefreshInterval: "100 millis" as const,
-  maximumConcurrentReadAuthorizations: 64,
+  maximumConcurrentReadAuthorizations: 1,
   readAuthorizationCacheCapacity: 4_096,
   migration
 }
@@ -152,6 +153,7 @@ const store = ServerStore.layer({
     return Effect.void
   },
   authorizeRead: ({ principal, spaceId: requestedSpaceId }) => {
+    if (MutableRef.get(hangReadAuthorization)) return Effect.never
     if (
       MutableRef.get(readAuthorized) && principal !== null && typeof principal === "object" &&
       !Array.isArray(principal) &&
@@ -544,7 +546,7 @@ describe("WebSocket synchronization", () => {
       Effect.provide(NodeCrypto.layer)
     ))
 
-  it.effect("reauthorizes an established watch before emitting a later wake", () =>
+  it.effect("fails a watch closed at expiry and releases a hung authorization lookup", () =>
     Effect.gen(function*() {
       MutableRef.set(readAuthorized, true)
       const remote = yield* SyncEngine.SyncEngine
@@ -559,13 +561,20 @@ describe("WebSocket synchronization", () => {
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(initialWake)
-      MutableRef.set(readAuthorized, false)
+      MutableRef.set(hangReadAuthorization, true)
       yield* TestClock.adjust("100 millis")
 
       const denied = yield* Fiber.join(watching).pipe(Effect.flip)
       assert.strictEqual(denied._tag, "AuthorizationDenied")
+
+      MutableRef.set(hangReadAuthorization, false)
+      const replacement = yield* remote.watch({ spaceId, schema: definition.schemaIdentity }).pipe(Stream.runHead)
+      assert.isTrue(Option.isSome(replacement))
     }).pipe(
-      Effect.ensuring(Effect.sync(() => MutableRef.set(readAuthorized, true))),
+      Effect.ensuring(Effect.sync(() => {
+        MutableRef.set(readAuthorized, true)
+        MutableRef.set(hangReadAuthorization, false)
+      })),
       Effect.provide(live),
       Effect.provide(NodeCrypto.layer)
     ), 10_000)
