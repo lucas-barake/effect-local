@@ -356,9 +356,10 @@ generation resumes synchronization through the same replica and WebSocket.
 
 `CredentialRejected` is a credential problem. `AuthenticatorUnavailable` is a verifier outage and remains retryable.
 `AuthorizationDenied` means an authenticated principal lacks permission and is terminal. `OperationTimeout` identifies
-the bounded session or RPC operation that expired. Session acquisition and each RPC default to 10 second timeouts and
-accept `Duration.Input`. Transient reconciliation failures use capped exponential backoff from `retryDelay`, default 1
-second, through `maximumRetryDelay`, default 1 minute. See [synchronization](docs/sync.md) and the
+the bounded session or RPC operation that expired. Session acquisition, unary RPCs, and stream acquisition default to
+10 second timeouts and accept `Duration.Input`. Established watch streams may remain idle. Transient reconciliation
+failures use capped exponential backoff from `retryDelay`, default 1 second, through `maximumRetryDelay`, default 1
+minute. See [synchronization](docs/sync.md) and the
 [`effect-local-rpc` guide](packages/local-rpc/README.md) for the provider contract and socket retry policy.
 
 The authenticated server facade sends all operations to the Cluster entity for the requested space. Cluster supplies

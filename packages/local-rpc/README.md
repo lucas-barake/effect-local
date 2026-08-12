@@ -92,9 +92,10 @@ the verifier or a dependency is unavailable. It reports `Offline` and retries wi
 
 `SyncClient.layerWithOptions` and `PresenceClient.layerWithOptions` accept `sessionAcquisitionTimeout` and
 `rpcTimeout` as `Duration.Input`. Both default to 10 seconds. The session timeout bounds negotiation and
-renegotiation. The RPC timeout bounds each unary RPC, stream acquisition, and wait for each stream element. Expiry
-interrupts the operation and returns typed `OperationTimeout`. Reconciliation reports `Offline` and retries it with
-the same capped exponential policy as `ServerUnavailable` and `AuthenticatorUnavailable`.
+renegotiation. The RPC timeout bounds each unary RPC and stream acquisition. Expiry interrupts the operation and
+returns typed `OperationTimeout`. An established watch may remain idle. Socket ping and reconnect behavior detect a
+dead connection without turning healthy inactivity into retry traffic. Reconciliation reports `Offline` and retries
+timeouts with the same capped exponential policy as `ServerUnavailable` and `AuthenticatorUnavailable`.
 
 Configure reconciliation with `retryDelay` and `maximumRetryDelay` on `SqlReplica`. Delays start at 1 second by
 default, double after each transient failure, and stop growing at the default 1 minute cap. A successful pass resets

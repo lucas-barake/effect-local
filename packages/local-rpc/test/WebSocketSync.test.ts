@@ -677,6 +677,30 @@ describe("WebSocket synchronization", () => {
       yield* Deferred.await(harness.pullInterrupted)
     }))
 
+  it.effect("keeps a healthy idle watch open past rpcTimeout", () =>
+    Effect.gen(function*() {
+      const harness = yield* makeLifecycleHarness({ rpcTimeout: "500 millis" })
+      const replicaContext = yield* Layer.build(harness.replicaLayer("8 seconds"))
+      const replica = Context.get(replicaContext, Replica.Replica)
+      const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
+      const space = yield* replica.space(spaceId)
+      yield* Effect.all([
+        awaitStatus(reactivity, space, "Online"),
+        Deferred.await(harness.watchStarted)
+      ], { discard: true, concurrency: "unbounded" })
+      yield* Queue.takeAll(harness.attempts)
+      const restarted = yield* Stream.fromQueue(harness.attempts).pipe(
+        Stream.filter(({ rpc }) => rpc === "Watch"),
+        Stream.runHead,
+        Effect.timeoutOption("3 seconds"),
+        Effect.forkChild({ startImmediately: true })
+      )
+
+      yield* TestClock.adjust("3 seconds")
+
+      assert.isTrue(Option.isNone(yield* Fiber.join(restarted)))
+    }))
+
   it.effect("multiplexes two Replica spaces through exactly one WebSocket", () =>
     Effect.gen(function*() {
       MutableRef.set(webSocketConstructions, 0)

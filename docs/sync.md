@@ -141,10 +141,11 @@ operation rejected after reconnect clears the cached selection, negotiates again
 shared version returns typed `UpgradeRequired`. Reconciliation treats it as terminal. Transport loss and
 `ServerUnavailable` remain retryable. A malformed frame remains `ProtocolInvalid`. It is not used as a version signal.
 
-`sessionAcquisitionTimeout` bounds negotiation and renegotiation. `rpcTimeout` bounds every sync and presence RPC,
-including stream acquisition and the wait for each stream element. Both accept `Duration.Input` and default to 10
-seconds. Expiry interrupts the operation and returns `OperationTimeout` with the operation name and configured
-`timeoutMillis`.
+`sessionAcquisitionTimeout` bounds negotiation and renegotiation. `rpcTimeout` bounds every unary sync and presence
+RPC plus stream acquisition. Both accept `Duration.Input` and default to 10 seconds. Expiry interrupts the operation
+and returns `OperationTimeout` with the operation name and configured `timeoutMillis`. An established watch may remain
+idle indefinitely. Socket ping and reconnect behavior detect a dead connection without treating healthy inactivity as
+an RPC timeout.
 
 The in memory and Workflow reconcilers start transient retries at `retryDelay`, defaulting to 1 second, then double
 the delay up to `maximumRetryDelay`, defaulting to 1 minute. A successful reconciliation resets the attempt count.

@@ -102,7 +102,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
             (version) =>
               Stream.unwrap(
                 Effect.gen(function*() {
-                  // Acquire before installing the per-pull timeout so the first event cannot race the subscription.
+                  // Acquire eagerly so the first event cannot race the subscription.
                   const acquisition = yield* client.WatchPresence(
                     { spaceId, protocolVersion: version },
                     { asQueue: true }
@@ -152,17 +152,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                           )
                       },
                       (_, error) => Stream.die(error)
-                    ),
-                    Stream.timeoutOrElse({
-                      duration: rpcTimeoutMillis,
-                      orElse: () =>
-                        Stream.fail(
-                          new ReplicaError.OperationTimeout({
-                            operation: "WatchPresence",
-                            timeoutMillis: rpcTimeoutMillis
-                          })
-                        )
-                    })
+                    )
                   )
                 })
               )
