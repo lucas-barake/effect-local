@@ -75,11 +75,13 @@ const BackfillRow = Schema.Struct({
   value_json: Schema.String
 })
 
+const PartitionValues = Schema.Array(Schema.Union([Schema.String, Schema.Number]))
+
 const backfillPageSize = 500
 
 const makeDescriptor = (model: Model.Any, indexName: string, index: SecondaryIndex.Any): Descriptor => {
   const hash = Canonical.hash({
-    format: 1,
+    format: 2,
     model: model.name,
     index: indexName,
     version: index.version,
@@ -111,7 +113,7 @@ const makeDescriptor = (model: Model.Any, indexName: string, index: SecondaryInd
     entity_key TEXT NOT NULL,
     ${componentColumns.join(",\n    ")},
     PRIMARY KEY (space_id, schema_generation, entity_key)
-  )`
+  ) WITHOUT ROWID`
   const scanColumns = [
     "space_id",
     "schema_generation",
@@ -336,7 +338,7 @@ export const make = (
         )
         if (rows.length === 0) return undefined
         return yield* Codec.parse(rows[0].values_json).pipe(
-          Effect.flatMap((parsed) => Codec.decode(Schema.Array(Schema.Union([Schema.String, Schema.Number])), parsed))
+          Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed))
         )
       })
 
@@ -617,9 +619,7 @@ export const make = (
           )
           for (const row of rows) {
             const values = yield* Codec.parse(row.values_json).pipe(
-              Effect.flatMap((parsed) =>
-                Codec.decode(Schema.Array(Schema.Union([Schema.String, Schema.Number])), parsed)
-              )
+              Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed))
             )
             found.set(row.entity_key, values)
           }
@@ -653,9 +653,7 @@ export const make = (
         for (const row of rows) {
           partitions.push(
             yield* Codec.parse(row.partition_json).pipe(
-              Effect.flatMap((parsed) =>
-                Codec.decode(Schema.Array(Schema.Union([Schema.String, Schema.Number])), parsed)
-              )
+              Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed))
             )
           )
         }

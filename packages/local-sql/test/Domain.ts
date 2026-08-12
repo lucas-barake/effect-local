@@ -68,7 +68,7 @@ export const PutMessage = Mutation.make("PutMessage", {
   payload: Message.schema
 })
 
-export const DeleteMessage = Mutation.make("DeleteMessage", {
+const DeleteMessage = Mutation.make("DeleteMessage", {
   version: 1,
   payload: { id: Schema.String }
 })

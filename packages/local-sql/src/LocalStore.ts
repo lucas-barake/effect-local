@@ -1570,21 +1570,26 @@ export const layer = (
         const resetIdentities = [...touched.values()]
         for (let offset = 0; offset < resetIdentities.length; offset += 100) {
           const batch = resetIdentities.slice(offset, offset + 100)
-          const matches = sql.or(
-            batch.map((entity) => sql`(model = ${entity.model} AND entity_key = ${entity.entityKey})`)
+          const identitiesJson = yield* Codec.stringify(
+            batch.map((entity) => ({ model: entity.model, key: entity.entityKey }))
           )
           yield* sql`DELETE FROM effect_local_client_visible_entities_data
             WHERE space_id = ${options.spaceId} AND schema_generation = ${replaySchemaGeneration}
-              AND projection_generation = ${projectionGeneration} AND ${matches}`
+              AND projection_generation = ${projectionGeneration}
+              AND (model, entity_key) IN (
+                SELECT json_extract(requested.value, '$.model'), json_extract(requested.value, '$.key')
+                FROM json_each(${identitiesJson}) AS requested
+              )`
           yield* sql`INSERT INTO effect_local_client_visible_entities_data
             (space_id, schema_generation, projection_generation, model, model_version, entity_key, value_json)
             SELECT c.space_id, c.schema_generation, ${projectionGeneration}, c.model, c.model_version,
               c.entity_key, c.value_json
             FROM effect_local_client_canonical_entities_data AS c
             WHERE c.space_id = ${options.spaceId} AND c.schema_generation = ${replaySchemaGeneration}
-              AND ${
-            sql.or(batch.map((entity) => sql`(c.model = ${entity.model} AND c.entity_key = ${entity.entityKey})`))
-          }
+              AND (c.model, c.entity_key) IN (
+                SELECT json_extract(requested.value, '$.model'), json_extract(requested.value, '$.key')
+                FROM json_each(${identitiesJson}) AS requested
+              )
               AND NOT EXISTS (
                 SELECT 1 FROM effect_local_client_retractions AS r
                 WHERE r.space_id = c.space_id AND r.generation = c.schema_generation
@@ -1600,10 +1605,16 @@ export const layer = (
         const allIdentities = [...touched.values()]
         for (let offset = 0; offset < allIdentities.length; offset += 100) {
           const batch = allIdentities.slice(offset, offset + 100)
+          const identitiesJson = yield* Codec.stringify(
+            batch.map((entity) => ({ model: entity.model, key: entity.entityKey }))
+          )
           yield* sql`DELETE FROM effect_local_client_visible_entities_data
             WHERE space_id = ${options.spaceId} AND schema_generation = ${replaySchemaGeneration}
               AND projection_generation = ${projectionGeneration}
-              AND ${sql.or(batch.map((entity) => sql`(model = ${entity.model} AND entity_key = ${entity.entityKey})`))}
+              AND (model, entity_key) IN (
+                SELECT json_extract(requested.value, '$.model'), json_extract(requested.value, '$.key')
+                FROM json_each(${identitiesJson}) AS requested
+              )
               AND EXISTS (
                 SELECT 1 FROM effect_local_client_retractions AS r
                 WHERE r.space_id = ${options.spaceId} AND r.generation = ${replaySchemaGeneration}
