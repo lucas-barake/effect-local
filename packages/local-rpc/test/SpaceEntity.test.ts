@@ -8,8 +8,11 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Cause from "effect/Cause"
+import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -210,10 +213,13 @@ describe("SpaceEntity", () => {
 
   it.effect("completes Submit while a Bootstrap page is paused", () =>
     Effect.gen(function*() {
-      const actual = yield* Effect.provide(ServerStore.ServerStore, store)
+      const actual = yield* Layer.build(store).pipe(
+        Effect.map((context) => Context.get(context, ServerStore.ServerStore))
+      )
       const firstEntered = yield* Deferred.make<void>()
       const releaseFirst = yield* Deferred.make<void>()
-      const submitCompleted = yield* Deferred.make<Protocol.Receipt>()
+      const submitEntered = yield* Deferred.make<void>()
+      const submitCompleted = yield* Deferred.make<Exit.Exit<Protocol.Receipt, unknown>>()
       const snapshotId = Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000001")
       const page = Protocol.BootstrapPage.make({
         manifest: {
@@ -234,8 +240,9 @@ describe("SpaceEntity", () => {
       const wrapped = ServerStore.ServerStore.of({
         ...actual,
         admit: (request, principal) =>
-          actual.admit(request, principal).pipe(
-            Effect.tap((receipt) => Deferred.succeed(submitCompleted, receipt))
+          Deferred.succeed(submitEntered, undefined).pipe(
+            Effect.andThen(actual.admit(request, principal)),
+            Effect.onExit((exit) => Deferred.succeed(submitCompleted, exit))
           ),
         bootstrapAuthorized: () =>
           Effect.gen(function*() {
@@ -270,8 +277,10 @@ describe("SpaceEntity", () => {
       )
       yield* Effect.yieldNow
 
-      assert.isTrue(yield* Deferred.isDone(submitCompleted))
-      assert.strictEqual((yield* Deferred.await(submitCompleted))._tag, "Accepted")
+      assert.isTrue(yield* Deferred.isDone(submitEntered))
+      const submitExit = yield* Deferred.await(submitCompleted)
+      if (Exit.isFailure(submitExit)) assert.fail(Cause.pretty(submitExit.cause))
+      assert.strictEqual(submitExit.value._tag, "Accepted")
       yield* Deferred.succeed(releaseFirst, undefined)
       yield* Fiber.join(first)
       yield* Fiber.join(submit)

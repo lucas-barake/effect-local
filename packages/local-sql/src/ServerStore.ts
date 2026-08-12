@@ -2099,7 +2099,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           after = spaces.at(-1)!.space_id
         }
       })
-      const watch = (request: Protocol.WatchRequest, principal: typeof Schema.Json.Type) =>
+      const watch = (request: Protocol.WatchRequest) =>
         Stream.unwrap(
           RcMap.get(wakes, request.spaceId).pipe(
             Effect.flatMap((channel) => PubSub.subscribe(channel)),
@@ -2114,25 +2114,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                       sequence = Identity.ServerSequence.make(stored.value.next_server_sequence - 1)
                     }
                     return Stream.succeed({ spaceId: request.spaceId, sequence } satisfies Protocol.Wake).pipe(
-                      Stream.concat(Stream.fromSubscription(subscription)),
-                      Stream.mapEffect((wake) =>
-                        authorizeRead(request.spaceId, principal).pipe(
-                          Effect.andThen(
-                            sql.withTransaction(Effect.gen(function*() {
-                              const current = yield* lockSpace(request.spaceId).pipe(
-                                Effect.mapError(StorageUnavailable.make)
-                              )
-                              yield* validateStoredSpace(current)
-                              return wake
-                            })).pipe(
-                              Effect.catchIf(
-                                SqlError.isSqlError,
-                                (cause) => Effect.fail(StorageUnavailable.make(cause))
-                              )
-                            )
-                          )
-                        )
-                      )
+                      Stream.concat(Stream.fromSubscription(subscription))
                     )
                   })
                 )
@@ -2205,14 +2187,14 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           return Stream.unwrap(
             authorizeRead(request.spaceId, null).pipe(
               Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-              Effect.as(watch(request, null))
+              Effect.as(watch(request))
             )
           )
         },
         watchAuthorized: (request, principal) =>
           authorizeRead(request.spaceId, principal).pipe(
             Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-            Effect.as(watch(request, principal))
+            Effect.as(watch(request))
           )
       })
     })

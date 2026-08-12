@@ -232,14 +232,14 @@ export const layerHandlers = (options: HandlerOptions = {}) =>
             return store.pullAuthorized(payload.request, payload.principal)
           })),
         Bootstrap: ({ payload }) =>
-          Effect.suspend(() => {
+          Rpc.fork(Effect.suspend(() => {
             if (spaceId === undefined || payload.request.spaceId !== spaceId) {
               return Effect.fail(
                 new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
               )
             }
             return store.bootstrapAuthorized(payload.request, payload.principal)
-          }),
+          })),
         Watch: ({ payload }) => {
           if (spaceId === undefined || payload.request.spaceId !== spaceId) {
             return Rpc.fork(
