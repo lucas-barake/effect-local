@@ -4,6 +4,7 @@ import * as Canonical from "./Canonical.js"
 import type * as Definition from "./Definition.js"
 import * as Identity from "./Identity.js"
 import * as ReplicaError from "./ReplicaError.js"
+import type * as SecondaryIndex from "./SecondaryIndex.js"
 
 export const maximumMutationBytes = 256 * 1024
 export const maximumBatchEntries = 1_000
@@ -178,7 +179,8 @@ const affinityMatches = (
   value: WindowComponentValue
 ): boolean => {
   if (affinity === "text") return typeof value === "string"
-  return typeof value === "number" || typeof value === "boolean"
+  if (affinity === "real") return typeof value === "number"
+  return typeof value === "boolean" || (typeof value === "number" && Number.isSafeInteger(value))
 }
 
 export const validateReplicationScope = (
@@ -214,7 +216,8 @@ export const validateReplicationScope = (
         new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${window.model}` })
       )
     }
-    const index = model.indexes[window.index]
+    let index: SecondaryIndex.Any | undefined
+    if (Object.hasOwn(model.indexes, window.index)) index = model.indexes[window.index]
     if (index === undefined) {
       return Effect.fail(
         new ReplicaError.ProtocolInvalid({ message: `Unknown replication window index: ${label}` })
