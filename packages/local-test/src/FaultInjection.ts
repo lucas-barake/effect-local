@@ -10,13 +10,13 @@ export interface State {
 }
 
 export interface Service {
-  readonly state: Effect.Effect<State>
-  readonly partition: Effect.Effect<void>
-  readonly heal: Effect.Effect<void>
-  readonly dropNextReceipt: Effect.Effect<void>
-  readonly duplicateNextPage: Effect.Effect<void>
-  readonly takeDroppedReceipt: Effect.Effect<boolean>
-  readonly takeDuplicatePage: Effect.Effect<boolean>
+  readonly state: (spaceId: Identity.SpaceId) => Effect.Effect<State>
+  readonly partition: (spaceId: Identity.SpaceId) => Effect.Effect<void>
+  readonly heal: (spaceId: Identity.SpaceId) => Effect.Effect<void>
+  readonly dropNextReceipt: (spaceId: Identity.SpaceId) => Effect.Effect<void>
+  readonly duplicateNextPage: (spaceId: Identity.SpaceId) => Effect.Effect<void>
+  readonly takeDroppedReceipt: (spaceId: Identity.SpaceId) => Effect.Effect<boolean>
+  readonly takeDuplicatePage: (spaceId: Identity.SpaceId) => Effect.Effect<boolean>
 }
 
 export class FaultInjection extends Context.Service<FaultInjection, Service>()(
@@ -26,21 +26,32 @@ export class FaultInjection extends Context.Service<FaultInjection, Service>()(
 export const layer: Layer.Layer<FaultInjection> = Layer.effect(
   FaultInjection,
   Effect.gen(function*() {
-    const state = yield* Ref.make<State>({ online: true, dropNextReceipt: false, duplicateNextPage: false })
-    const set = (patch: Partial<State>) => Ref.update(state, (current) => ({ ...current, ...patch }))
-    const take = (key: "dropNextReceipt" | "duplicateNextPage") =>
-      Ref.modify(state, (current) => [
-        current[key],
-        { ...current, [key]: false }
-      ])
+    const initial = (): State => ({ online: true, dropNextReceipt: false, duplicateNextPage: false })
+    const state = yield* Ref.make(new Map<Identity.SpaceId, State>())
+    const get = (spaceId: Identity.SpaceId) =>
+      Ref.get(state).pipe(Effect.map((spaces) => spaces.get(spaceId) ?? initial()))
+    const set = (spaceId: Identity.SpaceId, patch: Partial<State>) =>
+      Ref.update(state, (spaces) => {
+        const next = new Map(spaces)
+        next.set(spaceId, { ...(spaces.get(spaceId) ?? initial()), ...patch })
+        return next
+      })
+    const take = (spaceId: Identity.SpaceId, key: "dropNextReceipt" | "duplicateNextPage") =>
+      Ref.modify(state, (spaces) => {
+        const current = spaces.get(spaceId) ?? initial()
+        const next = new Map(spaces)
+        next.set(spaceId, { ...current, [key]: false })
+        return [current[key], next]
+      })
     return FaultInjection.of({
-      state: Ref.get(state),
-      partition: set({ online: false }),
-      heal: set({ online: true }),
-      dropNextReceipt: set({ dropNextReceipt: true }),
-      duplicateNextPage: set({ duplicateNextPage: true }),
-      takeDroppedReceipt: take("dropNextReceipt"),
-      takeDuplicatePage: take("duplicateNextPage")
+      state: get,
+      partition: (spaceId) => set(spaceId, { online: false }),
+      heal: (spaceId) => set(spaceId, { online: true }),
+      dropNextReceipt: (spaceId) => set(spaceId, { dropNextReceipt: true }),
+      duplicateNextPage: (spaceId) => set(spaceId, { duplicateNextPage: true }),
+      takeDroppedReceipt: (spaceId) => take(spaceId, "dropNextReceipt"),
+      takeDuplicatePage: (spaceId) => take(spaceId, "duplicateNextPage")
     })
   })
 )
+import type * as Identity from "@lucas-barake/effect-local/Identity"

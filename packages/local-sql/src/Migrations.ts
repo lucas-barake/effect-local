@@ -74,11 +74,17 @@ const MigrationRow = Schema.Struct({
   checksum: Identity.SchemaHash
 })
 const CountRow = Schema.Struct({ count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) })
+const ForeignKeyCheckRow = Schema.Struct({
+  table: Schema.String,
+  rowid: Schema.NullOr(Schema.Int),
+  parent: Schema.String,
+  fkid: Schema.Int
+})
 
 const ClientIdentityRow = Schema.Struct({
-  space_id: Identity.SpaceId,
   client_id: Identity.ClientId
 })
+const PragmaEnabledRow = Schema.Struct({ foreign_keys: Schema.Literals([0, 1]) })
 
 const validateCatalog = (
   catalog: Catalog,
@@ -151,6 +157,7 @@ export const runCatalog = (
       Result: MigrationRow,
       execute: () => sql`SELECT id, name, checksum FROM effect_local_server_migrations ORDER BY id`
     })
+    let appliedAtAttempt = 0
     const migrate = Effect.gen(function*() {
       let ledger = serverLedger
       if (catalog === "Client") ledger = clientLedger
@@ -164,6 +171,7 @@ export const runCatalog = (
             return new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause })
           })
         )
+        appliedAtAttempt = applied.length
         if (applied.length > migrations.length) {
           return yield* new ReplicaError.StorageMigrationMismatch({
             catalog,
@@ -209,7 +217,30 @@ export const runCatalog = (
         failure._tag === "StorageUnavailable" &&
         SqlError.isSqlError(failure.cause) &&
         (failure.cause.reason._tag === "ConstraintError" || failure.cause.reason._tag === "UniqueViolation")
-      ) continue
+      ) {
+        let read = readServer
+        if (catalog === "Client") read = readClient
+        const applied = yield* read(undefined).pipe(
+          Effect.mapError((cause) => {
+            if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
+            return new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause })
+          })
+        )
+        let valid = applied.length <= migrations.length
+        for (let index = 0; valid && index < applied.length; index++) {
+          const stored = applied[index]
+          const expected = migrations[index]
+          valid = stored.id === expected.id && stored.name === expected.name && stored.checksum === expected.checksum
+        }
+        if (valid && applied.length > appliedAtAttempt) {
+          if (applied.length === migrations.length) return yield* Effect.void
+          continue
+        }
+        return yield* new ReplicaError.StorageCorrupt({
+          message: `${catalog} migration failed a permanent constraint`,
+          cause: failure.cause
+        })
+      }
       if (
         failure._tag !== "StorageUnavailable" ||
         !SqlError.isSqlError(failure.cause) ||
@@ -955,6 +986,276 @@ const clientV7 = makeMigration({
   ]
 })
 
+const clientV8 = makeMigration({
+  id: 8,
+  name: "multi-space-client-storage",
+  statements: [
+    "DROP TRIGGER effect_local_pending_insert",
+    "DROP TRIGGER effect_local_pending_update",
+    "DROP TRIGGER effect_local_pending_delete",
+    "DROP TRIGGER effect_local_receipts_insert",
+    "DROP TRIGGER effect_local_receipts_update",
+    "DROP TRIGGER effect_local_receipts_delete",
+    "DROP TRIGGER effect_local_canonical_entities_insert",
+    "DROP TRIGGER effect_local_canonical_entities_update",
+    "DROP TRIGGER effect_local_canonical_entities_delete",
+    "DROP TRIGGER effect_local_visible_entities_insert",
+    "DROP TRIGGER effect_local_visible_entities_update",
+    "DROP TRIGGER effect_local_visible_entities_delete",
+    "DROP VIEW effect_local_pending",
+    "DROP VIEW effect_local_receipts",
+    "DROP VIEW effect_local_canonical_entities",
+    "DROP VIEW effect_local_visible_entities",
+    "ALTER TABLE effect_local_client_meta RENAME TO effect_local_client_meta_v7",
+    `CREATE TABLE effect_local_client_meta (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      client_id TEXT NOT NULL UNIQUE
+    )`,
+    `CREATE TABLE effect_local_client_spaces (
+      space_id TEXT PRIMARY KEY,
+      membership_incarnation TEXT NOT NULL,
+      definition_hash TEXT NOT NULL,
+      schema_version INTEGER,
+      schema_hash TEXT,
+      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
+      active_schema_generation INTEGER NOT NULL CHECK (active_schema_generation >= 0),
+      active_projection_generation INTEGER NOT NULL DEFAULT 0 CHECK (active_projection_generation >= 0),
+      projection_schema_generation INTEGER NOT NULL CHECK (projection_schema_generation >= 0),
+      target_schema_version INTEGER,
+      target_schema_hash TEXT,
+      migration_hash TEXT,
+      next_local_sequence INTEGER NOT NULL CHECK (next_local_sequence > 0),
+      server_cursor INTEGER NOT NULL CHECK (server_cursor >= 0),
+      visible_revision INTEGER NOT NULL CHECK (visible_revision >= 0),
+      requested_generation INTEGER NOT NULL CHECK (requested_generation >= 0),
+      completed_generation INTEGER NOT NULL CHECK (
+        completed_generation >= 0 AND completed_generation <= requested_generation
+      ),
+      installed_snapshot_id TEXT,
+      installed_snapshot_sequence INTEGER NOT NULL CHECK (installed_snapshot_sequence >= 0),
+      installed_snapshot_terminal_sequence INTEGER NOT NULL CHECK (installed_snapshot_terminal_sequence >= 0),
+      replication_view_id TEXT,
+      replication_view_revision INTEGER NOT NULL DEFAULT 0 CHECK (replication_view_revision >= 0),
+      desired_scope_json TEXT NOT NULL DEFAULT '{"models":[]}' CHECK (json_valid(desired_scope_json)),
+      desired_scope_digest TEXT NOT NULL
+        DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'
+        CHECK (length(desired_scope_digest) = 64),
+      scope_generation INTEGER NOT NULL DEFAULT 0 CHECK (scope_generation >= 0),
+      projection_replay_generation INTEGER,
+      projection_replay_cursor TEXT
+    )`,
+    "ALTER TABLE effect_local_server_log RENAME TO effect_local_server_log_v7",
+    `CREATE TABLE effect_local_server_log (
+      space_id TEXT NOT NULL,
+      membership_incarnation TEXT NOT NULL,
+      server_sequence INTEGER NOT NULL,
+      mutation_id TEXT NOT NULL,
+      entry_json TEXT NOT NULL,
+      source_schema_version INTEGER,
+      source_schema_hash TEXT,
+      mutation_version INTEGER,
+      PRIMARY KEY (space_id, server_sequence),
+      UNIQUE (space_id, mutation_id),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    "ALTER TABLE effect_local_client_pending_data RENAME TO effect_local_client_pending_data_v7",
+    `CREATE TABLE effect_local_client_pending_data (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL,
+      membership_incarnation TEXT NOT NULL,
+      mutation_id TEXT NOT NULL,
+      local_sequence INTEGER NOT NULL,
+      basis INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      digest_version INTEGER NOT NULL CHECK (digest_version = 3),
+      source_schema_version INTEGER,
+      source_schema_hash TEXT,
+      mutation_version INTEGER,
+      optimistic_result_json TEXT NOT NULL,
+      changes_json TEXT NOT NULL,
+      PRIMARY KEY (space_id, schema_generation, mutation_id),
+      UNIQUE (space_id, schema_generation, local_sequence),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    "ALTER TABLE effect_local_client_receipts_data RENAME TO effect_local_client_receipts_data_v7",
+    `CREATE TABLE effect_local_client_receipts_data (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL,
+      membership_incarnation TEXT NOT NULL,
+      mutation_id TEXT NOT NULL,
+      local_sequence INTEGER NOT NULL,
+      receipt_json TEXT NOT NULL,
+      source_schema_version INTEGER,
+      source_schema_hash TEXT,
+      mutation_version INTEGER,
+      rejection_origin TEXT,
+      mutation_name TEXT,
+      PRIMARY KEY (space_id, schema_generation, mutation_id),
+      UNIQUE (space_id, schema_generation, local_sequence),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    "ALTER TABLE effect_local_client_canonical_entities_data RENAME TO effect_local_client_canonical_entities_data_v7",
+    `CREATE TABLE effect_local_client_canonical_entities_data (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL,
+      model TEXT NOT NULL,
+      entity_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      model_version INTEGER,
+      PRIMARY KEY (space_id, schema_generation, model, entity_key),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    "ALTER TABLE effect_local_client_visible_entities_data RENAME TO effect_local_client_visible_entities_data_v7",
+    `CREATE TABLE effect_local_client_visible_entities_data (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL,
+      projection_generation INTEGER NOT NULL,
+      model TEXT NOT NULL,
+      entity_key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      model_version INTEGER,
+      PRIMARY KEY (space_id, schema_generation, projection_generation, model, entity_key),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    "ALTER TABLE effect_local_client_evolution RENAME TO effect_local_client_evolution_v7",
+    `CREATE TABLE effect_local_client_evolution (
+      space_id TEXT PRIMARY KEY,
+      source_schema_version INTEGER NOT NULL,
+      source_schema_hash TEXT NOT NULL,
+      target_schema_version INTEGER NOT NULL,
+      target_schema_hash TEXT NOT NULL,
+      migration_hash TEXT NOT NULL,
+      generation INTEGER NOT NULL CHECK (generation > 0),
+      source_generation INTEGER NOT NULL CHECK (source_generation >= 0),
+      source_projection_generation INTEGER NOT NULL DEFAULT 0 CHECK (source_projection_generation >= 0),
+      target_projection_generation INTEGER NOT NULL DEFAULT 0 CHECK (target_projection_generation >= 0),
+      phase TEXT NOT NULL,
+      cursor_model TEXT,
+      cursor_key TEXT,
+      cursor_sequence INTEGER,
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    "ALTER TABLE effect_local_client_key_lineage RENAME TO effect_local_client_key_lineage_v7",
+    `CREATE TABLE effect_local_client_key_lineage (
+      space_id TEXT NOT NULL,
+      source_schema_version INTEGER NOT NULL,
+      source_schema_hash TEXT NOT NULL,
+      source_model TEXT NOT NULL,
+      source_model_version INTEGER NOT NULL,
+      source_key TEXT NOT NULL,
+      target_model TEXT NOT NULL,
+      target_model_version INTEGER NOT NULL,
+      target_key TEXT NOT NULL,
+      PRIMARY KEY (space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    "ALTER TABLE effect_local_client_key_lineage_groups RENAME TO effect_local_client_key_lineage_groups_v7",
+    `CREATE TABLE effect_local_client_key_lineage_groups (
+      space_id TEXT NOT NULL,
+      source_schema_version INTEGER NOT NULL,
+      source_schema_hash TEXT NOT NULL,
+      source_model TEXT NOT NULL,
+      source_model_version INTEGER NOT NULL,
+      source_key TEXT NOT NULL,
+      lineage_id TEXT NOT NULL,
+      PRIMARY KEY (space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    "ALTER TABLE effect_local_client_key_lineage_targets RENAME TO effect_local_client_key_lineage_targets_v7",
+    `CREATE TABLE effect_local_client_key_lineage_targets (
+      space_id TEXT NOT NULL,
+      target_model TEXT NOT NULL,
+      target_model_version INTEGER NOT NULL,
+      target_key TEXT NOT NULL,
+      lineage_id TEXT NOT NULL,
+      PRIMARY KEY (space_id, target_model, target_model_version, target_key),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    "DROP TABLE effect_local_client_scoped_bootstrap_entries",
+    "DROP TABLE effect_local_client_scoped_bootstrap",
+    "DROP TABLE effect_local_client_retractions",
+    `CREATE TABLE effect_local_client_retractions (
+      space_id TEXT NOT NULL,
+      generation INTEGER NOT NULL CHECK (generation >= 0),
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL CHECK (model_version > 0),
+      entity_key TEXT NOT NULL,
+      PRIMARY KEY (space_id, generation, model, entity_key),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE effect_local_client_scoped_bootstrap (
+      snapshot_id TEXT NOT NULL,
+      space_id TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL,
+      definition_hash TEXT NOT NULL,
+      schema_version INTEGER NOT NULL,
+      schema_hash TEXT NOT NULL,
+      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
+      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
+      view_id TEXT NOT NULL,
+      view_revision INTEGER NOT NULL CHECK (view_revision >= 0),
+      server_sequence INTEGER NOT NULL,
+      terminal_sequence INTEGER NOT NULL,
+      entry_count INTEGER NOT NULL,
+      content_bytes INTEGER NOT NULL,
+      digest TEXT NOT NULL,
+      next_ordinal INTEGER NOT NULL,
+      received_bytes INTEGER NOT NULL,
+      rolling_digest TEXT NOT NULL,
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE effect_local_client_scoped_bootstrap_entries (
+      space_id TEXT NOT NULL,
+      snapshot_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      model TEXT NOT NULL,
+      entity_key TEXT NOT NULL,
+      change_json TEXT NOT NULL CHECK (json_valid(change_json)),
+      entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
+      PRIMARY KEY (space_id, ordinal),
+      UNIQUE (space_id, model, entity_key),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_scoped_bootstrap(space_id) ON DELETE CASCADE
+    )`,
+    "DROP TABLE effect_local_client_shadow_entities",
+    "DROP TABLE effect_local_client_shadow_receipts",
+    "DROP TABLE effect_local_client_shadow_visible_entities",
+    "DROP TABLE effect_local_client_shadow_pending",
+    "DROP TABLE effect_local_client_shadow_receipts_v2",
+    "DROP TABLE effect_local_client_key_lineage_targets_v7",
+    "DROP TABLE effect_local_client_key_lineage_groups_v7",
+    "DROP TABLE effect_local_client_key_lineage_v7",
+    "DROP TABLE effect_local_client_evolution_v7",
+    "DROP TABLE effect_local_client_visible_entities_data_v7",
+    "DROP TABLE effect_local_client_canonical_entities_data_v7",
+    "DROP TABLE effect_local_client_receipts_data_v7",
+    "DROP TABLE effect_local_client_pending_data_v7",
+    "DROP TABLE effect_local_server_log_v7",
+    "DROP TABLE effect_local_client_meta_v7"
+  ],
+  effect: {
+    id: "validate-multi-space-client-storage",
+    run: (sql) =>
+      SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: ForeignKeyCheckRow,
+        execute: () => sql`PRAGMA foreign_key_check`
+      })(undefined).pipe(
+        Effect.flatMap((rows) => {
+          if (rows.length === 0) return Effect.void
+          return new ReplicaError.StorageCorrupt({
+            message: `Client migration left ${rows.length} foreign key violation(s)`
+          })
+        }),
+        Effect.mapError((cause) => {
+          if (cause._tag === "StorageCorrupt") return cause
+          return StorageUnavailable.make(cause)
+        })
+      )
+  }
+})
+
 export const clientCatalog = Object.freeze([
   clientV1,
   clientV2,
@@ -962,7 +1263,8 @@ export const clientCatalog = Object.freeze([
   clientV4,
   clientV5,
   clientV6,
-  clientV7
+  clientV7,
+  clientV8
 ])
 
 const serverV6 = makeMigration({
@@ -1126,6 +1428,109 @@ const serverV7 = makeMigration({
   ]
 })
 
+const serverV8 = makeMigration({
+  id: 8,
+  name: "membership-incarnation-lineage",
+  statements: [
+    "DROP TRIGGER effect_local_count_history_insert",
+    "DROP TRIGGER effect_local_count_history_delete",
+    "DROP TRIGGER effect_local_count_receipt_insert",
+    "DROP TRIGGER effect_local_count_receipt_delete",
+    "DROP TRIGGER effect_local_require_current_receipt_writer",
+    "DROP TRIGGER effect_local_require_current_history_writer",
+    "ALTER TABLE effect_local_server_clients RENAME TO effect_local_server_clients_v7",
+    "ALTER TABLE effect_local_server_receipts RENAME TO effect_local_server_receipts_v7",
+    "ALTER TABLE effect_local_authoritative_log RENAME TO effect_local_authoritative_log_v7",
+    `CREATE TABLE effect_local_server_clients (
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      membership_incarnation TEXT NOT NULL,
+      last_local_sequence INTEGER NOT NULL,
+      expired_local_sequence INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (space_id, client_id, membership_incarnation)
+    )`,
+    `CREATE TABLE effect_local_server_receipts (
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      membership_incarnation TEXT NOT NULL,
+      local_sequence INTEGER NOT NULL,
+      mutation_id TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      receipt_json TEXT NOT NULL,
+      digest_version INTEGER NOT NULL CHECK (digest_version = 3),
+      source_schema_version INTEGER,
+      source_schema_hash TEXT,
+      mutation_version INTEGER,
+      rejection_origin TEXT,
+      terminal_sequence INTEGER NOT NULL DEFAULT 0,
+      server_sequence INTEGER,
+      mutation_name TEXT,
+      PRIMARY KEY (space_id, client_id, membership_incarnation, local_sequence),
+      UNIQUE (space_id, mutation_id)
+    )`,
+    `CREATE TABLE effect_local_authoritative_log (
+      space_id TEXT NOT NULL,
+      server_sequence INTEGER NOT NULL,
+      mutation_id TEXT NOT NULL,
+      entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
+      entry_json TEXT NOT NULL,
+      source_schema_version INTEGER,
+      source_schema_hash TEXT,
+      mutation_version INTEGER,
+      client_id TEXT NOT NULL,
+      local_sequence INTEGER NOT NULL,
+      digest TEXT NOT NULL,
+      membership_incarnation TEXT NOT NULL,
+      PRIMARY KEY (space_id, server_sequence),
+      UNIQUE (space_id, mutation_id)
+    )`,
+    "DROP TABLE effect_local_server_clients_v7",
+    "DROP TABLE effect_local_server_receipts_v7",
+    "DROP TABLE effect_local_authoritative_log_v7",
+    `CREATE INDEX effect_local_server_history_terminal
+      ON effect_local_authoritative_log (space_id, server_sequence, mutation_id)`,
+    `CREATE INDEX effect_local_server_receipts_terminal
+      ON effect_local_server_receipts
+        (space_id, terminal_sequence, client_id, membership_incarnation, local_sequence)`,
+    `CREATE TRIGGER effect_local_count_history_insert AFTER INSERT ON effect_local_authoritative_log
+      BEGIN
+        UPDATE effect_local_server_spaces SET retained_history_count = retained_history_count + 1
+          WHERE space_id = NEW.space_id;
+        UPDATE effect_local_server_space_counts SET history_count = history_count + 1
+          WHERE space_id = NEW.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_count_history_delete AFTER DELETE ON effect_local_authoritative_log
+      BEGIN
+        UPDATE effect_local_server_spaces SET retained_history_count = retained_history_count - 1
+          WHERE space_id = OLD.space_id;
+        UPDATE effect_local_server_space_counts SET history_count = history_count - 1
+          WHERE space_id = OLD.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_count_receipt_insert AFTER INSERT ON effect_local_server_receipts
+      BEGIN
+        UPDATE effect_local_server_spaces SET retained_receipt_count = retained_receipt_count + 1
+          WHERE space_id = NEW.space_id;
+        UPDATE effect_local_server_space_counts SET receipt_count = receipt_count + 1
+          WHERE space_id = NEW.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_count_receipt_delete AFTER DELETE ON effect_local_server_receipts
+      BEGIN
+        UPDATE effect_local_server_spaces SET retained_receipt_count = retained_receipt_count - 1
+          WHERE space_id = OLD.space_id;
+        UPDATE effect_local_server_space_counts SET receipt_count = receipt_count - 1
+          WHERE space_id = OLD.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_require_current_receipt_writer
+      BEFORE INSERT ON effect_local_server_receipts
+      WHEN NEW.terminal_sequence = 0
+      BEGIN SELECT RAISE(ABORT, 'effect-local server writer upgrade required'); END`,
+    `CREATE TRIGGER effect_local_require_current_history_writer
+      BEFORE INSERT ON effect_local_authoritative_log
+      WHEN NEW.client_id = '' OR NEW.local_sequence = 0 OR NEW.digest = ''
+      BEGIN SELECT RAISE(ABORT, 'effect-local server writer upgrade required'); END`
+  ]
+})
+
 export const serverCatalog = Object.freeze([
   serverV1,
   serverV2,
@@ -1133,22 +1538,61 @@ export const serverCatalog = Object.freeze([
   serverV4,
   serverV5,
   serverV6,
-  serverV7
+  serverV7,
+  serverV8
 ])
 
 export const client = (options: {
   readonly definition: Definition.Any
-  readonly spaceId: Identity.SpaceId
+  readonly spaceId?: Identity.SpaceId
   readonly clientId: Identity.ClientId
   readonly migration?: Options
 }) =>
   Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
+    yield* sql.unsafe("PRAGMA foreign_keys = ON")
+    const pragma = yield* SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: PragmaEnabledRow,
+      execute: () => sql`PRAGMA foreign_keys`
+    })(undefined).pipe(Effect.mapError((cause) => {
+      if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
+      return new ReplicaError.StorageCorrupt({ message: "SQLite foreign key state is unreadable", cause })
+    }))
+    if (pragma.foreign_keys !== 1) {
+      return yield* new ReplicaError.StorageCorrupt({ message: "SQLite foreign keys could not be enabled" })
+    }
+    const metaExists = yield* SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: CountRow,
+      execute: () =>
+        sql`SELECT COUNT(*) AS count FROM sqlite_master
+        WHERE type = 'table' AND name = 'effect_local_client_meta'`
+    })(undefined).pipe(Effect.mapError((cause) => {
+      if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
+      return new ReplicaError.StorageCorrupt({ message: "Client metadata catalog is unreadable", cause })
+    }))
+    if (metaExists.count !== 0) {
+      const beforeMigration = yield* SqlSchema.findOneOption({
+        Request: Schema.Void,
+        Result: ClientIdentityRow,
+        execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
+      })(undefined).pipe(Effect.mapError((cause) => {
+        if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
+        return new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
+      }))
+      if (Option.isSome(beforeMigration) && beforeMigration.value.client_id !== options.clientId) {
+        return yield* new ReplicaError.ReplicaIdentityMismatch({
+          expectedClientId: options.clientId,
+          actualClientId: beforeMigration.value.client_id
+        })
+      }
+    }
     yield* runCatalog("Client", clientCatalog, options.migration)
     const readIdentity = SqlSchema.findOneOption({
       Request: Schema.Void,
       Result: ClientIdentityRow,
-      execute: () => sql`SELECT space_id, client_id FROM effect_local_client_meta WHERE singleton = 1`
+      execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
     })
     const existing = yield* readIdentity(undefined).pipe(
       Effect.mapError((cause) => {
@@ -1156,22 +1600,30 @@ export const client = (options: {
         return new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
       })
     )
-    if (
-      Option.isSome(existing) &&
-      (existing.value.space_id !== options.spaceId || existing.value.client_id !== options.clientId)
-    ) {
+    if (Option.isSome(existing) && existing.value.client_id !== options.clientId) {
       return yield* new ReplicaError.ReplicaIdentityMismatch({
-        expectedSpaceId: options.spaceId,
-        actualSpaceId: existing.value.space_id,
         expectedClientId: options.clientId,
         actualClientId: existing.value.client_id
       })
     }
     yield* sql`INSERT INTO effect_local_client_meta
-    (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor, visible_revision,
-      requested_generation, completed_generation)
-    VALUES (1, ${options.spaceId}, ${options.clientId}, ${options.definition.hash}, 1, 0, 0, 0, 0)
+    (singleton, client_id) VALUES (1, ${options.clientId})
     ON CONFLICT (singleton) DO NOTHING`
+    if (options.spaceId !== undefined) {
+      yield* sql`INSERT INTO effect_local_client_spaces
+        (space_id, membership_incarnation, definition_hash, schema_version, schema_hash, schema_generation,
+          active_schema_generation, active_projection_generation, projection_schema_generation,
+          next_local_sequence, server_cursor, visible_revision, requested_generation, completed_generation,
+          installed_snapshot_sequence, installed_snapshot_terminal_sequence)
+        VALUES (${options.spaceId},
+          ('inc_' || lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
+            substr(lower(hex(randomblob(2))), 2) || '-' ||
+            substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))), 2) || '-' ||
+            lower(hex(randomblob(6)))), ${options.definition.hash},
+          ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash}, 0, 0, 0, 0,
+          1, 0, 0, 0, 0, 0, 0)
+        ON CONFLICT (space_id) DO NOTHING`
+    }
     return undefined
   }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 

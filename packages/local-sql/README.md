@@ -2,12 +2,17 @@
 
 SQLite persistence and authoritative mutation ordering for Effect Local.
 
-`SqlReplica.layer` provides the public replica with the lightweight in memory scheduler. `SqlReplica.layerWorkflow`
-uses the same store, query executor, and idempotent reconciliation pass with finite Effect Workflow generations.
-Local SQLite stores canonical entities, visible entities, pending mutations, bounded terminal receipts, a bounded
-accepted suffix, the server cursor, resumable snapshot staging, and requested and completed reconciliation generations.
-Optimistic writes, incremental reconciliation, and snapshot installation are transactional. Workflow storage contains
-execution control only.
+`SqlReplica.layer` provides one public replica for many spaces in one SQLite database. Membership is durable and every
+client table is partitioned by `space_id`. Each `Replica.Space` handle owns its operations and status. The root service
+joins, leaves, lists, and addresses handles, and reports aggregate status. One dispatcher schedules keyed watches and
+turns over the shared `SyncEngine`, so the RPC composition uses one WebSocket while spaces make progress independently.
+`reconciliationConcurrency` bounds how many finite turns the lightweight `SqlReplica.layer` dispatcher can run at once.
+
+`SqlReplica.layerWorkflow` uses the same store, query executor, and idempotent reconciliation pass with finite Effect
+Workflow generations. Local SQLite stores canonical entities, visible entities, pending mutations, bounded terminal
+receipts, a bounded accepted suffix, per space cursors, resumable snapshot staging, and requested and completed
+reconciliation generations. Optimistic writes, incremental reconciliation, and snapshot installation are
+transactional. Workflow storage contains execution control only.
 
 The caller chooses the Workflow engine and runner. A durable single runner composition is:
 
@@ -27,9 +32,9 @@ const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
 
 const ReplicaLive = SqlReplica.layerWorkflow({
   definition,
-  spaceId,
   clientId,
   scope,
+  initialSpaces: [spaceId],
   retainedReceipts: 256,
   maximumReceipts: 1_024,
   retainedHistoryEntries: 256,
@@ -41,6 +46,10 @@ const ReplicaLive = SqlReplica.layerWorkflow({
   Layer.provide(WorkflowEngineLive)
 )
 ```
+
+`initialSpaces` seeds first startup. Later calls to `Replica.join` persist membership and restart restores every joined
+space automatically. `Replica.leave` closes the space runtime before one cascading delete removes its local state.
+The database keeps the singleton `clientId`. Rejoining creates a new membership incarnation and local sequence.
 
 `retryDelay`, `maximumRetryDelay`, and `maximumAttempts` bound exponential retries within one Workflow execution. A
 terminal failed generation stays failed until a later mutation or server wake requests a new generation. Effect

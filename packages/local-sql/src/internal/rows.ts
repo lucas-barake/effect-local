@@ -7,12 +7,14 @@ const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 
 export const ClientMetaRow = Schema.Struct({
   space_id: Identity.SpaceId,
-  client_id: Identity.ClientId,
+  membership_incarnation: Identity.MembershipIncarnation,
   definition_hash: Schema.String,
   schema_version: Identity.SchemaVersion,
   schema_hash: Identity.SchemaHash,
   schema_generation: NonNegativeInt,
   active_schema_generation: NonNegativeInt,
+  active_projection_generation: NonNegativeInt,
+  projection_schema_generation: NonNegativeInt,
   target_schema_version: Schema.NullOr(Identity.SchemaVersion),
   target_schema_hash: Schema.NullOr(Identity.SchemaHash),
   migration_hash: Schema.NullOr(Identity.SchemaHash),
@@ -28,7 +30,9 @@ export const ClientMetaRow = Schema.Struct({
   replication_view_revision: Identity.ReplicationViewRevision,
   desired_scope_json: Schema.String,
   desired_scope_digest: Protocol.MutationDigest,
-  scope_generation: Identity.ReplicationScopeGeneration
+  scope_generation: Identity.ReplicationScopeGeneration,
+  projection_replay_generation: Schema.NullOr(NonNegativeInt),
+  projection_replay_cursor: Schema.NullOr(Schema.String)
 })
 
 export const ClientScopedBootstrapRow = Schema.Struct({
@@ -53,12 +57,20 @@ export const ClientScopedBootstrapRow = Schema.Struct({
 })
 
 export const EntityRow = Schema.Struct({ value_json: Schema.String })
+export const ProjectionEntityRow = Schema.Struct({
+  model: Schema.String,
+  model_version: Identity.SchemaVersion,
+  entity_key: Schema.String,
+  value_json: Schema.String
+})
+export const RowIdRow = Schema.Struct({ row_id: NonNegativeInt })
 export const SizedEntityRow = Schema.Struct({
   value_json: Schema.String,
   entity_bytes: NonNegativeInt
 })
 
 const PendingRowFields = {
+  membership_incarnation: Identity.MembershipIncarnation,
   mutation_id: Identity.MutationId,
   local_sequence: Identity.LocalSequence,
   basis: Identity.ServerSequence,
@@ -143,6 +155,7 @@ export const ReplicationSpaceRow = Schema.Struct({
 export const ServerReceiptRow = Schema.Struct({
   space_id: Identity.SpaceId,
   client_id: Identity.ClientId,
+  membership_incarnation: Identity.MembershipIncarnation,
   local_sequence: Identity.LocalSequence,
   digest: Protocol.MutationDigest,
   digest_version: Protocol.MutationDigestVersion,
@@ -158,6 +171,7 @@ export const ServerReceiptRow = Schema.Struct({
 })
 
 export const ClientLogRow = Schema.Struct({
+  membership_incarnation: Identity.MembershipIncarnation,
   server_sequence: Identity.ServerSequence,
   mutation_id: Identity.MutationId,
   entry_json: Schema.String
@@ -172,6 +186,7 @@ export const ServerLogRow = Schema.Struct({
   space_id: Identity.SpaceId,
   server_sequence: Identity.ServerSequence,
   client_id: Identity.ClientId,
+  membership_incarnation: Identity.MembershipIncarnation,
   local_sequence: Identity.LocalSequence,
   mutation_id: Identity.MutationId,
   digest: Protocol.MutationDigest,
@@ -293,6 +308,10 @@ export const ChangeRow = Schema.Struct({
 
 export const CountRow = Schema.Struct({ count: NonNegativeInt })
 export const SpaceIdRow = Schema.Struct({ space_id: Identity.SpaceId })
+export const SpacePendingCountRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  count: NonNegativeInt
+})
 export const SequenceRow = Schema.Struct({ server_sequence: Identity.ServerSequence })
 export const TerminalReceiptIdentityRow = Schema.Struct({
   terminal_sequence: Identity.TerminalSequence,

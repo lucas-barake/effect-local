@@ -65,11 +65,17 @@ export class PendingMutationEvolutionRejected extends Schema.TaggedErrorClass<Pe
 export class ReplicaIdentityMismatch extends Schema.TaggedErrorClass<ReplicaIdentityMismatch>(
   "@lucas-barake/effect-local/ReplicaIdentityMismatch"
 )("ReplicaIdentityMismatch", {
-  expectedSpaceId: Schema.String,
-  actualSpaceId: Schema.String,
   expectedClientId: Schema.String,
   actualClientId: Schema.String
 }) {}
+
+export class SpaceNotJoined extends Schema.TaggedErrorClass<SpaceNotJoined>(
+  "@lucas-barake/effect-local/SpaceNotJoined"
+)("SpaceNotJoined", { spaceId: Schema.String }) {}
+
+export class SpaceUnavailable extends Schema.TaggedErrorClass<SpaceUnavailable>(
+  "@lucas-barake/effect-local/SpaceUnavailable"
+)("SpaceUnavailable", { spaceId: Schema.String }) {}
 
 export class MutationIdentityConflict extends Schema.TaggedErrorClass<MutationIdentityConflict>(
   "@lucas-barake/effect-local/MutationIdentityConflict"
@@ -131,6 +137,8 @@ export const ReplicaError = Schema.Union([
   SchemaKeyCollision,
   PendingMutationEvolutionRejected,
   ReplicaIdentityMismatch,
+  SpaceNotJoined,
+  SpaceUnavailable,
   MutationIdentityConflict,
   OutOfOrderMutation,
   CursorGap,

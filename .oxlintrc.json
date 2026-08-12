@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json",
   "plugins": ["typescript", "import", "oxc", "eslint", "unicorn", "node"],
-  "jsPlugins": ["oxlint-plugin-effect/plugin"],
+  "jsPlugins": ["oxlint-plugin-effect/plugin", "./scripts/oxlint-plugin.mjs"],
   "options": {
     "typeAware": true
   },
@@ -43,7 +43,9 @@
     "effect/noTernary": "error",
     "effect/noTestLifecycleHooks": "error",
     "effect/noThrowStatement": "error",
-    "effect/noTryCatch": "error"
+    "effect/noTryCatch": "error",
+    "effect-local/noYieldEffectSync": "error",
+    "effect-local/noSemaphoreEffectSync": "error"
   },
   "overrides": [
     {

@@ -179,4 +179,26 @@ describe("domain contracts", () => {
     assert.strictEqual(change._tag, "Retract")
     assert.deepStrictEqual(change.entity.key, "a")
   })
+
+  it("accepts only the current mutation protocol with explicit membership", () => {
+    const current = {
+      spaceId: "spc_00000000-0000-4000-8000-000000000001",
+      clientId: "cli_00000000-0000-4000-8000-000000000001",
+      membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
+      mutationId: "mut_00000000-0000-4000-8000-000000000001",
+      localSequence: 1,
+      basis: 0,
+      name: "PutTodo",
+      payload: { id: "1", title: "current" },
+      digestVersion: 3,
+      sourceSchema: { version: 1, hash: "1111111111111111" },
+      mutationVersion: 1,
+      digest: "1".repeat(64)
+    }
+    assert.deepStrictEqual(Schema.decodeUnknownSync(Protocol.MutationEnvelope)(current).digestVersion, 3)
+    assert.throws(() => Schema.decodeUnknownSync(Protocol.MutationEnvelope)({ ...current, digestVersion: 2 }))
+    assert.throws(() =>
+      Schema.decodeUnknownSync(Protocol.MutationEnvelope)({ ...current, membershipIncarnation: undefined })
+    )
+  })
 })

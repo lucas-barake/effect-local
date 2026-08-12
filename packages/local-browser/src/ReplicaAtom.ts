@@ -39,51 +39,102 @@ export const make = <R, E,>(
   const runtime = factory(layer)
   const idleTTL = Duration.toMillis(options?.idleTTL ?? Duration.seconds(30))
 
-  const entity = <M extends Model.Any,>(model: M) =>
+  const spaceKey = (spaceId: Identity.SpaceId) => `effect-local:space:${spaceId}`
+  const entitiesKey = (spaceId: Identity.SpaceId) => `${spaceKey(spaceId)}:entities`
+
+  const entity = <M extends Model.Any,>(spaceId: Identity.SpaceId, model: M) =>
     Atom.family((key: Model.Key<M>) =>
-      runtime.atom(Replica.Replica.use((replica) => replica.get(model, key))).pipe(
-        factory.withReactivity({ "effect-local:entities": [[model.name, key]] }),
+      runtime.atom(
+        Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.get(model, key))))
+      ).pipe(
+        factory.withReactivity({
+          [spaceKey(spaceId)]: [],
+          [entitiesKey(spaceId)]: [[model.name, key]]
+        }),
         Atom.setIdleTTL(idleTTL)
       )
     )
 
-  const query = <Q extends Query.Any,>(definition: Q) => {
+  const query = <Q extends Query.Any,>(spaceId: Identity.SpaceId, definition: Q) => {
     const dependencyKeys = Array.from(
       new Set(definition.dependsOn.map((model) => model.name)),
       (name) => [name]
     )
     const family = Atom.family((key: QueryKey<Q["payloadSchema"]["Type"]>) =>
-      runtime.atom(Replica.Replica.use((replica) => replica.query(definition, key.payload))).pipe(
+      runtime.atom(
+        Replica.Replica.use((replica) =>
+          replica.space(spaceId).pipe(Effect.flatMap((space) => space.query(definition, key.payload)))
+        )
+      ).pipe(
         factory.withReactivity({
-          "effect-local:entities": dependencyKeys
+          [spaceKey(spaceId)]: [],
+          [entitiesKey(spaceId)]: dependencyKeys
         }),
         Atom.setIdleTTL(idleTTL)
       )
     )
     return (payload: Q["payloadSchema"]["Type"]) => {
-      return family(new QueryKey(`${definition.name}:${Canonical.hash(payload)}`, payload))
+      return family(new QueryKey(`${spaceId}:${definition.name}:${Canonical.hash(payload)}`, payload))
     }
   }
 
-  const mutation = <M extends Mutation.Any,>(definition: M) =>
+  const mutation = <M extends Mutation.Any,>(spaceId: Identity.SpaceId, definition: M) =>
     runtime.fn<Mutation.Payload<M>>()(
       (payload) =>
         Effect.yieldNow.pipe(
-          Effect.andThen(Replica.Replica.use((replica) => replica.mutate(definition, payload)))
+          Effect.andThen(
+            Replica.Replica.use((replica) =>
+              replica.space(spaceId).pipe(Effect.flatMap((space) => space.mutate(definition, payload)))
+            )
+          )
         ),
       { concurrent: true }
     )
 
-  const receipt = Atom.family((mutationId: Identity.MutationId) =>
-    runtime.atom(Replica.Replica.use((replica) => replica.receipt(mutationId))).pipe(
-      factory.withReactivity([`effect-local:receipt:${mutationId}`]),
+  const receipt = (spaceId: Identity.SpaceId, mutationId: Identity.MutationId) =>
+    runtime.atom(
+      Replica.Replica.use((replica) =>
+        replica.space(spaceId).pipe(Effect.flatMap((space) => space.receipt(mutationId)))
+      )
+    ).pipe(
+      factory.withReactivity([
+        spaceKey(spaceId),
+        `${spaceKey(spaceId)}:receipt:${mutationId}`
+      ]),
       Atom.setIdleTTL(idleTTL)
     )
-  )
 
-  const status = runtime.atom(Replica.Replica.use((replica) => replica.status)).pipe(
+  const status = Atom.family((spaceId: Identity.SpaceId) =>
+    runtime.atom(
+      Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.status)))
+    ).pipe(factory.withReactivity([spaceKey(spaceId), `${spaceKey(spaceId)}:status`]))
+  )
+  const spaces = runtime.atom(Replica.Replica.use((replica) => replica.spaces)).pipe(
     factory.withReactivity(["effect-local:status"])
   )
+  const aggregateStatus = runtime.atom(Replica.Replica.use((replica) => replica.status)).pipe(
+    factory.withReactivity(["effect-local:status"])
+  )
+  const join = runtime.fn<Identity.SpaceId>()(
+    (spaceId) => Replica.Replica.use((replica) => replica.join(spaceId)),
+    { concurrent: true }
+  )
+  const leave = runtime.fn<Identity.SpaceId>()(
+    (spaceId) => Replica.Replica.use((replica) => replica.leave(spaceId)),
+    { concurrent: true }
+  )
 
-  return { factory, runtime, entity, query, mutation, receipt, status } as const
+  return {
+    factory,
+    runtime,
+    entity,
+    query,
+    mutation,
+    receipt,
+    status,
+    spaces,
+    aggregateStatus,
+    join,
+    leave
+  } as const
 }

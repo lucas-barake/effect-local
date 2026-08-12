@@ -18,34 +18,36 @@ export const layer: Layer.Layer<
     const server = yield* ServerStore.ServerStore
     const faults = yield* FaultInjection.FaultInjection
     const crypto = yield* Crypto.Crypto
-    const online = faults.state.pipe(Effect.filterOrFail(
-      (state) => state.online,
-      () => new ReplicaError.ProtocolInvalid({ message: "The test network is partitioned" })
-    ))
+    const online = (spaceId: Protocol.SubmitRequest["envelope"]["spaceId"]) =>
+      faults.state(spaceId).pipe(Effect.filterOrFail(
+        (state) => state.online,
+        () => new ReplicaError.ServerUnavailable()
+      ))
     return SyncEngine.SyncEngine.of({
-      submit: (envelope) =>
+      submit: (request) =>
         Effect.gen(function*() {
-          yield* online
-          const receipt = yield* server.submit(envelope)
-          if (yield* faults.takeDroppedReceipt) {
-            return yield* new ReplicaError.ProtocolInvalid({ message: "The test network is partitioned" })
+          yield* online(request.envelope.spaceId)
+          const receipt = yield* server.submit(request)
+          if (yield* faults.takeDroppedReceipt(request.envelope.spaceId)) {
+            return yield* new ReplicaError.ServerUnavailable()
           }
           return receipt
         }),
       pull: (request) =>
         Effect.gen(function*() {
-          yield* online
+          yield* online(request.spaceId)
           const page = yield* server.pull(request)
           if (
-            "_tag" in page || !(yield* faults.takeDuplicatePage) || page.changes.length === 0 ||
+            "_tag" in page ||
+            !(yield* faults.takeDuplicatePage(request.spaceId)) ||
+            page.changes.length === 0 ||
             page.changes.length === Protocol.maximumBatchEntries
           ) return page
           const changes = [page.changes[0], ...page.changes]
-          const contentBytes = yield* Protocol.encodedBytesEffect(changes)
           const duplicate = Protocol.PullPage.make({
             ...page,
             changes,
-            contentBytes,
+            contentBytes: yield* Protocol.encodedBytesEffect(changes),
             digest: yield* Protocol.viewChangesDigest(changes).pipe(
               Effect.provideService(Crypto.Crypto, crypto)
             )
@@ -53,11 +55,11 @@ export const layer: Layer.Layer<
           if (Protocol.encodedBytes(duplicate) > Protocol.maximumBatchBytes) return page
           return duplicate
         }),
-      bootstrap: (request) => online.pipe(Effect.andThen(server.bootstrap(request))),
-      watch: (spaceId) =>
-        server.watch(spaceId).pipe(
-          Stream.filterEffect(() => faults.state.pipe(Effect.map((state) => state.online))),
-          Stream.mapError(() => new ReplicaError.ProtocolInvalid({ message: "The test network is partitioned" }))
+      bootstrap: (request) => online(request.spaceId).pipe(Effect.andThen(server.bootstrap(request))),
+      watch: (request) =>
+        server.watch(request).pipe(
+          Stream.filterEffect(() => faults.state(request.spaceId).pipe(Effect.map((state) => state.online))),
+          Stream.mapError(() => new ReplicaError.ServerUnavailable())
         )
     })
   })

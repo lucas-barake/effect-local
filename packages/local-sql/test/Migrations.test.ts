@@ -18,7 +18,6 @@ import * as Domain from "./Domain.js"
 const database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
-
 const LedgerRow = Schema.Struct({ id: Schema.Number, name: Schema.String, checksum: Schema.String })
 const NameRow = Schema.Struct({ name: Schema.String })
 const CountRow = Schema.Struct({ count: Schema.Number })
@@ -29,19 +28,6 @@ const ClientReplicationMetaRow = Schema.Struct({
   desired_scope_digest: Schema.String,
   scope_generation: Schema.Number
 })
-const LegacyClientRow = Schema.Struct({
-  definition_hash: Schema.String,
-  schema_version: Schema.NullOr(Schema.Number),
-  entity_value: Schema.String,
-  model_version: Schema.NullOr(Schema.Number)
-})
-const LegacyServerRow = Schema.Struct({
-  definition_hash: Schema.String,
-  schema_version: Schema.NullOr(Schema.Number),
-  entity_value: Schema.String,
-  model_version: Schema.NullOr(Schema.Number)
-})
-
 const clientLedger = (sql: SqlClient.SqlClient) =>
   SqlSchema.findAll({
     Request: Schema.Void,
@@ -147,18 +133,18 @@ describe("storage migration catalogs", () => {
       })
       yield* Migrations.server()
 
-      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
-      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8])
+      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8])
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
         "effect_local_client_evolution",
         "effect_local_client_key_lineage",
         "effect_local_client_key_lineage_groups",
         "effect_local_client_key_lineage_targets",
-        "effect_local_client_shadow_entities",
-        "effect_local_client_shadow_pending",
-        "effect_local_client_shadow_receipts_v2",
-        "effect_local_client_shadow_visible_entities",
+        "effect_local_client_spaces",
+        "effect_local_client_retractions",
+        "effect_local_client_scoped_bootstrap",
+        "effect_local_client_scoped_bootstrap_entries",
         "effect_local_client_canonical_entities_data",
         "effect_local_client_pending_data",
         "effect_local_client_receipts_data",
@@ -194,7 +180,7 @@ describe("storage migration catalogs", () => {
         execute: () =>
           sql`SELECT replication_view_id, replication_view_revision, desired_scope_json,
             desired_scope_digest, scope_generation
-          FROM effect_local_client_meta WHERE singleton = 1`
+          FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
       })(undefined)
       assert.deepStrictEqual(meta, {
         replication_view_id: null,
@@ -291,160 +277,6 @@ describe("storage migration catalogs", () => {
         (yield* Migrations.runCatalog("Server", [first, duplicateId]).pipe(Effect.flip))._tag,
         "StorageMigrationMismatch"
       )
-    }).pipe(Effect.provide(database)))
-
-  it.effect("upgrades the existing mutation log tables without stamping untrusted schema provenance", () =>
-    Effect.gen(function*() {
-      const sql = yield* SqlClient.SqlClient
-      const clientInitial = Migrations.clientCatalog[0]
-      const serverInitial = Migrations.serverCatalog[0]
-      if (clientInitial === undefined || serverInitial === undefined) {
-        assert.fail("Migration catalogs must contain their initial schema")
-      }
-      yield* Effect.forEach(clientInitial.statements, (statement) => sql.unsafe(statement), {
-        discard: true
-      })
-      yield* Effect.forEach(serverInitial.statements, (statement) => sql.unsafe(statement), {
-        discard: true
-      })
-      yield* sql`INSERT INTO effect_local_client_meta
-      (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor, visible_revision,
-        requested_generation, completed_generation)
-      VALUES (1, ${spaceId}, ${clientId}, 'legacy-client-hash', 1, 0, 0, 0, 0)`
-      yield* sql`INSERT INTO effect_local_canonical_entities (model, entity_key, value_json)
-      VALUES ('Todo', '"1"', '{"id":"1","title":"legacy"}')`
-      yield* sql`INSERT INTO effect_local_server_spaces (space_id, definition_hash, next_server_sequence)
-      VALUES (${spaceId}, 'legacy-server-hash', 1)`
-      yield* sql`INSERT INTO effect_local_server_entities (space_id, model, entity_key, value_json)
-      VALUES (${spaceId}, 'Todo', '"1"', '{"id":"1","title":"legacy"}')`
-
-      yield* Migrations.client({ definition: Domain.definition, spaceId, clientId })
-      yield* Migrations.server()
-
-      const clientRow = yield* SqlSchema.findOne({
-        Request: Schema.Void,
-        Result: LegacyClientRow,
-        execute: () =>
-          sql`SELECT m.definition_hash, m.schema_version, e.value_json AS entity_value,
-          e.model_version
-        FROM effect_local_client_meta AS m
-        INNER JOIN effect_local_canonical_entities AS e ON e.model = 'Todo' AND e.entity_key = '"1"'
-        WHERE m.singleton = 1`
-      })(undefined)
-      assert.deepStrictEqual(clientRow, {
-        definition_hash: "legacy-client-hash",
-        schema_version: null,
-        entity_value: "{\"id\":\"1\",\"title\":\"legacy\"}",
-        model_version: null
-      })
-
-      const serverRow = yield* SqlSchema.findOne({
-        Request: Schema.Void,
-        Result: LegacyServerRow,
-        execute: () =>
-          sql`SELECT s.definition_hash, s.schema_version, e.value_json AS entity_value,
-          e.model_version
-        FROM effect_local_server_spaces AS s
-        INNER JOIN effect_local_server_entities AS e
-          ON e.space_id = s.space_id AND e.model = 'Todo' AND e.entity_key = '"1"'
-        WHERE s.space_id = ${spaceId}`
-      })(undefined)
-      assert.deepStrictEqual(serverRow, {
-        definition_hash: "legacy-server-hash",
-        schema_version: null,
-        entity_value: "{\"id\":\"1\",\"title\":\"legacy\"}",
-        model_version: null
-      })
-    }).pipe(Effect.provide(database)))
-
-  it.effect("restarts pre-generation promotions from preserved source rows", () =>
-    Effect.gen(function*() {
-      const sql = yield* SqlClient.SqlClient
-      yield* Migrations.runCatalog("Client", Migrations.clientCatalog.slice(0, 6))
-      yield* Migrations.runCatalog("Server", Migrations.serverCatalog.slice(0, 6))
-      yield* sql`INSERT INTO effect_local_client_meta
-        (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor, visible_revision,
-          requested_generation, completed_generation, schema_version, schema_hash, schema_generation,
-          target_schema_version, target_schema_hash, migration_hash)
-        VALUES (1, ${spaceId}, ${clientId}, 'source-definition', 1, 0, 0, 0, 0,
-          1, 'source-hash', 4, 2, 'target-hash', 'migration-hash')`
-      yield* sql`INSERT INTO effect_local_canonical_entities (model, model_version, entity_key, value_json)
-        VALUES ('Todo', 1, '"source"', '{"id":"source"}')`
-      yield* sql`INSERT INTO effect_local_client_evolution
-        (singleton, source_schema_version, source_schema_hash, target_schema_version, target_schema_hash,
-          migration_hash, generation, phase, cursor_model, cursor_key, cursor_sequence)
-        VALUES (1, 1, 'source-hash', 2, 'target-hash', 'migration-hash', 4,
-          'Entities', 'Todo', '"source"', NULL)`
-      yield* sql`INSERT INTO effect_local_client_shadow_entities
-        (generation, model, model_version, entity_key, value_json)
-        VALUES (4, 'Todo', 2, '"partial"', '{"id":"partial"}')`
-
-      yield* sql`INSERT INTO effect_local_server_spaces
-        (space_id, definition_hash, next_server_sequence, schema_version, schema_hash, schema_generation,
-          target_schema_version, target_schema_hash, migration_hash, next_terminal_sequence, history_floor,
-          receipt_floor, retained_history_count, retained_receipt_count, entity_count, entity_bytes,
-          snapshot_sequence, snapshot_terminal_sequence, metadata_verified)
-        VALUES (${spaceId}, 'source-definition', 1, 1, 'source-hash', 4, 2, 'target-hash',
-          'migration-hash', 1, 0, 0, 0, 0, 1, 10, 0, 0, 1)`
-      yield* sql`INSERT INTO effect_local_server_entities
-        (space_id, model, model_version, entity_key, value_json, entity_bytes)
-        VALUES (${spaceId}, 'Todo', 1, '"source"', '{"id":"source"}', 10)`
-      yield* sql`INSERT INTO effect_local_server_evolution
-        (space_id, source_schema_version, source_schema_hash, target_schema_version, target_schema_hash,
-          migration_hash, generation, phase, cursor_model, cursor_key, cursor_sequence)
-        VALUES (${spaceId}, 1, 'source-hash', 2, 'target-hash', 'migration-hash', 4,
-          'Entities', 'Todo', '"source"', NULL)`
-      yield* sql`INSERT INTO effect_local_server_shadow_entities
-        (space_id, generation, model, model_version, entity_key, value_json)
-        VALUES (${spaceId}, 4, 'Todo', 2, '"partial"', '{"id":"partial"}')`
-
-      yield* Migrations.runCatalog("Client", Migrations.clientCatalog)
-      yield* Migrations.runCatalog("Server", Migrations.serverCatalog)
-
-      const client = (yield* sql<{
-        readonly active_schema_generation: number
-        readonly phase: string
-        readonly source_generation: number
-        readonly source_count: number
-        readonly target_count: number
-      }>`SELECT m.active_schema_generation, e.phase, e.source_generation,
-        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data WHERE generation = 3) AS source_count,
-        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data WHERE generation = 4) AS target_count
-        FROM effect_local_client_meta AS m INNER JOIN effect_local_client_evolution AS e ON e.singleton = m.singleton`)[
-        0
-      ]
-      assert.deepStrictEqual(client, {
-        active_schema_generation: 3,
-        phase: "Log",
-        source_generation: 3,
-        source_count: 1,
-        target_count: 0
-      })
-      const server = (yield* sql<{
-        readonly active_schema_generation: number
-        readonly phase: string
-        readonly source_generation: number
-        readonly source_count: number
-        readonly target_count: number
-        readonly target_entity_count: number
-        readonly target_entity_bytes: number
-      }>`SELECT s.active_schema_generation, e.phase, e.source_generation,
-        e.target_entity_count, e.target_entity_bytes,
-        (SELECT COUNT(*) FROM effect_local_server_entities_data
-          WHERE space_id = ${spaceId} AND generation = 3) AS source_count,
-        (SELECT COUNT(*) FROM effect_local_server_entities_data
-          WHERE space_id = ${spaceId} AND generation = 4) AS target_count
-        FROM effect_local_server_spaces AS s INNER JOIN effect_local_server_evolution AS e
-          ON e.space_id = s.space_id WHERE s.space_id = ${spaceId}`)[0]
-      assert.deepStrictEqual(server, {
-        active_schema_generation: 3,
-        phase: "Log",
-        source_generation: 3,
-        source_count: 1,
-        target_count: 0,
-        target_entity_count: 0,
-        target_entity_bytes: 0
-      })
     }).pipe(Effect.provide(database)))
 
   it.effect("rolls back migration statements and the ledger together, then reuses the same client", () =>

@@ -26,6 +26,9 @@ import * as Domain from "./Domain.js"
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const writerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const readerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+const membershipIncarnation = Identity.MembershipIncarnation.make(
+  "inc_00000000-0000-4000-8000-000000000001"
+)
 const scope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const history = {
@@ -100,7 +103,8 @@ const envelope = (id: string, sequence: number, title = "first") =>
       basis: Identity.ServerSequence.make(0),
       name: Domain.PutTodo.name,
       payload: Domain.todo(id, title),
-      digestVersion: 2 as const,
+      digestVersion: 3 as const,
+      membershipIncarnation,
       sourceSchema: Domain.definition.schemaIdentity,
       mutationVersion: Domain.PutTodo.version
     }
@@ -119,7 +123,8 @@ const deleteEnvelope = (id: string, sequence: number) =>
       basis: Identity.ServerSequence.make(0),
       name: Domain.DeleteTodo.name,
       payload: { id },
-      digestVersion: 2 as const,
+      digestVersion: 3 as const,
+      membershipIncarnation,
       sourceSchema: Domain.definition.schemaIdentity,
       mutationVersion: Domain.DeleteTodo.version
     }
@@ -138,7 +143,8 @@ const putManyEnvelope = (count: number, sequence: number) =>
       basis: Identity.ServerSequence.make(0),
       name: Domain.PutManyTodos.name,
       payload: { count },
-      digestVersion: 2 as const,
+      digestVersion: 3 as const,
+      membershipIncarnation,
       sourceSchema: Domain.definition.schemaIdentity,
       mutationVersion: Domain.PutManyTodos.version
     }
@@ -687,6 +693,7 @@ describe("scoped replication", () => {
           schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
           spaceId,
           clientId: readerId,
+          membershipIncarnation: local.membershipIncarnation,
           scope: initial.scope,
           scopeGeneration: initial.scopeGeneration,
           generation
