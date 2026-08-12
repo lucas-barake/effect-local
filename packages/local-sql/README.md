@@ -71,8 +71,21 @@ ordinary shutdown because it durably cancels the reconciliation.
 retries, deduplicates stable mutation identities, stores terminal rejections, assigns the next dense sequence to
 accepted mutations, and materializes authoritative state in the same SQL transaction. Its required history options
 set retained targets, hard admission caps, snapshot capacity, bootstrap page capacity, prune batches, retained
-snapshots, migration retry, maintenance concurrency, and the keyset page size used to enumerate spaces. `ServerStore.layerTrusted` is the explicit allow all
-composition.
+snapshots, migration retry, maintenance concurrency, and the keyset page size used to enumerate spaces. The required
+`maximumWatchersPerSpace`, `readAuthorizationRefreshInterval`, `maximumConcurrentReadAuthorizations`, and
+`readAuthorizationCacheCapacity` options bound live sync streams and their policy work. `ServerStore.layerTrusted` is
+the explicit allow all composition.
+
+Sync watch authorization shares successful structural `(spaceId, principal)` checks. Completed successes are finite,
+pending equal checks use one lookup, and denials are not cached. Each watcher starts refresh halfway through the
+configured interval. If no fresh success is available at the current success expiry, the watcher scope closes and its
+stream fails with `AuthorizationDenied`. `readAuthorizationRefreshInterval` is therefore the fail closed worst case
+revocation bound. Pull and Bootstrap perform uncached one shot read authorization.
+
+Each accepted mutation publishes one shared wake after its transaction commits. Watchers do not perform a SQLite
+transaction or space row write per publication. `wakeCapacity` is the optional sliding wake queue depth, while
+`maximumWatchersPerSpace` is the separate live watcher allowance. Excess streams fail with typed
+`CapacityExceeded { resource: "sync watchers", limit }`.
 
 Provide `ServerStore.layerMaintenance({ interval, runOnStart })` beside the store, or schedule `maintainAll` through an
 application owned job runner. Maintenance publishes an immutable snapshot and logical floors before bounded physical
@@ -99,6 +112,10 @@ const StoreLive = ServerStore.layer({
   retainedSnapshots: 2,
   maintenanceConcurrency: 4,
   maintenanceSpaceBatchSize: 128,
+  maximumWatchersPerSpace: 1_024,
+  readAuthorizationRefreshInterval: "30 seconds",
+  maximumConcurrentReadAuthorizations: 64,
+  readAuthorizationCacheCapacity: 4_096,
   migration: { retryDelay: "25 millis", maximumAttempts: 8 }
 })
 
@@ -112,6 +129,23 @@ Exact retries return retained receipts. Once receipt evidence has crossed the pu
 retry returns `Expired` and never executes again. The client retains an expired pending mutation until it installs the
 covering snapshot, unless its durable cursor already proves that canonical state includes the snapshot sequence.
 `SyncEngine` is the transport neutral boundary used by direct tests and the RPC client.
+
+## Operational metrics
+
+`ServerStore` records `effect_local_server_admission` by completed attempt outcome and
+`effect_local_server_rejection` by stable receipt origin or typed error `_tag`. The
+`effect_local_server_history_depth` and `effect_local_server_receipt_depth` gauges report the maximum retained rows in
+any one space. Their matching `_limit` gauges report the configured per space caps.
+
+`effect_local_server_sync_watcher_count` is the live sync watcher population.
+`effect_local_server_wake_fanout_duration` records publication to one subscriber delivery for accepted wakes.
+`effect_local_server_maintenance` records completed and failed maintenance runs, while `effect_local_server_pruned`
+counts committed deleted rows with `resource=history|receipt`.
+
+`LocalStore` increments `effect_local_client_bootstrap_install` after a snapshot installation commits and maintains
+`effect_local_client_pending_mutation_count` as the pending population across active stores. Metric labels use bounded
+outcomes and resource classes. They do not contain space, client, mutation, request, or principal identifiers. The
+production watcher benchmark is `../local-rpc/bench/Fanout.bench.ts`.
 
 See the [repository guide](https://github.com/lucas-barake/effect-local#readme) and
 [durability notes](https://github.com/lucas-barake/effect-local/blob/main/docs/durability.md).

@@ -21,6 +21,10 @@ one execution's history and repairs a lost wake when the next runner starts. A t
 mutation or server wake to request a new generation. Completed execution retention belongs to the selected Workflow
 storage.
 
+An accepted mutation publishes one wake after its SQL transaction commits. Every subscribed watcher consumes that
+shared in memory publication. Fanout does not start a SQLite transaction or write the space row for each watcher. Wakes
+remain hints. Pull reads the durable accepted sequence and repairs dropped or coalesced publications.
+
 ## History lifecycle
 
 The server retains a configurable dense accepted suffix and a configurable terminal receipt suffix. Hard caps are
@@ -47,19 +51,34 @@ full private result was reclaimed.
 ## WebSocket RPC
 
 `SyncRpc.Rpcs` uses one Effect RPC group for negotiation, submit, discard, pull, bootstrap, watch, presence publish,
-and presence watch. Effect's RPC
-Schema codecs define the external contract. `SyncServer.layer` is the authenticated facade. It routes each operation
-through the Effect Cluster entity named by the request's space. The entity validates that embedded space identity
-matches its Cluster address, then calls `ServerStore` or `PresenceHub`. `SyncClient.layer` maps the generated client
-to `SyncEngine` while preserving typed replica failures.
+and presence watch. Effect's RPC Schema codecs define the external contract. `SyncServer.layer` is the authenticated
+facade. It routes each operation to one of four Effect Cluster entities named by the request's space.
+`SpaceAdmissionEntity` serializes Submit and Discard. `SpaceReadEntity` forks Pull and immutable Bootstrap page reads.
+`SpaceWatchEntity` forks long lived sync and presence streams. `SpacePresencePublishEntity` admits bounded concurrent
+presence publications. Each entity validates that embedded space identity matches its Cluster address, then calls
+`ServerStore` or `PresenceHub`. `SyncClient.layer` maps the aggregated `SpaceEntity.Client` to `SyncEngine` while
+preserving typed replica failures.
+
+`SpaceEntity.HandlerOptions` requires finite positive mailboxes for admission, reads, watches, and presence publication.
+It also requires per space limits for concurrent Bootstrap pages and presence publications. A Bootstrap request does not
+wait behind the work limit. It fails with `CapacityExceeded { resource: "bootstrap pages", limit }`. A full entity
+mailbox becomes `ServerUnavailable` at the domain client boundary.
 
 Authentication is RPC middleware. The client reads a redacted credential and sets an `Authorization: Bearer` header.
 The server authenticates it into a JSON principal for each request. `ServerStore.layer` requires access, mutation
-admission, and read policies. Receipt retries recheck current access before reading durable state. `PresenceHub.layer`
-requires a tagged publish or watch policy that can bind the claimed presence client ID to the principal. The explicit
-`layerTrusted` constructors are reserved for tests and already trusted processes.
+admission, and read policies. Receipt retries recheck current access before reading durable state. Pull and Bootstrap
+perform one shot read authorization. Sync watches share successful structural `(spaceId, principal)` checks, with
+completed successes bounded by `readAuthorizationCacheCapacity` and policy calls bounded by
+`maximumConcurrentReadAuthorizations`. Denials are not cached. A watcher starts refreshing halfway through
+`readAuthorizationRefreshInterval`. If no fresh success exists at the current success expiry, it closes its watcher
+scope and fails with `AuthorizationDenied`, even if policy work hangs or the client has stopped pulling. The configured
+interval is the explicit worst case revocation bound.
 
-The space entity is the single live owner and relay for a space. Its operations are deliberately volatile. Durable
+`PresenceHub.layer` requires a tagged publish or watch policy that can bind the claimed presence client ID to the
+principal. Presence watch authorization is checked when the stream starts. The explicit `layerTrusted` constructors are
+reserved for tests and already trusted processes.
+
+The four space entities are the live owners and relays for their lanes. Their operations are deliberately volatile. Durable
 mutation custody has two owners at different stages. Before admission, the client keeps the pending envelope in its
 SQLite outbox. After admission, `ServerStore` keeps the terminal receipt and accepted event in
 `effect_local_server_receipts` and `effect_local_authoritative_log`. If a runner fails before SQL commit, the entity call
@@ -126,3 +145,18 @@ per-space sliding hubs on the Cluster space owner, and expires by TTL. Effect `R
 last subscriber closes. A slow subscriber may miss updates. Browser presence assigns an arrival token before decode
 so a slow older value cannot overwrite a newer valid value or survive an explicit remove. Invalid values do not
 suppress valid in flight values.
+
+`PresenceHub.maximumWatchersPerSpace` caps active presence streams and fails excess streams with
+`CapacityExceeded { resource: "presence watchers", limit }`. `PresenceHub.capacity`, which defaults to 1,024, is the
+sliding publication queue depth. It does not control watcher count. `ServerStore.maximumWatchersPerSpace` separately
+caps sync watch streams and uses resource `sync watchers`. Stream interruption and authorization failure release both
+allowances.
+
+## Operations
+
+The server records admission attempts by outcome, rejection origin or error class, maximum per space history and
+receipt depths beside their hard limits, active sync and presence watcher counts, per subscriber wake fanout duration,
+maintenance outcomes, and committed history and receipt prune volumes. The client records durable bootstrap installs
+and pending mutation population across active local stores. Metric names are listed in the repository README. They use
+bounded categorical attributes and no space, client, mutation, request, or principal labels. The fanout benchmark at
+`packages/local-rpc/bench/Fanout.bench.ts` covers 64, 256, and 1,024 watchers.

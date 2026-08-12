@@ -34,11 +34,12 @@ executes the same handler, and either stores a terminal rejection or appends pub
 changes at the next dense sequence. The submitting client's result remains in its private receipt. A client installs
 contiguous accepted entries into canonical state and then replays its remaining pending mutations over that state.
 
-Effect Cluster owns deployment neutral routing and live ownership. One entity per space serializes mutation admission,
-holds wake and presence recipients, and routes them across runners. The actor does not retain mutation payloads or
-replies in Cluster message history. Server SQL stores bounded authoritative history, bounded receipts, immutable state
-snapshots, and explicit retained floors. Clients retain pending mutations, a durable cursor, and resumable bootstrap
-staging in SQLite. Effect Workflow owns durable client scheduling through finite reconciliation generations.
+Effect Cluster owns deployment neutral routing and live ownership. Separate entities per space serialize mutation
+admission, fork reads and immutable snapshot pages, own long lived sync and presence watches, and bound presence
+publication. Each lane has a finite mailbox. The actors do not retain mutation payloads or replies in Cluster message
+history. Server SQL stores bounded authoritative history, bounded receipts, immutable state snapshots, and explicit
+retained floors. Clients retain pending mutations, a durable cursor, and resumable bootstrap staging in SQLite. Effect
+Workflow owns durable client scheduling through finite reconciliation generations.
 
 Ordinary fields store ordinary values. Applications that need concurrent intent for a specific field can use an
 explicit `Field.Semantics` such as a counter or grow only set. Every other model avoids causal metadata.
@@ -282,17 +283,32 @@ digest chained pages into durable staging before one atomic canonical replacemen
 `ServerStore.layer` requires `authorizeAccess`, `authorizeMutation`, and `authorizeRead`. Access authorization runs
 before retry receipt lookup. Mutation admission rejection consumes the client's local sequence and persists an exact
 retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted` is the explicit allow all Layer for
-tests and already trusted processes.
+tests and already trusted processes. Sync watch authorization successes are shared by structural space and principal,
+bounded by `readAuthorizationCacheCapacity`, and executed behind `maximumConcurrentReadAuthorizations`. Denials are not
+cached. Each live watch starts refreshing halfway through `readAuthorizationRefreshInterval` and closes its resources
+at the existing success expiry if refresh does not succeed. This interval is the explicit worst case revocation bound.
+Pull and bootstrap authorization remain one shot checks.
 
-`SyncRpc.Rpcs` multiplexes submit, pull, bootstrap, watch, and presence on one Effect RPC WebSocket. The server uses
+`SyncRpc.Rpcs` multiplexes submit, discard, pull, bootstrap, watch, and presence on one Effect RPC WebSocket. The server uses
 `Authentication.layerServer`; the client uses `Authentication.layerClient`, which writes a redacted bearer credential
-to the request headers. The authenticated server facade sends all five operations to the Cluster entity for the
-requested space. Cluster supplies the unique live owner and cross runner stream routing. SQL stores the authoritative
-accepted log and terminal receipts. The application chooses Effect's runner storage, message storage, runner transport, and
-deployment Layers. It also remains responsible for its HTTP server, WebSocket path, TLS, Origin policy, credential
-verification, and tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete
-JSON frames. A reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload
-limit.
+to the request headers. The authenticated server facade uses four Cluster entity types for the requested space.
+`SpaceAdmissionEntity` serializes Submit and Discard. `SpaceReadEntity` forks Pull and Bootstrap while bounding
+concurrent bootstrap pages. `SpaceWatchEntity` owns forked long lived sync and presence streams.
+`SpacePresencePublishEntity` bounds presence publication concurrency. Required `SpaceEntity.HandlerOptions` provide a
+finite mailbox for every lane plus the bootstrap and presence publication concurrency limits. Cluster supplies unique
+live ownership and cross runner stream routing. SQL stores the authoritative accepted log and terminal receipts. One
+accepted mutation publishes one in memory wake after commit. Watch fanout performs no SQLite write or transaction per
+watcher.
+
+`ServerStore.maximumWatchersPerSpace` caps live sync watches. `PresenceHub.maximumWatchersPerSpace` independently caps
+live presence watches. `PresenceHub.capacity` is the sliding update queue depth, not a watcher allowance. Its default is
+1,024. Excess sync watchers, presence watchers, and bootstrap pages fail with typed `CapacityExceeded { resource,
+limit }`. Full Cluster mailboxes map to `ServerUnavailable`.
+
+The application chooses Effect's runner storage, message storage, runner transport, and deployment Layers. It also
+remains responsible for its HTTP server, WebSocket path, TLS, Origin policy, credential verification, and tenant
+authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. A reverse proxy
+or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
 
 ## Effect Atom
 
@@ -317,6 +333,26 @@ actually read. Local commits and reconciliation batches refresh only affected mo
 status atoms also require a space address. The membership and aggregate atoms
 share the same runtime. Mutation atoms are concurrent and preserve their typed result. Pass an application factory
 with `options.factory` when the application already owns a deliberate custom runtime.
+
+## Capacity signals
+
+Effect metrics expose bounded load without labels for space, client, mutation, or principal identifiers:
+
+| Metric                                                                                 | Meaning                                                              |
+| -------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `effect_local_server_admission`                                                        | Completed admission attempts by `outcome=accepted`                   |
+| `effect_local_server_rejection`                                                        | Rejections by stable receipt origin or typed error `_tag` in `class` |
+| `effect_local_server_history_depth`, `effect_local_server_receipt_depth`               | Maximum retained rows in any one space                               |
+| `effect_local_server_history_limit`, `effect_local_server_receipt_limit`               | Configured per space hard limits                                     |
+| `effect_local_server_sync_watcher_count`, `effect_local_server_presence_watcher_count` | Current live watcher populations                                     |
+| `effect_local_server_wake_fanout_duration`                                             | Accepted wake publication to one subscriber delivery                 |
+| `effect_local_server_maintenance`                                                      | Maintenance runs by `outcome=completed`                              |
+| `effect_local_server_pruned`                                                           | Committed deleted rows by `resource=history`                         |
+| `effect_local_client_bootstrap_install`                                                | Durably installed client snapshots                                   |
+| `effect_local_client_pending_mutation_count`                                           | Pending mutations across active local stores                         |
+
+Compare retained depth with its limit, watcher count with its configured allowance, and pending mutation count with
+client status. The fanout benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1,024 watchers.
 
 ## Selective field semantics
 
@@ -408,11 +444,30 @@ window is missing a required downgrade transform.
 ```ts
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 
+const serverHistory = {
+  retainedHistoryEntries: 10_000,
+  maximumHistoryEntries: 20_000,
+  retainedReceipts: 10_000,
+  maximumReceipts: 20_000,
+  maximumSnapshotEntities: 100_000,
+  maximumSnapshotBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: 4 * 1024 * 1024,
+  pruneBatchSize: 1_000,
+  retainedSnapshots: 2,
+  maintenanceConcurrency: 4,
+  maintenanceSpaceBatchSize: 128,
+  migration: { retryDelay: "25 millis", maximumAttempts: 8 }
+} as const
+
 export const ServerLive = ServerStore.layer({
   ...serverHistory,
   definition: definitionV2,
   evolution,
   acceptedSchemaVersions: 1,
+  maximumWatchersPerSpace: 1_024,
+  readAuthorizationRefreshInterval: "30 seconds",
+  maximumConcurrentReadAuthorizations: 64,
+  readAuthorizationCacheCapacity: 4_096,
   authorizeAccess: ({ clientId, principal, spaceId }) => authorizeClient({ clientId, principal, spaceId }),
   authorizeMutation: ({ mutation, principal }) => authorizeMutation({ mutation, principal }),
   authorizeRead: ({ principal, spaceId }) => authorizeRead({ principal, spaceId })
@@ -527,8 +582,8 @@ The complete deployment sequence is:
 - Pull entries expose only public mutation identity and canonical changes. Payloads and success results are not in the
   shared authoritative log.
 - A terminal rejection rolls back its optimistic write set and replays remaining pending mutations.
-- Queues, mutation payloads, presence payloads, pull pages, bootstrap pages, snapshots, receipts, and retained history
-  are bounded by explicit configuration.
+- Entity mailboxes, active watchers, authorization lookups and cached successes, mutation and presence payloads, pull
+  pages, concurrent bootstrap pages, snapshots, receipts, and retained history are bounded by explicit configuration.
 - Presence is best effort, bounded, TTL based, and never enters the durable mutation log.
 - Cluster routes each space to one live owner across runners. Entity operations are volatile. A failed submit remains
   in the client's pending SQLite outbox until exact resubmission returns the SQL backed terminal receipt. Pull and watch
