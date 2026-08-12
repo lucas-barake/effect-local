@@ -26,9 +26,6 @@ export interface Transaction {
 
 export interface Query {
   readonly get: Transaction["get"]
-  readonly all: <M extends Model.Any,>(
-    model: M
-  ) => Effect.Effect<ReadonlyArray<Model.Value<M>>, ReplicaError.StorageError>
   readonly from: <M extends Model.Any, Name extends keyof Model.Indexes<M> & string,>(
     model: M,
     index: Name

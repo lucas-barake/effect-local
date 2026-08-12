@@ -59,13 +59,6 @@ export function make(options: {
   const mutationByName = indexed("mutation", options.mutations)
   const queryByName = indexed("query", queries)
   const version = Identity.SchemaVersion.make(options.version)
-  for (const query of queries) {
-    for (const dependency of query.dependsOn) {
-      if (modelByName.get(dependency.name) !== dependency) {
-        return Defect.invalid(`Query ${query.name} depends on an unregistered model: ${dependency.name}`)
-      }
-    }
-  }
   const models = options.models.map((model) => ({
     name: model.name,
     version: model.version,
@@ -90,8 +83,7 @@ export function make(options: {
       name: query.name,
       payload: SchemaDescriptor.make(query.payloadSchema),
       success: SchemaDescriptor.make(query.successSchema),
-      error: SchemaDescriptor.make(query.errorSchema),
-      dependsOn: query.dependsOn.map((model) => model.name).toSorted()
+      error: SchemaDescriptor.make(query.errorSchema)
     })).toSorted(byName)
   })
   const indexLayoutHash = Canonical.hash({

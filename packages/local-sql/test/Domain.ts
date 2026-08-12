@@ -80,8 +80,7 @@ export const ReturnHugeResult = Mutation.make("ReturnHugeResult", {
 const hugeTitle = "x".repeat(Protocol.maximumBatchBytes)
 
 const ListTodos = Query.make("ListTodos", {
-  success: Schema.Array(Todo.schema),
-  dependsOn: [Todo]
+  success: Schema.Array(Todo.schema)
 })
 
 export const ReadCountIndex = Query.make("ReadCountIndex", {
@@ -146,7 +145,12 @@ export const handlers = Layer.mergeAll(
     return transaction.set(Todo, payload.id, value).pipe(Effect.as(value))
   }),
   ReturnHugeResult.toLayer(() => Effect.succeed(hugeTitle)),
-  ListTodos.toLayer(({ query }) => query.all(Todo)),
+  ListTodos.toLayer(({ query }) =>
+    query.from(Todo, "byCount").stream().pipe(
+      Stream.runCollect,
+      Effect.map((items) => Array.from(items))
+    )
+  ),
   ReadCountIndex.toLayer(({ payload, query }) =>
     Effect.gen(function*() {
       const builder = query.from(Todo, "byCount")

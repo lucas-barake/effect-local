@@ -5,7 +5,6 @@ import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Defect from "./internal/defect.js"
 import * as SchemaInput from "./internal/schemaInput.js"
-import type * as Model from "./Model.js"
 import type * as ReplicaError from "./ReplicaError.js"
 import type * as Transaction from "./Transaction.js"
 
@@ -29,7 +28,6 @@ export interface Query<Name extends string, P extends Schema.Top, A extends Sche
   readonly payloadSchema: P
   readonly successSchema: A
   readonly errorSchema: E
-  readonly dependsOn: ReadonlyArray<Model.Any>
   readonly handler: Context.Service<HandlerService<Name, P, A, E>, HandlerService<Name, P, A, E>>
   readonly toLayer: <R, EX = never, RX = never,>(
     build:
@@ -43,7 +41,6 @@ export interface Any {
   readonly payloadSchema: Schema.Top
   readonly successSchema: Schema.Top
   readonly errorSchema: Schema.Top
-  readonly dependsOn: ReadonlyArray<Model.Any>
   readonly handler: Context.Service.Any
 }
 
@@ -60,14 +57,12 @@ export function make<
     readonly payload?: SchemaInput.Valid<P>
     readonly success?: A
     readonly error?: E
-    readonly dependsOn?: ReadonlyArray<Model.Any>
   }
 ): Query<Name, SchemaInput.Wire<P>, A, E>
 export function make(name: string, options: {
   readonly payload?: SchemaInput.Input
   readonly success?: SchemaInput.WireSchema
   readonly error?: SchemaInput.WireSchema
-  readonly dependsOn?: ReadonlyArray<Model.Any>
 }): Query<string, SchemaInput.WireSchema, SchemaInput.WireSchema, SchemaInput.WireSchema> {
   if (name.length === 0) return Defect.invalid("Query name must be nonempty")
   if (name.startsWith("$")) return Defect.invalid(`Query name must not start with $: ${name}`)
@@ -118,7 +113,6 @@ export function make(name: string, options: {
     payloadSchema,
     successSchema,
     errorSchema,
-    dependsOn: Object.freeze([...(options.dependsOn ?? [])]),
     handler,
     toLayer
   }

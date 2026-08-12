@@ -2257,8 +2257,7 @@ describe("server reconciled mutation log", () => {
         payload: { left: Schema.Number, right: Schema.Number }
       })
       const ReadPair = Query.make("ReadSnapshotPair", {
-        success: Schema.Tuple([Schema.Number, Schema.Number]),
-        dependsOn: [Item]
+        success: Schema.Tuple([Schema.Number, Schema.Number])
       })
       class QueryGate extends Context.Service<QueryGate, {
         readonly betweenReads: Effect.Effect<void>
@@ -2323,7 +2322,7 @@ describe("server reconciled mutation log", () => {
       yield* Deferred.succeed(release, undefined)
       assert.deepStrictEqual(yield* Fiber.join(query), [0, 0])
 
-      const counterfeit = Query.make("ReadSnapshotPair", { success: Schema.String, dependsOn: [Item] })
+      const counterfeit = Query.make("ReadSnapshotPair", { success: Schema.String })
       const error = yield* queryExecutor.execute(counterfeit, undefined).pipe(Effect.flip)
       assert.strictEqual(error._tag, "ProtocolInvalid")
     })).pipe(Effect.provide(NodeFileSystem.layer)))

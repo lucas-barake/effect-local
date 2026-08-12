@@ -35,7 +35,6 @@ const point = (title: string, entityKey: string): IndexStore.Point => ({
 
 const changes = (points: ReadonlyArray<IndexStore.Point>): QueryReactivity.Changes => ({
   entityKeys: new Set(),
-  models: new Set(["Todo"]),
   points,
   broadModels: new Set()
 })

@@ -11,8 +11,10 @@ import * as Schema from "effect/Schema"
 import * as SchemaGetter from "effect/SchemaGetter"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import { afterAll, assert, beforeAll, bench } from "vitest"
 import * as IndexStore from "../src/IndexStore.js"
+import * as Codec from "../src/internal/codec.js"
 import * as Migrations from "../src/Migrations.js"
 import * as QueryExecutor from "../src/QueryExecutor.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
@@ -64,13 +66,12 @@ const Indexed = Query.make("BenchIndexed", {
   payload: { minimum: Schema.Number },
   success: Schema.Array(Item.schema)
 })
-const Full = Query.make("BenchFull", { success: Schema.Array(Item.schema) })
 const MultiColumn = Query.make("BenchMultiColumn", { success: Schema.Array(Item.schema) })
 const definition = Definition.make({
   version: 1,
   models: [Item],
   mutations: [],
-  queries: [Indexed, Full, MultiColumn]
+  queries: [Indexed, MultiColumn]
 })
 const handlers = Layer.mergeAll(
   Indexed.toLayer(({ payload, query }) =>
@@ -78,7 +79,6 @@ const handlers = Layer.mergeAll(
       Effect.map((page) => page.items)
     )
   ),
-  Full.toLayer(({ query }) => query.all(Item)),
   MultiColumn.toLayer(({ query }) =>
     Effect.gen(function*() {
       const builder = query.from(Item, "byBucketScore").limit(25)
@@ -150,11 +150,22 @@ bench("low cardinality multicolumn cursor returns a stable second page", async (
   assert.strictEqual(decodedRows, 75)
 }, { iterations: 20, time: 0, warmupIterations: 3, warmupTime: 0, throws: true })
 
-bench("compatibility all decodes the complete model", async () => {
+bench("explicit unindexed scan decodes the complete model", async () => {
   decodedRows = 0
-  const result = await runtime.runPromise(
-    QueryExecutor.QueryExecutor.use((service) => service.execute(Full, undefined))
-  )
+  const result = await runtime.runPromise(Effect.gen(function*() {
+    const sql = yield* SqlClient.SqlClient
+    const rows = yield* SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: Schema.Struct({ value_json: Schema.String }),
+      execute: () =>
+        sql`SELECT value_json FROM effect_local_client_visible_entities_data
+        WHERE generation = 0 AND model = ${Item.name} ORDER BY entity_key`
+    })(undefined)
+    return yield* Effect.forEach(rows, (row) =>
+      Codec.parse(row.value_json).pipe(
+        Effect.flatMap((encoded) => Codec.decode(Item.schema, encoded))
+      ))
+  }))
   assert.strictEqual(result.length, 10_000)
-  assert.strictEqual(decodedRows, 20_000)
+  assert.strictEqual(decodedRows, 10_000)
 }, { iterations: 5, time: 0, warmupIterations: 1, warmupTime: 0, throws: true })

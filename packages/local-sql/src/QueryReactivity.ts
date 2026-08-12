@@ -5,12 +5,10 @@ import type * as IndexStore from "./IndexStore.js"
 
 export type Read =
   | { readonly _tag: "Entity"; readonly key: string }
-  | { readonly _tag: "Model"; readonly model: string }
   | { readonly _tag: "Index"; readonly footprint: IndexStore.Footprint }
 
 export interface Changes {
   readonly entityKeys: ReadonlySet<string>
-  readonly models: ReadonlySet<string>
   readonly points: ReadonlyArray<IndexStore.Point>
   readonly broadModels: ReadonlySet<string>
 }
@@ -102,8 +100,7 @@ const make = (): Service => {
     affected: (changes) =>
       Effect.sync(() => {
         if (
-          changes.entityKeys.size === 0 && changes.models.size === 0 && changes.points.length === 0 &&
-          changes.broadModels.size === 0
+          changes.entityKeys.size === 0 && changes.points.length === 0 && changes.broadModels.size === 0
         ) return []
         const pointsByDescriptor = new Map<string, Array<IndexStore.Point>>()
         for (const point of changes.points) {
@@ -115,7 +112,6 @@ const make = (): Service => {
         for (const [key, reads] of readsByKey) {
           const matches = reads.some((read) => {
             if (read._tag === "Entity") return changes.entityKeys.has(read.key)
-            if (read._tag === "Model") return changes.models.has(read.model)
             if (changes.broadModels.has(read.footprint.model)) return true
             return pointsByDescriptor.get(read.footprint.descriptor)?.some((point) =>
               pointMatches(read.footprint, point)

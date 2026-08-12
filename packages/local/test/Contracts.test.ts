@@ -15,7 +15,7 @@ const Todo = Model.make("Todo", {
   schema: Schema.Struct({ id: Schema.String, title: Schema.String })
 })
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
-const ListTodos = Query.make("ListTodos", { success: Schema.Array(Todo.schema), dependsOn: [Todo] })
+const ListTodos = Query.make("ListTodos", { success: Schema.Array(Todo.schema) })
 
 describe("domain contracts", () => {
   it("uses JSON null as the wire representation for void payloads and results", () => {
@@ -24,7 +24,6 @@ describe("domain contracts", () => {
     assert.strictEqual(Schema.encodeSync(mutation.payloadSchema)(undefined), null)
     assert.strictEqual(Schema.decodeUnknownSync(mutation.successSchema)(null), undefined)
     assert.strictEqual(Schema.encodeSync(query.payloadSchema)(undefined), null)
-    assert.deepStrictEqual(query.dependsOn, [])
   })
 
   it("builds a stable definition hash from Schema contracts", () => {
@@ -111,16 +110,10 @@ describe("domain contracts", () => {
     )
   })
 
-  it("rejects duplicate names and unregistered query dependencies", () => {
+  it("rejects duplicate names", () => {
     assert.throws(
       () => Definition.make({ version: 1, models: [Todo, Todo], mutations: [PutTodo] }),
       /Duplicate model name/
-    )
-    const Other = Model.make("Other", { version: 1, key: Schema.String, schema: Schema.Struct({ id: Schema.String }) })
-    const InvalidQuery = Query.make("Invalid", { dependsOn: [Other] })
-    assert.throws(
-      () => Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [InvalidQuery] }),
-      /unregistered model/
     )
   })
 
@@ -130,7 +123,7 @@ describe("domain contracts", () => {
       /must not start/
     )
     assert.throws(() => Mutation.make("$Mutation", { version: 1 }), /must not start/)
-    assert.throws(() => Query.make("$Query", { dependsOn: [] }), /must not start/)
+    assert.throws(() => Query.make("$Query", {}), /must not start/)
   })
 
   it.effect("applies opt in field semantics without replication metadata", () =>

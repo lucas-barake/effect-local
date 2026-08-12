@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest"
 import * as Schema from "effect/Schema"
 import * as Model from "../src/Model.js"
+import * as Query from "../src/Query.js"
 import type * as SecondaryIndex from "../src/SecondaryIndex.js"
 import type * as Transaction from "../src/Transaction.js"
 
@@ -59,6 +60,9 @@ const typeContracts = (
 
   query.from(Todo, "byPriority").where({ priority: { gt: 1 } }).after(priorityCursor)
 
+  // @ts-expect-error unindexed model scans are not part of the query capability
+  query.all(Todo)
+
   // @ts-expect-error undeclared indexes cannot be queried
   query.from(Todo, "byTitle")
   // @ts-expect-error where fields must belong to the declared index
@@ -68,6 +72,9 @@ const typeContracts = (
   // @ts-expect-error cursors are scoped to their model and index
   query.from(Todo, "byProjectCreatedAt").after(priorityCursor)
 }
+
+// @ts-expect-error static dependency fallbacks are not part of query declarations
+Query.make("LegacyDependencies", { dependsOn: [Todo] })
 
 void typeContracts
 
