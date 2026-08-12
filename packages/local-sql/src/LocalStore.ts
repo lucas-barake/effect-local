@@ -373,7 +373,7 @@ export const layer = (
       }
       if (
         initializedMeta.desired_scope_json !== desiredScopeJson ||
-        initializedMeta.desired_scope_digest !== desiredScopeDigest || initializedMeta.scope_generation === 0
+        initializedMeta.desired_scope_digest !== desiredScopeDigest
       ) {
         yield* sql`UPDATE effect_local_client_meta SET desired_scope_json = ${desiredScopeJson},
           desired_scope_digest = ${desiredScopeDigest}, scope_generation = scope_generation + 1

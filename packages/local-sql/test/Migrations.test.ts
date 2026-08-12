@@ -147,8 +147,8 @@ describe("storage migration catalogs", () => {
       })
       yield* Migrations.server()
 
-      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8])
-      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8])
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
+      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7])
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
         "effect_local_client_evolution",
@@ -159,8 +159,6 @@ describe("storage migration catalogs", () => {
         "effect_local_client_shadow_pending",
         "effect_local_client_shadow_receipts_v2",
         "effect_local_client_shadow_visible_entities",
-        "effect_local_bootstrap",
-        "effect_local_bootstrap_entities",
         "effect_local_client_canonical_entities_data",
         "effect_local_client_pending_data",
         "effect_local_client_receipts_data",
@@ -180,27 +178,13 @@ describe("storage migration catalogs", () => {
         "effect_local_server_scoped_snapshots",
         "effect_local_server_scoped_snapshot_entries"
       ])
+      assert.notInclude(names, "effect_local_bootstrap")
+      assert.notInclude(names, "effect_local_bootstrap_entities")
     }).pipe(Effect.provide(database)))
 
-  it.effect("upgrades V7 storage without fabricating a client view", () =>
+  it.effect("initializes scoped storage without fabricating a client view", () =>
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
-      yield* Migrations.runCatalog("Client", Migrations.clientCatalog.slice(0, 7))
-      yield* Migrations.runCatalog("Server", Migrations.serverCatalog.slice(0, 7))
-      yield* sql`INSERT INTO effect_local_client_meta
-        (singleton, space_id, client_id, definition_hash, next_local_sequence, server_cursor,
-          visible_revision, requested_generation, completed_generation, schema_version, schema_hash,
-          schema_generation, active_schema_generation)
-        VALUES (1, ${spaceId}, ${clientId}, ${Domain.definition.hash}, 1, 0, 0, 0, 0,
-          ${Domain.definition.schemaIdentity.version}, ${Domain.definition.schemaIdentity.hash}, 0, 0)`
-      yield* sql`INSERT INTO effect_local_server_spaces
-        (space_id, definition_hash, next_server_sequence, schema_version, schema_hash, schema_generation,
-          next_terminal_sequence, history_floor, receipt_floor, retained_history_count,
-          retained_receipt_count, entity_count, entity_bytes, snapshot_sequence,
-          snapshot_terminal_sequence, metadata_verified, active_schema_generation)
-        VALUES (${spaceId}, ${Domain.definition.hash}, 1, ${Domain.definition.schemaIdentity.version},
-          ${Domain.definition.schemaIdentity.hash}, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0)`
-
       yield* Migrations.client({ definition: Domain.definition, spaceId, clientId })
       yield* Migrations.server()
 

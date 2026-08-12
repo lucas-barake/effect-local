@@ -430,32 +430,7 @@ const clientV6 = makeMigration({
   statements: [
     "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_id TEXT",
     "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_sequence INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_terminal_sequence INTEGER NOT NULL DEFAULT 0",
-    `CREATE TABLE effect_local_bootstrap (
-      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-      snapshot_id TEXT NOT NULL,
-      space_id TEXT NOT NULL,
-      definition_hash TEXT NOT NULL,
-      schema_version INTEGER NOT NULL,
-      schema_hash TEXT NOT NULL,
-      server_sequence INTEGER NOT NULL,
-      terminal_sequence INTEGER NOT NULL,
-      entity_count INTEGER NOT NULL,
-      content_bytes INTEGER NOT NULL,
-      digest TEXT NOT NULL,
-      next_ordinal INTEGER NOT NULL,
-      received_bytes INTEGER NOT NULL,
-      rolling_digest TEXT NOT NULL
-    )`,
-    `CREATE TABLE effect_local_bootstrap_entities (
-      ordinal INTEGER PRIMARY KEY,
-      model TEXT NOT NULL,
-      model_version INTEGER NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      entity_bytes INTEGER NOT NULL,
-      UNIQUE (model, entity_key)
-    )`
+    "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_terminal_sequence INTEGER NOT NULL DEFAULT 0"
   ]
 })
 
@@ -930,14 +905,7 @@ const clientV7 = makeMigration({
         DELETE FROM effect_local_client_${kind}_entities_data
         WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
           AND model = OLD.model AND entity_key = OLD.entity_key; END`
-    ])
-  ]
-})
-
-const clientV8 = makeMigration({
-  id: 8,
-  name: "scoped-replication",
-  statements: [
+    ]),
     "ALTER TABLE effect_local_client_meta ADD COLUMN replication_view_id TEXT",
     "ALTER TABLE effect_local_client_meta ADD COLUMN replication_view_revision INTEGER NOT NULL DEFAULT 0 CHECK (replication_view_revision >= 0)",
     `ALTER TABLE effect_local_client_meta ADD COLUMN desired_scope_json TEXT NOT NULL DEFAULT '{"models":[]}'
@@ -994,8 +962,7 @@ export const clientCatalog = Object.freeze([
   clientV4,
   clientV5,
   clientV6,
-  clientV7,
-  clientV8
+  clientV7
 ])
 
 const serverV6 = makeMigration({
@@ -1080,14 +1047,7 @@ const serverV7 = makeMigration({
         NEW.generation = (SELECT active_schema_generation FROM effect_local_server_spaces
           WHERE space_id = NEW.space_id) BEGIN
       UPDATE effect_local_server_spaces SET entity_bytes = entity_bytes + NEW.entity_bytes - OLD.entity_bytes
-        WHERE space_id = NEW.space_id; END`
-  ]
-})
-
-const serverV8 = makeMigration({
-  id: 8,
-  name: "scoped-replication",
-  statements: [
+        WHERE space_id = NEW.space_id; END`,
     `CREATE TABLE effect_local_server_replication_views (
       space_id TEXT NOT NULL,
       client_id TEXT NOT NULL,
@@ -1173,8 +1133,7 @@ export const serverCatalog = Object.freeze([
   serverV4,
   serverV5,
   serverV6,
-  serverV7,
-  serverV8
+  serverV7
 ])
 
 export const client = (options: {
