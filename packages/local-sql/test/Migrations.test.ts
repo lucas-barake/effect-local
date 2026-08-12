@@ -21,6 +21,13 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000000
 const LedgerRow = Schema.Struct({ id: Schema.Number, name: Schema.String, checksum: Schema.String })
 const NameRow = Schema.Struct({ name: Schema.String })
 const CountRow = Schema.Struct({ count: Schema.Number })
+const ClientReplicationMetaRow = Schema.Struct({
+  replication_view_id: Schema.NullOr(Schema.String),
+  replication_view_revision: Schema.Number,
+  desired_scope_json: Schema.String,
+  desired_scope_digest: Schema.String,
+  scope_generation: Schema.Number
+})
 const clientLedger = (sql: SqlClient.SqlClient) =>
   SqlSchema.findAll({
     Request: Schema.Void,
@@ -138,8 +145,9 @@ describe("storage migration catalogs", () => {
         "effect_local_client_key_lineage_groups",
         "effect_local_client_key_lineage_targets",
         "effect_local_client_spaces",
-        "effect_local_bootstrap",
-        "effect_local_bootstrap_entities",
+        "effect_local_client_retractions",
+        "effect_local_client_scoped_bootstrap",
+        "effect_local_client_scoped_bootstrap_entries",
         "effect_local_client_canonical_entities_data",
         "effect_local_client_quarantine",
         "effect_local_client_quarantine_cancellations",
@@ -155,9 +163,51 @@ describe("storage migration catalogs", () => {
         "effect_local_server_key_lineage_targets",
         "effect_local_server_shadow_entities",
         "effect_local_server_entities_data",
+        "effect_local_server_replication_views",
+        "effect_local_server_replication_view_entities",
+        "effect_local_server_replication_pages",
+        "effect_local_server_scoped_snapshots",
+        "effect_local_server_scoped_snapshot_entries",
         "effect_local_server_snapshot_projections",
         "effect_local_server_snapshot_projection_entities"
       ])
+      assert.notInclude(names, "effect_local_bootstrap")
+      assert.notInclude(names, "effect_local_bootstrap_entities")
+    }).pipe(Effect.provide(database)))
+
+  it.effect("initializes scoped storage without fabricating a client view", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrations.client({ definition: Domain.definition, spaceId, clientId })
+      yield* Migrations.server()
+
+      const meta = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: ClientReplicationMetaRow,
+        execute: () =>
+          sql`SELECT replication_view_id, replication_view_revision, desired_scope_json,
+            desired_scope_digest, scope_generation
+          FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
+      })(undefined)
+      assert.deepStrictEqual(meta, {
+        replication_view_id: null,
+        replication_view_revision: 0,
+        desired_scope_json: "{\"models\":[]}",
+        desired_scope_digest: "0".repeat(64),
+        scope_generation: 0
+      })
+      const clientRetractions = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_client_retractions`
+      })(undefined)
+      const serverViews = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_server_replication_views`
+      })(undefined)
+      assert.strictEqual(clientRetractions.count, 0)
+      assert.strictEqual(serverViews.count, 0)
     }).pipe(Effect.provide(database)))
 
   it.effect("claims pending migrations before executing their effects", () =>

@@ -2,6 +2,7 @@ import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
+import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Quarantine from "@lucas-barake/effect-local/Quarantine"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -38,6 +39,7 @@ import * as SyncEngine from "./SyncEngine.js"
 export interface Options<D extends Definition.Any,> {
   readonly definition: D
   readonly clientId: Identity.ClientId
+  readonly scope: Protocol.ReplicationScope
   readonly initialSpaces?: Iterable<Identity.SpaceId>
   readonly spaceId?: Identity.SpaceId
   readonly maximumPendingMutations?: number
@@ -400,7 +402,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const evictMembership = (spaceId: Identity.SpaceId) =>
         sql.withTransaction(sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`).pipe(
           Effect.asVoid,
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
         )
 
       const reserveLeave = (

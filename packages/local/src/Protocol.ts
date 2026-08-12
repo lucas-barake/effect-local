@@ -1,8 +1,9 @@
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import * as Canonical from "./Canonical.js"
+import type * as Definition from "./Definition.js"
 import * as Identity from "./Identity.js"
-import type * as ReplicaError from "./ReplicaError.js"
+import * as ReplicaError from "./ReplicaError.js"
 
 export const maximumMutationBytes = 256 * 1024
 export const maximumBatchEntries = 1_000
@@ -105,6 +106,42 @@ export const Delete = Schema.TaggedStruct("Delete", { entity: EntityKey })
 export const EntityChange = Schema.Union([Upsert, Delete])
 export type EntityChange = typeof EntityChange.Type
 
+export const Retract = Schema.TaggedStruct("Retract", { entity: EntityKey })
+export const ViewChange = Schema.Union([Upsert, Delete, Retract])
+export type ViewChange = typeof ViewChange.Type
+
+const ReplicationModelName = Schema.NonEmptyString.check(Schema.isMaxLength(256))
+
+export const ReplicationScope = Schema.Struct({
+  models: Schema.Array(ReplicationModelName).check(Schema.isUnique())
+})
+export type ReplicationScope = typeof ReplicationScope.Type
+
+export const replicationScopeDigest = (scope: ReplicationScope) =>
+  Canonical.digest({ format: 1, scope }).pipe(Effect.map((value) => MutationDigest.make(value)))
+
+export const normalizeReplicationScope = (scope: ReplicationScope): ReplicationScope =>
+  ReplicationScope.make({ models: scope.models.toSorted() })
+
+export const validateReplicationScope = (
+  definition: Definition.Any,
+  scope: ReplicationScope
+): Effect.Effect<ReplicationScope, ReplicaError.ProtocolInvalid> => {
+  const normalized = normalizeReplicationScope(scope)
+  for (const model of normalized.models) {
+    if (!definition.modelByName.has(model)) {
+      return Effect.fail(new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${model}` }))
+    }
+  }
+  return Effect.succeed(normalized)
+}
+
+export const ReplicationCursor = Schema.Struct({
+  viewId: Identity.ReplicationViewId,
+  revision: Identity.ReplicationViewRevision
+})
+export type ReplicationCursor = typeof ReplicationCursor.Type
+
 const ReceiptIdentity = {
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
@@ -174,28 +211,43 @@ export const AcceptedMutation = Schema.Struct({
 })
 export type AcceptedMutation = typeof AcceptedMutation.Type
 
-export const PullRequest = Schema.Struct({
+const ReplicationRequestContext = {
   spaceId: Identity.SpaceId,
+  clientId: Identity.ClientId,
   schema: Identity.SchemaIdentity,
-  after: Identity.ServerSequence,
+  scope: ReplicationScope,
+  scopeGeneration: Identity.ReplicationScopeGeneration
+}
+
+export const PullRequest = Schema.Struct({
+  ...ReplicationRequestContext,
+  cursor: Schema.NullOr(ReplicationCursor),
   limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBatchEntries))
 })
 export type PullRequest = typeof PullRequest.Type
 export const VersionedPullRequest = PullRequest.pipe(withProtocolVersion)
 
 export const WatchRequest = Schema.Struct({
-  spaceId: Identity.SpaceId,
-  schema: Identity.SchemaIdentity
+  ...ReplicationRequestContext,
+  cursor: Schema.NullOr(ReplicationCursor)
 })
 export type WatchRequest = typeof WatchRequest.Type
 export const VersionedWatchRequest = WatchRequest.pipe(withProtocolVersion)
 
 export const PullPage = Schema.Struct({
-  entries: Schema.Array(AcceptedMutation).check(Schema.isMaxLength(maximumBatchEntries)),
+  scopeGeneration: Identity.ReplicationScopeGeneration,
+  cursor: ReplicationCursor,
+  serverSequence: Identity.ServerSequence,
+  changes: Schema.Array(ViewChange).check(Schema.isMaxLength(maximumBatchEntries)),
+  contentBytes: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  digest: MutationDigest,
   hasMore: Schema.Boolean,
   serverSchema: Identity.SchemaIdentity
 })
 export type PullPage = typeof PullPage.Type
+
+export const viewChangesDigest = (changes: ReadonlyArray<ViewChange>) =>
+  Canonical.digest({ format: 1, changes }).pipe(Effect.map((value) => MutationDigest.make(value)))
 
 export const SnapshotDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
 export type SnapshotDigest = typeof SnapshotDigest.Type
@@ -203,8 +255,12 @@ export const initialSnapshotDigest = SnapshotDigest.make("0".repeat(64))
 
 export const SnapshotManifest = Schema.Struct({
   spaceId: Identity.SpaceId,
+  clientId: Identity.ClientId,
   definitionHash: Schema.String,
   schema: Identity.SchemaIdentity,
+  scopeDigest: MutationDigest,
+  scopeGeneration: Identity.ReplicationScopeGeneration,
+  cursor: ReplicationCursor,
   snapshotId: Identity.SnapshotId,
   sequence: Identity.ServerSequence,
   terminalSequenceThrough: Identity.TerminalSequence,
@@ -213,6 +269,16 @@ export const SnapshotManifest = Schema.Struct({
   digest: SnapshotDigest
 })
 export type SnapshotManifest = typeof SnapshotManifest.Type
+
+export const SnapshotEntry = Schema.Struct({
+  ordinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  change: ViewChange,
+  entryBytes: Schema.Int.check(Schema.isGreaterThan(0))
+})
+export type SnapshotEntry = typeof SnapshotEntry.Type
+
+export const snapshotEntryDigest = (previous: SnapshotDigest, entry: SnapshotEntry) =>
+  Canonical.digest({ previous, entry }).pipe(Effect.map((value) => SnapshotDigest.make(value)))
 
 export const SnapshotEntity = Schema.Struct({
   ordinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -234,8 +300,8 @@ export const PullResult = Schema.Union([PullPage, BootstrapRequired])
 export type PullResult = typeof PullResult.Type
 
 export const BootstrapRequest = Schema.Struct({
-  spaceId: Identity.SpaceId,
-  schema: Identity.SchemaIdentity,
+  ...ReplicationRequestContext,
+  cursor: ReplicationCursor,
   snapshotId: Identity.SnapshotId,
   afterOrdinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1)),
   limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBootstrapEntries))
@@ -245,15 +311,14 @@ export const VersionedBootstrapRequest = BootstrapRequest.pipe(withProtocolVersi
 
 export const BootstrapPage = Schema.Struct({
   manifest: SnapshotManifest,
-  entities: Schema.Array(SnapshotEntity).check(Schema.isMaxLength(maximumBootstrapEntries)),
+  entries: Schema.Array(SnapshotEntry).check(Schema.isMaxLength(maximumBootstrapEntries)),
   hasMore: Schema.Boolean,
   serverSchema: Identity.SchemaIdentity
 })
 export type BootstrapPage = typeof BootstrapPage.Type
 
 export const Wake = Schema.Struct({
-  spaceId: Identity.SpaceId,
-  sequence: Identity.ServerSequence
+  spaceId: Identity.SpaceId
 })
 export type Wake = typeof Wake.Type
 

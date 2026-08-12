@@ -12,6 +12,7 @@ import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
@@ -32,6 +33,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "../src/Authentication.js"
 import * as PresenceClient from "../src/PresenceClient.js"
 import * as PresenceHub from "../src/PresenceHub.js"
+import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as ProtocolSession from "../src/ProtocolSession.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
 import * as SyncClient from "../src/SyncClient.js"
@@ -71,6 +73,18 @@ const definition = Definition.make({
   models: [Todo],
   mutations: [PutTodo, ReturnHugeResult, AssignRoleV2]
 })
+const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
+const scopeGeneration = Identity.ReplicationScopeGeneration.make(1)
+const pullRequest = (requestedSpaceId = spaceId): Protocol.PullRequest =>
+  Protocol.PullRequest.make({
+    spaceId: requestedSpaceId,
+    clientId,
+    schema: definition.schemaIdentity,
+    scope,
+    scopeGeneration,
+    cursor: null,
+    limit: 10
+  })
 const evolution = Evolution.make({
   current: definition,
   steps: [Evolution.step({
@@ -103,13 +117,14 @@ const migration = {
   maximumAttempts: 8
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const serverHistory = {
+  readAuthorizationRefreshInterval: "1 second" as const,
   retainedHistoryEntries: 0,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 0,
   maximumReceipts: 10_000,
   maximumSnapshotEntities: 10_000,
   maximumSnapshotBytes: 64 * 1024 * 1024,
-  maximumBootstrapPageBytes: 1_024,
+  maximumBootstrapPageBytes: 2_048,
   pruneBatchSize: 1_000,
   retainedSnapshots: 2,
   maintenanceConcurrency: 1,
@@ -171,6 +186,18 @@ const authenticator = Layer.succeed(
   })
 )
 const authenticationServer = Authentication.layerServer.pipe(Layer.provide(authenticator))
+const assertionCodec = Schema.fromJsonString(Schema.Json)
+const assertionIssuer = PrincipalAssertion.layerIssuer((principal) =>
+  Schema.encodeUnknownEffect(assertionCodec)(principal).pipe(
+    Effect.map((assertion) => PrincipalAssertion.PrincipalAssertion.make(assertion)),
+    Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "could not issue principal assertion" }))
+  )
+)
+const assertionVerifier = PrincipalAssertion.layerVerifier((assertion) =>
+  Schema.decodeUnknownEffect(assertionCodec)(assertion).pipe(
+    Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" }))
+  )
+)
 const authenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
   Layer.succeed(Authentication.Credentials, Redacted.make("secret"))
 ))
@@ -179,6 +206,7 @@ const revokedAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe
 ))
 const presenceHub = PresenceHub.layerTrusted()
 const cluster = SpaceEntity.layer().pipe(
+  Layer.provide(assertionVerifier),
   Layer.provide(store),
   Layer.provide(presenceHub),
   Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(database)))
@@ -191,6 +219,7 @@ const websocketServer = SyncServer.layer.pipe(
   Layer.provideMerge(websocketProtocol),
   Layer.provide(cluster),
   Layer.provide(authenticationServer),
+  Layer.provide(assertionIssuer),
   Layer.provide(HttpRouter.serve(websocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const webSocketConstructions = MutableRef.make(0)
@@ -239,6 +268,7 @@ const incompatibleServer = SyncServer.layerWithOptions({ supportedProtocolVersio
   Layer.provideMerge(websocketProtocol),
   Layer.provide(cluster),
   Layer.provide(authenticationServer),
+  Layer.provide(assertionIssuer),
   Layer.provide(HttpRouter.serve(websocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const incompatibleClient = SyncClient.layerWithOptions({ supportedProtocolVersions: [1] }).pipe(
@@ -298,6 +328,7 @@ const protocol2Server = SyncServer.layerWithOptions({ supportedProtocolVersions:
   Layer.provideMerge(websocketProtocol),
   Layer.provide(cluster),
   Layer.provide(observingAuthenticationServer),
+  Layer.provide(assertionIssuer),
   Layer.provide(HttpRouter.serve(websocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const configurableProtocolSession = ProtocolSession.layerWithOptions({ supportedProtocolVersions: [1, 2] })
@@ -322,6 +353,7 @@ describe("WebSocket synchronization", () => {
           definition,
           evolution,
           clientId,
+          scope,
           initialSpaces: [spaceId, secondSpaceId],
           retryDelay: "1 millis"
         }).pipe(
@@ -365,12 +397,7 @@ describe("WebSocket synchronization", () => {
   it.effect("returns UpgradeRequired when protocol versions do not intersect", () =>
     Effect.gen(function*() {
       const remote = yield* SyncEngine.SyncEngine
-      const error = yield* remote.pull({
-        spaceId,
-        schema: definition.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      }).pipe(Effect.flip)
+      const error = yield* remote.pull(pullRequest()).pipe(Effect.flip)
       assert.strictEqual(error._tag, "UpgradeRequired")
     }).pipe(Effect.provide(incompatibleLive)))
 
@@ -380,12 +407,7 @@ describe("WebSocket synchronization", () => {
       const remote = yield* SyncEngine.SyncEngine
       const presence = yield* PresenceClient.PresenceClient
 
-      yield* remote.pull({
-        spaceId,
-        schema: definition.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
+      yield* remote.pull(pullRequest())
       yield* presence.publish({
         spaceId,
         clientId,
@@ -427,31 +449,30 @@ describe("WebSocket synchronization", () => {
       }
       yield* (yield* ServerStore.ServerStore).maintain(spaceId)
 
-      const pulled = yield* remote.pull({
-        spaceId,
-        schema: definition.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
+      const pulled = yield* remote.pull(pullRequest())
       assert.isTrue("_tag" in pulled)
       if (!("_tag" in pulled)) assert.fail("expected bootstrap")
       const request = {
         spaceId,
+        clientId,
         schema: definition.schemaIdentity,
+        scope,
+        scopeGeneration,
+        cursor: pulled.manifest.cursor,
         snapshotId: pulled.manifest.snapshotId,
         afterOrdinal: -1,
-        limit: 10
+        limit: 1
       }
       let page = yield* remote.bootstrap(request)
       let entities = 0
       let pages = 0
       while (true) {
-        assert.isAbove(page.entities.length, 0)
+        assert.isAbove(page.entries.length, 0)
         assert.isAtMost(Protocol.encodedBytes(page), serverHistory.maximumBootstrapPageBytes)
-        entities += page.entities.length
+        entities += page.entries.length
         pages += 1
         if (!page.hasMore) break
-        const last = page.entities.at(-1)
+        const last = page.entries.at(-1)
         assert.isDefined(last)
         page = yield* remote.bootstrap({
           ...request,
@@ -501,21 +522,22 @@ describe("WebSocket synchronization", () => {
       const replyRows = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM cluster_replies`
       assert.deepStrictEqual([messageRows[0]?.count, replyRows[0]?.count], [0, 0])
 
-      const page = yield* remote.pull({
+      const page = yield* remote.pull(pullRequest())
+      if (!("_tag" in page)) assert.fail("expected bootstrap")
+      const bootstrap = yield* remote.bootstrap({
         spaceId,
+        clientId,
         schema: definition.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
+        scope,
+        scopeGeneration,
+        cursor: page.manifest.cursor,
+        snapshotId: page.manifest.snapshotId,
+        afterOrdinal: -1,
         limit: 10
       })
-      if ("_tag" in page) assert.fail("unexpected bootstrap")
-      assert.deepStrictEqual(page.entries.map((entry) => entry.mutationId), [mutationId])
+      assert.deepStrictEqual(bootstrap.entries.map((entry) => entry.change._tag), ["Upsert"])
 
-      const denied = yield* remote.pull({
-        spaceId: forbiddenSpaceId,
-        schema: definition.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      }).pipe(Effect.flip)
+      const denied = yield* remote.pull(pullRequest(forbiddenSpaceId)).pipe(Effect.flip)
       assert.strictEqual(denied._tag, "AuthorizationDenied")
 
       const forbiddenIdentity = { ...identity, spaceId: forbiddenSpaceId }
@@ -538,11 +560,15 @@ describe("WebSocket synchronization", () => {
       MutableRef.set(readAuthorized, true)
       const remote = yield* SyncEngine.SyncEngine
       const initialWake = yield* Deferred.make<void>()
-      const watching = yield* remote.watch({ spaceId, schema: definition.schemaIdentity }).pipe(
-        Stream.tap((wake) => {
-          if (wake.sequence === 0) return Deferred.succeed(initialWake, undefined)
-          return Effect.void
-        }),
+      const watching = yield* remote.watch({
+        spaceId,
+        clientId,
+        schema: definition.schemaIdentity,
+        scope,
+        scopeGeneration,
+        cursor: null
+      }).pipe(
+        Stream.tap(() => Deferred.succeed(initialWake, undefined)),
         Stream.take(2),
         Stream.runCollect,
         Effect.forkChild({ startImmediately: true })
@@ -662,14 +688,9 @@ describe("WebSocket synchronization", () => {
           limit: Protocol.maximumReceiptBytes
         })
       }
-      const page = yield* remote.pull({
-        spaceId,
-        schema: definition.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
-      if ("_tag" in page) assert.fail("unexpected bootstrap")
-      assert.deepStrictEqual(page.entries, [])
+      const page = yield* remote.pull(pullRequest())
+      if (!("_tag" in page)) assert.fail("expected bootstrap")
+      assert.strictEqual(page.manifest.entityCount, 0)
     }).pipe(
       Effect.provide(live),
       Effect.provide(NodeCrypto.layer)

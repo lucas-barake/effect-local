@@ -4,9 +4,16 @@
 
 - `submit` sends one stable mutation envelope and returns its durable terminal receipt
 - `discard` resolves one quarantined envelope without executing its mutation handler
-- `pull` reads a bounded accepted suffix or returns the immutable snapshot manifest required for bootstrap
-- `bootstrap` reads one identity bound, ordered, count and byte bounded snapshot page
-- `watch` streams wake notifications for a space
+- `pull` advances one durable client view through bounded `Upsert`, `Delete`, and `Retract` changes, or returns the
+  immutable scoped snapshot manifest required for bootstrap
+- `bootstrap` reads one client, scope, and principal bound, ordered, count and byte bounded snapshot page
+- `watch` streams payload free wake hints for a scoped client view
+
+Every client declares a `ReplicationScope` containing the model names it subscribes to. An empty scope is valid. A
+whole definition subscription is explicit. The server normalizes and validates the scope against the request schema
+identity before reading entities. Scope changes advance a durable generation. Widening backfills newly selected and
+authorized entities through incremental pull. Narrowing emits `Retract` changes so excluded entities are evicted
+without a full bootstrap.
 
 The reconciler does not trust notification delivery or ordering. A notification only requests another durable
 generation for its space. Every sync pass reads that space's SQLite cursor, catches up, submits pending mutations in
@@ -33,10 +40,23 @@ manifest binds space, definition, snapshot identity, both fences, entity count, 
 digest. The publication transaction compares the observed heads, inserts the immutable snapshot, then publishes
 logical floors before deleting any rows. A concurrent admission causes preparation to be discarded and retried later.
 
-A client cursor inside the retained suffix continues incrementally. An older or fresh cursor receives
-`BootstrapRequired`. The client stages pages durably and atomically installs the verified snapshot at `S`, then pulls
-`S + 1` onward. A newer manifest supersedes an older partial stage. Snapshot pages contain only materialized entities.
-They never contain mutation payloads, private results, or receipt bodies.
+The dense per space server sequence remains the mutation order and client mutation basis. Replication progress uses a
+separate per client view cursor. The server durably stores the acknowledged materialized view and at most one immutable
+outstanding page. Retrying a page from its base cursor returns the same page. Acknowledging its target cursor applies
+the page to the server view before the next diff is created. Empty pages can therefore advance the global server
+watermark without inventing entity changes.
+
+A fresh, unknown, or schema-invalidated view cursor receives `BootstrapRequired`. The client stages pages durably and
+atomically installs the verified scoped snapshot. A newer manifest supersedes an older partial stage. The manifest
+binds the client ID, normalized scope digest, scope generation, view cursor, global sequence and terminal fences,
+count, bytes, and rolling digest. Snapshot entries contain only current authorized `Upsert` rows. They never contain
+mutation payloads, private results, receipt bodies, retractions, or identifiers from a previous principal. Installation
+derives absence retractions from the client's prior canonical state.
+
+`Delete` means the authoritative entity no longer exists. `Retract` means it exists but is outside the current scope or
+principal visibility. Retractions remove canonical and visible state and persist a generation owned tombstone so
+pending optimistic replay cannot restore revoked data. A later authorized `Upsert` clears that tombstone. Whole scope
+authorization failure atomically clears replicated canonical and visible state before the failure is surfaced.
 
 Receipt reclamation advances a per client expired local sequence watermark. A retry below that watermark returns
 `Expired`, bound to a covering published snapshot, and never reexecutes. The pending client mutation remains visible
@@ -54,12 +74,19 @@ matches its Cluster address, then calls `ServerStore` or `PresenceHub`. `SyncCli
 to `SyncEngine` while preserving typed replica failures.
 
 Authentication is RPC middleware. The client reads a redacted credential and sets an `Authorization: Bearer` header.
-The server authenticates it into a JSON principal for each request. `ServerStore.layer` requires access, mutation
-admission, and read policies. Receipt retries recheck current access before reading durable state. `PresenceHub.layer`
+The server authenticates it into a JSON principal for each request. The authenticated facade issues an opaque principal
+assertion for the internal Cluster hop. The space entity verifies that assertion before deriving a principal and
+calling storage or presence services. Raw caller supplied JSON never confers authority inside the cluster.
+`ServerStore.layer` requires access, mutation admission, and read policies. Read policy receives a tagged scope check
+before schema or space disclosure, then a separate check for every candidate entity. Pull and every bootstrap page
+recheck entity visibility before sending data. Receipt retries recheck current access before reading durable state. `PresenceHub.layer`
 requires a tagged publish or watch policy that can bind the claimed presence client ID to the principal. The explicit
 `layerTrusted` constructors are reserved for tests and already trusted processes.
 
-The space entity is the single live owner and relay for a space. Its operations are deliberately volatile. Durable
+The space entity is the single live owner and relay for a space. Its operations are deliberately volatile. A wire wake
+contains only the space ID. Entity changes wake a client only when they are currently in scope and visible, or could
+remove something from its acknowledged view. Periodic authorization refresh hints ensure policy-only revocations are
+eventually pulled as retractions. Wakes never carry an entity or the global server sequence. Durable
 mutation custody has two owners at different stages. Before admission, the client keeps the pending envelope in its
 SQLite outbox. After admission, `ServerStore` keeps the terminal receipt and accepted event in
 `effect_local_server_receipts` and `effect_local_authoritative_log`. If a runner fails before SQL commit, the entity call
@@ -101,7 +128,8 @@ receipt expires, the durable watermark prevents reexecution and directs the clie
 accepted log or verified snapshot, not an acknowledgement, changes client canonical state.
 
 When a watch ends, its finalizer requests another reconciliation generation. The transport may reconnect
-independently. The durable cursor, pending queue, and generation counters contain everything required to resume.
+independently. The durable view cursor, scope generation, global mutation watermark, pending queue, retractions, and
+reconciliation generation counters contain everything required to resume.
 
 Servers accept their current application schema plus `acceptedSchemaVersions` immediately preceding definitions from
 the configured Evolution chain. Inbound old envelopes migrate forward. Receipts, pulls, and snapshots project back to

@@ -27,11 +27,15 @@ manifest and stay under the configured frame bound. Wake and presence streams ar
 current owner of the space.
 
 Authentication follows Effect RPC middleware conventions. The client reads redacted `Credentials` and writes a
-bearer header. The server uses `Authenticator` to provide a JSON `Principal`. `ServerStore.layer` requires explicit
-access, mutation admission, and read callbacks. `PresenceHub.layer` requires a tagged publish or watch callback and
-includes the claimed client ID for publish policy. Use the named `layerTrusted` constructors only where allow all is
-intentional. The principal is inserted into the internal entity payload by `SyncServer`. Browser payloads never carry
-or choose it.
+bearer header. The server uses `Authenticator` to provide a JSON `Principal`. `SyncServer.layerHandlers` requires a
+`PrincipalAssertion.Issuer`, while `SpaceEntity.layerHandlers` requires the matching
+`PrincipalAssertion.Verifier`. The assertion is opaque on the internal Cluster hop. The entity verifies it before
+deriving the principal, so browser payloads never carry or choose principal authority. Applications own assertion
+authenticity, expiry, and key rotation. Do not encode unsigned principal JSON as a production assertion.
+
+`ServerStore.layer` requires explicit access, mutation admission, and read callbacks. `PresenceHub.layer` requires a
+tagged publish or watch callback and includes the claimed client ID for publish policy. Use the named `layerTrusted`
+constructors only where allow all is intentional.
 
 Use `SyncRpc.layerJson` for the WebSocket serialization Layer. It bounds each complete UTF-8 JSON frame and makes
 remote defects opaque. The high level Effect Node server does not expose the underlying `ws` `maxPayload` option, so

@@ -8,6 +8,7 @@ import type * as HttpRouter from "effect/unstable/http/HttpRouter"
 import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import * as Authentication from "./Authentication.js"
+import * as PrincipalAssertion from "./PrincipalAssertion.js"
 import * as SpaceEntity from "./SpaceEntity.js"
 import * as SyncRpc from "./SyncRpc.js"
 
@@ -34,6 +35,8 @@ const makeLayerHandlers = (options?: Options) => {
       return Effect.fail(new ReplicaError.ProtocolVersionRejected({ version, serverVersions: supportedVersions }))
     }
     const client = yield* SpaceEntity.Client
+    const issuer = yield* PrincipalAssertion.Issuer
+    const issueAssertion = Authentication.Principal.pipe(Effect.flatMap(issuer.issue))
     return SyncRpc.Rpcs.of({
       Negotiate: ({ supportedVersions: clientVersions }) => {
         const version = supportedVersions.find((candidate) => clientVersions.includes(candidate))
@@ -42,45 +45,45 @@ const makeLayerHandlers = (options?: Options) => {
       },
       Submit: (request) =>
         requireVersion(request.protocolVersion).pipe(
-          Effect.andThen(Authentication.Principal),
-          Effect.flatMap((principal) => client.submit(request.envelope.spaceId, request, principal))
+          Effect.andThen(issueAssertion),
+          Effect.flatMap((assertion) => client.submit(request.envelope.spaceId, request, assertion))
         ),
       Discard: (request) =>
         requireVersion(request.protocolVersion).pipe(
-          Effect.andThen(Authentication.Principal),
-          Effect.flatMap((principal) => client.discard(request.envelope.spaceId, request, principal))
+          Effect.andThen(issueAssertion),
+          Effect.flatMap((assertion) => client.discard(request.envelope.spaceId, request, assertion))
         ),
       Pull: (request) =>
         requireVersion(request.protocolVersion).pipe(
-          Effect.andThen(Authentication.Principal),
-          Effect.flatMap((principal) => client.pull(request.spaceId, request, principal))
+          Effect.andThen(issueAssertion),
+          Effect.flatMap((assertion) => client.pull(request.spaceId, request, assertion))
         ),
       Bootstrap: (request) =>
         requireVersion(request.protocolVersion).pipe(
-          Effect.andThen(Authentication.Principal),
-          Effect.flatMap((principal) => client.bootstrap(request.spaceId, request, principal))
+          Effect.andThen(issueAssertion),
+          Effect.flatMap((assertion) => client.bootstrap(request.spaceId, request, assertion))
         ),
       Watch: (request) =>
         Stream.fromEffect(requireVersion(request.protocolVersion)).pipe(
           Stream.flatMap(() =>
-            Stream.unwrap(Authentication.Principal.pipe(
-              Effect.map((principal) => client.watch(request.spaceId, request, principal))
+            Stream.unwrap(issueAssertion.pipe(
+              Effect.map((assertion) => client.watch(request.spaceId, request, assertion))
             ))
           )
         ),
       PublishPresence: (update) => {
         const { protocolVersion, ...presence } = update
         return requireVersion(protocolVersion).pipe(
-          Effect.andThen(Authentication.Principal),
-          Effect.flatMap((principal) => client.publishPresence(update.spaceId, presence, principal)),
+          Effect.andThen(issueAssertion),
+          Effect.flatMap((assertion) => client.publishPresence(update.spaceId, presence, assertion)),
           Effect.as(null)
         )
       },
       WatchPresence: ({ spaceId, protocolVersion }) =>
         Stream.fromEffect(requireVersion(protocolVersion)).pipe(
           Stream.flatMap(() =>
-            Stream.unwrap(Authentication.Principal.pipe(
-              Effect.map((principal) => client.watchPresence(spaceId, principal))
+            Stream.unwrap(issueAssertion.pipe(
+              Effect.map((assertion) => client.watchPresence(spaceId, assertion))
             ))
           )
         )

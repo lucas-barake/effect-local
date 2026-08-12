@@ -9,6 +9,7 @@ import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
@@ -61,6 +62,7 @@ const runtime = MutationRuntime.layer(definition).pipe(Layer.provide(serverHandl
 
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } as const
 const clientHistory = {
+  scope: Protocol.ReplicationScope.make({ models: [Todo.name] }),
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
@@ -71,6 +73,7 @@ const clientHistory = {
   migration
 }
 const serverHistory = {
+  readAuthorizationRefreshInterval: "1 second" as const,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,
@@ -109,7 +112,8 @@ const makeServices = Effect.gen(function*() {
     SyncEngine.SyncEngine,
     TestServer.layer.pipe(
       Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
-      Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults))
+      Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults)),
+      Layer.provide(NodeCrypto.layer)
     )
   )
   const replica = yield* service(

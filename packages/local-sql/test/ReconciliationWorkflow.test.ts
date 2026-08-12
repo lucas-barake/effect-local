@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
@@ -33,6 +34,7 @@ import * as Domain from "./Domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const scopeGeneration = Identity.ReplicationScopeGeneration.make(1)
 
 const database = () =>
   Layer.mergeAll(
@@ -56,6 +58,7 @@ const migration = {
   maximumAttempts: 8
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const clientHistory = {
+  scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,
@@ -66,6 +69,7 @@ const clientHistory = {
   migration
 }
 const serverHistory = {
+  readAuthorizationRefreshInterval: "1 second" as const,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,
@@ -84,6 +88,12 @@ const serverLayer = ServerStore.layerTrusted({ ...serverHistory, definition: Dom
   Layer.provide(runtime),
   Layer.provide(database())
 )
+
+const serverLayerFor = (definition: Definition.Any) =>
+  ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
+    Layer.provide(MutationRuntime.layer(definition).pipe(Layer.provide(Domain.handlers))),
+    Layer.provide(database())
+  )
 
 const directSync = (server: ServerStore.Service) =>
   Layer.succeed(
@@ -123,6 +133,8 @@ describe("reconciliation workflow", () => {
       const second = yield* space.mutate(Domain.PutTodo, Domain.todo("2"))
       const requested = 2
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -148,6 +160,8 @@ describe("reconciliation workflow", () => {
         "generation",
         "membershipIncarnation",
         "schemaIdentity",
+        "scope",
+        "scopeGeneration",
         "spaceId"
       ])
     }))
@@ -177,6 +191,8 @@ describe("reconciliation workflow", () => {
         spaceId,
         clientId,
         membershipIncarnation: mutation.envelope.membershipIncarnation,
+        scope: clientHistory.scope,
+        scopeGeneration,
         generation: 1_000
       })
 
@@ -251,6 +267,8 @@ describe("reconciliation workflow", () => {
       const registered = yield* replica.space(spaceId)
       const pending = yield* registered.mutate(Domain.PutTodo, Domain.todo("identity"))
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId: Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002"),
         clientId,
@@ -297,6 +315,8 @@ describe("reconciliation workflow", () => {
       const mutation = yield* space.mutate(Domain.PutTodo, Domain.todo("cluster"))
       const requested = 2
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -337,13 +357,45 @@ describe("reconciliation workflow", () => {
             )
           )
           const local = Context.get(localContext, LocalStore.Store)
-          const remote = SyncEngine.SyncEngine.of({
-            discard: () => Effect.die("unexpected discard"),
-            submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-            pull: () => Effect.succeed({ entries: [], hasMore: false, serverSchema: definition.schemaIdentity }),
-            bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-            watch: () => Stream.never
+          const serverContext = yield* Layer.build(serverLayerFor(definition))
+          const server = Context.get(serverContext, ServerStore.ServerStore)
+          let remote = SyncEngine.SyncEngine.of({
+            discard: (request) => server.discard(request, null),
+            submit: server.submit,
+            pull: server.pull,
+            bootstrap: server.bootstrap,
+            watch: server.watch
           })
+          if (definition.hash !== Domain.definition.hash) {
+            remote = SyncEngine.SyncEngine.of({
+              discard: (request) => server.discard(request, null),
+              submit: server.submit,
+              pull: (request) => {
+                if (request.cursor === null) return server.pull(request)
+                const cursor = request.cursor
+                return Protocol.viewChangesDigest([]).pipe(
+                  Effect.map((digest) =>
+                    Protocol.PullPage.make({
+                      scopeGeneration: request.scopeGeneration,
+                      cursor: Protocol.ReplicationCursor.make({
+                        viewId: cursor.viewId,
+                        revision: Identity.ReplicationViewRevision.make(cursor.revision + 1)
+                      }),
+                      serverSequence: Identity.ServerSequence.make(0),
+                      changes: [],
+                      contentBytes: Protocol.encodedBytes([]),
+                      digest,
+                      hasMore: false,
+                      serverSchema: definition.schemaIdentity
+                    })
+                  ),
+                  Effect.provide(NodeCrypto.layer)
+                )
+              },
+              bootstrap: server.bootstrap,
+              watch: server.watch
+            })
+          }
           const reconciliationContext = yield* Layer.build(
             Reconciler.layerOnePass({ definition, spaceId }).pipe(
               Layer.provide(Layer.succeed(LocalStore.Store, local)),
@@ -377,6 +429,8 @@ describe("reconciliation workflow", () => {
 
       const retainedGeneration = yield* legacy.requestReconciliation
       const retainedPayload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -394,6 +448,8 @@ describe("reconciliation workflow", () => {
       const current = yield* register(definitionV2)
       const generation = yield* current.requestReconciliation
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${definitionV2.schemaIdentity.version}:${definitionV2.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -411,6 +467,8 @@ describe("reconciliation workflow", () => {
 
       const legacyGeneration = yield* legacy.requestReconciliation
       const legacyPayload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -433,6 +491,8 @@ describe("reconciliation workflow", () => {
       const secondClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
       const engineContext = yield* Layer.build(WorkflowEngine.layerMemory)
       const engine = Context.get(engineContext, WorkflowEngine.WorkflowEngine)
+      const serverContext = yield* Layer.build(serverLayer)
+      const server = Context.get(serverContext, ServerStore.ServerStore)
       const register = (
         registeredClientId: Identity.ClientId,
         pulls: Ref.Ref<number>,
@@ -454,16 +514,12 @@ describe("reconciliation workflow", () => {
           const remote = SyncEngine.SyncEngine.of({
             discard: () => Effect.die("unexpected discard"),
             submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-            pull: () =>
+            pull: (request) =>
               Ref.update(pulls, (count) => count + 1).pipe(
                 Effect.andThen(Deferred.succeed(pulled, undefined)),
-                Effect.as({
-                  entries: [],
-                  hasMore: false,
-                  serverSchema: Domain.definition.schemaIdentity
-                })
+                Effect.andThen(server.pull(request))
               ),
-            bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+            bootstrap: server.bootstrap,
             watch: () => Stream.never
           })
           const reconciliationContext = yield* Layer.build(
@@ -490,6 +546,8 @@ describe("reconciliation workflow", () => {
       const firstLocal = yield* register(clientId, firstPulls, firstPulled)
       const secondLocal = yield* register(secondClientId, secondPulls, secondPulled)
       const firstPayload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -497,6 +555,8 @@ describe("reconciliation workflow", () => {
         generation: 1
       })
       const secondPayload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId: secondClientId,
@@ -527,19 +587,16 @@ describe("reconciliation workflow", () => {
         )
       )
       const local = Context.get(localContext, LocalStore.Store)
+      const serverContext = yield* Layer.build(serverLayer)
+      const server = Context.get(serverContext, ServerStore.ServerStore)
       const remote = SyncEngine.SyncEngine.of({
         discard: () => Effect.die("unexpected discard"),
         submit: () =>
           Ref.update(attempts, (count) => count + 1).pipe(
             Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
           ),
-        pull: () =>
-          Effect.succeed({
-            entries: [],
-            hasMore: false,
-            serverSchema: Domain.definition.schemaIdentity
-          }),
-        bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        pull: server.pull,
+        bootstrap: server.bootstrap,
         watch: () => Stream.never
       })
       const reconciliationContext = yield* Layer.build(
@@ -568,6 +625,8 @@ describe("reconciliation workflow", () => {
       yield* local.mutate(Domain.PutTodo, Domain.todo("permanent-failure"))
       const generations = yield* local.reconciliationGenerations
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
@@ -641,6 +700,8 @@ describe("reconciliation workflow", () => {
       )
       const generation = yield* local.requestReconciliation
       const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,

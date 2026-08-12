@@ -28,17 +28,22 @@ The caller chooses the Workflow engine and runner. A durable single runner compo
 
 ```ts
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Layer from "effect/Layer"
 import * as ClusterWorkflowEngine from "effect/unstable/cluster/ClusterWorkflowEngine"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
+import { definition, Todo } from "./domain.js"
 
 const WorkflowEngineLive = ClusterWorkflowEngine.layer.pipe(
   Layer.provideMerge(SingleRunner.layer({ runnerStorage: "sql" }))
 )
 
+const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
+
 const ReplicaLive = SqlReplica.layerWorkflow({
   definition,
   clientId,
+  scope,
   initialSpaces: [spaceId],
   retainedReceipts: 256,
   maximumReceipts: 1_024,
@@ -55,6 +60,11 @@ const ReplicaLive = SqlReplica.layerWorkflow({
 `initialSpaces` seeds first startup. Later calls to `Replica.join` persist membership and restart restores every joined
 space automatically. `Replica.leave` closes the space runtime before one cascading delete removes its local state.
 The database keeps the singleton `clientId`. Rejoining creates a new membership incarnation and local sequence.
+
+The required `scope` is a model subscription shared by the replica's joined spaces. Changing the configured scope on
+the next startup advances a durable generation. A wider scope backfills through incremental pull. A narrower scope
+receives `Retract` changes and evicts the excluded canonical and visible entities without a new bootstrap. The current
+scope contract does not express key ranges, rolling windows, lazy fetches, or automatic cache eviction.
 
 `retryDelay`, `maximumRetryDelay`, and `maximumAttempts` bound exponential retries within one Workflow execution. A
 terminal failed generation stays failed until a later mutation or server wake requests a new generation. Effect
@@ -74,6 +84,38 @@ set retained targets, hard admission caps, snapshot capacity, bootstrap page cap
 snapshots, migration retry, maintenance concurrency, and the keyset page size used to enumerate spaces. `ServerStore.layerTrusted` is the explicit allow all
 composition.
 
+`authorizeRead` receives a tagged union. `_tag: "Scope"` authorizes the client and requested model set before space or
+schema disclosure. `_tag: "Entity"` authorizes one Schema encoded entity key and value. Only entities that pass both
+scope selection and entity policy can enter pull or bootstrap responses. Policy-only revocations are discovered by
+the periodic wake interval and delivered as durable `Retract` changes. A true authoritative deletion remains a
+`Delete`.
+
+The returned Effect may require application services. Those requirements are part of the resulting server Layer, so
+the idiomatic implementation can be a Context service consumed by the option callback:
+
+```ts
+import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
+import * as Context from "effect/Context"
+import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
+
+class ReadPolicy extends Context.Service<ReadPolicy, {
+  readonly authorize: (
+    input: ServerStore.ReadAuthorizationInput
+  ) => Effect.Effect<void, typeof Schema.Json.Type>
+}>()("app/ReadPolicy") {}
+
+const StoreLive = ServerStore.layer({
+  ...serverHistory,
+  definition,
+  readAuthorizationRefreshInterval: "30 seconds",
+  authorizeAccess,
+  authorizeMutation,
+  authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
+}).pipe(Layer.provide(ReadPolicyLive))
+```
+
 Provide `ServerStore.layerMaintenance({ interval, runOnStart })` beside the store, or schedule `maintainAll` through an
 application owned job runner. Maintenance publishes an immutable snapshot and logical floors before bounded physical
 deletion. Admission fails before handler execution at a hard cap until maintenance creates capacity. Old cursors use
@@ -85,6 +127,7 @@ import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 
 const StoreLive = ServerStore.layer({
   definition,
+  readAuthorizationRefreshInterval: "30 seconds",
   authorizeAccess,
   authorizeMutation,
   authorizeRead,

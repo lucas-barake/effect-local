@@ -93,6 +93,10 @@ export class CursorGap extends Schema.TaggedErrorClass<CursorGap>(
   "@lucas-barake/effect-local/CursorGap"
 )("CursorGap", { expected: Schema.Number, actual: Schema.Number }) {}
 
+export class StaleReplicationScope extends Schema.TaggedErrorClass<StaleReplicationScope>(
+  "@lucas-barake/effect-local/StaleReplicationScope"
+)("StaleReplicationScope", { expected: Schema.Number, actual: Schema.Number }) {}
+
 export class SnapshotUnavailable extends Schema.TaggedErrorClass<SnapshotUnavailable>(
   "@lucas-barake/effect-local/SnapshotUnavailable"
 )("SnapshotUnavailable", { snapshotId: Schema.String }) {}
@@ -157,6 +161,7 @@ export const ReplicaError = Schema.Union([
   QuarantineResubmissionConflict,
   OutOfOrderMutation,
   CursorGap,
+  StaleReplicationScope,
   SnapshotUnavailable,
   CapacityExceeded,
   InvalidConfiguration,

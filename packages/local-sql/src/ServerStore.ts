@@ -14,14 +14,13 @@ import * as PubSub from "effect/PubSub"
 import * as RcMap from "effect/RcMap"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
-import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Rows from "./internal/rows.js"
+import * as ScopedReplication from "./internal/scopedReplication.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as TerminalRejection from "./internal/TerminalRejection.js"
 import * as SqlTransaction from "./internal/transaction.js"
@@ -64,7 +63,7 @@ export interface Service {
     principal: typeof Schema.Json.Type
   ) => Effect.Effect<Protocol.PullResult, ReplicaError.ReplicaError>
   readonly watch: (
-    request: Protocol.WatchRequest | Identity.SpaceId
+    request: Protocol.WatchRequest
   ) => Stream.Stream<Protocol.Wake, ReplicaError.ReplicaError>
   readonly bootstrap: (
     request: Protocol.BootstrapRequest | Omit<Protocol.BootstrapRequest, "schema">
@@ -100,11 +99,36 @@ export interface Options<R = never,> extends HistoryOptions {
     readonly mutation: MutationRuntime.CurrentMutationView
     readonly principal: typeof Schema.Json.Type
   }) => Effect.Effect<void, typeof Schema.Json.Type, R>
-  readonly authorizeRead: (input: {
-    readonly spaceId: Identity.SpaceId
-    readonly principal: typeof Schema.Json.Type
-  }) => Effect.Effect<void, typeof Schema.Json.Type, R>
+  readonly authorizeRead: (input: ReadAuthorizationInput) => Effect.Effect<void, typeof Schema.Json.Type, R>
+  readonly readAuthorizationRefreshInterval: Duration.Input
   readonly wakeCapacity?: number
+}
+
+interface ReadAuthorizationCommon {
+  readonly spaceId: Identity.SpaceId
+  readonly clientId: Identity.ClientId
+  readonly scope: Protocol.ReplicationScope
+  readonly principal: typeof Schema.Json.Type
+}
+
+export type ReadAuthorizationInput =
+  | ReadAuthorizationCommon & { readonly _tag: "Scope" }
+  | ReadAuthorizationCommon & {
+    readonly _tag: "Entity"
+    readonly entity: Protocol.EntityKey
+    readonly value: typeof Schema.Json.Type
+  }
+
+interface GlobalSnapshotManifest {
+  readonly spaceId: Identity.SpaceId
+  readonly definitionHash: string
+  readonly schema: Identity.SchemaIdentity
+  readonly snapshotId: Identity.SnapshotId
+  readonly sequence: Identity.ServerSequence
+  readonly terminalSequenceThrough: Identity.TerminalSequence
+  readonly entityCount: number
+  readonly contentBytes: number
+  readonly digest: Protocol.SnapshotDigest
 }
 
 type NumericHistoryOption = Exclude<keyof HistoryOptions, "migration">
@@ -202,6 +226,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         }
       }
       const context = yield* Effect.context<R>()
+      const readAuthorizationRefreshMillis = yield* Configuration.positiveFiniteDurationMillis(
+        "readAuthorizationRefreshInterval",
+        options.readAuthorizationRefreshInterval
+      )
       const wakeCapacity = options.wakeCapacity ?? 1_024
       if (
         runtime.migrationHash !== evolution.migrationHash ||
@@ -220,13 +248,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         })
       }
       yield* Migrations.server(options.migration)
-      const projectionGates = yield* RcMap.make({
-        lookup: (_key: string) => Semaphore.make(1)
-      })
-
       const wakes = yield* RcMap.make({
         lookup: (_spaceId: Identity.SpaceId) =>
-          Effect.acquireRelease(PubSub.sliding<Protocol.Wake>(wakeCapacity), PubSub.shutdown)
+          Effect.acquireRelease(PubSub.sliding<ReadonlyArray<Protocol.EntityChange>>(wakeCapacity), PubSub.shutdown)
       })
       const findReceiptByMutation = SqlSchema.findOneOption({
         Request: Schema.Struct({ spaceId: Identity.SpaceId, mutationId: Identity.MutationId }),
@@ -336,29 +360,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           FROM effect_local_server_entities WHERE space_id = ${spaceId}
           ORDER BY entity_bytes DESC, model, entity_key LIMIT 1`
       })
-      const findLogMetadata = SqlSchema.findAll({
-        Request: Schema.Struct({ spaceId: Identity.SpaceId, after: Identity.ServerSequence, limit: Schema.Int }),
-        Result: Rows.ServerLogMetadataRow,
-        execute: ({ spaceId, after, limit }) =>
-          sql`SELECT server_sequence, entry_bytes FROM effect_local_authoritative_log
-          WHERE space_id = ${spaceId} AND server_sequence > ${after}
-          ORDER BY server_sequence LIMIT ${limit}`
-      })
-      const findLogEntries = SqlSchema.findAll({
-        Request: Schema.Struct({
-          spaceId: Identity.SpaceId,
-          after: Identity.ServerSequence,
-          through: Identity.ServerSequence
-        }),
-        Result: Rows.ServerLogRow,
-        execute: ({ spaceId, after, through }) =>
-          sql`SELECT space_id, server_sequence, client_id, membership_incarnation,
-            local_sequence, mutation_id, digest,
-            entry_bytes, entry_json, source_schema_version, source_schema_hash
-          FROM effect_local_authoritative_log
-          WHERE space_id = ${spaceId} AND server_sequence > ${after} AND server_sequence <= ${through}
-          ORDER BY server_sequence`
-      })
       const findSnapshot = SqlSchema.findOneOption({
         Request: Schema.Struct({ spaceId: Identity.SpaceId, snapshotId: Identity.SnapshotId }),
         Result: Rows.SnapshotManifestRow,
@@ -368,98 +369,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             entity_count, content_bytes, digest
           FROM effect_local_server_snapshots
           WHERE space_id = ${spaceId} AND snapshot_id = ${snapshotId}`
-      })
-      const findSnapshotEntityMetadata = SqlSchema.findAll({
-        Request: Schema.Struct({
-          spaceId: Identity.SpaceId,
-          snapshotId: Identity.SnapshotId,
-          after: Schema.Int,
-          limit: Schema.Int
-        }),
-        Result: Rows.SnapshotEntityMetadataRow,
-        execute: ({ spaceId, snapshotId, after, limit }) =>
-          sql`SELECT ordinal, wire_bytes
-          FROM effect_local_server_snapshot_entities
-          WHERE space_id = ${spaceId} AND snapshot_id = ${snapshotId} AND ordinal > ${after}
-          ORDER BY ordinal LIMIT ${limit}`
-      })
-      const findSnapshotEntityWire = SqlSchema.findAll({
-        Request: Schema.Struct({
-          spaceId: Identity.SpaceId,
-          snapshotId: Identity.SnapshotId,
-          after: Schema.Int,
-          through: Schema.Int
-        }),
-        Result: Rows.SnapshotEntityWireRow,
-        execute: ({ spaceId, snapshotId, after, through }) =>
-          sql`SELECT ordinal, wire_json, wire_bytes
-          FROM effect_local_server_snapshot_entities
-          WHERE space_id = ${spaceId} AND snapshot_id = ${snapshotId}
-            AND ordinal > ${after} AND ordinal <= ${through}
-          ORDER BY ordinal`
-      })
-      const findSnapshotProjection = SqlSchema.findOneOption({
-        Request: Schema.Struct({
-          spaceId: Identity.SpaceId,
-          snapshotId: Identity.SnapshotId,
-          target: Identity.SchemaIdentity
-        }),
-        Result: Rows.SnapshotProjectionRow,
-        execute: ({ spaceId, snapshotId, target }) =>
-          sql`SELECT space_id, snapshot_id, target_schema_version, target_schema_hash, definition_hash,
-            entity_count, content_bytes, digest
-          FROM effect_local_server_snapshot_projections
-          WHERE space_id = ${spaceId} AND snapshot_id = ${snapshotId}
-            AND target_schema_version = ${target.version} AND target_schema_hash = ${target.hash}`
-      })
-      const findSnapshotProjectionEntityMetadata = SqlSchema.findAll({
-        Request: Schema.Struct({
-          spaceId: Identity.SpaceId,
-          snapshotId: Identity.SnapshotId,
-          target: Identity.SchemaIdentity,
-          after: Schema.Int,
-          limit: Schema.Int
-        }),
-        Result: Rows.SnapshotEntityMetadataRow,
-        execute: ({ spaceId, snapshotId, target, after, limit }) =>
-          sql`SELECT ordinal, wire_bytes
-          FROM effect_local_server_snapshot_projection_entities
-          WHERE space_id = ${spaceId} AND snapshot_id = ${snapshotId}
-            AND target_schema_version = ${target.version} AND target_schema_hash = ${target.hash}
-            AND ordinal > ${after}
-          ORDER BY ordinal LIMIT ${limit}`
-      })
-      const findSnapshotProjectionEntityWire = SqlSchema.findAll({
-        Request: Schema.Struct({
-          spaceId: Identity.SpaceId,
-          snapshotId: Identity.SnapshotId,
-          target: Identity.SchemaIdentity,
-          after: Schema.Int,
-          through: Schema.Int
-        }),
-        Result: Rows.SnapshotEntityWireRow,
-        execute: ({ spaceId, snapshotId, target, after, through }) =>
-          sql`SELECT ordinal, wire_json, wire_bytes
-          FROM effect_local_server_snapshot_projection_entities
-          WHERE space_id = ${spaceId} AND snapshot_id = ${snapshotId}
-            AND target_schema_version = ${target.version} AND target_schema_hash = ${target.hash}
-            AND ordinal > ${after} AND ordinal <= ${through}
-          ORDER BY ordinal`
-      })
-      const findSnapshotProjectionEntityByKey = SqlSchema.findOneOption({
-        Request: Schema.Struct({
-          spaceId: Identity.SpaceId,
-          snapshotId: Identity.SnapshotId,
-          target: Identity.SchemaIdentity,
-          model: Schema.String,
-          entityKey: Schema.String
-        }),
-        Result: Schema.Struct({ ordinal: Schema.Int }),
-        execute: ({ spaceId, snapshotId, target, model, entityKey }) =>
-          sql`SELECT ordinal FROM effect_local_server_snapshot_projection_entities
-          WHERE space_id = ${spaceId} AND snapshot_id = ${snapshotId}
-            AND target_schema_version = ${target.version} AND target_schema_hash = ${target.hash}
-            AND model = ${model} AND entity_key = ${entityKey}`
       })
       const findHistoryPrune = SqlSchema.findAll({
         Request: Schema.Struct({ spaceId: Identity.SpaceId, through: Identity.ServerSequence, limit: Schema.Int }),
@@ -477,18 +386,17 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           WHERE space_id = ${spaceId} AND terminal_sequence <= ${through}
           ORDER BY terminal_sequence LIMIT ${limit}`
       })
-      const manifestFromRow = (row: typeof Rows.SnapshotManifestRow.Type) =>
-        Protocol.SnapshotManifest.make({
-          spaceId: row.space_id,
-          definitionHash: row.definition_hash,
-          schema: Identity.SchemaIdentity.make({ version: row.schema_version, hash: row.schema_hash }),
-          snapshotId: row.snapshot_id,
-          sequence: row.server_sequence,
-          terminalSequenceThrough: row.terminal_sequence,
-          entityCount: row.entity_count,
-          contentBytes: row.content_bytes,
-          digest: row.digest
-        })
+      const manifestFromRow = (row: typeof Rows.SnapshotManifestRow.Type): GlobalSnapshotManifest => ({
+        spaceId: row.space_id,
+        definitionHash: row.definition_hash,
+        schema: Identity.SchemaIdentity.make({ version: row.schema_version, hash: row.schema_hash }),
+        snapshotId: row.snapshot_id,
+        sequence: row.server_sequence,
+        terminalSequenceThrough: row.terminal_sequence,
+        entityCount: row.entity_count,
+        contentBytes: row.content_bytes,
+        digest: row.digest
+      })
       const currentManifest = (spaceId: Identity.SpaceId, meta: typeof Rows.ServerMetaRow.Type) =>
         Effect.gen(function*() {
           if (meta.snapshot_id === null) {
@@ -611,11 +519,35 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           Effect.provide(context),
           Effect.mapError((reason) => new ReplicaError.AuthorizationDenied({ reason }))
         )
-      const authorizeRead = (spaceId: Identity.SpaceId, principal: typeof Schema.Json.Type) =>
-        options.authorizeRead({ spaceId, principal }).pipe(
+      const authorizeReadScope = (
+        request: Protocol.PullRequest | Protocol.BootstrapRequest | Protocol.WatchRequest,
+        principal: typeof Schema.Json.Type
+      ) =>
+        options.authorizeRead({
+          _tag: "Scope",
+          spaceId: request.spaceId,
+          clientId: request.clientId,
+          scope: request.scope,
+          principal
+        }).pipe(
           Effect.provide(context),
           Effect.mapError((reason) => new ReplicaError.AuthorizationDenied({ reason }))
         )
+      const authorizeReadEntity = (
+        request: Protocol.PullRequest | Protocol.BootstrapRequest | Protocol.WatchRequest,
+        principal: typeof Schema.Json.Type,
+        entity: Protocol.EntityKey,
+        value: typeof Schema.Json.Type
+      ) =>
+        options.authorizeRead({
+          _tag: "Entity",
+          spaceId: request.spaceId,
+          clientId: request.clientId,
+          scope: request.scope,
+          principal,
+          entity,
+          value
+        }).pipe(Effect.provide(context), Effect.result, Effect.map(Result.isSuccess))
 
       const validateCallerSchema = (schema: Identity.SchemaIdentity) => {
         const definition = evolution.definitionByIdentity.get(`${schema.version}:${schema.hash}`)
@@ -694,248 +626,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           })
         })
 
-      const projectEntry = (entry: Protocol.AcceptedMutation, target: Definition.Any) =>
-        Effect.gen(function*() {
-          if (
-            target.schemaIdentity.version === options.definition.schemaIdentity.version &&
-            target.schemaIdentity.hash === options.definition.schemaIdentity.hash
-          ) return entry
-          const changes: Array<Protocol.EntityChange> = []
-          for (const change of entry.changes) {
-            if (!target.modelByName.has(change.entity.model)) continue
-            let migrated: Evolution.MigratedModel
-            if (change._tag === "Upsert") {
-              migrated = yield* Evolution.migrateModelTo({
-                evolution,
-                source: entry.sourceSchema,
-                target: target.schemaIdentity,
-                model: change.entity.model,
-                modelVersion: change.entity.modelVersion,
-                key: change.entity.key,
-                value: change.value
-              })
-            } else {
-              migrated = yield* Evolution.migrateModelTo({
-                evolution,
-                source: entry.sourceSchema,
-                target: target.schemaIdentity,
-                model: change.entity.model,
-                modelVersion: change.entity.modelVersion,
-                key: change.entity.key
-              })
-            }
-            const entity = Protocol.EntityKey.make({
-              model: change.entity.model,
-              modelVersion: migrated.modelVersion,
-              key: migrated.key
-            })
-            if (change._tag === "Delete") changes.push(Protocol.Delete.make({ entity }))
-            else changes.push(Protocol.Upsert.make({ entity, value: migrated.value }))
-          }
-          return Protocol.AcceptedMutation.make({ ...entry, sourceSchema: target.schemaIdentity, changes })
-        })
-
-      const ensureSnapshotProjection = (manifest: Protocol.SnapshotManifest, target: Definition.Any) =>
-        Effect.gen(function*() {
-          const existing = yield* findSnapshotProjection({
-            spaceId: manifest.spaceId,
-            snapshotId: manifest.snapshotId,
-            target: target.schemaIdentity
-          }).pipe(Effect.mapError(StorageUnavailable.make))
-          if (Option.isSome(existing)) {
-            const row = existing.value
-            if (row.definition_hash !== target.hash) {
-              return yield* new ReplicaError.StorageCorrupt({
-                message: `Snapshot ${manifest.snapshotId} projection definition is inconsistent`
-              })
-            }
-            return Protocol.SnapshotManifest.make({
-              ...manifest,
-              definitionHash: row.definition_hash,
-              schema: target.schemaIdentity,
-              entityCount: row.entity_count,
-              contentBytes: row.content_bytes,
-              digest: row.digest
-            })
-          }
-          const projectionKey = Canonical.stringify({
-            spaceId: manifest.spaceId,
-            snapshotId: manifest.snapshotId,
-            target: target.schemaIdentity
-          })
-          return yield* Effect.scoped(
-            RcMap.get(projectionGates, projectionKey).pipe(
-              Effect.flatMap((gate) =>
-                gate.withPermit(sql.withTransaction(Effect.gen(function*() {
-                  const stored = yield* findSnapshotProjection({
-                    spaceId: manifest.spaceId,
-                    snapshotId: manifest.snapshotId,
-                    target: target.schemaIdentity
-                  }).pipe(Effect.mapError(StorageUnavailable.make))
-                  if (Option.isSome(stored)) {
-                    const row = stored.value
-                    if (row.definition_hash !== target.hash) {
-                      return yield* new ReplicaError.StorageCorrupt({
-                        message: `Snapshot ${manifest.snapshotId} projection definition is inconsistent`
-                      })
-                    }
-                    return Protocol.SnapshotManifest.make({
-                      ...manifest,
-                      definitionHash: row.definition_hash,
-                      schema: target.schemaIdentity,
-                      entityCount: row.entity_count,
-                      contentBytes: row.content_bytes,
-                      digest: row.digest
-                    })
-                  }
-
-                  let sourceOrdinal = -1
-                  let projectedOrdinal = 0
-                  let contentBytes = 0
-                  let digest = Protocol.initialSnapshotDigest
-                  let projectedRows: Array<{
-                    readonly space_id: Identity.SpaceId
-                    readonly snapshot_id: Identity.SnapshotId
-                    readonly target_schema_version: Identity.SchemaVersion
-                    readonly target_schema_hash: Identity.SchemaHash
-                    readonly ordinal: number
-                    readonly model: string
-                    readonly model_version: Identity.SchemaVersion
-                    readonly entity_key: string
-                    readonly wire_json: string
-                    readonly wire_bytes: number
-                  }> = []
-                  const flushProjectedRows = Effect.suspend(() => {
-                    if (projectedRows.length === 0) return Effect.void
-                    const batch = projectedRows
-                    projectedRows = []
-                    return sql`INSERT INTO effect_local_server_snapshot_projection_entities ${sql.insert(batch)}`.pipe(
-                      Effect.asVoid,
-                      Effect.catchReason("SqlError", "UniqueViolation", (_reason, error) =>
-                        Effect.gen(function*() {
-                          const batchKeys = new Set<string>()
-                          for (const row of batch) {
-                            const key = Canonical.stringify([row.model, row.entity_key])
-                            if (batchKeys.has(key)) {
-                              return yield* new ReplicaError.SchemaKeyCollision({
-                                model: row.model,
-                                key: row.entity_key
-                              })
-                            }
-                            batchKeys.add(key)
-                            const conflict = yield* findSnapshotProjectionEntityByKey({
-                              spaceId: row.space_id,
-                              snapshotId: row.snapshot_id,
-                              target: target.schemaIdentity,
-                              model: row.model,
-                              entityKey: row.entity_key
-                            }).pipe(Effect.mapError(StorageUnavailable.make))
-                            if (Option.isSome(conflict)) {
-                              return yield* new ReplicaError.SchemaKeyCollision({
-                                model: row.model,
-                                key: row.entity_key
-                              })
-                            }
-                          }
-                          return yield* error
-                        }))
-                    )
-                  })
-                  while (sourceOrdinal + 1 < manifest.entityCount) {
-                    const through = Math.min(sourceOrdinal + 256, manifest.entityCount - 1)
-                    const rows = yield* findSnapshotEntityWire({
-                      spaceId: manifest.spaceId,
-                      snapshotId: manifest.snapshotId,
-                      after: sourceOrdinal,
-                      through
-                    }).pipe(Effect.mapError(StorageUnavailable.make))
-                    if (rows.length === 0) {
-                      return yield* new ReplicaError.StorageCorrupt({
-                        message: `Snapshot ${manifest.snapshotId} durable rows are incomplete`
-                      })
-                    }
-                    for (const row of rows) {
-                      const entity = yield* Codec.parse(row.wire_json).pipe(
-                        Effect.flatMap((value) => Codec.decode(Protocol.SnapshotEntity, value))
-                      )
-                      if (
-                        entity.ordinal !== sourceOrdinal + 1 ||
-                        row.wire_bytes !== (yield* Protocol.encodedBytesEffect(entity)) ||
-                        row.wire_json !== (yield* Codec.stringify(entity))
-                      ) {
-                        return yield* new ReplicaError.StorageCorrupt({
-                          message: `Snapshot ${manifest.snapshotId} durable entity ${row.ordinal} is inconsistent`
-                        })
-                      }
-                      sourceOrdinal = entity.ordinal
-                      if (!target.modelByName.has(entity.model)) continue
-                      const migrated = yield* Evolution.migrateModelTo({
-                        evolution,
-                        source: manifest.schema,
-                        target: target.schemaIdentity,
-                        model: entity.model,
-                        modelVersion: entity.modelVersion,
-                        key: entity.key,
-                        value: entity.value
-                      })
-                      const entityKey = yield* Codec.stringify(migrated.key)
-                      const projected = {
-                        ordinal: projectedOrdinal,
-                        model: entity.model,
-                        modelVersion: migrated.modelVersion,
-                        key: migrated.key,
-                        value: migrated.value
-                      }
-                      const entityBytes = yield* Protocol.encodedBytesEffect({
-                        model: projected.model,
-                        modelVersion: projected.modelVersion,
-                        key: projected.key,
-                        value: projected.value
-                      })
-                      const encoded = Protocol.SnapshotEntity.make({ ...projected, entityBytes })
-                      const wireJson = yield* Codec.stringify(encoded)
-                      projectedRows.push({
-                        space_id: manifest.spaceId,
-                        snapshot_id: manifest.snapshotId,
-                        target_schema_version: target.schemaIdentity.version,
-                        target_schema_hash: target.schemaIdentity.hash,
-                        ordinal: projectedOrdinal,
-                        model: entity.model,
-                        model_version: migrated.modelVersion,
-                        entity_key: entityKey,
-                        wire_json: wireJson,
-                        wire_bytes: yield* Protocol.encodedBytesEffect(encoded)
-                      })
-                      if (projectedRows.length === 100) yield* flushProjectedRows
-                      contentBytes += entityBytes
-                      digest = Protocol.SnapshotDigest.make(
-                        yield* Canonical.digest({ previous: digest, entity: encoded }).pipe(
-                          Effect.provideService(Crypto.Crypto, crypto)
-                        )
-                      )
-                      projectedOrdinal += 1
-                    }
-                  }
-                  yield* flushProjectedRows
-                  yield* sql`INSERT INTO effect_local_server_snapshot_projections
-                    (space_id, snapshot_id, target_schema_version, target_schema_hash, definition_hash,
-                      entity_count, content_bytes, digest)
-                    VALUES (${manifest.spaceId}, ${manifest.snapshotId}, ${target.schemaIdentity.version},
-                      ${target.schemaIdentity.hash}, ${target.hash}, ${projectedOrdinal}, ${contentBytes}, ${digest})`
-                  return Protocol.SnapshotManifest.make({
-                    ...manifest,
-                    definitionHash: target.hash,
-                    schema: target.schemaIdentity,
-                    entityCount: projectedOrdinal,
-                    contentBytes,
-                    digest
-                  })
-                })))
-              )
-            )
-          )
-        })
-
       const validateStoredSpace = (space: typeof Rows.ServerMetaRow.Type) => {
         if (
           space.schema_version !== options.definition.schemaIdentity.version ||
@@ -985,26 +675,49 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           if (options.schemaEvolutionBatchBytes !== undefined) {
             evolutionOptions = { ...evolutionOptions, batchBytes: options.schemaEvolutionBatchBytes }
           }
-          yield* SchemaEvolution.server(evolutionOptions).pipe(Effect.provideService(SqlClient.SqlClient, sql))
-        }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          return yield* SchemaEvolution.server(evolutionOptions).pipe(Effect.provideService(SqlClient.SqlClient, sql))
+        }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const bootstrapEntityFits = (spaceId: Identity.SpaceId, entity: Protocol.SnapshotEntity) =>
-        Protocol.encodedBytesEffect(Protocol.BootstrapPage.make({
-          manifest: Protocol.SnapshotManifest.make({
-            spaceId,
-            definitionHash: options.definition.hash,
-            schema: options.definition.schemaIdentity,
-            snapshotId: Identity.SnapshotId.make("snp_ffffffff-ffff-4fff-bfff-ffffffffffff"),
-            sequence: Identity.ServerSequence.make(Number.MAX_SAFE_INTEGER),
-            terminalSequenceThrough: Identity.TerminalSequence.make(Number.MAX_SAFE_INTEGER),
-            entityCount: options.maximumSnapshotEntities,
-            contentBytes: options.maximumSnapshotBytes,
-            digest: Protocol.SnapshotDigest.make("f".repeat(64))
-          }),
-          entities: [entity],
-          hasMore: true,
-          serverSchema: options.definition.schemaIdentity
-        })).pipe(Effect.map((bytes) => bytes <= options.maximumBootstrapPageBytes))
+        Effect.gen(function*() {
+          const change = Protocol.Upsert.make({
+            entity: Protocol.EntityKey.make({
+              model: entity.model,
+              modelVersion: entity.modelVersion,
+              key: entity.key
+            }),
+            value: entity.value
+          })
+          const entry = Protocol.SnapshotEntry.make({
+            ordinal: 0,
+            change,
+            entryBytes: yield* Protocol.encodedBytesEffect(change)
+          })
+          const page = Protocol.BootstrapPage.make({
+            manifest: {
+              spaceId,
+              clientId: Identity.ClientId.make("cli_ffffffff-ffff-4fff-bfff-ffffffffffff"),
+              definitionHash: options.definition.hash,
+              schema: options.definition.schemaIdentity,
+              scopeDigest: Protocol.MutationDigest.make("f".repeat(64)),
+              scopeGeneration: Identity.ReplicationScopeGeneration.make(Number.MAX_SAFE_INTEGER),
+              cursor: Protocol.ReplicationCursor.make({
+                viewId: Identity.ReplicationViewId.make("viw_ffffffff-ffff-4fff-bfff-ffffffffffff"),
+                revision: Identity.ReplicationViewRevision.make(Number.MAX_SAFE_INTEGER)
+              }),
+              snapshotId: Identity.SnapshotId.make("snp_ffffffff-ffff-4fff-bfff-ffffffffffff"),
+              sequence: Identity.ServerSequence.make(Number.MAX_SAFE_INTEGER),
+              terminalSequenceThrough: Identity.TerminalSequence.make(Number.MAX_SAFE_INTEGER),
+              entityCount: options.maximumSnapshotEntities,
+              contentBytes: options.maximumSnapshotBytes,
+              digest: Protocol.SnapshotDigest.make("f".repeat(64))
+            },
+            entries: [entry],
+            hasMore: true,
+            serverSchema: options.definition.schemaIdentity
+          })
+          return (yield* Protocol.encodedBytesEffect(page)) <= options.maximumBootstrapPageBytes
+        })
 
       const decodeEntityRows = (spaceId: Identity.SpaceId, rows: ReadonlyArray<typeof Rows.ServerEntityRow.Type>) =>
         Effect.gen(function*() {
@@ -1130,6 +843,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
 
       const admit = (request: Protocol.SubmitRequest, principal: typeof Schema.Json.Type) => {
         const submittedEnvelope = request.envelope
+        let wakeChanges: ReadonlyArray<Protocol.EntityChange> | undefined
         return Effect.gen(function*() {
           yield* authorizeAccess(submittedEnvelope, principal)
           const callerDefinition = yield* validateCallerSchema(request.schema)
@@ -1361,23 +1075,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                         changes: result.success.changes
                       })
                       const entryBytes = yield* Protocol.encodedBytesEffect(entry)
-                      if (
-                        (yield* Protocol.encodedBytesEffect(Protocol.PullPage.make({
-                          entries: [entry],
-                          hasMore: false,
-                          serverSchema: options.definition.schemaIdentity
-                        }))) >
-                          Protocol.maximumBatchBytes
-                      ) {
-                        return yield* new TerminalRejection.TerminalRejection({
-                          origin: "Capacity",
-                          rejection: {
-                            _tag: "CapacityExceeded",
-                            resource: "accepted mutation bytes",
-                            limit: Protocol.maximumBatchBytes
-                          }
-                        })
-                      }
                       const accepted = Protocol.AcceptedReceipt.make({
                         spaceId: envelope.spaceId,
                         clientId: envelope.clientId,
@@ -1434,6 +1131,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                     ${envelope.mutationId}, ${envelope.digest}, ${entryBytes}, ${entryJson},
                     ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash},
                     ${mutation.mutationVersion})`
+                wakeChanges = entry.changes
                 receipt = executed.success.receipt
               }
             }
@@ -1461,23 +1159,20 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             return yield* projectReceipt(receipt, callerDefinition)
           }))
         }).pipe(
-          Effect.catchIf(
-            SqlError.isSqlError,
-            (cause) =>
-              Effect.fail(new ReplicaError.UnknownCommitOutcome({ mutationId: submittedEnvelope.mutationId, cause }))
-          ),
+          Effect.catchTag("SqlError", (cause) =>
+            Effect.fail(new ReplicaError.UnknownCommitOutcome({ mutationId: submittedEnvelope.mutationId, cause }))),
           Effect.tap((receipt) => {
-            if (receipt._tag !== "Accepted") return Effect.void
+            const changes = wakeChanges
+            if (receipt._tag !== "Accepted" || changes === undefined) {
+              return Effect.void
+            }
             return RcMap.has(wakes, submittedEnvelope.spaceId).pipe(
               Effect.flatMap((hasWatchers) => {
                 if (hasWatchers) {
                   return Effect.scoped(
                     RcMap.get(wakes, submittedEnvelope.spaceId).pipe(
                       Effect.flatMap((channel) =>
-                        PubSub.publish(channel, {
-                          spaceId: submittedEnvelope.spaceId,
-                          sequence: receipt.serverSequence
-                        })
+                        PubSub.publish(channel, changes)
                       )
                     )
                   )
@@ -1625,300 +1320,18 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             return yield* projectReceipt(receipt, callerDefinition)
           }))
         }).pipe(
-          Effect.catchIf(
-            SqlError.isSqlError,
-            (cause) =>
-              Effect.fail(
-                new ReplicaError.UnknownCommitOutcome({
-                  mutationId: submittedEnvelope.mutationId,
-                  cause
-                })
-              )
-          ),
+          Effect.catchTag("SqlError", (cause) =>
+            Effect.fail(
+              new ReplicaError.UnknownCommitOutcome({
+                mutationId: submittedEnvelope.mutationId,
+                cause
+              })
+            )),
           Effect.withSpan("ServerStore.discard", {
             attributes: { "mutation.id": submittedEnvelope.mutationId, "space.id": submittedEnvelope.spaceId }
           })
         )
       }
-
-      const pull = (request: Protocol.PullRequest) =>
-        sql.withTransaction(Effect.gen(function*() {
-          const callerDefinition = yield* validateCallerSchema(request.schema)
-          const stored = yield* findSpace(request.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-          if (Option.isNone(stored)) {
-            return Protocol.PullPage.make({
-              entries: [],
-              hasMore: false,
-              serverSchema: options.definition.schemaIdentity
-            })
-          }
-          const meta = stored.value
-          yield* validateStoredSpace(meta)
-          if (request.after < meta.history_floor) {
-            const manifest = yield* currentManifest(request.spaceId, meta)
-            if (
-              callerDefinition.schemaIdentity.version === options.definition.schemaIdentity.version &&
-              callerDefinition.schemaIdentity.hash === options.definition.schemaIdentity.hash
-            ) {
-              return Protocol.BootstrapRequired.make({
-                manifest,
-                serverSchema: options.definition.schemaIdentity
-              })
-            }
-            const projected = yield* ensureSnapshotProjection(manifest, callerDefinition)
-            return Protocol.BootstrapRequired.make({
-              manifest: projected,
-              serverSchema: options.definition.schemaIdentity
-            })
-          }
-          const head = meta.next_server_sequence - 1
-          if (request.after > head) {
-            return yield* new ReplicaError.CursorGap({ expected: head, actual: request.after })
-          }
-          const metadata = yield* findLogMetadata({ ...request, limit: request.limit + 1 }).pipe(
-            Effect.mapError(StorageUnavailable.make)
-          )
-          for (let index = 0; index < metadata.length; index++) {
-            const expected = request.after + index + 1
-            if (metadata[index].server_sequence !== expected) {
-              return yield* new ReplicaError.StorageCorrupt({
-                message: `Authoritative log expected sequence ${expected} but found ${metadata[index].server_sequence}`
-              })
-            }
-          }
-          const selected: Array<typeof Rows.ServerLogMetadataRow.Type> = []
-          let selectedSourceBytes = 0
-          for (const row of metadata.slice(0, request.limit)) {
-            if (selectedSourceBytes + row.entry_bytes > Protocol.maximumBatchBytes) break
-            selected.push(row)
-            selectedSourceBytes += row.entry_bytes
-          }
-          if (metadata.length > 0 && selected.length === 0) {
-            return yield* new ReplicaError.StorageCorrupt({
-              message: `Authoritative entry ${metadata[0].server_sequence} exceeds the durable byte limit`
-            })
-          }
-          const through = selected.at(-1)?.server_sequence ?? request.after
-          const rows = yield* findLogEntries({ spaceId: request.spaceId, after: request.after, through }).pipe(
-            Effect.mapError(StorageUnavailable.make)
-          )
-          if (rows.length !== selected.length) {
-            return yield* new ReplicaError.StorageCorrupt({ message: "Authoritative log metadata is incomplete" })
-          }
-          const entries: Array<Protocol.AcceptedMutation> = []
-          let pageBytes = yield* Protocol.encodedBytesEffect(Protocol.PullPage.make({
-            entries: [],
-            hasMore: false,
-            serverSchema: options.definition.schemaIdentity
-          }))
-          for (let index = 0; index < rows.length; index++) {
-            const row = rows[index]
-            const metadataRow = selected[index]
-            const entry = yield* Codec.parse(row.entry_json).pipe(
-              Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
-            )
-            if (
-              row.space_id !== request.spaceId ||
-              row.server_sequence !== metadataRow.server_sequence ||
-              row.server_sequence !== entry.sequence ||
-              row.client_id !== entry.clientId ||
-              row.membership_incarnation !== entry.membershipIncarnation ||
-              row.local_sequence !== entry.localSequence ||
-              row.mutation_id !== entry.mutationId ||
-              row.digest !== entry.digest ||
-              row.source_schema_version !== entry.sourceSchema.version ||
-              row.source_schema_hash !== entry.sourceSchema.hash ||
-              row.entry_bytes !== metadataRow.entry_bytes ||
-              row.entry_bytes !== (yield* Protocol.encodedBytesEffect(entry)) ||
-              entry.spaceId !== request.spaceId
-            ) {
-              return yield* new ReplicaError.StorageCorrupt({
-                message: `Authoritative entry ${row.server_sequence} conflicts with durable metadata`
-              })
-            }
-            const projected = yield* projectEntry(entry, callerDefinition)
-            let separatorBytes = 1
-            if (entries.length === 0) separatorBytes = 0
-            const projectedBytes = yield* Protocol.encodedBytesEffect(projected)
-            if (pageBytes + separatorBytes + projectedBytes > Protocol.maximumBatchBytes) break
-            entries.push(projected)
-            pageBytes += separatorBytes + projectedBytes
-          }
-          if (rows.length > 0 && entries.length === 0) {
-            return yield* new ReplicaError.StaleSchema({
-              expectedVersion: options.definition.schemaIdentity.version,
-              expectedHash: options.definition.schemaIdentity.hash,
-              actualVersion: request.schema.version,
-              actualHash: request.schema.hash
-            })
-          }
-          const page = Protocol.PullPage.make({
-            entries,
-            hasMore: metadata.length > entries.length || rows.length > entries.length,
-            serverSchema: options.definition.schemaIdentity
-          })
-          return page
-        })).pipe(
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
-          Effect.withSpan("ServerStore.pull", {
-            attributes: { "space.id": request.spaceId, "server.after": request.after, "page.limit": request.limit }
-          })
-        )
-      const bootstrap = (request: Protocol.BootstrapRequest) =>
-        sql.withTransaction(Effect.gen(function*() {
-          const callerDefinition = yield* validateCallerSchema(request.schema)
-          const stored = yield* findSnapshot({ spaceId: request.spaceId, snapshotId: request.snapshotId }).pipe(
-            Effect.mapError(StorageUnavailable.make)
-          )
-          let manifest: Protocol.SnapshotManifest
-          let afterOrdinal = request.afterOrdinal
-          let projectionTarget: Identity.SchemaIdentity | undefined
-          if (Option.isNone(stored)) {
-            const current = yield* findSpace(request.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-            if (Option.isNone(current) || current.value.snapshot_id === null) {
-              return yield* new ReplicaError.SnapshotUnavailable({ snapshotId: request.snapshotId })
-            }
-            yield* validateStoredSpace(current.value)
-            manifest = yield* currentManifest(request.spaceId, current.value)
-            afterOrdinal = -1
-          } else {
-            manifest = manifestFromRow(stored.value)
-          }
-          if (manifest.definitionHash !== options.definition.hash) {
-            return yield* new ReplicaError.DefinitionMismatch({
-              expected: options.definition.hash,
-              actual: manifest.definitionHash
-            })
-          }
-          if (
-            callerDefinition.schemaIdentity.version !== options.definition.schemaIdentity.version ||
-            callerDefinition.schemaIdentity.hash !== options.definition.schemaIdentity.hash
-          ) {
-            projectionTarget = callerDefinition.schemaIdentity
-            manifest = yield* ensureSnapshotProjection(manifest, callerDefinition)
-          }
-          if (afterOrdinal >= manifest.entityCount) {
-            return yield* new ReplicaError.CursorGap({
-              expected: Math.max(-1, manifest.entityCount - 1),
-              actual: afterOrdinal
-            })
-          }
-          let metadata: ReadonlyArray<typeof Rows.SnapshotEntityMetadataRow.Type>
-          if (projectionTarget === undefined) {
-            metadata = yield* findSnapshotEntityMetadata({
-              spaceId: request.spaceId,
-              snapshotId: manifest.snapshotId,
-              after: afterOrdinal,
-              limit: request.limit + 1
-            }).pipe(Effect.mapError(StorageUnavailable.make))
-          } else {
-            metadata = yield* findSnapshotProjectionEntityMetadata({
-              spaceId: request.spaceId,
-              snapshotId: manifest.snapshotId,
-              target: projectionTarget,
-              after: afterOrdinal,
-              limit: request.limit + 1
-            }).pipe(Effect.mapError(StorageUnavailable.make))
-          }
-          const emptyMoreBytes = yield* Protocol.encodedBytesEffect(
-            Protocol.BootstrapPage.make({
-              manifest,
-              entities: [],
-              hasMore: true,
-              serverSchema: options.definition.schemaIdentity
-            })
-          )
-          const emptyFinalBytes = yield* Protocol.encodedBytesEffect(
-            Protocol.BootstrapPage.make({
-              manifest,
-              entities: [],
-              hasMore: false,
-              serverSchema: options.definition.schemaIdentity
-            })
-          )
-          let selectedCount = 0
-          let selectedWireBytes = 0
-          for (const row of metadata) {
-            if (selectedCount >= request.limit) break
-            const expectedOrdinal = afterOrdinal + selectedCount + 1
-            if (row.ordinal !== expectedOrdinal) {
-              return yield* new ReplicaError.StorageCorrupt({
-                message: `Snapshot ${manifest.snapshotId} expected ordinal ${expectedOrdinal} but found ${row.ordinal}`
-              })
-            }
-            const hasMore = row.ordinal + 1 < manifest.entityCount
-            let candidateBaseBytes = emptyFinalBytes
-            if (hasMore) candidateBaseBytes = emptyMoreBytes
-            const candidateBytes = candidateBaseBytes +
-              selectedWireBytes + row.wire_bytes + selectedCount
-            if (candidateBytes > options.maximumBootstrapPageBytes) break
-            selectedCount += 1
-            selectedWireBytes += row.wire_bytes
-          }
-          if (metadata.length > 0 && selectedCount === 0) {
-            return yield* new ReplicaError.StorageCorrupt({
-              message: `Snapshot entity ${metadata[0].ordinal} exceeds the bootstrap page limit`
-            })
-          }
-          const through = afterOrdinal + selectedCount
-          let rows: ReadonlyArray<typeof Rows.SnapshotEntityWireRow.Type> = []
-          if (selectedCount > 0) {
-            if (projectionTarget === undefined) {
-              rows = yield* findSnapshotEntityWire({
-                spaceId: request.spaceId,
-                snapshotId: manifest.snapshotId,
-                after: afterOrdinal,
-                through
-              }).pipe(Effect.mapError(StorageUnavailable.make))
-            } else {
-              rows = yield* findSnapshotProjectionEntityWire({
-                spaceId: request.spaceId,
-                snapshotId: manifest.snapshotId,
-                target: projectionTarget,
-                after: afterOrdinal,
-                through
-              }).pipe(Effect.mapError(StorageUnavailable.make))
-            }
-          }
-          if (rows.length !== selectedCount) {
-            return yield* new ReplicaError.StorageCorrupt({
-              message: `Snapshot ${manifest.snapshotId} durable page rows are incomplete`
-            })
-          }
-          const entities: Array<Protocol.SnapshotEntity> = []
-          for (let index = 0; index < rows.length; index++) {
-            const row = rows[index]
-            const entity = yield* Codec.parse(row.wire_json).pipe(
-              Effect.flatMap((value) => Codec.decode(Protocol.SnapshotEntity, value))
-            )
-            if (
-              entity.ordinal !== afterOrdinal + index + 1 ||
-              row.wire_bytes !== (yield* Protocol.encodedBytesEffect(entity)) ||
-              row.wire_json !== (yield* Codec.stringify(entity))
-            ) {
-              return yield* new ReplicaError.StorageCorrupt({
-                message: `Snapshot ${manifest.snapshotId} durable entity ${row.ordinal} is inconsistent`
-              })
-            }
-            entities.push(entity)
-          }
-          const hasMore = through + 1 < manifest.entityCount
-          const page = Protocol.BootstrapPage.make({
-            manifest,
-            entities,
-            hasMore,
-            serverSchema: options.definition.schemaIdentity
-          })
-          if ((yield* Protocol.encodedBytesEffect(page)) > options.maximumBootstrapPageBytes) {
-            return yield* new ReplicaError.StorageCorrupt({ message: "Bootstrap page exceeds its byte limit" })
-          }
-          return page
-        })).pipe(
-          Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
-          Effect.withSpan("ServerStore.bootstrap", {
-            attributes: { "space.id": request.spaceId, "snapshot.id": request.snapshotId }
-          })
-        )
 
       const prepareSnapshot = (spaceId: Identity.SpaceId) =>
         sql.withTransaction(Effect.gen(function*() {
@@ -1947,7 +1360,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             observedNextServer: meta.next_server_sequence,
             observedNextTerminal: meta.next_terminal_sequence,
             observedSchemaGeneration: meta.schema_generation,
-            manifest: Protocol.SnapshotManifest.make({
+            manifest: {
               spaceId,
               definitionHash: meta.definition_hash,
               schema: Identity.SchemaIdentity.make({ version: meta.schema_version, hash: meta.schema_hash }),
@@ -1957,10 +1370,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               entityCount: decoded.entities.length,
               contentBytes: decoded.contentBytes,
               digest: decoded.digest
-            }),
+            },
             entities: decoded.entities
           })
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const publishAndPrune = (
         prepared: Option.Option<
@@ -2077,7 +1490,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   ORDER BY server_sequence DESC, terminal_sequence DESC
                   LIMIT -1 OFFSET ${options.retainedSnapshots}
                 )`
-            })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         })
 
       const maintain = (spaceId: Identity.SpaceId) =>
@@ -2099,45 +1512,136 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           after = spaces.at(-1)!.space_id
         }
       })
+      const scopedReplication = ScopedReplication.make({
+        sql,
+        crypto,
+        definition: options.definition,
+        maximumSnapshotEntities: options.maximumSnapshotEntities,
+        maximumSnapshotBytes: options.maximumSnapshotBytes,
+        maximumBootstrapPageBytes: options.maximumBootstrapPageBytes,
+        authorization: {
+          scope: authorizeReadScope,
+          entity: authorizeReadEntity
+        },
+        resolveDefinition: validateCallerSchema,
+        projectEntity: (target, entity, value) =>
+          Effect.gen(function*() {
+            if (!target.modelByName.has(entity.model)) return Option.none()
+            if (
+              target.schemaIdentity.version === options.definition.schemaIdentity.version &&
+              target.schemaIdentity.hash === options.definition.schemaIdentity.hash
+            ) return Option.some({ entity, value })
+            const migrated = yield* Evolution.migrateModelTo({
+              evolution,
+              source: options.definition.schemaIdentity,
+              target: target.schemaIdentity,
+              model: entity.model,
+              modelVersion: entity.modelVersion,
+              key: entity.key,
+              value
+            })
+            if (migrated.value === undefined) {
+              return yield* new ReplicaError.SchemaEvolutionUnsupported({
+                sourceVersion: options.definition.schemaIdentity.version,
+                sourceHash: options.definition.schemaIdentity.hash,
+                targetVersion: target.schemaIdentity.version,
+                targetHash: target.schemaIdentity.hash
+              })
+            }
+            return Option.some({
+              entity: Protocol.EntityKey.make({
+                model: entity.model,
+                modelVersion: migrated.modelVersion,
+                key: migrated.key
+              }),
+              value: migrated.value
+            })
+          })
+      })
+      const countAcknowledgedEntities = SqlSchema.findOne({
+        Request: Schema.Struct({
+          spaceId: Identity.SpaceId,
+          clientId: Identity.ClientId,
+          principalDigest: Protocol.MutationDigest,
+          entitiesJson: Schema.String
+        }),
+        Result: Rows.CountRow,
+        execute: ({ spaceId, clientId, principalDigest, entitiesJson }) =>
+          sql`SELECT EXISTS(
+            SELECT 1 FROM json_each(${entitiesJson}) AS requested
+            WHERE EXISTS(
+              SELECT 1 FROM effect_local_server_replication_view_entities AS acknowledged
+              INNER JOIN effect_local_server_replication_views AS current
+                ON current.space_id = acknowledged.space_id AND current.client_id = acknowledged.client_id
+                AND current.principal_digest = acknowledged.principal_digest
+                AND current.view_id = acknowledged.view_id
+              WHERE acknowledged.space_id = ${spaceId} AND acknowledged.client_id = ${clientId}
+                AND acknowledged.principal_digest = ${principalDigest}
+                AND acknowledged.model = json_extract(requested.value, '$.model')
+                AND acknowledged.entity_key = json_extract(requested.value, '$.key')
+                AND acknowledged.disposition = 'Upsert'
+            )
+          ) AS count`
+      })
+      const mutationWakeVisible = (
+        request: Protocol.WatchRequest,
+        principal: typeof Schema.Json.Type,
+        changes: ReadonlyArray<Protocol.EntityChange>
+      ) =>
+        Effect.gen(function*() {
+          const scoped = changes.filter((change) => request.scope.models.includes(change.entity.model))
+          if (scoped.length === 0) return false
+          const identities = yield* Effect.forEach(scoped, (change) =>
+            Codec.stringify(change.entity.key).pipe(
+              Effect.map((key) => ({ model: change.entity.model, key }))
+            ))
+          const principalHash = yield* Canonical.digest({ format: 1, principal }).pipe(
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.map((value) => Protocol.MutationDigest.make(value))
+          )
+          const acknowledged = yield* countAcknowledgedEntities({
+            spaceId: request.spaceId,
+            clientId: request.clientId,
+            principalDigest: principalHash,
+            entitiesJson: yield* Codec.stringify(identities)
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+          if (acknowledged.count > 0) return true
+          for (const change of scoped) {
+            if (
+              change._tag === "Upsert" &&
+              (yield* authorizeReadEntity(request, principal, change.entity, change.value))
+            ) return true
+          }
+          return false
+        })
       const watch = (request: Protocol.WatchRequest, principal: typeof Schema.Json.Type) =>
         Stream.unwrap(
           RcMap.get(wakes, request.spaceId).pipe(
             Effect.flatMap((channel) => PubSub.subscribe(channel)),
-            Effect.flatMap((subscription) =>
-              findSpace(request.spaceId).pipe(
-                Effect.mapError(StorageUnavailable.make),
-                Effect.flatMap((stored) =>
-                  Effect.gen(function*() {
-                    if (Option.isSome(stored)) yield* validateStoredSpace(stored.value)
-                    let sequence = Identity.ServerSequence.make(0)
-                    if (Option.isSome(stored)) {
-                      sequence = Identity.ServerSequence.make(stored.value.next_server_sequence - 1)
-                    }
-                    return Stream.succeed({ spaceId: request.spaceId, sequence } satisfies Protocol.Wake).pipe(
-                      Stream.concat(Stream.fromSubscription(subscription)),
-                      Stream.mapEffect((wake) =>
-                        authorizeRead(request.spaceId, principal).pipe(
-                          Effect.andThen(
-                            sql.withTransaction(Effect.gen(function*() {
-                              const current = yield* lockSpace(request.spaceId).pipe(
-                                Effect.mapError(StorageUnavailable.make)
-                              )
-                              yield* validateStoredSpace(current)
-                              return wake
-                            })).pipe(
-                              Effect.catchIf(
-                                SqlError.isSqlError,
-                                (cause) => Effect.fail(StorageUnavailable.make(cause))
-                              )
-                            )
-                          )
-                        )
-                      )
-                    )
-                  })
-                )
+            Effect.map((subscription) => {
+              const mutations = Stream.fromSubscription(subscription).pipe(Stream.map(Option.some))
+              const refreshes = Stream.tick(readAuthorizationRefreshMillis).pipe(
+                Stream.drop(1),
+                Stream.map(() => Option.none())
               )
-            )
+              return Stream.succeed(Option.none<ReadonlyArray<Protocol.EntityChange>>()).pipe(
+                Stream.concat(Stream.merge(mutations, refreshes)),
+                Stream.filterEffect((signal) =>
+                  Effect.gen(function*() {
+                    yield* authorizeReadScope(request, principal)
+                    const normalized = yield* Protocol.validateReplicationScope(options.definition, request.scope)
+                    if (
+                      Option.isSome(signal) &&
+                      !(yield* mutationWakeVisible({ ...request, scope: normalized }, principal, signal.value))
+                    ) {
+                      return false
+                    }
+                    return true
+                  })
+                ),
+                Stream.map(() => Protocol.Wake.make({ spaceId: request.spaceId }))
+              )
+            })
           )
         )
 
@@ -2155,14 +1659,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         if (Schema.is(Protocol.PullRequest)(request)) return request
         return { ...request, schema: options.definition.schemaIdentity }
       }
-      const trustedWatchRequest = (
-        request: Protocol.WatchRequest | Identity.SpaceId
-      ): Protocol.WatchRequest => {
-        if (typeof request === "string") {
-          return { spaceId: request, schema: options.definition.schemaIdentity }
-        }
-        return request
-      }
       const trustedBootstrapRequest = (
         request: Protocol.BootstrapRequest | Omit<Protocol.BootstrapRequest, "schema">
       ): Protocol.BootstrapRequest => {
@@ -2176,41 +1672,37 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         discard,
         pull: (input) => {
           const request = trustedPullRequest(input)
-          return authorizeRead(request.spaceId, null).pipe(
-            Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-            Effect.andThen(pull(request))
+          return prepareSpace(request.spaceId, request.schema).pipe(
+            Effect.flatMap((generation) => scopedReplication.pull(request, null, generation))
           )
         },
         pullAuthorized: (request, principal) =>
-          authorizeRead(request.spaceId, principal).pipe(
+          authorizeReadScope(request, principal).pipe(
             Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-            Effect.andThen(pull(request))
+            Effect.flatMap((generation) => scopedReplication.pull(request, principal, generation))
           ),
         bootstrap: (input) => {
           const request = trustedBootstrapRequest(input)
-          return authorizeRead(request.spaceId, null).pipe(
-            Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-            Effect.andThen(bootstrap(request))
+          return prepareSpace(request.spaceId, request.schema).pipe(
+            Effect.flatMap((generation) => scopedReplication.bootstrap(request, null, generation))
           )
         },
         bootstrapAuthorized: (request, principal) =>
-          authorizeRead(request.spaceId, principal).pipe(
+          authorizeReadScope(request, principal).pipe(
             Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-            Effect.andThen(bootstrap(request))
+            Effect.flatMap((generation) => scopedReplication.bootstrap(request, principal, generation))
           ),
         maintain,
         maintainAll,
-        watch: (input) => {
-          const request = trustedWatchRequest(input)
+        watch: (request) => {
           return Stream.unwrap(
-            authorizeRead(request.spaceId, null).pipe(
-              Effect.andThen(prepareSpace(request.spaceId, request.schema)),
+            prepareSpace(request.spaceId, request.schema).pipe(
               Effect.as(watch(request, null))
             )
           )
         },
         watchAuthorized: (request, principal) =>
-          authorizeRead(request.spaceId, principal).pipe(
+          authorizeReadScope(request, principal).pipe(
             Effect.andThen(prepareSpace(request.spaceId, request.schema)),
             Effect.as(watch(request, principal))
           )
@@ -2224,6 +1716,7 @@ export const layerTrusted = (
     readonly evolution?: Evolution.Evolution
     readonly schemaEvolutionBatchSize?: number
     readonly schemaEvolutionBatchBytes?: number
+    readonly readAuthorizationRefreshInterval: Duration.Input
     readonly wakeCapacity?: number
   } & HistoryOptions
 ): Layer.Layer<

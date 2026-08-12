@@ -12,6 +12,7 @@ import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Context from "effect/Context"
@@ -101,6 +102,7 @@ const migration = {
   maximumAttempts: 8
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const clientHistory = {
+  scope: Protocol.ReplicationScope.make({ models: [Todo.name, Numbered.name] }),
   settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 10_000,
@@ -112,6 +114,7 @@ const clientHistory = {
 }
 const server = ServerStore.layerTrusted({
   definition,
+  readAuthorizationRefreshInterval: "1 second" as const,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,
@@ -160,7 +163,8 @@ const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) 
   )
   const faultedSync = TestServer.layer.pipe(
     Layer.provide(server),
-    Layer.provide(faults)
+    Layer.provide(faults),
+    Layer.provide(NodeCrypto.layer)
   )
   return TestReplica.layer({
     ...clientHistory,

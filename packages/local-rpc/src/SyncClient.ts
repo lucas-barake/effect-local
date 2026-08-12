@@ -73,7 +73,11 @@ export const layerFromSession: Layer.Layer<
           ))
           .pipe(
             Effect.withSpan("SyncClient.pull", {
-              attributes: { "space.id": request.spaceId, "server.after": request.after }
+              attributes: {
+                "space.id": request.spaceId,
+                "view.revision": request.cursor?.revision ?? 0,
+                "scope.generation": request.scopeGeneration
+              }
             })
           ),
       bootstrap: (request) =>

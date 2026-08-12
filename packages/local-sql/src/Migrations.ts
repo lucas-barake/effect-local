@@ -206,7 +206,7 @@ export const runCatalog = (
         }
         return yield* Effect.void
       }))
-    }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
     let attempt = 1
     while (true) {
@@ -461,32 +461,7 @@ const clientV6 = makeMigration({
   statements: [
     "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_id TEXT",
     "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_sequence INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_terminal_sequence INTEGER NOT NULL DEFAULT 0",
-    `CREATE TABLE effect_local_bootstrap (
-      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-      snapshot_id TEXT NOT NULL,
-      space_id TEXT NOT NULL,
-      definition_hash TEXT NOT NULL,
-      schema_version INTEGER NOT NULL,
-      schema_hash TEXT NOT NULL,
-      server_sequence INTEGER NOT NULL,
-      terminal_sequence INTEGER NOT NULL,
-      entity_count INTEGER NOT NULL,
-      content_bytes INTEGER NOT NULL,
-      digest TEXT NOT NULL,
-      next_ordinal INTEGER NOT NULL,
-      received_bytes INTEGER NOT NULL,
-      rolling_digest TEXT NOT NULL
-    )`,
-    `CREATE TABLE effect_local_bootstrap_entities (
-      ordinal INTEGER PRIMARY KEY,
-      model TEXT NOT NULL,
-      model_version INTEGER NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      entity_bytes INTEGER NOT NULL,
-      UNIQUE (model, entity_key)
-    )`
+    "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_terminal_sequence INTEGER NOT NULL DEFAULT 0"
   ]
 })
 
@@ -1013,6 +988,13 @@ const clientV8 = makeMigration({
       installed_snapshot_id TEXT,
       installed_snapshot_sequence INTEGER NOT NULL CHECK (installed_snapshot_sequence >= 0),
       installed_snapshot_terminal_sequence INTEGER NOT NULL CHECK (installed_snapshot_terminal_sequence >= 0),
+      replication_view_id TEXT,
+      replication_view_revision INTEGER NOT NULL DEFAULT 0 CHECK (replication_view_revision >= 0),
+      desired_scope_json TEXT NOT NULL DEFAULT '{"models":[]}' CHECK (json_valid(desired_scope_json)),
+      desired_scope_digest TEXT NOT NULL
+        DEFAULT '0000000000000000000000000000000000000000000000000000000000000000'
+        CHECK (length(desired_scope_digest) = 64),
+      scope_generation INTEGER NOT NULL DEFAULT 0 CHECK (scope_generation >= 0),
       projection_replay_generation INTEGER,
       projection_replay_cursor TEXT
     )`,
@@ -1149,16 +1131,29 @@ const clientV8 = makeMigration({
       PRIMARY KEY (space_id, target_model, target_model_version, target_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    "ALTER TABLE effect_local_bootstrap RENAME TO effect_local_bootstrap_v7",
-    `CREATE TABLE effect_local_bootstrap (
-      space_id TEXT PRIMARY KEY,
+    `CREATE TABLE effect_local_client_retractions (
+      space_id TEXT NOT NULL,
+      generation INTEGER NOT NULL CHECK (generation >= 0),
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL CHECK (model_version > 0),
+      entity_key TEXT NOT NULL,
+      PRIMARY KEY (space_id, generation, model, entity_key),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE effect_local_client_scoped_bootstrap (
       snapshot_id TEXT NOT NULL,
+      space_id TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL,
       definition_hash TEXT NOT NULL,
       schema_version INTEGER NOT NULL,
       schema_hash TEXT NOT NULL,
+      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
+      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
+      view_id TEXT NOT NULL,
+      view_revision INTEGER NOT NULL CHECK (view_revision >= 0),
       server_sequence INTEGER NOT NULL,
       terminal_sequence INTEGER NOT NULL,
-      entity_count INTEGER NOT NULL,
+      entry_count INTEGER NOT NULL,
       content_bytes INTEGER NOT NULL,
       digest TEXT NOT NULL,
       next_ordinal INTEGER NOT NULL,
@@ -1166,26 +1161,23 @@ const clientV8 = makeMigration({
       rolling_digest TEXT NOT NULL,
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    "ALTER TABLE effect_local_bootstrap_entities RENAME TO effect_local_bootstrap_entities_v7",
-    `CREATE TABLE effect_local_bootstrap_entities (
+    `CREATE TABLE effect_local_client_scoped_bootstrap_entries (
       space_id TEXT NOT NULL,
+      snapshot_id TEXT NOT NULL,
       ordinal INTEGER NOT NULL,
       model TEXT NOT NULL,
-      model_version INTEGER NOT NULL,
       entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      entity_bytes INTEGER NOT NULL,
+      change_json TEXT NOT NULL CHECK (json_valid(change_json)),
+      entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
       PRIMARY KEY (space_id, ordinal),
       UNIQUE (space_id, model, entity_key),
-      FOREIGN KEY (space_id) REFERENCES effect_local_bootstrap(space_id) ON DELETE CASCADE
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_scoped_bootstrap(space_id) ON DELETE CASCADE
     )`,
     "DROP TABLE effect_local_client_shadow_entities",
     "DROP TABLE effect_local_client_shadow_receipts",
     "DROP TABLE effect_local_client_shadow_visible_entities",
     "DROP TABLE effect_local_client_shadow_pending",
     "DROP TABLE effect_local_client_shadow_receipts_v2",
-    "DROP TABLE effect_local_bootstrap_entities_v7",
-    "DROP TABLE effect_local_bootstrap_v7",
     "DROP TABLE effect_local_client_key_lineage_targets_v7",
     "DROP TABLE effect_local_client_key_lineage_groups_v7",
     "DROP TABLE effect_local_client_key_lineage_v7",
@@ -1410,7 +1402,86 @@ const serverV7 = makeMigration({
         NEW.generation = (SELECT active_schema_generation FROM effect_local_server_spaces
           WHERE space_id = NEW.space_id) BEGIN
       UPDATE effect_local_server_spaces SET entity_bytes = entity_bytes + NEW.entity_bytes - OLD.entity_bytes
-        WHERE space_id = NEW.space_id; END`
+        WHERE space_id = NEW.space_id; END`,
+    `CREATE TABLE effect_local_server_replication_views (
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
+      view_id TEXT NOT NULL,
+      view_revision INTEGER NOT NULL CHECK (view_revision >= 0),
+      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
+      scope_json TEXT NOT NULL CHECK (json_valid(scope_json)),
+      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
+      definition_hash TEXT NOT NULL,
+      schema_version INTEGER NOT NULL,
+      schema_hash TEXT NOT NULL,
+      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
+      PRIMARY KEY (space_id, client_id)
+    )`,
+    `CREATE TABLE effect_local_server_replication_view_entities (
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
+      view_id TEXT NOT NULL,
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL CHECK (model_version > 0),
+      entity_key TEXT NOT NULL,
+      disposition TEXT NOT NULL CHECK (disposition IN ('Upsert', 'Delete', 'Retract')),
+      value_json TEXT CHECK (value_json IS NULL OR json_valid(value_json)),
+      PRIMARY KEY (space_id, client_id, view_id, model, entity_key)
+    )`,
+    `CREATE TABLE effect_local_server_replication_pages (
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
+      view_id TEXT NOT NULL,
+      base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
+      target_revision INTEGER NOT NULL CHECK (target_revision = base_revision + 1),
+      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
+      scope_json TEXT NOT NULL CHECK (json_valid(scope_json)),
+      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
+      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
+      changes_json TEXT NOT NULL CHECK (json_valid(changes_json)),
+      content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
+      digest TEXT NOT NULL CHECK (length(digest) = 64),
+      has_more INTEGER NOT NULL CHECK (has_more IN (0, 1)),
+      PRIMARY KEY (space_id, client_id)
+    )`,
+    `CREATE TABLE effect_local_server_scoped_snapshots (
+      snapshot_id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
+      definition_hash TEXT NOT NULL,
+      schema_version INTEGER NOT NULL,
+      schema_hash TEXT NOT NULL,
+      scope_json TEXT NOT NULL CHECK (json_valid(scope_json)),
+      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
+      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
+      view_id TEXT NOT NULL,
+      view_revision INTEGER NOT NULL CHECK (view_revision >= 0),
+      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
+      terminal_sequence INTEGER NOT NULL CHECK (terminal_sequence >= 0),
+      entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
+      content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
+      digest TEXT NOT NULL CHECK (length(digest) = 64),
+      UNIQUE (space_id, client_id)
+    )`,
+    `CREATE TABLE effect_local_server_scoped_snapshot_entries (
+      snapshot_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+      change_json TEXT NOT NULL CHECK (json_valid(change_json)),
+      entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
+      source_model TEXT NOT NULL,
+      source_model_version INTEGER NOT NULL CHECK (source_model_version > 0),
+      source_entity_key TEXT NOT NULL,
+      source_value_json TEXT NOT NULL CHECK (json_valid(source_value_json)),
+      PRIMARY KEY (snapshot_id, ordinal)
+    )`,
+    `CREATE INDEX effect_local_server_replication_view_entities_identity
+      ON effect_local_server_replication_view_entities (space_id, client_id, model, entity_key)`,
+    `CREATE INDEX effect_local_server_scoped_snapshot_entries_page
+      ON effect_local_server_scoped_snapshot_entries (snapshot_id, ordinal)`
   ]
 })
 
@@ -1650,6 +1721,6 @@ export const client = (options: {
         ON CONFLICT (space_id) DO NOTHING`
     }
     return undefined
-  }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+  }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const server = (options: Options = defaultOptions) => runCatalog("Server", serverCatalog, options)

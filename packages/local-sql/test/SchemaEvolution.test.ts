@@ -1,4 +1,4 @@
-import { NodeCrypto } from "@effect/platform-node"
+import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Definition from "@lucas-barake/effect-local/Definition"
@@ -14,6 +14,7 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
@@ -39,6 +40,7 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000000
 const membershipIncarnation = Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
+  scope: Protocol.ReplicationScope.make({ models: ["Todo"] }),
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,
@@ -49,6 +51,7 @@ const clientHistory = {
   migration
 }
 const serverHistory = {
+  readAuthorizationRefreshInterval: "1 second" as const,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,
@@ -61,11 +64,6 @@ const serverHistory = {
   maintenanceConcurrency: 1,
   maintenanceSpaceBatchSize: 128,
   migration
-}
-
-const incremental = (result: Protocol.PullResult): Protocol.PullPage => {
-  if ("_tag" in result) assert.fail(`Unexpected bootstrap ${result.manifest.snapshotId}`)
-  return result
 }
 
 const TodoV1 = Model.make("Todo", {
@@ -96,6 +94,39 @@ const PutTodoV2 = Mutation.make("PutTodo", {
   rejection: Schema.String
 })
 const definitionV2 = Definition.make({ version: 2, models: [TodoV2], mutations: [PutTodoV2] })
+const pullRequest = (
+  definition: Definition.Any,
+  cursor: Protocol.ReplicationCursor | null = null,
+  model: string = TodoV2.name,
+  requestedClientId = clientId
+): Protocol.PullRequest =>
+  Protocol.PullRequest.make({
+    spaceId,
+    clientId: requestedClientId,
+    schema: definition.schemaIdentity,
+    scope: Protocol.ReplicationScope.make({ models: [model] }),
+    scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+    cursor,
+    limit: 10
+  })
+const bootstrapRequest = (
+  definition: Definition.Any,
+  manifest: Protocol.SnapshotManifest,
+  model: string = TodoV2.name,
+  afterOrdinal = -1,
+  limit = 10
+): Protocol.BootstrapRequest =>
+  Protocol.BootstrapRequest.make({
+    spaceId,
+    clientId: manifest.clientId,
+    schema: definition.schemaIdentity,
+    scope: Protocol.ReplicationScope.make({ models: [model] }),
+    scopeGeneration: manifest.scopeGeneration,
+    cursor: manifest.cursor,
+    snapshotId: manifest.snapshotId,
+    afterOrdinal,
+    limit
+  })
 const handlersV2 = PutTodoV2.toLayer(({ payload, transaction }) =>
   transaction.set(TodoV2, payload.id, payload).pipe(Effect.as(payload))
 )
@@ -374,12 +405,7 @@ const buildReplica = <D extends Definition.Any,>(
 const unavailableSync = SyncEngine.SyncEngine.of({
   submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
   discard: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-  pull: () =>
-    Effect.succeed(Protocol.PullPage.make({
-      entries: [],
-      hasMore: false,
-      serverSchema: definitionV2.schemaIdentity
-    })),
+  pull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
   bootstrap: () => Effect.die("unexpected bootstrap"),
   watch: () => Stream.never
 })
@@ -844,6 +870,124 @@ describe("client schema evolution", () => {
       assert.strictEqual((yield* v2.pending)[0].envelope.digest, pending.envelope.digest)
     })).pipe(Effect.provide(database)))
 
+  it.effect("migrates durable retractions before flipping the active client generation", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      yield* v1.applyEntries([Protocol.AcceptedMutation.make({
+        sequence: Identity.ServerSequence.make(1),
+        spaceId,
+        clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+        mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000220"),
+        localSequence: Identity.LocalSequence.make(1),
+        membershipIncarnation,
+        sourceSchema: definitionV1.schemaIdentity,
+        digest: Protocol.MutationDigest.make("2".repeat(64)),
+        changes: [Protocol.Upsert.make({
+          entity: { model: TodoV1.name, modelVersion: TodoV1.version, key: "3" },
+          value: { id: "3", title: "canonical" }
+        })]
+      })])
+      yield* v1.mutate(PutTodoV1, { id: "3", title: "pending" })
+      yield* v1.revokeReplication
+
+      const viewId = Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000001")
+      const snapshotId = Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000001")
+      yield* sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId},
+        replication_view_revision = 4, installed_snapshot_id = ${snapshotId},
+        installed_snapshot_sequence = 1, installed_snapshot_terminal_sequence = 1 WHERE space_id = ${spaceId}`
+      yield* sql`INSERT INTO effect_local_client_scoped_bootstrap
+        (snapshot_id, space_id, client_id, definition_hash, schema_version, schema_hash,
+          scope_digest, scope_generation, view_id, view_revision, server_sequence, terminal_sequence,
+          entry_count, content_bytes, digest, next_ordinal, received_bytes, rolling_digest)
+        VALUES (${snapshotId}, ${spaceId}, ${clientId}, ${definitionV1.hash},
+          ${definitionV1.schemaIdentity.version}, ${definitionV1.schemaIdentity.hash}, ${"0".repeat(64)},
+          1, ${viewId}, 4, 1, 1, 1, 1, ${"0".repeat(64)}, 1, 1, ${"0".repeat(64)})`
+      yield* sql`INSERT INTO effect_local_client_scoped_bootstrap_entries
+        (space_id, snapshot_id, ordinal, model, entity_key, change_json, entry_bytes)
+        VALUES (${spaceId}, ${snapshotId}, 0, ${TodoV1.name}, ${yield* Codec.stringify("3")},
+          ${yield* Codec.stringify(Protocol.Retract.make({
+        entity: { model: TodoV1.name, modelVersion: TodoV1.version, key: "3" }
+      }))}, 1)`
+
+      const reached = yield* Deferred.make<void>()
+      const PhaseRow = Schema.Struct({
+        phase: Schema.String,
+        generation: Schema.Number,
+        source_generation: Schema.Number
+      })
+      const readProgress = SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: PhaseRow,
+        execute: () =>
+          sql`SELECT phase, generation, source_generation FROM effect_local_client_evolution
+            WHERE space_id = ${spaceId}`
+      })
+      const afterBatch = Effect.gen(function*() {
+        const row = yield* readProgress(undefined)
+        if (row.phase !== "Flip") return
+        yield* Deferred.succeed(reached, undefined)
+        yield* Effect.never
+      }).pipe(Effect.orDie)
+      const runtimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(handlersV2))
+      const fiber = yield* SchemaEvolution.client({
+        definition: definitionV2,
+        evolution,
+        spaceId,
+        clientId,
+        batchSize: 1,
+        afterBatch
+      }).pipe(Effect.provide(runtimeV2), Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.await(reached)
+      yield* Fiber.interrupt(fiber)
+
+      const progress = yield* readProgress(undefined)
+      const CountRow = Schema.Struct({ count: Schema.Number })
+      const migratedKey = yield* Codec.stringify(3)
+      const targetRetractions = yield* SqlSchema.findOne({
+        Request: Schema.Number,
+        Result: CountRow,
+        execute: (generation) =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_client_retractions
+          WHERE space_id = ${spaceId} AND generation = ${generation}
+            AND model = ${TodoV2.name} AND model_version = ${TodoV2.version}
+            AND entity_key = ${migratedKey}`
+      })(progress.generation)
+      const targetVisible = yield* SqlSchema.findOne({
+        Request: Schema.Number,
+        Result: CountRow,
+        execute: (generation) =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_client_visible_entities_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${generation}
+            AND model = ${TodoV2.name} AND entity_key = ${migratedKey}`
+      })(progress.generation)
+      assert.strictEqual(targetRetractions.count, 1)
+      assert.strictEqual(targetVisible.count, 0)
+
+      const v2 = yield* buildStore(definitionV2, handlersV2, evolution)
+      assert.isTrue(Option.isNone(yield* v2.get(TodoV2, 3)))
+      const final = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Schema.Struct({
+          replication_view_id: Schema.NullOr(Schema.String),
+          replication_view_revision: Schema.Number,
+          staged: Schema.Number,
+          source_retractions: Schema.Number
+        }),
+        execute: () =>
+          sql`SELECT replication_view_id, replication_view_revision,
+          (SELECT COUNT(*) FROM effect_local_client_scoped_bootstrap
+            WHERE space_id = ${spaceId}) AS staged,
+          (SELECT COUNT(*) FROM effect_local_client_retractions
+            WHERE space_id = ${spaceId} AND generation = ${progress.source_generation}) AS source_retractions
+          FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
+      })(undefined)
+      assert.strictEqual(final.replication_view_id, null)
+      assert.strictEqual(final.replication_view_revision, 0)
+      assert.strictEqual(final.staged, 0)
+      assert.strictEqual(final.source_retractions, 0)
+    })).pipe(Effect.provide(database)))
+
   it.effect("bounds generation work and resumes cleanup after the active flip", () =>
     Effect.scoped(Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
@@ -1050,6 +1194,7 @@ describe("client schema evolution", () => {
 
   it.effect("promotes a server space and admits an old offline envelope through the current handler", () =>
     Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
       const localV1 = yield* buildStore(definitionV1, handlersV1)
       const serverV1 = yield* buildServer(definitionV1, handlersV1)
       const accepted = yield* localV1.mutate(PutTodoV1, { id: "4", title: "accepted-old" })
@@ -1057,13 +1202,7 @@ describe("client schema evolution", () => {
       const offline = yield* localV1.mutate(PutTodoV1, { id: "5", title: "offline-old" })
 
       const serverV2 = yield* buildServer(definitionV2, handlersV2, evolution)
-      const historical = yield* serverV2.pull({
-        spaceId,
-        schema: definitionV2.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
-      assert.deepStrictEqual(incremental(historical).entries[0].sourceSchema, definitionV1.schemaIdentity)
+      yield* serverV2.pull(pullRequest(definitionV2))
 
       const offlineReceipt = yield* serverV2.submit({
         envelope: offline.envelope,
@@ -1074,18 +1213,14 @@ describe("client schema evolution", () => {
         assert.deepStrictEqual(offlineReceipt.sourceSchema, definitionV2.schemaIdentity)
         assert.deepStrictEqual(offlineReceipt.result, { id: 5, title: "offline-old", done: false })
       }
-      const current = yield* serverV2.pull({
-        spaceId,
-        schema: definitionV2.schemaIdentity,
-        after: Identity.ServerSequence.make(1),
-        limit: 10
-      })
-      assert.deepStrictEqual(incremental(current).entries[0].sourceSchema, definitionV2.schemaIdentity)
-      assert.deepStrictEqual(incremental(current).entries[0].changes[0], {
-        _tag: "Upsert",
-        entity: { model: "Todo", modelVersion: TodoV2.version, key: 5 },
-        value: { id: 5, title: "offline-old", done: false }
-      })
+      const LogRow = Schema.Struct({ entry_json: Schema.String })
+      const logRows = yield* SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: LogRow,
+        execute: () => sql`SELECT entry_json FROM effect_local_authoritative_log ORDER BY server_sequence`
+      })(undefined)
+      const historical = yield* Codec.decode(Protocol.AcceptedMutation, yield* Codec.parse(logRows[0].entry_json))
+      assert.deepStrictEqual(historical.sourceSchema, definitionV1.schemaIdentity)
     })).pipe(Effect.provide(database)))
 
   it.effect("starts after quarantining a pending mutation rejected during promotion", () =>
@@ -1299,17 +1434,10 @@ describe("client schema evolution", () => {
       assert.deepStrictEqual(yield* replica.quarantine, [])
       assert.deepStrictEqual(yield* stagingStore.pending, [])
       assert.isTrue(Option.isNone(yield* stagingStore.get(TodoV2, 45)))
-      assert.deepStrictEqual(
-        incremental(
-          yield* server.pull({
-            spaceId,
-            schema: definitionV2.schemaIdentity,
-            after: Identity.ServerSequence.make(0),
-            limit: 10
-          })
-        ).entries,
-        []
-      )
+      const required = yield* server.pull(pullRequest(definitionV2))
+      if (!("_tag" in required)) assert.fail("expected bootstrap")
+      const page = yield* server.bootstrap(bootstrapRequest(definitionV2, required.manifest))
+      assert.deepStrictEqual(page.entries, [])
       assert.isAtLeast(invalidations.entity, 1)
       assert.isAtLeast(invalidations.status, 1)
       assert.isAtLeast(invalidations.originalReceipt, 1)
@@ -1322,7 +1450,7 @@ describe("client schema evolution", () => {
       const original = yield* v1.mutate(PutTodoV1, { id: "49", title: "original" })
       yield* buildStore(definitionV2, rejectingHandlersV2, evolution)
       const writable = yield* buildStore(definitionV2, handlersV2, evolution)
-      const intervening = yield* writable.mutate(PutTodoV2, {
+      yield* writable.mutate(PutTodoV2, {
         id: 50,
         title: "intervening",
         done: false
@@ -1346,15 +1474,15 @@ describe("client schema evolution", () => {
 
       assert.deepStrictEqual(yield* replica.quarantine, [])
       assert.deepStrictEqual(yield* writable.pending, [])
-      const page = incremental(
-        yield* server.pull({
-          spaceId,
-          schema: definitionV2.schemaIdentity,
-          after: Identity.ServerSequence.make(0),
-          limit: 10
+      const required = yield* server.pull(pullRequest(definitionV2))
+      if (!("_tag" in required)) assert.fail("expected bootstrap")
+      const page = yield* server.bootstrap(bootstrapRequest(definitionV2, required.manifest))
+      assert.deepStrictEqual(page.entries.map(({ change }) => change), [
+        Protocol.Upsert.make({
+          entity: Protocol.EntityKey.make({ model: TodoV2.name, modelVersion: TodoV2.version, key: 50 }),
+          value: { id: 50, title: "intervening", done: false }
         })
-      )
-      assert.deepStrictEqual(page.entries.map(({ mutationId }) => mutationId), [intervening.envelope.mutationId])
+      ])
     })).pipe(Effect.provide(database)))
 
   it.effect("resumes staged replacement cancellation after an intervening submit failure", () =>
@@ -1368,6 +1496,7 @@ describe("client schema evolution", () => {
         title: "intervening",
         done: false
       })
+      assert.strictEqual(intervening.envelope.localSequence, 2)
       const staged = yield* Effect.scoped(
         buildReplica(definitionV2, handlersV2, unavailableSync, evolution).pipe(
           Effect.flatMap((replica) =>
@@ -1396,21 +1525,22 @@ describe("client schema evolution", () => {
       const replica = yield* buildReplica(definitionV2, handlersV2, failOnce, evolution)
       const firstError = yield* replica.discardQuarantined(original.envelope.mutationId).pipe(Effect.flip)
       assert.strictEqual(firstError._tag, "ServerUnavailable")
+      yield* Ref.set(failSubmit, false)
 
       yield* Ref.set(failSubmit, false)
       const receipt = yield* replica.discardQuarantined(original.envelope.mutationId)
       assert.strictEqual(receipt._tag, "Rejected")
       assert.deepStrictEqual(yield* replica.quarantine, [])
       assert.deepStrictEqual(yield* writable.pending, [])
-      const page = incremental(
-        yield* server.pull({
-          spaceId,
-          schema: definitionV2.schemaIdentity,
-          after: Identity.ServerSequence.make(0),
-          limit: 10
+      const required = yield* server.pull(pullRequest(definitionV2))
+      if (!("_tag" in required)) assert.fail("expected bootstrap")
+      const page = yield* server.bootstrap(bootstrapRequest(definitionV2, required.manifest))
+      assert.deepStrictEqual(page.entries.map(({ change }) => change), [
+        Protocol.Upsert.make({
+          entity: Protocol.EntityKey.make({ model: TodoV2.name, modelVersion: TodoV2.version, key: 52 }),
+          value: { id: 52, title: "intervening", done: false }
         })
-      )
-      assert.deepStrictEqual(page.entries.map(({ mutationId }) => mutationId), [intervening.envelope.mutationId])
+      ])
     })).pipe(Effect.provide(database)))
 
   it.effect("resubmits a quarantined mutation through the public replica composition", () =>
@@ -1512,9 +1642,8 @@ describe("client schema evolution", () => {
       assert.isTrue(Option.isSome(yield* v2.quarantineByMutation(original.envelope.mutationId)))
     })).pipe(Effect.provide(database)))
 
-  it.effect("serves submit and pull to the immediately previous schema inside the configured window", () =>
+  it.effect("serves schemas inside the configured window across source schema evolution", () =>
     Effect.scoped(Effect.gen(function*() {
-      const sql = yield* SqlClient.SqlClient
       const server = yield* buildServer(definitionV2, handlersV2, evolution, {
         acceptedSchemaVersions: 1,
         retainedHistoryEntries: 0
@@ -1534,68 +1663,41 @@ describe("client schema evolution", () => {
         assert.deepStrictEqual(receipt.result, { id: "42", title: "mixed-version" })
       }
 
-      const result = incremental(
-        yield* server.pullAuthorized({
-          spaceId,
-          schema: definitionV1.schemaIdentity,
-          after: Identity.ServerSequence.make(0),
-          limit: 10
-        }, "principal")
+      const required = yield* server.pullAuthorized(pullRequest(definitionV1), "principal")
+      if (!("_tag" in required)) assert.fail("expected a projected bootstrap manifest")
+      assert.deepStrictEqual(required.manifest.schema, definitionV1.schemaIdentity)
+      assert.strictEqual(required.manifest.definitionHash, definitionV1.hash)
+      assert.deepStrictEqual(required.serverSchema, definitionV2.schemaIdentity)
+      const page = yield* server.bootstrapAuthorized(
+        bootstrapRequest(definitionV1, required.manifest, TodoV1.name),
+        "principal"
       )
-      assert.strictEqual(result.entries.length, 1)
-      assert.deepStrictEqual(result.entries[0].sourceSchema, definitionV1.schemaIdentity)
-      assert.deepStrictEqual(result.entries[0].changes, [{
-        _tag: "Upsert",
-        entity: { model: "Todo", modelVersion: TodoV1.version, key: "42" },
-        value: { id: "42", title: "mixed-version" }
-      }])
-
-      yield* server.maintain(spaceId)
-      const compacted = yield* server.pullAuthorized({
-        spaceId,
-        schema: definitionV1.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      }, "principal")
-      assert.isTrue("_tag" in compacted)
-      if (!("_tag" in compacted)) assert.fail("expected a projected bootstrap manifest")
-      assert.deepStrictEqual(compacted.manifest.schema, definitionV1.schemaIdentity)
-      assert.strictEqual(compacted.manifest.definitionHash, definitionV1.hash)
-      const page = yield* server.bootstrapAuthorized({
-        spaceId,
-        schema: definitionV1.schemaIdentity,
-        snapshotId: compacted.manifest.snapshotId,
-        afterOrdinal: -1,
-        limit: 10
-      }, "principal")
-      assert.deepStrictEqual(page.manifest, compacted.manifest)
-      assert.deepStrictEqual(page.entities.map(({ entityBytes: _, ...entity }) => entity), [{
+      assert.deepStrictEqual(page.manifest, required.manifest)
+      assert.deepStrictEqual(page.entries.map(({ entryBytes: _, ...entry }) => entry), [{
         ordinal: 0,
-        model: "Todo",
-        modelVersion: TodoV1.version,
-        key: "42",
-        value: { id: "42", title: "mixed-version" }
+        change: Protocol.Upsert.make({
+          entity: Protocol.EntityKey.make({ model: TodoV1.name, modelVersion: TodoV1.version, key: "42" }),
+          value: { id: "42", title: "mixed-version" }
+        })
       }])
       assert.isFalse(page.hasMore)
-      const ProjectionCounts = Schema.Struct({ manifests: Schema.Number, entities: Schema.Number })
-      const projectionCounts = yield* SqlSchema.findOne({
-        Request: Schema.Void,
-        Result: ProjectionCounts,
-        execute: () =>
-          sql`SELECT
-          (SELECT COUNT(*) FROM effect_local_server_snapshot_projections) AS manifests,
-          (SELECT COUNT(*) FROM effect_local_server_snapshot_projection_entities) AS entities`
-      })(undefined)
-      assert.deepStrictEqual(projectionCounts, { manifests: 1, entities: 1 })
 
-      const serverV3 = yield* buildServer(definitionV3, handlersV3, evolutionV3, { acceptedSchemaVersions: 1 })
-      const stale = yield* serverV3.pullAuthorized({
-        spaceId,
-        schema: definitionV1.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      }, "principal").pipe(Effect.flip)
-      assert.strictEqual(stale._tag, "StaleSchema")
+      const serverV3 = yield* buildServer(definitionV3, handlersV3, evolutionV3, { acceptedSchemaVersions: 2 })
+      const replacement = yield* serverV3.pullAuthorized(pullRequest(definitionV1), "principal")
+      if (!("_tag" in replacement)) assert.fail("expected a replacement bootstrap manifest")
+      assert.notStrictEqual(replacement.manifest.snapshotId, required.manifest.snapshotId)
+      assert.deepStrictEqual(replacement.serverSchema, definitionV3.schemaIdentity)
+      const replacementPage = yield* serverV3.bootstrapAuthorized(
+        bootstrapRequest(definitionV1, replacement.manifest, TodoV1.name),
+        "principal"
+      )
+      assert.deepStrictEqual(replacementPage.entries.map(({ entryBytes: _, ...entry }) => entry), [{
+        ordinal: 0,
+        change: Protocol.Upsert.make({
+          entity: Protocol.EntityKey.make({ model: TodoV1.name, modelVersion: TodoV1.version, key: "42" }),
+          value: { id: "42", title: "mixed-version" }
+        })
+      }])
     })).pipe(Effect.provide(database)))
 
   it.effect("rejects an accepted schema window without complete downgrade transforms", () =>
@@ -1637,31 +1739,28 @@ describe("client schema evolution", () => {
         )
       }
 
-      const first = incremental(
-        yield* server.pull({
-          spaceId,
-          schema: expandedDefinitionV1.schemaIdentity,
-          after: Identity.ServerSequence.make(0),
-          limit: 10
-        })
+      const required = yield* server.pull(pullRequest(expandedDefinitionV1, null, ExpandedV1.name))
+      if (!("_tag" in required)) assert.fail("expected bootstrap")
+      const first = yield* server.bootstrap(
+        bootstrapRequest(expandedDefinitionV1, required.manifest, ExpandedV1.name)
       )
       assert.strictEqual(first.entries.length, 1)
       assert.isTrue(first.hasMore)
       assert.isAtMost(yield* Protocol.encodedBytesEffect(first), Protocol.maximumBatchBytes)
 
-      const second = incremental(
-        yield* server.pull({
-          spaceId,
-          schema: expandedDefinitionV1.schemaIdentity,
-          after: first.entries[0].sequence,
-          limit: 10
-        })
+      const second = yield* server.bootstrap(
+        bootstrapRequest(
+          expandedDefinitionV1,
+          required.manifest,
+          ExpandedV1.name,
+          first.entries[0].ordinal
+        )
       )
       assert.strictEqual(second.entries.length, 1)
       assert.isFalse(second.hasMore)
     })).pipe(Effect.provide(database)))
 
-  it.effect("caps source log bytes before loading entries that project smaller", () =>
+  it.effect("pages by the compact projected representation instead of source entity bytes", () =>
     Effect.scoped(Effect.gen(function*() {
       const server = yield* buildServer(largeDefinitionV2, largeHandlers, compactingEvolution, {
         acceptedSchemaVersions: 1
@@ -1690,27 +1789,14 @@ describe("client schema evolution", () => {
         )
       }
 
-      const first = incremental(
-        yield* server.pull({
-          spaceId,
-          schema: compactDefinitionV1.schemaIdentity,
-          after: Identity.ServerSequence.make(0),
-          limit: 10
-        })
+      const required = yield* server.pull(pullRequest(compactDefinitionV1, null, CompactV1.name))
+      if (!("_tag" in required)) assert.fail("expected bootstrap")
+      const page = yield* server.bootstrap(
+        bootstrapRequest(compactDefinitionV1, required.manifest, CompactV1.name)
       )
-      assert.strictEqual(first.entries.length, 1)
-      assert.isTrue(first.hasMore)
-
-      const second = incremental(
-        yield* server.pull({
-          spaceId,
-          schema: compactDefinitionV1.schemaIdentity,
-          after: first.entries[0].sequence,
-          limit: 10
-        })
-      )
-      assert.strictEqual(second.entries.length, 1)
-      assert.isFalse(second.hasMore)
+      assert.strictEqual(page.entries.length, 2)
+      assert.isFalse(page.hasMore)
+      assert.isAtMost(yield* Protocol.encodedBytesEffect(page), Protocol.maximumBatchBytes)
     })).pipe(Effect.provide(database)))
 
   it.effect("reports durable snapshot projection key conflicts as schema collisions", () =>
@@ -1742,12 +1828,7 @@ describe("client schema evolution", () => {
       }
       yield* server.maintain(spaceId)
 
-      const error = yield* server.pull({
-        spaceId,
-        schema: definitionV1.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      }).pipe(Effect.flip)
+      const error = yield* server.pull(pullRequest(definitionV1)).pipe(Effect.flip)
       assert.strictEqual(error._tag, "SchemaKeyCollision")
       const ProjectionCounts = Schema.Struct({ manifests: Schema.Number, entities: Schema.Number })
       const projectionCounts = yield* SqlSchema.findOne({
@@ -1816,19 +1897,259 @@ describe("client schema evolution", () => {
       assert.strictEqual(copied[0].count, 1)
 
       const serverV2 = yield* buildServer(definitionV2, handlersV2, evolution)
-      const page = yield* serverV2.pull({
-        spaceId,
-        schema: definitionV2.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
-      assert.deepStrictEqual(incremental(page).entries[0].sourceSchema, definitionV1.schemaIdentity)
-      assert.deepStrictEqual(incremental(page).entries[0].changes[0], {
+      yield* serverV2.pull(pullRequest(definitionV2))
+      const LogRow = Schema.Struct({ entry_json: Schema.String })
+      const log = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: LogRow,
+        execute: () => sql`SELECT entry_json FROM effect_local_authoritative_log WHERE server_sequence = 1`
+      })(undefined)
+      const entry = yield* Codec.decode(Protocol.AcceptedMutation, yield* Codec.parse(log.entry_json))
+      assert.deepStrictEqual(entry.sourceSchema, definitionV1.schemaIdentity)
+      assert.deepStrictEqual(entry.changes[0], {
         _tag: "Upsert",
         entity: { model: "Todo", modelVersion: TodoV1.version, key: "6" },
         value: { id: "6", title: "resume-server" }
       })
     })).pipe(Effect.provide(database)))
+
+  it.effect("invalidates scoped server views atomically with a schema generation flip", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const serverV1 = yield* buildServer(definitionV1, handlersV1)
+      yield* serverV1.submit(
+        yield* v1Envelope(
+          clientId,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000221"),
+          1,
+          { id: "7", title: "scoped-view" }
+        )
+      )
+      const scope = Protocol.ReplicationScope.make({ models: [TodoV1.name] })
+      const scopeGeneration = Identity.ReplicationScopeGeneration.make(1)
+      const initial = yield* serverV1.pullAuthorized(
+        Protocol.PullRequest.make({
+          spaceId,
+          clientId,
+          schema: definitionV1.schemaIdentity,
+          scope,
+          scopeGeneration,
+          cursor: null,
+          limit: 10
+        }),
+        null
+      )
+      if (!("_tag" in initial)) assert.fail("expected bootstrap")
+      const bootstrap = yield* serverV1.bootstrapAuthorized(
+        Protocol.BootstrapRequest.make({
+          spaceId,
+          clientId,
+          schema: definitionV1.schemaIdentity,
+          scope,
+          scopeGeneration,
+          cursor: initial.manifest.cursor,
+          snapshotId: initial.manifest.snapshotId,
+          afterOrdinal: -1,
+          limit: 10
+        }),
+        null
+      )
+      assert.isFalse(bootstrap.hasMore)
+      const outstanding = yield* serverV1.pullAuthorized(
+        Protocol.PullRequest.make({
+          spaceId,
+          clientId,
+          schema: definitionV1.schemaIdentity,
+          scope,
+          scopeGeneration,
+          cursor: initial.manifest.cursor,
+          limit: 10
+        }),
+        null
+      )
+      if ("_tag" in outstanding) assert.fail("expected incremental page")
+      for (const suffix of [2, 3]) {
+        const scopedClientId = Identity.ClientId.make(
+          `cli_00000000-0000-4000-8000-${String(suffix).padStart(12, "0")}`
+        )
+        const required = yield* serverV1.pullAuthorized(
+          Protocol.PullRequest.make({
+            spaceId,
+            clientId: scopedClientId,
+            schema: definitionV1.schemaIdentity,
+            scope,
+            scopeGeneration,
+            cursor: null,
+            limit: 10
+          }),
+          null
+        )
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* serverV1.bootstrapAuthorized(
+          Protocol.BootstrapRequest.make({
+            spaceId,
+            clientId: scopedClientId,
+            schema: definitionV1.schemaIdentity,
+            scope,
+            scopeGeneration,
+            cursor: required.manifest.cursor,
+            snapshotId: required.manifest.snapshotId,
+            afterOrdinal: -1,
+            limit: 10
+          }),
+          null
+        )
+        yield* serverV1.pullAuthorized(
+          Protocol.PullRequest.make({
+            spaceId,
+            clientId: scopedClientId,
+            schema: definitionV1.schemaIdentity,
+            scope,
+            scopeGeneration,
+            cursor: required.manifest.cursor,
+            limit: 10
+          }),
+          null
+        )
+      }
+
+      const flipped = yield* Deferred.make<void>()
+      const cleanupPhases = yield* Ref.make<ReadonlyArray<string>>([])
+      const cleanupCounts = yield* Ref.make<ReadonlyArray<number>>([])
+      const Progress = Schema.Struct({ phase: Schema.String })
+      const CountRow = Schema.Struct({ count: Schema.Number })
+      const readProgress = SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Progress,
+        execute: () => sql`SELECT phase FROM effect_local_server_evolution WHERE space_id = ${spaceId}`
+      })
+      const countScopedRows = SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () =>
+          sql`SELECT
+          (SELECT COUNT(*) FROM effect_local_server_replication_views WHERE space_id = ${spaceId}) +
+          (SELECT COUNT(*) FROM effect_local_server_replication_view_entities WHERE space_id = ${spaceId}) +
+          (SELECT COUNT(*) FROM effect_local_server_replication_pages WHERE space_id = ${spaceId}) +
+          (SELECT COUNT(*) FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId}) +
+          (SELECT COUNT(*) FROM effect_local_server_scoped_snapshot_entries WHERE snapshot_id IN (
+            SELECT snapshot_id FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId}
+          )) AS count`
+      })
+      const afterBatch = Effect.gen(function*() {
+        const progress = yield* readProgress(undefined)
+        const scopedRows = yield* countScopedRows(undefined)
+        yield* Ref.update(cleanupCounts, (counts) => [...counts, scopedRows.count])
+        if (progress.phase.startsWith("CleanupScoped")) {
+          yield* Ref.update(cleanupPhases, (phases) => [...phases, progress.phase])
+        }
+        if (progress.phase !== "CleanupEntities") return
+        yield* Deferred.succeed(flipped, undefined)
+        yield* Effect.never
+      }).pipe(Effect.orDie)
+      const fiber = yield* SchemaEvolution.server({
+        definition: definitionV2,
+        evolution,
+        spaceId,
+        batchSize: 1,
+        afterBatch
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.await(flipped)
+      yield* Fiber.interrupt(fiber)
+      assert.include(yield* Ref.get(cleanupPhases), "CleanupScopedSnapshotEntries")
+      const counts = yield* Ref.get(cleanupCounts)
+      assert.isAtLeast(counts[0] ?? 0, 15)
+      for (let index = 1; index < counts.length; index++) {
+        assert.isAtMost(counts[index - 1] - counts[index], 1)
+      }
+
+      const scopedRows = yield* countScopedRows(undefined)
+      assert.strictEqual(scopedRows.count, 0)
+
+      yield* SchemaEvolution.server({ definition: definitionV2, evolution, spaceId, batchSize: 1 })
+      const serverV2 = yield* buildServer(definitionV2, handlersV2, evolution)
+      const result = yield* serverV2.pullAuthorized(
+        Protocol.PullRequest.make({
+          spaceId,
+          clientId,
+          schema: definitionV2.schemaIdentity,
+          scope: Protocol.ReplicationScope.make({ models: [TodoV2.name] }),
+          scopeGeneration,
+          cursor: outstanding.cursor,
+          limit: 10
+        }),
+        null
+      )
+      if (!("_tag" in result)) assert.fail("expected a replacement bootstrap")
+      assert.notStrictEqual(result.manifest.cursor.viewId, outstanding.cursor.viewId)
+    })).pipe(Effect.provide(database)))
+
+  it.effect("fences scoped writes after the prepared schema generation changes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const fs = yield* FileSystem.FileSystem
+      const directory = yield* fs.makeTempDirectoryScoped()
+      const filename = `${directory}/schema-fence.sqlite`
+      const persistentDatabase = () =>
+        Layer.mergeAll(SqliteClient.layer({ filename }), NodeCrypto.layer, Reactivity.layer)
+      const prepared = yield* Deferred.make<void>()
+      const resume = yield* Deferred.make<void>()
+      const scopeAuthorizations = yield* Ref.make(0)
+      const runtimeV1 = MutationRuntime.layer(definitionV1).pipe(Layer.provide(handlersV1))
+      const serverV1 = yield* Layer.build(
+        ServerStore.layer({
+          ...serverHistory,
+          definition: definitionV1,
+          schemaEvolutionBatchSize: 1,
+          authorizeAccess: () => Effect.void,
+          authorizeMutation: () => Effect.void,
+          authorizeRead: (input) => {
+            if (input._tag === "Entity") return Effect.void
+            return Ref.updateAndGet(scopeAuthorizations, (count) => count + 1).pipe(
+              Effect.flatMap((count) => {
+                if (count !== 2) return Effect.void
+                return Deferred.succeed(prepared, undefined).pipe(Effect.andThen(Deferred.await(resume)))
+              })
+            )
+          }
+        }).pipe(Layer.provide(runtimeV1), Layer.provide(persistentDatabase()))
+      ).pipe(
+        Effect.map((context) => Context.get(context, ServerStore.ServerStore))
+      )
+      const stale = yield* serverV1.pullAuthorized(
+        Protocol.PullRequest.make({
+          spaceId,
+          clientId,
+          schema: definitionV1.schemaIdentity,
+          scope: Protocol.ReplicationScope.make({ models: [TodoV1.name] }),
+          scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+          cursor: null,
+          limit: 10
+        }),
+        null
+      ).pipe(Effect.result, Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.await(prepared)
+      yield* SchemaEvolution.server({ definition: definitionV2, evolution, spaceId, batchSize: 1 }).pipe(
+        Effect.provide(SqliteClient.layer({ filename }))
+      )
+      yield* Deferred.succeed(resume, undefined)
+      const result = yield* Fiber.join(stale)
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, "SchemaGenerationConflict")
+      const CountRow = Schema.Struct({ count: Schema.Number })
+      const staleCount = yield* Effect.gen(function*() {
+        const sql = yield* SqlClient.SqlClient
+        return yield* SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: CountRow,
+          execute: () =>
+            sql`SELECT
+              (SELECT COUNT(*) FROM effect_local_server_replication_views WHERE space_id = ${spaceId}) +
+              (SELECT COUNT(*) FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId}) AS count`
+        })(undefined)
+      })
+        .pipe(Effect.provide(SqliteClient.layer({ filename })))
+      assert.strictEqual(staleCount.count, 0)
+    })).pipe(Effect.provide(NodeFileSystem.layer)))
 
   it.effect("migrates every server receipt when client sequences overlap", () =>
     Effect.scoped(Effect.gen(function*() {
@@ -1853,12 +2174,7 @@ describe("client schema evolution", () => {
         source_schema_hash = NULL, mutation_version = NULL, mutation_name = NULL`
 
       const serverV2 = yield* buildServer(definitionV2, handlersV2, evolution)
-      yield* serverV2.pull({
-        spaceId,
-        schema: definitionV2.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
+      yield* serverV2.pull(pullRequest(definitionV2))
       const migrated = yield* sql<{
         readonly client_id: string
         readonly local_sequence: number
@@ -1993,12 +2309,7 @@ describe("client schema evolution", () => {
       ).pipe(
         Effect.map((context) => Context.get(context, ServerStore.ServerStore))
       )
-      const stale = {
-        spaceId,
-        schema: definitionV1.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      }
+      const stale = pullRequest(definitionV1)
       assert.strictEqual((yield* server.pullAuthorized(stale, "denied").pipe(Effect.flip))._tag, "AuthorizationDenied")
       const CountRow = Schema.Struct({ count: Schema.Number })
       const countSpaces = SqlSchema.findOne({
@@ -2029,12 +2340,7 @@ describe("client schema evolution", () => {
         Result: CountRow,
         execute: () => sql`SELECT COUNT(*) AS count FROM space_update_probe`
       })
-      const request = {
-        spaceId,
-        schema: definitionV2.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      }
+      const request = pullRequest(definitionV2)
 
       yield* server.pull(request)
       const afterFirst = (yield* countUpdates(undefined)).count

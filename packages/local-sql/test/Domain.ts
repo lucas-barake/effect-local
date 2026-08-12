@@ -46,6 +46,16 @@ export const RenameTodo = Mutation.make("RenameTodo", {
   rejection: Schema.Literal("TodoNotFound")
 })
 
+export const DeleteTodo = Mutation.make("DeleteTodo", {
+  version: 1,
+  payload: { id: Schema.String }
+})
+
+export const PutManyTodos = Mutation.make("PutManyTodos", {
+  version: 1,
+  payload: { count: Schema.Number }
+})
+
 export const IncrementTodo = Mutation.make("IncrementTodo", {
   version: 1,
   payload: { id: Schema.String, delta: Schema.Number },
@@ -95,7 +105,17 @@ export const ReadCountIndex = Query.make("ReadCountIndex", {
 export const definition = Definition.make({
   version: 1,
   models: [Todo],
-  mutations: [PutTodo, RenameTodo, IncrementTodo, AddLabel, RejectAfterWrite, PutHugeTodo, ReturnHugeResult],
+  mutations: [
+    PutTodo,
+    RenameTodo,
+    DeleteTodo,
+    PutManyTodos,
+    IncrementTodo,
+    AddLabel,
+    RejectAfterWrite,
+    PutHugeTodo,
+    ReturnHugeResult
+  ],
   queries: [ListTodos, ReadCountIndex]
 })
 
@@ -114,6 +134,14 @@ export const handlers = Layer.mergeAll(
       const current = yield* getTodo(transaction, payload.id)
       yield* transaction.set(Todo, payload.id, { ...current, title: payload.title })
     })
+  ),
+  DeleteTodo.toLayer(({ payload, transaction }) => transaction.delete(Todo, payload.id)),
+  PutManyTodos.toLayer(({ payload, transaction }) =>
+    Effect.forEach(
+      Array.from({ length: payload.count }, (_, index) => todo(`bulk-${index}`)),
+      (value) => transaction.set(Todo, value.id, value),
+      { discard: true }
+    )
   ),
   IncrementTodo.toLayer(({ payload, transaction }) =>
     Effect.gen(function*() {

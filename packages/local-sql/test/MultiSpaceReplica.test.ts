@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
@@ -29,7 +30,9 @@ import * as Domain from "./Domain.js"
 const spaceA = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const spaceB = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const scope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
 const clientHistory = {
+  scope,
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,
@@ -45,7 +48,7 @@ const remote = Layer.succeed(
   SyncEngine.SyncEngine.of({
     submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
     discard: () => Effect.die("unexpected discard"),
-    pull: () => Effect.succeed({ entries: [], hasMore: false, serverSchema: Domain.definition.schemaIdentity }),
+    pull: () => Effect.never,
     bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
     watch: () => Stream.never
   })
@@ -199,7 +202,7 @@ describe("multi space Replica", () => {
         SyncEngine.SyncEngine.of({
           submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           discard: () => Effect.die("unexpected discard"),
-          pull: () => Effect.succeed({ entries: [], hasMore: false, serverSchema: Domain.definition.schemaIdentity }),
+          pull: () => Effect.never,
           bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           watch: () =>
             Stream.unwrap(Effect.acquireRelease(
@@ -215,10 +218,16 @@ describe("multi space Replica", () => {
       const local = {
         requestReconciliation: Deferred.succeed(requestBlocked, undefined).pipe(Effect.andThen(Effect.never)),
         reconciliationGenerations: Effect.succeed({ requested: 0, completed: 0 }),
+        replicationState: Effect.succeed({
+          clientId,
+          scope,
+          scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+          cursor: null
+        }),
         completeReconciliation: () => Effect.void
       } satisfies Pick<
         LocalStore.Service,
-        "requestReconciliation" | "reconciliationGenerations" | "completeReconciliation"
+        "requestReconciliation" | "reconciliationGenerations" | "replicationState" | "completeReconciliation"
       >
       const reconciliation = Reconciler.Reconciliation.of({
         sync: Effect.void,
@@ -416,7 +425,7 @@ describe("multi space Replica", () => {
               ),
               () =>
                 Deferred.await(release).pipe(
-                  Effect.as({ entries: [], hasMore: false, serverSchema: Domain.definition.schemaIdentity } as const)
+                  Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
                 ),
               () => Ref.update(current, (count) => count - 1)
             ),

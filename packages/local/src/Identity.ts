@@ -31,6 +31,9 @@ export type MutationId = typeof MutationId.Type
 export const SnapshotId = identifier("SnapshotId", "snp")
 export type SnapshotId = typeof SnapshotId.Type
 
+export const ReplicationViewId = identifier("ReplicationViewId", "viw")
+export type ReplicationViewId = typeof ReplicationViewId.Type
+
 export const LocalSequence = sequence("LocalSequence", 1)
 export type LocalSequence = typeof LocalSequence.Type
 
@@ -42,6 +45,12 @@ export type TerminalSequence = typeof TerminalSequence.Type
 
 export const VisibleRevision = sequence("VisibleRevision", 0)
 export type VisibleRevision = typeof VisibleRevision.Type
+
+export const ReplicationViewRevision = sequence("ReplicationViewRevision", 0)
+export type ReplicationViewRevision = typeof ReplicationViewRevision.Type
+
+export const ReplicationScopeGeneration = sequence("ReplicationScopeGeneration", 0)
+export type ReplicationScopeGeneration = typeof ReplicationScopeGeneration.Type
 
 export const SchemaVersion = sequence("SchemaVersion", 1)
 export type SchemaVersion = typeof SchemaVersion.Type
@@ -65,3 +74,4 @@ export const makeClientId = makeIdentifier(ClientId, "cli")
 export const makeMembershipIncarnation = makeIdentifier(MembershipIncarnation, "inc")
 export const makeMutationId = makeIdentifier(MutationId, "mut")
 export const makeSnapshotId = makeIdentifier(SnapshotId, "snp")
+export const makeReplicationViewId = makeIdentifier(ReplicationViewId, "viw")

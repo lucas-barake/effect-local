@@ -54,7 +54,7 @@ export interface ManagedSpace {
   readonly definition: Definition.Any
   readonly local: Pick<
     LocalStore.Service,
-    "requestReconciliation" | "reconciliationGenerations" | "completeReconciliation"
+    "requestReconciliation" | "reconciliationGenerations" | "completeReconciliation" | "replicationState"
   >
   readonly reconciliation: ReconciliationService
   readonly retryDelay?: Duration.Input
@@ -211,7 +211,18 @@ export const makeManager = (options: {
           watches,
           managedKey(space.spaceId, space.generation),
           Effect.forever(
-            remote.watch({ spaceId: space.spaceId, schema: space.definition.schemaIdentity }).pipe(
+            Stream.unwrap(space.local.replicationState.pipe(
+              Effect.map((replication) =>
+                remote.watch({
+                  spaceId: space.spaceId,
+                  clientId: replication.clientId,
+                  schema: space.definition.schemaIdentity,
+                  scope: replication.scope,
+                  scopeGeneration: replication.scopeGeneration,
+                  cursor: replication.cursor
+                })
+              )
+            )).pipe(
               Stream.runForEach(() => enqueue(state)),
               Effect.catch((error) =>
                 state.reconciliation.failed(error).pipe(
@@ -298,22 +309,29 @@ export const layerOnePass = (
         return Ref.set(updateAvailable, serverSchema)
       }
 
-      const bootstrap = (
-        manifest: Protocol.SnapshotManifest
+      const continueBootstrap = (
+        manifest: Protocol.SnapshotManifest,
+        initialAfterOrdinal: number
       ): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.gen(function*() {
-          let afterOrdinal = yield* local.prepareBootstrap(manifest)
+          let afterOrdinal = initialAfterOrdinal
           while (true) {
+            const state = yield* local.replicationState
             const page = yield* remote.bootstrap({
               spaceId: options.spaceId,
+              clientId: state.clientId,
               schema: options.definition.schemaIdentity,
+              scope: state.scope,
+              scopeGeneration: state.scopeGeneration,
+              cursor: manifest.cursor,
               snapshotId: manifest.snapshotId,
               afterOrdinal,
               limit: pageSize
             })
             yield* observeServerSchema(page.serverSchema)
             if (page.manifest.snapshotId !== manifest.snapshotId) {
-              yield* bootstrap(page.manifest)
+              const nextAfterOrdinal = yield* local.prepareBootstrap(page.manifest)
+              yield* continueBootstrap(page.manifest, nextAfterOrdinal)
               return yield* Effect.void
             }
             const complete = yield* local.stageBootstrapPage(page)
@@ -321,15 +339,32 @@ export const layerOnePass = (
               yield* local.installBootstrap(page.manifest)
               return yield* Effect.void
             }
-            afterOrdinal += page.entities.length
+            afterOrdinal += page.entries.length
           }
         })
 
+      const bootstrap = (
+        manifest: Protocol.SnapshotManifest
+      ): Effect.Effect<void, ReplicaError.ReplicaError> =>
+        local.prepareBootstrap(manifest).pipe(
+          Effect.flatMap((afterOrdinal) => continueBootstrap(manifest, afterOrdinal))
+        )
+
       const bootstrapExpired = (receipt: Protocol.ExpiredReceipt) =>
         Effect.gen(function*() {
+          const state = yield* local.replicationState
+          if (state.cursor === null) {
+            return yield* new ReplicaError.ProtocolInvalid({
+              message: "Expired receipt recovery requires an installed replication view"
+            })
+          }
           const firstPage = yield* remote.bootstrap({
             spaceId: options.spaceId,
+            clientId: state.clientId,
             schema: options.definition.schemaIdentity,
+            scope: state.scope,
+            scopeGeneration: state.scopeGeneration,
+            cursor: state.cursor,
             snapshotId: receipt.snapshotId,
             afterOrdinal: -1,
             limit: pageSize
@@ -350,37 +385,21 @@ export const layerOnePass = (
               yield* local.installBootstrap(firstPage.manifest)
               return yield* Effect.void
             }
-            afterOrdinal = firstPage.entities.length - 1
+            afterOrdinal = firstPage.entries.length - 1
           }
-          while (true) {
-            const page = yield* remote.bootstrap({
-              spaceId: options.spaceId,
-              schema: options.definition.schemaIdentity,
-              snapshotId: firstPage.manifest.snapshotId,
-              afterOrdinal,
-              limit: pageSize
-            })
-            yield* observeServerSchema(page.serverSchema)
-            if (page.manifest.snapshotId !== firstPage.manifest.snapshotId) {
-              yield* bootstrap(page.manifest)
-              return yield* Effect.void
-            }
-            const complete = yield* local.stageBootstrapPage(page)
-            if (complete) {
-              yield* local.installBootstrap(page.manifest)
-              return yield* Effect.void
-            }
-            afterOrdinal += page.entities.length
-          }
-        })
+          return yield* continueBootstrap(firstPage.manifest, afterOrdinal)
+        }).pipe(Effect.tapErrorTag("AuthorizationDenied", () => local.revokeReplication))
 
       const catchUp = Effect.gen(function*() {
         while (true) {
-          const cursor = yield* local.cursor
+          const state = yield* local.replicationState
           const result = yield* remote.pull({
             spaceId: options.spaceId,
+            clientId: state.clientId,
             schema: options.definition.schemaIdentity,
-            after: cursor,
+            scope: state.scope,
+            scopeGeneration: state.scopeGeneration,
+            cursor: state.cursor,
             limit: pageSize
           })
           yield* observeServerSchema(result.serverSchema)
@@ -388,10 +407,10 @@ export const layerOnePass = (
             yield* bootstrap(result.manifest)
             continue
           }
-          yield* local.applyEntries(result.entries, { publishProjection: !result.hasMore })
+          yield* local.applyViewPage(result)
           if (!result.hasMore) return
         }
-      })
+      }).pipe(Effect.tapErrorTag("AuthorizationDenied", () => local.revokeReplication))
 
       const submitPending = Effect.gen(function*() {
         yield* local.settleReceipts
@@ -431,6 +450,7 @@ export const layerOnePass = (
         yield* catchUp
         yield* submitPending
         yield* catchUp
+        yield* local.settleReceipts
         yield* succeeded
       })).pipe(
         Effect.tapError(failed),
@@ -493,7 +513,17 @@ export const layerInMemoryScheduler = (
       const workerFiber = yield* Effect.forkScoped(worker)
       const watchFiber = yield* Effect.forkScoped(
         Effect.forever(
-          remote.watch({ spaceId: options.spaceId, schema: options.definition.schemaIdentity }).pipe(
+          local.replicationState.pipe(
+            Effect.map((state) => ({
+              spaceId: options.spaceId,
+              clientId: state.clientId,
+              schema: options.definition.schemaIdentity,
+              scope: state.scope,
+              scopeGeneration: state.scopeGeneration,
+              cursor: state.cursor
+            })),
+            Effect.map(remote.watch),
+            Stream.unwrap,
             Stream.runForEach(() => requestAndNotify),
             Effect.matchEffect({
               onFailure: (error) => {

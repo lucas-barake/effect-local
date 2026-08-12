@@ -24,21 +24,23 @@ flowchart LR
   S --> O["Authoritative total order"]
   O --> W
   W --> L
-  L --> C["Canonical state"]
+  L --> C["Scoped canonical state"]
   C --> V
 ```
 
 One local transaction allocates a stable mutation identity, runs the handler, stores the pending envelope and write
 set, and updates visible state. The server authenticates and authorizes the mutation, deduplicates exact retries,
-executes the same handler, and either stores a terminal rejection or appends public mutation identity plus canonical
-changes at the next dense sequence. The submitting client's result remains in its private receipt. A client installs
-contiguous accepted entries into canonical state and then replays its remaining pending mutations over that state.
+executes the same handler, and either stores a terminal rejection or advances the space's dense mutation sequence.
+The submitting client's result remains in its private receipt. Replication sends only the current entities selected
+for that client. The client applies those view changes to canonical state and then replays its remaining pending
+mutations over that state.
 
 Effect Cluster owns deployment neutral routing and live ownership. One entity per space serializes mutation admission,
 holds wake and presence recipients, and routes them across runners. The actor does not retain mutation payloads or
-replies in Cluster message history. Server SQL stores bounded authoritative history, bounded receipts, immutable state
-snapshots, and explicit retained floors. Clients retain pending mutations, a durable cursor, and resumable bootstrap
-staging in SQLite. Effect Workflow owns durable client scheduling through finite reconciliation generations.
+replies in Cluster message history. Server SQL stores authoritative entities, bounded mutation history and receipts,
+and a materialized replication view per client. Clients retain pending mutations, a dense view cursor, the global
+mutation watermark, durable retractions, and resumable scoped bootstrap staging in SQLite. Effect Workflow owns
+durable client scheduling through finite reconciliation generations.
 
 Ordinary fields store ordinary values. Applications that need concurrent intent for a specific field can use an
 explicit `Field.Semantics` such as a counter or grow only set. Every other model avoids causal metadata.
@@ -196,6 +198,7 @@ import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -203,6 +206,7 @@ import { definition, DomainLive, ListTasks, PutTask, Task } from "./domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const scope = Protocol.ReplicationScope.make({ models: [Task.name] })
 
 const DatabaseLive = Layer.mergeAll(
   SqliteClient.layer({ filename: "tasks.sqlite" }),
@@ -223,6 +227,7 @@ const history = {
 export const ReplicaLive = SqlReplica.layer({
   definition,
   clientId,
+  scope,
   initialSpaces: [spaceId],
   reconciliationConcurrency: 8,
   ...history
@@ -278,20 +283,64 @@ Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect W
 `layerWorkflow` to bound one execution's exponential retry history. A later local mutation or server wake creates a
 new generation after a terminal failure. `SqlReplica.layer` remains the explicit lightweight in memory choice.
 
+## Replication scope and read authorization
+
+`scope` is the model subscription for the replica. It applies to every joined space. The current scope shape is an
+explicit set of model names. An empty set is valid. Key ranges, rolling time windows, lazy fetches, and time based
+eviction are not part of this contract. When a replica starts with a changed configured scope, it advances a durable
+scope generation. Widening backfills newly selected entities through ordinary pull pages. Narrowing sends `Retract`
+changes so excluded entities disappear locally without replacing the database or doing a full bootstrap.
+
+The server computes effective visibility as the intersection of the requested scope and `authorizeRead`. It first
+calls the policy with `_tag: "Scope"`, before disclosing space or schema state. It then calls the policy with
+`_tag: "Entity"` for every candidate entity. The entity key and value are Schema encoded JSON. A candidate that fails
+either check never enters a pull or bootstrap page. Wakes contain no entity payload.
+
+The option callback and a Context service compose directly. The Effect returned by `authorizeRead` may require
+services. Those requirements propagate to `ServerStore.layer`, where normal Layer composition supplies them:
+
+```ts
+import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
+import * as Context from "effect/Context"
+import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
+
+class ReadPolicy extends Context.Service<ReadPolicy, {
+  readonly authorize: (
+    input: ServerStore.ReadAuthorizationInput
+  ) => Effect.Effect<void, typeof Schema.Json.Type>
+}>()("app/ReadPolicy") {}
+
+const StoreLive = ServerStore.layer({
+  ...serverHistory,
+  definition,
+  readAuthorizationRefreshInterval: "30 seconds",
+  authorizeAccess: ({ clientId, principal, spaceId }) => authorizeClient({ clientId, principal, spaceId }),
+  authorizeMutation: ({ mutation, principal }) => authorizeMutation({ mutation, principal }),
+  authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
+}).pipe(Layer.provide(ReadPolicyLive))
+```
+
+`Delete` means the authoritative entity no longer exists. `Retract` means it still exists but no longer belongs to the
+client's scope or visibility. A retraction removes canonical and visible state and leaves a durable fence so an old
+optimistic mutation cannot resurrect revoked data. Later authorization can send an `Upsert` and clear the fence.
+Watches carry only wake hints. Pull rechecks the policy. `readAuthorizationRefreshInterval` supplies periodic hints so
+a policy-only revocation is eventually retracted even when no mutation changes that entity.
+
 ## Server and WebSocket RPC
 
-`ServerStore.layer` persists one dense accepted sequence per space, terminal receipts per client mutation, and the
-authoritative entity state. Its mutation path acquires the space row inside the SQL transaction, so handler execution,
-materialization, sequence allocation, and hard capacity checks share one order. Explicit history options set retained
-targets, hard admission caps, snapshot entity and byte limits, bootstrap page bytes, prune batch size, snapshot
-retention, migration retry, maintenance concurrency, and maintenance space page size.
+`ServerStore.layer` persists one dense mutation sequence per space, terminal receipts per client mutation, the
+authoritative entity state, and principal bound client views. Its mutation path acquires the space row inside the SQL
+transaction, so handler execution, materialization, sequence allocation, and hard capacity checks share one order.
+The dense space sequence remains the mutation basis. A separate dense view cursor orders the subset visible to one
+client.
 
-Call `ServerStore.maintain` or provide `ServerStore.layerMaintenance` in the server scope. Maintenance prepares a
-Schema checked immutable snapshot at the current accepted and terminal fences. It publishes that snapshot and the
-logical retained floors atomically before deleting bounded history and receipt prefixes. Admission returns
-`CapacityExceeded` before handler execution when a hard cap is reached, so the maintenance Layer is required in a
-long lived deployment. A client below the retained history floor receives `BootstrapRequired` and installs bounded,
-digest chained pages into durable staging before one atomic canonical replacement.
+Call `ServerStore.maintain` or provide `ServerStore.layerMaintenance` in the server scope. Maintenance prepares the
+global recovery snapshot used to expire old mutation and receipt evidence, then reclaims bounded prefixes. Admission
+returns `CapacityExceeded` before handler execution when a hard cap is reached, so the maintenance Layer is required
+in a long lived deployment. A fresh or invalid client view receives `BootstrapRequired` and installs client, scope,
+schema, and principal bound pages into durable staging before one atomic canonical replacement.
 
 `ServerStore.layer` requires `authorizeAccess`, `authorizeMutation`, and `authorizeRead`. Access authorization runs
 before retry receipt lookup. Mutation admission rejection consumes the client's local sequence and persists an exact
@@ -432,12 +481,13 @@ export const ServerLive = ServerStore.layer({
   acceptedSchemaVersions: 1,
   authorizeAccess: ({ clientId, principal, spaceId }) => authorizeClient({ clientId, principal, spaceId }),
   authorizeMutation: ({ mutation, principal }) => authorizeMutation({ mutation, principal }),
-  authorizeRead: ({ principal, spaceId }) => authorizeRead({ principal, spaceId })
+  authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
 })
 ```
 
-The authorization functions above are application Effects. `ServerStore.layerTrusted` remains for tests and already
-trusted processes. Do not use a digest as authorization. Client and space ownership belongs in `authorizeAccess`.
+The authorization functions above are application Effects. Their requirements propagate to the server Layer.
+`ServerStore.layerTrusted` remains for tests and already trusted processes. Do not use a digest as authorization.
+Client and space ownership belongs in `authorizeAccess`.
 
 ### Negotiate one protocol for sync and presence
 
