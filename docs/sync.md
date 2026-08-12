@@ -22,9 +22,9 @@ mutation or server wake to request a new generation. Completed execution retenti
 storage.
 
 An accepted admission publishes a shared wake after its SQL transaction commits. An exact retry may republish the
-retained receipt to repair a lost postcommit publication. Every subscribed watcher consumes that
-shared in memory publication. Fanout does not start a SQLite transaction or write the space row for each watcher. Wakes
-remain hints. Pull reads the durable accepted sequence and repairs dropped or coalesced publications.
+retained receipt to repair a lost postcommit publication. The sliding per space hub broadcasts it to subscribed
+watchers. Fanout does not start a SQLite transaction or write the space row for each watcher. Wakes remain hints. Pull
+reads the durable accepted sequence and repairs dropped or coalesced publications.
 
 ## History lifecycle
 

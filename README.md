@@ -341,14 +341,14 @@ Effect metrics expose bounded load without labels for space, client, mutation, o
 
 | Metric                                                                                 | Meaning                                                              |
 | -------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `effect_local_server_admission`                                                        | Completed admission attempts by `outcome=accepted`                   |
+| `effect_local_server_admission`                                                        | Completed admission attempts by `outcome`                            |
 | `effect_local_server_rejection`                                                        | Rejections by stable receipt origin or typed error `_tag` in `class` |
 | `effect_local_server_history_depth`, `effect_local_server_receipt_depth`               | Maximum retained rows in any one space                               |
 | `effect_local_server_history_limit`, `effect_local_server_receipt_limit`               | Configured per space hard limits                                     |
 | `effect_local_server_sync_watcher_count`, `effect_local_server_presence_watcher_count` | Current live watcher populations                                     |
 | `effect_local_server_wake_fanout_duration`                                             | Accepted wake publication to one subscriber delivery                 |
-| `effect_local_server_maintenance`                                                      | Maintenance runs by `outcome=completed`                              |
-| `effect_local_server_pruned`                                                           | Committed deleted rows by `resource=history`                         |
+| `effect_local_server_maintenance`                                                      | Maintenance runs by `outcome`                                        |
+| `effect_local_server_pruned`                                                           | Committed deleted rows by `resource`                                 |
 | `effect_local_client_bootstrap_install`                                                | Durably installed client snapshots                                   |
 | `effect_local_client_pending_mutation_count`                                           | Pending mutations across active local stores                         |
 

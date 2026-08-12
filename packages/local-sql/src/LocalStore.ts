@@ -566,12 +566,11 @@ export const layer = (
         }
         return Effect.void
       }
-      const refreshPendingMetric = metrics.refreshPending(
-        sql.withTransaction(Effect.gen(function*() {
-          yield* validateFence(yield* meta)
-          return (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
-      ).pipe(
+      const readPendingCount = sql.withTransaction(Effect.gen(function*() {
+        yield* validateFence(yield* meta)
+        return (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
+      })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      const refreshPendingMetric = metrics.refreshPending(readPendingCount).pipe(
         Effect.catchCause((cause): Effect.Effect<void> => {
           if (Cause.hasInterrupts(cause)) return Effect.interrupt
           return Effect.logWarning("Client pending metric refresh failed", cause)
@@ -2142,10 +2141,7 @@ export const layer = (
           yield* validateFence(row)
           return Identity.ServerSequence.make(row.server_cursor)
         })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
-        pendingCount: sql.withTransaction(Effect.gen(function*() {
-          yield* validateFence(yield* meta)
-          return (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
-        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+        pendingCount: readPendingCount,
         reconciliationGenerations,
         requestReconciliation,
         completeReconciliation,
