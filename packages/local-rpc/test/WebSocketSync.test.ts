@@ -517,20 +517,33 @@ const makeLifecycleHarness = (options?: {
       Layer.provideMerge(lifecycleServer),
       Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
     )
+    const replicaLayer = (maximumRetryDelay: Duration.Input) =>
+      SqlReplica.layer({
+        ...clientHistory,
+        definition,
+        evolution,
+        clientId,
+        initialSpaces: [spaceId],
+        retryDelay: "1 second",
+        maximumRetryDelay
+      }).pipe(
+        Layer.provide(lifecycleHandlers),
+        Layer.provideMerge(database),
+        Layer.provide(lifecycleLive)
+      )
 
     return {
       applications,
       attempts,
       blockPull,
       credentials,
-      database,
-      handlers: lifecycleHandlers,
       live: lifecycleLive,
       webSocketConstructions: lifecycleWebSocketConstructions,
       mode,
       pullEntered,
       pullInterrupted,
       pullRelease,
+      replicaLayer,
       refreshWaitStarted,
       watchStarted
     }
@@ -540,21 +553,7 @@ describe("WebSocket synchronization", () => {
   it.effect("pauses a rejected credential generation at NeedsAuthentication", () =>
     Effect.gen(function*() {
       const harness = yield* makeLifecycleHarness()
-      const replicaContext = yield* Layer.build(
-        SqlReplica.layer({
-          ...clientHistory,
-          definition,
-          evolution,
-          clientId,
-          initialSpaces: [spaceId],
-          retryDelay: "1 second",
-          maximumRetryDelay: "4 seconds"
-        }).pipe(
-          Layer.provide(harness.handlers),
-          Layer.provideMerge(harness.database),
-          Layer.provide(harness.live)
-        )
-      )
+      const replicaContext = yield* Layer.build(harness.replicaLayer("4 seconds"))
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
@@ -581,21 +580,7 @@ describe("WebSocket synchronization", () => {
   it.effect("resumes synchronization after a credential refresh without rebuilding the replica", () =>
     Effect.gen(function*() {
       const harness = yield* makeLifecycleHarness()
-      const replicaContext = yield* Layer.build(
-        SqlReplica.layer({
-          ...clientHistory,
-          definition,
-          evolution,
-          clientId,
-          initialSpaces: [spaceId],
-          retryDelay: "1 second",
-          maximumRetryDelay: "4 seconds"
-        }).pipe(
-          Layer.provide(harness.handlers),
-          Layer.provideMerge(harness.database),
-          Layer.provide(harness.live)
-        )
-      )
+      const replicaContext = yield* Layer.build(harness.replicaLayer("4 seconds"))
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
@@ -630,21 +615,7 @@ describe("WebSocket synchronization", () => {
   it.effect("backs off an unavailable authenticator and recovers", () =>
     Effect.gen(function*() {
       const harness = yield* makeLifecycleHarness()
-      const replicaContext = yield* Layer.build(
-        SqlReplica.layer({
-          ...clientHistory,
-          definition,
-          evolution,
-          clientId,
-          initialSpaces: [spaceId],
-          retryDelay: "1 second",
-          maximumRetryDelay: "2 seconds"
-        }).pipe(
-          Layer.provide(harness.handlers),
-          Layer.provideMerge(harness.database),
-          Layer.provide(harness.live)
-        )
-      )
+      const replicaContext = yield* Layer.build(harness.replicaLayer("2 seconds"))
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)

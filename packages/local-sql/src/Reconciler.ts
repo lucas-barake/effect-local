@@ -101,10 +101,14 @@ const isTransientFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "ServerUnavailable" ||
   error._tag === "OperationTimeout"
 
-const cappedRetryDelay = (space: ManagedState) =>
+const cappedRetryDelay = (
+  retryDelayMillis: number,
+  maximumRetryDelayMillis: number,
+  retryAttempt: number
+) =>
   Math.min(
-    space.maximumRetryDelayMillis,
-    space.retryDelayMillis * 2 ** Math.min(space.retryAttempt, 52)
+    maximumRetryDelayMillis,
+    retryDelayMillis * 2 ** Math.min(retryAttempt, 52)
   )
 
 export const makeManager = (options: {
@@ -203,7 +207,11 @@ export const makeManager = (options: {
 
     const scheduleRetry = (space: ManagedState) =>
       Effect.gen(function*() {
-        const delay = cappedRetryDelay(space)
+        const delay = cappedRetryDelay(
+          space.retryDelayMillis,
+          space.maximumRetryDelayMillis,
+          space.retryAttempt
+        )
         space.retryAttempt += 1
         space.retrying = true
         yield* FiberMap.run(
@@ -334,10 +342,7 @@ export const makeManager = (options: {
               }),
               Effect.matchEffect({
                 onSuccess: () => {
-                  const delay = Math.min(
-                    maximumRetryDelayMillis,
-                    retryDelayMillis * 2 ** Math.min(watchAttempt, 52)
-                  )
+                  const delay = cappedRetryDelay(retryDelayMillis, maximumRetryDelayMillis, watchAttempt)
                   watchAttempt += 1
                   return Effect.sleep(delay).pipe(Effect.andThen(watch()))
                 },
@@ -357,10 +362,7 @@ export const makeManager = (options: {
                     )
                   } else if (isTransientFailure(error)) {
                     policy = Effect.suspend(() => {
-                      const delay = Math.min(
-                        maximumRetryDelayMillis,
-                        retryDelayMillis * 2 ** Math.min(watchAttempt, 52)
-                      )
+                      const delay = cappedRetryDelay(retryDelayMillis, maximumRetryDelayMillis, watchAttempt)
                       watchAttempt += 1
                       return Effect.sleep(delay).pipe(Effect.andThen(watch()))
                     })
@@ -643,10 +645,7 @@ export const layerInMemoryScheduler = (
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
       let retryAttempt = 0
       const retryAfterBackoff = Effect.suspend(() => {
-        const delay = Math.min(
-          maximumRetryDelayMillis,
-          retryDelayMillis * 2 ** Math.min(retryAttempt, 52)
-        )
+        const delay = cappedRetryDelay(retryDelayMillis, maximumRetryDelayMillis, retryAttempt)
         retryAttempt += 1
         return Effect.sleep(delay).pipe(Effect.andThen(notify))
       })
@@ -729,10 +728,7 @@ export const layerInMemoryScheduler = (
                   )
                 }
                 if (!isTransientFailure(error)) return reconciliation.failed(error)
-                const delay = Math.min(
-                  maximumRetryDelayMillis,
-                  retryDelayMillis * 2 ** Math.min(watchAttempt, 52)
-                )
+                const delay = cappedRetryDelay(retryDelayMillis, maximumRetryDelayMillis, watchAttempt)
                 watchAttempt += 1
                 return reconciliation.failed(error).pipe(
                   Effect.andThen(Effect.logWarning("Sync watch ended", error)),
@@ -741,10 +737,7 @@ export const layerInMemoryScheduler = (
                 )
               },
               onSuccess: () => {
-                const delay = Math.min(
-                  maximumRetryDelayMillis,
-                  retryDelayMillis * 2 ** Math.min(watchAttempt, 52)
-                )
+                const delay = cappedRetryDelay(retryDelayMillis, maximumRetryDelayMillis, watchAttempt)
                 watchAttempt += 1
                 return Effect.sleep(delay).pipe(Effect.andThen(watch()))
               }

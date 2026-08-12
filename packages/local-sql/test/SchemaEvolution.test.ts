@@ -1517,7 +1517,6 @@ describe("client schema evolution", () => {
       const failSubmit = yield* Ref.make(true)
       const failOnce = SyncEngine.SyncEngine.of({
         ...live,
-        waitForCredentialChange: () => Effect.never,
         submit: (request) =>
           Effect.gen(function*() {
             const shouldFail = yield* Ref.get(failSubmit)

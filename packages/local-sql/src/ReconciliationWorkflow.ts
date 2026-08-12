@@ -433,46 +433,37 @@ const layerSchedulerWithConfiguration = (
       >(Option.none())
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
-      const supervisorRetryAttempt = yield* Ref.make(0)
-      const watchRetryAttempt = yield* Ref.make(0)
-      interface AuthenticationPause {
-        readonly generation: number
-        readonly gate: Deferred.Deferred<void>
-      }
-      const authenticationPause = yield* Ref.make<Option.Option<AuthenticationPause>>(Option.none())
+      const authenticationPause = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(Option.none())
       const awaitAuthenticationChange = Ref.get(authenticationPause).pipe(
         Effect.flatMap(Option.match({
           onNone: () => Effect.void,
-          onSome: (pause) => Deferred.await(pause.gate)
+          onSome: Deferred.await
         }))
       )
       const pauseForCredential = (generation: number) =>
         Effect.uninterruptibleMask((restore) =>
           Effect.gen(function*() {
-            const candidate = {
-              generation,
-              gate: yield* Deferred.make<void>()
-            }
+            const candidate = yield* Deferred.make<void>()
             const admitted = yield* Ref.modify(authenticationPause, (
               current
             ): readonly [
-              { readonly pause: AuthenticationPause; readonly owner: boolean },
-              Option.Option<AuthenticationPause>
+              { readonly gate: Deferred.Deferred<void>; readonly owner: boolean },
+              Option.Option<Deferred.Deferred<void>>
             ] =>
               Option.match(current, {
-                onNone: () => [{ pause: candidate, owner: true }, Option.some(candidate)],
-                onSome: (pause) => [{ pause, owner: false }, Option.some(pause)]
+                onNone: () => [{ gate: candidate, owner: true }, Option.some(candidate)],
+                onSome: (gate) => [{ gate, owner: false }, Option.some(gate)]
               }))
             if (admitted.owner) {
-              yield* remote.waitForCredentialChange(admitted.pause.generation).pipe(
+              yield* remote.waitForCredentialChange(generation).pipe(
                 Effect.andThen(Effect.uninterruptible(Effect.gen(function*() {
                   const owned = yield* Ref.modify(authenticationPause, (current) => {
-                    if (Option.isSome(current) && current.value === admitted.pause) {
+                    if (Option.isSome(current) && current.value === admitted.gate) {
                       return [true, Option.none()] as const
                     }
                     return [false, current] as const
                   })
-                  if (owned) yield* Deferred.succeed(admitted.pause.gate, undefined)
+                  if (owned) yield* Deferred.succeed(admitted.gate, undefined)
                 }))),
                 Effect.catchCause((cause) => {
                   if (Cause.hasInterruptsOnly(cause)) return Effect.void
@@ -481,11 +472,12 @@ const layerSchedulerWithConfiguration = (
                 Effect.forkScoped
               )
             }
-            yield* restore(Deferred.await(admitted.pause.gate))
+            yield* restore(Deferred.await(admitted.gate))
           })
         )
 
       const supervise = Effect.gen(function*() {
+        let retryAttempt = 0
         while (true) {
           yield* Queue.take(wake)
           yield* awaitAuthenticationChange
@@ -510,7 +502,7 @@ const layerSchedulerWithConfiguration = (
               yield* workflow.execute(payload).pipe(
                 Effect.ensuring(Ref.set(activeExecution, Option.none()))
               )
-              yield* Ref.set(supervisorRetryAttempt, 0)
+              retryAttempt = 0
             }
           }).pipe(Effect.result)
           if (Result.isSuccess(result)) continue
@@ -522,7 +514,7 @@ const layerSchedulerWithConfiguration = (
               return
             }
             yield* pauseForCredential(error.credentialGeneration)
-            yield* Ref.set(supervisorRetryAttempt, 0)
+            retryAttempt = 0
             yield* requestAndNotify
             continue
           }
@@ -531,9 +523,9 @@ const layerSchedulerWithConfiguration = (
             error._tag === "ServerUnavailable" ||
             error._tag === "OperationTimeout"
           ) {
-            const attempt = yield* Ref.getAndUpdate(supervisorRetryAttempt, (current) => current + 1)
+            retryAttempt += 1
             yield* Effect.logWarning("Reconciliation supervisor will retry", error)
-            yield* Effect.sleep(retryMillis(configuration, attempt + 1))
+            yield* Effect.sleep(retryMillis(configuration, retryAttempt))
             yield* requestAndNotify
             continue
           }
@@ -544,6 +536,7 @@ const layerSchedulerWithConfiguration = (
 
       const supervisorFiber = yield* Effect.forkScoped(supervise)
       const watch = Effect.gen(function*() {
+        let retryAttempt = 0
         while (true) {
           yield* awaitAuthenticationChange
           const result = yield* Stream.unwrap(local.replicationState.pipe(
@@ -558,13 +551,16 @@ const layerSchedulerWithConfiguration = (
               })
             )
           )).pipe(
-            Stream.runForEach(() => Ref.set(watchRetryAttempt, 0).pipe(Effect.andThen(requestAndNotify))),
+            Stream.runForEach(() => {
+              retryAttempt = 0
+              return requestAndNotify
+            }),
             Effect.result
           )
           if (Result.isSuccess(result)) {
-            const attempt = yield* Ref.getAndUpdate(watchRetryAttempt, (current) => current + 1)
+            retryAttempt += 1
             yield* requestAndNotify
-            yield* Effect.sleep(retryMillis(configuration, attempt + 1))
+            yield* Effect.sleep(retryMillis(configuration, retryAttempt))
             continue
           }
           const error = result.failure
@@ -575,7 +571,7 @@ const layerSchedulerWithConfiguration = (
               return
             }
             yield* pauseForCredential(error.credentialGeneration)
-            yield* Ref.set(watchRetryAttempt, 0)
+            retryAttempt = 0
             continue
           }
           if (
@@ -583,9 +579,9 @@ const layerSchedulerWithConfiguration = (
             error._tag === "ServerUnavailable" ||
             error._tag === "OperationTimeout"
           ) {
-            const attempt = yield* Ref.getAndUpdate(watchRetryAttempt, (current) => current + 1)
+            retryAttempt += 1
             yield* Effect.logWarning("Sync watch will retry", error)
-            yield* Effect.sleep(retryMillis(configuration, attempt + 1))
+            yield* Effect.sleep(retryMillis(configuration, retryAttempt))
             yield* notify
             continue
           }
