@@ -1472,6 +1472,10 @@ const serverV7 = makeMigration({
       ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
       change_json TEXT NOT NULL CHECK (json_valid(change_json)),
       entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
+      source_model TEXT NOT NULL,
+      source_model_version INTEGER NOT NULL CHECK (source_model_version > 0),
+      source_entity_key TEXT NOT NULL,
+      source_value_json TEXT NOT NULL CHECK (json_valid(source_value_json)),
       PRIMARY KEY (snapshot_id, ordinal)
     )`,
     `CREATE INDEX effect_local_server_replication_view_entities_identity

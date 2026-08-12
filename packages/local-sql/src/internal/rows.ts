@@ -338,6 +338,16 @@ export const ScopedSnapshotEntryRow = Schema.Struct({
   entry_bytes: PositiveInt
 })
 
+export const ServerScopedSnapshotEntryRow = Schema.Struct({
+  ordinal: NonNegativeInt,
+  change_json: Schema.String,
+  entry_bytes: PositiveInt,
+  source_model: Schema.String,
+  source_model_version: Identity.SchemaVersion,
+  source_entity_key: Schema.String,
+  source_value_json: Schema.String
+})
+
 export const ChangeRow = Schema.Struct({
   mutation_id: Identity.MutationId,
   changes_json: Schema.String

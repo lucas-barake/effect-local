@@ -56,6 +56,16 @@ interface MaterializedEntity {
   readonly valueJson: string
   readonly sourceEntity: Protocol.EntityKey
   readonly sourceValue: typeof Schema.Json.Type
+  readonly sourceEntityKey: string
+  readonly sourceValueJson: string
+}
+
+interface StoredSnapshotEntry {
+  readonly entry: Protocol.SnapshotEntry
+  readonly sourceModel: string
+  readonly sourceIdentity: string
+  readonly sourceEntityKey: string
+  readonly sourceValueJson: string
 }
 
 const identityOf = (model: string, entityKey: string) => `${model}\u0000${entityKey}`
@@ -77,6 +87,18 @@ export const make = (options: Options) => {
       sql`SELECT model, model_version, entity_key, value_json, entity_bytes
       FROM effect_local_server_entities WHERE space_id = ${spaceId}
       ORDER BY model, entity_key LIMIT ${limit}`
+  })
+  const findEntitiesByIdentity = SqlSchema.findAll({
+    Request: Schema.Struct({ spaceId: Identity.SpaceId, entitiesJson: Schema.String }),
+    Result: Rows.ServerEntityRow,
+    execute: ({ spaceId, entitiesJson }) =>
+      sql`SELECT entity.model, entity.model_version, entity.entity_key, entity.value_json, entity.entity_bytes
+      FROM effect_local_server_entities AS entity
+      WHERE entity.space_id = ${spaceId} AND EXISTS(
+        SELECT 1 FROM json_each(${entitiesJson}) AS requested
+        WHERE entity.model = json_extract(requested.value, '$.model')
+          AND entity.entity_key = json_extract(requested.value, '$.key')
+      ) ORDER BY entity.model, entity.entity_key`
   })
   const findView = SqlSchema.findOneOption({
     Request: Schema.Struct({ spaceId: Identity.SpaceId, clientId: Identity.ClientId }),
@@ -118,13 +140,28 @@ export const make = (options: Options) => {
         view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest
       FROM effect_local_server_scoped_snapshots WHERE snapshot_id = ${snapshotId}`
   })
-  const findSnapshotEntries = SqlSchema.findAll({
-    Request: Identity.SnapshotId,
-    Result: Rows.ScopedSnapshotEntryRow,
-    execute: (snapshotId) =>
-      sql`SELECT ordinal, change_json, entry_bytes
+  const findClientSnapshot = SqlSchema.findOneOption({
+    Request: Schema.Struct({ spaceId: Identity.SpaceId, clientId: Identity.ClientId }),
+    Result: Rows.ScopedSnapshotManifestRow,
+    execute: ({ spaceId, clientId }) =>
+      sql`SELECT snapshot_id, space_id, client_id, principal_digest, definition_hash,
+        schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id,
+        view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest
+      FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId} AND client_id = ${clientId}`
+  })
+  const findSnapshotEntryPage = SqlSchema.findAll({
+    Request: Schema.Struct({
+      snapshotId: Identity.SnapshotId,
+      afterOrdinal: Schema.Int,
+      limit: Schema.Int
+    }),
+    Result: Rows.ServerScopedSnapshotEntryRow,
+    execute: ({ snapshotId, afterOrdinal, limit }) =>
+      sql`SELECT ordinal, change_json, entry_bytes, source_model, source_model_version,
+        source_entity_key, source_value_json
       FROM effect_local_server_scoped_snapshot_entries
-      WHERE snapshot_id = ${snapshotId} ORDER BY ordinal`
+      WHERE snapshot_id = ${snapshotId} AND ordinal > ${afterOrdinal}
+      ORDER BY ordinal LIMIT ${limit}`
   })
 
   const digest = (value: unknown) => Canonical.digest(value).pipe(Effect.provideService(Crypto.Crypto, options.crypto))
@@ -242,7 +279,9 @@ export const make = (options: Options) => {
           value,
           valueJson,
           sourceEntity: entity,
-          sourceValue: value
+          sourceValue: value,
+          sourceEntityKey: keyJson,
+          sourceValueJson: valueJson
         })
       }
       return entities
@@ -254,16 +293,12 @@ export const make = (options: Options) => {
       Effect.flatMap((rows) => decodeAuthoritative(spaceId, rows))
     )
 
-  const projectVisible = (
-    request: Protocol.PullRequest | Protocol.BootstrapRequest,
-    principal: typeof Schema.Json.Type,
+  const projectAll = (
     source: ReadonlyMap<string, MaterializedEntity>,
     targetDefinition: Definition.Any
   ) =>
     Effect.gen(function*() {
-      const selected = new Set(request.scope.models)
       const all = new Map<string, MaterializedEntity>()
-      const target = new Map<string, MaterializedEntity>()
       for (const candidate of source.values()) {
         const projected = yield* options.projectEntity(targetDefinition, candidate.entity, candidate.value)
         if (Option.isNone(projected)) continue
@@ -282,13 +317,35 @@ export const make = (options: Options) => {
           value: projected.value.value,
           valueJson: yield* Codec.stringify(projected.value.value),
           sourceEntity: candidate.entity,
-          sourceValue: candidate.value
+          sourceValue: candidate.value,
+          sourceEntityKey: candidate.entityKey,
+          sourceValueJson: candidate.valueJson
         }
         all.set(identity, materialized)
+      }
+      return all
+    })
+
+  const projectVisible = (
+    request: Protocol.PullRequest | Protocol.BootstrapRequest,
+    principal: typeof Schema.Json.Type,
+    source: ReadonlyMap<string, MaterializedEntity>,
+    targetDefinition: Definition.Any
+  ) =>
+    Effect.gen(function*() {
+      const all = yield* projectAll(source, targetDefinition)
+      const selected = new Set(request.scope.models)
+      const target = new Map<string, MaterializedEntity>()
+      for (const materialized of all.values()) {
         if (!selected.has(materialized.entity.model)) continue
-        if (yield* options.authorization.entity(request, principal, candidate.entity, candidate.value)) {
-          target.set(identity, materialized)
-        }
+        if (
+          yield* options.authorization.entity(
+            request,
+            principal,
+            materialized.sourceEntity,
+            materialized.sourceValue
+          )
+        ) target.set(materialized.identity, materialized)
       }
       return { all, target }
     })
@@ -310,21 +367,48 @@ export const make = (options: Options) => {
       digest: row.digest
     })
 
-  const decodeSnapshotEntries = (rows: ReadonlyArray<typeof Rows.ScopedSnapshotEntryRow.Type>) =>
+  const decodeSnapshotEntries = (rows: ReadonlyArray<typeof Rows.ServerScopedSnapshotEntryRow.Type>) =>
     Effect.forEach(rows, (row) =>
       Codec.parse(row.change_json).pipe(
         Effect.flatMap((value) => Codec.decode(Protocol.SnapshotEntry, value)),
-        Effect.flatMap((entry) => {
-          if (
-            entry.ordinal !== row.ordinal || row.entry_bytes !== entry.entryBytes ||
-            entry.entryBytes !== Protocol.encodedBytes(entry.change)
-          ) {
-            return Effect.fail(
-              new ReplicaError.StorageCorrupt({ message: `Scoped snapshot entry ${row.ordinal} is corrupt` })
+        Effect.flatMap((entry) =>
+          Effect.gen(function*() {
+            if (
+              entry.ordinal !== row.ordinal || row.entry_bytes !== entry.entryBytes ||
+              entry.entryBytes !== Protocol.encodedBytes(entry.change)
+            ) {
+              return yield* Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: `Scoped snapshot entry ${row.ordinal} is corrupt` })
+              )
+            }
+            const model = options.definition.modelByName.get(row.source_model)
+            if (model === undefined || model.version !== row.source_model_version) {
+              return yield* new ReplicaError.StorageCorrupt({
+                message: `Scoped snapshot entry ${row.ordinal} has invalid source metadata`
+              })
+            }
+            const sourceKey = yield* Codec.parse(row.source_entity_key).pipe(
+              Effect.flatMap((value) => Codec.decode(model.key, value))
             )
-          }
-          return Effect.succeed(entry)
-        })
+            const sourceValue = yield* Codec.parse(row.source_value_json).pipe(
+              Effect.flatMap((value) => Codec.decode(model.schema, value))
+            )
+            const sourceEntityKey = yield* Codec.stringify(sourceKey)
+            const sourceValueJson = yield* Codec.stringify(sourceValue)
+            if (sourceEntityKey !== row.source_entity_key || sourceValueJson !== row.source_value_json) {
+              return yield* new ReplicaError.StorageCorrupt({
+                message: `Scoped snapshot entry ${row.ordinal} has noncanonical source metadata`
+              })
+            }
+            return {
+              entry,
+              sourceModel: row.source_model,
+              sourceIdentity: identityOf(row.source_model, sourceEntityKey),
+              sourceEntityKey,
+              sourceValueJson
+            } satisfies StoredSnapshotEntry
+          })
+        )
       ))
 
   const deleteSnapshot = (spaceId: Identity.SpaceId, clientId: Identity.ClientId) =>
@@ -341,26 +425,22 @@ export const make = (options: Options) => {
     request: Protocol.PullRequest | Protocol.BootstrapRequest,
     principal: Protocol.MutationDigest,
     cursor: Protocol.ReplicationCursor,
-    changes: ReadonlyArray<Protocol.ViewChange>
+    entities: ReadonlyArray<MaterializedEntity>
   ) =>
     Effect.gen(function*() {
       yield* sql`DELETE FROM effect_local_server_replication_view_entities
         WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}`
-      const rows = yield* Effect.forEach(changes, (change) =>
-        Effect.gen(function*() {
-          if (change._tag !== "Upsert") return undefined
-          return {
-            space_id: request.spaceId,
-            client_id: request.clientId,
-            principal_digest: principal,
-            view_id: cursor.viewId,
-            model: change.entity.model,
-            model_version: change.entity.modelVersion,
-            entity_key: yield* Codec.stringify(change.entity.key),
-            disposition: change._tag,
-            value_json: yield* Codec.stringify(change.value)
-          }
-        })).pipe(Effect.map((values) => values.filter((value) => value !== undefined)))
+      const rows = entities.map((entity) => ({
+        space_id: request.spaceId,
+        client_id: request.clientId,
+        principal_digest: principal,
+        view_id: cursor.viewId,
+        model: entity.entity.model,
+        model_version: entity.entity.modelVersion,
+        entity_key: entity.entityKey,
+        disposition: "Upsert",
+        value_json: entity.valueJson
+      }))
       for (let offset = 0; offset < rows.length; offset += 100) {
         yield* sql`INSERT INTO effect_local_server_replication_view_entities
           ${sql.insert(rows.slice(offset, offset + 100))}`
@@ -388,17 +468,14 @@ export const make = (options: Options) => {
       }
       const source = yield* authoritative(request.spaceId)
       const projected = yield* projectVisible({ ...request, scope: normalized }, principal, source, targetDefinition)
-      const changes: Array<Protocol.ViewChange> = []
-      for (const entity of projected.target.values()) {
-        changes.push(Protocol.Upsert.make({ entity: entity.entity, value: entity.value }))
-      }
-      const orderedChanges = changes.toSorted((left, right) => {
-        const leftKey = identityOf(left.entity.model, Canonical.stringify(left.entity.key))
-        const rightKey = identityOf(right.entity.model, Canonical.stringify(right.entity.key))
-        if (leftKey < rightKey) return -1
-        if (leftKey > rightKey) return 1
+      const visibleEntities = Array.from(projected.target.values())
+      const orderedEntities = visibleEntities.toSorted((left, right) => {
+        if (left.identity < right.identity) return -1
+        if (left.identity > right.identity) return 1
         return 0
       })
+      const orderedChanges = orderedEntities
+        .map((entity) => Protocol.Upsert.make({ entity: entity.entity, value: entity.value }))
       const viewId = yield* Identity.makeReplicationViewId.pipe(
         Effect.provideService(Crypto.Crypto, options.crypto),
         Effect.mapError((cause) => new ReplicaError.StorageUnavailable({ cause }))
@@ -448,7 +525,7 @@ export const make = (options: Options) => {
           scope_digest = excluded.scope_digest, definition_hash = excluded.definition_hash,
           schema_version = excluded.schema_version, schema_hash = excluded.schema_hash,
           server_sequence = excluded.server_sequence`
-      yield* replaceViewEntities(request, principalHash, cursor, changes)
+      yield* replaceViewEntities(request, principalHash, cursor, visibleEntities)
       yield* sql`INSERT INTO effect_local_server_scoped_snapshots
         (snapshot_id, space_id, client_id, principal_digest, definition_hash, schema_version,
           schema_hash, scope_json, scope_digest, scope_generation, view_id, view_revision,
@@ -463,7 +540,11 @@ export const make = (options: Options) => {
           snapshot_id: snapshotId,
           ordinal: entry.ordinal,
           change_json: changeJson,
-          entry_bytes: entry.entryBytes
+          entry_bytes: entry.entryBytes,
+          source_model: orderedEntities[entry.ordinal].sourceEntity.model,
+          source_model_version: orderedEntities[entry.ordinal].sourceEntity.modelVersion,
+          source_entity_key: orderedEntities[entry.ordinal].sourceEntityKey,
+          source_value_json: orderedEntities[entry.ordinal].sourceValueJson
         }))))
       for (let offset = 0; offset < entryRows.length; offset += 100) {
         yield* sql`INSERT INTO effect_local_server_scoped_snapshot_entries
@@ -499,6 +580,12 @@ export const make = (options: Options) => {
         })
       )
     )
+
+  const existingBootstrapRequired = (snapshot: typeof Rows.ScopedSnapshotManifestRow.Type) =>
+    Protocol.BootstrapRequired.make({
+      manifest: manifestFromRow(snapshot),
+      serverSchema: options.definition.schemaIdentity
+    })
 
   const pageFromRow = (row: typeof Rows.ReplicationPageRow.Type) =>
     Codec.parse(row.changes_json).pipe(
@@ -726,6 +813,28 @@ export const make = (options: Options) => {
         })
       }
       if (
+        request.cursor === null && Option.isSome(stored) && stored.value.principal_digest === principalHash &&
+        stored.value.definition_hash === targetDefinition.hash &&
+        stored.value.schema_version === request.schema.version && stored.value.schema_hash === request.schema.hash &&
+        stored.value.scope_generation === request.scopeGeneration && stored.value.scope_digest === normalizedDigest
+      ) {
+        const snapshot = yield* findClientSnapshot({
+          spaceId: request.spaceId,
+          clientId: request.clientId
+        }).pipe(Effect.mapError(StorageUnavailable.make))
+        if (
+          Option.isSome(snapshot) && snapshot.value.principal_digest === principalHash &&
+          snapshot.value.definition_hash === targetDefinition.hash &&
+          snapshot.value.schema_version === request.schema.version &&
+          snapshot.value.schema_hash === request.schema.hash &&
+          snapshot.value.scope_generation === request.scopeGeneration &&
+          snapshot.value.scope_digest === normalizedDigest && snapshot.value.view_id === stored.value.view_id &&
+          snapshot.value.view_revision === stored.value.view_revision &&
+          snapshot.value.server_sequence === space.next_server_sequence - 1 &&
+          snapshot.value.terminal_sequence === space.next_terminal_sequence - 1
+        ) return existingBootstrapRequired(snapshot.value)
+      }
+      if (
         request.cursor === null || Option.isNone(stored) || stored.value.principal_digest !== principalHash ||
         stored.value.definition_hash !== targetDefinition.hash ||
         stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
@@ -825,26 +934,93 @@ export const make = (options: Options) => {
         return yield* new ReplicaError.StorageCorrupt({ message: "Scoped snapshot disappeared" })
       }
       let row = stored.value
-      let rows = yield* findSnapshotEntries(row.snapshot_id).pipe(Effect.mapError(StorageUnavailable.make))
-      let entries = yield* decodeSnapshotEntries(rows)
-      const source = yield* authoritative(request.spaceId)
-      const projected = yield* projectVisible({ ...request, scope: normalized }, principal, source, targetDefinition)
+      let afterOrdinal = request.afterOrdinal
+      if (afterOrdinal >= row.entry_count) {
+        return yield* new ReplicaError.CursorGap({
+          expected: Math.max(-1, row.entry_count - 1),
+          actual: afterOrdinal
+        })
+      }
+      const loadEntries = (snapshot: typeof Rows.ScopedSnapshotManifestRow.Type, after: number) =>
+        findSnapshotEntryPage({
+          snapshotId: snapshot.snapshot_id,
+          afterOrdinal: after,
+          limit: request.limit
+        }).pipe(
+          Effect.mapError(StorageUnavailable.make),
+          Effect.flatMap(decodeSnapshotEntries),
+          Effect.flatMap((entries) => {
+            for (let index = 0; index < entries.length; index++) {
+              if (entries[index].entry.ordinal !== after + index + 1) {
+                return Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Scoped snapshot page contains an ordinal gap" })
+                )
+              }
+            }
+            if (entries.length === 0 && after + 1 < snapshot.entry_count) {
+              return Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Scoped snapshot page is missing durable entries" })
+              )
+            }
+            return Effect.succeed(entries)
+          })
+        )
+      const selectEntries = (
+        snapshot: typeof Rows.ScopedSnapshotManifestRow.Type,
+        after: number,
+        entries: ReadonlyArray<StoredSnapshotEntry>
+      ) => {
+        let lower = 0
+        let upper = Math.min(request.limit, entries.length)
+        while (lower < upper) {
+          const length = Math.ceil((lower + upper) / 2)
+          const candidate = Protocol.BootstrapPage.make({
+            manifest: manifestFromRow(snapshot),
+            entries: entries.slice(0, length).map((snapshotEntry) => snapshotEntry.entry),
+            hasMore: after + length + 1 < snapshot.entry_count,
+            serverSchema: options.definition.schemaIdentity
+          })
+          if (Protocol.encodedBytes(candidate) <= options.maximumBootstrapPageBytes) lower = length
+          else upper = length - 1
+        }
+        return entries.slice(0, lower)
+      }
+      let remaining = yield* loadEntries(row, afterOrdinal)
+      let selected = selectEntries(row, afterOrdinal, remaining)
+      const sourceRows = yield* findEntitiesByIdentity({
+        spaceId: request.spaceId,
+        entitiesJson: yield* Codec.stringify(selected.map((snapshotEntry) => ({
+          model: snapshotEntry.sourceModel,
+          key: snapshotEntry.sourceEntityKey
+        })))
+      }).pipe(Effect.mapError(StorageUnavailable.make))
+      const source = yield* decodeAuthoritative(request.spaceId, sourceRows)
       let valid = true
-      for (const entry of entries) {
-        const key = yield* Codec.stringify(entry.change.entity.key)
-        const current = projected.all.get(identityOf(entry.change.entity.model, key))
+      for (const storedEntry of selected) {
+        const { entry } = storedEntry
+        const current = source.get(storedEntry.sourceIdentity)
+        let projected = Option.none<{ readonly entity: Protocol.EntityKey; readonly value: typeof Schema.Json.Type }>()
+        if (current !== undefined) {
+          projected = yield* options.projectEntity(targetDefinition, current.entity, current.value)
+        }
+        let projectedKey: string | undefined
+        if (Option.isSome(projected)) {
+          projectedKey = yield* Codec.stringify(projected.value.entity.key)
+        }
         if (
           entry.change._tag !== "Upsert" || current === undefined ||
-          !normalized.models.includes(current.entity.model) ||
-          entry.change.entity.modelVersion !== current.entity.modelVersion ||
-          (yield* Codec.stringify(entry.change.value)) !== current.valueJson ||
+          current.valueJson !== storedEntry.sourceValueJson || Option.isNone(projected) ||
+          !normalized.models.includes(projected.value.entity.model) ||
+          entry.change.entity.model !== projected.value.entity.model ||
+          entry.change.entity.modelVersion !== projected.value.entity.modelVersion ||
+          (yield* Codec.stringify(entry.change.entity.key)) !== projectedKey ||
+          (yield* Codec.stringify(entry.change.value)) !== (yield* Codec.stringify(projected.value.value)) ||
           !(yield* options.authorization.entity(request, principal, current.sourceEntity, current.sourceValue))
         ) {
           valid = false
           break
         }
       }
-      let afterOrdinal = request.afterOrdinal
       if (!valid) {
         const manifest = yield* createSnapshot({ ...request, scope: normalized }, principal, principalHash)
         const replacement = yield* findSnapshot(manifest.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
@@ -852,31 +1028,10 @@ export const make = (options: Options) => {
           return yield* new ReplicaError.StorageCorrupt({ message: "Replacement scoped snapshot disappeared" })
         }
         row = replacement.value
-        rows = yield* findSnapshotEntries(row.snapshot_id).pipe(Effect.mapError(StorageUnavailable.make))
-        entries = yield* decodeSnapshotEntries(rows)
         afterOrdinal = -1
+        remaining = yield* loadEntries(row, afterOrdinal)
+        selected = selectEntries(row, afterOrdinal, remaining)
       }
-      if (afterOrdinal >= entries.length) {
-        return yield* new ReplicaError.CursorGap({
-          expected: Math.max(-1, entries.length - 1),
-          actual: afterOrdinal
-        })
-      }
-      const remaining = entries.slice(afterOrdinal + 1)
-      let lower = 0
-      let upper = Math.min(request.limit, remaining.length)
-      while (lower < upper) {
-        const length = Math.ceil((lower + upper) / 2)
-        const candidate = Protocol.BootstrapPage.make({
-          manifest: manifestFromRow(row),
-          entries: remaining.slice(0, length),
-          hasMore: length < remaining.length,
-          serverSchema: options.definition.schemaIdentity
-        })
-        if (Protocol.encodedBytes(candidate) <= options.maximumBootstrapPageBytes) lower = length
-        else upper = length - 1
-      }
-      const selected = remaining.slice(0, lower)
       if (remaining.length > 0 && selected.length === 0) {
         return yield* new ReplicaError.CapacityExceeded({
           resource: "bootstrap page bytes",
@@ -885,8 +1040,8 @@ export const make = (options: Options) => {
       }
       return Protocol.BootstrapPage.make({
         manifest: manifestFromRow(row),
-        entries: selected,
-        hasMore: selected.length < remaining.length,
+        entries: selected.map((snapshotEntry) => snapshotEntry.entry),
+        hasMore: afterOrdinal + selected.length + 1 < row.entry_count,
         serverSchema: options.definition.schemaIdentity
       })
     })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))

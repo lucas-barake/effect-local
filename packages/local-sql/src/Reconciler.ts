@@ -388,7 +388,7 @@ export const layerOnePass = (
             afterOrdinal = firstPage.entries.length - 1
           }
           return yield* continueBootstrap(firstPage.manifest, afterOrdinal)
-        })
+        }).pipe(Effect.tapErrorTag("AuthorizationDenied", () => local.revokeReplication))
 
       const catchUp = Effect.gen(function*() {
         while (true) {
@@ -410,7 +410,7 @@ export const layerOnePass = (
           yield* local.applyViewPage(result)
           if (!result.hasMore) return
         }
-      })
+      }).pipe(Effect.tapErrorTag("AuthorizationDenied", () => local.revokeReplication))
 
       const submitPending = Effect.gen(function*() {
         yield* local.settleReceipts
@@ -453,10 +453,6 @@ export const layerOnePass = (
         yield* local.settleReceipts
         yield* succeeded
       })).pipe(
-        Effect.tapError((error) => {
-          if (error._tag === "AuthorizationDenied") return local.revokeReplication
-          return Effect.void
-        }),
         Effect.tapError(failed),
         Effect.withSpan("Reconciliation.sync")
       )

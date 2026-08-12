@@ -2294,9 +2294,10 @@ export const layer = (
               const identity = `${row.model}\\u0000${row.entity_key}`
               if (!stagedIdentities.has(identity)) {
                 yield* sql`INSERT INTO effect_local_client_retractions
-                  (generation, model, model_version, entity_key)
-                  VALUES (${activeGeneration}, ${row.model}, ${row.model_version}, ${row.entity_key})
-                  ON CONFLICT (generation, model, entity_key) DO UPDATE SET
+                  (space_id, generation, model, model_version, entity_key)
+                  VALUES (${options.spaceId}, ${activeGeneration}, ${row.model}, ${row.model_version},
+                    ${row.entity_key})
+                  ON CONFLICT (space_id, generation, model, entity_key) DO UPDATE SET
                     model_version = excluded.model_version`
               }
             }
@@ -2445,6 +2446,11 @@ export const layer = (
             if (contentBytes !== page.contentBytes || pageDigest !== page.digest) {
               return yield* new ReplicaError.ProtocolInvalid({
                 message: "Replication page does not match its byte metadata or digest"
+              })
+            }
+            if (!page.hasMore && page.serverSequence < current.server_cursor) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: "Replication page regresses the durable server watermark"
               })
             }
             for (const change of page.changes) {

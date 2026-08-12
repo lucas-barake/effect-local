@@ -1594,15 +1594,21 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         Request: Schema.Struct({
           spaceId: Identity.SpaceId,
           clientId: Identity.ClientId,
+          principalDigest: Protocol.MutationDigest,
           entitiesJson: Schema.String
         }),
         Result: Rows.CountRow,
-        execute: ({ spaceId, clientId, entitiesJson }) =>
+        execute: ({ spaceId, clientId, principalDigest, entitiesJson }) =>
           sql`SELECT EXISTS(
             SELECT 1 FROM json_each(${entitiesJson}) AS requested
             WHERE EXISTS(
               SELECT 1 FROM effect_local_server_replication_view_entities AS acknowledged
+              INNER JOIN effect_local_server_replication_views AS current
+                ON current.space_id = acknowledged.space_id AND current.client_id = acknowledged.client_id
+                AND current.principal_digest = acknowledged.principal_digest
+                AND current.view_id = acknowledged.view_id
               WHERE acknowledged.space_id = ${spaceId} AND acknowledged.client_id = ${clientId}
+                AND acknowledged.principal_digest = ${principalDigest}
                 AND acknowledged.model = json_extract(requested.value, '$.model')
                 AND acknowledged.entity_key = json_extract(requested.value, '$.key')
                 AND acknowledged.disposition = 'Upsert'
@@ -1621,9 +1627,14 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             Codec.stringify(change.entity.key).pipe(
               Effect.map((key) => ({ model: change.entity.model, key }))
             ))
+          const principalHash = yield* Canonical.digest({ format: 1, principal }).pipe(
+            Effect.provideService(Crypto.Crypto, crypto),
+            Effect.map((value) => Protocol.MutationDigest.make(value))
+          )
           const acknowledged = yield* countAcknowledgedEntities({
             spaceId: request.spaceId,
             clientId: request.clientId,
+            principalDigest: principalHash,
             entitiesJson: yield* Codec.stringify(identities)
           }).pipe(Effect.mapError(StorageUnavailable.make))
           if (acknowledged.count > 0) return true
