@@ -695,10 +695,24 @@ export const layer = (
         yield* validateFence(yield* meta)
         return (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
       })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-      const refreshPendingMetric = metrics.refreshPending(readPendingCount).pipe(
-        Effect.catchCause((cause): Effect.Effect<void> => {
-          if (Cause.hasInterrupts(cause)) return Effect.interrupt
-          return Effect.logWarning("Client pending metric refresh failed", cause)
+      const initializePendingMetric = (count: number) =>
+        metrics.initializePending(count).pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+            return Effect.logWarning("Client pending metric initialization failed", cause)
+          })
+        )
+      const updatePendingMetric = (delta: number) =>
+        metrics.updatePending(delta).pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+            return Effect.logWarning("Client pending metric update failed", cause)
+          })
+        )
+      const recordBootstrapInstallMetric = metrics.recordBootstrapInstall.pipe(
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+          return Effect.logWarning("Client bootstrap install metric update failed", cause)
         })
       )
       if (
@@ -869,7 +883,7 @@ export const layer = (
           return deletedSettlements
         })).pipe(
           Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
-          Effect.tap(() => refreshPendingMetric)
+          Effect.tap((deletedSettlements) => updatePendingMetric(-deletedSettlements.length))
         )
       }
 
@@ -1831,6 +1845,7 @@ export const layer = (
                 yield* validateNamedReceiptProvenance(receipt)
               }
               const canceledTouched = new Map<string, Protocol.EntityKey>()
+              let pendingDelta = 0
               let canceledReplacement: Option.Option<Quarantine.QuarantinedMutation> = Option.none()
               const intent = yield* findQuarantineResubmission(receipt.mutationId).pipe(
                 Effect.mapError(StorageUnavailable.make)
@@ -1863,9 +1878,10 @@ export const layer = (
                     ${replacement.envelope.sourceSchema.hash}, ${replacement.envelope.mutationVersion},
                     ${yield* Codec.stringify(canceled.rejection)}, ${canceled.targetSchema.version},
                     ${canceled.targetSchema.hash})`
-                  yield* sql`DELETE FROM effect_local_client_pending_data
-                  WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
-                    AND mutation_id = ${replacement.envelope.mutationId}`
+                  const deleted = yield* deletePendingByMutationIds([replacement.envelope.mutationId]).pipe(
+                    Effect.mapError(StorageUnavailable.make)
+                  )
+                  pendingDelta -= deleted.length
                   canceledReplacement = Option.some(canceled)
                   yield* requestProjectionReplay(yield* meta)
                 } else {
@@ -1909,6 +1925,7 @@ export const layer = (
                 ${item.envelope.name}, ${yield* Codec.stringify(item.envelope.payload)}, ${item.envelope.digest},
                 ${item.envelope.digestVersion}, ${item.envelope.sourceSchema.version},
                 ${item.envelope.sourceSchema.hash}, ${item.envelope.mutationVersion}, 'null', '[]', 'Queued', 0)`
+              pendingDelta++
               if ((yield* Protocol.encodedBytesEffect(receipt)) > Protocol.maximumReceiptBytes) {
                 return yield* new ReplicaError.ProtocolInvalid({
                   message: `Receipt ${receipt.mutationId} exceeds the protocol byte limit`
@@ -1927,8 +1944,14 @@ export const layer = (
               WHERE space_id = ${options.spaceId} AND original_mutation_id = ${receipt.mutationId}`
               yield* sql`DELETE FROM effect_local_client_quarantine
               WHERE space_id = ${options.spaceId} AND mutation_id = ${receipt.mutationId}`
-              return { canceledReplacement, touched: Array.from(canceledTouched.values()), receiptIds: pruned }
+              return {
+                canceledReplacement,
+                pendingDelta,
+                touched: Array.from(canceledTouched.values()),
+                receiptIds: pruned
+              }
             })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            yield* updatePendingMetric(transactionResult.pendingDelta)
             yield* deferInvalidation(
               transactionResult.touched,
               [receipt.mutationId, ...transactionResult.receiptIds],
@@ -2414,7 +2437,7 @@ export const layer = (
             prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
             return yield* Effect.void
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-          yield* metrics.recordBootstrapInstall
+          yield* recordBootstrapInstallMetric
           const entities = Array.from(dirty.values())
           const indexPoints = yield* rebuildWithIndexPoints(entities)
           const deletedSettlements = yield* deleteSettledPending(settlements)
@@ -2766,15 +2789,15 @@ export const layer = (
                 const rejection = yield* Codec.decode(mutation.rejectionSchema, replacement.rejection)
                 return yield* Effect.fail(rejection)
               }
-              return { pendingMutation: replacement, indexPoints: [] }
+              return { pendingMutation: replacement, indexPoints: [], pendingDelta: 0 }
             }
             const mutationResult = yield* mutateInTransaction(mutation, payload, true)
             yield* sql`INSERT INTO effect_local_client_quarantine_resubmissions
               (space_id, original_mutation_id, replacement_mutation_id)
               VALUES (${options.spaceId}, ${mutationId}, ${mutationResult.pendingMutation.envelope.mutationId})`
-            return mutationResult
+            return { ...mutationResult, pendingDelta: 1 }
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-          yield* refreshPendingMetric
+          yield* updatePendingMetric(result.pendingDelta)
           yield* reactivity.withBatch(
             invalidate(result.pendingMutation.changes.map((change) => change.entity), [], result.indexPoints, true)
           )
@@ -2785,7 +2808,7 @@ export const layer = (
 
       yield* projectionGate.withPermit(rebuildProjection)
       indexes = yield* IndexStore.install(sql, options.definition, indexAddress(yield* meta))
-      yield* refreshPendingMetric
+      yield* initializePendingMetric(yield* readPendingCount)
 
       const receipt = (mutationId: Identity.MutationId) =>
         sql.withTransaction(Effect.gen(function*() {
@@ -2807,7 +2830,7 @@ export const layer = (
             const result = yield* sql.withTransaction(mutateInTransaction(mutation, payloadValue)).pipe(
               Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
             )
-            yield* refreshPendingMetric
+            yield* updatePendingMetric(1)
             yield* reactivity.withBatch(
               invalidate(
                 result.pendingMutation.changes.map((change) => change.entity),

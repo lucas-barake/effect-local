@@ -20,12 +20,18 @@ export const make = Effect.gen(function*() {
 
   return {
     recordBootstrapInstall: Metric.update(bootstrapInstall, 1),
-    refreshPending: <E, R,>(read: Effect.Effect<number, E, R>) =>
+    initializePending: (count: number) =>
       Effect.gen(function*() {
-        const count = yield* read
         const delta = count - pendingContribution
-        yield* Metric.update(pendingMutationCount, delta)
         pendingContribution = count
+        yield* Metric.update(pendingMutationCount, delta)
+      }),
+    updatePending: (delta: number) => {
+      if (delta === 0) return Effect.void
+      return Effect.gen(function*() {
+        pendingContribution += delta
+        yield* Metric.update(pendingMutationCount, delta)
       })
+    }
   }
 })
