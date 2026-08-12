@@ -3,11 +3,11 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
-import * as Queue from "effect/Queue"
 import * as Stream from "effect/Stream"
 import * as PresenceHub from "../src/PresenceHub.js"
 
@@ -42,8 +42,9 @@ describe("PresenceHub", () => {
         Stream.runHead,
         Effect.forkChild({ startImmediately: true })
       )
-      yield* Fiber.interrupt(watcher)
       yield* hub.publish(update(spaceA), { subject: "writer" })
+      const received = yield* Fiber.join(watcher)
+      assert.deepStrictEqual(Option.getOrUndefined(received), update(spaceA))
 
       assert.deepStrictEqual(inputs, [
         {
@@ -164,30 +165,31 @@ describe("PresenceHub", () => {
 
   it.effect("caps active presence watchers and releases slots on interruption", () =>
     Effect.gen(function*() {
-      const authorized = yield* Queue.unbounded<void>()
-      const live = PresenceHub.layer({
+      const live = PresenceHub.layerTrusted({
         capacity: 1,
-        maximumWatchersPerSpace: 2,
-        authorize: (input) => {
-          if (input._tag !== "Watch") return Effect.void
-          return Queue.offer(authorized, undefined).pipe(Effect.asVoid)
-        }
+        maximumWatchersPerSpace: 2
       })
 
       yield* Effect.gen(function*() {
         const hub = yield* PresenceHub.PresenceHub
-        const first = yield* hub.watch(spaceA, { subject: "first" }).pipe(
-          Stream.runDrain,
-          Effect.forkChild({ startImmediately: true })
-        )
-        yield* Queue.take(authorized)
-        const second = yield* hub.watch(spaceA, { subject: "second" }).pipe(
-          Stream.runDrain,
-          Effect.forkChild({ startImmediately: true })
-        )
-        yield* Queue.take(authorized)
+        const startActive = (spaceId: Identity.SpaceId, cursor: number) =>
+          Effect.gen(function*() {
+            const delivered = yield* Deferred.make<Protocol.PresenceUpdate>()
+            const watcher = yield* hub.watch(spaceId, null).pipe(
+              Stream.tap((presence) => Deferred.succeed(delivered, presence)),
+              Stream.runDrain,
+              Effect.forkChild({ startImmediately: true })
+            )
+            const expected = { ...update(spaceId), value: { cursor } }
+            yield* hub.publish(expected, null)
+            assert.deepStrictEqual(yield* Deferred.await(delivered), expected)
+            return watcher
+          })
 
-        const failure = yield* hub.watch(spaceA, { subject: "excess" }).pipe(
+        const first = yield* startActive(spaceA, 1)
+        const second = yield* startActive(spaceA, 2)
+
+        const failure = yield* hub.watch(spaceA, null).pipe(
           Stream.runDrain,
           Effect.flip
         )
@@ -197,31 +199,74 @@ describe("PresenceHub", () => {
           assert.strictEqual(failure.limit, 2)
         }
 
-        const otherSpace = yield* hub.watch(spaceB, { subject: "other-space" }).pipe(
-          Stream.runDrain,
-          Effect.forkChild({ startImmediately: true })
-        )
-        yield* Queue.take(authorized)
+        const otherSpace = yield* startActive(spaceB, 3)
 
         yield* Fiber.interrupt(first)
-        const replacement = yield* hub.watch(spaceA, { subject: "replacement" }).pipe(
-          Stream.runDrain,
-          Effect.forkChild({ startImmediately: true })
-        )
-        yield* Queue.take(authorized)
+        const replacement = yield* startActive(spaceA, 4)
         yield* Fiber.interruptAll([second, otherSpace, replacement])
       }).pipe(Effect.provide(live))
     }))
 
+  it.effect("releases an acquired watcher permit when metric registration defects", () => {
+    const registry = new Map<string, Metric.Metric.Metadata<any, any>>()
+    return Effect.gen(function*() {
+      const live = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 2 })
+
+      yield* Effect.gen(function*() {
+        const hub = yield* PresenceHub.PresenceHub
+        const firstDelivered = yield* Deferred.make<Protocol.PresenceUpdate>()
+        const first = yield* hub.watch(spaceA, null).pipe(
+          Stream.tap((presence) => Deferred.succeed(firstDelivered, presence)),
+          Stream.runDrain,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* hub.publish(update(spaceA), null)
+        assert.deepStrictEqual(yield* Deferred.await(firstDelivered), update(spaceA))
+        const active = (yield* Metric.snapshot).find(
+          (snapshot) => snapshot.id === "effect_local_server_presence_watcher_count"
+        )
+        assert.isDefined(active)
+
+        const metadata = Array.from(registry.values()).find(
+          (entry) => entry.id === "effect_local_server_presence_watcher_count"
+        )
+        assert.isDefined(metadata)
+        const modify = metadata.hooks.modify.bind(metadata.hooks)
+        let defectNextIncrement = true
+        Object.defineProperty(metadata.hooks, "modify", {
+          configurable: true,
+          value: (input: number, context: never) => {
+            if (input === 1 && defectNextIncrement) {
+              defectNextIncrement = false
+              assert.fail("metric registry defect")
+            }
+            return modify(input, context)
+          }
+        })
+
+        const defective = yield* hub.watch(spaceA, null).pipe(Stream.runDrain, Effect.exit)
+        assert.isTrue(Exit.isFailure(defective))
+
+        const replacement = yield* hub.watch(spaceA, null).pipe(
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* hub.publish(update(spaceA), null)
+        const received = yield* Fiber.join(replacement)
+        assert.deepStrictEqual(Option.getOrUndefined(received), update(spaceA))
+        yield* Fiber.interrupt(first)
+      }).pipe(Effect.provide(live))
+    }).pipe(Effect.provideService(Metric.MetricRegistry, registry))
+  })
+
   it.effect("releases presence watcher capacity after establishment authorization denial", () => {
     return Effect.gen(function*() {
-      const replacementAuthorized = yield* Deferred.make<void>()
       const live = PresenceHub.layer({
         maximumWatchersPerSpace: 1,
         authorize: (input) => {
           if (input._tag !== "Watch") return Effect.void
           if (input.principal === "denied") return Effect.fail("denied")
-          return Deferred.succeed(replacementAuthorized, undefined).pipe(Effect.asVoid)
+          return Effect.void
         }
       })
 
@@ -231,34 +276,43 @@ describe("PresenceHub", () => {
         assert.strictEqual(denied._tag, "AuthorizationDenied")
 
         const replacement = yield* hub.watch(spaceA, "allowed").pipe(
-          Stream.runDrain,
+          Stream.runHead,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* Deferred.await(replacementAuthorized)
-        yield* Fiber.interrupt(replacement)
+        yield* hub.publish(update(spaceA), null)
+        assert.deepStrictEqual(Option.getOrUndefined(yield* Fiber.join(replacement)), update(spaceA))
       }).pipe(Effect.provide(live))
     })
   })
 
   it.effect("does not reveal presence watcher occupancy to unauthorized principals", () =>
     Effect.gen(function*() {
-      const authorized = yield* Queue.unbounded<void>()
       const live = PresenceHub.layer({
         maximumWatchersPerSpace: 1,
         authorize: (input) => {
           if (input._tag !== "Watch") return Effect.void
           if (input.principal === "denied") return Effect.fail("denied")
-          return Queue.offer(authorized, undefined).pipe(Effect.asVoid)
+          return Effect.void
         }
       })
 
       yield* Effect.gen(function*() {
         const hub = yield* PresenceHub.PresenceHub
+        const delivered = yield* Deferred.make<Protocol.PresenceUpdate>()
         const first = yield* hub.watch(spaceA, "allowed").pipe(
+          Stream.tap((presence) => Deferred.succeed(delivered, presence)),
           Stream.runDrain,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* Queue.take(authorized)
+        yield* hub.publish(update(spaceA), null)
+        assert.deepStrictEqual(yield* Deferred.await(delivered), update(spaceA))
+
+        const excess = yield* hub.watch(spaceA, "allowed").pipe(Stream.runHead, Effect.flip)
+        assert.strictEqual(excess._tag, "CapacityExceeded")
+        if (excess._tag === "CapacityExceeded") {
+          assert.strictEqual(excess.resource, "presence watchers")
+          assert.strictEqual(excess.limit, 1)
+        }
 
         const denied = yield* hub.watch(spaceA, "denied").pipe(Stream.runHead, Effect.flip)
         assert.strictEqual(denied._tag, "AuthorizationDenied")
@@ -268,14 +322,7 @@ describe("PresenceHub", () => {
 
   it.effect("releases presence watcher capacity after stream completion", () =>
     Effect.gen(function*() {
-      const authorized = yield* Queue.unbounded<void>()
-      const live = PresenceHub.layer({
-        maximumWatchersPerSpace: 1,
-        authorize: (input) => {
-          if (input._tag !== "Watch") return Effect.void
-          return Queue.offer(authorized, undefined).pipe(Effect.asVoid)
-        }
-      })
+      const live = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1 })
 
       yield* Effect.gen(function*() {
         const hub = yield* PresenceHub.PresenceHub
@@ -283,38 +330,34 @@ describe("PresenceHub", () => {
           Stream.runHead,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* Queue.take(authorized)
         yield* hub.publish(update(spaceA), null)
-        yield* Fiber.join(first)
+        assert.deepStrictEqual(Option.getOrUndefined(yield* Fiber.join(first)), update(spaceA))
 
         const replacement = yield* hub.watch(spaceA, null).pipe(
-          Stream.runDrain,
+          Stream.runHead,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* Queue.take(authorized)
-        yield* Fiber.interrupt(replacement)
+        const next = { ...update(spaceA), value: { cursor: 2 } }
+        yield* hub.publish(next, null)
+        assert.deepStrictEqual(Option.getOrUndefined(yield* Fiber.join(replacement)), next)
       }).pipe(Effect.provide(live))
     }))
 
   it.effect("records live presence watchers in each layer's metric registry", () => {
     const exercise = (registry: Map<string, Metric.Metric.Metadata<any, any>>) =>
       Effect.gen(function*() {
-        const authorized = yield* Deferred.make<void>()
-        const live = PresenceHub.layer({
-          maximumWatchersPerSpace: 1,
-          authorize: (input) => {
-            if (input._tag !== "Watch") return Effect.void
-            return Deferred.succeed(authorized, undefined).pipe(Effect.asVoid)
-          }
-        })
+        const live = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1 })
 
         yield* Effect.gen(function*() {
           const hub = yield* PresenceHub.PresenceHub
+          const delivered = yield* Deferred.make<Protocol.PresenceUpdate>()
           const watcher = yield* hub.watch(spaceA, null).pipe(
+            Stream.tap((presence) => Deferred.succeed(delivered, presence)),
             Stream.runDrain,
             Effect.forkChild({ startImmediately: true })
           )
-          yield* Deferred.await(authorized)
+          yield* hub.publish(update(spaceA), null)
+          assert.deepStrictEqual(yield* Deferred.await(delivered), update(spaceA))
 
           const active = (yield* Metric.snapshot).find(
             (snapshot) => snapshot.id === "effect_local_server_presence_watcher_count"
