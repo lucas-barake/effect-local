@@ -1354,6 +1354,7 @@ const serverV7 = makeMigration({
   name: "generation-owned-storage",
   statements: [
     "ALTER TABLE effect_local_server_spaces ADD COLUMN active_schema_generation INTEGER NOT NULL DEFAULT 0 CHECK (active_schema_generation >= 0)",
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)",
     "ALTER TABLE effect_local_server_evolution ADD COLUMN source_generation INTEGER NOT NULL DEFAULT 0 CHECK (source_generation >= 0)",
     "ALTER TABLE effect_local_server_evolution ADD COLUMN target_entity_count INTEGER NOT NULL DEFAULT 0 CHECK (target_entity_count >= 0)",
     "ALTER TABLE effect_local_server_evolution ADD COLUMN target_entity_bytes INTEGER NOT NULL DEFAULT 0 CHECK (target_entity_bytes >= 0)",
@@ -1436,6 +1437,8 @@ const serverV7 = makeMigration({
       schema_version INTEGER NOT NULL,
       schema_hash TEXT NOT NULL,
       server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
+      delivered_sequence INTEGER NOT NULL DEFAULT 0 CHECK (delivered_sequence >= 0),
+      read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0),
       PRIMARY KEY (space_id, client_id)
     )`,
     `CREATE TABLE effect_local_server_replication_view_entities (
@@ -1465,6 +1468,7 @@ const serverV7 = makeMigration({
       content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
       digest TEXT NOT NULL CHECK (length(digest) = 64),
       has_more INTEGER NOT NULL CHECK (has_more IN (0, 1)),
+      read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0),
       PRIMARY KEY (space_id, client_id)
     )`,
     `CREATE TABLE effect_local_server_scoped_snapshots (
@@ -1648,17 +1652,6 @@ const serverV9 = makeMigration({
 
 const serverV10 = makeMigration({
   id: 10,
-  name: "delta-replication-watermarks",
-  statements: [
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_replication_views ADD COLUMN delivered_sequence INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_replication_views ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_replication_pages ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0"
-  ]
-})
-
-const serverV11 = makeMigration({
-  id: 11,
   name: "server-secondary-indexes",
   statements: [
     `CREATE TABLE effect_local_server_index_catalog (
@@ -1697,8 +1690,7 @@ export const serverCatalog = Object.freeze([
   serverV7,
   serverV8,
   serverV9,
-  serverV10,
-  serverV11
+  serverV10
 ])
 
 export const client = (options: {
