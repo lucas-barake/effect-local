@@ -7,6 +7,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
@@ -1105,7 +1106,7 @@ describe("client schema evolution", () => {
       const invalidations = { entity: 0, status: 0, originalReceipt: 0, replacementReceipt: 0 }
       const spaceKey = `effect-local:space:${spaceId}`
       const cancelEntity = reactivity.registerUnsafe(
-        { [`${spaceKey}:entities`]: [[TodoV2.name, 45]] },
+        [ReactivityKey.entity(spaceId, TodoV2.name, 45)],
         () => invalidations.entity++
       )
       const cancelStatus = reactivity.registerUnsafe([`${spaceKey}:status`], () => invalidations.status++)
@@ -1222,7 +1223,7 @@ describe("client schema evolution", () => {
         ...live,
         submit: (request) =>
           Effect.gen(function*() {
-            const shouldFail = yield* Ref.modify(failSubmit, (current) => [current, false])
+            const shouldFail = yield* Ref.get(failSubmit)
             if (shouldFail) return yield* new ReplicaError.ServerUnavailable()
             return yield* live.submit(request)
           })
@@ -1231,6 +1232,7 @@ describe("client schema evolution", () => {
       const firstError = yield* replica.discardQuarantined(original.envelope.mutationId).pipe(Effect.flip)
       assert.strictEqual(firstError._tag, "ServerUnavailable")
 
+      yield* Ref.set(failSubmit, false)
       const receipt = yield* replica.discardQuarantined(original.envelope.mutationId)
       assert.strictEqual(receipt._tag, "Rejected")
       assert.deepStrictEqual(yield* replica.quarantine, [])

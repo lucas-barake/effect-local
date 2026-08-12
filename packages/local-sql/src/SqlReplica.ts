@@ -28,6 +28,7 @@ import * as LocalStore from "./LocalStore.js"
 import * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
 import * as QueryExecutor from "./QueryExecutor.js"
+import * as QueryReactivity from "./QueryReactivity.js"
 import * as Reconciler from "./Reconciler.js"
 import * as ReconciliationWorkflow from "./ReconciliationWorkflow.js"
 import * as SyncEngine from "./SyncEngine.js"
@@ -120,15 +121,20 @@ const aggregateStatus = (spaces: ReadonlyArray<ReplicaStatus.SpaceStatus>): Repl
 const makeLayer = <D extends Definition.Any, R,>(
   options: Options<D>,
   workflowEngine: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"] | undefined, never, R>
-): Layer.Layer<Replica.Replica, ReplicaError.ReplicaError, BaseRequirements<D> | R> =>
-  Layer.effect(
+): Layer.Layer<
+  Replica.Replica | QueryReactivity.QueryReactivity,
+  ReplicaError.ReplicaError,
+  BaseRequirements<D> | R
+> => {
+  const queryReactivity = QueryReactivity.makeLayer()
+  return Layer.effect(
     Replica.Replica,
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
       const reactivity = yield* Reactivity.Reactivity
       const remote = yield* SyncEngine.SyncEngine
       const parentScope = yield* Effect.scope
-      const rootContext = yield* Effect.context<BaseRequirements<D> | R>()
+      const rootContext = yield* Effect.context<BaseRequirements<D> | QueryReactivity.QueryReactivity | R>()
       const entries = new Map<Identity.SpaceId, Entry>()
       let nextGeneration = 0
       const workflow = yield* workflowEngine
@@ -499,7 +505,8 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       return Replica.Replica.of({ join, leave, spaces, space, status })
     })
-  )
+  ).pipe(Layer.provideMerge(queryReactivity))
+}
 
 export const layer = <D extends Definition.Any,>(options: Options<D>) =>
   makeLayer<D, never>(options, Effect.succeed(undefined))

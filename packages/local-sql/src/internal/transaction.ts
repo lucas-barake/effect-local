@@ -55,10 +55,9 @@ export const local = (options: {
   readonly schemaGeneration: number
   readonly projectionGeneration: number
   readonly changes?: Array<Protocol.EntityChange>
-  readonly onVisibleChange?: <M extends Model.Any,>(
-    model: M,
-    entityKey: string,
-    value: Model.Value<M> | undefined
+  readonly onVisibleChange?: (
+    model: string,
+    entityKey: string
   ) => Effect.Effect<void, ReplicaError.StorageError>
 }): Transaction.Transaction => {
   const find = SqlSchema.findOneOption({
@@ -108,7 +107,7 @@ export const local = (options: {
             value_json = excluded.value_json, model_version = excluded.model_version`
         }
         if (options.table === "visible") {
-          yield* (options.onVisibleChange?.(model, encoded.keyJson, value) ?? Effect.void)
+          yield* (options.onVisibleChange?.(model.name, encoded.keyJson) ?? Effect.void)
         }
         options.changes?.push({
           _tag: "Upsert",
@@ -130,7 +129,7 @@ export const local = (options: {
             AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
         }
         if (options.table === "visible") {
-          yield* (options.onVisibleChange?.(model, encoded.keyJson, undefined) ?? Effect.void)
+          yield* (options.onVisibleChange?.(model.name, encoded.keyJson) ?? Effect.void)
         }
         options.changes?.push({
           _tag: "Delete",

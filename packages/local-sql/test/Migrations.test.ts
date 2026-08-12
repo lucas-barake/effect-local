@@ -126,7 +126,10 @@ describe("storage migration catalogs", () => {
       })
       yield* Migrations.server()
 
-      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+      assert.deepStrictEqual(
+        (yield* clientLedger(sql)).map((row) => row.id),
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+      )
       assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8, 9])
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
@@ -144,6 +147,8 @@ describe("storage migration catalogs", () => {
         "effect_local_client_pending_data",
         "effect_local_client_receipts_data",
         "effect_local_client_visible_entities_data",
+        "effect_local_client_index_catalog",
+        "effect_local_client_index_state",
         "effect_local_server_evolution",
         "effect_local_server_key_lineage",
         "effect_local_server_key_lineage_groups",

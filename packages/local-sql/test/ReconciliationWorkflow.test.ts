@@ -309,7 +309,8 @@ describe("reconciliation workflow", () => {
       const replicaDatabase = Layer.mergeAll(
         Layer.succeed(SqlClient.SqlClient, Context.get(databaseContext, SqlClient.SqlClient)),
         Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto)),
-        Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity))
+        Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity)),
+        Layer.succeed(QueryReactivity.QueryReactivity, Context.get(databaseContext, QueryReactivity.QueryReactivity))
       )
       const runner = SingleRunner.layer({ runnerStorage: "sql" }).pipe(Layer.provide(replicaDatabase))
       const engineContext = yield* Layer.build(

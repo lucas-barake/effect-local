@@ -72,7 +72,9 @@ const handlers = Layer.mergeAll(
   PutNumbered.toLayer(({ payload, transaction }) =>
     transaction.set(Numbered, payload.id, payload).pipe(Effect.as(payload))
   ),
-  ListTodos.toLayer(({ query }) => query.all(Todo)),
+  ListTodos.toLayer(({ query }) =>
+    query.from(Todo, "byTitle").limit(100).page().pipe(Effect.map((page) => page.items))
+  ),
   RangeTodos.toLayer(({ payload, query }) => {
     const key = `${payload.lower}:${payload.upper}`
     rangeReads.set(key, (rangeReads.get(key) ?? 0) + 1)
@@ -152,9 +154,9 @@ describe("Replica Atom graph", () => {
       const graph = BrowserReplica.make(replica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
-      const related = graph.query(RangeTodos)({ lower: "a", upper: "m" })
-      const unrelated = graph.query(RangeTodos)({ lower: "n", upper: "z" })
-      const mutation = graph.mutation(PutTodo)
+      const related = graph.query(spaceId, RangeTodos)({ lower: "a", upper: "m" })
+      const unrelated = graph.query(spaceId, RangeTodos)({ lower: "n", upper: "z" })
+      const mutation = graph.mutation(spaceId, PutTodo)
       const unmountRelated = registry.mount(related)
       const unmountUnrelated = registry.mount(unrelated)
       const unmountMutation = registry.mount(mutation)
@@ -172,6 +174,7 @@ describe("Replica Atom graph", () => {
 
       registry.set(mutation, { id: "range", title: "beta" })
       yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      yield* Effect.yieldNow
       assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, related), [{ id: "range", title: "beta" }])
       yield* Effect.sleep("20 millis")
       assert.isAtLeast(rangeReads.get("a:m") ?? 0, 2)
@@ -183,8 +186,8 @@ describe("Replica Atom graph", () => {
       const graph = BrowserReplica.make(replica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
-      const entity = graph.entity(Numbered)(1)
-      const mutation = graph.mutation(PutNumbered)
+      const entity = graph.entity(spaceId, Numbered)(1)
+      const mutation = graph.mutation(spaceId, PutNumbered)
       const unmountEntity = registry.mount(entity)
       const unmountMutation = registry.mount(mutation)
       yield* Effect.addFinalizer(() =>
@@ -196,6 +199,7 @@ describe("Replica Atom graph", () => {
       assert.isTrue(Option.isNone(yield* AtomRegistry.getResult(registry, entity)))
       registry.set(mutation, { id: 1, value: "encoded-key" })
       yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      yield* Effect.yieldNow
       assert.deepStrictEqual(Option.getOrThrow(yield* AtomRegistry.getResult(registry, entity)), {
         id: 1,
         value: "encoded-key"
@@ -211,20 +215,24 @@ describe("Replica Atom graph", () => {
           Effect.map((service) =>
             Replica.Replica.of({
               ...service,
-              get: (model, key) => {
-                if (model.name === Todo.name && Object.is(key, "unrelated")) unrelatedReads++
-                return service.get(model, key)
-              }
+              space: (address) =>
+                service.space(address).pipe(Effect.map((space) => ({
+                  ...space,
+                  get: (model, key) => {
+                    if (model.name === Todo.name && Object.is(key, "unrelated")) unrelatedReads++
+                    return space.get(model, key)
+                  }
+                })))
             })
           )
         )
-      ).pipe(Layer.provide(replica))
+      ).pipe(Layer.provideMerge(replica))
       const graph = BrowserReplica.make(observed)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
-      const changed = graph.entity(Todo)("changed")
-      const unrelated = graph.entity(Todo)("unrelated")
-      const mutation = graph.mutation(PutTodo)
+      const changed = graph.entity(spaceId, Todo)("changed")
+      const unrelated = graph.entity(spaceId, Todo)("unrelated")
+      const mutation = graph.mutation(spaceId, PutTodo)
       const unmountChanged = registry.mount(changed)
       const unmountUnrelated = registry.mount(unrelated)
       const unmountMutation = registry.mount(mutation)
@@ -241,6 +249,7 @@ describe("Replica Atom graph", () => {
 
       registry.set(mutation, { id: "changed", title: "new" })
       yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      yield* Effect.yieldNow
       assert.deepStrictEqual(Option.getOrThrow(yield* AtomRegistry.getResult(registry, changed)), {
         id: "changed",
         title: "new"
@@ -300,7 +309,10 @@ describe("Replica Atom graph", () => {
           })
         )
         assert.isTrue(Option.isNone(yield* AtomRegistry.getResult(registry, entity)))
-        assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, query), [])
+        assert.deepStrictEqual(
+          (yield* AtomRegistry.getResult(registry, query)).filter((todo) => todo.id === "1"),
+          []
+        )
         registry.set(mutation, { id: "1", title: "atom" })
         const pending = yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
         yield* Effect.yieldNow
@@ -317,10 +329,10 @@ describe("Replica Atom graph", () => {
           )
         ))
         assert.strictEqual(accepted._tag, "Accepted")
-        assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, query), [{
-          id: "1",
-          title: "atom"
-        }])
+        assert.deepStrictEqual(
+          (yield* AtomRegistry.getResult(registry, query)).filter((todo) => todo.id === "1"),
+          [{ id: "1", title: "atom" }]
+        )
         const status = yield* AtomRegistry.getResult(registry, graph.status(spaceId))
         assert.strictEqual(status._tag, "Online")
       })

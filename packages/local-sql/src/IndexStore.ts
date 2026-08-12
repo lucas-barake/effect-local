@@ -1,5 +1,6 @@
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Definition from "@lucas-barake/effect-local/Definition"
+import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as SchemaDescriptor from "@lucas-barake/effect-local/SchemaDescriptor"
@@ -17,6 +18,12 @@ import * as StorageUnavailable from "./internal/storageUnavailable.js"
 
 type SqlValue = string | number
 
+export interface Address {
+  readonly spaceId: Identity.SpaceId
+  readonly schemaGeneration: number
+  readonly projectionGeneration: number
+}
+
 interface Descriptor {
   readonly model: Model.Any
   readonly indexName: string
@@ -33,6 +40,7 @@ interface Descriptor {
 }
 
 export interface Point {
+  readonly spaceId: Identity.SpaceId
   readonly descriptor: string
   readonly model: string
   readonly index: string
@@ -42,6 +50,7 @@ export interface Point {
 }
 
 export interface Footprint {
+  readonly spaceId: Identity.SpaceId
   readonly descriptor: string
   readonly model: string
   readonly index: string
@@ -66,11 +75,13 @@ const CatalogRow = Schema.Struct({
   table_name: Schema.String,
   table_checksum: Schema.String,
   scan_index_name: Schema.String,
-  scan_index_checksum: Schema.String,
-  backfill_generation: Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  scan_index_checksum: Schema.String
+})
+
+const StateRow = Schema.Struct({
   backfill_after_key: Schema.NullOr(Schema.String),
   backfill_visible_revision: Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
-  ready_generation: Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
+  ready: Schema.Literals([0, 1])
 })
 
 const CatalogObjectRow = Schema.Struct({
@@ -83,11 +94,12 @@ const CatalogObjectRow = Schema.Struct({
 
 const ReadyRow = Schema.Struct({
   layout_hash: Schema.String,
-  ready_generation: Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
+  ready: Schema.Literals([0, 1])
 })
 
 const GenerationRow = Schema.Struct({
   active_schema_generation: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  active_projection_generation: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   visible_revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 })
 
@@ -139,14 +151,19 @@ const makeDescriptor = (model: Model.Any, indexName: string, index: SecondaryInd
     return `${prefix}${ordinal} ${affinitySql[component.affinity]} NOT NULL`
   })
   const tableSchema = `CREATE TABLE ${tableName} (
-    index_generation INTEGER NOT NULL CHECK (index_generation >= 0),
+    space_id TEXT NOT NULL,
+    index_schema_generation INTEGER NOT NULL CHECK (index_schema_generation >= 0),
+    index_projection_generation INTEGER NOT NULL CHECK (index_projection_generation >= 0),
     index_entity_key TEXT NOT NULL,
     ${componentColumns.join(",\n    ")},
-    PRIMARY KEY (index_generation, index_entity_key)
+    PRIMARY KEY (space_id, index_schema_generation, index_projection_generation, index_entity_key),
+    FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
   )`
   const tableDdl = tableSchema.replace("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")
   const scanColumns = [
-    "index_generation",
+    "space_id",
+    "index_schema_generation",
+    "index_projection_generation",
     ...index.partition.map((_, position) => `p${position}`),
     ...index.sort.map((_, position) => `s${position}`),
     "index_entity_key"
@@ -214,7 +231,13 @@ const encodedComponents = (
     (component) => encodeComponent(component, component.extract(value))
   )
 
-const point = (descriptor: Descriptor, entityKey: string, values: ReadonlyArray<SqlValue>): Point => ({
+const point = (
+  address: Address,
+  descriptor: Descriptor,
+  entityKey: string,
+  values: ReadonlyArray<SqlValue>
+): Point => ({
+  spaceId: address.spaceId,
   descriptor: descriptor.hash,
   model: descriptor.model.name,
   index: descriptor.indexName,
@@ -230,7 +253,7 @@ const componentColumns = (descriptor: Descriptor): ReadonlyArray<string> => [
 
 const makeIndexRow = (
   descriptor: Descriptor,
-  generation: number,
+  address: Address,
   entityKey: string,
   value: unknown
 ): Effect.Effect<
@@ -240,7 +263,9 @@ const makeIndexRow = (
   Effect.gen(function*() {
     const values = yield* encodedComponents(descriptor, value)
     const row: Record<string, unknown> = {
-      index_generation: generation,
+      space_id: address.spaceId,
+      index_schema_generation: address.schemaGeneration,
+      index_projection_generation: address.projectionGeneration,
       index_entity_key: entityKey
     }
     for (let position = 0; position < descriptor.index.partition.length; position++) {
@@ -263,7 +288,7 @@ const upsertRows = (
   const assignments = sql.join(", ", false)(
     columns.map((name) => sql`${sql(name)} = excluded.${sql(name)}`)
   )
-  const batchSize = Math.max(1, Math.floor(900 / (columns.length + 2)))
+  const batchSize = Math.max(1, Math.floor(900 / (columns.length + 4)))
   return Effect.forEach(
     Array.from(
       { length: Math.ceil(rows.length / batchSize) },
@@ -271,7 +296,8 @@ const upsertRows = (
     ),
     (batch) =>
       sql`INSERT INTO ${table} ${sql.insert(batch)}
-      ON CONFLICT (index_generation, index_entity_key) DO UPDATE SET ${assignments}`,
+      ON CONFLICT (space_id, index_schema_generation, index_projection_generation, index_entity_key)
+      DO UPDATE SET ${assignments}`,
     { discard: true }
   ).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 }
@@ -279,7 +305,7 @@ const upsertRows = (
 const writeEntity = (
   sql: SqlClient.SqlClient,
   descriptor: Descriptor,
-  generation: number,
+  address: Address,
   entityKey: string,
   value: unknown
 ): Effect.Effect<ReadonlyArray<Point>, ReplicaError.StorageError> =>
@@ -287,13 +313,19 @@ const writeEntity = (
     const table = sql(descriptor.tableName)
     const columns = componentColumns(descriptor)
     const findOld = SqlSchema.findOneOption({
-      Request: Schema.Struct({ generation: Schema.Int, entityKey: Schema.String }),
+      Request: Schema.Struct({
+        spaceId: Schema.String,
+        schemaGeneration: Schema.Int,
+        projectionGeneration: Schema.Int,
+        entityKey: Schema.String
+      }),
       Result: TupleRow,
-      execute: ({ entityKey: storedEntityKey, generation: storedGeneration }) =>
+      execute: ({ entityKey: storedEntityKey, projectionGeneration, schemaGeneration, spaceId }) =>
         sql`SELECT json_array(${sql.csv(columns.map(sql.literal))}) AS values_json
-        FROM ${table} WHERE index_generation = ${storedGeneration} AND index_entity_key = ${storedEntityKey}`
+        FROM ${table} WHERE space_id = ${spaceId} AND index_schema_generation = ${schemaGeneration}
+          AND index_projection_generation = ${projectionGeneration} AND index_entity_key = ${storedEntityKey}`
     })
-    const old = yield* findOld({ generation, entityKey }).pipe(
+    const old = yield* findOld({ ...address, entityKey }).pipe(
       Effect.catchTag("SchemaError", (cause) =>
         Effect.fail(new ReplicaError.StorageCorrupt({ message: "Stored secondary index row is invalid", cause }))),
       Effect.catchIf(SqlError.isSqlError, (cause) =>
@@ -306,16 +338,17 @@ const writeEntity = (
           new ReplicaError.StorageCorrupt({ message: "Stored secondary index tuple is invalid", cause })
         )
       )
-      points.push(point(descriptor, entityKey, values))
+      points.push(point(address, descriptor, entityKey, values))
     }
     if (value === undefined) {
       yield* sql`DELETE FROM ${table}
-        WHERE index_generation = ${generation} AND index_entity_key = ${entityKey}`
+        WHERE space_id = ${address.spaceId} AND index_schema_generation = ${address.schemaGeneration}
+          AND index_projection_generation = ${address.projectionGeneration} AND index_entity_key = ${entityKey}`
       return points
     }
-    const encoded = yield* makeIndexRow(descriptor, generation, entityKey, value)
+    const encoded = yield* makeIndexRow(descriptor, address, entityKey, value)
     yield* upsertRows(sql, descriptor, [encoded.row])
-    points.push(point(descriptor, entityKey, encoded.values))
+    points.push(point(address, descriptor, entityKey, encoded.values))
     return points
   }).pipe(
     Effect.catchIf(SqlError.isSqlError, (cause) =>
@@ -325,19 +358,53 @@ const writeEntity = (
     })
   )
 
+const readPoint = (
+  sql: SqlClient.SqlClient,
+  descriptor: Descriptor,
+  address: Address,
+  entityKey: string
+): Effect.Effect<ReadonlyArray<Point>, ReplicaError.StorageError> => {
+  const table = sql(descriptor.tableName)
+  const columns = componentColumns(descriptor)
+  return SqlSchema.findOneOption({
+    Request: Schema.Void,
+    Result: TupleRow,
+    execute: () =>
+      sql`SELECT json_array(${sql.csv(columns.map(sql.literal))}) AS values_json FROM ${table}
+      WHERE space_id = ${address.spaceId} AND index_schema_generation = ${address.schemaGeneration}
+        AND index_projection_generation = ${address.projectionGeneration} AND index_entity_key = ${entityKey}`
+  })(undefined).pipe(
+    Effect.catchTag(
+      "SchemaError",
+      (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Stored secondary index row is invalid", cause }))
+    ),
+    Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
+    Effect.flatMap(Option.match({
+      onNone: () => Effect.succeed([]),
+      onSome: (row) =>
+        Schema.decodeUnknownEffect(SqlValuesFromString)(row.values_json).pipe(
+          Effect.mapError((cause) =>
+            new ReplicaError.StorageCorrupt({ message: "Stored secondary index tuple is invalid", cause })
+          ),
+          Effect.map((values) => [point(address, descriptor, entityKey, values)])
+        )
+    }))
+  )
+}
+
 const decodeEntity = (model: Model.Any, valueJson: string) =>
   Codec.parse(valueJson).pipe(Effect.flatMap((encoded) => Codec.decode(model.schema, encoded)))
 
 const ensureCatalog = (
   sql: SqlClient.SqlClient,
   descriptor: Descriptor
-): Effect.Effect<typeof CatalogRow.Type, ReplicaError.StorageError> => {
+): Effect.Effect<void, ReplicaError.StorageError> => {
   const findCatalog = SqlSchema.findOneOption({
     Request: Schema.Struct({ model: Schema.String, indexName: Schema.String, hash: Schema.String }),
     Result: CatalogRow,
     execute: ({ hash, indexName, model }) =>
-      sql`SELECT layout_hash, table_name, table_checksum, scan_index_name, scan_index_checksum,
-        backfill_generation, backfill_after_key, backfill_visible_revision, ready_generation
+      sql`SELECT layout_hash, table_name, table_checksum, scan_index_name, scan_index_checksum
       FROM effect_local_client_index_catalog
       WHERE model = ${model} AND index_name = ${indexName} AND descriptor_hash = ${hash}`
   })
@@ -401,17 +468,7 @@ const ensureCatalog = (
         VALUES (${descriptor.model.name}, ${descriptor.indexName}, ${descriptor.hash}, ${descriptor.hash},
           ${descriptor.tableName}, ${descriptor.tableChecksum}, ${descriptor.scanIndexName},
           ${descriptor.scanIndexChecksum})`
-      return {
-        layout_hash: descriptor.hash,
-        table_name: descriptor.tableName,
-        table_checksum: descriptor.tableChecksum,
-        scan_index_name: descriptor.scanIndexName,
-        scan_index_checksum: descriptor.scanIndexChecksum,
-        backfill_generation: null,
-        backfill_after_key: null,
-        backfill_visible_revision: null,
-        ready_generation: null
-      }
+      return yield* Effect.void
     }
     const row = stored.value
     if (
@@ -424,20 +481,11 @@ const ensureCatalog = (
       })
     }
     if (Option.isNone(priorTable)) {
-      yield* sql`UPDATE effect_local_client_index_catalog
-        SET backfill_generation = NULL, backfill_after_key = NULL, backfill_visible_revision = NULL,
-          ready_generation = NULL
-        WHERE model = ${descriptor.model.name} AND index_name = ${descriptor.indexName}
-          AND descriptor_hash = ${descriptor.hash}`
-      return {
-        ...row,
-        backfill_generation: null,
-        backfill_after_key: null,
-        backfill_visible_revision: null,
-        ready_generation: null
-      }
+      yield* sql`UPDATE effect_local_client_index_state SET ready = 0, backfill_after_key = NULL,
+        backfill_visible_revision = NULL WHERE model = ${descriptor.model.name}
+          AND index_name = ${descriptor.indexName} AND descriptor_hash = ${descriptor.hash}`
     }
-    return row
+    return yield* Effect.void
   })).pipe(
     Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
     Effect.withSpan("IndexStore.ensureCatalog", {
@@ -446,118 +494,181 @@ const ensureCatalog = (
   )
 }
 
-const findGeneration = (sql: SqlClient.SqlClient) =>
-  SqlSchema.findOneOption({
-    Request: Schema.Void,
+const findGeneration = (sql: SqlClient.SqlClient, spaceId: Identity.SpaceId) =>
+  SqlSchema.findOne({
+    Request: Schema.Struct({ spaceId: Schema.String }),
     Result: GenerationRow,
-    execute: () =>
-      sql`SELECT active_schema_generation, visible_revision FROM effect_local_client_meta WHERE singleton = 1`
-  })(undefined).pipe(
+    execute: ({ spaceId: requestedSpaceId }) =>
+      sql`SELECT active_schema_generation, active_projection_generation, visible_revision
+      FROM effect_local_client_spaces WHERE space_id = ${requestedSpaceId}`
+  })({ spaceId }).pipe(
     Effect.catchTag("SchemaError", (cause) =>
       Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client generation metadata is invalid", cause }))),
     Effect.catchIf(SqlError.isSqlError, (cause) =>
       Effect.fail(StorageUnavailable.make(cause))),
-    Effect.flatMap(Option.match({
-      onNone: () => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client generation metadata is missing" })),
-      onSome: Effect.succeed
-    }))
+    Effect.catchTag("NoSuchElementError", () =>
+      Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client generation metadata is missing" })))
   )
+
+const sameAddress = (row: typeof GenerationRow.Type, address: Address): boolean =>
+  row.active_schema_generation === address.schemaGeneration &&
+  row.active_projection_generation === address.projectionGeneration
 
 const backfill = (
   sql: SqlClient.SqlClient,
   descriptor: Descriptor,
-  initial: typeof CatalogRow.Type
+  address: Address
 ): Effect.Effect<void, ReplicaError.StorageError> =>
   Effect.gen(function*() {
-    const startingMeta = yield* findGeneration(sql)
-    const generation = startingMeta.active_schema_generation
-    if (initial.ready_generation === generation) return
-    let revision = initial.backfill_visible_revision
-    let after = initial.backfill_after_key
-    if (initial.backfill_generation !== generation || revision !== startingMeta.visible_revision) {
+    const findState = SqlSchema.findOne({
+      Request: Schema.Struct({
+        spaceId: Schema.String,
+        schemaGeneration: Schema.Int,
+        projectionGeneration: Schema.Int,
+        model: Schema.String,
+        indexName: Schema.String,
+        hash: Schema.String
+      }),
+      Result: StateRow,
+      execute: ({ hash, indexName, model, projectionGeneration, schemaGeneration, spaceId }) =>
+        sql`SELECT backfill_after_key, backfill_visible_revision, ready
+        FROM effect_local_client_index_state WHERE space_id = ${spaceId}
+          AND schema_generation = ${schemaGeneration} AND projection_generation = ${projectionGeneration}
+          AND model = ${model} AND index_name = ${indexName} AND descriptor_hash = ${hash}`
+    })
+    const stateRequest = {
+      ...address,
+      model: descriptor.model.name,
+      indexName: descriptor.indexName,
+      hash: descriptor.hash
+    }
+    yield* sql`INSERT INTO effect_local_client_index_state
+      (space_id, schema_generation, projection_generation, model, index_name, descriptor_hash)
+      VALUES (${address.spaceId}, ${address.schemaGeneration}, ${address.projectionGeneration},
+        ${descriptor.model.name}, ${descriptor.indexName}, ${descriptor.hash})
+      ON CONFLICT DO NOTHING`
+    let state = yield* findState(stateRequest).pipe(
+      Effect.catchTag("SchemaError", (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Secondary index state row is invalid", cause }))),
+      Effect.catchTag("NoSuchElementError", (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Secondary index state row is missing", cause })))
+    )
+    const startingMeta = yield* findGeneration(sql, address.spaceId)
+    if (!sameAddress(startingMeta, address)) {
+      return yield* new ReplicaError.StorageCorrupt({
+        message: "Secondary index address does not match the active projection"
+      })
+    }
+    if (state.ready === 1) {
+      return yield* Effect.void
+    }
+    let revision = state.backfill_visible_revision
+    let after = state.backfill_after_key
+    if (revision !== startingMeta.visible_revision) {
       revision = startingMeta.visible_revision
       after = null
       yield* sql.withTransaction(Effect.gen(function*() {
-        const current = yield* findGeneration(sql)
-        if (current.active_schema_generation !== generation) {
+        const current = yield* findGeneration(sql, address.spaceId)
+        if (!sameAddress(current, address)) {
           return yield* new ReplicaError.StorageCorrupt({
-            message: "Schema generation changed while secondary indexes were backfilling"
+            message: "Projection changed while secondary indexes were backfilling"
           })
         }
         revision = current.visible_revision
         const table = sql(descriptor.tableName)
-        yield* sql`DELETE FROM ${table} WHERE index_generation = ${generation}`
-        yield* sql`UPDATE effect_local_client_index_catalog
-          SET backfill_generation = ${generation}, backfill_after_key = NULL,
-            backfill_visible_revision = ${revision}, ready_generation = NULL
-          WHERE model = ${descriptor.model.name} AND index_name = ${descriptor.indexName}
-            AND descriptor_hash = ${descriptor.hash}`
+        yield* sql`DELETE FROM ${table} WHERE space_id = ${address.spaceId}
+          AND index_schema_generation = ${address.schemaGeneration}
+          AND index_projection_generation = ${address.projectionGeneration}`
+        yield* sql`UPDATE effect_local_client_index_state
+          SET backfill_after_key = NULL, backfill_visible_revision = ${revision}, ready = 0
+          WHERE space_id = ${address.spaceId} AND schema_generation = ${address.schemaGeneration}
+            AND projection_generation = ${address.projectionGeneration} AND model = ${descriptor.model.name}
+            AND index_name = ${descriptor.indexName} AND descriptor_hash = ${descriptor.hash}`
         return yield* Effect.void
       }))
     }
     const findPage = SqlSchema.findAll({
-      Request: Schema.Struct({ generation: Schema.Int, model: Schema.String, after: Schema.NullOr(Schema.String) }),
+      Request: Schema.Struct({
+        spaceId: Schema.String,
+        schemaGeneration: Schema.Int,
+        projectionGeneration: Schema.Int,
+        model: Schema.String,
+        after: Schema.NullOr(Schema.String)
+      }),
       Result: IndexedEntityRow,
-      execute: ({ after: pageAfter, generation: pageGeneration, model: pageModel }) => {
+      execute: ({ after: pageAfter, model, projectionGeneration, schemaGeneration, spaceId }) => {
         if (pageAfter === null) {
           return sql`SELECT entity_key, value_json FROM effect_local_client_visible_entities_data
-            WHERE generation = ${pageGeneration} AND model = ${pageModel}
+            WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
+              AND projection_generation = ${projectionGeneration} AND model = ${model}
             ORDER BY entity_key LIMIT ${backfillPageSize}`
         }
         return sql`SELECT entity_key, value_json FROM effect_local_client_visible_entities_data
-          WHERE generation = ${pageGeneration} AND model = ${pageModel} AND entity_key > ${pageAfter}
+          WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
+            AND projection_generation = ${projectionGeneration} AND model = ${model} AND entity_key > ${pageAfter}
           ORDER BY entity_key LIMIT ${backfillPageSize}`
       }
     })
     while (true) {
       const result = yield* sql.withTransaction(Effect.gen(function*() {
-        const current = yield* findGeneration(sql)
-        if (current.active_schema_generation !== generation) {
+        const current = yield* findGeneration(sql, address.spaceId)
+        if (!sameAddress(current, address)) {
           return yield* new ReplicaError.StorageCorrupt({
-            message: "Schema generation changed while secondary indexes were backfilling"
+            message: "Projection changed while secondary indexes were backfilling"
           })
         }
         if (current.visible_revision !== revision) {
           const table = sql(descriptor.tableName)
           revision = current.visible_revision
           after = null
-          yield* sql`DELETE FROM ${table} WHERE index_generation = ${generation}`
-          yield* sql`UPDATE effect_local_client_index_catalog
-            SET backfill_after_key = NULL, backfill_visible_revision = ${revision}, ready_generation = NULL
-            WHERE model = ${descriptor.model.name} AND index_name = ${descriptor.indexName}
-              AND descriptor_hash = ${descriptor.hash} AND backfill_generation = ${generation}`
+          yield* sql`DELETE FROM ${table} WHERE space_id = ${address.spaceId}
+            AND index_schema_generation = ${address.schemaGeneration}
+            AND index_projection_generation = ${address.projectionGeneration}`
+          yield* sql`UPDATE effect_local_client_index_state
+            SET backfill_after_key = NULL, backfill_visible_revision = ${revision}, ready = 0
+            WHERE space_id = ${address.spaceId} AND schema_generation = ${address.schemaGeneration}
+              AND projection_generation = ${address.projectionGeneration} AND model = ${descriptor.model.name}
+              AND index_name = ${descriptor.indexName} AND descriptor_hash = ${descriptor.hash}`
           return { _tag: "Restart" as const }
         }
-        const rows = yield* findPage({ generation, model: descriptor.model.name, after }).pipe(
+        const rows = yield* findPage({ ...address, model: descriptor.model.name, after }).pipe(
           Effect.catchTag("SchemaError", (cause) =>
             Effect.fail(new ReplicaError.StorageCorrupt({ message: "Secondary index backfill row is invalid", cause })))
         )
         if (rows.length === 0) {
           const table = sql(descriptor.tableName)
-          yield* sql`DELETE FROM ${table} WHERE index_generation <> ${generation}`
-          yield* sql`UPDATE effect_local_client_index_catalog
-            SET backfill_generation = NULL, backfill_after_key = NULL, backfill_visible_revision = NULL,
-              ready_generation = ${generation}
-            WHERE model = ${descriptor.model.name} AND index_name = ${descriptor.indexName}
-              AND descriptor_hash = ${descriptor.hash} AND backfill_generation = ${generation}
+          yield* sql`UPDATE effect_local_client_index_state
+            SET backfill_after_key = NULL, backfill_visible_revision = NULL, ready = 1
+            WHERE space_id = ${address.spaceId} AND schema_generation = ${address.schemaGeneration}
+              AND projection_generation = ${address.projectionGeneration} AND model = ${descriptor.model.name}
+              AND index_name = ${descriptor.indexName} AND descriptor_hash = ${descriptor.hash}
               AND backfill_visible_revision = ${revision}`
+          yield* sql`DELETE FROM ${table} WHERE space_id = ${address.spaceId} AND NOT
+            (index_schema_generation = ${address.schemaGeneration}
+              AND index_projection_generation = ${address.projectionGeneration})`
+          yield* sql`DELETE FROM effect_local_client_index_state WHERE space_id = ${address.spaceId}
+            AND model = ${descriptor.model.name} AND index_name = ${descriptor.indexName}
+            AND descriptor_hash = ${descriptor.hash} AND NOT
+              (schema_generation = ${address.schemaGeneration}
+                AND projection_generation = ${address.projectionGeneration})`
           return { _tag: "Done" as const }
         }
         const indexRows: Array<Record<string, unknown>> = []
         for (const row of rows) {
           const value = yield* decodeEntity(descriptor.model, row.value_json)
-          indexRows.push((yield* makeIndexRow(descriptor, generation, row.entity_key, value)).row)
+          indexRows.push((yield* makeIndexRow(descriptor, address, row.entity_key, value)).row)
         }
         yield* upsertRows(sql, descriptor, indexRows)
         const nextAfter = rows[rows.length - 1].entity_key
-        yield* sql`UPDATE effect_local_client_index_catalog SET backfill_after_key = ${nextAfter}
-          WHERE model = ${descriptor.model.name} AND index_name = ${descriptor.indexName}
-            AND descriptor_hash = ${descriptor.hash} AND backfill_generation = ${generation}
+        yield* sql`UPDATE effect_local_client_index_state SET backfill_after_key = ${nextAfter}
+          WHERE space_id = ${address.spaceId} AND schema_generation = ${address.schemaGeneration}
+            AND projection_generation = ${address.projectionGeneration} AND model = ${descriptor.model.name}
+            AND index_name = ${descriptor.indexName} AND descriptor_hash = ${descriptor.hash}
             AND backfill_visible_revision = ${revision}`
         return { _tag: "Page" as const, after: nextAfter }
       }))
       if (result._tag === "Done") {
-        return
+        return yield* Effect.void
       }
       if (result._tag === "Page") {
         after = result.after
@@ -603,18 +714,26 @@ const cleanupObsolete = (
   )
 
 export interface Runtime {
-  readonly update: (
-    model: Model.Any,
-    generation: number,
-    entityKey: string,
-    value: unknown
+  readonly ensure: (address: Address) => Effect.Effect<void, ReplicaError.StorageError>
+  readonly points: (
+    address: Address,
+    entities: ReadonlyArray<EntityIdentity>
   ) => Effect.Effect<ReadonlyArray<Point>, ReplicaError.StorageError>
-  readonly rebuild: (generation: number) => Effect.Effect<void, ReplicaError.StorageError>
+  readonly replace: (
+    address: Address,
+    entities: ReadonlyArray<EntityIdentity>
+  ) => Effect.Effect<ReadonlyArray<Point>, ReplicaError.StorageError>
+}
+
+export interface EntityIdentity {
+  readonly model: string
+  readonly entityKey: string
 }
 
 export const install = (
   sql: SqlClient.SqlClient,
-  definition: Definition.Any
+  definition: Definition.Any,
+  initial: Address
 ): Effect.Effect<Runtime, ReplicaError.StorageError> =>
   Effect.gen(function*() {
     const all = descriptors(definition)
@@ -622,98 +741,60 @@ export const install = (
     for (const model of definition.models) {
       byModel.set(model.name, all.filter((descriptor) => descriptor.model === model))
     }
-    for (const descriptor of all) {
-      const catalog = yield* ensureCatalog(sql, descriptor)
-      yield* backfill(sql, descriptor, catalog)
-    }
+    for (const descriptor of all) yield* ensureCatalog(sql, descriptor)
     yield* cleanupObsolete(sql, all)
-    const update: Runtime["update"] = (model, generation, entityKey, value) =>
-      Effect.forEach(
-        byModel.get(model.name) ?? [],
-        (descriptor) => writeEntity(sql, descriptor, generation, entityKey, value)
-      ).pipe(
-        Effect.map((points) => points.flat()),
-        Effect.withSpan("IndexStore.update", { attributes: { "index.model": model.name } })
+    const ensure: Runtime["ensure"] = (address) =>
+      Effect.forEach(all, (descriptor) => backfill(sql, descriptor, address), { discard: true }).pipe(
+        Effect.withSpan("IndexStore.ensure", { attributes: { "space.id": address.spaceId } })
       )
-    const rebuild: Runtime["rebuild"] = (generation) =>
-      Effect.gen(function*() {
-        for (const model of definition.models) {
-          const modelDescriptors = byModel.get(model.name) ?? []
-          if (modelDescriptors.length === 0) continue
-          yield* sql.withTransaction(Effect.gen(function*() {
-            for (const descriptor of modelDescriptors) {
-              yield* sql`DELETE FROM ${sql(descriptor.tableName)} WHERE index_generation = ${generation}`
-              yield* sql`UPDATE effect_local_client_index_catalog SET ready_generation = NULL,
-                backfill_generation = ${generation}, backfill_after_key = NULL,
-                backfill_visible_revision = NULL
-                WHERE model = ${descriptor.model.name} AND index_name = ${descriptor.indexName}
-                  AND descriptor_hash = ${descriptor.hash}`
-            }
-          }))
-          let after: string | null = null
-          const findRows = SqlSchema.findAll({
-            Request: Schema.Struct({
-              generation: Schema.Int,
-              model: Schema.String,
-              after: Schema.NullOr(Schema.String)
-            }),
-            Result: IndexedEntityRow,
-            execute: ({ generation: rowGeneration, model: rowModel, after: rowAfter }) => {
-              if (rowAfter === null) {
-                return sql`SELECT entity_key, value_json FROM effect_local_client_visible_entities_data
-                  WHERE generation = ${rowGeneration} AND model = ${rowModel}
-                  ORDER BY entity_key LIMIT ${backfillPageSize}`
-              }
-              return sql`SELECT entity_key, value_json FROM effect_local_client_visible_entities_data
-                WHERE generation = ${rowGeneration} AND model = ${rowModel} AND entity_key > ${rowAfter}
-                ORDER BY entity_key LIMIT ${backfillPageSize}`
-            }
-          })
-          while (true) {
-            const result = yield* sql.withTransaction(Effect.gen(function*() {
-              const rows = yield* findRows({ generation, model: model.name, after }).pipe(
-                Effect.catchTag("SchemaError", (cause) =>
-                  Effect.fail(
-                    new ReplicaError.StorageCorrupt({ message: "Secondary index rebuild row is invalid", cause })
-                  ))
-              )
-              if (rows.length === 0) return Option.none<string>()
-              const batches = new Map<Descriptor, Array<Record<string, unknown>>>()
-              for (const descriptor of modelDescriptors) {
-                batches.set(descriptor, [])
-              }
-              for (const row of rows) {
-                const value = yield* decodeEntity(model, row.value_json)
-                for (const descriptor of modelDescriptors) {
-                  const batch = batches.get(descriptor)
-                  if (batch === undefined) continue
-                  batch.push((yield* makeIndexRow(descriptor, generation, row.entity_key, value)).row)
-                }
-              }
-              for (const descriptor of modelDescriptors) {
-                yield* upsertRows(sql, descriptor, batches.get(descriptor) ?? [])
-              }
-              return Option.some(rows[rows.length - 1].entity_key)
-            }))
-            if (Option.isNone(result)) break
-            after = result.value
+    const points: Runtime["points"] = (address, entities) =>
+      Effect.forEach(entities, (entity) =>
+        Effect.forEach(
+          byModel.get(entity.model) ?? [],
+          (descriptor) => readPoint(sql, descriptor, address, entity.entityKey)
+        ).pipe(Effect.map((values) => values.flat()))).pipe(Effect.map((values) => values.flat()))
+    const findEntity = SqlSchema.findOneOption({
+      Request: Schema.Struct({
+        spaceId: Schema.String,
+        schemaGeneration: Schema.Int,
+        projectionGeneration: Schema.Int,
+        model: Schema.String,
+        entityKey: Schema.String
+      }),
+      Result: IndexedEntityRow,
+      execute: ({ entityKey, model, projectionGeneration, schemaGeneration, spaceId }) =>
+        sql`SELECT entity_key, value_json FROM effect_local_client_visible_entities_data
+        WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
+          AND projection_generation = ${projectionGeneration} AND model = ${model} AND entity_key = ${entityKey}`
+    })
+    const replace: Runtime["replace"] = (address, entities) =>
+      Effect.forEach(entities, (entity) =>
+        Effect.gen(function*() {
+          const model = definition.modelByName.get(entity.model)
+          if (model === undefined) {
+            return yield* new ReplicaError.StorageCorrupt({ message: `Unknown indexed model: ${entity.model}` })
           }
-          yield* sql.withTransaction(Effect.gen(function*() {
-            for (const descriptor of modelDescriptors) {
-              const table = sql(descriptor.tableName)
-              yield* sql`DELETE FROM ${table} WHERE index_generation <> ${generation}`
-              yield* sql`UPDATE effect_local_client_index_catalog SET ready_generation = ${generation},
-                backfill_generation = NULL, backfill_after_key = NULL, backfill_visible_revision = NULL
-                WHERE model = ${descriptor.model.name} AND index_name = ${descriptor.indexName}
-                  AND descriptor_hash = ${descriptor.hash}`
-            }
-          }))
-        }
-      }).pipe(
-        Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
-        Effect.withSpan("IndexStore.rebuild", { attributes: { "index.generation": generation } })
-      )
-    return { update, rebuild }
+          const found = yield* findEntity({ ...address, ...entity }).pipe(
+            Effect.catchTag(
+              "SchemaError",
+              (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Indexed entity row is invalid", cause }))
+            ),
+            Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+          )
+          let value: unknown
+          if (Option.isSome(found)) value = yield* decodeEntity(model, found.value.value_json)
+          return yield* Effect.forEach(
+            byModel.get(entity.model) ?? [],
+            (descriptor) => writeEntity(sql, descriptor, address, entity.entityKey, value)
+          ).pipe(Effect.map((values) => values.flat()))
+        })).pipe(
+          Effect.map((values) => values.flat()),
+          Effect.withSpan("IndexStore.replace", { attributes: { "space.id": address.spaceId } })
+        )
+    const runtime = { ensure, points, replace }
+    yield* runtime.ensure(initial)
+    return runtime
   }).pipe(Effect.withSpan("IndexStore.install"))
 
 interface QueryState {
@@ -775,7 +856,7 @@ const encodeWhere = (
 
 const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & string,>(
   sql: SqlClient.SqlClient,
-  generation: number,
+  address: Address,
   model: M,
   indexName: Name,
   descriptor: Descriptor,
@@ -786,6 +867,7 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
   ReplicaError.StorageError
 > =>
   Effect.gen(function*() {
+    yield* backfill(sql, descriptor, address)
     if (state.direction !== "asc" && state.direction !== "desc") {
       return yield* new ReplicaError.StorageCorrupt({ message: "Query order must be asc or desc" })
     }
@@ -795,12 +877,30 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
       })
     }
     const ready = yield* SqlSchema.findOneOption({
-      Request: Schema.Struct({ model: Schema.String, indexName: Schema.String, hash: Schema.String }),
+      Request: Schema.Struct({
+        spaceId: Schema.String,
+        schemaGeneration: Schema.Int,
+        projectionGeneration: Schema.Int,
+        model: Schema.String,
+        indexName: Schema.String,
+        hash: Schema.String
+      }),
       Result: ReadyRow,
-      execute: ({ hash, indexName: readyIndexName, model: readyModel }) =>
-        sql`SELECT layout_hash, ready_generation FROM effect_local_client_index_catalog
-        WHERE model = ${readyModel} AND index_name = ${readyIndexName} AND descriptor_hash = ${hash}`
-    })({ model: model.name, indexName, hash: descriptor.hash }).pipe(
+      execute: ({
+        hash,
+        indexName: requestedIndex,
+        model: requestedModel,
+        projectionGeneration,
+        schemaGeneration,
+        spaceId
+      }) =>
+        sql`SELECT c.layout_hash, s.ready FROM effect_local_client_index_catalog AS c
+        INNER JOIN effect_local_client_index_state AS s
+          ON s.model = c.model AND s.index_name = c.index_name AND s.descriptor_hash = c.descriptor_hash
+        WHERE s.space_id = ${spaceId} AND s.schema_generation = ${schemaGeneration}
+          AND s.projection_generation = ${projectionGeneration} AND c.model = ${requestedModel}
+          AND c.index_name = ${requestedIndex} AND c.descriptor_hash = ${hash}`
+    })({ ...address, model: model.name, indexName, hash: descriptor.hash }).pipe(
       Effect.catchTag("SchemaError", (cause) =>
         Effect.fail(new ReplicaError.StorageCorrupt({ message: "Secondary index readiness row is invalid", cause }))),
       Effect.catchIf(SqlError.isSqlError, (cause) =>
@@ -808,10 +908,10 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
     )
     if (
       Option.isNone(ready) || ready.value.layout_hash !== descriptor.hash ||
-      ready.value.ready_generation !== generation
+      ready.value.ready !== 1
     ) {
       return yield* new ReplicaError.StorageCorrupt({
-        message: `Secondary index ${model.name}.${indexName} is not ready for this generation`
+        message: `Secondary index ${model.name}.${indexName} is not ready for this projection`
       })
     }
     const encodedWhere = yield* encodeWhere(descriptor, state.where)
@@ -913,6 +1013,7 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
       hasMore: boolean,
       full: boolean
     ): Footprint => ({
+      spaceId: address.spaceId,
       descriptor: descriptor.hash,
       model: model.name,
       index: indexName,
@@ -941,9 +1042,11 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
       execute: () =>
         sql`SELECT e.entity_key, e.value_json FROM ${table} AS i
         INNER JOIN effect_local_client_visible_entities_data AS e
-          ON e.generation = i.index_generation AND e.model = ${model.name}
+          ON e.space_id = i.space_id AND e.schema_generation = i.index_schema_generation
+          AND e.projection_generation = i.index_projection_generation AND e.model = ${model.name}
           AND e.entity_key = i.index_entity_key
-        WHERE i.index_generation = ${generation} AND ${sql.and(whereClauses)}
+        WHERE i.space_id = ${address.spaceId} AND i.index_schema_generation = ${address.schemaGeneration}
+          AND i.index_projection_generation = ${address.projectionGeneration} AND ${sql.and(whereClauses)}
         ORDER BY ${order} LIMIT ${state.limit + 1}`
     })
     const rows = yield* findRows(undefined).pipe(
@@ -996,7 +1099,7 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
 
 export const query = <M extends Model.Any, Name extends keyof Model.Indexes<M> & string,>(
   sql: SqlClient.SqlClient,
-  generation: number,
+  address: Address,
   model: M,
   indexName: Name,
   onRead?: ReadRegistration
@@ -1010,7 +1113,7 @@ export const query = <M extends Model.Any, Name extends keyof Model.Indexes<M> &
     order: (direction) => build({ ...state, direction }),
     limit: (limit) => build({ ...state, limit }),
     after: (cursor) => build({ ...state, cursor: cursor.token }),
-    page: () => runPage(sql, generation, model, indexName, descriptor, state, onRead),
+    page: () => runPage(sql, address, model, indexName, descriptor, state, onRead),
     stream: () => {
       let registered = false
       let streamRead: ReadRegistration | undefined
@@ -1026,7 +1129,7 @@ export const query = <M extends Model.Any, Name extends keyof Model.Indexes<M> &
       return Stream.paginate(
         state.cursor,
         (cursor) =>
-          runPage(sql, generation, model, indexName, descriptor, { ...state, cursor }, streamRead).pipe(
+          runPage(sql, address, model, indexName, descriptor, { ...state, cursor }, streamRead).pipe(
             Effect.map((page) => {
               if (page.next === undefined) return [page.items, Option.none<string>()] as const
               return [page.items, Option.some(page.next.token)] as const

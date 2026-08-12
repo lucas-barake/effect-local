@@ -7,9 +7,9 @@ import type * as AtomRegistry from "effect/unstable/reactivity/AtomRegistry"
 import type * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as ReplicaAtom from "./ReplicaAtom.js"
 
-export const make = <R, E,>(
+export const make = <E,>(
   layer: Layer.Layer<
-    Replica.Replica | QueryReactivity.QueryReactivity | R,
+    Replica.Replica | QueryReactivity.QueryReactivity,
     E,
     AtomRegistry.AtomRegistry | Reactivity.Reactivity
   >,

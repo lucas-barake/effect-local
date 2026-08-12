@@ -1,3 +1,4 @@
+import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -8,6 +9,7 @@ export type Read =
   | { readonly _tag: "Index"; readonly footprint: IndexStore.Footprint }
 
 export interface Changes {
+  readonly spaceId: Identity.SpaceId
   readonly entityKeys: ReadonlySet<string>
   readonly points: ReadonlyArray<IndexStore.Point>
   readonly broadModels: ReadonlySet<string>
@@ -50,6 +52,7 @@ const sameTuple = (
 ): boolean => compareTuple(left, right) === 0
 
 const pointMatches = (footprint: IndexStore.Footprint, point: IndexStore.Point): boolean => {
+  if (point.spaceId !== footprint.spaceId) return false
   if (!sameTuple(point.partition, footprint.partition)) return false
   const ranged = point.sort[0]
   if (ranged !== undefined) {
@@ -112,6 +115,7 @@ const make = (): Service => {
         for (const [key, reads] of readsByKey) {
           const matches = reads.some((read) => {
             if (read._tag === "Entity") return changes.entityKeys.has(read.key)
+            if (read.footprint.spaceId !== changes.spaceId) return false
             if (changes.broadModels.has(read.footprint.model)) return true
             return pointsByDescriptor.get(read.footprint.descriptor)?.some((point) =>
               pointMatches(read.footprint, point)

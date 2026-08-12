@@ -182,20 +182,26 @@ describe("server reconciled mutation log", () => {
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("corrupt-index-refresh"))
       const meta = yield* SqlSchema.findOne({
         Request: Schema.Void,
-        Result: Schema.Struct({ active_schema_generation: Schema.Int }),
-        execute: () => sql`SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1`
+        Result: Schema.Struct({
+          active_schema_generation: Schema.Int,
+          active_projection_generation: Schema.Int
+        }),
+        execute: () =>
+          sql`SELECT active_schema_generation, active_projection_generation
+          FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
       })(undefined)
 
       yield* sql`INSERT INTO effect_local_client_canonical_entities_data
-        (generation, model, model_version, entity_key, value_json)
-        VALUES (${meta.active_schema_generation}, ${Domain.Todo.name}, ${Domain.Todo.version},
+        (space_id, schema_generation, model, model_version, entity_key, value_json)
+        VALUES (${spaceId}, ${meta.active_schema_generation}, ${Domain.Todo.name}, ${Domain.Todo.version},
           ${Canonical.stringify("corrupt-index-refresh")}, x'00')`
       const malformed = yield* SqlSchema.findOne({
         Request: Schema.Void,
         Result: Schema.Struct({ value_json: Schema.Unknown }),
         execute: () =>
           sql`SELECT value_json FROM effect_local_client_canonical_entities_data
-          WHERE generation = ${meta.active_schema_generation} AND model = ${Domain.Todo.name}
+          WHERE space_id = ${spaceId} AND schema_generation = ${meta.active_schema_generation}
+          AND model = ${Domain.Todo.name}
           AND entity_key = ${Canonical.stringify("corrupt-index-refresh")}`
       })(undefined)
       assert.instanceOf(malformed.value_json, Uint8Array)
@@ -204,6 +210,7 @@ describe("server reconciled mutation log", () => {
         clientId,
         mutationId: pending.envelope.mutationId,
         localSequence: pending.envelope.localSequence,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
         ...putTodoProvenance,
         origin: "Mutation",
         terminalSequence: Identity.TerminalSequence.make(1),
@@ -220,7 +227,7 @@ describe("server reconciled mutation log", () => {
       const local = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
         Layer.provide(runtime)
       )
-      const queries = QueryExecutor.layer(Domain.definition).pipe(Layer.provide(Domain.handlers))
+      const queries = QueryExecutor.layer(Domain.definition, spaceId).pipe(Layer.provide(Domain.handlers))
       const context = yield* Layer.build(Layer.merge(local, queries).pipe(Layer.provide(sharedDatabase)))
       const store = Context.get(context, LocalStore.Store)
       const executor = Context.get(context, QueryExecutor.QueryExecutor)
@@ -668,7 +675,8 @@ describe("server reconciled mutation log", () => {
         const services = Layer.mergeAll(
           Layer.succeed(SqlClient.SqlClient, sql),
           Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto)),
-          Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity))
+          Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity)),
+          Layer.succeed(QueryReactivity.QueryReactivity, Context.get(databaseContext, QueryReactivity.QueryReactivity))
         )
         const localContext = yield* Layer.build(
           LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(

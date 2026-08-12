@@ -92,11 +92,11 @@ const database = Layer.merge(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   Reactivity.layer
 )
-const dependencies = Layer.mergeAll(database, handlers, QueryReactivity.layer)
-const executor = QueryExecutor.layer(definition).pipe(Layer.provide(dependencies))
-const runtime = ManagedRuntime.make(Layer.merge(executor, dependencies))
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const dependencies = Layer.mergeAll(database, handlers, QueryReactivity.layer)
+const executor = QueryExecutor.layer(definition, spaceId).pipe(Layer.provide(dependencies))
+const runtime = ManagedRuntime.make(Layer.merge(executor, dependencies))
 
 beforeAll(async () => {
   await runtime.runPromise(Effect.gen(function*() {
@@ -107,12 +107,12 @@ beforeAll(async () => {
       clientId,
       migration: { retryDelay: "1 millis", maximumAttempts: 8 }
     })
-    yield* sql`UPDATE effect_local_client_meta SET schema_version = ${definition.schemaIdentity.version},
-      schema_hash = ${definition.schemaIdentity.hash} WHERE singleton = 1`
     const rows = Array.from({ length: 10_000 }, (_, score) => {
       const id = `item-${score.toString().padStart(5, "0")}`
       return {
-        generation: 0,
+        space_id: spaceId,
+        schema_generation: 0,
+        projection_generation: 0,
         model: Item.name,
         entity_key: Canonical.stringify(id),
         value_json: Canonical.stringify({ id, bucket: score % 4, score }),
@@ -123,7 +123,11 @@ beforeAll(async () => {
       yield* sql`INSERT INTO effect_local_client_visible_entities_data
         ${sql.insert(rows.slice(offset, offset + 500))}`
     }
-    yield* IndexStore.install(sql, definition)
+    yield* IndexStore.install(sql, definition, {
+      spaceId,
+      schemaGeneration: 0,
+      projectionGeneration: 0
+    })
   }))
   decodedRows = 0
 })
@@ -159,7 +163,8 @@ bench("explicit unindexed scan decodes the complete model", async () => {
       Result: Schema.Struct({ value_json: Schema.String }),
       execute: () =>
         sql`SELECT value_json FROM effect_local_client_visible_entities_data
-        WHERE generation = 0 AND model = ${Item.name} ORDER BY entity_key`
+        WHERE space_id = ${spaceId} AND schema_generation = 0 AND projection_generation = 0
+          AND model = ${Item.name} ORDER BY entity_key`
     })(undefined)
     return yield* Effect.forEach(rows, (row) =>
       Codec.parse(row.value_json).pipe(

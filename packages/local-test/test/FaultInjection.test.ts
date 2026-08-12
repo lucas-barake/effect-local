@@ -24,15 +24,6 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as FaultInjection from "../src/FaultInjection.js"
 import * as TestServer from "../src/TestServer.js"
 
-type EffectQueryReactivity = {
-  readonly retain: (key: string) => Effect.Effect<Effect.Effect<void>>
-  readonly record: (key: string, reads: ReadonlyArray<QueryReactivity.Read>) => Effect.Effect<void>
-  readonly affected: (changes: QueryReactivity.Changes) => Effect.Effect<ReadonlyArray<string>>
-}
-type QueryReactivityMethodsReturnEffects = QueryReactivity.Service extends EffectQueryReactivity ? true : false
-const queryReactivityMethodsReturnEffects: QueryReactivityMethodsReturnEffects = true
-void queryReactivityMethodsReturnEffects
-
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")

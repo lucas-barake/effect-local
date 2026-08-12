@@ -1,7 +1,10 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
 import type * as IndexStore from "../src/IndexStore.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
+
+const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 
 const footprint = (options: {
   readonly lower: string
@@ -9,6 +12,7 @@ const footprint = (options: {
   readonly boundary?: ReadonlyArray<string | number>
   readonly full?: boolean
 }): IndexStore.Footprint => ({
+  spaceId,
   descriptor: "todo-by-title",
   model: "Todo",
   index: "byTitle",
@@ -25,6 +29,7 @@ const footprint = (options: {
 })
 
 const point = (title: string, entityKey: string): IndexStore.Point => ({
+  spaceId,
   descriptor: "todo-by-title",
   model: "Todo",
   index: "byTitle",
@@ -34,6 +39,7 @@ const point = (title: string, entityKey: string): IndexStore.Point => ({
 })
 
 const changes = (points: ReadonlyArray<IndexStore.Point>): QueryReactivity.Changes => ({
+  spaceId,
   entityKeys: new Set(),
   points,
   broadModels: new Set()
@@ -43,12 +49,6 @@ describe("query range reactivity", () => {
   it.effect("intersects old and new index points with only the result ranges they can change", () =>
     Effect.gen(function*() {
       const registry = yield* QueryReactivity.QueryReactivity
-      const effectService: {
-        readonly retain: (key: string) => Effect.Effect<Effect.Effect<void>>
-        readonly record: (key: string, reads: ReadonlyArray<QueryReactivity.Read>) => Effect.Effect<void>
-        readonly affected: (changes: QueryReactivity.Changes) => Effect.Effect<ReadonlyArray<string>>
-      } = registry
-      void effectService
       const releaseRelated = yield* registry.retain("related")
       const releaseUnrelated = yield* registry.retain("unrelated")
       yield* Effect.addFinalizer(() => releaseUnrelated.pipe(Effect.andThen(releaseRelated)))
@@ -88,6 +88,7 @@ describe("query range reactivity", () => {
       yield* Effect.addFinalizer(() => Effect.all(releases, { discard: true }))
       let comparisons = 0
       const unrelated = Array.from({ length: 1_000 }, (_, index): IndexStore.Point => ({
+        spaceId,
         get descriptor() {
           comparisons++
           return "another-index"
