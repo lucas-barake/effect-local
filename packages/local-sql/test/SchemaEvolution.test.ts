@@ -597,9 +597,9 @@ describe("client schema evolution", () => {
         rejection: "server-rejected"
       })
       yield* v1.persistReceipt(receipt)
-      yield* sql`CREATE TRIGGER fail_projection_promotion BEFORE UPDATE OF active_projection_generation
+      yield* sql`CREATE TRIGGER fail_projection_promotion BEFORE UPDATE OF visible_revision
         ON effect_local_client_spaces
-        WHEN NEW.active_projection_generation <> OLD.active_projection_generation
+        WHEN NEW.visible_revision <> OLD.visible_revision
         BEGIN SELECT RAISE(ABORT, 'projection failed'); END`
 
       const failedSettlement = yield* v1.settleReceipts.pipe(Effect.result)

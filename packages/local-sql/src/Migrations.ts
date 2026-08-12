@@ -1309,6 +1309,21 @@ const clientV12 = makeMigration({
   ]
 })
 
+const clientV13 = makeMigration({
+  id: 13,
+  name: "projection-dirty-entities",
+  statements: [
+    `CREATE TABLE effect_local_client_projection_dirty (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL CHECK (model_version > 0),
+      entity_key TEXT NOT NULL,
+      PRIMARY KEY (space_id, schema_generation, model, entity_key)
+    )`
+  ]
+})
+
 export const clientCatalog = Object.freeze([
   clientV1,
   clientV2,
@@ -1321,7 +1336,8 @@ export const clientCatalog = Object.freeze([
   clientV9,
   clientV10,
   clientV11,
-  clientV12
+  clientV12,
+  clientV13
 ])
 
 const serverV6 = makeMigration({

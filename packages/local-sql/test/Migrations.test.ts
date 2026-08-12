@@ -135,7 +135,7 @@ describe("storage migration catalogs", () => {
 
       assert.deepStrictEqual(
         (yield* clientLedger(sql)).map((row) => row.id),
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
       )
       assert.deepStrictEqual(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
