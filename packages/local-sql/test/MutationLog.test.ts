@@ -2589,24 +2589,19 @@ describe("server reconciled mutation log", () => {
     Effect.scoped(Effect.gen(function*() {
       const pullEntered = yield* Deferred.make<void>()
       const releasePull = yield* Deferred.make<void>()
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
-          pull: () =>
+          pull: (request) =>
             Deferred.succeed(pullEntered, undefined).pipe(
               Effect.andThen(Deferred.await(releasePull)),
-              Effect.as(
-                {
-                  entries: [],
-                  hasMore: false,
-                  serverSchema: Domain.definition.schemaIdentity
-                } as const
-              )
+              Effect.andThen(server.pull(request))
             ),
-          bootstrap: () => Effect.die("unexpected bootstrap"),
+          bootstrap: server.bootstrap,
           watch: () => Stream.never
         })
       )

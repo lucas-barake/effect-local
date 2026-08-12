@@ -335,7 +335,18 @@ export const makeManager = (options: {
             if (authenticationGate !== undefined) {
               return Deferred.await(authenticationGate).pipe(Effect.andThen(watch()))
             }
-            return remote.watch({ spaceId: space.spaceId, schema: space.definition.schemaIdentity }).pipe(
+            return Stream.unwrap(space.local.replicationState.pipe(
+              Effect.map((replication) =>
+                remote.watch({
+                  spaceId: space.spaceId,
+                  clientId: replication.clientId,
+                  schema: space.definition.schemaIdentity,
+                  scope: replication.scope,
+                  scopeGeneration: replication.scopeGeneration,
+                  cursor: replication.cursor
+                })
+              )
+            )).pipe(
               Stream.runForEach(() => {
                 watchAttempt = 0
                 return enqueue(state)

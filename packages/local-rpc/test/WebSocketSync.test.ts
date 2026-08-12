@@ -135,6 +135,7 @@ const serverHistory = {
   migration
 }
 const clientHistory = {
+  scope,
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,
@@ -475,6 +476,7 @@ const makeLifecycleHarness = (options?: {
       }
     }).pipe(Layer.provide(lifecycleRuntime), Layer.provide(database))
     const lifecycleCluster = SpaceEntity.layer().pipe(
+      Layer.provide(assertionVerifier),
       Layer.provide(lifecycleStore),
       Layer.provide(PresenceHub.layerTrusted()),
       Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(database)))
@@ -486,6 +488,7 @@ const makeLifecycleHarness = (options?: {
       Layer.provideMerge(lifecycleWebSocketProtocol),
       Layer.provide(lifecycleCluster),
       Layer.provide(observedAuthenticationServer),
+      Layer.provide(assertionIssuer),
       Layer.provide(HttpRouter.serve(lifecycleWebSocketProtocol, {
         disableListenLog: true,
         disableLogger: true
@@ -658,12 +661,7 @@ describe("WebSocket synchronization", () => {
       yield* Effect.addFinalizer(() => Deferred.succeed(harness.pullRelease, undefined))
       const context = yield* Layer.build(harness.live)
       const remote = Context.get(context, SyncEngine.SyncEngine)
-      const request = {
-        spaceId,
-        schema: definition.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      }
+      const request = pullRequest()
       yield* remote.pull(request)
       MutableRef.set(harness.blockPull, true)
       const pulling = yield* remote.pull(request).pipe(Effect.forkChild({ startImmediately: true }))
