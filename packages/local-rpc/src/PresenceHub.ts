@@ -117,6 +117,10 @@ export const layer = <R = never,>(options: {
           Stream.unwrap(
             Effect.gen(function*() {
               const { channel, watcherPermits } = yield* RcMap.get(updates, spaceId)
+              yield* options.authorize(WatchAuthorization.make({ spaceId, principal })).pipe(
+                Effect.provide(context),
+                Effect.mapError((reason) => new ReplicaError.AuthorizationDenied({ reason }))
+              )
               yield* Effect.acquireRelease(
                 Effect.gen(function*() {
                   if (!(yield* Semaphore.takeIfAvailable(watcherPermits, 1))) {
@@ -132,10 +136,6 @@ export const layer = <R = never,>(options: {
                     Semaphore.release(watcherPermits, 1),
                     Metric.modify(watcherCount, -1)
                   ], { discard: true })
-              )
-              yield* options.authorize(WatchAuthorization.make({ spaceId, principal })).pipe(
-                Effect.provide(context),
-                Effect.mapError((reason) => new ReplicaError.AuthorizationDenied({ reason }))
               )
               const subscription = yield* PubSub.subscribe(channel)
               return Stream.fromSubscription(subscription)

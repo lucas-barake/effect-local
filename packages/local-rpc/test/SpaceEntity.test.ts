@@ -317,34 +317,42 @@ describe("SpaceEntity", () => {
             return bootstrapPage
           })
       })
-      const entityHandlers = SpaceEntity.layerHandlers(handlerOptions).pipe(
+      const cluster = SpaceEntity.layer(handlerOptions).pipe(
         Layer.provide(Layer.succeed(ServerStore.ServerStore, wrapped)),
-        Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }))
+        Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+        Layer.provide(
+          SingleRunner.layer({
+            runnerStorage: "memory",
+            shardingConfig: {
+              entityTerminationTimeout: 0,
+              entityMessagePollInterval: 5_000,
+              sendRetryInterval: 100
+            }
+          }).pipe(Layer.provide(database))
+        )
       )
-      const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, entityHandlers)
-      const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, entityHandlers)
-      const admissionClient = yield* makeAdmissionClient(spaceA)
-      const readClient = yield* makeReadClient(spaceA)
-      const first = yield* readClient.Bootstrap({ request: bootstrapRequest, principal: null }).pipe(
-        Effect.forkChild({ startImmediately: true })
-      )
-      yield* Deferred.await(firstEntered)
-      const submitted = yield* envelope(spaceA)
-      const submit = yield* admissionClient.Submit({
-        request: { envelope: submitted, schema: definition.schemaIdentity },
-        principal: null
-      }).pipe(
-        Effect.forkChild({ startImmediately: true })
-      )
-      yield* Effect.yieldNow
+      yield* Effect.gen(function*() {
+        const client = yield* SpaceEntity.Client
+        const first = yield* client.bootstrap(spaceA, bootstrapRequest, null).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(firstEntered)
+        const submitted = yield* envelope(spaceA)
+        const submit = yield* client.submit(
+          spaceA,
+          { envelope: submitted, schema: definition.schemaIdentity },
+          null
+        ).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Effect.yieldNow
 
-      assert.isTrue(yield* Deferred.isDone(submitEntered))
-      const submitExit = yield* Deferred.await(submitCompleted)
-      if (Exit.isFailure(submitExit)) assert.fail(Cause.pretty(submitExit.cause))
-      assert.strictEqual(submitExit.value._tag, "Accepted")
-      yield* Deferred.succeed(releaseFirst, undefined)
-      yield* Fiber.join(first)
-      yield* Fiber.join(submit)
+        assert.isTrue(yield* Deferred.isDone(submitEntered))
+        const submitExit = yield* Deferred.await(submitCompleted)
+        if (Exit.isFailure(submitExit)) assert.fail(Cause.pretty(submitExit.cause))
+        assert.strictEqual(submitExit.value._tag, "Accepted")
+        yield* Deferred.succeed(releaseFirst, undefined)
+        yield* Fiber.join(first)
+        yield* Fiber.join(submit)
+      }).pipe(Effect.provide(cluster))
     }).pipe(
       Effect.provide(shardingConfig),
       Effect.provide(NodeCrypto.layer)

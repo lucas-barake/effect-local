@@ -94,6 +94,7 @@ const handlers = Layer.mergeAll(
 const runtime = MutationRuntime.layer(definition, evolution).pipe(Layer.provide(handlers))
 const readAuthorized = MutableRef.make(true)
 const hangReadAuthorization = MutableRef.make(false)
+const defectReadAuthorization = MutableRef.make(false)
 const database = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   NodeCrypto.layer,
@@ -153,6 +154,7 @@ const store = ServerStore.layer({
     return Effect.void
   },
   authorizeRead: ({ principal, spaceId: requestedSpaceId }) => {
+    if (MutableRef.get(defectReadAuthorization)) return Effect.die("policy backend defect")
     if (MutableRef.get(hangReadAuthorization)) return Effect.never
     if (
       MutableRef.get(readAuthorized) && principal !== null && typeof principal === "object" &&
@@ -574,6 +576,39 @@ describe("WebSocket synchronization", () => {
       Effect.ensuring(Effect.sync(() => {
         MutableRef.set(readAuthorized, true)
         MutableRef.set(hangReadAuthorization, false)
+      })),
+      Effect.provide(live),
+      Effect.provide(NodeCrypto.layer)
+    ), 10_000)
+
+  it.effect("fails a watch closed when authorization refresh defects", () =>
+    Effect.gen(function*() {
+      MutableRef.set(readAuthorized, true)
+      const remote = yield* SyncEngine.SyncEngine
+      const initialWake = yield* Deferred.make<void>()
+      const watching = yield* remote.watch({ spaceId, schema: definition.schemaIdentity }).pipe(
+        Stream.tap((wake) => {
+          if (wake.sequence === 0) return Deferred.succeed(initialWake, undefined)
+          return Effect.void
+        }),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(initialWake)
+      MutableRef.set(defectReadAuthorization, true)
+      yield* TestClock.adjust("100 millis")
+
+      const denied = yield* Fiber.join(watching).pipe(Effect.flip)
+      assert.strictEqual(denied._tag, "AuthorizationDenied")
+
+      MutableRef.set(defectReadAuthorization, false)
+      const replacement = yield* remote.watch({ spaceId, schema: definition.schemaIdentity }).pipe(Stream.runHead)
+      assert.isTrue(Option.isSome(replacement))
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => {
+        MutableRef.set(readAuthorized, true)
+        MutableRef.set(defectReadAuthorization, false)
       })),
       Effect.provide(live),
       Effect.provide(NodeCrypto.layer)

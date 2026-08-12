@@ -16,9 +16,11 @@ interface Key {
 
 const key = (tenant: string): Key => ({ tenant, path: ["spaces", "read"] })
 
-const make = (options?: Partial<ReadAuthorization.Options>) =>
+const make = (options?: Partial<ReadAuthorization.Options<string>>) =>
   ReadAuthorization.make<Key, string, string>({
     refreshInterval: "1 second",
+    lookupTimeout: "1 second",
+    onLookupTimeout: () => "timeout",
     maximumConcurrentLookups: 2,
     completedCacheCapacity: 16,
     ...options
@@ -108,6 +110,39 @@ describe("read authorization coordinator", () => {
       yield* Effect.forEach(fibers, Fiber.join)
       assert.strictEqual(maximumRunning, 2)
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 0, completed: 5 })
+    }).pipe(Effect.scoped))
+
+  it.effect("expires queued owner work before it can run stale policy lookups", () =>
+    Effect.gen(function*() {
+      const coordinator = yield* make({ maximumConcurrentLookups: 1 })
+      const firstEntered = yield* Deferred.make<void>()
+      let queuedEntered = false
+      const first = yield* coordinator.authorize(
+        key("first"),
+        () => Deferred.succeed(firstEntered, undefined).pipe(Effect.andThen(Effect.never))
+      ).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.await(firstEntered)
+      const queued = yield* coordinator.authorize(
+        key("queued"),
+        () =>
+          Effect.sync(() => {
+            queuedEntered = true
+            return "queued"
+          })
+      ).pipe(Effect.forkChild({ startImmediately: true }))
+      assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 2, completed: 0 })
+      yield* Effect.yieldNow
+
+      yield* TestClock.adjust("2 seconds")
+      yield* Effect.yieldNow
+      assert.isTrue(Exit.isFailure(yield* Fiber.await(first)))
+      assert.isTrue(Exit.isFailure(yield* Fiber.await(queued)))
+      assert.isFalse(queuedEntered)
+      assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 0, completed: 0 })
+      assert.strictEqual(
+        (yield* coordinator.authorize(key("replacement"), () => Effect.succeed("replacement"))).value,
+        "replacement"
+      )
     }).pipe(Effect.scoped))
 
   it.effect("detaches interrupted leader and follower callers without canceling shared work", () =>

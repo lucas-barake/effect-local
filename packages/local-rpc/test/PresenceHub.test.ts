@@ -240,6 +240,32 @@ describe("PresenceHub", () => {
     })
   })
 
+  it.effect("does not reveal presence watcher occupancy to unauthorized principals", () =>
+    Effect.gen(function*() {
+      const authorized = yield* Queue.unbounded<void>()
+      const live = PresenceHub.layer({
+        maximumWatchersPerSpace: 1,
+        authorize: (input) => {
+          if (input._tag !== "Watch") return Effect.void
+          if (input.principal === "denied") return Effect.fail("denied")
+          return Queue.offer(authorized, undefined).pipe(Effect.asVoid)
+        }
+      })
+
+      yield* Effect.gen(function*() {
+        const hub = yield* PresenceHub.PresenceHub
+        const first = yield* hub.watch(spaceA, "allowed").pipe(
+          Stream.runDrain,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Queue.take(authorized)
+
+        const denied = yield* hub.watch(spaceA, "denied").pipe(Stream.runHead, Effect.flip)
+        assert.strictEqual(denied._tag, "AuthorizationDenied")
+        yield* Fiber.interrupt(first)
+      }).pipe(Effect.provide(live))
+    }))
+
   it.effect("releases presence watcher capacity after stream completion", () =>
     Effect.gen(function*() {
       const authorized = yield* Queue.unbounded<void>()

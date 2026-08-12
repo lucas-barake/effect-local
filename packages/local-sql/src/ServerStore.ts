@@ -4,6 +4,7 @@ import * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
@@ -14,6 +15,7 @@ import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
+import * as Queue from "effect/Queue"
 import * as RcMap from "effect/RcMap"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
@@ -257,34 +259,62 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         Result: Schema.Struct({ history: Schema.Number, receipts: Schema.Number }),
         execute: () =>
           sql`SELECT
-          COALESCE(MAX(history_count), 0) AS history,
-          COALESCE(MAX(receipt_count), 0) AS receipts
-          FROM effect_local_server_space_counts`
+          COALESCE((SELECT history_count FROM effect_local_server_space_counts
+            ORDER BY history_count DESC LIMIT 1), 0) AS history,
+          COALESCE((SELECT receipt_count FROM effect_local_server_space_counts
+            ORDER BY receipt_count DESC LIMIT 1), 0) AS receipts`
       })
       const metricDepthRefreshes = yield* Semaphore.make(1)
       const refreshMetricDepths = metricDepthRefreshes.withPermit(
         readMetricDepths(undefined).pipe(
+          Effect.mapError(StorageUnavailable.make),
           Effect.flatMap((depths) => metrics.initializeDepths(depths.history, depths.receipts)),
-          Effect.mapError(StorageUnavailable.make)
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+            return Effect.logWarning("Server metric refresh failed", cause)
+          })
         )
       )
       yield* refreshMetricDepths
-      interface ReadAuthorizationKey {
-        readonly spaceId: Identity.SpaceId
-        readonly principal: typeof Schema.Json.Type
-      }
+      const metricDepthRefreshRequests = yield* Queue.dropping<void>(1)
+      yield* Queue.take(metricDepthRefreshRequests).pipe(
+        Effect.andThen(Effect.sleep("10 millis")),
+        Effect.andThen(refreshMetricDepths),
+        Effect.forever,
+        Effect.forkScoped
+      )
+      const scheduleMetricDepthRefresh = Queue.offer(metricDepthRefreshRequests, undefined).pipe(Effect.asVoid)
       const readAuthorizations = yield* ReadAuthorization.make<
-        ReadAuthorizationKey,
+        string,
         void,
         ReplicaError.AuthorizationDenied
       >({
         refreshInterval: options.readAuthorizationRefreshInterval,
+        lookupTimeout: Duration.millis(readAuthorizationRefreshMillis / 2),
+        onLookupTimeout: () => new ReplicaError.AuthorizationDenied({ reason: { _tag: "ReadAuthorizationExpired" } }),
         maximumConcurrentLookups: options.maximumConcurrentReadAuthorizations,
         completedCacheCapacity: options.readAuthorizationCacheCapacity
       })
       const projectionGates = yield* RcMap.make({
         lookup: (_key: string) => Semaphore.make(1)
       })
+      const recordAdmissionMetrics = (receipt: Protocol.Receipt) => {
+        let outcome: "accepted" | "rejected" | "expired" = "expired"
+        if (receipt._tag === "Accepted") outcome = "accepted"
+        if (receipt._tag === "Rejected") outcome = "rejected"
+        let rejection = Effect.void
+        if (receipt._tag === "Rejected") rejection = metrics.recordRejection(receipt.origin)
+        return Effect.all([
+          metrics.recordAdmission(outcome),
+          scheduleMetricDepthRefresh,
+          rejection
+        ], { discard: true })
+      }
+      const recordAdmissionFailure = (error: ReplicaError.ReplicaError) =>
+        Effect.all([
+          metrics.recordAdmission("failed"),
+          metrics.recordRejection(error._tag)
+        ], { discard: true })
 
       interface PublishedWake {
         readonly wake: Protocol.Wake
@@ -1540,16 +1570,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               Effect.fail(new ReplicaError.UnknownCommitOutcome({ mutationId: submittedEnvelope.mutationId, cause }))
           ),
           Effect.tap((receipt) => {
-            let outcome: "accepted" | "rejected" | "expired" = "expired"
-            if (receipt._tag === "Accepted") outcome = "accepted"
-            if (receipt._tag === "Rejected") outcome = "rejected"
-            let recordRejection = Effect.void
-            if (receipt._tag === "Rejected") recordRejection = metrics.recordRejection(receipt.origin)
-            const record = Effect.all([
-              metrics.recordAdmission(outcome),
-              refreshMetricDepths,
-              recordRejection
-            ], { discard: true })
+            const record = recordAdmissionMetrics(receipt)
             if (receipt._tag !== "Accepted") return record
             return RcMap.has(wakes, submittedEnvelope.spaceId).pipe(
               Effect.flatMap((hasWatchers) => {
@@ -1557,7 +1578,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   return Effect.scoped(
                     RcMap.get(wakes, submittedEnvelope.spaceId).pipe(
                       Effect.flatMap(({ channel }) =>
-                        Clock.currentTimeNanos.pipe(
+                        Clock.monotonicTimeNanos.pipe(
                           Effect.flatMap((publishedAtNanos) =>
                             PubSub.publish(channel, {
                               wake: {
@@ -1578,12 +1599,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               Effect.asVoid
             )
           }),
-          Effect.tapError((error) =>
-            Effect.all([
-              metrics.recordAdmission("failed"),
-              metrics.recordRejection(error._tag)
-            ], { discard: true })
-          ),
+          Effect.tapError(recordAdmissionFailure),
           Effect.withSpan("ServerStore.submit", {
             attributes: {
               "mutation.name": submittedEnvelope.name,
@@ -1732,6 +1748,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 })
               )
           ),
+          Effect.tap(recordAdmissionMetrics),
+          Effect.tapError(recordAdmissionFailure),
           Effect.withSpan("ServerStore.discard", {
             attributes: { "mutation.id": submittedEnvelope.mutationId, "space.id": submittedEnvelope.spaceId }
           })
@@ -2178,21 +2196,22 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
         })
 
-      const maintain = (spaceId: Identity.SpaceId) =>
+      const maintainSpace = (spaceId: Identity.SpaceId) =>
         prepareSnapshot(spaceId).pipe(
           Effect.flatMap(publishAndPrune),
           Effect.tap((pruned) =>
             Effect.all([
               metrics.recordMaintenance("completed"),
               metrics.recordPruned("history", pruned.history),
-              metrics.recordPruned("receipt", pruned.receipts),
-              refreshMetricDepths
+              metrics.recordPruned("receipt", pruned.receipts)
             ], { discard: true })
           ),
           Effect.tapError(() => metrics.recordMaintenance("failed")),
           Effect.asVoid,
           Effect.withSpan("ServerStore.maintain", { attributes: { "space.id": spaceId } })
         )
+      const maintain = (spaceId: Identity.SpaceId) =>
+        maintainSpace(spaceId).pipe(Effect.ensuring(scheduleMetricDepthRefresh))
       const maintainAll = Effect.gen(function*() {
         let after = ""
         while (true) {
@@ -2200,27 +2219,41 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             Effect.mapError(StorageUnavailable.make)
           )
           if (spaces.length === 0) return
-          yield* Effect.forEach(spaces, ({ space_id }) => maintain(space_id), {
+          yield* Effect.forEach(spaces, ({ space_id }) => maintainSpace(space_id), {
             concurrency: options.maintenanceConcurrency,
             discard: true
           })
           after = spaces.at(-1)!.space_id
         }
-      })
-      const readAuthorizationExpired = () =>
-        new ReplicaError.AuthorizationDenied({ reason: { _tag: "ReadAuthorizationExpired" } })
-      const readAuthorizationLookup = (key: ReadAuthorizationKey) =>
-        authorizeRead(key.spaceId, key.principal).pipe(
-          Effect.timeoutOption(Duration.millis(readAuthorizationRefreshMillis / 2)),
-          Effect.flatMap(Option.match({
-            onNone: () => Effect.fail(readAuthorizationExpired()),
-            onSome: () => Effect.void
-          }))
-        )
-      const watch = (request: Protocol.WatchRequest, principal: typeof Schema.Json.Type) =>
+      }).pipe(Effect.ensuring(scheduleMetricDepthRefresh))
+      const captureReadAuthorization = (
+        spaceId: Identity.SpaceId,
+        principal: typeof Schema.Json.Type
+      ) => {
+        const encoded = Canonical.stringify({ spaceId, principal })
+        const captured = Schema.decodeSync(Schema.fromJsonString(Schema.Struct({
+          spaceId: Identity.SpaceId,
+          principal: Schema.Json
+        })))(encoded)
+        return {
+          key: encoded,
+          lookup: () => authorizeRead(captured.spaceId, captured.principal)
+        }
+      }
+      const watch = (
+        request: Protocol.WatchRequest,
+        authorization?: {
+          readonly key: string
+          readonly lookup: () => Effect.Effect<void, ReplicaError.AuthorizationDenied>
+        }
+      ) =>
         Stream.unwrap(
           Effect.gen(function*() {
             const parentScope = yield* Effect.scope
+            let authorized: ReadAuthorization.Success<void> | undefined
+            if (authorization !== undefined) {
+              authorized = yield* readAuthorizations.authorize(authorization.key, authorization.lookup)
+            }
             const childScope = yield* Scope.make()
             yield* Effect.addFinalizer(() => Scope.close(childScope, Exit.void))
             const state = yield* RcMap.get(wakes, request.spaceId).pipe(Scope.provide(childScope))
@@ -2239,9 +2272,28 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 Effect.asVoid
               )
             )
-            const key: ReadAuthorizationKey = { spaceId: request.spaceId, principal }
-            const authorization = yield* readAuthorizations.authorize(key, readAuthorizationLookup)
             const subscription = yield* PubSub.subscribe(state.channel).pipe(Scope.provide(childScope))
+            const stored = yield* findSpace(request.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+            if (Option.isSome(stored)) yield* validateStoredSpace(stored.value)
+            let sequence = Identity.ServerSequence.make(0)
+            if (Option.isSome(stored)) {
+              sequence = Identity.ServerSequence.make(stored.value.next_server_sequence - 1)
+            }
+            const outputWakes = Stream.succeed({ spaceId: request.spaceId, sequence } satisfies Protocol.Wake).pipe(
+              Stream.concat(
+                Stream.fromSubscription(subscription).pipe(
+                  Stream.mapEffect((published) =>
+                    Clock.monotonicTimeNanos.pipe(
+                      Effect.tap((deliveredAtNanos) =>
+                        metrics.recordWakeFanout(deliveredAtNanos - published.publishedAtNanos)
+                      ),
+                      Effect.as(published.wake)
+                    )
+                  )
+                )
+              )
+            )
+            if (authorization === undefined || authorized === undefined) return outputWakes
             const revoked = yield* Deferred.make<never, ReplicaError.AuthorizationDenied>()
             const failClosed = (error: ReplicaError.AuthorizationDenied) =>
               Deferred.fail(revoked, error).pipe(
@@ -2258,41 +2310,27 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 if (refreshAt > now) yield* Effect.sleep(Duration.nanos(refreshAt - now))
                 const refreshStartedAt = yield* Clock.monotonicTimeNanos
                 const remaining = current.expiresAtNanos - refreshStartedAt
-                if (remaining <= 0n) return yield* failClosed(readAuthorizationExpired())
-                const refreshed = yield* readAuthorizations.refresh(
-                  key,
-                  current.generation,
-                  readAuthorizationLookup
-                ).pipe(
-                  Effect.map(Option.some),
-                  Effect.catch(() => Effect.succeed(Option.none())),
-                  Effect.timeoutOption(Duration.nanos(remaining)),
-                  Effect.map(Option.flatten)
-                )
-                if (Option.isNone(refreshed)) return yield* failClosed(readAuthorizationExpired())
-                return yield* monitor(refreshed.value)
-              })
-            yield* Effect.forkScoped(monitor(authorization))
-            const stored = yield* findSpace(request.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-            if (Option.isSome(stored)) yield* validateStoredSpace(stored.value)
-            let sequence = Identity.ServerSequence.make(0)
-            if (Option.isSome(stored)) {
-              sequence = Identity.ServerSequence.make(stored.value.next_server_sequence - 1)
-            }
-            const outputWakes = Stream.succeed({ spaceId: request.spaceId, sequence } satisfies Protocol.Wake).pipe(
-              Stream.concat(
-                Stream.fromSubscription(subscription).pipe(
-                  Stream.mapEffect((published) =>
-                    Clock.currentTimeNanos.pipe(
-                      Effect.tap((deliveredAtNanos) =>
-                        metrics.recordWakeFanout(deliveredAtNanos - published.publishedAtNanos)
-                      ),
-                      Effect.as(published.wake)
-                    )
+                if (remaining <= 0n) {
+                  return yield* failClosed(
+                    new ReplicaError.AuthorizationDenied({ reason: { _tag: "ReadAuthorizationExpired" } })
                   )
+                }
+                const refreshed = yield* readAuthorizations.refresh(
+                  authorization.key,
+                  current.generation,
+                  authorization.lookup
+                ).pipe(
+                  Effect.timeoutOption(Duration.nanos(remaining)),
+                  Effect.exit
                 )
-              )
-            )
+                if (Exit.isFailure(refreshed) || Option.isNone(refreshed.value)) {
+                  return yield* failClosed(
+                    new ReplicaError.AuthorizationDenied({ reason: { _tag: "ReadAuthorizationExpired" } })
+                  )
+                }
+                return yield* monitor(refreshed.value.value)
+              })
+            yield* Effect.forkScoped(monitor(authorized))
             return Stream.merge(outputWakes, Stream.fromEffect(Deferred.await(revoked)))
           })
         )
@@ -2359,15 +2397,19 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         watch: (input) => {
           const request = trustedWatchRequest(input)
           return Stream.unwrap(
-            prepareSpace(request.spaceId, request.schema).pipe(
-              Effect.as(watch(request, null))
+            authorizeRead(request.spaceId, null).pipe(
+              Effect.andThen(prepareSpace(request.spaceId, request.schema)),
+              Effect.as(watch(request))
             )
           )
         },
-        watchAuthorized: (request, principal) =>
-          prepareSpace(request.spaceId, request.schema).pipe(
-            Effect.as(watch(request, principal))
+        watchAuthorized: (request, principal) => {
+          const authorization = captureReadAuthorization(request.spaceId, principal)
+          return readAuthorizations.authorize(authorization.key, authorization.lookup).pipe(
+            Effect.andThen(prepareSpace(request.spaceId, request.schema)),
+            Effect.as(watch(request, authorization))
           )
+        }
       })
     })
   )

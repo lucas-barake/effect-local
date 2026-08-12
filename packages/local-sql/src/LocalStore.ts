@@ -8,6 +8,7 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import type * as Quarantine from "@lucas-barake/effect-local/Quarantine"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
@@ -570,6 +571,11 @@ export const layer = (
           yield* validateFence(yield* meta)
           return (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
         })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      ).pipe(
+        Effect.catchCause((cause): Effect.Effect<void> => {
+          if (Cause.hasInterrupts(cause)) return Effect.interrupt
+          return Effect.logWarning("Client pending metric refresh failed", cause)
+        })
       )
       if (
         (initializedMeta.installed_snapshot_id === null &&

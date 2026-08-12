@@ -141,6 +141,53 @@ describe("LocalStore metrics", () => {
     })
   })
 
+  it.effect("does not fail a committed mutation when pending metric refresh fails", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const actualSql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
+        Effect.provide(Reactivity.layer)
+      )
+      let failMetricRefresh = false
+      let pendingReads = 0
+      const observedSql = new Proxy(actualSql, {
+        apply: (target, thisArgument, argumentsList) => {
+          const statement = Reflect.apply(target, thisArgument, argumentsList)
+          let text = ""
+          if (Array.isArray(argumentsList[0])) text = argumentsList[0].join("?")
+          if (!failMetricRefresh || !text.includes("COUNT(*) AS count FROM effect_local_client_pending_data")) {
+            return statement
+          }
+          pendingReads++
+          if (pendingReads === 1) return statement
+          return Effect.die("pending metric refresh failed")
+        }
+      })
+      const infrastructure = Layer.mergeAll(
+        Layer.succeed(SqlClient.SqlClient, observedSql),
+        NodeCrypto.layer,
+        Reactivity.layer,
+        QueryReactivity.layer
+      )
+      const context = yield* Layer.build(
+        LocalStore.layer({
+          ...options,
+          definition: Domain.definition,
+          spaceId,
+          clientId: firstClientId
+        }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(infrastructure)
+        )
+      )
+      const store = Context.get(context, LocalStore.Store)
+      failMetricRefresh = true
+
+      const mutation = yield* store.mutate(Domain.PutTodo, Domain.todo("committed"))
+
+      assert.strictEqual(mutation.envelope.localSequence, 1)
+      assert.strictEqual(pendingReads, 2)
+      assert.strictEqual((yield* store.pending).length, 1)
+    })))
+
   it.effect("counts a durable bootstrap install before projection replay", () => {
     const registry = new Map()
     return Effect.gen(function*() {

@@ -292,6 +292,86 @@ describe("server reconciled mutation log", () => {
       )
     ))
 
+  it.effect("does not reuse authorization after a caller mutates its principal", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: ({ principal }) => {
+              if (
+                typeof principal === "object" && principal !== null && !Array.isArray(principal) &&
+                "subject" in principal && principal.subject === "allowed"
+              ) return Effect.void
+              return Effect.fail("denied")
+            }
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const principal: { subject: string } = { subject: "allowed" }
+        const first = yield* server.watchAuthorized({
+          spaceId,
+          schema: Domain.definition.schemaIdentity
+        }, principal)
+        assert.isTrue(Option.isSome(
+          yield* first.pipe(Stream.runHead)
+        ))
+
+        principal.subject = "denied"
+        const deniedStream = yield* server.watchAuthorized({
+          spaceId,
+          schema: Domain.definition.schemaIdentity
+        }, principal).pipe(Effect.flip)
+        assert.strictEqual(deniedStream._tag, "AuthorizationDenied")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("does not reveal sync watcher occupancy to unauthorized principals", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: ({ principal }) => {
+              if (principal === "allowed") return Effect.void
+              return Effect.fail("denied")
+            }
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const ready = yield* Deferred.make<void>()
+        const firstStream = yield* server.watchAuthorized({
+          spaceId,
+          schema: Domain.definition.schemaIdentity
+        }, "allowed")
+        const first = yield* firstStream.pipe(
+          Stream.runForEach(() => Deferred.succeed(ready, undefined)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(ready)
+
+        const denied = yield* server.watchAuthorized({
+          spaceId,
+          schema: Domain.definition.schemaIdentity
+        }, "denied").pipe(Effect.flip)
+        assert.strictEqual(denied._tag, "AuthorizationDenied")
+        yield* Fiber.interrupt(first)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("records server capacity metrics in the active registry", () =>
     Effect.scoped(
       Effect.gen(function*() {
@@ -321,6 +401,7 @@ describe("server reconciled mutation log", () => {
         )
         yield* Queue.take(wakes)
         yield* server.maintain(spaceId)
+        yield* TestClock.adjust("20 millis")
 
         const snapshots = yield* Metric.snapshot
         const find = (id: string, attributes?: Readonly<Record<string, string>>) =>
