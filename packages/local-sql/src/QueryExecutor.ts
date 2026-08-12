@@ -85,7 +85,6 @@ export const layer = <D extends Definition.Any,>(
       const queryCapability = (schemaGeneration: number, projectionGeneration: number): Transaction.Query => ({
         get: SqlTransaction.local({
           sql,
-          definition,
           table: "visible",
           spaceId,
           schemaGeneration,

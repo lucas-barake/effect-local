@@ -348,9 +348,9 @@ const currentOrLegacyEntry = (
       sequence: legacy.sequence,
       spaceId: legacy.spaceId,
       clientId: legacy.clientId,
+      membershipIncarnation: Identity.legacyMembershipIncarnation,
       mutationId: legacy.mutationId,
       localSequence: legacy.localSequence,
-      membershipIncarnation: Identity.legacyMembershipIncarnation,
       sourceSchema: source,
       digest: legacy.digest,
       changes
@@ -400,6 +400,7 @@ const currentOrLegacyReceipt = (
     return Protocol.LegacyReceipt.make({
       spaceId: legacy.spaceId,
       clientId: legacy.clientId,
+      membershipIncarnation: Identity.legacyMembershipIncarnation,
       mutationId: legacy.mutationId,
       localSequence: legacy.localSequence,
       sourceSchema: source,
@@ -1062,8 +1063,7 @@ export const client = (options: ClientOptions) =>
               envelope,
               SqlTransaction.local({
                 sql,
-                definition: options.definition,
-                table: "shadow-visible",
+                table: "visible",
                 spaceId: options.spaceId,
                 schemaGeneration: state.generation,
                 projectionGeneration: state.target_projection_generation,

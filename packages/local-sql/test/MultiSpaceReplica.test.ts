@@ -29,6 +29,15 @@ import * as Domain from "./Domain.js"
 const spaceA = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const spaceB = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const clientHistory = {
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  retainedHistoryEntries: 256,
+  maximumBootstrapEntities: 10_000,
+  maximumBootstrapBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: 4 * 1024 * 1024,
+  migration: { retryDelay: "1 millis", maximumAttempts: 8 }
+} satisfies Omit<SqlReplica.Options<typeof Domain.definition>, "definition" | "clientId">
 
 const remote = Layer.succeed(
   SyncEngine.SyncEngine,
@@ -41,16 +50,10 @@ const remote = Layer.succeed(
 )
 
 const live = SqlReplica.layer({
+  ...clientHistory,
   definition: Domain.definition,
   clientId,
-  initialSpaces: [spaceB, spaceA],
-  retainedReceipts: 256,
-  maximumReceipts: 10_000,
-  retainedHistoryEntries: 256,
-  maximumBootstrapEntities: 10_000,
-  maximumBootstrapBytes: 64 * 1024 * 1024,
-  maximumBootstrapPageBytes: 4 * 1024 * 1024,
-  migration: { retryDelay: "1 millis", maximumAttempts: 8 }
+  initialSpaces: [spaceB, spaceA]
 }).pipe(
   Layer.provide(Domain.handlers),
   Layer.provide(remote),
@@ -115,15 +118,9 @@ describe("multi space Replica", () => {
       )
       const replicaLayer = (initialSpaces?: Iterable<Identity.SpaceId>) => {
         const options = {
+          ...clientHistory,
           definition: Domain.definition,
-          clientId,
-          retainedReceipts: 256,
-          maximumReceipts: 10_000,
-          retainedHistoryEntries: 256,
-          maximumBootstrapEntities: 10_000,
-          maximumBootstrapBytes: 64 * 1024 * 1024,
-          maximumBootstrapPageBytes: 4 * 1024 * 1024,
-          migration: { retryDelay: "1 millis", maximumAttempts: 8 }
+          clientId
         } satisfies SqlReplica.Options<typeof Domain.definition>
         let replica = SqlReplica.layer(options)
         if (initialSpaces !== undefined) replica = SqlReplica.layer({ ...options, initialSpaces })
@@ -170,15 +167,9 @@ describe("multi space Replica", () => {
         }
       })
       const replicaLayer = SqlReplica.layerWorkflow({
+        ...clientHistory,
         definition: Domain.definition,
-        clientId,
-        retainedReceipts: 256,
-        maximumReceipts: 10_000,
-        retainedHistoryEntries: 256,
-        maximumBootstrapEntities: 10_000,
-        maximumBootstrapBytes: 64 * 1024 * 1024,
-        maximumBootstrapPageBytes: 4 * 1024 * 1024,
-        migration: { retryDelay: "1 millis", maximumAttempts: 8 }
+        clientId
       }).pipe(
         Layer.provide(Domain.handlers),
         Layer.provide(remote),
@@ -266,16 +257,10 @@ describe("multi space Replica", () => {
         )
       )
       const replicaLayer = SqlReplica.layer({
+        ...clientHistory,
         definition,
         clientId,
-        initialSpaces: [spaceA],
-        retainedReceipts: 256,
-        maximumReceipts: 10_000,
-        retainedHistoryEntries: 256,
-        maximumBootstrapEntities: 10_000,
-        maximumBootstrapBytes: 64 * 1024 * 1024,
-        maximumBootstrapPageBytes: 4 * 1024 * 1024,
-        migration: { retryDelay: "1 millis", maximumAttempts: 8 }
+        initialSpaces: [spaceA]
       }).pipe(
         Layer.provide(handlers),
         Layer.provide(remote),
@@ -317,16 +302,10 @@ describe("multi space Replica", () => {
         )
       )
       const replicaLayer = SqlReplica.layer({
+        ...clientHistory,
         definition,
         clientId,
-        initialSpaces: [spaceA],
-        retainedReceipts: 256,
-        maximumReceipts: 10_000,
-        retainedHistoryEntries: 256,
-        maximumBootstrapEntities: 10_000,
-        maximumBootstrapBytes: 64 * 1024 * 1024,
-        maximumBootstrapPageBytes: 4 * 1024 * 1024,
-        migration: { retryDelay: "1 millis", maximumAttempts: 8 }
+        initialSpaces: [spaceA]
       }).pipe(
         Layer.provide(handlers),
         Layer.provide(remote),
@@ -386,16 +365,10 @@ describe("multi space Replica", () => {
         )
       const replicaLayer = (client: SqlClient.SqlClient, initialSpaces?: Iterable<Identity.SpaceId>) =>
         SqlReplica.layer({
+          ...clientHistory,
           definition: Domain.definition,
           clientId,
-          initialSpaces: initialSpaces ?? [],
-          retainedReceipts: 256,
-          maximumReceipts: 10_000,
-          retainedHistoryEntries: 256,
-          maximumBootstrapEntities: 10_000,
-          maximumBootstrapBytes: 64 * 1024 * 1024,
-          maximumBootstrapPageBytes: 4 * 1024 * 1024,
-          migration: { retryDelay: "1 millis", maximumAttempts: 8 }
+          initialSpaces: initialSpaces ?? []
         }).pipe(
           Layer.provide(Domain.handlers),
           Layer.provide(remote),
@@ -445,17 +418,11 @@ describe("multi space Replica", () => {
         })
       )
       const replicaLayer = SqlReplica.layer({
+        ...clientHistory,
         definition: Domain.definition,
         clientId,
         initialSpaces: spaces,
-        reconciliationConcurrency: 2,
-        retainedReceipts: 256,
-        maximumReceipts: 10_000,
-        retainedHistoryEntries: 256,
-        maximumBootstrapEntities: 10_000,
-        maximumBootstrapBytes: 64 * 1024 * 1024,
-        maximumBootstrapPageBytes: 4 * 1024 * 1024,
-        migration: { retryDelay: "1 millis", maximumAttempts: 8 }
+        reconciliationConcurrency: 2
       }).pipe(
         Layer.provide(Domain.handlers),
         Layer.provide(blockedRemote),

@@ -610,7 +610,6 @@ export const layer = (
                 item.envelope,
                 SqlTransaction.local({
                   sql,
-                  definition: options.definition,
                   table: "visible",
                   spaceId: options.spaceId,
                   schemaGeneration: replaySchemaGeneration,
@@ -1580,7 +1579,6 @@ export const layer = (
                 payloadJsonValue,
                 SqlTransaction.local({
                   sql,
-                  definition: options.definition,
                   table: "visible",
                   spaceId: options.spaceId,
                   schemaGeneration: storedMeta.active_schema_generation,
@@ -1632,7 +1630,6 @@ export const layer = (
             yield* validateFence(current)
             return yield* SqlTransaction.local({
               sql,
-              definition: options.definition,
               table: "visible",
               spaceId: options.spaceId,
               schemaGeneration: current.active_schema_generation,
@@ -1722,12 +1719,10 @@ export const layer = (
                 const currentChanges = yield* migrateEntryChanges(entry)
                 for (const change of currentChanges) {
                   touched.push(change.entity)
-                  yield* SqlTransaction.applyLocalChange(
+                  yield* SqlTransaction.applyCanonicalChange(
                     sql,
-                    "canonical",
                     options.spaceId,
                     currentMeta.active_schema_generation,
-                    currentMeta.active_projection_generation,
                     change
                   )
                 }

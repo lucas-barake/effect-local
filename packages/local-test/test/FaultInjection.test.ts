@@ -74,7 +74,7 @@ const database = () =>
 const service = <I, S, E, R,>(tag: Context.Service<I, S>, layer: Layer.Layer<I, E, R>) =>
   Layer.build(layer).pipe(Effect.map((context) => Context.get(context, tag)))
 
-const makeServices = Effect.gen(function*() {
+const makeSyncServices = Effect.gen(function*() {
   const server = yield* service(
     ServerStore.ServerStore,
     ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
@@ -90,6 +90,11 @@ const makeServices = Effect.gen(function*() {
       Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults))
     )
   )
+  return { faults, sync }
+})
+
+const makeServices = Effect.gen(function*() {
+  const { faults, sync } = yield* makeSyncServices
   const local = yield* service(
     LocalStore.Store,
     LocalStore.layer({ ...clientHistory, definition, spaceId, clientId }).pipe(
@@ -124,22 +129,8 @@ describe("test synchronization faults", () => {
 
   it.effect("lets one space settle while another space is partitioned", () =>
     Effect.gen(function*() {
-      const server = yield* service(
-        ServerStore.ServerStore,
-        ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
-          Layer.provide(runtime),
-          Layer.provide(database())
-        )
-      )
-      const faults = yield* service(FaultInjection.FaultInjection, FaultInjection.layer)
+      const { faults, sync } = yield* makeSyncServices
       yield* faults.partition(spaceId)
-      const sync = yield* service(
-        SyncEngine.SyncEngine,
-        TestServer.layer.pipe(
-          Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
-          Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults))
-        )
-      )
       const root = yield* service(
         Replica.Replica,
         SqlReplica.layer({
