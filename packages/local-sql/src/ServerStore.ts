@@ -4,26 +4,36 @@ import * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
-import type * as Duration from "effect/Duration"
+import * as Deferred from "effect/Deferred"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
+import * as Queue from "effect/Queue"
 import * as RcMap from "effect/RcMap"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import * as Scope from "effect/Scope"
+import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
+import * as ReadAuthorization from "./internal/readAuthorization.js"
 import * as Rows from "./internal/rows.js"
 import * as ScopedReplication from "./internal/scopedReplication.js"
+import * as ServerMetrics from "./internal/serverMetrics.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as TerminalRejection from "./internal/TerminalRejection.js"
 import * as SqlTransaction from "./internal/transaction.js"
+import * as WakeVisibility from "./internal/wakeVisibility.js"
 import * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
 import * as SchemaEvolution from "./SchemaEvolution.js"
@@ -72,6 +82,13 @@ export interface Service {
     request: Protocol.BootstrapRequest,
     principal: typeof Schema.Json.Type
   ) => Effect.Effect<Protocol.BootstrapPage, ReplicaError.ReplicaError>
+  readonly prepareBootstrapAuthorized: (
+    request: Protocol.BootstrapRequest,
+    principal: typeof Schema.Json.Type
+  ) => Effect.Effect<
+    Effect.Effect<Protocol.BootstrapPage, ReplicaError.ReplicaError>,
+    ReplicaError.ReplicaError
+  >
   readonly maintain: (spaceId: Identity.SpaceId) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly maintainAll: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly watchAuthorized: (
@@ -102,6 +119,10 @@ export interface Options<R = never,> extends HistoryOptions {
   readonly authorizeRead: (input: ReadAuthorizationInput) => Effect.Effect<void, typeof Schema.Json.Type, R>
   readonly readAuthorizationRefreshInterval: Duration.Input
   readonly wakeCapacity?: number
+  readonly maximumWatchersPerSpace: number
+  readonly maximumConcurrentReadAuthorizations: number
+  readonly maximumPendingReadAuthorizations: number
+  readonly readAuthorizationCacheCapacity: number
 }
 
 interface ReadAuthorizationCommon {
@@ -226,11 +247,45 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         }
       }
       const context = yield* Effect.context<R>()
-      const readAuthorizationRefreshMillis = yield* Configuration.positiveFiniteDurationMillis(
-        "readAuthorizationRefreshInterval",
-        options.readAuthorizationRefreshInterval
+      const readAuthorizationRefresh = yield* Option.match(
+        Duration.fromInput(options.readAuthorizationRefreshInterval),
+        {
+          onNone: () =>
+            Effect.fail(
+              new ReplicaError.InvalidConfiguration({
+                option: "readAuthorizationRefreshInterval",
+                message: "readAuthorizationRefreshInterval must be a valid positive finite duration"
+              })
+            ),
+          onSome: (duration) => {
+            if (Duration.isPositive(duration) && Duration.isFinite(duration)) return Effect.succeed(duration)
+            return Effect.fail(
+              new ReplicaError.InvalidConfiguration({
+                option: "readAuthorizationRefreshInterval",
+                message: "readAuthorizationRefreshInterval must be a valid positive finite duration"
+              })
+            )
+          }
+        }
       )
+      const readAuthorizationRefreshMillis = Duration.toMillis(readAuthorizationRefresh)
+      const readAuthorizationRefreshNanos = BigInt(Math.round(readAuthorizationRefreshMillis * 1_000_000))
       const wakeCapacity = options.wakeCapacity ?? 1_024
+      for (
+        const option of [
+          "maximumWatchersPerSpace",
+          "maximumConcurrentReadAuthorizations",
+          "maximumPendingReadAuthorizations",
+          "readAuthorizationCacheCapacity"
+        ] as const
+      ) {
+        if (!Number.isSafeInteger(options[option]) || options[option] <= 0) {
+          return yield* new ReplicaError.InvalidConfiguration({
+            option,
+            message: `${option} must be a positive safe integer`
+          })
+        }
+      }
       if (
         runtime.migrationHash !== evolution.migrationHash ||
         runtime.schemaIdentity.version !== evolution.current.schemaIdentity.version ||
@@ -248,9 +303,97 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         })
       }
       yield* Migrations.server(options.migration)
+      const metrics = ServerMetrics.make({
+        history: options.maximumHistoryEntries,
+        receipts: options.maximumReceipts
+      })
+      const readMetricDepths = SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Schema.Struct({ history: Schema.Number, receipts: Schema.Number }),
+        execute: () =>
+          sql`SELECT
+          COALESCE((SELECT history_count FROM effect_local_server_space_counts
+            ORDER BY history_count DESC LIMIT 1), 0) AS history,
+          COALESCE((SELECT receipt_count FROM effect_local_server_space_counts
+            ORDER BY receipt_count DESC LIMIT 1), 0) AS receipts`
+      })
+      const refreshMetricDepths = readMetricDepths(undefined).pipe(
+        Effect.mapError(StorageUnavailable.make),
+        Effect.flatMap((depths) => metrics.initializeDepths(depths.history, depths.receipts)),
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+          return Effect.logWarning("Server metric refresh failed", cause)
+        })
+      )
+      yield* refreshMetricDepths
+      const metricDepthRefreshRequests = yield* Effect.acquireRelease(
+        Queue.dropping<void>(1),
+        Queue.shutdown
+      )
+      yield* Queue.take(metricDepthRefreshRequests).pipe(
+        Effect.andThen(Effect.sleep("10 millis")),
+        Effect.andThen(refreshMetricDepths),
+        Effect.forever,
+        Effect.forkScoped
+      )
+      const scheduleMetricDepthRefresh = Queue.offer(metricDepthRefreshRequests, undefined).pipe(Effect.asVoid)
+      const readAuthorizations = yield* ReadAuthorization.make<
+        string,
+        void,
+        ReplicaError.AuthorizationDenied | ReplicaError.CapacityExceeded
+      >({
+        refreshIntervalNanos: readAuthorizationRefreshNanos,
+        lookupTimeoutNanos: readAuthorizationRefreshNanos / 2n,
+        onLookupTimeout: () => new ReplicaError.AuthorizationDenied({ reason: { _tag: "ReadAuthorizationExpired" } }),
+        maximumConcurrentLookups: options.maximumConcurrentReadAuthorizations,
+        maximumPendingLookups: options.maximumPendingReadAuthorizations,
+        onPendingCapacityExceeded: () =>
+          new ReplicaError.CapacityExceeded({
+            resource: "read authorizations",
+            limit: options.maximumPendingReadAuthorizations
+          }),
+        completedCacheCapacity: options.readAuthorizationCacheCapacity
+      })
+      const wakeVisibilityLimiter = yield* WakeVisibility.makeLimiter<ReplicaError.ReplicaError>({
+        lookupTimeoutNanos: readAuthorizationRefreshNanos / 2n,
+        onLookupTimeout: () => new ReplicaError.AuthorizationDenied({ reason: { _tag: "ReadAuthorizationExpired" } }),
+        maximumConcurrentLookups: options.maximumConcurrentReadAuthorizations,
+        maximumPendingLookups: options.maximumPendingReadAuthorizations,
+        onPendingCapacityExceeded: () =>
+          new ReplicaError.CapacityExceeded({
+            resource: "read authorizations",
+            limit: options.maximumPendingReadAuthorizations
+          })
+      })
+      const recordAdmissionMetrics = (receipt: Protocol.Receipt) => {
+        let outcome: "accepted" | "rejected" | "expired" = "expired"
+        if (receipt._tag === "Accepted") outcome = "accepted"
+        if (receipt._tag === "Rejected") outcome = "rejected"
+        let rejection = Effect.void
+        if (receipt._tag === "Rejected") rejection = metrics.recordRejection(receipt.origin)
+        return Effect.all([
+          metrics.recordAdmission(outcome),
+          scheduleMetricDepthRefresh,
+          rejection
+        ], { discard: true })
+      }
+      const recordAdmissionFailure = (error: ReplicaError.ReplicaError) =>
+        Effect.all([
+          metrics.recordAdmission("failed"),
+          metrics.recordRejection(error._tag)
+        ], { discard: true })
+      interface PublishedWake {
+        readonly changes: ReadonlyArray<Protocol.EntityChange>
+        readonly publishedAtNanos: bigint
+        readonly visibility: WakeVisibility.Coordinator<string, boolean, ReplicaError.ReplicaError>
+      }
       const wakes = yield* RcMap.make({
         lookup: (_spaceId: Identity.SpaceId) =>
-          Effect.acquireRelease(PubSub.sliding<ReadonlyArray<Protocol.EntityChange>>(wakeCapacity), PubSub.shutdown)
+          Effect.gen(function*() {
+            const channel = yield* Effect.acquireRelease(PubSub.sliding<PublishedWake>(wakeCapacity), PubSub.shutdown)
+            const watchers = yield* Semaphore.make(options.maximumWatchersPerSpace)
+            return { channel, watchers }
+          })
       })
       const findReceiptByMutation = SqlSchema.findOneOption({
         Request: Schema.Struct({ spaceId: Identity.SpaceId, mutationId: Identity.MutationId }),
@@ -279,6 +422,18 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         FROM effect_local_server_receipts AS r
         WHERE r.space_id = ${spaceId} AND r.client_id = ${clientId}
           AND r.membership_incarnation = ${membershipIncarnation} AND r.local_sequence = ${localSequence}`
+      })
+      const findAcceptedEntry = SqlSchema.findOneOption({
+        Request: Schema.Struct({
+          spaceId: Identity.SpaceId,
+          serverSequence: Identity.ServerSequence
+        }),
+        Result: Rows.ServerLogRow,
+        execute: ({ spaceId, serverSequence }) =>
+          sql`SELECT space_id, server_sequence, client_id, membership_incarnation, local_sequence,
+            mutation_id, digest, entry_bytes, entry_json, source_schema_version, source_schema_hash
+          FROM effect_local_authoritative_log
+          WHERE space_id = ${spaceId} AND server_sequence = ${serverSequence}`
       })
       const lockClient = SqlSchema.findOne({
         Request: Schema.Struct({
@@ -468,6 +623,52 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           }
           return { ...receipt, terminalSequence: row.terminal_sequence }
         })
+      const retryWakeChanges = (
+        receipt: Protocol.Receipt,
+        envelope: Protocol.MutationEnvelope
+      ): Effect.Effect<ReadonlyArray<Protocol.EntityChange> | undefined, ReplicaError.ReplicaError> => {
+        if (receipt._tag !== "Accepted") return Effect.succeed(undefined)
+        return findAcceptedEntry({
+          spaceId: envelope.spaceId,
+          serverSequence: receipt.serverSequence
+        }).pipe(
+          Effect.mapError(StorageUnavailable.make),
+          Effect.flatMap(Option.match({
+            onNone: () => Effect.succeed(undefined),
+            onSome: (row) =>
+              Effect.gen(function*() {
+                const entry = yield* Codec.parse(row.entry_json).pipe(
+                  Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
+                )
+                if (
+                  row.space_id !== envelope.spaceId ||
+                  row.server_sequence !== receipt.serverSequence ||
+                  row.client_id !== envelope.clientId ||
+                  row.membership_incarnation !== envelope.membershipIncarnation ||
+                  row.local_sequence !== envelope.localSequence ||
+                  row.mutation_id !== envelope.mutationId ||
+                  row.digest !== envelope.digest ||
+                  row.source_schema_version !== entry.sourceSchema.version ||
+                  row.source_schema_hash !== entry.sourceSchema.hash ||
+                  entry.spaceId !== row.space_id ||
+                  entry.sequence !== row.server_sequence ||
+                  entry.clientId !== row.client_id ||
+                  entry.membershipIncarnation !== row.membership_incarnation ||
+                  entry.localSequence !== row.local_sequence ||
+                  entry.mutationId !== row.mutation_id ||
+                  entry.digest !== row.digest ||
+                  row.entry_bytes !== (yield* Protocol.encodedBytesEffect(entry)) ||
+                  row.entry_json !== (yield* Codec.stringify(entry))
+                ) {
+                  return yield* new ReplicaError.StorageCorrupt({
+                    message: `Accepted entry ${row.server_sequence} conflicts with its durable metadata`
+                  })
+                }
+                return entry.changes
+              })
+          }))
+        )
+      }
       const receiptCapacityRejection: {
         readonly _tag: "CapacityExceeded"
         readonly resource: string
@@ -857,9 +1058,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 mutationId: submittedEnvelope.mutationId
               })
             }
-            return yield* decodeStoredReceipt(exactReceipt.value, submittedEnvelope).pipe(
-              Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution)),
-              Effect.flatMap((receipt) => projectReceipt(receipt, callerDefinition))
+            const receipt = yield* decodeStoredReceipt(exactReceipt.value, submittedEnvelope)
+            wakeChanges = yield* retryWakeChanges(receipt, submittedEnvelope)
+            return yield* SchemaEvolution.migrateReceipt(receipt, evolution).pipe(
+              Effect.flatMap((migratedReceipt) => projectReceipt(migratedReceipt, callerDefinition))
             )
           }
           const envelope = submittedEnvelope
@@ -916,9 +1118,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               if (committedByMutation.value.digest !== envelope.digest) {
                 return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
               }
-              return yield* decodeStoredReceipt(committedByMutation.value, envelope).pipe(
-                Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution)),
-                Effect.flatMap((receipt) => projectReceipt(receipt, callerDefinition))
+              const receipt = yield* decodeStoredReceipt(committedByMutation.value, envelope)
+              wakeChanges = yield* retryWakeChanges(receipt, envelope)
+              return yield* SchemaEvolution.migrateReceipt(receipt, evolution).pipe(
+                Effect.flatMap((migratedReceipt) => projectReceipt(migratedReceipt, callerDefinition))
               )
             }
             const committedBySequence = yield* findReceiptBySequence({
@@ -1171,17 +1374,35 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 if (hasWatchers) {
                   return Effect.scoped(
                     RcMap.get(wakes, submittedEnvelope.spaceId).pipe(
-                      Effect.flatMap((channel) =>
-                        PubSub.publish(channel, changes)
+                      Effect.flatMap(({ channel }) =>
+                        Clock.monotonicTimeNanos.pipe(
+                          Effect.flatMap((publishedAtNanos) =>
+                            PubSub.publish(channel, {
+                              changes,
+                              publishedAtNanos,
+                              visibility: WakeVisibility.make<string, boolean, ReplicaError.ReplicaError>(
+                                wakeVisibilityLimiter
+                              )
+                            })
+                          )
+                        )
                       )
                     )
                   )
                 }
                 return Effect.void
               }),
+              Effect.andThen(recordAdmissionMetrics(receipt)),
               Effect.asVoid
             )
           }),
+          Effect.tap((receipt) => {
+            if (receipt._tag === "Accepted" && wakeChanges !== undefined) {
+              return Effect.void
+            }
+            return recordAdmissionMetrics(receipt)
+          }),
+          Effect.tapError(recordAdmissionFailure),
           Effect.withSpan("ServerStore.submit", {
             attributes: {
               "mutation.name": submittedEnvelope.name,
@@ -1206,7 +1427,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               return yield* new ReplicaError.MutationIdentityConflict({ mutationId: submittedEnvelope.mutationId })
             }
             return yield* decodeStoredReceipt(exact.value, submittedEnvelope).pipe(
-              Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution)),
+              Effect.flatMap((receipt) =>
+                SchemaEvolution.migrateReceipt(receipt, evolution)
+              ),
               Effect.flatMap((receipt) => projectReceipt(receipt, callerDefinition))
             )
           }
@@ -1327,6 +1550,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 cause
               })
             )),
+          Effect.tap(recordAdmissionMetrics),
+          Effect.tapError(recordAdmissionFailure),
           Effect.withSpan("ServerStore.discard", {
             attributes: { "mutation.id": submittedEnvelope.mutationId, "space.id": submittedEnvelope.spaceId }
           })
@@ -1381,7 +1606,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         >
       ) =>
         Option.match(prepared, {
-          onNone: () => Effect.void,
+          onNone: () => Effect.succeed({ history: 0, receipts: 0 }),
           onSome: (candidate) =>
             sql.withTransaction(Effect.gen(function*() {
               const meta = yield* lockSpace(candidate.manifest.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
@@ -1390,7 +1615,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 meta.next_server_sequence !== candidate.observedNextServer ||
                 meta.next_terminal_sequence !== candidate.observedNextTerminal ||
                 meta.schema_generation !== candidate.observedSchemaGeneration
-              ) return
+              ) return { history: 0, receipts: 0 }
               let snapshotId = meta.snapshot_id
               if (
                 snapshotId === null ||
@@ -1490,14 +1715,26 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   ORDER BY server_sequence DESC, terminal_sequence DESC
                   LIMIT -1 OFFSET ${options.retainedSnapshots}
                 )`
+              return { history: history.length, receipts: receipts.length }
             })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         })
 
-      const maintain = (spaceId: Identity.SpaceId) =>
+      const maintainSpace = (spaceId: Identity.SpaceId) =>
         prepareSnapshot(spaceId).pipe(
           Effect.flatMap(publishAndPrune),
+          Effect.tap((pruned) =>
+            Effect.all([
+              metrics.recordMaintenance("completed"),
+              metrics.recordPruned("history", pruned.history),
+              metrics.recordPruned("receipt", pruned.receipts)
+            ], { discard: true })
+          ),
+          Effect.tapError(() => metrics.recordMaintenance("failed")),
+          Effect.asVoid,
           Effect.withSpan("ServerStore.maintain", { attributes: { "space.id": spaceId } })
         )
+      const maintain = (spaceId: Identity.SpaceId) =>
+        maintainSpace(spaceId).pipe(Effect.ensuring(scheduleMetricDepthRefresh))
       const maintainAll = Effect.gen(function*() {
         let after = ""
         while (true) {
@@ -1505,13 +1742,50 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             Effect.mapError(StorageUnavailable.make)
           )
           if (spaces.length === 0) return
-          yield* Effect.forEach(spaces, ({ space_id }) => maintain(space_id), {
+          yield* Effect.forEach(spaces, ({ space_id }) => maintainSpace(space_id), {
             concurrency: options.maintenanceConcurrency,
             discard: true
           })
           after = spaces.at(-1)!.space_id
         }
-      })
+      }).pipe(Effect.ensuring(scheduleMetricDepthRefresh))
+      const projectScopedEntity = (
+        target: Definition.Any,
+        entity: Protocol.EntityKey,
+        value: typeof Schema.Json.Type
+      ) =>
+        Effect.gen(function*() {
+          if (!target.modelByName.has(entity.model)) return Option.none()
+          if (
+            target.schemaIdentity.version === options.definition.schemaIdentity.version &&
+            target.schemaIdentity.hash === options.definition.schemaIdentity.hash
+          ) return Option.some({ entity, value })
+          const migrated = yield* Evolution.migrateModelTo({
+            evolution,
+            source: options.definition.schemaIdentity,
+            target: target.schemaIdentity,
+            model: entity.model,
+            modelVersion: entity.modelVersion,
+            key: entity.key,
+            value
+          })
+          if (migrated.value === undefined) {
+            return yield* new ReplicaError.SchemaEvolutionUnsupported({
+              sourceVersion: options.definition.schemaIdentity.version,
+              sourceHash: options.definition.schemaIdentity.hash,
+              targetVersion: target.schemaIdentity.version,
+              targetHash: target.schemaIdentity.hash
+            })
+          }
+          return Option.some({
+            entity: Protocol.EntityKey.make({
+              model: entity.model,
+              modelVersion: migrated.modelVersion,
+              key: migrated.key
+            }),
+            value: migrated.value
+          })
+        })
       const scopedReplication = ScopedReplication.make({
         sql,
         crypto,
@@ -1524,39 +1798,21 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           entity: authorizeReadEntity
         },
         resolveDefinition: validateCallerSchema,
-        projectEntity: (target, entity, value) =>
-          Effect.gen(function*() {
-            if (!target.modelByName.has(entity.model)) return Option.none()
-            if (
-              target.schemaIdentity.version === options.definition.schemaIdentity.version &&
-              target.schemaIdentity.hash === options.definition.schemaIdentity.hash
-            ) return Option.some({ entity, value })
-            const migrated = yield* Evolution.migrateModelTo({
-              evolution,
-              source: options.definition.schemaIdentity,
-              target: target.schemaIdentity,
-              model: entity.model,
-              modelVersion: entity.modelVersion,
-              key: entity.key,
-              value
-            })
-            if (migrated.value === undefined) {
-              return yield* new ReplicaError.SchemaEvolutionUnsupported({
-                sourceVersion: options.definition.schemaIdentity.version,
-                sourceHash: options.definition.schemaIdentity.hash,
-                targetVersion: target.schemaIdentity.version,
-                targetHash: target.schemaIdentity.hash
-              })
-            }
-            return Option.some({
-              entity: Protocol.EntityKey.make({
-                model: entity.model,
-                modelVersion: migrated.modelVersion,
-                key: migrated.key
-              }),
-              value: migrated.value
-            })
-          })
+        projectEntity: projectScopedEntity
+      })
+      const preauthorizedScopedReplication = ScopedReplication.make({
+        sql,
+        crypto,
+        definition: options.definition,
+        maximumSnapshotEntities: options.maximumSnapshotEntities,
+        maximumSnapshotBytes: options.maximumSnapshotBytes,
+        maximumBootstrapPageBytes: options.maximumBootstrapPageBytes,
+        authorization: {
+          scope: () => Effect.void,
+          entity: authorizeReadEntity
+        },
+        resolveDefinition: validateCallerSchema,
+        projectEntity: projectScopedEntity
       })
       const countAcknowledgedEntities = SqlSchema.findOne({
         Request: Schema.Struct({
@@ -1614,35 +1870,147 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           }
           return false
         })
-      const watch = (request: Protocol.WatchRequest, principal: typeof Schema.Json.Type) =>
-        Stream.unwrap(
-          RcMap.get(wakes, request.spaceId).pipe(
-            Effect.flatMap((channel) => PubSub.subscribe(channel)),
-            Effect.map((subscription) => {
-              const mutations = Stream.fromSubscription(subscription).pipe(Stream.map(Option.some))
-              const refreshes = Stream.tick(readAuthorizationRefreshMillis).pipe(
-                Stream.drop(1),
-                Stream.map(() => Option.none())
-              )
-              return Stream.succeed(Option.none<ReadonlyArray<Protocol.EntityChange>>()).pipe(
-                Stream.concat(Stream.merge(mutations, refreshes)),
-                Stream.filterEffect((signal) =>
-                  Effect.gen(function*() {
-                    yield* authorizeReadScope(request, principal)
-                    const normalized = yield* Protocol.validateReplicationScope(options.definition, request.scope)
-                    if (
-                      Option.isSome(signal) &&
-                      !(yield* mutationWakeVisible({ ...request, scope: normalized }, principal, signal.value))
-                    ) {
-                      return false
-                    }
-                    return true
-                  })
-                ),
-                Stream.map(() => Protocol.Wake.make({ spaceId: request.spaceId }))
-              )
-            })
+      const captureReadAuthorization = (
+        request: Protocol.WatchRequest,
+        principal: typeof Schema.Json.Type
+      ) =>
+        Effect.gen(function*() {
+          const scope = yield* Protocol.validateReplicationScope(options.definition, request.scope)
+          const encoded = yield* Canonical.stringifyEffect({
+            spaceId: request.spaceId,
+            clientId: request.clientId,
+            scope,
+            principal
+          })
+          const captured = yield* Codec.decode(
+            Schema.fromJsonString(Schema.Struct({
+              spaceId: Identity.SpaceId,
+              clientId: Identity.ClientId,
+              scope: Protocol.ReplicationScope,
+              principal: Schema.Json
+            })),
+            encoded
           )
+          const capturedRequest = { ...request, ...captured }
+          return {
+            key: encoded,
+            request: capturedRequest,
+            principal: captured.principal,
+            lookup: () => authorizeReadScope(capturedRequest, captured.principal)
+          }
+        })
+      const watch = (
+        request: Protocol.WatchRequest,
+        principal: typeof Schema.Json.Type,
+        authorization?: Effect.Success<ReturnType<typeof captureReadAuthorization>>
+      ) =>
+        Stream.unwrap(
+          Effect.gen(function*() {
+            const parentScope = yield* Effect.scope
+            let authorized: ReadAuthorization.Success<void> | undefined
+            const capturedVisibility = authorization ?? (yield* captureReadAuthorization(request, principal))
+            if (authorization !== undefined) {
+              authorized = yield* readAuthorizations.authorize(authorization.key, authorization.lookup).pipe(
+                Effect.tapErrorTag("CapacityExceeded", () => metrics.recordRejection("CapacityExceeded"))
+              )
+            }
+            const childScope = yield* Scope.make()
+            yield* Effect.addFinalizer(() => Scope.close(childScope, Exit.void))
+            const state = yield* RcMap.get(wakes, request.spaceId).pipe(Scope.provide(childScope))
+            yield* Effect.acquireRelease(
+              Effect.gen(function*() {
+                if (!(yield* state.watchers.takeIfAvailable(1))) {
+                  yield* metrics.recordRejection("CapacityExceeded")
+                  yield* new ReplicaError.CapacityExceeded({
+                    resource: "sync watchers",
+                    limit: options.maximumWatchersPerSpace
+                  })
+                }
+              }),
+              () => state.watchers.release(1).pipe(Effect.asVoid)
+            ).pipe(
+              Scope.provide(childScope)
+            )
+            yield* Effect.acquireRelease(
+              metrics.changeWatchers(1),
+              () => metrics.changeWatchers(-1)
+            ).pipe(
+              Scope.provide(childScope)
+            )
+            const subscription = yield* PubSub.subscribe(state.channel).pipe(Scope.provide(childScope))
+            const mutations = Stream.fromSubscription(subscription).pipe(Stream.map(Option.some))
+            const refreshes = Stream.tick(readAuthorizationRefreshMillis).pipe(
+              Stream.drop(1),
+              Stream.map(() => Option.none<PublishedWake>())
+            )
+            const outputWakes = Stream.succeed(Option.none<PublishedWake>()).pipe(
+              Stream.concat(Stream.merge(mutations, refreshes)),
+              Stream.filterEffect((signal) => {
+                if (Option.isNone(signal)) return Effect.succeed(true)
+                return signal.value.visibility.evaluate(
+                  capturedVisibility.key,
+                  () =>
+                    mutationWakeVisible(
+                      capturedVisibility.request,
+                      capturedVisibility.principal,
+                      signal.value.changes
+                    )
+                )
+              }),
+              Stream.mapEffect((signal) => {
+                if (Option.isNone(signal)) return Effect.succeed(Protocol.Wake.make({ spaceId: request.spaceId }))
+                return Clock.monotonicTimeNanos.pipe(
+                  Effect.tap((deliveredAtNanos) =>
+                    metrics.recordWakeFanout(deliveredAtNanos - signal.value.publishedAtNanos)
+                  ),
+                  Effect.as(Protocol.Wake.make({ spaceId: request.spaceId }))
+                )
+              })
+            )
+            if (authorization === undefined || authorized === undefined) return outputWakes
+            const revoked = yield* Deferred.make<never, ReplicaError.ReplicaError>()
+            const failClosed = (error: ReplicaError.AuthorizationDenied) =>
+              Deferred.fail(revoked, error).pipe(
+                Effect.tap(() => Scope.close(childScope, Exit.void).pipe(Effect.forkIn(parentScope))),
+                Effect.asVoid
+              )
+            const monitor = (current: ReadAuthorization.Success<void>): Effect.Effect<void> =>
+              Effect.gen(function*() {
+                const now = yield* Clock.monotonicTimeNanos
+                const refreshAt = current.expiresAtNanos -
+                  BigInt(Math.floor(readAuthorizationRefreshMillis * 500_000))
+                if (refreshAt > now) yield* Effect.sleep(Duration.nanos(refreshAt - now))
+                const refreshStartedAt = yield* Clock.monotonicTimeNanos
+                const remaining = current.expiresAtNanos - refreshStartedAt
+                if (remaining <= 0n) {
+                  return yield* failClosed(
+                    new ReplicaError.AuthorizationDenied({ reason: { _tag: "ReadAuthorizationExpired" } })
+                  )
+                }
+                const refreshed = yield* readAuthorizations.refresh(
+                  authorization.key,
+                  current.generation,
+                  authorization.lookup
+                ).pipe(
+                  Effect.timeoutOption(Duration.nanos(remaining)),
+                  Effect.exit
+                )
+                if (Exit.isFailure(refreshed)) {
+                  return yield* Deferred.failCause(revoked, refreshed.cause).pipe(
+                    Effect.tap(() => Scope.close(childScope, Exit.void).pipe(Effect.forkIn(parentScope))),
+                    Effect.asVoid
+                  )
+                }
+                if (Option.isNone(refreshed.value)) {
+                  return yield* failClosed(
+                    new ReplicaError.AuthorizationDenied({ reason: { _tag: "ReadAuthorizationExpired" } })
+                  )
+                }
+                return yield* monitor(refreshed.value.value)
+              })
+            yield* Effect.forkScoped(monitor(authorized))
+            return Stream.merge(outputWakes, Stream.fromEffect(Deferred.await(revoked)))
+          })
         )
 
       const trustedSubmitRequest = (
@@ -1666,6 +2034,31 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         return { ...request, schema: options.definition.schemaIdentity }
       }
 
+      const prepareBootstrapAuthorized = (
+        request: Protocol.BootstrapRequest,
+        principal: typeof Schema.Json.Type
+      ) =>
+        Effect.gen(function*() {
+          const captured = yield* Codec.decode(
+            Schema.fromJsonString(Schema.Struct({
+              request: Protocol.BootstrapRequest,
+              principal: Schema.Json
+            })),
+            yield* Canonical.stringifyEffect({ request, principal })
+          )
+          const callerDefinition = yield* validateCallerSchema(captured.request.schema)
+          const normalizedRequest = {
+            ...captured.request,
+            scope: yield* Protocol.validateReplicationScope(callerDefinition, captured.request.scope)
+          }
+          yield* authorizeReadScope(normalizedRequest, captured.principal)
+          return prepareSpace(normalizedRequest.spaceId, normalizedRequest.schema).pipe(
+            Effect.flatMap((generation) =>
+              preauthorizedScopedReplication.bootstrap(normalizedRequest, captured.principal, generation)
+            )
+          )
+        })
+
       return ServerStore.of({
         submit: (request) => admit(trustedSubmitRequest(request), null),
         admit,
@@ -1688,24 +2081,27 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           )
         },
         bootstrapAuthorized: (request, principal) =>
-          authorizeReadScope(request, principal).pipe(
-            Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-            Effect.flatMap((generation) => scopedReplication.bootstrap(request, principal, generation))
-          ),
+          prepareBootstrapAuthorized(request, principal).pipe(Effect.flatten),
+        prepareBootstrapAuthorized,
         maintain,
         maintainAll,
         watch: (request) => {
           return Stream.unwrap(
-            prepareSpace(request.spaceId, request.schema).pipe(
-              Effect.as(watch(request, null))
+            Protocol.validateReplicationScope(options.definition, request.scope).pipe(
+              Effect.flatMap((scope) => prepareSpace(request.spaceId, request.schema).pipe(Effect.as(scope))),
+              Effect.map((scope) => watch({ ...request, scope }, null))
             )
           )
         },
         watchAuthorized: (request, principal) =>
-          authorizeReadScope(request, principal).pipe(
-            Effect.andThen(prepareSpace(request.spaceId, request.schema)),
-            Effect.as(watch(request, principal))
-          )
+          Effect.gen(function*() {
+            const authorization = yield* captureReadAuthorization(request, principal)
+            yield* readAuthorizations.authorize(authorization.key, authorization.lookup).pipe(
+              Effect.tapErrorTag("CapacityExceeded", () => metrics.recordRejection("CapacityExceeded"))
+            )
+            yield* prepareSpace(request.spaceId, request.schema)
+            return watch(authorization.request, authorization.principal, authorization)
+          })
       })
     })
   )
@@ -1718,6 +2114,10 @@ export const layerTrusted = (
     readonly schemaEvolutionBatchBytes?: number
     readonly readAuthorizationRefreshInterval: Duration.Input
     readonly wakeCapacity?: number
+    readonly maximumWatchersPerSpace: number
+    readonly maximumConcurrentReadAuthorizations: number
+    readonly maximumPendingReadAuthorizations: number
+    readonly readAuthorizationCacheCapacity: number
   } & HistoryOptions
 ): Layer.Layer<
   ServerStore,

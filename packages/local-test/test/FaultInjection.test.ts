@@ -56,7 +56,6 @@ const clientHistory = {
   migration
 }
 const serverHistory = {
-  readAuthorizationRefreshInterval: "1 second" as const,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,
@@ -68,6 +67,11 @@ const serverHistory = {
   retainedSnapshots: 2,
   maintenanceConcurrency: 1,
   maintenanceSpaceBatchSize: 128,
+  maximumWatchersPerSpace: 1_024,
+  readAuthorizationRefreshInterval: "30 seconds" as const,
+  maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
+  readAuthorizationCacheCapacity: 4_096,
   migration
 }
 const database = () =>

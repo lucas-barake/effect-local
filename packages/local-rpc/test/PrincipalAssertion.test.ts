@@ -36,6 +36,10 @@ const database = Layer.mergeAll(
 const store = ServerStore.layer({
   definition,
   readAuthorizationRefreshInterval: "1 second",
+  maximumWatchersPerSpace: 1_024,
+  maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
+  readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,
@@ -65,12 +69,20 @@ describe("principal assertions", () => {
         }
         return Effect.fail(new ReplicaError.AuthorizationDenied({ reason: "forged assertion" }))
       })
-      const handlers = SpaceEntity.layerHandlers().pipe(
+      const handlers = SpaceEntity.layerHandlers({
+        admissionMailboxCapacity: 32,
+        readMailboxCapacity: 32,
+        watchMailboxCapacity: 32,
+        presencePublicationMailboxCapacity: 32,
+        maximumConcurrentBootstrapAuthorizations: 16,
+        maximumConcurrentBootstrapPagesPerSpace: 4,
+        maximumConcurrentPresencePublicationsPerSpace: 16
+      }).pipe(
         Layer.provide(store),
-        Layer.provide(PresenceHub.layerTrusted()),
+        Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
         Layer.provide(verifier)
       )
-      const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceEntity, handlers)
+      const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, handlers)
       const client = yield* makeClient(spaceId)
       const request = Protocol.PullRequest.make({
         spaceId,

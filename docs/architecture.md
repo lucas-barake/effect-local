@@ -111,10 +111,15 @@ in Effects. Callers select either the lightweight in memory reconciliation Layer
 Workflow payload contains only definition, space, client, membership incarnation, and generation identity. Activities call the same
 idempotent reconciliation operation as the in memory scheduler.
 
-The server front door is an authenticated WebSocket RPC facade. It routes submit, pull, watch, presence publish, and
-presence watch through one Effect Cluster entity keyed by space. The sequential entity command lane gives a space one
-live mutation owner while forked reads and streams stay concurrent. The owner holds per-space wake and presence
-recipients, so a client connected to one runner observes work admitted through another.
+The server front door is an authenticated WebSocket RPC facade. It routes every operation by space through four Effect
+Cluster entity types. `SpaceAdmissionEntity` runs Submit and Discard sequentially. `SpaceReadEntity` forks Pull and
+immutable snapshot Bootstrap pages. `SpaceWatchEntity` forks long lived sync and presence streams.
+`SpacePresencePublishEntity` runs bounded concurrent presence publications. Each entity has its own required finite
+mailbox, so a paused Bootstrap page or a full watch lane cannot occupy mutation admission.
+
+An accepted admission publishes a shared in memory wake after its SQL transaction commits. Subscribers read that
+publication from the per space hub. Fanout does not acquire a SQLite transaction or write a space row for each watcher.
+Pull remains the durable repair path when a wake is lost.
 
 Entity operations are volatile. Client SQLite owns a mutation until admission returns its exact receipt. Server SQL then
 owns the authoritative mutation log, terminal receipt, canonical changes, and total sequence. A runner failure before
@@ -135,11 +140,42 @@ Entity keys invalidate exact records. Query dependencies invalidate once per spa
 
 Protocol limits bound a mutation, a pull page, a bootstrap page, and a presence update by count and encoded bytes.
 Server options set hard history, receipt, entity, snapshot byte, and bootstrap byte limits. Admission cross checks
-space counters against trigger maintained shadow counters under the lock before executing a handler and checks resulting snapshot capacity inside the handler
-savepoint. The client bounds pending mutations, retained receipts, accepted evidence, staged entities, staged bytes,
-and incoming page bytes. Server wake publication and presence publication are bounded or sliding. The in memory
-reconciler uses one keyed dispatcher with independent watches and turns. Workflow generations coalesce durable
-requests. Streams and publications carry only notifications.
+space counters against trigger maintained shadow counters under the lock before executing a handler and checks
+resulting snapshot capacity inside the handler savepoint. The client bounds pending mutations, retained receipts,
+accepted evidence, staged entities, staged bytes, and incoming page bytes. The in memory reconciler uses one keyed
+dispatcher with independent watches and turns. Workflow generations coalesce durable requests. Streams and
+publications carry only notifications.
+
+`SpaceEntity.HandlerOptions` requires positive finite `admissionMailboxCapacity`, `readMailboxCapacity`,
+`watchMailboxCapacity`, and `presencePublicationMailboxCapacity` values. It also requires
+`maximumConcurrentBootstrapAuthorizations`, `maximumConcurrentBootstrapPagesPerSpace`, and
+`maximumConcurrentPresencePublicationsPerSpace`. Bootstrap assertion verification and preparation share one fail fast
+Layer wide allowance. Published page reads use a separate per space allowance. Saturation reports `CapacityExceeded`
+with resource `bootstrap authorizations` or `bootstrap pages`.
+
+`ServerStore.maximumWatchersPerSpace` is the active sync watcher allowance. `PresenceHub.maximumWatchersPerSpace` is a
+separate active presence watcher allowance. `ServerStore.wakeCapacity` and `PresenceHub.capacity` are sliding
+publication queue depths, not watcher limits. Excess watchers fail with typed `CapacityExceeded` resources `sync
+watchers` or `presence watchers`. Interrupted, denied, and revoked streams release their watcher allowance.
+
+Sync watch authorization successes share one structural `(spaceId, clientId, normalized scope, principal)` lookup and expire after
+`readAuthorizationRefreshInterval`. `maximumConcurrentReadAuthorizations` bounds policy work and
+`maximumPendingReadAuthorizations` independently bounds all live authorization callers and distinct owner lookups. It
+also bounds distinct per-wake visibility evaluations waiting for policy execution. `readAuthorizationCacheCapacity`
+bounds completed successes. These limits are independent of the active watcher allowance. Equal lookups share one result
+within the caller allowance and denials are not cached. Overflow fails with typed
+`CapacityExceeded { resource: "read authorizations", limit }`. Each watch begins refresh halfway
+through the interval. If a fresh success is not available at the existing success expiry, the watcher scope closes and
+the stream fails with `AuthorizationDenied`. The configured interval is therefore the fail closed revocation bound even
+when policy work hangs or the client stops pulling. Pull and Bootstrap perform uncached one shot authorization checks.
+
+Capacity failures use the Schema tagged `CapacityExceeded { resource, limit }` error across SQL, presence, and RPC
+boundaries. Full Cluster mailboxes map to `ServerUnavailable` because the request did not enter its domain handler.
+
+Operational metrics report admission outcome and rejection class, history and receipt depth beside their limits, sync
+and presence watcher populations, wake fanout duration, durable bootstrap installs, maintenance outcomes and prune
+volumes, and pending client mutation population. Labels are bounded categories. They do not contain resource
+identifiers. The production fanout benchmark is `packages/local-rpc/bench/Fanout.bench.ts`.
 
 History maintenance is an explicit service lifecycle. It reads one consistent bounded materialized state, builds an
 immutable manifest in memory, then locks the space and compares both sequence heads. Only an unchanged candidate is

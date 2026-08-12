@@ -121,6 +121,10 @@ const migration = {
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const serverHistory = {
   readAuthorizationRefreshInterval: "1 second" as const,
+  maximumWatchersPerSpace: 1_024,
+  maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
+  readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 0,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 0,
@@ -134,6 +138,15 @@ const serverHistory = {
   maintenanceSpaceBatchSize: 128,
   migration
 }
+const entityOptions = {
+  admissionMailboxCapacity: 64,
+  readMailboxCapacity: 64,
+  watchMailboxCapacity: 64,
+  presencePublicationMailboxCapacity: 64,
+  maximumConcurrentBootstrapAuthorizations: 16,
+  maximumConcurrentBootstrapPagesPerSpace: 4,
+  maximumConcurrentPresencePublicationsPerSpace: 16
+} satisfies SpaceEntity.HandlerOptions
 const clientHistory = {
   scope,
   retainedReceipts: 256,
@@ -220,8 +233,8 @@ const revokedAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe
     })
   )
 ))
-const presenceHub = PresenceHub.layerTrusted()
-const cluster = SpaceEntity.layer().pipe(
+const presenceHub = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })
+const cluster = SpaceEntity.layer(entityOptions).pipe(
   Layer.provide(assertionVerifier),
   Layer.provide(store),
   Layer.provide(presenceHub),
@@ -475,10 +488,10 @@ const makeLifecycleHarness = (options?: {
         )
       }
     }).pipe(Layer.provide(lifecycleRuntime), Layer.provide(database))
-    const lifecycleCluster = SpaceEntity.layer().pipe(
+    const lifecycleCluster = SpaceEntity.layer(entityOptions).pipe(
       Layer.provide(assertionVerifier),
       Layer.provide(lifecycleStore),
-      Layer.provide(PresenceHub.layerTrusted()),
+      Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
       Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(database)))
     )
     const lifecycleWebSocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(
@@ -913,7 +926,7 @@ describe("WebSocket synchronization", () => {
       Effect.provide(NodeCrypto.layer)
     ))
 
-  it.effect("reauthorizes an established watch before emitting a later wake", () =>
+  it.effect("revokes an established watch within the configured authorization window", () =>
     Effect.gen(function*() {
       MutableRef.set(readAuthorized, true)
       const remote = yield* SyncEngine.SyncEngine
@@ -933,26 +946,7 @@ describe("WebSocket synchronization", () => {
       )
       yield* Deferred.await(initialWake)
       MutableRef.set(readAuthorized, false)
-
-      const identity = {
-        spaceId,
-        clientId,
-        mutationId,
-        localSequence: Identity.LocalSequence.make(1),
-        basis: Identity.ServerSequence.make(0),
-        name: PutTodo.name,
-        payload: { id: "1", title: "socket" },
-        digestVersion: 3 as const,
-        membershipIncarnation: Identity.legacyMembershipIncarnation,
-        sourceSchema: definition.schemaIdentity,
-        mutationVersion: PutTodo.version
-      }
-      const envelope: Protocol.MutationEnvelope = {
-        ...identity,
-        digest: yield* Protocol.mutationDigest(identity)
-      }
-      const receipt = yield* remote.submit({ envelope, schema: definition.schemaIdentity })
-      assert.strictEqual(receipt._tag, "Accepted")
+      yield* TestClock.adjust("500 millis")
 
       const denied = yield* Fiber.join(watching).pipe(Effect.flip)
       assert.strictEqual(denied._tag, "AuthorizationDenied")

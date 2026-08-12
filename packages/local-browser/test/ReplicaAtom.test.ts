@@ -114,7 +114,11 @@ const clientHistory = {
 }
 const server = ServerStore.layerTrusted({
   definition,
-  readAuthorizationRefreshInterval: "1 second" as const,
+  readAuthorizationRefreshInterval: "30 seconds" as const,
+  maximumWatchersPerSpace: 1_024,
+  maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
+  readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,

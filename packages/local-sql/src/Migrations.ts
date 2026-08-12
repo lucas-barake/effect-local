@@ -666,6 +666,10 @@ const serverV5 = makeMigration({
       history_count INTEGER NOT NULL CHECK (history_count >= 0),
       receipt_count INTEGER NOT NULL CHECK (receipt_count >= 0)
     )`,
+    `CREATE INDEX effect_local_server_space_counts_history
+      ON effect_local_server_space_counts (history_count DESC)`,
+    `CREATE INDEX effect_local_server_space_counts_receipts
+      ON effect_local_server_space_counts (receipt_count DESC)`,
     `INSERT INTO effect_local_server_space_counts (space_id, history_count, receipt_count)
       SELECT space_id, retained_history_count, retained_receipt_count
       FROM effect_local_server_spaces`,

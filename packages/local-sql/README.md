@@ -81,8 +81,25 @@ ordinary shutdown because it durably cancels the reconciliation.
 retries, deduplicates stable mutation identities, stores terminal rejections, assigns the next dense sequence to
 accepted mutations, and materializes authoritative state in the same SQL transaction. Its required history options
 set retained targets, hard admission caps, snapshot capacity, bootstrap page capacity, prune batches, retained
-snapshots, migration retry, maintenance concurrency, and the keyset page size used to enumerate spaces. `ServerStore.layerTrusted` is the explicit allow all
-composition.
+snapshots, migration retry, maintenance concurrency, and the keyset page size used to enumerate spaces. The required
+`maximumWatchersPerSpace`, `readAuthorizationRefreshInterval`, `maximumConcurrentReadAuthorizations`,
+`maximumPendingReadAuthorizations`, and `readAuthorizationCacheCapacity` options bound live sync streams and their
+policy work. `ServerStore.layerTrusted` is the explicit allow all composition.
+
+Sync watch authorization shares successful structural `(spaceId, clientId, normalized scope, principal)` checks.
+`maximumConcurrentReadAuthorizations` bounds executing policy calls. `maximumPendingReadAuthorizations` independently
+bounds all live authorization callers and distinct owner lookups. It also bounds distinct per-wake visibility work
+waiting for execution. `readAuthorizationCacheCapacity` bounds completed successes. Active watchers have their own
+limit. Equal checks use one lookup within the caller allowance and denials are not cached. Overflow fails with typed
+`CapacityExceeded { resource: "read authorizations", limit }`. Each watcher starts refresh halfway through the configured
+interval. If no fresh success is available at the current success expiry, the watcher scope closes and its stream fails
+with `AuthorizationDenied`. `readAuthorizationRefreshInterval` is therefore the fail closed worst case revocation bound.
+Pull and Bootstrap perform uncached one shot read authorization.
+
+Each accepted admission publishes a shared wake after its transaction commits. Watchers do not perform a SQLite
+transaction or space row write per publication. `wakeCapacity` is the optional sliding wake queue depth, while
+`maximumWatchersPerSpace` is the separate live watcher allowance. Excess streams fail with typed
+`CapacityExceeded { resource: "sync watchers", limit }`.
 
 `authorizeRead` receives a tagged union. `_tag: "Scope"` authorizes the client and requested model set before space or
 schema disclosure. `_tag: "Entity"` authorizes one Schema encoded entity key and value. Only entities that pass both
@@ -110,6 +127,9 @@ const StoreLive = ServerStore.layer({
   ...serverHistory,
   definition,
   readAuthorizationRefreshInterval: "30 seconds",
+  maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
+  readAuthorizationCacheCapacity: 4_096,
   authorizeAccess,
   authorizeMutation,
   authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
@@ -127,7 +147,6 @@ import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 
 const StoreLive = ServerStore.layer({
   definition,
-  readAuthorizationRefreshInterval: "30 seconds",
   authorizeAccess,
   authorizeMutation,
   authorizeRead,
@@ -142,6 +161,11 @@ const StoreLive = ServerStore.layer({
   retainedSnapshots: 2,
   maintenanceConcurrency: 4,
   maintenanceSpaceBatchSize: 128,
+  maximumWatchersPerSpace: 1_024,
+  readAuthorizationRefreshInterval: "30 seconds",
+  maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
+  readAuthorizationCacheCapacity: 4_096,
   migration: { retryDelay: "25 millis", maximumAttempts: 8 }
 })
 
@@ -155,6 +179,23 @@ Exact retries return retained receipts. Once receipt evidence has crossed the pu
 retry returns `Expired` and never executes again. The client retains an expired pending mutation until it installs the
 covering snapshot, unless its durable cursor already proves that canonical state includes the snapshot sequence.
 `SyncEngine` is the transport neutral boundary used by direct tests and the RPC client.
+
+## Operational metrics
+
+`ServerStore` records `effect_local_server_admission` by completed attempt outcome and
+`effect_local_server_rejection` by stable receipt origin or typed error `_tag`. The
+`effect_local_server_history_depth` and `effect_local_server_receipt_depth` gauges report the maximum retained rows in
+any one space. Their matching `_limit` gauges report the configured per space caps.
+
+`effect_local_server_sync_watcher_count` is the live sync watcher population.
+`effect_local_server_wake_fanout_duration` records publication to one subscriber delivery for accepted wakes.
+`effect_local_server_maintenance` records completed and failed maintenance runs, while `effect_local_server_pruned`
+counts committed deleted rows with `resource=history|receipt`.
+
+`LocalStore` increments `effect_local_client_bootstrap_install` after a snapshot installation commits and maintains
+`effect_local_client_pending_mutation_count` as the pending population across active stores. Metric labels use bounded
+outcomes and resource classes. They do not contain space, client, mutation, request, or principal identifiers. The
+production watcher benchmark is `../local-rpc/bench/Fanout.bench.ts`.
 
 See the [repository guide](https://github.com/lucas-barake/effect-local#readme) and
 [durability notes](https://github.com/lucas-barake/effect-local/blob/main/docs/durability.md).

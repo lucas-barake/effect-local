@@ -7,10 +7,42 @@ publication, and presence watch streams over one WebSocket. `SyncServer.layer` k
 and routes each operation through `SpaceEntity.Client`. `SyncClient.layer` adapts the generated typed client to
 `SyncEngine`.
 
-`SpaceEntity` gives every space one Cluster routing key. All operations are explicitly volatile. The entity command lane
-is sequential. Read and stream handlers use `Rpc.fork`, so long lived watches do not block mutation commands. Options
-expose mailbox, idle time, defect, and span controls without allowing callers to break the single writer invariant.
-`SpaceEntity.layerClient` provides the domain client used by the public facade. `SpaceEntity.layer()` composes both.
+`SpaceEntity` routes one space through four volatile Cluster entity types. `SpaceAdmissionEntity` serializes Submit and
+Discard. `SpaceReadEntity` forks Pull and immutable Bootstrap page reads. `SpaceWatchEntity` forks long lived sync and
+presence streams. `SpacePresencePublishEntity` bounds concurrent presence publications. Separate finite mailboxes keep
+paused Bootstrap pages and long lived streams out of mutation admission. `SpaceEntity.layerClient` aggregates the four
+generated clients for the public facade. `SpaceEntity.layer(options)` composes handlers and that client.
+
+```ts
+import * as PresenceHub from "@lucas-barake/effect-local-rpc/PresenceHub"
+import * as SpaceEntity from "@lucas-barake/effect-local-rpc/SpaceEntity"
+import * as Layer from "effect/Layer"
+
+const PresenceLive = PresenceHub.layer({
+  capacity: 1_024,
+  maximumWatchersPerSpace: 1_024,
+  authorize: authorizePresence
+})
+
+const SpaceLive = SpaceEntity.layer({
+  admissionMailboxCapacity: 64,
+  readMailboxCapacity: 64,
+  watchMailboxCapacity: 2_048,
+  presencePublicationMailboxCapacity: 256,
+  maximumConcurrentBootstrapAuthorizations: 64,
+  maximumConcurrentBootstrapPagesPerSpace: 8,
+  maximumConcurrentPresencePublicationsPerSpace: 64
+}).pipe(
+  Layer.provide(StoreLive),
+  Layer.provide(PresenceLive),
+  Layer.provide(RunnerLive)
+)
+```
+
+All seven numeric `SpaceEntity` options are required positive safe integers. A full mailbox maps to `ServerUnavailable`.
+Bootstrap concurrency is fail fast. `maximumConcurrentBootstrapAuthorizations` bounds assertion verification and
+bootstrap preparation across the Layer. `maximumConcurrentBootstrapPagesPerSpace` bounds published page reads per
+space. Saturation reports typed `CapacityExceeded` with resource `bootstrap authorizations` or `bootstrap pages`.
 
 For one process, provide `SingleRunner.layer` with the selected runner storage. A Node multi runner deployment provides
 `SocketRunner.layer` with `NodeClusterSocket.layerSocketServer` and `NodeClusterSocket.layerClientProtocol`, then supplies
@@ -120,6 +152,15 @@ The socket reconnect policy is separate from reconciliation backoff. `retryTrans
 errors internal while retries remain. If a finite `retryPolicy` exhausts, that protocol instance stops opening the
 socket. Outstanding operations still fail at their configured timeout. Rebuilding the protocol Layer starts a new
 socket acquisition lifecycle.
+
+`PresenceHub.maximumWatchersPerSpace` caps active presence streams. It is independent from `capacity`, the sliding
+per space update queue depth. Excess presence streams fail with `CapacityExceeded { resource: "presence watchers",
+limit }` and release their allowance on interruption or authorization failure. The live population is exported as
+`effect_local_server_presence_watcher_count`.
+
+`ServerStore.maximumWatchersPerSpace` separately caps sync streams. Accepted admissions publish a shared wake after
+commit. Delivering it performs no SQLite transaction or space row write per watcher. The benchmark at
+`bench/Fanout.bench.ts` exercises the production composed path with 64, 256, and 1,024 watchers.
 
 Use `SyncRpc.layerJson` for the WebSocket serialization Layer. It bounds each complete UTF-8 JSON frame and makes
 remote defects opaque. The high level Effect Node server does not expose the underlying `ws` `maxPayload` option, so

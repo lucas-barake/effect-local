@@ -16,11 +16,14 @@ import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
 import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
+import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
@@ -100,6 +103,10 @@ const clientHistory = {
 }
 const serverHistory = {
   readAuthorizationRefreshInterval: "1 second" as const,
+  maximumWatchersPerSpace: 1_024,
+  maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
+  readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,
@@ -197,6 +204,16 @@ const bootstrapRequest = (
     limit
   })
 
+const watchRequest = (requestedClientId = clientId): Protocol.WatchRequest =>
+  Protocol.WatchRequest.make({
+    spaceId,
+    clientId: requestedClientId,
+    schema: Domain.definition.schemaIdentity,
+    scope,
+    scopeGeneration,
+    cursor: null
+  })
+
 const installFreshView = (
   local: LocalStore.Service,
   server: ServerStore.Service,
@@ -257,6 +274,537 @@ const clientServices = (id: Identity.ClientId, server: ServerStore.Service) => {
 }
 
 describe("server reconciled mutation log", () => {
+  it.effect("does not scale SQL writes or transactions with watcher fanout", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const actualSql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
+          Effect.provide(Reactivity.layer)
+        )
+        const transactionCalls = yield* Ref.make(0)
+        const observedSql = new Proxy(actualSql, {
+          get: (target, property, receiver) => {
+            if (property !== "withTransaction") return Reflect.get(target, property, receiver)
+            return <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+              Ref.update(transactionCalls, (count) => count + 1).pipe(
+                Effect.andThen(target.withTransaction(effect))
+              )
+          }
+        })
+        const infrastructure = Layer.mergeAll(
+          Layer.succeed(SqlClient.SqlClient, observedSql),
+          NodeCrypto.layer,
+          Reactivity.layer
+        )
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(infrastructure)
+          )
+        )
+        yield* observedSql`CREATE TABLE space_update_probe (count INTEGER NOT NULL)`
+        yield* observedSql`CREATE TRIGGER count_space_updates AFTER UPDATE ON effect_local_server_spaces
+          BEGIN INSERT INTO space_update_probe (count) VALUES (1); END`
+        const countUpdates = SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: Schema.Struct({ count: Schema.Number }),
+          execute: () => observedSql`SELECT COUNT(*) AS count FROM space_update_probe`
+        })
+        const submit = (localSequence: number) =>
+          envelope(
+            Domain.PutTodo.name,
+            Domain.todo(`fanout-${localSequence}`),
+            localSequence,
+            Identity.MutationId.make(
+              `mut_00000000-0000-4000-8020-${String(localSequence).padStart(12, "0")}`
+            )
+          ).pipe(Effect.flatMap(server.submit))
+
+        assert.strictEqual((yield* submit(1))._tag, "Accepted")
+        yield* Ref.set(transactionCalls, 0)
+        yield* observedSql`DELETE FROM space_update_probe`
+        assert.strictEqual((yield* submit(2))._tag, "Accepted")
+        const baselineTransactions = yield* Ref.get(transactionCalls)
+        const baselineUpdates = (yield* countUpdates(undefined)).count
+
+        const watcherQueues = yield* Effect.forEach(
+          Array.from({ length: 4 }),
+          () => Queue.unbounded<Protocol.Wake>()
+        )
+        const watchers = yield* Effect.forEach(watcherQueues, (queue) =>
+          server.watch(watchRequest()).pipe(
+            Stream.runForEach((wake) => Queue.offer(queue, wake)),
+            Effect.forkChild({ startImmediately: true })
+          ))
+        yield* Effect.forEach(watcherQueues, Queue.take)
+        yield* Ref.set(transactionCalls, 0)
+        yield* observedSql`DELETE FROM space_update_probe`
+
+        assert.strictEqual((yield* submit(3))._tag, "Accepted")
+        const wakes = yield* Effect.forEach(watcherQueues, Queue.take)
+        assert.deepStrictEqual(wakes, Array.from({ length: 4 }, () => ({ spaceId })))
+        assert.strictEqual(yield* Ref.get(transactionCalls), baselineTransactions)
+        assert.strictEqual((yield* countUpdates(undefined)).count, baselineUpdates)
+        yield* Effect.forEach(watchers, Fiber.interrupt)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("caps active sync watchers and releases slots on interruption", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const ready = yield* Deferred.make<void>()
+        const first = yield* server.watch(watchRequest()).pipe(
+          Stream.runForEach(() => Deferred.succeed(ready, undefined)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(ready)
+
+        const error = yield* server.watch(watchRequest()).pipe(Stream.runHead, Effect.flip)
+        assert.deepStrictEqual(
+          error,
+          new ReplicaError.CapacityExceeded({ resource: "sync watchers", limit: 1 })
+        )
+        const rejection = (yield* Metric.snapshot).find((snapshot) =>
+          snapshot.id === "effect_local_server_rejection" && snapshot.attributes?.class === "CapacityExceeded"
+        )
+        assert.strictEqual(rejection?.type, "Counter")
+        if (rejection?.type === "Counter") assert.strictEqual(rejection.state.count, 1)
+
+        yield* Fiber.interrupt(first)
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+      }).pipe(
+        Effect.provide(NodeCrypto.layer),
+        Effect.provideService(Metric.MetricRegistry, new Map())
+      )
+    ))
+
+  it.effect("keeps watcher admission available when its metric update defects", () => {
+    const registry = new Map<string, Metric.Metric.Metadata<any, any>>()
+    return Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 2
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const firstReady = yield* Deferred.make<void>()
+        const first = yield* server.watch(watchRequest()).pipe(
+          Stream.tap(() => Deferred.succeed(firstReady, undefined)),
+          Stream.runDrain,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(firstReady)
+
+        const metadata = Array.from(registry.values()).find(
+          (entry) => entry.id === "effect_local_server_sync_watcher_count"
+        )
+        assert.isDefined(metadata)
+        const modify = metadata.hooks.modify.bind(metadata.hooks)
+        let defectNextIncrement = true
+        Object.defineProperty(metadata.hooks, "modify", {
+          configurable: true,
+          value: (input: number, context: never) => {
+            if (input === 1 && defectNextIncrement) {
+              defectNextIncrement = false
+              assert.fail("metric registry defect")
+            }
+            return modify(input, context)
+          }
+        })
+
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+        yield* Fiber.interrupt(first)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ).pipe(Effect.provideService(Metric.MetricRegistry, registry))
+  })
+
+  it.effect("returns accepted and retry receipts when admission metrics defect after recording", () => {
+    const registry = new Map<string, Metric.Metric.Metadata<any, any>>()
+    return Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        yield* Metric.update(
+          Metric.withAttributes(
+            Metric.counter("effect_local_server_admission", { incremental: true }),
+            { outcome: "accepted" }
+          ),
+          0
+        )
+        const metadata = Array.from(registry.values()).find((entry) =>
+          entry.id === "effect_local_server_admission" && entry.attributes?.outcome === "accepted"
+        )
+        assert.isDefined(metadata)
+        const update = metadata.hooks.update.bind(metadata.hooks)
+        Object.defineProperty(metadata.hooks, "update", {
+          configurable: true,
+          value: (input: number, context: never) => {
+            update(input, context)
+            assert.fail("admission metric defect")
+          }
+        })
+        const submitted = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("metric-defect-receipt"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8021-000000000001")
+        )
+
+        const accepted = yield* server.submit(submitted)
+        const retry = yield* server.submit(submitted)
+
+        assert.strictEqual(accepted._tag, "Accepted")
+        assert.deepStrictEqual(retry, accepted)
+        const admissions = yield* Metric.snapshot
+        const acceptedMetric = admissions.find((snapshot) =>
+          snapshot.id === "effect_local_server_admission" && snapshot.attributes?.outcome === "accepted"
+        )
+        const failedMetric = admissions.find((snapshot) =>
+          snapshot.id === "effect_local_server_admission" && snapshot.attributes?.outcome === "failed"
+        )
+        assert.strictEqual(acceptedMetric?.type, "Counter")
+        if (acceptedMetric?.type === "Counter") assert.strictEqual(acceptedMetric.state.count, 2)
+        assert.isUndefined(failedMetric)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ).pipe(Effect.provideService(Metric.MetricRegistry, registry))
+  })
+
+  it.effect("preserves a refresh defect and releases the sync watcher slot", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let lookups = 0
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => {
+              lookups++
+              if (lookups === 1) return Effect.void
+              return Effect.die("refresh defect")
+            }
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const initial = yield* Deferred.make<void>()
+        const watching = yield* server.watchAuthorized(watchRequest(), "reader").pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.tap(() => Deferred.succeed(initial, undefined)),
+              Stream.runDrain
+            )
+          ),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(initial)
+        yield* TestClock.adjust("500 millis")
+
+        const exit = yield* Fiber.await(watching)
+        assert.isTrue(Exit.isFailure(exit))
+        if (Exit.isFailure(exit)) {
+          assert.deepStrictEqual(
+            exit.cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect),
+            ["refresh defect"]
+          )
+        }
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("preserves a refresh policy denial and releases the sync watcher slot", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let lookups = 0
+        const denial = { reason: "read revoked" }
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => {
+              lookups++
+              if (lookups === 1) return Effect.void
+              return Effect.fail(denial)
+            }
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const initial = yield* Deferred.make<void>()
+        const watching = yield* server.watchAuthorized(watchRequest(), "reader").pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.tap(() => Deferred.succeed(initial, undefined)),
+              Stream.runDrain
+            )
+          ),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(initial)
+        yield* TestClock.adjust("500 millis")
+
+        const error = yield* Fiber.join(watching).pipe(Effect.flip)
+        assert.deepStrictEqual(error, new ReplicaError.AuthorizationDenied({ reason: denial }))
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("preserves refresh interruption and releases the sync watcher slot", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let lookups = 0
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => {
+              lookups++
+              if (lookups === 1) return Effect.void
+              return Effect.interrupt
+            }
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const initial = yield* Deferred.make<void>()
+        const watching = yield* server.watchAuthorized(watchRequest(), "reader").pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.tap(() => Deferred.succeed(initial, undefined)),
+              Stream.runDrain
+            )
+          ),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(initial)
+        yield* TestClock.adjust("500 millis")
+
+        const exit = yield* Fiber.await(watching)
+        assert.isTrue(Exit.isFailure(exit))
+        if (Exit.isFailure(exit)) assert.isTrue(Cause.hasInterrupts(exit.cause))
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects excess pending read authorizations with typed capacity", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const entered = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumConcurrentReadAuthorizations: 1,
+            maximumPendingReadAuthorizations: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release))
+              )
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const pending = yield* server.watchAuthorized(watchRequest(), "first").pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(entered)
+
+        const error = yield* server.watchAuthorized(watchRequest(), "second").pipe(Effect.flip)
+        assert.deepStrictEqual(
+          error,
+          new ReplicaError.CapacityExceeded({ resource: "read authorizations", limit: 1 })
+        )
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(pending)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("does not reuse authorization after a caller mutates its principal", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: ({ principal }) => {
+              if (
+                typeof principal === "object" && principal !== null && !Array.isArray(principal) &&
+                "subject" in principal && principal.subject === "allowed"
+              ) return Effect.void
+              return Effect.fail("denied")
+            }
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const principal: { subject: string } = { subject: "allowed" }
+        const first = yield* server.watchAuthorized(watchRequest(), principal)
+        assert.isTrue(Option.isSome(yield* first.pipe(Stream.runHead)))
+
+        principal.subject = "denied"
+        const denied = yield* server.watchAuthorized(watchRequest(), principal).pipe(Effect.flip)
+        assert.strictEqual(denied._tag, "AuthorizationDenied")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("does not reveal sync watcher occupancy to unauthorized principals", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: ({ principal }) => {
+              if (principal === "allowed") return Effect.void
+              return Effect.fail("denied")
+            }
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const ready = yield* Deferred.make<void>()
+        const firstStream = yield* server.watchAuthorized(watchRequest(), "allowed")
+        const first = yield* firstStream.pipe(
+          Stream.runForEach(() => Deferred.succeed(ready, undefined)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(ready)
+
+        const denied = yield* server.watchAuthorized(watchRequest(), "denied").pipe(Effect.flip)
+        assert.strictEqual(denied._tag, "AuthorizationDenied")
+        yield* Fiber.interrupt(first)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("records server capacity metrics in the active registry", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const wakes = yield* Queue.unbounded<Protocol.Wake>()
+        const watcher = yield* server.watch(watchRequest()).pipe(
+          Stream.runForEach((wake) => Queue.offer(wakes, wake)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Queue.take(wakes)
+        assert.strictEqual(
+          (yield* server.submit(
+            yield* envelope(
+              Domain.PutTodo.name,
+              Domain.todo("metric"),
+              1,
+              Identity.MutationId.make("mut_00000000-0000-4000-8030-000000000001")
+            )
+          ))._tag,
+          "Accepted"
+        )
+        yield* Queue.take(wakes)
+        yield* server.maintain(spaceId)
+        yield* TestClock.adjust("20 millis")
+
+        const snapshots = yield* Metric.snapshot
+        const find = (id: string, attributes?: Readonly<Record<string, string>>) =>
+          snapshots.find((snapshot) =>
+            snapshot.id === id &&
+            (attributes === undefined ||
+              Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value))
+          )
+        const watcherCount = find("effect_local_server_sync_watcher_count")
+        assert.strictEqual(watcherCount?.type, "Gauge")
+        if (watcherCount?.type === "Gauge") assert.strictEqual(watcherCount.state.value, 1)
+        const fanout = find("effect_local_server_wake_fanout_duration")
+        assert.strictEqual(fanout?.type, "Histogram")
+        if (fanout?.type === "Histogram") assert.strictEqual(fanout.state.count, 1)
+        const admission = find("effect_local_server_admission", { outcome: "accepted" })
+        assert.strictEqual(admission?.type, "Counter")
+        if (admission?.type === "Counter") assert.strictEqual(admission.state.count, 1)
+        const maintenance = find("effect_local_server_maintenance", { outcome: "completed" })
+        assert.strictEqual(maintenance?.type, "Counter")
+        if (maintenance?.type === "Counter") assert.strictEqual(maintenance.state.count, 1)
+        const historyDepth = find("effect_local_server_history_depth")
+        assert.strictEqual(historyDepth?.type, "Gauge")
+        if (historyDepth?.type === "Gauge") assert.strictEqual(historyDepth.state.value, 1)
+        const receiptDepth = find("effect_local_server_receipt_depth")
+        assert.strictEqual(receiptDepth?.type, "Gauge")
+        if (receiptDepth?.type === "Gauge") assert.strictEqual(receiptDepth.state.value, 1)
+        const historyLimit = find("effect_local_server_history_limit")
+        assert.strictEqual(historyLimit?.type, "Gauge")
+        if (historyLimit?.type === "Gauge") {
+          assert.strictEqual(historyLimit.state.value, serverHistory.maximumHistoryEntries)
+        }
+        const receiptLimit = find("effect_local_server_receipt_limit")
+        assert.strictEqual(receiptLimit?.type, "Gauge")
+        if (receiptLimit?.type === "Gauge") {
+          assert.strictEqual(receiptLimit.state.value, serverHistory.maximumReceipts)
+        }
+        yield* Fiber.interrupt(watcher)
+        const afterRelease = (yield* Metric.snapshot).find((snapshot) =>
+          snapshot.id === "effect_local_server_sync_watcher_count"
+        )
+        assert.strictEqual(afterRelease?.type, "Gauge")
+        if (afterRelease?.type === "Gauge") assert.strictEqual(afterRelease.state.value, 0)
+      }).pipe(
+        Effect.provide(NodeCrypto.layer),
+        Effect.provideService(Metric.MetricRegistry, new Map())
+      )
+    ))
+
   it.effect("classifies malformed visible rows during index maintenance as storage corruption", () =>
     Effect.scoped(Effect.gen(function*() {
       const clientDatabase = database()
@@ -795,6 +1343,17 @@ describe("server reconciled mutation log", () => {
         assert.strictEqual(counts.history, 1)
         assert.strictEqual(counts.receipts, 1)
         assert.strictEqual(counts.snapshots, 1)
+        const metrics = yield* Metric.snapshot
+        const prunedHistory = metrics.find((snapshot) =>
+          snapshot.id === "effect_local_server_pruned" && snapshot.attributes?.resource === "history"
+        )
+        assert.strictEqual(prunedHistory?.type, "Counter")
+        if (prunedHistory?.type === "Counter") assert.strictEqual(prunedHistory.state.count, 3)
+        const prunedReceipt = metrics.find((snapshot) =>
+          snapshot.id === "effect_local_server_pruned" && snapshot.attributes?.resource === "receipt"
+        )
+        assert.strictEqual(prunedReceipt?.type, "Counter")
+        if (prunedReceipt?.type === "Counter") assert.strictEqual(prunedReceipt.state.count, 3)
         const globalSnapshot = yield* SqlSchema.findOne({
           Request: Identity.SpaceId,
           Result: Schema.Struct({ snapshot_id: Identity.SnapshotId }),
@@ -818,7 +1377,10 @@ describe("server reconciled mutation log", () => {
           assert.notStrictEqual(expired.snapshotId, pulled.manifest.snapshotId)
           assert.isAtLeast(expired.terminalSequenceThrough, 3)
         }
-      }).pipe(Effect.provide(NodeCrypto.layer))
+      }).pipe(
+        Effect.provide(NodeCrypto.layer),
+        Effect.provideService(Metric.MetricRegistry, new Map())
+      )
     ))
 
   it.effect("pages every space during global history maintenance", () =>
@@ -1756,6 +2318,26 @@ describe("server reconciled mutation log", () => {
       if (first._tag === "Accepted") assert.strictEqual(first.serverSequence, 1)
     })))
 
+  it.effect("republishes an accepted retry from its durable authoritative entry", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const local = yield* service(LocalStore.Store, localLayer())
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      const wakes = yield* Queue.unbounded<Protocol.Wake>()
+      const watcher = yield* server.watch(watchRequest()).pipe(
+        Stream.runForEach((wake) => Queue.offer(wakes, wake)),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Queue.take(wakes)
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("retry-wake"))
+      const first = yield* server.submit(pending.envelope)
+      assert.strictEqual(first._tag, "Accepted")
+      yield* Queue.take(wakes)
+
+      assert.deepStrictEqual(yield* server.submit(pending.envelope), first)
+      assert.deepStrictEqual(yield* Queue.take(wakes), Protocol.Wake.make({ spaceId }))
+      yield* Fiber.interrupt(watcher)
+    })))
+
   it.effect("reauthorizes an exact retry before returning its durable receipt", () =>
     Effect.scoped(
       Effect.gen(function*() {
@@ -2283,6 +2865,22 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual(wakeCapacityError._tag, "InvalidConfiguration")
       if (wakeCapacityError._tag === "InvalidConfiguration") {
         assert.strictEqual(wakeCapacityError.option, "wakeCapacity")
+      }
+
+      const pendingReadAuthorizationError = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layerTrusted({
+          ...serverHistory,
+          definition: Domain.definition,
+          maximumPendingReadAuthorizations: 0
+        }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(database())
+        )
+      ).pipe(Effect.flip)
+      assert.strictEqual(pendingReadAuthorizationError._tag, "InvalidConfiguration")
+      if (pendingReadAuthorizationError._tag === "InvalidConfiguration") {
+        assert.strictEqual(pendingReadAuthorizationError.option, "maximumPendingReadAuthorizations")
       }
 
       const server = yield* service(ServerStore.ServerStore, serverLayer())

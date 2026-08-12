@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Stream from "effect/Stream"
@@ -36,6 +37,11 @@ const membershipIncarnation = Identity.MembershipIncarnation.make(
 const scope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const history = {
+  wakeCapacity: 16,
+  maximumWatchersPerSpace: 1_024,
+  maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
+  readAuthorizationCacheCapacity: 4_096,
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,
@@ -294,35 +300,14 @@ describe("scoped replication", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
-  it.effect("does not wake for hidden mutations and emits a periodic revocation hint", () =>
+  it.effect("emits a periodic revocation hint", () =>
     Effect.scoped(
       Effect.gen(function*() {
-        const hiddenChecks = yield* Ref.make(0)
-        const secondHiddenStarted = yield* Deferred.make<void>()
-        const releaseSecondHidden = yield* Deferred.make<void>()
-        const thirdHiddenStarted = yield* Deferred.make<void>()
-        const hiddenWakeCount = yield* Ref.make(0)
-        const server = yield* service(
-          ServerStore.ServerStore,
-          makeServer((input) => {
-            if (input._tag === "Entity" && input.entity.key === "private") {
-              return Effect.gen(function*() {
-                const check = yield* Ref.updateAndGet(hiddenChecks, (count) => count + 1)
-                if (check === 2) {
-                  yield* Deferred.succeed(secondHiddenStarted, undefined)
-                  yield* Deferred.await(releaseSecondHidden)
-                }
-                if (check === 3) yield* Deferred.succeed(thirdHiddenStarted, undefined)
-                return yield* Effect.fail("private")
-              })
-            }
-            return Effect.void
-          })
-        )
+        const server = yield* service(ServerStore.ServerStore, makeServer())
         const initial = yield* server.pullAuthorized(pullRequest(), "reader")
         if (!("_tag" in initial)) assert.fail("expected scoped bootstrap")
         yield* server.bootstrapAuthorized(bootstrapRequest(initial.manifest), "reader")
-        const firstWake = yield* Deferred.make<void>()
+        const wakes = yield* Queue.unbounded<Protocol.Wake>()
         const watcher = yield* server.watchAuthorized(
           Protocol.WatchRequest.make({
             spaceId,
@@ -336,57 +321,18 @@ describe("scoped replication", () => {
         ).pipe(
           Effect.map((stream) =>
             stream.pipe(
-              Stream.tap(() =>
-                Ref.updateAndGet(hiddenWakeCount, (count) => count + 1).pipe(
-                  Effect.flatMap((count) => {
-                    if (count === 1) return Deferred.succeed(firstWake, undefined)
-                    return Effect.void
-                  })
-                )
-              ),
-              Stream.runDrain
+              Stream.runForEach((wake) => Queue.offer(wakes, wake))
             )
           ),
           Effect.flatMap(Effect.forkChild({ startImmediately: true }))
         )
-        yield* Deferred.await(firstWake)
-        yield* server.submit(yield* envelope("private", 1))
-        yield* server.submit(yield* envelope("private", 2, "second"))
-        yield* Deferred.await(secondHiddenStarted)
-        assert.strictEqual(yield* Ref.get(hiddenWakeCount), 1)
-        yield* Deferred.succeed(releaseSecondHidden, undefined)
-        yield* server.submit(yield* envelope("private", 3, "third"))
-        yield* Deferred.await(thirdHiddenStarted)
-        assert.strictEqual(yield* Ref.get(hiddenWakeCount), 1)
-        yield* Fiber.interrupt(watcher)
-
-        const periodicFirstWake = yield* Deferred.make<void>()
-        const periodicWatcher = yield* server.watchAuthorized(
-          Protocol.WatchRequest.make({
-            spaceId,
-            clientId: readerId,
-            schema: Domain.definition.schemaIdentity,
-            scope,
-            scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
-            cursor: initial.manifest.cursor
-          }),
-          "reader"
-        ).pipe(
-          Effect.map((stream) =>
-            stream.pipe(
-              Stream.tap(() => Deferred.succeed(periodicFirstWake, undefined)),
-              Stream.take(2),
-              Stream.runCollect
-            )
-          ),
-          Effect.flatMap(Effect.forkChild({ startImmediately: true }))
+        assert.deepStrictEqual(yield* Queue.take(wakes), { spaceId })
+        const periodicWake = yield* Queue.take(wakes).pipe(
+          Effect.forkChild({ startImmediately: true })
         )
-        yield* Deferred.await(periodicFirstWake)
         yield* TestClock.adjust("1 second")
-        const wakes = yield* Fiber.join(periodicWatcher)
-        assert.strictEqual(wakes.length, 2)
-        assert.deepStrictEqual(wakes[0], { spaceId })
-        assert.deepStrictEqual(wakes[1], { spaceId })
+        assert.deepStrictEqual(yield* Fiber.join(periodicWake), { spaceId })
+        yield* Fiber.interrupt(watcher)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
