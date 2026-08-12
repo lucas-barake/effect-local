@@ -19,6 +19,7 @@ import * as FileSystem from "effect/FileSystem"
 import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
@@ -164,6 +165,84 @@ const clientServices = (id: Identity.ClientId, server: ServerStore.Service) => {
 }
 
 describe("server reconciled mutation log", () => {
+  it.effect("does not scale SQL writes or transactions with watcher fanout", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const actualSql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
+          Effect.provide(Reactivity.layer)
+        )
+        const transactionCalls = yield* Ref.make(0)
+        const observedSql = new Proxy(actualSql, {
+          get: (target, property, receiver) => {
+            if (property !== "withTransaction") return Reflect.get(target, property, receiver)
+            return <R, E, A,>(effect: Effect.Effect<A, E, R>) =>
+              Ref.update(transactionCalls, (count) => count + 1).pipe(
+                Effect.andThen(target.withTransaction(effect))
+              )
+          }
+        })
+        const infrastructure = Layer.mergeAll(
+          Layer.succeed(SqlClient.SqlClient, observedSql),
+          NodeCrypto.layer,
+          Reactivity.layer
+        )
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(infrastructure)
+          )
+        )
+        yield* observedSql`CREATE TABLE space_update_probe (count INTEGER NOT NULL)`
+        yield* observedSql`CREATE TRIGGER count_space_updates AFTER UPDATE ON effect_local_server_spaces
+          BEGIN INSERT INTO space_update_probe (count) VALUES (1); END`
+        const countUpdates = SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: Schema.Struct({ count: Schema.Number }),
+          execute: () => observedSql`SELECT COUNT(*) AS count FROM space_update_probe`
+        })
+        const submit = (localSequence: number) =>
+          envelope(
+            Domain.PutTodo.name,
+            Domain.todo(`fanout-${localSequence}`),
+            localSequence,
+            Identity.MutationId.make(
+              `mut_00000000-0000-4000-8020-${String(localSequence).padStart(12, "0")}`
+            )
+          ).pipe(Effect.flatMap(server.submit))
+
+        assert.strictEqual((yield* submit(1))._tag, "Accepted")
+        yield* Ref.set(transactionCalls, 0)
+        yield* observedSql`DELETE FROM space_update_probe`
+        assert.strictEqual((yield* submit(2))._tag, "Accepted")
+        const baselineTransactions = yield* Ref.get(transactionCalls)
+        const baselineUpdates = (yield* countUpdates(undefined)).count
+
+        const watcherQueues = yield* Effect.forEach(
+          Array.from({ length: 4 }),
+          () => Queue.unbounded<Protocol.Wake>()
+        )
+        const watchers = yield* Effect.forEach(watcherQueues, (queue) =>
+          server.watch(spaceId).pipe(
+            Stream.runForEach((wake) => Queue.offer(queue, wake)),
+            Effect.forkChild({ startImmediately: true })
+          ))
+        yield* Effect.forEach(watcherQueues, Queue.take)
+        yield* Ref.set(transactionCalls, 0)
+        yield* observedSql`DELETE FROM space_update_probe`
+
+        assert.strictEqual((yield* submit(3))._tag, "Accepted")
+        const wakes = yield* Effect.forEach(watcherQueues, Queue.take)
+        assert.deepStrictEqual(
+          wakes.map((wake) => wake.sequence),
+          Array.from({ length: 4 }, () => Identity.ServerSequence.make(3))
+        )
+        assert.strictEqual(yield* Ref.get(transactionCalls), baselineTransactions)
+        assert.strictEqual((yield* countUpdates(undefined)).count, baselineUpdates)
+        yield* Effect.forEach(watchers, Fiber.interrupt)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("classifies malformed visible rows during index maintenance as storage corruption", () =>
     Effect.scoped(Effect.gen(function*() {
       const clientDatabase = database()

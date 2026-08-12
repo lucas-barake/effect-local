@@ -14,7 +14,6 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
-import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as Entity from "effect/unstable/cluster/Entity"
@@ -209,13 +208,12 @@ describe("SpaceEntity", () => {
       Effect.provide(NodeCrypto.layer)
     ))
 
-  it.effect("serializes bootstrap page work through the entity concurrency limit", () =>
+  it.effect("completes Submit while a Bootstrap page is paused", () =>
     Effect.gen(function*() {
       const actual = yield* Effect.provide(ServerStore.ServerStore, store)
       const firstEntered = yield* Deferred.make<void>()
-      const secondEntered = yield* Deferred.make<void>()
       const releaseFirst = yield* Deferred.make<void>()
-      const calls = yield* Ref.make(0)
+      const submitCompleted = yield* Deferred.make<Protocol.Receipt>()
       const snapshotId = Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000001")
       const page = Protocol.BootstrapPage.make({
         manifest: {
@@ -235,15 +233,14 @@ describe("SpaceEntity", () => {
       })
       const wrapped = ServerStore.ServerStore.of({
         ...actual,
+        admit: (request, principal) =>
+          actual.admit(request, principal).pipe(
+            Effect.tap((receipt) => Deferred.succeed(submitCompleted, receipt))
+          ),
         bootstrapAuthorized: () =>
           Effect.gen(function*() {
-            const call = yield* Ref.getAndUpdate(calls, (count) => count + 1)
-            if (call === 0) {
-              yield* Deferred.succeed(firstEntered, undefined)
-              yield* Deferred.await(releaseFirst)
-            } else {
-              yield* Deferred.succeed(secondEntered, undefined)
-            }
+            yield* Deferred.succeed(firstEntered, undefined)
+            yield* Deferred.await(releaseFirst)
             return page
           })
       })
@@ -264,16 +261,20 @@ describe("SpaceEntity", () => {
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(firstEntered)
-      const second = yield* client.Bootstrap({ request, principal: null }).pipe(
+      const submitted = yield* envelope(spaceA)
+      const submit = yield* client.Submit({
+        request: { envelope: submitted, schema: definition.schemaIdentity },
+        principal: null
+      }).pipe(
         Effect.forkChild({ startImmediately: true })
       )
       yield* Effect.yieldNow
 
-      assert.isFalse(yield* Deferred.isDone(secondEntered))
+      assert.isTrue(yield* Deferred.isDone(submitCompleted))
+      assert.strictEqual((yield* Deferred.await(submitCompleted))._tag, "Accepted")
       yield* Deferred.succeed(releaseFirst, undefined)
       yield* Fiber.join(first)
-      yield* Fiber.join(second)
-      assert.isTrue(yield* Deferred.isDone(secondEntered))
+      yield* Fiber.join(submit)
     }).pipe(
       Effect.provide(shardingConfig),
       Effect.provide(NodeCrypto.layer)
