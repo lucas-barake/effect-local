@@ -5,12 +5,17 @@ import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
+import * as FaultInjection from "@lucas-barake/effect-local-test/FaultInjection"
+import * as TestReplica from "@lucas-barake/effect-local-test/TestReplica"
+import * as TestServer from "@lucas-barake/effect-local-test/TestServer"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -149,10 +154,32 @@ const replica = SqlReplica.layer({
   Layer.provide(handlers)
 )
 
+const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) => {
+  const faults = FaultInjection.layer.pipe(
+    Layer.tap((context) => Deferred.succeed(faultsReady, Context.get(context, FaultInjection.FaultInjection)))
+  )
+  const faultedSync = TestServer.layer.pipe(
+    Layer.provide(server),
+    Layer.provide(faults)
+  )
+  return TestReplica.layer({
+    ...clientHistory,
+    definition,
+    initialSpaces: [spaceId],
+    clientId,
+    retryDelay: "10 millis"
+  }).pipe(
+    Layer.provide(faultedSync),
+    Layer.provide(database),
+    Layer.provide(handlers)
+  )
+}
+
 describe("Replica Atom graph", () => {
   it.effect("reacts to pending mutation submission and settlement", () =>
     Effect.scoped(Effect.gen(function*() {
-      const graph = BrowserReplica.make(replica)
+      const faultsReady = yield* Deferred.make<FaultInjection.Service>()
+      const graph = BrowserReplica.make(faultedReplica(faultsReady))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const pending = graph.pendingFor(spaceId, PutTodo)
@@ -166,28 +193,35 @@ describe("Replica Atom graph", () => {
         })
       )
       assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, pending), [])
+      const faults = yield* Deferred.await(faultsReady)
 
       const id = `pending-atom-${Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")}`
-      const observed = yield* AtomRegistry.toStreamResult(registry, pending).pipe(
-        Stream.filter((items) => items.some((item) => item.payload.id === id)),
+      yield* faults.holdNextReceipt(spaceId)
+      const submitted = yield* AtomRegistry.toStreamResult(registry, pending).pipe(
+        Stream.filter((items) =>
+          items.some((item) => item.payload.id === id && item.submissionState === "Submitting" && item.attempts > 0)
+        ),
         Stream.runHead,
-        Effect.forkChild({ startImmediately: true })
+        Effect.forkScoped({ startImmediately: true })
       )
-      yield* Effect.yieldNow
       registry.set(mutation, { id, title: "0-pending" })
-      const pendingItems = Option.getOrThrow(yield* Fiber.join(observed))
+      yield* faults.awaitReceiptCommitted(spaceId)
+      const pendingItems = Option.getOrThrow(yield* Fiber.join(submitted))
       const item = pendingItems.find((candidate) => candidate.payload.id === id)
       assert.isDefined(item)
       assert.deepStrictEqual(item.payload, { id, title: "0-pending" })
-      assert.isAtLeast(item.attempts, 0)
+      assert.strictEqual(item.submissionState, "Submitting")
+      assert.strictEqual(item.attempts, 1)
 
-      const settled = Option.getOrThrow(
-        yield* AtomRegistry.toStreamResult(registry, pending).pipe(
-          Stream.filter((items) => !items.some((candidate) => candidate.payload.id === id)),
-          Stream.runHead
-        )
+      const settled = yield* AtomRegistry.toStreamResult(registry, pending).pipe(
+        Stream.filter((items) => !items.some((candidate) => candidate.payload.id === id)),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
       )
-      assert.isFalse(settled.some((candidate) => candidate.payload.id === id))
+      yield* faults.releaseHeldReceipt(spaceId)
+      yield* faults.awaitReceiptReturned(spaceId)
+      const settledItems = Option.getOrThrow(yield* Fiber.join(settled))
+      assert.isFalse(settledItems.some((candidate) => candidate.payload.id === id))
     })))
 
   it.live("reruns only an indexed query whose result range can change", () =>

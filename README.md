@@ -265,10 +265,12 @@ SQLite tables used by the in memory composition.
 contains only failures from that local run. Use `space.pending` to inspect every in flight mutation, including its
 decoded payload, submission state, and attempt count. Use `space.pendingFor(PutTask)` when the mutation specific type
 matters. `space.settlements` is a bounded live Stream of terminal `{ pending, receipt }` values. A current subscriber
-receives each accepted or rejected settlement once after rollback and pending replay have completed. The Stream has no
+receives each terminal settlement once after rollback and pending replay have completed. The Stream has no
 history. Durable recovery remains `space.receipt(PutTask, mutationId)`. Mutation rejections from either surface are
 decoded through `PutTask.rejectionSchema`; authorization, capacity, legacy, and quarantine rejections remain distinct
-origin tagged JSON branches.
+origin tagged JSON branches. `settlementCapacity` bounds each space's live feed. A subscriber that does not keep up
+backpressures settlement delivery and reconciliation, but never the local `mutate` commit. Leaving the space or closing
+the replica scope shuts down its settlement Stream.
 
 Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect Workflow. Supply
 `ClusterWorkflowEngine.layer` and the official runner Layer separately. For one SQLite owner this is normally

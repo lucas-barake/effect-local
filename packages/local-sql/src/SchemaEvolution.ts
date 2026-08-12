@@ -104,7 +104,8 @@ const PendingBatchRow = Schema.Struct({
   optimistic_result_json: Schema.String,
   changes_json: Schema.String,
   submission_state: Protocol.SubmissionState,
-  attempt_count: NonNegativeInt
+  attempt_count: NonNegativeInt,
+  receipt_count: NonNegativeInt
 })
 
 const SequenceBytesRow = Schema.Struct({
@@ -719,9 +720,13 @@ export const client = (options: ClientOptions) =>
       execute: ({ generation, after, limit }) =>
         sql`SELECT membership_incarnation, mutation_id, local_sequence, basis, name, payload_json, digest,
         digest_version, source_schema_version, source_schema_hash, mutation_version,
-        optimistic_result_json, changes_json, submission_state, attempt_count FROM effect_local_client_pending_data
-        WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
-          AND local_sequence > ${after}
+        optimistic_result_json, changes_json, submission_state, attempt_count,
+        (SELECT COUNT(*) FROM effect_local_client_receipts_data AS r
+          WHERE r.space_id = p.space_id AND r.schema_generation = p.schema_generation
+            AND r.mutation_id = p.mutation_id) AS receipt_count
+        FROM effect_local_client_pending_data AS p
+        WHERE p.space_id = ${options.spaceId} AND p.schema_generation = ${generation}
+          AND p.local_sequence > ${after}
         ORDER BY local_sequence LIMIT ${limit}`
     })
     const pendingMetadata = SqlSchema.findAll({
@@ -1057,9 +1062,51 @@ export const client = (options: ClientOptions) =>
                 )
               )
             }
+            const migratedHistoricalChanges: Array<Protocol.EntityChange> = []
             for (const change of historicalChanges) {
               const migrated = yield* migrateEntityChange(options.evolution, source, change)
               yield* registerLineage(change.entity.model, migrated)
+              const entity = {
+                model: change.entity.model,
+                modelVersion: migrated.modelVersion,
+                key: migrated.key
+              }
+              if (change._tag === "Delete") {
+                migratedHistoricalChanges.push(Protocol.Delete.make({ entity }))
+              } else {
+                if (migrated.value === undefined) {
+                  return yield* new ReplicaError.StorageCorrupt({
+                    message: `Migrated pending upsert for ${change.entity.model} has no value`
+                  })
+                }
+                migratedHistoricalChanges.push(Protocol.Upsert.make({ entity, value: migrated.value }))
+              }
+            }
+            if (row.submission_state === "AwaitingReceipt" || row.receipt_count > 0) {
+              const sourceMutation = definition.mutationByName.get(envelope.name)
+              if (sourceMutation === undefined) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Pending mutation references unknown mutation ${envelope.name}`
+                })
+              }
+              const optimisticResult = yield* Evolution.migrateMutationSuccess({
+                evolution: options.evolution,
+                source,
+                mutation: envelope.name,
+                mutationVersion: sourceMutation.version,
+                value: yield* decodeJson(Schema.Json, row.optimistic_result_json)
+              })
+              yield* sql`INSERT INTO effect_local_client_pending_data
+                (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, basis, name,
+                  payload_json, digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
+                  optimistic_result_json, changes_json, submission_state, attempt_count)
+                VALUES (${options.spaceId}, ${state.generation}, ${envelope.membershipIncarnation},
+                  ${envelope.mutationId}, ${envelope.localSequence}, ${envelope.basis},
+                  ${envelope.name}, ${yield* Codec.stringify(envelope.payload)}, ${envelope.digest},
+                  ${envelope.digestVersion}, ${envelope.sourceSchema.version}, ${envelope.sourceSchema.hash},
+                  ${envelope.mutationVersion}, ${yield* Codec.stringify(optimisticResult.value)},
+                  ${yield* Codec.stringify(migratedHistoricalChanges)}, ${row.submission_state}, ${row.attempt_count})`
+              continue
             }
             const changes: Array<Protocol.EntityChange> = []
             const executed = yield* sql.withTransaction(

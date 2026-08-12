@@ -16,6 +16,7 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Context from "effect/Context"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
@@ -109,6 +110,21 @@ const makeServices = Effect.gen(function*() {
 })
 
 describe("test synchronization faults", () => {
+  it.effect("routes synchronization events without stealing another space's event", () =>
+    Effect.gen(function*() {
+      const { faults } = yield* makeServices
+      yield* faults.emit({ _tag: "RequestRejectedOffline", spaceId: secondSpaceId })
+      yield* faults.emit({ _tag: "RequestRejectedOffline", spaceId })
+
+      assert.strictEqual((yield* faults.awaitRequestRejectedOffline(spaceId)).spaceId, spaceId)
+      const second = yield* faults.awaitRequestRejectedOffline(secondSpaceId).pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* TestClock.adjust("1 second")
+      assert.strictEqual(Option.getOrThrow(yield* Fiber.join(second)).spaceId, secondSpaceId)
+    }))
+
   it.effect("partitions and consumes one-shot faults by space", () =>
     Effect.gen(function*() {
       const { faults } = yield* makeServices

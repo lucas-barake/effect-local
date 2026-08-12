@@ -82,7 +82,9 @@ export interface Space {
     mutation: M
   ) => Effect.Effect<ReadonlyArray<PendingMutation<M>>, ReplicaError.ReplicaError>
   readonly settlements: Stream.Stream<MutationSettlement>
-  readonly settlementsFor: <M extends Mutation.Any,>(mutation: M) => Stream.Stream<MutationSettlement<M>>
+  readonly settlementsFor: <M extends Mutation.Any,>(
+    mutation: M
+  ) => Stream.Stream<MutationSettlement<M>, ReplicaError.ReplicaError>
   readonly quarantine: Effect.Effect<ReadonlyArray<Quarantine.QuarantinedMutation>, ReplicaError.ReplicaError>
   readonly discardQuarantined: (
     mutationId: Identity.MutationId

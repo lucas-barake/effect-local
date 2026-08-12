@@ -23,6 +23,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as LocalStore from "./LocalStore.js"
@@ -282,19 +283,24 @@ const makeLayer = <D extends Definition.Any, R,>(
               receipt: (mutation, mutationId) => admit(local.receiptFor(mutation, mutationId)),
               pending: admit(local.pending),
               pendingFor: (mutation) =>
-                admit(local.pending).pipe(
-                  Effect.map((pending) =>
-                    pending.flatMap((item) => {
-                      if (item.envelope.name !== mutation.name) return []
-                      return [{ ...item } satisfies Replica.PendingMutation<typeof mutation>]
-                    })
-                  )
-                ),
+                admit(MutationDescriptor.validate(options.definition, mutation).pipe(Effect.andThen(local.pending)))
+                  .pipe(
+                    Effect.map((pending) =>
+                      pending.flatMap((item) => {
+                        if (item.envelope.name !== mutation.name) return []
+                        return [{ ...item } satisfies Replica.PendingMutation<typeof mutation>]
+                      })
+                    )
+                  ),
               settlements: local.settlements,
               settlementsFor: (mutation) =>
-                Stream.filter(
-                  local.settlements,
-                  (settlement) => settlement.pending.envelope.name === mutation.name
+                Stream.fromEffect(admit(MutationDescriptor.validate(options.definition, mutation))).pipe(
+                  Stream.flatMap(() =>
+                    Stream.filter(
+                      local.settlements,
+                      (settlement) => settlement.pending.envelope.name === mutation.name
+                    )
+                  )
                 ),
               quarantine: admit(local.quarantine),
               discardQuarantined: (mutationId) => admit(discardQuarantined(mutationId)),
@@ -427,29 +433,32 @@ const makeLayer = <D extends Definition.Any, R,>(
               yield* restore(Deferred.await(decision.completion))
               return yield* Effect.void
             }
-            let scopeClosed = false
-            const result = yield* restore(decision.entry.operationGate.withPermit(
-              decision.entry.interruptReconciliation.pipe(
-                Effect.andThen(Effect.uninterruptible(
-                  Scope.close(decision.entry.scope, Exit.void).pipe(
-                    Effect.andThen(Effect.sync(() => {
-                      scopeClosed = true
-                    }))
-                  )
-                )),
-                Effect.andThen(evictMembership(spaceId))
-              )
-            )).pipe(Effect.exit)
-            if (result._tag === "Success") {
-              entries.delete(spaceId)
-              yield* Deferred.succeed(decision.completion, undefined)
-              yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
-              return yield* Effect.void
-            }
-            if (scopeClosed) entries.delete(spaceId)
-            else entries.set(spaceId, decision.entry)
-            yield* Deferred.done(decision.completion, result)
-            return yield* result
+            yield* decision.entry.local.shutdownSettlements
+            yield* Effect.gen(function*() {
+              let scopeClosed = false
+              const result = yield* decision.entry.operationGate.withPermit(
+                decision.entry.interruptReconciliation.pipe(
+                  Effect.andThen(Effect.uninterruptible(
+                    Scope.close(decision.entry.scope, Exit.void).pipe(
+                      Effect.andThen(Effect.sync(() => {
+                        scopeClosed = true
+                      }))
+                    )
+                  )),
+                  Effect.andThen(evictMembership(spaceId))
+                )
+              ).pipe(Effect.exit)
+              if (result._tag === "Success") {
+                entries.delete(spaceId)
+                yield* Deferred.succeed(decision.completion, undefined)
+                yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
+                return
+              }
+              if (scopeClosed) entries.delete(spaceId)
+              else entries.set(spaceId, decision.entry)
+              yield* Deferred.done(decision.completion, result)
+            }).pipe(Effect.forkIn(parentScope, { startImmediately: true }))
+            return yield* restore(Deferred.await(decision.completion))
           })
         )
 

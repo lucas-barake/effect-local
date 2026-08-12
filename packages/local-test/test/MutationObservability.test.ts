@@ -16,7 +16,7 @@ import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
-import * as Ref from "effect/Ref"
+import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
@@ -129,10 +129,10 @@ const makeServices = Effect.gen(function*() {
   return { faults, replica }
 })
 
-const subscribe = <A,>(stream: Stream.Stream<A>) =>
+const subscribe = <A, E,>(stream: Stream.Stream<A, E>) =>
   stream.pipe(
     Stream.runHead,
-    Effect.forkChild({ startImmediately: true })
+    Effect.forkScoped({ startImmediately: true })
   )
 
 describe("mutation observability", () => {
@@ -160,30 +160,21 @@ describe("mutation observability", () => {
     Effect.gen(function*() {
       const { faults, replica } = yield* makeServices
       const space = yield* replica.space(spaceId)
-      const received = yield* Ref.make<Array<Replica.MutationSettlement<typeof PutTodo>>>([])
-      let targetMutationId: Identity.MutationId | undefined
-      const firstSettlement = yield* Deferred.make<void>()
-      const collector = yield* space.settlementsFor(PutTodo).pipe(
-        Stream.runForEach((settlement) =>
-          Effect.gen(function*() {
-            yield* Ref.update(received, (values) => [...values, settlement])
-            if (settlement.pending.envelope.mutationId === targetMutationId) {
-              yield* Deferred.succeed(firstSettlement, undefined)
-            }
-          })
-        ),
-        Effect.forkChild({ startImmediately: true })
-      )
+      const firstCollector = yield* Stream.toQueue(space.settlementsFor(PutTodo), { capacity: "unbounded" })
+      const secondCollector = yield* Stream.toQueue(space.settlementsFor(PutTodo), { capacity: "unbounded" })
       yield* faults.withholdPullEvidence(spaceId)
       yield* faults.dropNextReceipt(spaceId)
 
       const pending = yield* space.mutate(PutTodo, { id: "duplicate", title: "once" })
-      targetMutationId = pending.envelope.mutationId
-      yield* faults.awaitReceiptDropped(spaceId)
+      const firstCommitted = yield* faults.awaitReceiptCommitted(spaceId)
+      const dropped = yield* faults.awaitReceiptDropped(spaceId)
+      assert.strictEqual(firstCommitted.receipt.mutationId, pending.envelope.mutationId)
+      assert.strictEqual(dropped.receipt.mutationId, pending.envelope.mutationId)
       yield* faults.holdNextReceipt(spaceId)
       yield* TestClock.adjust("1 millis")
-      yield* faults.awaitReceiptCommitted(spaceId)
-      yield* space.mutate(PutTodo, { id: "trigger", title: "next reconciliation" })
+      const secondCommitted = yield* faults.awaitReceiptCommitted(spaceId)
+      assert.deepStrictEqual(secondCommitted.receipt, firstCommitted.receipt)
+      const barrier = yield* space.mutate(PutTodo, { id: "trigger", title: "next reconciliation" })
       yield* faults.partitionAfterNextReceipt(spaceId)
       yield* faults.releaseHeldReceipt(spaceId)
       const firstReturned = yield* faults.awaitReceiptReturned(spaceId)
@@ -196,15 +187,28 @@ describe("mutation observability", () => {
       assert.deepStrictEqual(duplicateReturned.receipt, firstReturned.receipt)
       yield* faults.releasePullEvidence(spaceId)
       yield* faults.awaitPullCompletedAfterReceipt(spaceId)
-      yield* Deferred.await(firstSettlement)
 
-      assert.lengthOf(
-        (yield* Ref.get(received)).filter(
-          (settlement) => settlement.pending.envelope.mutationId === pending.envelope.mutationId
-        ),
-        1
-      )
-      yield* Fiber.interrupt(collector)
+      const collectThroughBarrier = (collector: typeof firstCollector) =>
+        Effect.gen(function*() {
+          const settlements: Array<Replica.MutationSettlement<typeof PutTodo>> = []
+          while (true) {
+            const settlement = yield* Queue.take(collector)
+            settlements.push(settlement)
+            if (settlement.pending.envelope.mutationId === barrier.envelope.mutationId) return settlements
+          }
+        })
+      const received = yield* Effect.all([
+        collectThroughBarrier(firstCollector),
+        collectThroughBarrier(secondCollector)
+      ], { concurrency: "unbounded" })
+      for (const settlements of received) {
+        assert.lengthOf(
+          settlements.filter(
+            (settlement) => settlement.pending.envelope.mutationId === pending.envelope.mutationId
+          ),
+          1
+        )
+      }
     }))
 
   it.effect("publishes rejection only after rollback and later pending replay", () =>
@@ -216,14 +220,14 @@ describe("mutation observability", () => {
         readonly rejected: Option.Option<typeof Todo.schema.Type>
         readonly later: Option.Option<typeof Todo.schema.Type>
       }>()
-      const collector = yield* space.settlementsFor(RejectTodo).pipe(
+      yield* space.settlementsFor(RejectTodo).pipe(
         Stream.runForEach(() =>
           Effect.all([
             space.get(Todo, "rejected"),
             space.get(Todo, "later")
           ]).pipe(Effect.flatMap(([rejected, later]) => Deferred.succeed(observed, { rejected, later })))
         ),
-        Effect.forkChild({ startImmediately: true })
+        Effect.forkScoped({ startImmediately: true })
       )
 
       yield* space.mutate(RejectTodo, { id: "rejected", title: "rolled back" })
@@ -234,6 +238,5 @@ describe("mutation observability", () => {
       const state = yield* Deferred.await(observed)
       assert.isTrue(Option.isNone(state.rejected))
       assert.deepStrictEqual(Option.getOrThrow(state.later), { id: "later", title: "replayed" })
-      yield* Fiber.interrupt(collector)
     }))
 })
