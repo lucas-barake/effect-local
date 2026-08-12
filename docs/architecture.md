@@ -2,7 +2,7 @@
 
 Effect Local has two authority domains.
 
-The client owns local availability. It assigns `(spaceId, clientId, localSequence)`, generates an immutable
+The client owns local availability. It assigns `(spaceId, clientId, membershipIncarnation, localSequence)`, generates an immutable
 `mutationId`, computes a digest over the canonical envelope, executes the mutation optimistically, and commits the
 pending mutation plus visible writes to SQLite. None of those steps require the server.
 
@@ -12,7 +12,8 @@ terminal receipt. Accepted mutations alone receive the next dense server sequenc
 
 ## State model
 
-Client SQLite contains:
+Client SQLite contains one durable `clientId` plus a membership row for every joined space. All remaining client rows
+are partitioned by `space_id`. Each membership contains:
 
 - replica identity, definition hash, next local sequence, server cursor, visible revision, and requested and completed
   reconciliation generations
@@ -28,7 +29,7 @@ Server SQL contains:
 
 - a definition hash, accepted and terminal sequence heads, retained floors, exact row counters, and snapshot pointer per
   space
-- a last processed and expired local sequence per `(spaceId, clientId)`
+- a last processed and expired local sequence per `(spaceId, clientId, membershipIncarnation)`
 - retained immutable receipts keyed by both mutation identity and client sequence
 - a retained dense accepted suffix keyed by server sequence
 - authoritative materialized entities with exact snapshot byte accounting
@@ -74,7 +75,8 @@ environment dependent decisions belong in the payload or admission policy. A han
 
 Mutation identity and accepted order are separate.
 
-- `(spaceId, clientId, localSequence)` provides a monotonic client session order.
+- `(spaceId, clientId, membershipIncarnation, localSequence)` provides a monotonic membership order.
+- `membershipIncarnation` allows a fully evicted space to rejoin with a fresh local sequence without reusing server lineage.
 - `mutationId` provides a stable random retry identity.
 - `digest` rejects reuse of either identity with different bytes.
 - `basis` records the accepted cursor observed when the mutation was created.
@@ -88,7 +90,7 @@ watermark returns `Expired` bound to a published snapshot fence and never execut
 
 Public capabilities are `Context.Service` values. Implementations are scoped Layers. SQL transactions and errors stay
 in Effects. Callers select either the lightweight in memory reconciliation Layer or the finite Workflow Layer. The
-Workflow payload contains only definition, space, client, and generation identity. Activities call the same
+Workflow payload contains only definition, space, client, membership incarnation, and generation identity. Activities call the same
 idempotent reconciliation operation as the in memory scheduler.
 
 The server front door is an authenticated WebSocket RPC facade. It routes submit, pull, watch, presence publish, and
@@ -108,8 +110,8 @@ server SQL database must remain reachable after shard reassignment. Pod-local SQ
 placement keeps that database with its space owner.
 
 The browser graph defaults to Effect's shared `Atom.runtime`. The replica Layer and `factory.withReactivity` therefore
-share one application memo map and memoized `Reactivity` service. Entity keys invalidate exact records. Query
-dependencies invalidate once per model.
+share one application memo map and memoized `Reactivity` service. Every atom and invalidation key includes its space.
+Entity keys invalidate exact records. Query dependencies invalidate once per space and model.
 
 ## Capacity
 
@@ -117,8 +119,9 @@ Protocol limits bound a mutation, a pull page, a bootstrap page, and a presence 
 Server options set hard history, receipt, entity, snapshot byte, and bootstrap byte limits. Admission cross checks
 space counters against trigger maintained shadow counters under the lock before executing a handler and checks resulting snapshot capacity inside the handler
 savepoint. The client bounds pending mutations, retained receipts, accepted evidence, staged entities, staged bytes,
-and incoming page bytes. Server wake publication, presence publication, and in memory reconciler wakeup are bounded or
-sliding. Workflow generations coalesce durable requests. Streams and publications carry only notifications.
+and incoming page bytes. Server wake publication and presence publication are bounded or sliding. The in memory
+reconciler uses one keyed dispatcher with independent watches and turns. Workflow generations coalesce durable
+requests. Streams and publications carry only notifications.
 
 History maintenance is an explicit service lifecycle. It reads one consistent bounded materialized state, builds an
 immutable manifest in memory, then locks the space and compares both sequence heads. Only an unchanged candidate is

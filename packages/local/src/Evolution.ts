@@ -521,10 +521,8 @@ export const migrateModel = (options: {
           })
         )
       )
-      const migratedKey = yield* Effect.sync(() => {
-        if (migration?.migrateKey === undefined) return sourceKey
-        return migration.migrateKey(sourceKey)
-      })
+      let migratedKey = sourceKey
+      if (migration?.migrateKey !== undefined) migratedKey = migration.migrateKey(sourceKey)
       const targetKey = yield* Schema.decodeUnknownEffect(Schema.toType(target.key))(migratedKey).pipe(
         Effect.mapError((cause) =>
           new ReplicaError.SchemaEvolutionFailed({
@@ -580,10 +578,10 @@ export const migrateModel = (options: {
             })
           )
         )
-        const migratedValue = yield* Effect.sync(() => {
-          if (migration?.migrateValue === undefined) return sourceValue
-          return migration.migrateValue({ key: sourceKey, targetKey, value: sourceValue })
-        })
+        let migratedValue = sourceValue
+        if (migration?.migrateValue !== undefined) {
+          migratedValue = migration.migrateValue({ key: sourceKey, targetKey, value: sourceValue })
+        }
         const targetValue = yield* Schema.decodeUnknownEffect(Schema.toType(target.schema))(migratedValue).pipe(
           Effect.mapError((cause) =>
             new ReplicaError.SchemaEvolutionFailed({
@@ -712,7 +710,7 @@ const migrateMutationPart = (options: {
           })
         )
       )
-      const migrated = yield* Effect.sync(() => migrate(sourceValue))
+      const migrated = migrate(sourceValue)
       const targetValue = yield* Schema.decodeUnknownEffect(Schema.toType(toSchema))(migrated).pipe(
         Effect.mapError((cause) =>
           new ReplicaError.SchemaEvolutionFailed({

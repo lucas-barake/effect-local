@@ -8,13 +8,17 @@
 - `watch` streams wake notifications for a space
 
 The reconciler does not trust notification delivery or ordering. A notification only requests another durable
-generation. Every sync pass reads the SQLite cursor, catches up, submits pending mutations in local order, and catches
-up again. SQLite commits requested generation changes with local mutations and records completed generations
-idempotently. Each Workflow is finite, coalesces requests made while it ran, and has bounded exponential retry
-attempts. This bounds one execution's history and repairs a lost wake when the next runner starts. A terminal failure
-waits for a later local mutation or server wake to request a new generation. Completed execution retention belongs to
-the selected Workflow storage. The explicit in memory Layer uses the same sync pass with a sliding queue for
-lightweight processes and tests.
+generation for its space. Every sync pass reads that space's SQLite cursor, catches up, submits pending mutations in
+local order, and catches up again. SQLite commits requested generation changes with local mutations and records
+completed generations idempotently. The in memory composition has one dispatcher, one keyed watch per joined space,
+and one keyed turn per active space. A blocked or retrying turn cannot prevent another key from starting, and all keys
+share the same RPC protocol and physical WebSocket.
+
+Each Workflow is finite, coalesces requests made while it ran, and has bounded exponential retry attempts. Its
+identity includes the membership incarnation, so leave and rejoin cannot resume stale execution identity. This bounds
+one execution's history and repairs a lost wake when the next runner starts. A terminal failure waits for a later local
+mutation or server wake to request a new generation. Completed execution retention belongs to the selected Workflow
+storage.
 
 ## History lifecycle
 

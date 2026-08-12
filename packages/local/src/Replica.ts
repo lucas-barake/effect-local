@@ -9,7 +9,8 @@ import type * as Query from "./Query.js"
 import type * as ReplicaError from "./ReplicaError.js"
 import type * as ReplicaStatus from "./ReplicaStatus.js"
 
-export interface Service {
+export interface Space {
+  readonly spaceId: Identity.SpaceId
   readonly mutate: <M extends Mutation.Any,>(
     mutation: M,
     payload: Mutation.Payload<M>
@@ -25,7 +26,17 @@ export interface Service {
   readonly receipt: (
     mutationId: Identity.MutationId
   ) => Effect.Effect<Option.Option<Protocol.Receipt>, ReplicaError.ReplicaError>
-  readonly status: Effect.Effect<ReplicaStatus.ReplicaStatus, ReplicaError.ReplicaError>
+  readonly status: Effect.Effect<ReplicaStatus.SpaceStatus, ReplicaError.ReplicaError>
+}
+
+export interface Service {
+  readonly join: (spaceId: Identity.SpaceId) => Effect.Effect<Space, ReplicaError.ReplicaError>
+  readonly leave: (spaceId: Identity.SpaceId) => Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly spaces: Effect.Effect<ReadonlyArray<Space>, ReplicaError.ReplicaError>
+  readonly space: (
+    spaceId: Identity.SpaceId
+  ) => Effect.Effect<Space, ReplicaError.ReplicaError>
+  readonly status: Effect.Effect<ReplicaStatus.Aggregate, ReplicaError.ReplicaError>
 }
 
 export class Replica extends Context.Service<Replica, Service>()("@lucas-barake/effect-local/Replica") {}

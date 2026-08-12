@@ -37,6 +37,9 @@ import * as Domain from "./Domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const defaultMembershipIncarnation = Identity.MembershipIncarnation.make(
+  "inc_00000000-0000-4000-8000-000000000001"
+)
 const putTodoProvenance = {
   name: Domain.PutTodo.name,
   sourceSchema: Domain.definition.schemaIdentity,
@@ -47,7 +50,8 @@ const envelope = (
   name: string,
   payload: Schema.Json,
   localSequence: number,
-  mutationId: Identity.MutationId
+  mutationId: Identity.MutationId,
+  membershipIncarnation: Identity.MembershipIncarnation = defaultMembershipIncarnation
 ) =>
   Effect.gen(function*() {
     const identity = {
@@ -58,7 +62,8 @@ const envelope = (
       basis: Identity.ServerSequence.make(0),
       name,
       payload,
-      digestVersion: 2 as const,
+      digestVersion: 3 as const,
+      membershipIncarnation,
       sourceSchema: Domain.definition.schemaIdentity,
       mutationVersion: Domain.definition.mutationByName.get(name)?.version ?? Identity.SchemaVersion.make(1)
     }
@@ -317,7 +322,8 @@ describe("server reconciled mutation log", () => {
             basis: Identity.ServerSequence.make(0),
             name: Domain.PutTodo.name,
             payload: Domain.todo(`maintain-${index}`),
-            digestVersion: 2,
+            digestVersion: 3,
+            membershipIncarnation: defaultMembershipIncarnation,
             sourceSchema: Domain.definition.schemaIdentity,
             mutationVersion: Domain.PutTodo.version
           }
@@ -563,6 +569,55 @@ describe("server reconciled mutation log", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
+  it.effect("publishes one projection after a multi-page catch up", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, serverLayer())
+        for (let sequence = 1; sequence <= 4; sequence++) {
+          yield* server.submit(
+            yield* envelope(
+              Domain.PutTodo.name,
+              Domain.todo(`paged-${sequence}`),
+              sequence,
+              Identity.MutationId.make(`mut_00000000-0000-4000-8004-${String(sequence).padStart(12, "0")}`)
+            )
+          )
+        }
+
+        const databaseContext = yield* Layer.build(database())
+        const sql = Context.get(databaseContext, SqlClient.SqlClient)
+        const services = Layer.mergeAll(
+          Layer.succeed(SqlClient.SqlClient, sql),
+          Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto)),
+          Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity))
+        )
+        const localContext = yield* Layer.build(
+          LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(services)
+          )
+        )
+        const local = Context.get(localContext, LocalStore.Store)
+        yield* sql`CREATE TABLE projection_insert_probe (count INTEGER NOT NULL)`
+        yield* sql`CREATE TRIGGER projection_insert_probe_trigger
+        AFTER INSERT ON effect_local_client_visible_entities_data
+        BEGIN INSERT INTO projection_insert_probe VALUES (1); END`
+        const reconciliation = yield* service(
+          Reconciler.Reconciliation,
+          Reconciler.layerOnePass({ definition: Domain.definition, spaceId, pageSize: 1 }).pipe(
+            Layer.provide(Layer.succeed(LocalStore.Store, local)),
+            Layer.provide(directSync(server))
+          )
+        )
+
+        yield* reconciliation.sync
+
+        const copied = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM projection_insert_probe`
+        assert.strictEqual(copied[0].count, 4)
+        assert.strictEqual(yield* local.cursor, 4)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("resumes a durable bootstrap stage after reopening the client database", () =>
     Effect.scoped(
       Effect.gen(function*() {
@@ -771,8 +826,8 @@ describe("server reconciled mutation log", () => {
           Result: Schema.Struct({ receipts: Schema.Int, history: Schema.Int }),
           execute: () =>
             sql`SELECT
-              (SELECT COUNT(*) FROM effect_local_receipts) AS receipts,
-              (SELECT COUNT(*) FROM effect_local_server_log) AS history`
+              (SELECT COUNT(*) FROM effect_local_client_receipts_data WHERE space_id = ${spaceId}) AS receipts,
+              (SELECT COUNT(*) FROM effect_local_server_log WHERE space_id = ${spaceId}) AS history`
         })
         assert.deepStrictEqual(yield* countRows(undefined), { receipts: 1, history: 0 })
       }).pipe(Effect.provide(NodeCrypto.layer))
@@ -892,7 +947,8 @@ describe("server reconciled mutation log", () => {
           Domain.RenameTodo.name,
           { id: "staged-corruption", title: "new" },
           2,
-          Identity.MutationId.make("mut_00000000-0000-4000-8007-000000000002")
+          Identity.MutationId.make("mut_00000000-0000-4000-8007-000000000002"),
+          initial.envelope.membershipIncarnation
         )
         yield* server.submit(rename)
         yield* server.maintain(spaceId)
@@ -949,6 +1005,7 @@ describe("server reconciled mutation log", () => {
         yield* local.persistReceipt(Protocol.RejectedReceipt.make({
           spaceId,
           clientId,
+          membershipIncarnation: first.envelope.membershipIncarnation,
           mutationId: first.envelope.mutationId,
           localSequence: first.envelope.localSequence,
           ...putTodoProvenance,
@@ -959,6 +1016,7 @@ describe("server reconciled mutation log", () => {
         const corrupt = Protocol.RejectedReceipt.make({
           spaceId,
           clientId,
+          membershipIncarnation: second.envelope.membershipIncarnation,
           mutationId: second.envelope.mutationId,
           localSequence: second.envelope.localSequence,
           ...putTodoProvenance,
@@ -966,8 +1024,8 @@ describe("server reconciled mutation log", () => {
           terminalSequence: Identity.TerminalSequence.make(1),
           rejection: "denied"
         })
-        yield* sql`UPDATE effect_local_receipts SET receipt_json = ${Canonical.stringify(corrupt)}
-          WHERE mutation_id = ${first.envelope.mutationId}`
+        yield* sql`UPDATE effect_local_client_receipts_data SET receipt_json = ${Canonical.stringify(corrupt)}
+          WHERE space_id = ${spaceId} AND mutation_id = ${first.envelope.mutationId}`
         const authoritative = yield* envelope(
           Domain.PutTodo.name,
           Domain.todo("snapshot-receipt-identity"),
@@ -1003,6 +1061,7 @@ describe("server reconciled mutation log", () => {
         yield* local.persistReceipt(Protocol.RejectedReceipt.make({
           spaceId,
           clientId,
+          membershipIncarnation: pending.envelope.membershipIncarnation,
           mutationId: pending.envelope.mutationId,
           localSequence: pending.envelope.localSequence,
           ...putTodoProvenance,
@@ -1016,6 +1075,7 @@ describe("server reconciled mutation log", () => {
               Effect.as(Protocol.RejectedReceipt.make({
                 spaceId,
                 clientId,
+                membershipIncarnation: submitted.envelope.membershipIncarnation,
                 mutationId: submitted.envelope.mutationId,
                 localSequence: submitted.envelope.localSequence,
                 ...putTodoProvenance,
@@ -1051,9 +1111,9 @@ describe("server reconciled mutation log", () => {
       yield* Migrations.client({ definition: Domain.definition, spaceId, clientId, migration }).pipe(
         Effect.provideService(SqlClient.SqlClient, sql)
       )
-      yield* sql`UPDATE effect_local_client_meta
+      yield* sql`UPDATE effect_local_client_spaces
         SET server_cursor = 0, installed_snapshot_id = NULL, installed_snapshot_sequence = 1
-        WHERE singleton = 1`
+        WHERE space_id = ${spaceId}`
       const services = Layer.mergeAll(
         Layer.succeed(SqlClient.SqlClient, sql),
         Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto)),
@@ -1094,6 +1154,66 @@ describe("server reconciled mutation log", () => {
       assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "1")), Domain.todo("1"))
       assert.strictEqual(yield* local.cursor, 1)
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(pending.envelope.mutationId))._tag, "Accepted")
+    })))
+
+  it.effect("publishes a complete projection after bounded replay", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const clientDatabase = database()
+      const live = LocalStore.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId,
+        projectionReplayBatchSize: 1
+      }).pipe(
+        Layer.provide(runtime),
+        Layer.provide(clientDatabase)
+      )
+      const context = yield* Layer.build(Layer.merge(live, clientDatabase))
+      const local = Context.get(context, LocalStore.Store)
+      const sql = Context.get(context, SqlClient.SqlClient)
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+
+      const first = yield* local.mutate(Domain.PutTodo, Domain.todo("projection-1"))
+      yield* local.mutate(Domain.PutTodo, Domain.todo("projection-2"))
+      const receipt = yield* server.submit(first.envelope)
+      const page = incremental(
+        yield* server.pull({
+          spaceId,
+          after: Identity.ServerSequence.make(0),
+          limit: 10
+        })
+      )
+
+      yield* local.applyReceipt(receipt)
+      yield* local.applyEntries(page.entries)
+
+      const projection = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Schema.Struct({
+          active: Schema.Int,
+          replay: Schema.NullOr(Schema.Int),
+          active_rows: Schema.Int,
+          inactive_rows: Schema.Int
+        }),
+        execute: () =>
+          sql`SELECT
+          s.active_projection_generation AS active,
+          s.projection_replay_generation AS replay,
+          SUM(CASE WHEN e.projection_generation = s.active_projection_generation THEN 1 ELSE 0 END) AS active_rows,
+          SUM(CASE WHEN e.projection_generation <> s.active_projection_generation THEN 1 ELSE 0 END) AS inactive_rows
+          FROM effect_local_client_spaces AS s
+          LEFT JOIN effect_local_client_visible_entities_data AS e ON e.space_id = s.space_id
+          WHERE s.space_id = ${spaceId}`
+      })(undefined)
+      assert.strictEqual(projection.active, 1)
+      assert.isNull(projection.replay)
+      assert.strictEqual(projection.active_rows, 2)
+      assert.strictEqual(projection.inactive_rows, 0)
+      assert.deepStrictEqual(
+        Option.getOrThrow(yield* local.get(Domain.Todo, "projection-2")),
+        Domain.todo("projection-2")
+      )
     })))
 
   it.effect("rejects a first submission whose digest does not match its envelope", () =>
@@ -1491,8 +1611,8 @@ describe("server reconciled mutation log", () => {
         const local = Context.get(context, LocalStore.Store)
         const sql = Context.get(context, SqlClient.SqlClient)
         const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("digest-corrupt"))
-        yield* sql`UPDATE effect_local_pending SET digest = ${"0".repeat(64)}
-        WHERE mutation_id = ${pending.envelope.mutationId}`
+        yield* sql`UPDATE effect_local_client_pending_data SET digest = ${"0".repeat(64)}
+        WHERE space_id = ${spaceId} AND mutation_id = ${pending.envelope.mutationId}`
 
         const error = yield* local.pending.pipe(Effect.flip)
         assert.strictEqual(error._tag, "StorageCorrupt")
@@ -1516,6 +1636,7 @@ describe("server reconciled mutation log", () => {
               ...putTodoProvenance,
               spaceId,
               clientId,
+              membershipIncarnation: submitted.membershipIncarnation,
               mutationId: submitted.mutationId,
               localSequence: submitted.localSequence,
               origin: "Authorization",
@@ -1554,7 +1675,7 @@ describe("server reconciled mutation log", () => {
       const pending = yield* store.mutate(Domain.PutTodo, Domain.todo("1"))
       let invalidations = 0
       const cancel = reactivity.registerUnsafe(
-        [`effect-local:receipt:${pending.envelope.mutationId}`],
+        [`effect-local:space:${spaceId}:receipt:${pending.envelope.mutationId}`],
         () => invalidations++
       )
       yield* Effect.addFinalizer(() => Effect.sync(cancel))
@@ -1563,6 +1684,7 @@ describe("server reconciled mutation log", () => {
         ...putTodoProvenance,
         spaceId,
         clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
         mutationId: pending.envelope.mutationId,
         localSequence: pending.envelope.localSequence,
         origin: "Authorization",
@@ -1858,6 +1980,7 @@ describe("server reconciled mutation log", () => {
                   ...putTodoProvenance,
                   spaceId,
                   clientId,
+                  membershipIncarnation: submitted.membershipIncarnation,
                   mutationId: submitted.mutationId,
                   localSequence: submitted.localSequence,
                   origin: "Authorization",
@@ -1945,7 +2068,8 @@ describe("server reconciled mutation log", () => {
               localSequence: Identity.LocalSequence.make(localSequence),
               basis: Identity.ServerSequence.make(0),
               payload: Domain.todo(`${targetSpaceId}:${localSequence}`),
-              digestVersion: 2 as const,
+              digestVersion: 3 as const,
+              membershipIncarnation: defaultMembershipIncarnation,
               ...putTodoProvenance
             }
             return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
@@ -2035,7 +2159,7 @@ describe("server reconciled mutation log", () => {
         Layer.provide(pairRuntime),
         Layer.provide(pairDatabase())
       )
-      const queries = QueryExecutor.layer(definition).pipe(
+      const queries = QueryExecutor.layer(definition, spaceId).pipe(
         Layer.provide(handlers),
         Layer.provide(gate),
         Layer.provide(pairDatabase())
@@ -2068,6 +2192,7 @@ describe("server reconciled mutation log", () => {
         clientId,
         mutationId: pending.envelope.mutationId,
         localSequence: pending.envelope.localSequence,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
         origin: "Authorization",
         rejection: { reason: "wrong space" }
       }).pipe(Effect.flip)
@@ -2085,6 +2210,7 @@ describe("server reconciled mutation log", () => {
         ...putTodoProvenance,
         spaceId,
         clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
         mutationId: pending.envelope.mutationId,
         localSequence: pending.envelope.localSequence,
         serverSequence: Identity.ServerSequence.make(1),

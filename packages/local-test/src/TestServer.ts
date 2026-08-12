@@ -13,35 +13,40 @@ export const layer: Layer.Layer<SyncEngine.SyncEngine, never, ServerStore.Server
     Effect.gen(function*() {
       const server = yield* ServerStore.ServerStore
       const faults = yield* FaultInjection.FaultInjection
-      const online = faults.state.pipe(Effect.filterOrFail(
-        (state) => state.online,
-        () => new ReplicaError.ProtocolInvalid({ message: "The test network is partitioned" })
-      ))
+      const online = (spaceId: Protocol.SubmitRequest["envelope"]["spaceId"]) =>
+        faults.state(spaceId).pipe(Effect.filterOrFail(
+          (state) => state.online,
+          () => new ReplicaError.ServerUnavailable()
+        ))
       return SyncEngine.SyncEngine.of({
-        submit: (envelope) =>
+        submit: (request) =>
           Effect.gen(function*() {
-            yield* online
-            const receipt = yield* server.submit(envelope)
-            if (yield* faults.takeDroppedReceipt) {
-              return yield* new ReplicaError.ProtocolInvalid({ message: "The test network is partitioned" })
+            yield* online(request.envelope.spaceId)
+            const receipt = yield* server.submit(request)
+            if (yield* faults.takeDroppedReceipt(request.envelope.spaceId)) {
+              return yield* new ReplicaError.ServerUnavailable()
             }
             return receipt
           }),
         pull: (request) =>
           Effect.gen(function*() {
-            yield* online
+            yield* online(request.spaceId)
             const page = yield* server.pull(request)
-            if ("_tag" in page || !(yield* faults.takeDuplicatePage) || page.entries.length === 0) return page
+            if (
+              "_tag" in page ||
+              !(yield* faults.takeDuplicatePage(request.spaceId)) ||
+              page.entries.length === 0
+            ) return page
             return {
               entries: [page.entries[0], ...page.entries].slice(0, Protocol.maximumBatchEntries),
               hasMore: page.hasMore
             }
           }),
-        bootstrap: (request) => online.pipe(Effect.andThen(server.bootstrap(request))),
-        watch: (spaceId) =>
-          server.watch(spaceId).pipe(
-            Stream.filterEffect(() => faults.state.pipe(Effect.map((state) => state.online))),
-            Stream.mapError(() => new ReplicaError.ProtocolInvalid({ message: "The test network is partitioned" }))
+        bootstrap: (request) => online(request.spaceId).pipe(Effect.andThen(server.bootstrap(request))),
+        watch: (request) =>
+          server.watch(request).pipe(
+            Stream.filterEffect(() => faults.state(request.spaceId).pipe(Effect.map((state) => state.online))),
+            Stream.mapError(() => new ReplicaError.ServerUnavailable())
           )
       })
     })

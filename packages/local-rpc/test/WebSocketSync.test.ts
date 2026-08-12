@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
+import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Evolution from "@lucas-barake/effect-local/Evolution"
@@ -10,6 +11,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
@@ -25,6 +27,7 @@ import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as HttpRouter from "effect/unstable/http/HttpRouter"
 import * as HttpServer from "effect/unstable/http/HttpServer"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as Socket from "effect/unstable/socket/Socket"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "../src/Authentication.js"
 import * as PresenceClient from "../src/PresenceClient.js"
@@ -35,7 +38,8 @@ import * as SyncRpc from "../src/SyncRpc.js"
 import * as SyncServer from "../src/SyncServer.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
-const forbiddenSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
+const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
+const forbiddenSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
 
@@ -111,6 +115,15 @@ const serverHistory = {
   maintenanceSpaceBatchSize: 128,
   migration
 }
+const clientHistory = {
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  retainedHistoryEntries: 256,
+  maximumBootstrapEntities: 10_000,
+  maximumBootstrapBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: 4 * 1024 * 1024,
+  migration
+}
 
 const store = ServerStore.layer({
   ...serverHistory,
@@ -119,7 +132,8 @@ const store = ServerStore.layer({
   authorizeAccess: ({ principal, spaceId: requestedSpaceId }) => {
     if (
       principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
-      "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
+      "subject" in principal && principal.subject === "test" &&
+      (requestedSpaceId === spaceId || requestedSpaceId === secondSpaceId)
     ) {
       return Effect.void
     }
@@ -135,7 +149,8 @@ const store = ServerStore.layer({
     if (
       MutableRef.get(readAuthorized) && principal !== null && typeof principal === "object" &&
       !Array.isArray(principal) &&
-      "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
+      "subject" in principal && principal.subject === "test" &&
+      (requestedSpaceId === spaceId || requestedSpaceId === secondSpaceId)
     ) {
       return Effect.void
     }
@@ -176,12 +191,26 @@ const websocketServer = SyncServer.layer.pipe(
   Layer.provide(authenticationServer),
   Layer.provide(HttpRouter.serve(websocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
+const webSocketConstructions = MutableRef.make(0)
+const liveWebSockets = MutableRef.make(0)
+const countedConstructor = Layer.effect(
+  Socket.WebSocketConstructor,
+  Socket.WebSocketConstructor.pipe(Effect.map((makeWebSocket) => (url: string, protocols?: string | Array<string>) => {
+    MutableRef.update(webSocketConstructions, (count) => count + 1)
+    MutableRef.update(liveWebSockets, (count) => count + 1)
+    const webSocket = makeWebSocket(url, protocols)
+    webSocket.addEventListener("close", () => {
+      MutableRef.update(liveWebSockets, (count) => count - 1)
+    }, { once: true })
+    return webSocket
+  }))
+).pipe(Layer.provide(NodeSocket.layerWebSocketConstructor))
 const socket = Effect.gen(function*() {
   const server = yield* HttpServer.HttpServer
   const address = server.address
   if (address._tag === "UnixAddress") return yield* Effect.die("Expected the test HTTP server to use a TCP address")
-  return NodeSocket.layerWebSocket(`http://127.0.0.1:${address.port}/sync`)
-}).pipe(Layer.unwrap)
+  return yield* Socket.makeWebSocket(`http://127.0.0.1:${address.port}/sync`)
+}).pipe(Layer.effect(Socket.Socket), Layer.provide(countedConstructor))
 const clientProtocol = SyncClient.layerProtocolSocket().pipe(Layer.provide(socket))
 const client = Layer.merge(SyncClient.layer, PresenceClient.layer).pipe(
   Layer.provide(clientProtocol),
@@ -199,8 +228,56 @@ const live = Layer.merge(client, revokedClient).pipe(
   Layer.provideMerge(websocketServer),
   Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
 )
+const singleClientLive = client.pipe(
+  Layer.provideMerge(websocketServer),
+  Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
+)
 
 describe("WebSocket synchronization", () => {
+  it.effect("multiplexes two Replica spaces through exactly one WebSocket", () =>
+    Effect.gen(function*() {
+      MutableRef.set(webSocketConstructions, 0)
+      MutableRef.set(liveWebSockets, 0)
+      const replicaContext = yield* Layer.build(
+        SqlReplica.layer({
+          ...clientHistory,
+          definition,
+          evolution,
+          clientId,
+          initialSpaces: [spaceId, secondSpaceId],
+          retryDelay: "1 millis"
+        }).pipe(
+          Layer.provide(handlers),
+          Layer.provide(database),
+          Layer.provide(singleClientLive)
+        )
+      )
+      const replica = Context.get(replicaContext, Replica.Replica)
+      const first = yield* replica.space(spaceId)
+      const second = yield* replica.space(secondSpaceId)
+      const [firstPending, secondPending] = yield* Effect.all([
+        first.mutate(PutTodo, { id: "shared", title: "first socket" }),
+        second.mutate(PutTodo, { id: "shared", title: "second socket" })
+      ], { concurrency: "unbounded" })
+      const awaitReceipt = (space: Replica.Space, id: Identity.MutationId) =>
+        Effect.gen(function*() {
+          while (true) {
+            const receipt = yield* space.receipt(id)
+            if (Option.isSome(receipt)) return receipt.value
+            yield* Effect.yieldNow
+          }
+        })
+      const [firstReceipt, secondReceipt] = yield* Effect.all([
+        awaitReceipt(first, firstPending.envelope.mutationId),
+        awaitReceipt(second, secondPending.envelope.mutationId)
+      ], { concurrency: "unbounded" })
+
+      assert.strictEqual(firstReceipt.spaceId, spaceId)
+      assert.strictEqual(secondReceipt.spaceId, secondSpaceId)
+      assert.strictEqual(MutableRef.get(webSocketConstructions), 1)
+      assert.strictEqual(MutableRef.get(liveWebSockets), 1)
+    }).pipe(Effect.provide(NodeCrypto.layer)))
+
   it.effect("delivers an authorized bounded bootstrap through both RPC hops", () =>
     Effect.gen(function*() {
       const remote = yield* SyncEngine.SyncEngine
@@ -215,7 +292,8 @@ describe("WebSocket synchronization", () => {
           basis: Identity.ServerSequence.make(0),
           name: PutTodo.name,
           payload: { id: `bootstrap-${sequence}`, title: "s".repeat(250) },
-          digestVersion: 2,
+          digestVersion: 3,
+          membershipIncarnation: Identity.legacyMembershipIncarnation,
           sourceSchema: definition.schemaIdentity,
           mutationVersion: PutTodo.version
         }
@@ -279,7 +357,8 @@ describe("WebSocket synchronization", () => {
         basis: Identity.ServerSequence.make(0),
         name: PutTodo.name,
         payload: { id: "1", title: "socket" },
-        digestVersion: 2 as const,
+        digestVersion: 3 as const,
+        membershipIncarnation: Identity.legacyMembershipIncarnation,
         sourceSchema: definition.schemaIdentity,
         mutationVersion: PutTodo.version
       }
@@ -357,7 +436,8 @@ describe("WebSocket synchronization", () => {
         basis: Identity.ServerSequence.make(0),
         name: PutTodo.name,
         payload: { id: "1", title: "socket" },
-        digestVersion: 2 as const,
+        digestVersion: 3 as const,
+        membershipIncarnation: Identity.legacyMembershipIncarnation,
         sourceSchema: definition.schemaIdentity,
         mutationVersion: PutTodo.version
       }
@@ -387,7 +467,8 @@ describe("WebSocket synchronization", () => {
         basis: Identity.ServerSequence.make(0),
         name: AssignRoleV1.name,
         payload: { account: "victim" },
-        digestVersion: 2 as const,
+        digestVersion: 3 as const,
+        membershipIncarnation: Identity.legacyMembershipIncarnation,
         sourceSchema: definitionV1.schemaIdentity,
         mutationVersion: AssignRoleV1.version
       }
@@ -436,7 +517,8 @@ describe("WebSocket synchronization", () => {
         basis: Identity.ServerSequence.make(0),
         name: ReturnHugeResult.name,
         payload: null,
-        digestVersion: 2 as const,
+        digestVersion: 3 as const,
+        membershipIncarnation: Identity.legacyMembershipIncarnation,
         sourceSchema: definition.schemaIdentity,
         mutationVersion: ReturnHugeResult.version
       }

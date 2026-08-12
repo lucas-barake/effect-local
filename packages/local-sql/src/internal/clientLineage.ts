@@ -12,7 +12,7 @@ import * as StorageUnavailable from "./storageUnavailable.js"
 
 const LineageRow = Schema.Struct({ lineage_id: Schema.String })
 
-export const make = (sql: SqlClient.SqlClient) => {
+export const make = (sql: SqlClient.SqlClient, spaceId: Identity.SpaceId) => {
   const readGroup = SqlSchema.findOneOption({
     Request: Schema.Struct({
       schemaVersion: Identity.SchemaVersion,
@@ -24,7 +24,8 @@ export const make = (sql: SqlClient.SqlClient) => {
     Result: LineageRow,
     execute: (request) =>
       sql`SELECT lineage_id FROM effect_local_client_key_lineage_groups
-      WHERE source_schema_version = ${request.schemaVersion} AND source_schema_hash = ${request.schemaHash}
+      WHERE space_id = ${spaceId} AND source_schema_version = ${request.schemaVersion}
+        AND source_schema_hash = ${request.schemaHash}
         AND source_model = ${request.model} AND source_model_version = ${request.modelVersion}
         AND source_key = ${request.key}`
   })
@@ -33,7 +34,8 @@ export const make = (sql: SqlClient.SqlClient) => {
     Result: LineageRow,
     execute: (request) =>
       sql`SELECT lineage_id FROM effect_local_client_key_lineage_targets
-      WHERE target_model = ${request.model} AND target_model_version = ${request.modelVersion}
+      WHERE space_id = ${spaceId} AND target_model = ${request.model}
+        AND target_model_version = ${request.modelVersion}
         AND target_key = ${request.key}`
   })
 
@@ -75,24 +77,27 @@ export const make = (sql: SqlClient.SqlClient) => {
       }
       for (const alias of aliases) {
         yield* sql`INSERT INTO effect_local_client_key_lineage_groups
-          (source_schema_version, source_schema_hash, source_model, source_model_version, source_key, lineage_id)
-          VALUES (${alias.schemaIdentity.version}, ${alias.schemaIdentity.hash}, ${model},
+          (space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key,
+            lineage_id)
+          VALUES (${spaceId}, ${alias.schemaIdentity.version}, ${alias.schemaIdentity.hash}, ${model},
             ${alias.modelVersion}, ${alias.key}, ${lineageId})
-          ON CONFLICT (source_schema_version, source_schema_hash, source_model, source_model_version, source_key)
+          ON CONFLICT (space_id, source_schema_version, source_schema_hash, source_model, source_model_version,
+            source_key)
           DO NOTHING`
         yield* sql`INSERT INTO effect_local_client_key_lineage
-          (source_schema_version, source_schema_hash, source_model, source_model_version, source_key,
+          (space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key,
             target_model, target_model_version, target_key)
-          VALUES (${alias.schemaIdentity.version}, ${alias.schemaIdentity.hash}, ${model},
+          VALUES (${spaceId}, ${alias.schemaIdentity.version}, ${alias.schemaIdentity.hash}, ${model},
             ${alias.modelVersion}, ${alias.key}, ${model}, ${migrated.modelVersion}, ${targetKey})
-          ON CONFLICT (source_schema_version, source_schema_hash, source_model, source_model_version, source_key)
+          ON CONFLICT (space_id, source_schema_version, source_schema_hash, source_model, source_model_version,
+            source_key)
           DO UPDATE SET target_model = excluded.target_model,
             target_model_version = excluded.target_model_version, target_key = excluded.target_key`
       }
       yield* sql`INSERT INTO effect_local_client_key_lineage_targets
-        (target_model, target_model_version, target_key, lineage_id)
-        VALUES (${model}, ${migrated.modelVersion}, ${targetKey}, ${lineageId})
-        ON CONFLICT (target_model, target_model_version, target_key) DO NOTHING`
+        (space_id, target_model, target_model_version, target_key, lineage_id)
+        VALUES (${spaceId}, ${model}, ${migrated.modelVersion}, ${targetKey}, ${lineageId})
+        ON CONFLICT (space_id, target_model, target_model_version, target_key) DO NOTHING`
       const storedTarget = yield* readTarget({
         model,
         modelVersion: migrated.modelVersion,

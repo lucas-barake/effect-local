@@ -28,6 +28,7 @@ import * as ServerStore from "../src/ServerStore.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const membershipIncarnation = Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
   retainedReceipts: 256,
@@ -126,25 +127,6 @@ const evolution = Evolution.make({
   })]
 })
 
-const legacyBaselineV1 = Evolution.legacyBaseline({
-  id: "legacy-v1",
-  hash: "1111111111111111",
-  definition: definitionV1
-})
-const evolutionWithLegacyBaseline = Evolution.make({
-  current: definitionV2,
-  steps: evolution.steps,
-  legacyBaselines: [legacyBaselineV1]
-})
-const ambiguousLegacyEvolution = Evolution.make({
-  current: definitionV2,
-  steps: evolution.steps,
-  legacyBaselines: [
-    legacyBaselineV1,
-    Evolution.legacyBaseline({ id: "legacy-v2", hash: "2222222222222222", definition: definitionV2 })
-  ]
-})
-
 const evolutionV3 = Evolution.make({
   current: definitionV3,
   steps: [
@@ -232,76 +214,13 @@ const v1Envelope = (
       basis: Identity.ServerSequence.make(0),
       name: PutTodoV1.name,
       payload,
-      digestVersion: 2 as const,
+      digestVersion: 3 as const,
+      membershipIncarnation,
       sourceSchema: definitionV1.schemaIdentity,
       mutationVersion: PutTodoV1.version
     }
     return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
   })
-
-const legacyV1Envelope = (
-  mutationId: Identity.MutationId,
-  payload: typeof TodoV1.schema.Type,
-  localSequence = 1
-) =>
-  Effect.gen(function*() {
-    const identity = {
-      spaceId,
-      clientId,
-      mutationId,
-      localSequence: Identity.LocalSequence.make(localSequence),
-      basis: Identity.ServerSequence.make(0),
-      name: PutTodoV1.name,
-      payload,
-      digestVersion: 1 as const,
-      sourceSchema: definitionV1.schemaIdentity,
-      mutationVersion: PutTodoV1.version
-    }
-    return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
-  })
-
-describe("mutation digest evolution", () => {
-  it.effect("preserves legacy digests and binds schema provenance in version 2", () =>
-    Effect.gen(function*() {
-      const common = {
-        spaceId,
-        clientId,
-        mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000201"),
-        localSequence: Identity.LocalSequence.make(1),
-        basis: Identity.ServerSequence.make(0),
-        name: PutTodoV1.name,
-        payload: { id: "1", title: "digest" }
-      }
-      const legacyV1 = yield* Protocol.mutationDigest({
-        ...common,
-        digestVersion: 1,
-        sourceSchema: definitionV1.schemaIdentity,
-        mutationVersion: PutTodoV1.version
-      })
-      const legacyV2 = yield* Protocol.mutationDigest({
-        ...common,
-        digestVersion: 1,
-        sourceSchema: definitionV2.schemaIdentity,
-        mutationVersion: PutTodoV2.version
-      })
-      const currentV1 = yield* Protocol.mutationDigest({
-        ...common,
-        digestVersion: 2,
-        sourceSchema: definitionV1.schemaIdentity,
-        mutationVersion: PutTodoV1.version
-      })
-      const currentV2 = yield* Protocol.mutationDigest({
-        ...common,
-        digestVersion: 2,
-        sourceSchema: definitionV2.schemaIdentity,
-        mutationVersion: PutTodoV2.version
-      })
-
-      assert.strictEqual(legacyV1, legacyV2)
-      assert.notStrictEqual(currentV1, currentV2)
-      assert.match(currentV1, /^[0-9a-f]{64}$/)
-    }).pipe(Effect.provide(NodeCrypto.layer)))
-})
 
 describe("client schema evolution", () => {
   it.effect("atomically promotes canonical state, receipts, and replayed pending mutations", () =>
@@ -311,6 +230,7 @@ describe("client schema evolution", () => {
       yield* v1.applyReceipt(Protocol.AcceptedReceipt.make({
         spaceId,
         clientId,
+        membershipIncarnation: accepted.envelope.membershipIncarnation,
         mutationId: accepted.envelope.mutationId,
         localSequence: accepted.envelope.localSequence,
         name: PutTodoV1.name,
@@ -323,6 +243,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(1),
         spaceId,
         clientId,
+        membershipIncarnation: accepted.envelope.membershipIncarnation,
         mutationId: accepted.envelope.mutationId,
         localSequence: accepted.envelope.localSequence,
         sourceSchema: definitionV1.schemaIdentity,
@@ -372,6 +293,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(1),
         spaceId,
         clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+        membershipIncarnation,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000201"),
         localSequence: Identity.LocalSequence.make(1),
         sourceSchema: definitionV2.schemaIdentity,
@@ -430,6 +352,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(1),
         spaceId,
         clientId: remoteClientId,
+        membershipIncarnation,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000202"),
         localSequence: Identity.LocalSequence.make(1),
         sourceSchema: definitionV1.schemaIdentity,
@@ -444,6 +367,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(2),
         spaceId,
         clientId: remoteClientId,
+        membershipIncarnation,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000203"),
         localSequence: Identity.LocalSequence.make(2),
         sourceSchema: definitionV1.schemaIdentity,
@@ -471,6 +395,7 @@ describe("client schema evolution", () => {
       const receipt = Protocol.AcceptedReceipt.make({
         spaceId,
         clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
         mutationId: pending.envelope.mutationId,
         localSequence: pending.envelope.localSequence,
         name: PutTodoV1.name,
@@ -484,7 +409,9 @@ describe("client schema evolution", () => {
         ...receipt,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000999")
       })
-      yield* sql`UPDATE effect_local_receipts SET receipt_json = ${yield* Codec.stringify(conflicting)}`
+      yield* sql`UPDATE effect_local_client_receipts_data
+        SET receipt_json = ${yield* Codec.stringify(conflicting)}
+        WHERE space_id = ${spaceId} AND mutation_id = ${pending.envelope.mutationId}`
 
       const result = yield* buildStore(definitionV2, handlersV2, evolution).pipe(Effect.result)
       assert.isTrue(Result.isFailure(result))
@@ -500,6 +427,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(1),
         spaceId,
         clientId: remoteClientId,
+        membershipIncarnation,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000204"),
         localSequence: Identity.LocalSequence.make(1),
         sourceSchema: definitionV1.schemaIdentity,
@@ -530,6 +458,7 @@ describe("client schema evolution", () => {
         sequence: Identity.ServerSequence.make(1),
         spaceId,
         clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+        membershipIncarnation,
         mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000202"),
         localSequence: Identity.LocalSequence.make(1),
         sourceSchema: definitionV1.schemaIdentity,
@@ -544,10 +473,12 @@ describe("client schema evolution", () => {
         const progress = (yield* sql<{
           readonly generation: number
           readonly cursor_model: string | null
-        }>`SELECT generation, cursor_model FROM effect_local_client_evolution WHERE singleton = 1`)[0]
+        }>`SELECT generation, cursor_model FROM effect_local_client_evolution
+          WHERE space_id = ${spaceId}`)[0]
         if (progress === undefined || progress.cursor_model === null) return
         const copied = (yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
-          FROM effect_local_client_canonical_entities_data WHERE generation = ${progress.generation}`)[0]
+          FROM effect_local_client_canonical_entities_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${progress.generation}`)[0]
         if (copied.count !== 1) return
         yield* Deferred.succeed(reached, undefined)
         yield* Effect.never
@@ -568,11 +499,13 @@ describe("client schema evolution", () => {
         readonly generation: number
         readonly phase: string
         readonly cursor_model: string | null
-      }>`SELECT generation, phase, cursor_model FROM effect_local_client_evolution WHERE singleton = 1`)[0]
+      }>`SELECT generation, phase, cursor_model FROM effect_local_client_evolution
+        WHERE space_id = ${spaceId}`)[0]
       assert.strictEqual(progress.phase, "Entities")
       assert.strictEqual(progress.cursor_model, TodoV1.name)
       const copied = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
-        FROM effect_local_client_canonical_entities_data WHERE generation = ${progress.generation}`
+        FROM effect_local_client_canonical_entities_data
+        WHERE space_id = ${spaceId} AND schema_generation = ${progress.generation}`
       assert.strictEqual(copied[0].count, 1)
 
       const v2 = yield* buildStore(definitionV2, handlersV2, evolution)
@@ -588,15 +521,22 @@ describe("client schema evolution", () => {
     Effect.scoped(Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
       yield* buildStore(definitionV1, handlersV1)
-      const source = (yield* sql<{ readonly active_schema_generation: number }>`SELECT active_schema_generation
-        FROM effect_local_client_meta WHERE singleton = 1`)[0].active_schema_generation
+      const source = (yield* sql<{
+        readonly active_schema_generation: number
+        readonly active_projection_generation: number
+      }>`SELECT active_schema_generation, active_projection_generation
+        FROM effect_local_client_spaces WHERE space_id = ${spaceId}`)[0]
       for (let index = 1; index <= 3; index++) {
         const key = yield* Codec.stringify(String(index))
         const value = yield* Codec.stringify({ id: String(index), title: `todo-${index}` })
-        yield* sql`INSERT INTO effect_local_canonical_entities (model, model_version, entity_key, value_json)
-          VALUES (${TodoV1.name}, ${TodoV1.version}, ${key}, ${value})`
-        yield* sql`INSERT INTO effect_local_visible_entities (model, model_version, entity_key, value_json)
-          VALUES (${TodoV1.name}, ${TodoV1.version}, ${key}, ${value})`
+        yield* sql`INSERT INTO effect_local_client_canonical_entities_data
+          (space_id, schema_generation, model, model_version, entity_key, value_json)
+          VALUES (${spaceId}, ${source.active_schema_generation}, ${TodoV1.name},
+            ${TodoV1.version}, ${key}, ${value})`
+        yield* sql`INSERT INTO effect_local_client_visible_entities_data
+          (space_id, schema_generation, projection_generation, model, model_version, entity_key, value_json)
+          VALUES (${spaceId}, ${source.active_schema_generation}, ${source.active_projection_generation},
+            ${TodoV1.name}, ${TodoV1.version}, ${key}, ${value})`
       }
       yield* sql`CREATE TABLE evolution_write_probe (operation TEXT NOT NULL)`
       yield* sql`CREATE TRIGGER probe_canonical_insert AFTER INSERT ON effect_local_client_canonical_entities_data
@@ -615,7 +555,8 @@ describe("client schema evolution", () => {
         const count = (yield* sql<typeof ProbeRow.Type>`SELECT COUNT(*) AS count FROM evolution_write_probe`)[0].count
         yield* Ref.update(maximumWrites, (current) => Math.max(current, count))
         yield* sql`DELETE FROM evolution_write_probe`
-        const phase = (yield* sql<typeof PhaseRow.Type>`SELECT phase FROM effect_local_client_evolution`)[0]?.phase
+        const phase = (yield* sql<typeof PhaseRow.Type>`SELECT phase FROM effect_local_client_evolution
+          WHERE space_id = ${spaceId}`)[0]?.phase
         if (phase === "CleanupCanonical") {
           yield* Deferred.succeed(flipped, undefined)
           yield* Effect.never
@@ -634,8 +575,8 @@ describe("client schema evolution", () => {
       yield* Fiber.interrupt(fiber)
 
       const active = yield* sql<{ readonly active_schema_generation: number }>`SELECT active_schema_generation
-        FROM effect_local_client_meta WHERE singleton = 1`
-      assert.strictEqual(active[0].active_schema_generation, source + 1)
+        FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
+      assert.strictEqual(active[0].active_schema_generation, source.active_schema_generation + 1)
       assert.isAtMost(yield* Ref.get(maximumWrites), 2)
 
       yield* SchemaEvolution.client({
@@ -646,11 +587,85 @@ describe("client schema evolution", () => {
         batchSize: 1
       }).pipe(Effect.provide(runtimeV2))
       const remaining = yield* sql<{ readonly count: number }>`SELECT
-        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data WHERE generation = ${source}) +
-        (SELECT COUNT(*) FROM effect_local_client_visible_entities_data WHERE generation = ${source}) +
-        (SELECT COUNT(*) FROM effect_local_client_receipts_data WHERE generation = ${source}) +
-        (SELECT COUNT(*) FROM effect_local_client_pending_data WHERE generation = ${source}) AS count`
+        (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}) +
+        (SELECT COUNT(*) FROM effect_local_client_visible_entities_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}) +
+        (SELECT COUNT(*) FROM effect_local_client_receipts_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}) +
+        (SELECT COUNT(*) FROM effect_local_client_pending_data
+          WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}) AS count`
       assert.strictEqual(remaining[0].count, 0)
+    })).pipe(Effect.provide(database)))
+
+  it.effect("recovers schema promotion from an interrupted projection replay", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const v1 = yield* buildStore(definitionV1, handlersV1)
+      yield* v1.mutate(PutTodoV1, { id: "7", title: "pending" })
+      yield* v1.applyEntries([Protocol.AcceptedMutation.make({
+        sequence: Identity.ServerSequence.make(1),
+        spaceId,
+        clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+        membershipIncarnation,
+        mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000207"),
+        localSequence: Identity.LocalSequence.make(1),
+        sourceSchema: definitionV1.schemaIdentity,
+        digest: "7".repeat(64),
+        changes: [Protocol.Upsert.make({
+          entity: { model: TodoV1.name, modelVersion: TodoV1.version, key: "8" },
+          value: { id: "8", title: "committed" }
+        })]
+      })])
+      const source = (yield* sql<{
+        readonly active_schema_generation: number
+        readonly active_projection_generation: number
+      }>`SELECT active_schema_generation, active_projection_generation
+        FROM effect_local_client_spaces WHERE space_id = ${spaceId}`)[0]
+      const interruptedProjection = source.active_projection_generation + 1
+      yield* sql`INSERT INTO effect_local_client_visible_entities_data
+        (space_id, schema_generation, projection_generation, model, model_version, entity_key, value_json)
+        SELECT space_id, schema_generation, ${interruptedProjection}, model, model_version, entity_key, value_json
+        FROM effect_local_client_visible_entities_data
+        WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}
+          AND projection_generation = ${source.active_projection_generation}
+        ORDER BY model, entity_key LIMIT 1`
+      yield* sql`UPDATE effect_local_client_spaces
+        SET projection_replay_generation = ${interruptedProjection}, projection_replay_cursor = 'pending:0'
+        WHERE space_id = ${spaceId}`
+
+      const batches = yield* Ref.make(0)
+      const afterBatch = Ref.updateAndGet(batches, (count) => count + 1).pipe(
+        Effect.flatMap((count) => {
+          if (count > 40) return Effect.die("schema evolution cleanup stalled")
+          return Effect.void
+        })
+      )
+      const runtimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(handlersV2))
+      yield* SchemaEvolution.client({
+        definition: definitionV2,
+        evolution,
+        spaceId,
+        clientId,
+        batchSize: 1,
+        afterBatch
+      }).pipe(Effect.provide(runtimeV2))
+
+      const metadata = (yield* sql<{
+        readonly projection_replay_generation: number | null
+        readonly projection_replay_cursor: string | null
+      }>`SELECT projection_replay_generation, projection_replay_cursor
+        FROM effect_local_client_spaces WHERE space_id = ${spaceId}`)[0]
+      assert.isNull(metadata.projection_replay_generation)
+      assert.isNull(metadata.projection_replay_cursor)
+      const remaining = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        FROM effect_local_client_visible_entities_data
+        WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}`
+      assert.strictEqual(remaining[0].count, 0)
+
+      const v2 = yield* buildStore(definitionV2, handlersV2, evolution)
+      assert.strictEqual(Option.getOrThrow(yield* v2.get(TodoV2, 7)).title, "pending")
+      assert.strictEqual(Option.getOrThrow(yield* v2.get(TodoV2, 8)).title, "committed")
     })).pipe(Effect.provide(database)))
 
   it.effect("rejects one evolution row larger than the configured byte budget", () =>
@@ -686,14 +701,21 @@ describe("client schema evolution", () => {
       const source = yield* SqlSchema.findOne({
         Request: Schema.Void,
         Result: CountRow,
-        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_pending`
+        execute: () =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_client_pending_data AS p
+          INNER JOIN effect_local_client_spaces AS s ON s.space_id = p.space_id
+            AND s.active_schema_generation = p.schema_generation
+          WHERE p.space_id = ${spaceId}`
       })(undefined)
       const published = yield* SqlSchema.findOne({
         Request: Schema.Void,
         Result: CountRow,
         execute: () =>
-          sql`SELECT COUNT(*) AS count FROM effect_local_visible_entities
-          WHERE model_version = ${TodoV2.version}`
+          sql`SELECT COUNT(*) AS count FROM effect_local_client_visible_entities_data AS v
+          INNER JOIN effect_local_client_spaces AS s ON s.space_id = v.space_id
+            AND s.active_schema_generation = v.schema_generation
+            AND s.active_projection_generation = v.projection_generation
+          WHERE v.space_id = ${spaceId} AND v.model_version = ${TodoV2.version}`
       })(undefined)
       assert.strictEqual(source.count, 2)
       assert.strictEqual(published.count, 0)
@@ -737,102 +759,6 @@ describe("client schema evolution", () => {
         entity: { model: "Todo", modelVersion: TodoV2.version, key: 5 },
         value: { id: 5, title: "offline-old", done: false }
       })
-    })).pipe(Effect.provide(database)))
-
-  it.effect("rejects a first legacy digest when configured baselines have distinct schema identities", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const server = yield* buildServer(definitionV2, handlersV2, ambiguousLegacyEvolution)
-      const envelope = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000205"),
-        { id: "7", title: "ambiguous" }
-      )
-
-      assert.strictEqual((yield* server.submit(envelope).pipe(Effect.flip))._tag, "ProtocolInvalid")
-    })).pipe(Effect.provide(database)))
-
-  it.effect("keeps the legacy mutation byte limit for a digest version one envelope", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000206")
-      const legacyWithoutTitle = {
-        spaceId,
-        clientId,
-        mutationId,
-        localSequence: Identity.LocalSequence.make(1),
-        basis: Identity.ServerSequence.make(0),
-        name: PutTodoV1.name,
-        payload: { id: "8", title: "" },
-        digest: "0".repeat(64)
-      }
-      const title = "x".repeat(Protocol.maximumMutationBytes - Protocol.encodedBytes(legacyWithoutTitle))
-      const envelope = yield* legacyV1Envelope(mutationId, { id: "8", title })
-      const legacyWire = { ...legacyWithoutTitle, digest: envelope.digest, payload: envelope.payload }
-      assert.strictEqual(Protocol.encodedBytes(legacyWire), Protocol.maximumMutationBytes)
-      assert.isAbove(Protocol.encodedBytes(envelope), Protocol.maximumMutationBytes)
-
-      const server = yield* buildServer(definitionV2, handlersV2, evolutionWithLegacyBaseline)
-      assert.strictEqual((yield* server.submit(envelope))._tag, "Accepted")
-    })).pipe(Effect.provide(database)))
-
-  it.effect("retains the legacy baseline for exact retries and later offline mutations", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const first = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000207"),
-        { id: "9", title: "retry" }
-      )
-      const serverV1 = yield* buildServer(
-        definitionV1,
-        handlersV1,
-        Evolution.make({ current: definitionV1, legacyBaselines: [legacyBaselineV1] })
-      )
-      assert.strictEqual((yield* serverV1.submit(first))._tag, "Accepted")
-
-      const serverV2 = yield* buildServer(definitionV2, handlersV2, ambiguousLegacyEvolution)
-      yield* serverV2.pull({
-        spaceId,
-        schema: definitionV2.schemaIdentity,
-        after: Identity.ServerSequence.make(0),
-        limit: 10
-      })
-      assert.strictEqual(
-        (yield* serverV2.submit({ envelope: first, schema: definitionV2.schemaIdentity }))._tag,
-        "Accepted"
-      )
-
-      const second = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000208"),
-        { id: "10", title: "offline" },
-        2
-      )
-      assert.strictEqual(
-        (yield* serverV2.submit({ envelope: second, schema: definitionV2.schemaIdentity }))._tag,
-        "Accepted"
-      )
-    })).pipe(Effect.provide(database)))
-
-  it.effect("does not replace a persisted legacy identity with another configured baseline", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const first = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000209"),
-        { id: "11", title: "first" }
-      )
-      const server = yield* buildServer(definitionV2, handlersV2, evolutionWithLegacyBaseline)
-      assert.strictEqual((yield* server.submit(first))._tag, "Accepted")
-
-      const droppedV1 = Evolution.make({
-        current: definitionV2,
-        legacyBaselines: [Evolution.legacyBaseline({
-          id: "legacy-v2-only",
-          hash: "3333333333333333",
-          definition: definitionV2
-        })]
-      })
-      const restarted = yield* buildServer(definitionV2, handlersV2, droppedV1)
-      const second = yield* legacyV1Envelope(
-        Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000210"),
-        { id: "12", title: "second" },
-        2
-      )
-      assert.strictEqual((yield* restarted.submit(second).pipe(Effect.flip))._tag, "ProtocolInvalid")
     })).pipe(Effect.provide(database)))
 
   it.effect("resumes a server promotion after interruption", () =>

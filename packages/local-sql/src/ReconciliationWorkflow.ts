@@ -7,9 +7,12 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
+import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as Activity from "effect/unstable/workflow/Activity"
 import * as DurableClock from "effect/unstable/workflow/DurableClock"
@@ -29,6 +32,7 @@ const PayloadFields = {
   schemaIdentity: Schema.String,
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
+  membershipIncarnation: Identity.MembershipIncarnation,
   generation: ReconciliationGeneration
 } as const
 
@@ -38,7 +42,7 @@ export type Payload = typeof Payload.Type
 const schemaIdentityKey = (definition: Definition.Any): string =>
   `${definition.schemaIdentity.version}:${definition.schemaIdentity.hash}`
 
-type ReplicaIdentity = Pick<Payload, "schemaIdentity" | "spaceId" | "clientId">
+type ReplicaIdentity = Pick<Payload, "schemaIdentity" | "spaceId" | "clientId" | "membershipIncarnation">
 
 interface RegisteredSchema {
   readonly version: number
@@ -59,8 +63,11 @@ type EngineWithRegistrationState = WorkflowEngine.WorkflowEngine["Service"] & {
   [workflowRegistrationStateSymbol]?: WorkflowRegistrationState
 }
 
-const replicaIdentityKey = (options: Pick<Options, "spaceId" | "clientId">) =>
-  encodeJson([options.spaceId, options.clientId])
+const replicaIdentityKey = (options: {
+  readonly spaceId: Identity.SpaceId
+  readonly clientId: Identity.ClientId
+  readonly membershipIncarnation: Identity.MembershipIncarnation
+}) => encodeJson([options.spaceId, options.clientId, options.membershipIncarnation])
 
 const workflowRegistrationState = (
   engine: WorkflowEngine.WorkflowEngine["Service"]
@@ -72,14 +79,30 @@ const workflowRegistrationState = (
   return state
 }
 
-export const make = ({ clientId, schemaIdentity: workflowSchemaIdentity, spaceId }: ReplicaIdentity) =>
-  Workflow.make(`effect-local/ReconcileReplica/v2/${encodeJson([workflowSchemaIdentity, spaceId, clientId])}`, {
-    payload: PayloadFields,
-    success: Schema.Void,
-    error: ReplicaError.ReplicaError,
-    idempotencyKey: (payload) =>
-      encodeJson([payload.schemaIdentity, payload.spaceId, payload.clientId, payload.generation])
-  })
+export const make = ({
+  clientId,
+  membershipIncarnation,
+  schemaIdentity: workflowSchemaIdentity,
+  spaceId
+}: ReplicaIdentity) =>
+  Workflow.make(
+    `effect-local/ReconcileReplica/v3/${
+      encodeJson([workflowSchemaIdentity, spaceId, clientId, membershipIncarnation])
+    }`,
+    {
+      payload: PayloadFields,
+      success: Schema.Void,
+      error: ReplicaError.ReplicaError,
+      idempotencyKey: (payload) =>
+        encodeJson([
+          payload.schemaIdentity,
+          payload.spaceId,
+          payload.clientId,
+          payload.membershipIncarnation,
+          payload.generation
+        ])
+    }
+  )
 
 export const Execution = Schema.Struct({
   ...PayloadFields,
@@ -93,6 +116,10 @@ export interface RegistrationService {
 
 export class Registration extends Context.Service<Registration, RegistrationService>()(
   "@lucas-barake/effect-local-sql/ReconciliationWorkflow/Registration"
+) {}
+
+export class RegistrationScope extends Context.Service<RegistrationScope, Scope.Scope>()(
+  "@lucas-barake/effect-local-sql/ReconciliationWorkflow/RegistrationScope"
 ) {}
 
 export const executionId = (payload: Payload) => make(payload).executionId(payload)
@@ -197,7 +224,14 @@ const handler = (
         message: "Reconciliation workflow payload does not match this replica"
       })
     }
-    const registered = registrationState.schemas.get(replicaIdentityKey(options))
+    const local = yield* LocalStore.Store
+    if (payload.membershipIncarnation !== local.membershipIncarnation) {
+      return yield* new ReplicaError.SpaceUnavailable({ spaceId: payload.spaceId })
+    }
+    const registered = registrationState.schemas.get(replicaIdentityKey({
+      ...options,
+      membershipIncarnation: local.membershipIncarnation
+    }))
     if (
       registered !== undefined &&
       (registered.version !== options.definition.schemaIdentity.version ||
@@ -210,7 +244,6 @@ const handler = (
         actualHash: options.definition.schemaIdentity.hash
       })
     }
-    const local = yield* LocalStore.Store
     const reconciliation = yield* Reconciler.Reconciliation
     const runActivity = (name: string, execute: Effect.Effect<void, ReplicaError.ReplicaError>) =>
       Effect.gen(function*() {
@@ -223,7 +256,11 @@ const handler = (
           }).pipe(Effect.result)
           if (Result.isSuccess(result)) return
           yield* reconciliation.failed(result.failure)
-          if (result.failure._tag === "StaleSchema" || attempt >= configuration.maximumAttempts) {
+          if (
+            result.failure._tag === "StaleSchema" ||
+            result.failure._tag === "SpaceUnavailable" ||
+            attempt >= configuration.maximumAttempts
+          ) {
             yield* result.failure
             return
           }
@@ -253,17 +290,28 @@ const layerRegistrationWithConfiguration = (
     Effect.gen(function*() {
       const configuration = yield* RetryConfiguration
       const engine = yield* WorkflowEngine.WorkflowEngine
+      const local = yield* LocalStore.Store
+      const currentScope = yield* Effect.scope
+      const registrationScope = Option.getOrElse(
+        yield* Effect.serviceOption(RegistrationScope),
+        () => currentScope
+      )
       const evolution = options.evolution ?? Evolution.make({ current: options.definition })
       const registrationState = workflowRegistrationState(engine)
-      const replicaKey = replicaIdentityKey(options)
+      const identity = {
+        ...options,
+        membershipIncarnation: local.membershipIncarnation
+      }
+      const replicaKey = replicaIdentityKey(identity)
       yield* engine.register(
         make({
           schemaIdentity: schemaIdentityKey(options.definition),
           spaceId: options.spaceId,
-          clientId: options.clientId
+          clientId: options.clientId,
+          membershipIncarnation: local.membershipIncarnation
         }),
         handler(options, configuration, registrationState)
-      )
+      ).pipe(Scope.provide(registrationScope))
       const registered = registrationState.schemas.get(replicaKey)
       if (
         registered !== undefined &&
@@ -287,12 +335,13 @@ const layerRegistrationWithConfiguration = (
         legacySchemas.set(schemaIdentityKey(baseline.definition), baseline.definition)
       }
       legacySchemas.delete(schemaIdentityKey(options.definition))
-      for (const [identity, definition] of legacySchemas) {
+      for (const [legacyIdentity, definition] of legacySchemas) {
         yield* engine.register(
           make({
-            schemaIdentity: identity,
+            schemaIdentity: legacyIdentity,
             spaceId: options.spaceId,
-            clientId: options.clientId
+            clientId: options.clientId,
+            membershipIncarnation: local.membershipIncarnation
           }),
           () =>
             Effect.gen(function*() {
@@ -304,39 +353,7 @@ const layerRegistrationWithConfiguration = (
                 actualHash: definition.schemaIdentity.hash
               })
             })
-        )
-      }
-      const legacyDefinitions = new Map<string, Definition.Any>()
-      for (const step of evolution.steps) legacyDefinitions.set(step.from.hash, step.from)
-      for (const baseline of evolution.legacyBaselines) {
-        legacyDefinitions.set(baseline.hash, baseline.definition)
-      }
-      legacyDefinitions.delete(options.definition.hash)
-      for (const [definitionHash, definition] of legacyDefinitions) {
-        const legacy = Workflow.make(
-          `effect-local/ReconcileReplica/${encodeJson([definitionHash, options.spaceId, options.clientId])}`,
-          {
-            payload: {
-              definitionHash: Schema.String,
-              spaceId: Identity.SpaceId,
-              clientId: Identity.ClientId,
-              generation: ReconciliationGeneration
-            },
-            success: Schema.Void,
-            error: ReplicaError.ReplicaError,
-            idempotencyKey: ({ generation }) => String(generation)
-          }
-        )
-        yield* engine.register(legacy, () =>
-          Effect.gen(function*() {
-            const current = registrationState.schemas.get(replicaKey) ?? options.definition.schemaIdentity
-            return yield* new ReplicaError.StaleSchema({
-              expectedVersion: current.version,
-              expectedHash: current.hash,
-              actualVersion: definition.schemaIdentity.version,
-              actualHash: definition.schemaIdentity.hash
-            })
-          }))
+        ).pipe(Scope.provide(registrationScope))
       }
       return Layer.succeed(Registration, Registration.of({ registered: true }))
     })
@@ -365,7 +382,14 @@ const layerSchedulerWithConfiguration = (
       const reconciliation = yield* Reconciler.Reconciliation
       yield* Registration
       const remote = yield* SyncEngine.SyncEngine
+      const engine = yield* WorkflowEngine.WorkflowEngine
       const wake = yield* Queue.sliding<void>(1)
+      const activeExecution = yield* Ref.make<
+        Option.Option<{
+          readonly workflow: ReturnType<typeof make>
+          readonly executionId: string
+        }>
+      >(Option.none())
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
 
@@ -380,9 +404,15 @@ const layerSchedulerWithConfiguration = (
                   schemaIdentity: schemaIdentityKey(options.definition),
                   spaceId: options.spaceId,
                   clientId: options.clientId,
+                  membershipIncarnation: local.membershipIncarnation,
                   generation: generations.requested
                 })
-                yield* make(payload).execute(payload)
+                const workflow = make(payload)
+                const activeExecutionId = yield* workflow.executionId(payload)
+                yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
+                yield* workflow.execute(payload).pipe(
+                  Effect.ensuring(Ref.set(activeExecution, Option.none()))
+                )
               }
             })
           ),
@@ -418,7 +448,20 @@ const layerSchedulerWithConfiguration = (
         )
       )
 
-      return Reconciler.Reconciler.of({ sync: reconciliation.sync, notify, status: reconciliation.status })
+      const shutdown = Effect.gen(function*() {
+        const active = yield* Ref.get(activeExecution)
+        const supervisorInterruption = yield* Effect.forkChild(Fiber.interrupt(supervisorFiber), {
+          startImmediately: true
+        })
+        if (Option.isSome(active)) {
+          const result = yield* engine.poll(active.value.workflow, active.value.executionId)
+          if (Option.isNone(result)) {
+            yield* engine.interruptUnsafe(active.value.workflow, active.value.executionId)
+          }
+        }
+        yield* Fiber.join(supervisorInterruption)
+      })
+      return Reconciler.Reconciler.of({ sync: reconciliation.sync, notify, status: reconciliation.status, shutdown })
     })
   )
 

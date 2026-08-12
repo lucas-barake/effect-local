@@ -50,6 +50,7 @@ Read this file before any work. Treat these rules as required for every package.
 
 - Use `.pipe(...)` for readable linear data last composition. Use `Effect.gen` for sequential dependent workflows. Keep direct data first calls when they are clearer.
 - Use `Effect.sync` only to suspend a synchronous side effect that is not expected to throw. Use `Effect.suspend` when the thunk returns an Effect.
+- Inside `Effect.gen`, execute synchronous code directly. Never write `yield* Effect.sync(...)`; the generator body is already suspended by the enclosing Effect.
 - Use `Effect.log`, `logTrace`, `logDebug`, `logInfo`, `logWarning`, `logError`, or `logFatal`. Add structured fields with `Effect.annotateLogs`.
 - Do not call global `console.log`, `console.warn`, or `console.error` in library code.
 - Add `Effect.withSpan` or named `Effect.fn` spans at meaningful workflow, I/O, and remote boundaries. Add stable names and nonsecret attributes.
@@ -59,6 +60,7 @@ Read this file before any work. Treat these rules as required for every package.
 - Prefer Effect returning combinators over throwing synchronous variants inside Effect code, for example `Schema.decodeUnknownEffect` over `Schema.decodeUnknownSync`. Contain unavoidable throwing variants at the non Effect boundary that requires them.
 - Give queues, latches, subscriptions, and scopes a documented owner and cleanup path.
 - Attach cleanup immediately after acquiring a native resource so every later failure and interruption path releases it.
+- Never wrap `Effect.sync` in `Semaphore.withPermit`. Synchronous JavaScript cannot interleave. Use a semaphore only when one invariant spans an effectful suspension.
 - Recheck mutable admission, quota, and idempotency state inside the same lock or transaction that performs the write.
 
 ## Persistence And Validation

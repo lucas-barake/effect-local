@@ -11,3 +11,37 @@ export const NeedsAuthentication = Schema.TaggedStruct("NeedsAuthentication", { 
 export const Failed = Schema.TaggedStruct("Failed", { pending: Schema.Int, message: Schema.String })
 export const ReplicaStatus = Schema.Union([Offline, Connecting, Online, NeedsAuthentication, Failed])
 export type ReplicaStatus = typeof ReplicaStatus.Type
+
+export const SpaceStatus = Schema.Union([
+  Schema.Struct({ spaceId: Identity.SpaceId, ...Offline.fields }),
+  Schema.Struct({ spaceId: Identity.SpaceId, ...Connecting.fields }),
+  Schema.Struct({ spaceId: Identity.SpaceId, ...Online.fields }),
+  Schema.Struct({ spaceId: Identity.SpaceId, ...NeedsAuthentication.fields }),
+  Schema.Struct({ spaceId: Identity.SpaceId, ...Failed.fields })
+])
+export type SpaceStatus = typeof SpaceStatus.Type
+
+export const AggregateState = Schema.Literals([
+  "Idle",
+  "Failed",
+  "NeedsAuthentication",
+  "Online",
+  "Offline",
+  "Connecting",
+  "Degraded"
+])
+export type AggregateState = typeof AggregateState.Type
+
+export const Aggregate = Schema.Struct({
+  state: AggregateState,
+  spaces: Schema.Array(SpaceStatus),
+  totalPending: Schema.Int,
+  counts: Schema.Struct({
+    offline: Schema.Int,
+    connecting: Schema.Int,
+    online: Schema.Int,
+    needsAuthentication: Schema.Int,
+    failed: Schema.Int
+  })
+})
+export type Aggregate = typeof Aggregate.Type
