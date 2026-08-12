@@ -1,6 +1,7 @@
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Query from "@lucas-barake/effect-local/Query"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Context from "effect/Context"
@@ -10,10 +11,11 @@ import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as IndexStore from "./IndexStore.js"
 import * as Codec from "./internal/codec.js"
-import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as SqlTransaction from "./internal/transaction.js"
+import * as QueryReactivity from "./QueryReactivity.js"
 
 export interface Service {
   readonly execute: <Q extends Query.Any,>(
@@ -51,28 +53,17 @@ const SchemaFenceRow = Schema.Struct({
 export const layer = <D extends Definition.Any,>(
   definition: D,
   spaceId: Identity.SpaceId
-): Layer.Layer<QueryExecutor, never, SqlClient.SqlClient | Handlers<D>> =>
+): Layer.Layer<QueryExecutor, never, SqlClient.SqlClient | Handlers<D> | QueryReactivity.QueryReactivity> =>
   Layer.effect(
     QueryExecutor,
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
+      const queryReactivity = yield* QueryReactivity.QueryReactivity
       const context = yield* Effect.context<Handlers<D>>()
       for (const query of definition.queries) {
         Context.getUnsafe<Query.HandlerService<any, any, any, any>, any>(query.handler)(context)
       }
 
-      const allRows = SqlSchema.findAll({
-        Request: Schema.Struct({
-          model: Schema.String,
-          schemaGeneration: Schema.Int,
-          projectionGeneration: Schema.Int
-        }),
-        Result: Rows.EntityRow,
-        execute: ({ model, projectionGeneration, schemaGeneration }) =>
-          sql`SELECT value_json FROM effect_local_client_visible_entities_data
-          WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
-            AND projection_generation = ${projectionGeneration} AND model = ${model} ORDER BY entity_key`
-      })
       const findFence = SqlSchema.findOne({
         Request: Schema.Void,
         Result: SchemaFenceRow,
@@ -82,30 +73,49 @@ export const layer = <D extends Definition.Any,>(
           target_schema_version, target_schema_hash, migration_hash
           FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
       })
-      const queryCapability = (schemaGeneration: number, projectionGeneration: number): Transaction.Query => ({
-        get: SqlTransaction.local({
-          sql,
-          table: "visible",
-          spaceId,
-          schemaGeneration,
-          projectionGeneration
-        }).get,
-        all: (model) =>
-          allRows({ model: model.name, schemaGeneration, projectionGeneration }).pipe(
-            Effect.mapError(StorageUnavailable.make),
-            Effect.flatMap((rows) =>
-              Effect.forEach(
-                rows,
-                (row) => Codec.parse(row.value_json).pipe(Effect.flatMap((value) => Codec.decode(model.schema, value)))
-              )
-            )
-          )
-      })
+      const queryCapability = (
+        address: IndexStore.Address,
+        queryToken: string,
+        reads: Array<QueryReactivity.Read>
+      ): Transaction.Query => {
+        const transaction = SqlTransaction.local({ sql, table: "visible", ...address })
+        const record = (read: QueryReactivity.Read): Effect.Effect<number> =>
+          Effect.gen(function*() {
+            const position = reads.length
+            reads.push(read)
+            yield* queryReactivity.record(queryToken, reads)
+            return position
+          })
+        return {
+          get: (model, key) =>
+            record({ _tag: "Entity", key: ReactivityKey.entity(spaceId, model.name, key) }).pipe(
+              Effect.andThen(transaction.get(model, key))
+            ),
+          from: (model, index) => {
+            let position: number | undefined
+            return IndexStore.query(sql, address, model, index, (initial) =>
+              Effect.gen(function*() {
+                if (position === undefined) position = yield* record({ _tag: "Index", footprint: initial })
+                else {
+                  reads[position] = { _tag: "Index", footprint: initial }
+                  yield* queryReactivity.record(queryToken, reads)
+                }
+                return (complete) =>
+                  Effect.gen(function*() {
+                    if (position === undefined) return
+                    reads[position] = { _tag: "Index", footprint: complete }
+                    yield* queryReactivity.record(queryToken, reads)
+                  })
+              }))
+          }
+        }
+      }
       const execute = <Q extends Query.Any,>(
         query: Q,
         payload: Q["payloadSchema"]["Type"]
-      ): Effect.Effect<Q["successSchema"]["Type"], ReplicaError.ReplicaError | Q["errorSchema"]["Type"]> =>
-        sql.withTransaction(Effect.gen(function*() {
+      ): Effect.Effect<Q["successSchema"]["Type"], ReplicaError.ReplicaError | Q["errorSchema"]["Type"]> => {
+        const key = ReactivityKey.query(spaceId, query.name, payload)
+        return sql.withTransaction(Effect.gen(function*() {
           const fence = yield* findFence(undefined).pipe(Effect.mapError(StorageUnavailable.make))
           if (
             fence.schema_version !== definition.schemaIdentity.version ||
@@ -145,18 +155,31 @@ export const layer = <D extends Definition.Any,>(
           >(query.successSchema.ast)
           const encodedPayload = yield* Codec.encode(payloadSchema, payload)
           const decodedPayload = yield* Codec.decode(payloadSchema, encodedPayload)
+          const reads: Array<QueryReactivity.Read> = []
+          yield* queryReactivity.record(key, reads)
           const result = yield* handler.execute({
-            query: queryCapability(fence.active_schema_generation, fence.active_projection_generation),
+            query: queryCapability(
+              {
+                spaceId,
+                schemaGeneration: fence.active_schema_generation,
+                projectionGeneration: fence.active_projection_generation
+              },
+              key,
+              reads
+            ),
             payload: decodedPayload
           })
           const encoded = yield* Codec.encode(successSchema, result)
-          return yield* Codec.decode(successSchema, encoded)
+          const value = yield* Codec.decode(successSchema, encoded)
+          yield* queryReactivity.record(key, reads)
+          return value
         })).pipe(
           Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
           Effect.withSpan("QueryExecutor.execute", {
             attributes: { "query.name": query.name }
           })
         )
+      }
       return QueryExecutor.of({ execute })
     })
   )

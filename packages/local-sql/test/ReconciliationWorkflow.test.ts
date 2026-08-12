@@ -24,6 +24,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
 import * as LocalStore from "../src/LocalStore.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
+import * as QueryReactivity from "../src/QueryReactivity.js"
 import * as Reconciler from "../src/Reconciler.js"
 import * as ReconciliationWorkflow from "../src/ReconciliationWorkflow.js"
 import * as ServerStore from "../src/ServerStore.js"
@@ -39,7 +40,8 @@ const database = () =>
   Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
-    Reactivity.layer
+    Reactivity.layer,
+    QueryReactivity.layer
   )
 
 const runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.handlers))
@@ -327,7 +329,8 @@ describe("reconciliation workflow", () => {
       const replicaDatabase = Layer.mergeAll(
         Layer.succeed(SqlClient.SqlClient, Context.get(databaseContext, SqlClient.SqlClient)),
         Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto)),
-        Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity))
+        Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity)),
+        Layer.succeed(QueryReactivity.QueryReactivity, Context.get(databaseContext, QueryReactivity.QueryReactivity))
       )
       const runner = SingleRunner.layer({ runnerStorage: "sql" }).pipe(Layer.provide(replicaDatabase))
       const engineContext = yield* Layer.build(

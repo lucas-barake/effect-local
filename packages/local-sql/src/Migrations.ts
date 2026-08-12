@@ -1313,6 +1313,43 @@ const clientV11 = makeMigration({
   ]
 })
 
+const clientV12 = makeMigration({
+  id: 12,
+  name: "secondary-index-catalog",
+  statements: [
+    `CREATE TABLE effect_local_client_index_catalog (
+      model TEXT NOT NULL,
+      index_name TEXT NOT NULL,
+      descriptor_hash TEXT NOT NULL,
+      layout_hash TEXT NOT NULL,
+      table_name TEXT NOT NULL UNIQUE,
+      table_checksum TEXT NOT NULL,
+      scan_index_name TEXT NOT NULL UNIQUE,
+      scan_index_checksum TEXT NOT NULL,
+      PRIMARY KEY (model, index_name, descriptor_hash)
+    )`,
+    `CREATE TABLE effect_local_client_index_state (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
+      projection_generation INTEGER NOT NULL CHECK (projection_generation >= 0),
+      model TEXT NOT NULL,
+      index_name TEXT NOT NULL,
+      descriptor_hash TEXT NOT NULL,
+      backfill_after_key TEXT,
+      backfill_visible_revision INTEGER CHECK (
+        backfill_visible_revision IS NULL OR backfill_visible_revision >= 0
+      ),
+      ready INTEGER NOT NULL DEFAULT 0 CHECK (ready IN (0, 1)),
+      PRIMARY KEY (
+        space_id, schema_generation, projection_generation, model, index_name, descriptor_hash
+      ),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE,
+      FOREIGN KEY (model, index_name, descriptor_hash)
+        REFERENCES effect_local_client_index_catalog(model, index_name, descriptor_hash) ON DELETE CASCADE
+    )`
+  ]
+})
+
 export const clientCatalog = Object.freeze([
   clientV1,
   clientV2,
@@ -1324,7 +1361,8 @@ export const clientCatalog = Object.freeze([
   clientV8,
   clientV9,
   clientV10,
-  clientV11
+  clientV11,
+  clientV12
 ])
 
 const serverV6 = makeMigration({

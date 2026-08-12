@@ -1,8 +1,10 @@
+import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as Query from "@lucas-barake/effect-local/Query"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -10,6 +12,7 @@ import * as Equal from "effect/Equal"
 import * as Hash from "effect/Hash"
 import type * as Layer from "effect/Layer"
 import { Atom } from "effect/unstable/reactivity"
+import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import type * as AtomRegistry from "effect/unstable/reactivity/AtomRegistry"
 import type * as Reactivity from "effect/unstable/reactivity/Reactivity"
 
@@ -28,8 +31,12 @@ class QueryKey<P,> implements Equal.Equal {
   }
 }
 
-export const make = <R, E,>(
-  layer: Layer.Layer<Replica.Replica | R, E, AtomRegistry.AtomRegistry | Reactivity.Reactivity>,
+export const make = <E,>(
+  layer: Layer.Layer<
+    Replica.Replica | QueryReactivity.QueryReactivity,
+    E,
+    AtomRegistry.AtomRegistry | Reactivity.Reactivity
+  >,
   options?: {
     readonly factory?: Atom.RuntimeFactory
     readonly idleTTL?: Duration.Input
@@ -40,39 +47,40 @@ export const make = <R, E,>(
   const idleTTL = Duration.toMillis(options?.idleTTL ?? Duration.seconds(30))
 
   const spaceKey = (spaceId: Identity.SpaceId) => `effect-local:space:${spaceId}`
-  const entitiesKey = (spaceId: Identity.SpaceId) => `${spaceKey(spaceId)}:entities`
-
   const entity = <M extends Model.Any,>(spaceId: Identity.SpaceId, model: M) =>
     Atom.family((key: Model.Key<M>) =>
       runtime.atom(
         Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.get(model, key))))
       ).pipe(
-        factory.withReactivity({
-          [spaceKey(spaceId)]: [],
-          [entitiesKey(spaceId)]: [[model.name, key]]
-        }),
+        factory.withReactivity([spaceKey(spaceId), ReactivityKey.entity(spaceId, model.name, key)]),
         Atom.setIdleTTL(idleTTL)
       )
     )
 
   const query = <Q extends Query.Any,>(spaceId: Identity.SpaceId, definition: Q) => {
-    const dependencyKeys = Array.from(
-      new Set(definition.dependsOn.map((model) => model.name)),
-      (name) => [name]
-    )
-    const family = Atom.family((key: QueryKey<Q["payloadSchema"]["Type"]>) =>
-      runtime.atom(
+    const family = Atom.family((key: QueryKey<Q["payloadSchema"]["Type"]>) => {
+      const token = ReactivityKey.query(spaceId, definition.name, key.payload)
+      const retention = runtime.atom(
+        QueryReactivity.QueryReactivity.use((service) =>
+          Effect.acquireRelease(
+            service.retain(token),
+            (release) => release
+          ).pipe(Effect.asVoid)
+        )
+      ).pipe(Atom.setIdleTTL(idleTTL))
+      const target = runtime.atom(
         Replica.Replica.use((replica) =>
           replica.space(spaceId).pipe(Effect.flatMap((space) => space.query(definition, key.payload)))
         )
       ).pipe(
-        factory.withReactivity({
-          [spaceKey(spaceId)]: [],
-          [entitiesKey(spaceId)]: dependencyKeys
-        }),
-        Atom.setIdleTTL(idleTTL)
+        factory.withReactivity([spaceKey(spaceId), token])
       )
-    )
+      return Atom.transform(target, (get, atom) => {
+        if (!AsyncResult.isSuccess(get(retention))) return AsyncResult.initial(true)
+        get.subscribe(atom, (value) => get.setSelf(value))
+        return get.once(atom)
+      }, { initialValueTarget: target }).pipe(Atom.setIdleTTL(idleTTL))
+    })
     return (payload: Q["payloadSchema"]["Type"]) => {
       return family(new QueryKey(`${spaceId}:${definition.name}:${Canonical.hash(payload)}`, payload))
     }

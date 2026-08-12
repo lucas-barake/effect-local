@@ -201,10 +201,14 @@ export const make = (options: Options) => {
             message: `Space ${spaceId} contains an invalid model row for ${row.model}`
           })
         }
-        const key = yield* Codec.parse(row.entity_key).pipe(Effect.flatMap((value) => Codec.decode(model.key, value)))
-        const value = yield* Codec.parse(row.value_json).pipe(
-          Effect.flatMap((parsed) => Codec.decode(model.schema, parsed))
+        const key = yield* Codec.parse(row.entity_key).pipe(
+          Effect.flatMap((parsed) => Codec.decode(Schema.Json, parsed))
         )
+        const value = yield* Codec.parse(row.value_json).pipe(
+          Effect.flatMap((parsed) => Codec.decode(Schema.Json, parsed))
+        )
+        yield* Codec.decode(model.key, key)
+        yield* Codec.decode(model.schema, value)
         const keyJson = yield* Codec.stringify(key)
         const valueJson = yield* Codec.stringify(value)
         if (keyJson !== row.entity_key || valueJson !== row.value_json) {

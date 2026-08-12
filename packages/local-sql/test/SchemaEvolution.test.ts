@@ -7,6 +7,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
@@ -27,6 +28,7 @@ import * as Codec from "../src/internal/codec.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
+import * as QueryReactivity from "../src/QueryReactivity.js"
 import * as SchemaEvolution from "../src/SchemaEvolution.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as SqlReplica from "../src/SqlReplica.js"
@@ -327,7 +329,8 @@ const evolutionV3 = Evolution.make({
 const database = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   NodeCrypto.layer,
-  Reactivity.layer
+  Reactivity.layer,
+  QueryReactivity.layer
 )
 
 const buildStore = <D extends Definition.Any,>(
@@ -1238,7 +1241,7 @@ describe("client schema evolution", () => {
       const invalidations = { entity: 0, status: 0, originalReceipt: 0, replacementReceipt: 0 }
       const spaceKey = `effect-local:space:${spaceId}`
       const cancelEntity = reactivity.registerUnsafe(
-        { [`${spaceKey}:entities`]: [[TodoV2.name, 45]] },
+        [ReactivityKey.entity(spaceId, TodoV2.name, 45)],
         () => invalidations.entity++
       )
       const cancelStatus = reactivity.registerUnsafe([`${spaceKey}:status`], () => invalidations.status++)
@@ -1359,6 +1362,7 @@ describe("client schema evolution", () => {
       assert.strictEqual(firstError._tag, "ServerUnavailable")
       yield* Ref.set(failSubmit, false)
 
+      yield* Ref.set(failSubmit, false)
       const receipt = yield* replica.discardQuarantined(original.envelope.mutationId)
       assert.strictEqual(receipt._tag, "Rejected")
       assert.deepStrictEqual(yield* replica.quarantine, [])

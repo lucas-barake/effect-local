@@ -89,8 +89,7 @@ describe("schema evolution", () => {
       mutations: [First, Second],
       queries: [
         Query.make("ListTodos", {
-          success: Schema.Array(TodoV1.schema),
-          dependsOn: [TodoV1]
+          success: Schema.Array(TodoV1.schema)
         })
       ]
     })

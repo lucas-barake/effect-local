@@ -78,7 +78,24 @@ export const Task = Model.make("Task", {
     id: Schema.String,
     title: Schema.NonEmptyString,
     completed: Schema.Boolean
-  })
+  }),
+  indexes: {
+    byCompletedTitle: {
+      version: 1,
+      partition: [{
+        name: "completed",
+        affinity: "integer",
+        schema: Schema.Boolean,
+        extract: (task) => task.completed
+      }],
+      sort: [{
+        name: "title",
+        affinity: "text",
+        schema: Schema.NonEmptyString,
+        extract: (task) => task.title
+      }]
+    }
+  }
 })
 
 export const PutTask = Mutation.make("PutTask", {
@@ -93,8 +110,8 @@ export const ToggleTask = Mutation.make("ToggleTask", {
 })
 
 export const ListTasks = Query.make("ListTasks", {
-  success: Schema.Array(Task.schema),
-  dependsOn: [Task]
+  payload: { completed: Schema.Boolean, titleFrom: Schema.optional(Schema.NonEmptyString) },
+  success: Schema.Array(Task.schema)
 })
 
 export const definition = Definition.make({
@@ -114,7 +131,17 @@ export const DomainLive = Layer.mergeAll(
       }))
     )
   ),
-  ListTasks.toLayer(({ query }) => query.all(Task))
+  ListTasks.toLayer(({ payload, query }) =>
+    query.from(Task, "byCompletedTitle")
+      .where({
+        completed: payload.completed,
+        title: payload.titleFrom === undefined ? undefined : { gte: payload.titleFrom }
+      })
+      .order("asc")
+      .limit(50)
+      .page()
+      .pipe(Effect.map((page) => page.items))
+  )
 )
 ```
 
@@ -124,6 +151,40 @@ authorization, and identity failures use the tagged classes in `ReplicaError`.
 
 Handlers must be deterministic. Put timestamps, random values, generated identifiers, and other nondeterministic
 inputs in the mutation payload before committing it.
+
+### Indexed queries
+
+Every multi row query names an index declared on its model. Partition components require exact values. The first sort
+component accepts `gt`, `gte`, `lt`, and `lte` bounds. Ordering applies to the complete sort tuple, and the encoded
+entity key is the stable final tie breaker. Unknown indexes, missing partition fields, extra filter fields, and cursors
+from another model or index are type errors.
+
+`page()` fetches at most the configured limit and returns `{ items, next }`. Pass `next` to `after()` for the following
+keyset page:
+
+```ts
+const tasks = query.from(Task, "byCompletedTitle")
+  .where({ completed: false, title: { gte: "A", lt: "N" } })
+  .order("asc")
+  .limit(25)
+
+const first = yield * tasks.page()
+const second = first.next === undefined ? undefined : yield * tasks.after(first.next).page()
+```
+
+Use `stream()` when a handler must consume every matching row without materializing the result set first. It advances
+through the same bounded keyset pages and decodes only selected entities. The named query still returns a value
+accepted by its success Schema, so a live Stream cannot escape through `Replica.query`.
+
+SQLite stores each declared index in an owner qualified shadow table. The migration catalog checks its DDL checksum
+and resumes bounded backfills. Local mutations, accepted sync changes, projection replay, and snapshot installation
+maintain the active index generation. Index declarations are client local derived storage. Changing one rebuilds the
+local layout without changing the wire definition or model schema identity.
+
+Reactive query atoms retain the exact entity and index ranges read by the handler. A write publishes old and new index
+points after commit. Only mounted queries whose recorded ranges can change rerun. Reads through `query.get` use exact
+space, model, and decoded key tokens. `Query.make` has no static dependency list because runtime reads are the source
+of truth.
 
 ## SQLite replica
 
@@ -182,7 +243,7 @@ const program = Replica.Replica.use((replica) =>
       completed: false
     })
     const task = yield* space.get(Task, "task-1")
-    const tasks = yield* space.query(ListTasks, undefined)
+    const tasks = yield* space.query(ListTasks, { completed: false })
     return { pending, task, tasks }
   })
 ).pipe(Effect.provide(ReplicaLive), Effect.scoped)
@@ -244,7 +305,7 @@ import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserRepli
 export const graph = BrowserReplica.make(ReplicaLive)
 
 export const taskAtom = graph.entity(spaceId, Task)("task-1")
-export const tasksAtom = graph.query(spaceId, ListTasks)(undefined)
+export const tasksAtom = graph.query(spaceId, ListTasks)({ completed: false })
 export const putTaskAtom = graph.mutation(spaceId, PutTask)
 export const spaceStatusAtom = graph.status(spaceId)
 export const replicaStatusAtom = graph.aggregateStatus
@@ -254,8 +315,9 @@ export const leaveAtom = graph.leave
 ```
 
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
-and query atoms register space addressed Effect `Reactivity` keys and refresh after local commits and reconciliation
-transactions. Mutation, receipt, and status atoms also require a space address. The membership and aggregate atoms
+atoms register exact space addressed keys. Query atoms also retain the entity keys and index ranges their handler
+actually read. Local commits and reconciliation batches refresh only affected mounted reads. Mutation, receipt, and
+status atoms also require a space address. The membership and aggregate atoms
 share the same runtime. Mutation atoms are concurrent and preserve their typed result. Pass an application factory
 with `options.factory` when the application already owns a deliberate custom runtime.
 
