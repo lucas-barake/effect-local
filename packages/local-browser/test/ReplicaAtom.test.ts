@@ -116,6 +116,10 @@ const server = ServerStore.layerTrusted({
   retainedSnapshots: 2,
   maintenanceConcurrency: 1,
   maintenanceSpaceBatchSize: 128,
+  maximumWatchersPerSpace: 1_024,
+  readAuthorizationRefreshInterval: "30 seconds" as const,
+  maximumConcurrentReadAuthorizations: 64,
+  readAuthorizationCacheCapacity: 4_096,
   migration
 }).pipe(
   Layer.provide(mutationRuntime),

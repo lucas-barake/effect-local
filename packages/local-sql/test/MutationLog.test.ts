@@ -18,6 +18,7 @@ import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
 import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
+import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
@@ -104,6 +105,10 @@ const serverHistory = {
   retainedSnapshots: 2,
   maintenanceConcurrency: 1,
   maintenanceSpaceBatchSize: 128,
+  maximumWatchersPerSpace: 1_024,
+  readAuthorizationRefreshInterval: "30 seconds" as const,
+  maximumConcurrentReadAuthorizations: 64,
+  readAuthorizationCacheCapacity: 4_096,
   migration
 }
 
@@ -241,6 +246,104 @@ describe("server reconciled mutation log", () => {
         assert.strictEqual((yield* countUpdates(undefined)).count, baselineUpdates)
         yield* Effect.forEach(watchers, Fiber.interrupt)
       }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("caps active sync watchers and releases slots on interruption", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1
+          }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const ready = yield* Deferred.make<void>()
+        const first = yield* server.watch(spaceId).pipe(
+          Stream.runForEach(() => Deferred.succeed(ready, undefined)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(ready)
+
+        const error = yield* server.watch(spaceId).pipe(Stream.runHead, Effect.flip)
+        assert.deepStrictEqual(
+          error,
+          new ReplicaError.CapacityExceeded({
+            resource: "sync watchers",
+            limit: 1
+          })
+        )
+
+        yield* Fiber.interrupt(first)
+        const replacement = yield* server.watch(spaceId).pipe(Stream.runHead)
+        assert.isTrue(Option.isSome(replacement))
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("records server capacity metrics in the active registry", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(database())
+          )
+        )
+        const wakes = yield* Queue.unbounded<Protocol.Wake>()
+        const watcher = yield* server.watch(spaceId).pipe(
+          Stream.runForEach((wake) => Queue.offer(wakes, wake)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Queue.take(wakes)
+        assert.strictEqual(
+          (yield* server.submit(
+            yield* envelope(
+              Domain.PutTodo.name,
+              Domain.todo("metric"),
+              1,
+              Identity.MutationId.make("mut_00000000-0000-4000-8030-000000000001")
+            )
+          ))._tag,
+          "Accepted"
+        )
+        yield* Queue.take(wakes)
+        yield* server.maintain(spaceId)
+
+        const snapshots = yield* Metric.snapshot
+        const byId = new Map(snapshots.map((snapshot) => [snapshot.id, snapshot]))
+        const required = [
+          "effect_local_server_admission",
+          "effect_local_server_history_depth",
+          "effect_local_server_history_limit",
+          "effect_local_server_receipt_depth",
+          "effect_local_server_receipt_limit",
+          "effect_local_server_sync_watcher_count",
+          "effect_local_server_wake_fanout_duration",
+          "effect_local_server_maintenance"
+        ]
+        for (const id of required) assert.isTrue(byId.has(id), `missing metric ${id}`)
+        const watcherCount = byId.get("effect_local_server_sync_watcher_count")
+        assert.strictEqual(watcherCount?.type, "Gauge")
+        if (watcherCount?.type === "Gauge") assert.strictEqual(watcherCount.state.value, 1)
+        const fanout = byId.get("effect_local_server_wake_fanout_duration")
+        assert.strictEqual(fanout?.type, "Histogram")
+        if (fanout?.type === "Histogram") assert.strictEqual(fanout.state.count, 1)
+
+        yield* Fiber.interrupt(watcher)
+        const afterRelease = (yield* Metric.snapshot).find((snapshot) =>
+          snapshot.id === "effect_local_server_sync_watcher_count"
+        )
+        assert.strictEqual(afterRelease?.type, "Gauge")
+        if (afterRelease?.type === "Gauge") assert.strictEqual(afterRelease.state.value, 0)
+      }).pipe(
+        Effect.provide(NodeCrypto.layer),
+        Effect.provideService(Metric.MetricRegistry, new Map())
+      )
     ))
 
   it.effect("classifies malformed visible rows during index maintenance as storage corruption", () =>
