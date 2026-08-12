@@ -133,8 +133,8 @@ describe("storage migration catalogs", () => {
       })
       yield* Migrations.server()
 
-      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8])
-      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8])
+      assert.deepStrictEqual((yield* clientLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+      assert.deepStrictEqual((yield* serverMigrationLedger(sql)).map((row) => row.id), [1, 2, 3, 4, 5, 6, 7, 8, 9])
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
         "effect_local_client_evolution",
@@ -146,6 +146,9 @@ describe("storage migration catalogs", () => {
         "effect_local_client_scoped_bootstrap",
         "effect_local_client_scoped_bootstrap_entries",
         "effect_local_client_canonical_entities_data",
+        "effect_local_client_quarantine",
+        "effect_local_client_quarantine_cancellations",
+        "effect_local_client_quarantine_resubmissions",
         "effect_local_client_pending_data",
         "effect_local_client_receipts_data",
         "effect_local_client_visible_entities_data",
@@ -162,7 +165,9 @@ describe("storage migration catalogs", () => {
         "effect_local_server_replication_view_entities",
         "effect_local_server_replication_pages",
         "effect_local_server_scoped_snapshots",
-        "effect_local_server_scoped_snapshot_entries"
+        "effect_local_server_scoped_snapshot_entries",
+        "effect_local_server_snapshot_projections",
+        "effect_local_server_snapshot_projection_entities"
       ])
       assert.notInclude(names, "effect_local_bootstrap")
       assert.notInclude(names, "effect_local_bootstrap_entities")

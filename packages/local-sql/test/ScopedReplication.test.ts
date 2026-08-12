@@ -606,6 +606,7 @@ describe("scoped replication", () => {
         const remote = Layer.succeed(
           SyncEngine.SyncEngine,
           SyncEngine.SyncEngine.of({
+            discard: (request) => server.discard(request, "reader"),
             submit: server.submit,
             pull: (request) => server.pullAuthorized(request, "reader"),
             bootstrap: (request) =>

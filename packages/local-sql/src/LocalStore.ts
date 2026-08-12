@@ -5,6 +5,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import type * as Quarantine from "@lucas-barake/effect-local/Quarantine"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
@@ -58,9 +59,11 @@ export interface ReplicationState {
   readonly scopeGeneration: Identity.ReplicationScopeGeneration
   readonly cursor: Protocol.ReplicationCursor | null
 }
+export type QuarantineDisposition = "Discard" | "Resubmit"
 
 export interface Service {
   readonly membershipIncarnation: Identity.MembershipIncarnation
+  readonly schema: Identity.SchemaIdentity
   readonly mutate: <M extends Mutation.Any,>(
     mutation: M,
     payload: Mutation.Payload<M>
@@ -70,6 +73,22 @@ export interface Service {
     key: Model.Key<M>
   ) => Effect.Effect<Option.Option<Model.Value<M>>, ReplicaError.ReplicaError>
   readonly pending: Effect.Effect<ReadonlyArray<Protocol.PendingMutation>, ReplicaError.ReplicaError>
+  readonly quarantine: Effect.Effect<ReadonlyArray<Quarantine.QuarantinedMutation>, ReplicaError.ReplicaError>
+  readonly quarantineByMutation: (
+    mutationId: Identity.MutationId
+  ) => Effect.Effect<Option.Option<Quarantine.QuarantinedMutation>, ReplicaError.ReplicaError>
+  readonly quarantineCancellation: (
+    mutationId: Identity.MutationId
+  ) => Effect.Effect<Option.Option<Quarantine.QuarantinedMutation>, ReplicaError.ReplicaError>
+  readonly ensureQuarantineResubmission: <M extends Mutation.Any,>(
+    mutationId: Identity.MutationId,
+    mutation: M,
+    payload: Mutation.Payload<M>
+  ) => Effect.Effect<Protocol.PendingMutation, ReplicaError.ReplicaError | Mutation.Rejection<M>>
+  readonly resolveQuarantine: (
+    receipt: Protocol.Receipt,
+    disposition?: QuarantineDisposition
+  ) => Effect.Effect<Option.Option<Quarantine.QuarantinedMutation>, ReplicaError.ReplicaError>
   readonly receipt: (
     mutationId: Identity.MutationId
   ) => Effect.Effect<Option.Option<Protocol.Receipt>, ReplicaError.ReplicaError>
@@ -257,7 +276,53 @@ export const layer = (
         optimistic_result_json, changes_json FROM effect_local_client_pending_data
         WHERE space_id = ${options.spaceId} AND schema_generation = (
           SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+          AND local_sequence < COALESCE((SELECT MIN(local_sequence)
+            FROM effect_local_client_quarantine WHERE space_id = ${options.spaceId}),
+            ${Number.MAX_SAFE_INTEGER})
         ORDER BY local_sequence`
+      })
+      const findQuarantine = SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Rows.QuarantineRow,
+        execute: () =>
+          sql`SELECT space_id, membership_incarnation, mutation_id, local_sequence, basis, name, payload_json,
+            digest, digest_version, source_schema_version, source_schema_hash, mutation_version, rejection_json,
+            target_schema_version, target_schema_hash
+          FROM effect_local_client_quarantine WHERE space_id = ${options.spaceId} ORDER BY local_sequence`
+      })
+      const findQuarantineByMutation = SqlSchema.findOneOption({
+        Request: Identity.MutationId,
+        Result: Rows.QuarantineRow,
+        execute: (mutationId) =>
+          sql`SELECT space_id, membership_incarnation, mutation_id, local_sequence, basis, name, payload_json,
+            digest, digest_version, source_schema_version, source_schema_hash, mutation_version, rejection_json,
+            target_schema_version, target_schema_hash
+          FROM effect_local_client_quarantine
+          WHERE space_id = ${options.spaceId} AND mutation_id = ${mutationId}`
+      })
+      const findQuarantineResubmission = SqlSchema.findOneOption({
+        Request: Identity.MutationId,
+        Result: Rows.QuarantineResubmissionRow,
+        execute: (mutationId) =>
+          sql`SELECT space_id, original_mutation_id, replacement_mutation_id
+          FROM effect_local_client_quarantine_resubmissions
+          WHERE space_id = ${options.spaceId} AND original_mutation_id = ${mutationId}`
+      })
+      const findQuarantineCancellationByRoot = SqlSchema.findOneOption({
+        Request: Identity.MutationId,
+        Result: Rows.QuarantineCancellationRow,
+        execute: (mutationId) =>
+          sql`SELECT space_id, root_mutation_id, current_mutation_id
+          FROM effect_local_client_quarantine_cancellations
+          WHERE space_id = ${options.spaceId} AND root_mutation_id = ${mutationId}`
+      })
+      const findQuarantineCancellationByCurrent = SqlSchema.findOneOption({
+        Request: Identity.MutationId,
+        Result: Rows.QuarantineCancellationRow,
+        execute: (mutationId) =>
+          sql`SELECT space_id, root_mutation_id, current_mutation_id
+          FROM effect_local_client_quarantine_cancellations
+          WHERE space_id = ${options.spaceId} AND current_mutation_id = ${mutationId}`
       })
       const findPendingByMutation = SqlSchema.findOneOption({
         Request: Identity.MutationId,
@@ -386,6 +451,12 @@ export const layer = (
           sql`SELECT COUNT(*) AS count FROM effect_local_client_pending_data
           WHERE space_id = ${options.spaceId} AND schema_generation = (
             SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})`
+      })
+      const countQuarantine = SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Rows.CountRow,
+        execute: () =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_client_quarantine WHERE space_id = ${options.spaceId}`
       })
       const countReceipts = SqlSchema.findOne({
         Request: Schema.Void,
@@ -582,6 +653,53 @@ export const layer = (
           })
         })
 
+      const decodeQuarantineRow = (row: typeof Rows.QuarantineRow.Type) =>
+        Effect.gen(function*() {
+          if (
+            row.space_id !== options.spaceId || row.membership_incarnation !== initializedMeta.membership_incarnation
+          ) {
+            return yield* new ReplicaError.StorageCorrupt({
+              message: `Quarantined mutation ${row.mutation_id} does not belong to this membership`
+            })
+          }
+          const identity = {
+            spaceId: options.spaceId,
+            clientId: options.clientId,
+            mutationId: row.mutation_id,
+            localSequence: row.local_sequence,
+            basis: row.basis,
+            name: row.name,
+            payload: yield* Codec.parse(row.payload_json).pipe(
+              Effect.flatMap((value) => Codec.decode(Schema.Json, value))
+            ),
+            digestVersion: row.digest_version,
+            membershipIncarnation: row.membership_incarnation,
+            sourceSchema: Identity.SchemaIdentity.make({
+              version: row.source_schema_version,
+              hash: row.source_schema_hash
+            }),
+            mutationVersion: row.mutation_version
+          }
+          const expectedDigest = yield* Protocol.mutationDigest(identity).pipe(
+            Effect.provideService(Crypto.Crypto, crypto)
+          )
+          if (expectedDigest !== row.digest) {
+            return yield* new ReplicaError.StorageCorrupt({
+              message: `Quarantined mutation ${row.mutation_id} digest does not match its durable identity`
+            })
+          }
+          return {
+            envelope: Protocol.MutationEnvelope.make({ ...identity, digest: row.digest }),
+            rejection: yield* Codec.parse(row.rejection_json).pipe(
+              Effect.flatMap((value) => Codec.decode(Schema.Json, value))
+            ),
+            targetSchema: Identity.SchemaIdentity.make({
+              version: row.target_schema_version,
+              hash: row.target_schema_hash
+            })
+          } satisfies Quarantine.QuarantinedMutation
+        })
+
       const pending = sql.withTransaction(Effect.gen(function*() {
         yield* validateFence(yield* meta)
         return yield* findPending(undefined).pipe(
@@ -589,6 +707,40 @@ export const layer = (
           Effect.flatMap(Effect.forEach(decodePendingRow))
         )
       })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+
+      const quarantine = sql.withTransaction(Effect.gen(function*() {
+        yield* validateFence(yield* meta)
+        return yield* findQuarantine(undefined).pipe(
+          Effect.mapError(StorageUnavailable.make),
+          Effect.flatMap(Effect.forEach(decodeQuarantineRow))
+        )
+      })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+
+      const quarantineByMutation = (mutationId: Identity.MutationId) =>
+        sql.withTransaction(Effect.gen(function*() {
+          yield* validateFence(yield* meta)
+          const found = yield* findQuarantineByMutation(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
+          if (Option.isNone(found)) return Option.none()
+          return Option.some(yield* decodeQuarantineRow(found.value))
+        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+
+      const quarantineCancellation = (mutationId: Identity.MutationId) =>
+        sql.withTransaction(Effect.gen(function*() {
+          yield* validateFence(yield* meta)
+          const continuation = yield* findQuarantineCancellationByRoot(mutationId).pipe(
+            Effect.mapError(StorageUnavailable.make)
+          )
+          if (Option.isNone(continuation)) return Option.none()
+          const found = yield* findQuarantineByMutation(continuation.value.current_mutation_id).pipe(
+            Effect.mapError(StorageUnavailable.make)
+          )
+          if (Option.isNone(found)) {
+            return yield* new ReplicaError.StorageCorrupt({
+              message: `Quarantine cancellation ${mutationId} is missing its current mutation`
+            })
+          }
+          return Option.some(yield* decodeQuarantineRow(found.value))
+        })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const invalidate = (
         entities: ReadonlyArray<Protocol.EntityKey>,
@@ -904,6 +1056,34 @@ export const layer = (
         row.content_bytes === manifest.contentBytes &&
         row.digest === manifest.digest
 
+      const insertReceipt = (receipt: Protocol.Receipt, envelope: Protocol.MutationEnvelope) =>
+        Effect.gen(function*() {
+          let receiptSchema = receipt.sourceSchema
+          if (receipt._tag === "Expired") receiptSchema = envelope.sourceSchema
+          let receiptMutationVersion: Identity.SchemaVersion | null = null
+          if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
+            receiptMutationVersion = receipt.mutationVersion
+          } else if (receipt._tag === "Expired") {
+            receiptMutationVersion = envelope.mutationVersion
+          }
+          let receiptName: string | null = null
+          if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
+            receiptName = receipt.name
+          } else if (receipt._tag === "Expired") {
+            receiptName = envelope.name
+          }
+          let rejectionOrigin: string | null = null
+          if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
+          else if (receipt._tag === "Legacy") rejectionOrigin = "Legacy"
+          yield* sql`INSERT INTO effect_local_client_receipts_data
+            (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, receipt_json,
+              source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin)
+            VALUES (${options.spaceId}, ${activeGeneration}, ${receipt.membershipIncarnation},
+              ${receipt.mutationId}, ${receipt.localSequence}, ${yield* Codec.stringify(receipt)},
+              ${receiptSchema.version}, ${receiptSchema.hash}, ${receiptMutationVersion}, ${receiptName},
+              ${rejectionOrigin})`
+        })
+
       const persistReceipt = (receipt: Protocol.Receipt) =>
         Effect.gen(function*() {
           if ((yield* Protocol.encodedBytesEffect(receipt)) > Protocol.maximumReceiptBytes) {
@@ -961,31 +1141,7 @@ export const layer = (
                 limit: options.maximumReceipts
               })
             }
-            let receiptSchema = receipt.sourceSchema
-            if (receipt._tag === "Expired") receiptSchema = pendingMutation.envelope.sourceSchema
-            let receiptMutationVersion: Identity.SchemaVersion | null = null
-            if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
-              receiptMutationVersion = receipt.mutationVersion
-            } else if (receipt._tag === "Expired") {
-              receiptMutationVersion = pendingMutation.envelope.mutationVersion
-            }
-            let receiptName: string | null = null
-            if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
-              receiptName = receipt.name
-            } else if (receipt._tag === "Expired") {
-              receiptName = pendingMutation.envelope.name
-            }
-            let rejectionOrigin: string | null = null
-            if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
-            else if (receipt._tag === "Legacy") rejectionOrigin = "Legacy"
-            yield* sql`INSERT INTO effect_local_client_receipts_data
-              (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, receipt_json,
-                source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin)
-              VALUES (${options.spaceId}, ${activeGeneration}, ${receipt.membershipIncarnation},
-                ${receipt.mutationId}, ${receipt.localSequence},
-                ${yield* Codec.stringify(receipt)},
-            ${receiptSchema.version}, ${receiptSchema.hash}, ${receiptMutationVersion}, ${receiptName},
-            ${rejectionOrigin})`
+            yield* insertReceipt(receipt, pendingMutation.envelope)
             inserted = true
             return yield* Effect.void
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
@@ -1069,7 +1225,7 @@ export const layer = (
           return yield* Effect.void
         })
 
-      const settleReceipts = withProjectionGate(Effect.gen(function*() {
+      const settleReceiptsInGate = Effect.gen(function*() {
         const touched = new Map<string, Protocol.EntityKey>()
         let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
         yield* sql.withTransaction(Effect.gen(function*() {
@@ -1093,7 +1249,10 @@ export const layer = (
         if (touched.size > 0) yield* rebuildProjection
         if (touched.size > 0) yield* invalidate(Array.from(touched.values()))
         if (prunedReceiptIds.length > 0) yield* invalidate([], prunedReceiptIds)
-      })).pipe(Effect.withSpan("LocalStore.settleReceipts"))
+      })
+      const settleReceipts = withProjectionGate(settleReceiptsInGate).pipe(
+        Effect.withSpan("LocalStore.settleReceipts")
+      )
 
       const applyReceipts = (receipts: ReadonlyArray<Protocol.Receipt>) =>
         Effect.gen(function*() {
@@ -1169,6 +1328,135 @@ export const layer = (
           Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))),
           Effect.withSpan("LocalStore.setScope")
         )
+
+      const resolveQuarantine = (receipt: Protocol.Receipt, disposition: QuarantineDisposition = "Resubmit") =>
+        withProjectionGate(Effect.gen(function*() {
+          const transactionResult = yield* sql.withTransaction(Effect.gen(function*() {
+            yield* validateFence(yield* meta)
+            const found = yield* findQuarantineByMutation(receipt.mutationId).pipe(
+              Effect.mapError(StorageUnavailable.make)
+            )
+            if (Option.isNone(found)) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Receipt does not match quarantined mutation ${receipt.mutationId}`
+              })
+            }
+            const item = yield* decodeQuarantineRow(found.value)
+            if (
+              receipt.spaceId !== item.envelope.spaceId ||
+              receipt.clientId !== item.envelope.clientId ||
+              receipt.membershipIncarnation !== item.envelope.membershipIncarnation ||
+              receipt.localSequence !== item.envelope.localSequence
+            ) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Receipt does not match quarantined mutation ${receipt.mutationId}`
+              })
+            }
+            const canceledTouched = new Map<string, Protocol.EntityKey>()
+            let canceledReplacement: Option.Option<Quarantine.QuarantinedMutation> = Option.none()
+            const intent = yield* findQuarantineResubmission(receipt.mutationId).pipe(
+              Effect.mapError(StorageUnavailable.make)
+            )
+            const preservesReplacement = disposition === "Resubmit" &&
+              receipt._tag === "Rejected" && receipt.origin === "Quarantine"
+            if (Option.isSome(intent) && !preservesReplacement) {
+              const pendingReplacement = yield* findPendingByMutation(intent.value.replacement_mutation_id).pipe(
+                Effect.mapError(StorageUnavailable.make)
+              )
+              if (Option.isSome(pendingReplacement)) {
+                const replacement = yield* decodePendingRow(pendingReplacement.value)
+                for (const change of replacement.changes) {
+                  canceledTouched.set(SqlTransaction.entityKey(change.entity), change.entity)
+                }
+                const canceled = {
+                  envelope: replacement.envelope,
+                  rejection: "Quarantine resubmission canceled",
+                  targetSchema: options.definition.schemaIdentity
+                } satisfies Quarantine.QuarantinedMutation
+                yield* sql`INSERT INTO effect_local_client_quarantine
+                  (space_id, membership_incarnation, mutation_id, local_sequence, basis, name, payload_json,
+                    digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
+                    rejection_json, target_schema_version, target_schema_hash)
+                  VALUES (${options.spaceId}, ${replacement.envelope.membershipIncarnation},
+                    ${replacement.envelope.mutationId}, ${replacement.envelope.localSequence},
+                    ${replacement.envelope.basis}, ${replacement.envelope.name},
+                    ${yield* Codec.stringify(replacement.envelope.payload)}, ${replacement.envelope.digest},
+                    ${replacement.envelope.digestVersion}, ${replacement.envelope.sourceSchema.version},
+                    ${replacement.envelope.sourceSchema.hash}, ${replacement.envelope.mutationVersion},
+                    ${yield* Codec.stringify(canceled.rejection)}, ${canceled.targetSchema.version},
+                    ${canceled.targetSchema.hash})`
+                yield* sql`DELETE FROM effect_local_client_pending_data
+                  WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
+                    AND mutation_id = ${replacement.envelope.mutationId}`
+                canceledReplacement = Option.some(canceled)
+                yield* requestProjectionReplay(yield* meta)
+              } else {
+                const quarantinedReplacement = yield* findQuarantineByMutation(
+                  intent.value.replacement_mutation_id
+                ).pipe(Effect.mapError(StorageUnavailable.make))
+                if (Option.isNone(quarantinedReplacement)) {
+                  return yield* new ReplicaError.StorageCorrupt({
+                    message: `Quarantine resubmission ${receipt.mutationId} is missing its replacement`
+                  })
+                }
+                canceledReplacement = Option.some(yield* decodeQuarantineRow(quarantinedReplacement.value))
+              }
+            }
+            const existingCancellation = yield* findQuarantineCancellationByCurrent(receipt.mutationId).pipe(
+              Effect.mapError(StorageUnavailable.make)
+            )
+            if (Option.isSome(canceledReplacement)) {
+              if (Option.isSome(existingCancellation)) {
+                yield* sql`UPDATE effect_local_client_quarantine_cancellations
+                  SET current_mutation_id = ${canceledReplacement.value.envelope.mutationId}
+                  WHERE space_id = ${options.spaceId}
+                    AND root_mutation_id = ${existingCancellation.value.root_mutation_id}`
+              } else {
+                yield* sql`INSERT INTO effect_local_client_quarantine_cancellations
+                  (space_id, root_mutation_id, current_mutation_id)
+                  VALUES (${options.spaceId}, ${receipt.mutationId},
+                    ${canceledReplacement.value.envelope.mutationId})`
+              }
+            } else if (Option.isSome(existingCancellation)) {
+              yield* sql`DELETE FROM effect_local_client_quarantine_cancellations
+                WHERE space_id = ${options.spaceId}
+                  AND root_mutation_id = ${existingCancellation.value.root_mutation_id}`
+            }
+            yield* sql`INSERT INTO effect_local_client_pending_data
+              (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, basis, name,
+                payload_json, digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
+                optimistic_result_json, changes_json)
+              VALUES (${options.spaceId}, ${activeGeneration}, ${item.envelope.membershipIncarnation},
+                ${item.envelope.mutationId}, ${item.envelope.localSequence}, ${item.envelope.basis},
+                ${item.envelope.name}, ${yield* Codec.stringify(item.envelope.payload)}, ${item.envelope.digest},
+                ${item.envelope.digestVersion}, ${item.envelope.sourceSchema.version},
+                ${item.envelope.sourceSchema.hash}, ${item.envelope.mutationVersion}, 'null', '[]')`
+            if ((yield* Protocol.encodedBytesEffect(receipt)) > Protocol.maximumReceiptBytes) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Receipt ${receipt.mutationId} exceeds the protocol byte limit`
+              })
+            }
+            const pruned = yield* pruneReceipts(options.retainedReceipts)
+            const receiptCount = yield* countReceipts(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            if (receiptCount.count >= options.maximumReceipts) {
+              return yield* new ReplicaError.CapacityExceeded({
+                resource: "client receipts",
+                limit: options.maximumReceipts
+              })
+            }
+            yield* insertReceipt(receipt, item.envelope)
+            yield* sql`DELETE FROM effect_local_client_quarantine_resubmissions
+              WHERE space_id = ${options.spaceId} AND original_mutation_id = ${receipt.mutationId}`
+            yield* sql`DELETE FROM effect_local_client_quarantine
+              WHERE space_id = ${options.spaceId} AND mutation_id = ${receipt.mutationId}`
+            return { canceledReplacement, touched: Array.from(canceledTouched.values()), receiptIds: pruned }
+          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          yield* settleReceiptsInGate
+          yield* invalidate(transactionResult.touched, [receipt.mutationId, ...transactionResult.receiptIds])
+          return transactionResult.canceledReplacement
+        })).pipe(Effect.withSpan("LocalStore.resolveQuarantine", {
+          attributes: { "mutation.id": receipt.mutationId, "quarantine.disposition": disposition }
+        }))
 
       const validateManifest = (manifest: Protocol.SnapshotManifest) =>
         Effect.gen(function*() {
@@ -1791,101 +2079,185 @@ export const layer = (
           attributes: { "reconciliation.generation": generation }
         }))
 
-      yield* projectionGate.withPermit(rebuildProjection)
-
-      const service: Service = {
-        membershipIncarnation: initializedMeta.membership_incarnation,
-        mutate: (mutation, payloadValue) =>
-          withProjectionGate(Effect.gen(function*() {
-            const result = yield* sql.withTransaction(Effect.gen(function*() {
-              const storedMeta = yield* meta
-              yield* validateFence(storedMeta)
-              yield* nextReconciliationGeneration(storedMeta.requested_generation)
-              if (storedMeta.next_local_sequence >= Number.MAX_SAFE_INTEGER) {
-                return yield* new ReplicaError.CapacityExceeded({
-                  resource: "local sequence",
-                  limit: Number.MAX_SAFE_INTEGER - 1
-                })
-              }
-              const count = yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))
-              if (count.count >= maximumPending) {
-                return yield* new ReplicaError.CapacityExceeded({
-                  resource: "pending mutations",
-                  limit: maximumPending
-                })
-              }
-              const mutationId = yield* Identity.makeMutationId.pipe(Effect.provideService(Crypto.Crypto, crypto))
-              const encodedPayload = yield* Codec.encode(mutation.payloadSchema, payloadValue)
-              const payloadJsonValue = yield* Schema.decodeUnknownEffect(Schema.Json)(encodedPayload).pipe(
-                Effect.mapError((cause) =>
-                  new ReplicaError.StorageCorrupt({ message: "Mutation payload is not JSON", cause })
-                )
-              )
-              const identity = {
-                spaceId: options.spaceId,
-                clientId: options.clientId,
-                mutationId,
-                localSequence: storedMeta.next_local_sequence,
-                basis: storedMeta.server_cursor,
-                name: mutation.name,
-                payload: payloadJsonValue,
-                digestVersion: 3 as const,
-                membershipIncarnation: storedMeta.membership_incarnation,
-                sourceSchema: options.definition.schemaIdentity,
-                mutationVersion: mutation.version
-              }
-              const digest = yield* Protocol.mutationDigest(identity).pipe(
-                Effect.provideService(Crypto.Crypto, crypto)
-              )
-              const envelope = yield* Codec.decode(Protocol.MutationEnvelope, { ...identity, digest })
-              if ((yield* Protocol.encodedBytesEffect(envelope)) > Protocol.maximumMutationBytes) {
-                return yield* new ReplicaError.CapacityExceeded({
-                  resource: "mutation bytes",
-                  limit: Protocol.maximumMutationBytes
-                })
-              }
-              const changes: Array<Protocol.EntityChange> = []
-              const executed = yield* runtime.execute(
-                mutation.name,
-                payloadJsonValue,
-                SqlTransaction.local({
-                  sql,
-                  table: "visible",
-                  spaceId: options.spaceId,
-                  schemaGeneration: storedMeta.active_schema_generation,
-                  projectionGeneration: storedMeta.active_projection_generation,
-                  changes
-                }),
-                changes
-              )
-              if (Result.isFailure(executed)) {
-                const rejection = yield* Codec.decode(mutation.rejectionSchema, executed.failure)
-                return yield* Effect.fail(rejection)
-              }
-              const pendingMutation: Protocol.PendingMutation = {
-                envelope,
-                optimisticResult: executed.success.result,
-                changes
-              }
-              yield* sql`INSERT INTO effect_local_client_pending_data
+      const mutateInTransaction = <M extends Mutation.Any,>(
+        mutation: M,
+        payloadValue: Mutation.Payload<M>,
+        replacingQuarantine = false
+      ) =>
+        Effect.gen(function*() {
+          const storedMeta = yield* meta
+          yield* validateFence(storedMeta)
+          yield* nextReconciliationGeneration(storedMeta.requested_generation)
+          if (storedMeta.next_local_sequence >= Number.MAX_SAFE_INTEGER) {
+            return yield* new ReplicaError.CapacityExceeded({
+              resource: "local sequence",
+              limit: Number.MAX_SAFE_INTEGER - 1
+            })
+          }
+          const pendingCount = yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const quarantineCount = yield* countQuarantine(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          let unresolvedCount = pendingCount.count + quarantineCount.count
+          if (replacingQuarantine) unresolvedCount -= 1
+          if (unresolvedCount >= maximumPending) {
+            return yield* new ReplicaError.CapacityExceeded({
+              resource: "pending mutations",
+              limit: maximumPending
+            })
+          }
+          const mutationId = yield* Identity.makeMutationId.pipe(Effect.provideService(Crypto.Crypto, crypto))
+          const encodedPayload = yield* Codec.encode(mutation.payloadSchema, payloadValue)
+          const payloadJsonValue = yield* Schema.decodeUnknownEffect(Schema.Json)(encodedPayload).pipe(
+            Effect.mapError((cause) =>
+              new ReplicaError.StorageCorrupt({ message: "Mutation payload is not JSON", cause })
+            )
+          )
+          const identity = {
+            spaceId: options.spaceId,
+            clientId: options.clientId,
+            mutationId,
+            localSequence: storedMeta.next_local_sequence,
+            basis: storedMeta.server_cursor,
+            name: mutation.name,
+            payload: payloadJsonValue,
+            digestVersion: 3 as const,
+            membershipIncarnation: storedMeta.membership_incarnation,
+            sourceSchema: options.definition.schemaIdentity,
+            mutationVersion: mutation.version
+          }
+          const digest = yield* Protocol.mutationDigest(identity).pipe(
+            Effect.provideService(Crypto.Crypto, crypto)
+          )
+          const envelope = yield* Codec.decode(Protocol.MutationEnvelope, { ...identity, digest })
+          if ((yield* Protocol.encodedBytesEffect(envelope)) > Protocol.maximumMutationBytes) {
+            return yield* new ReplicaError.CapacityExceeded({
+              resource: "mutation bytes",
+              limit: Protocol.maximumMutationBytes
+            })
+          }
+          const changes: Array<Protocol.EntityChange> = []
+          const executed = yield* runtime.execute(
+            mutation.name,
+            payloadJsonValue,
+            SqlTransaction.local({
+              sql,
+              table: "visible",
+              spaceId: options.spaceId,
+              schemaGeneration: storedMeta.active_schema_generation,
+              projectionGeneration: storedMeta.active_projection_generation,
+              changes
+            }),
+            changes
+          )
+          if (Result.isFailure(executed)) {
+            const rejection = yield* Codec.decode(mutation.rejectionSchema, executed.failure)
+            return yield* Effect.fail(rejection)
+          }
+          const pendingMutation: Protocol.PendingMutation = {
+            envelope,
+            optimisticResult: executed.success.result,
+            changes
+          }
+          yield* sql`INSERT INTO effect_local_client_pending_data
             (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, basis, name,
               payload_json, digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
               optimistic_result_json, changes_json)
-            VALUES (${options.spaceId}, ${storedMeta.active_schema_generation}, ${envelope.membershipIncarnation}, ${mutationId},
-              ${envelope.localSequence}, ${envelope.basis}, ${envelope.name},
+            VALUES (${options.spaceId}, ${storedMeta.active_schema_generation}, ${envelope.membershipIncarnation},
+              ${mutationId}, ${envelope.localSequence}, ${envelope.basis}, ${envelope.name},
               ${yield* Codec.stringify(envelope.payload)}, ${digest}, ${envelope.digestVersion},
-              ${envelope.sourceSchema.version}, ${envelope.sourceSchema.hash}, ${envelope.mutationVersion}, ${yield* Codec
-                .stringify(
-                  executed.success.result
-                )},
-              ${yield* Codec.stringify(changes)})`
-              yield* sql`UPDATE effect_local_client_spaces
+              ${envelope.sourceSchema.version}, ${envelope.sourceSchema.hash}, ${envelope.mutationVersion},
+              ${yield* Codec.stringify(executed.success.result)}, ${yield* Codec.stringify(changes)})`
+          yield* sql`UPDATE effect_local_client_spaces
             SET next_local_sequence = next_local_sequence + 1,
                 visible_revision = visible_revision + 1,
                 requested_generation = requested_generation + 1
             WHERE space_id = ${options.spaceId}`
-              return pendingMutation
-            })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          return pendingMutation
+        })
+
+      const ensureQuarantineResubmission = <M extends Mutation.Any,>(
+        mutationId: Identity.MutationId,
+        mutation: M,
+        payload: Mutation.Payload<M>
+      ) =>
+        withProjectionGate(Effect.gen(function*() {
+          const result = yield* sql.withTransaction(Effect.gen(function*() {
+            const quarantined = yield* findQuarantineByMutation(mutationId).pipe(
+              Effect.mapError(StorageUnavailable.make)
+            )
+            if (Option.isNone(quarantined)) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Quarantined mutation ${mutationId} was not found`
+              })
+            }
+            const item = yield* decodeQuarantineRow(quarantined.value)
+            if (mutation.name !== item.envelope.name) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
+              })
+            }
+            const encodedPayload = yield* Codec.encode(mutation.payloadSchema, payload)
+            const requestedPayload = yield* Schema.decodeUnknownEffect(Schema.Json)(encodedPayload).pipe(
+              Effect.mapError((cause) =>
+                new ReplicaError.StorageCorrupt({ message: "Mutation payload is not JSON", cause })
+              )
+            )
+            const existing = yield* findQuarantineResubmission(mutationId).pipe(
+              Effect.mapError(StorageUnavailable.make)
+            )
+            if (Option.isSome(existing)) {
+              const pendingRow = yield* findPendingByMutation(existing.value.replacement_mutation_id).pipe(
+                Effect.mapError(StorageUnavailable.make)
+              )
+              let replacement: Protocol.PendingMutation | Quarantine.QuarantinedMutation
+              if (Option.isSome(pendingRow)) {
+                replacement = yield* decodePendingRow(pendingRow.value)
+              } else {
+                const quarantineRow = yield* findQuarantineByMutation(existing.value.replacement_mutation_id).pipe(
+                  Effect.mapError(StorageUnavailable.make)
+                )
+                if (Option.isNone(quarantineRow)) {
+                  return yield* new ReplicaError.StorageCorrupt({
+                    message: `Quarantine resubmission ${mutationId} is missing its replacement`
+                  })
+                }
+                replacement = yield* decodeQuarantineRow(quarantineRow.value)
+              }
+              if (
+                replacement.envelope.name !== mutation.name ||
+                replacement.envelope.mutationVersion !== mutation.version ||
+                (yield* Canonical.stringifyEffect(replacement.envelope.payload)) !==
+                  (yield* Canonical.stringifyEffect(requestedPayload))
+              ) {
+                return yield* new ReplicaError.QuarantineResubmissionConflict({ mutationId })
+              }
+              if ("rejection" in replacement) {
+                const rejection = yield* Codec.decode(mutation.rejectionSchema, replacement.rejection)
+                return yield* Effect.fail(rejection)
+              }
+              return replacement
+            }
+            const pendingMutation = yield* mutateInTransaction(mutation, payload, true)
+            yield* sql`INSERT INTO effect_local_client_quarantine_resubmissions
+              (space_id, original_mutation_id, replacement_mutation_id)
+              VALUES (${options.spaceId}, ${mutationId}, ${pendingMutation.envelope.mutationId})`
+            return pendingMutation
+          })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          yield* invalidate(result.changes.map((change) => change.entity))
+          return result
+        })).pipe(Effect.withSpan("LocalStore.ensureQuarantineResubmission", {
+          attributes: { "mutation.id": mutationId, "mutation.name": mutation.name }
+        }))
+
+      yield* projectionGate.withPermit(rebuildProjection)
+
+      const service: Service = {
+        membershipIncarnation: initializedMeta.membership_incarnation,
+        schema: options.definition.schemaIdentity,
+        mutate: (mutation, payloadValue) =>
+          withProjectionGate(Effect.gen(function*() {
+            const result = yield* sql.withTransaction(mutateInTransaction(mutation, payloadValue)).pipe(
+              Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
+            )
             yield* invalidate(result.changes.map((change) => change.entity))
             return result
           })).pipe(Effect.withSpan("LocalStore.mutate", {
@@ -1911,6 +2283,11 @@ export const layer = (
             )
           })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))),
         pending,
+        quarantine,
+        quarantineByMutation,
+        quarantineCancellation,
+        ensureQuarantineResubmission,
+        resolveQuarantine,
         receipt: (mutationId) =>
           sql.withTransaction(Effect.gen(function*() {
             yield* validateFence(yield* meta)

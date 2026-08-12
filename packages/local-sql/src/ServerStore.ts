@@ -52,6 +52,10 @@ export interface Service {
     request: Protocol.SubmitRequest,
     principal: typeof Schema.Json.Type
   ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
+  readonly discard: (
+    request: Protocol.DiscardRequest,
+    principal: typeof Schema.Json.Type
+  ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
   readonly pull: (
     request: Protocol.PullRequest | Omit<Protocol.PullRequest, "schema">
   ) => Effect.Effect<Protocol.PullResult, ReplicaError.ReplicaError>
@@ -84,6 +88,7 @@ export class ServerStore extends Context.Service<ServerStore, Service>()(
 export interface Options<R = never,> extends HistoryOptions {
   readonly definition: Definition.Any
   readonly evolution?: Evolution.Evolution
+  readonly acceptedSchemaVersions?: number
   readonly schemaEvolutionBatchSize?: number
   readonly schemaEvolutionBatchBytes?: number
   readonly authorizeAccess: (input: {
@@ -200,6 +205,33 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
       const crypto = yield* Crypto.Crypto
       const runtime = yield* MutationRuntime.MutationRuntime
       const evolution = options.evolution ?? Evolution.make({ current: options.definition })
+      const acceptedSchemaVersions = options.acceptedSchemaVersions ?? 0
+      if (!Number.isSafeInteger(acceptedSchemaVersions) || acceptedSchemaVersions < 0) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "acceptedSchemaVersions",
+          message: "acceptedSchemaVersions must be a nonnegative safe integer"
+        })
+      }
+      if (acceptedSchemaVersions > evolution.steps.length) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "acceptedSchemaVersions",
+          message: "acceptedSchemaVersions exceeds the configured evolution history"
+        })
+      }
+      const minimumAcceptedSchemaVersion = options.definition.version - acceptedSchemaVersions
+      if (acceptedSchemaVersions > 0) {
+        for (const entry of evolution.steps.slice(-acceptedSchemaVersions)) {
+          yield* Evolution.validateDowngradeTarget(evolution, entry.from.schemaIdentity).pipe(
+            Effect.mapError(() =>
+              new ReplicaError.InvalidConfiguration({
+                option: "acceptedSchemaVersions",
+                message:
+                  `Schema ${entry.from.schemaIdentity.version}:${entry.from.schemaIdentity.hash} cannot be projected from the current definition`
+              })
+            )
+          )
+        }
+      }
       const context = yield* Effect.context<R>()
       const readAuthorizationRefreshMillis = yield* Configuration.positiveFiniteDurationMillis(
         "readAuthorizationRefreshInterval",
@@ -223,7 +255,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         })
       }
       yield* Migrations.server(options.migration)
-
       const wakes = yield* RcMap.make({
         lookup: (_spaceId: Identity.SpaceId) =>
           Effect.acquireRelease(PubSub.sliding<InternalWake>(wakeCapacity), PubSub.shutdown)
@@ -541,10 +572,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         }).pipe(Effect.provide(context), Effect.result, Effect.map(Result.isSuccess))
 
       const validateCallerSchema = (schema: Identity.SchemaIdentity) => {
-        if (
-          schema.version === options.definition.schemaIdentity.version &&
-          schema.hash === options.definition.schemaIdentity.hash
-        ) return Effect.void
+        const definition = evolution.definitionByIdentity.get(`${schema.version}:${schema.hash}`)
+        if (definition !== undefined && definition.version >= minimumAcceptedSchemaVersion) {
+          return Effect.succeed(definition)
+        }
         return Effect.fail(
           new ReplicaError.StaleSchema({
             expectedVersion: options.definition.schemaIdentity.version,
@@ -554,6 +585,68 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           })
         )
       }
+
+      const projectReceipt = (receipt: Protocol.Receipt, target: Definition.Any) =>
+        Effect.gen(function*() {
+          if (
+            receipt._tag === "Legacy" ||
+            (receipt.sourceSchema.version === target.schemaIdentity.version &&
+              receipt.sourceSchema.hash === target.schemaIdentity.hash)
+          ) return receipt
+          const mutation = target.mutationByName.get(receipt.name)
+          if (mutation === undefined) {
+            return yield* new ReplicaError.SchemaEvolutionUnsupported({
+              sourceVersion: receipt.sourceSchema.version,
+              sourceHash: receipt.sourceSchema.hash,
+              targetVersion: target.schemaIdentity.version,
+              targetHash: target.schemaIdentity.hash
+            })
+          }
+          if (receipt._tag === "Expired") {
+            return Protocol.ExpiredReceipt.make({
+              ...receipt,
+              sourceSchema: target.schemaIdentity,
+              mutationVersion: mutation.version
+            })
+          }
+          if (receipt._tag === "Rejected" && receipt.origin !== "Mutation") {
+            return Protocol.RejectedReceipt.make({
+              ...receipt,
+              sourceSchema: target.schemaIdentity,
+              mutationVersion: mutation.version
+            })
+          }
+          if (receipt._tag === "Accepted") {
+            const result = yield* Evolution.migrateMutationSuccessTo({
+              evolution,
+              source: receipt.sourceSchema,
+              target: target.schemaIdentity,
+              mutation: receipt.name,
+              mutationVersion: receipt.mutationVersion,
+              value: receipt.result
+            })
+            return Protocol.AcceptedReceipt.make({
+              ...receipt,
+              sourceSchema: result.schemaIdentity,
+              mutationVersion: result.mutationVersion,
+              result: result.value
+            })
+          }
+          const rejection = yield* Evolution.migrateMutationRejectionTo({
+            evolution,
+            source: receipt.sourceSchema,
+            target: target.schemaIdentity,
+            mutation: receipt.name,
+            mutationVersion: receipt.mutationVersion,
+            value: receipt.rejection
+          })
+          return Protocol.RejectedReceipt.make({
+            ...receipt,
+            sourceSchema: rejection.schemaIdentity,
+            mutationVersion: rejection.mutationVersion,
+            rejection: rejection.value
+          })
+        })
 
       const validateStoredSpace = (space: typeof Rows.ServerMetaRow.Type) => {
         if (
@@ -608,21 +701,45 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         }).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const bootstrapEntityFits = (spaceId: Identity.SpaceId, entity: Protocol.SnapshotEntity) =>
-        Protocol.encodedBytesEffect({
-          manifest: {
-            spaceId,
-            definitionHash: options.definition.hash,
-            schema: options.definition.schemaIdentity,
-            snapshotId: Identity.SnapshotId.make("snp_ffffffff-ffff-4fff-bfff-ffffffffffff"),
-            sequence: Identity.ServerSequence.make(Number.MAX_SAFE_INTEGER),
-            terminalSequenceThrough: Identity.TerminalSequence.make(Number.MAX_SAFE_INTEGER),
-            entityCount: options.maximumSnapshotEntities,
-            contentBytes: options.maximumSnapshotBytes,
-            digest: Protocol.SnapshotDigest.make("f".repeat(64))
-          },
-          entities: [entity],
-          hasMore: true
-        }).pipe(Effect.map((bytes) => bytes <= options.maximumBootstrapPageBytes))
+        Effect.gen(function*() {
+          const change = Protocol.Upsert.make({
+            entity: Protocol.EntityKey.make({
+              model: entity.model,
+              modelVersion: entity.modelVersion,
+              key: entity.key
+            }),
+            value: entity.value
+          })
+          const entry = Protocol.SnapshotEntry.make({
+            ordinal: 0,
+            change,
+            entryBytes: yield* Protocol.encodedBytesEffect(change)
+          })
+          const page = Protocol.BootstrapPage.make({
+            manifest: {
+              spaceId,
+              clientId: Identity.ClientId.make("cli_ffffffff-ffff-4fff-bfff-ffffffffffff"),
+              definitionHash: options.definition.hash,
+              schema: options.definition.schemaIdentity,
+              scopeDigest: Protocol.MutationDigest.make("f".repeat(64)),
+              scopeGeneration: Identity.ReplicationScopeGeneration.make(Number.MAX_SAFE_INTEGER),
+              cursor: Protocol.ReplicationCursor.make({
+                viewId: Identity.ReplicationViewId.make("viw_ffffffff-ffff-4fff-bfff-ffffffffffff"),
+                revision: Identity.ReplicationViewRevision.make(Number.MAX_SAFE_INTEGER)
+              }),
+              snapshotId: Identity.SnapshotId.make("snp_ffffffff-ffff-4fff-bfff-ffffffffffff"),
+              sequence: Identity.ServerSequence.make(Number.MAX_SAFE_INTEGER),
+              terminalSequenceThrough: Identity.TerminalSequence.make(Number.MAX_SAFE_INTEGER),
+              entityCount: options.maximumSnapshotEntities,
+              contentBytes: options.maximumSnapshotBytes,
+              digest: Protocol.SnapshotDigest.make("f".repeat(64))
+            },
+            entries: [entry],
+            hasMore: true,
+            serverSchema: options.definition.schemaIdentity
+          })
+          return (yield* Protocol.encodedBytesEffect(page)) <= options.maximumBootstrapPageBytes
+        })
 
       const decodeEntityRows = (spaceId: Identity.SpaceId, rows: ReadonlyArray<typeof Rows.ServerEntityRow.Type>) =>
         Effect.gen(function*() {
@@ -750,7 +867,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         const submittedEnvelope = request.envelope
         return Effect.gen(function*() {
           yield* authorizeAccess(submittedEnvelope, principal)
-          yield* validateCallerSchema(request.schema)
+          const callerDefinition = yield* validateCallerSchema(request.schema)
           const exactReceipt = yield* findReceiptByMutation({
             spaceId: submittedEnvelope.spaceId,
             mutationId: submittedEnvelope.mutationId
@@ -762,7 +879,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               })
             }
             return yield* decodeStoredReceipt(exactReceipt.value, submittedEnvelope).pipe(
-              Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution))
+              Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution)),
+              Effect.flatMap((receipt) => projectReceipt(receipt, callerDefinition))
             )
           }
           const envelope = submittedEnvelope
@@ -820,7 +938,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
               }
               return yield* decodeStoredReceipt(committedByMutation.value, envelope).pipe(
-                Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution))
+                Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution)),
+                Effect.flatMap((receipt) => projectReceipt(receipt, callerDefinition))
               )
             }
             const committedBySequence = yield* findReceiptBySequence({
@@ -835,19 +954,22 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             yield* validateStoredSpace(storedSpace)
             if (envelope.localSequence <= client.expired_local_sequence) {
               const manifest = yield* currentManifest(envelope.spaceId, storedSpace)
-              return Protocol.ExpiredReceipt.make({
-                spaceId: envelope.spaceId,
-                clientId: envelope.clientId,
-                membershipIncarnation,
-                mutationId: envelope.mutationId,
-                localSequence: envelope.localSequence,
-                name: mutation.name,
-                sourceSchema: options.definition.schemaIdentity,
-                mutationVersion: mutation.mutationVersion,
-                snapshotId: manifest.snapshotId,
-                snapshotSequence: manifest.sequence,
-                terminalSequenceThrough: manifest.terminalSequenceThrough
-              })
+              return yield* projectReceipt(
+                Protocol.ExpiredReceipt.make({
+                  spaceId: envelope.spaceId,
+                  clientId: envelope.clientId,
+                  membershipIncarnation,
+                  mutationId: envelope.mutationId,
+                  localSequence: envelope.localSequence,
+                  name: mutation.name,
+                  sourceSchema: options.definition.schemaIdentity,
+                  mutationVersion: mutation.mutationVersion,
+                  snapshotId: manifest.snapshotId,
+                  snapshotSequence: manifest.sequence,
+                  terminalSequenceThrough: manifest.terminalSequenceThrough
+                }),
+                callerDefinition
+              )
             }
             if (envelope.localSequence <= client.last_local_sequence) {
               return yield* new ReplicaError.StorageCorrupt({
@@ -974,19 +1096,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                         changes: result.success.changes
                       })
                       const entryBytes = yield* Protocol.encodedBytesEffect(entry)
-                      if (
-                        (yield* Protocol.encodedBytesEffect({ entries: [entry], hasMore: false })) >
-                          Protocol.maximumBatchBytes
-                      ) {
-                        return yield* new TerminalRejection.TerminalRejection({
-                          origin: "Capacity",
-                          rejection: {
-                            _tag: "CapacityExceeded",
-                            resource: "accepted mutation bytes",
-                            limit: Protocol.maximumBatchBytes
-                          }
-                        })
-                      }
                       const accepted = Protocol.AcceptedReceipt.make({
                         spaceId: envelope.spaceId,
                         clientId: envelope.clientId,
@@ -1067,7 +1176,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             yield* sql`UPDATE effect_local_server_clients SET last_local_sequence = ${envelope.localSequence}
               WHERE space_id = ${envelope.spaceId} AND client_id = ${envelope.clientId}
                 AND membership_incarnation = ${membershipIncarnation}`
-            return receipt
+            return yield* projectReceipt(receipt, callerDefinition)
           }))
         }).pipe(
           Effect.catchIf(
@@ -1120,6 +1229,150 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               "mutation.id": submittedEnvelope.mutationId,
               "space.id": submittedEnvelope.spaceId
             }
+          })
+        )
+      }
+
+      const discard = (request: Protocol.DiscardRequest, principal: typeof Schema.Json.Type) => {
+        const submittedEnvelope = request.envelope
+        return Effect.gen(function*() {
+          yield* authorizeAccess(submittedEnvelope, principal)
+          const callerDefinition = yield* validateCallerSchema(request.schema)
+          const exact = yield* findReceiptByMutation({
+            spaceId: submittedEnvelope.spaceId,
+            mutationId: submittedEnvelope.mutationId
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+          if (Option.isSome(exact)) {
+            if (exact.value.digest !== submittedEnvelope.digest) {
+              return yield* new ReplicaError.MutationIdentityConflict({ mutationId: submittedEnvelope.mutationId })
+            }
+            return yield* decodeStoredReceipt(exact.value, submittedEnvelope).pipe(
+              Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution)),
+              Effect.flatMap((receipt) => projectReceipt(receipt, callerDefinition))
+            )
+          }
+          const envelope = submittedEnvelope
+          const membershipIncarnation = envelope.membershipIncarnation
+          yield* prepareSpace(envelope.spaceId, request.schema)
+          const { digest, ...identity } = envelope
+          const expectedDigest = yield* Protocol.mutationDigest(identity).pipe(
+            Effect.provideService(Crypto.Crypto, crypto)
+          )
+          if (digest !== expectedDigest) {
+            return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
+          }
+          const mutation = yield* runtime.prepare(envelope)
+          return yield* sql.withTransaction(Effect.gen(function*() {
+            yield* sql`INSERT INTO effect_local_server_clients
+              (space_id, client_id, membership_incarnation, last_local_sequence, expired_local_sequence)
+              VALUES (${envelope.spaceId}, ${envelope.clientId}, ${membershipIncarnation}, 0, 0)
+              ON CONFLICT (space_id, client_id, membership_incarnation) DO NOTHING`
+            let storedSpace = yield* lockSpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+            if (storedSpace.metadata_verified === 0) {
+              storedSpace = yield* repairLockedSpace(envelope.spaceId, storedSpace)
+            }
+            yield* validateStoredSpace(storedSpace)
+            const committed = yield* findReceiptByMutation({
+              spaceId: envelope.spaceId,
+              mutationId: envelope.mutationId
+            }).pipe(Effect.mapError(StorageUnavailable.make))
+            if (Option.isSome(committed)) {
+              if (committed.value.digest !== envelope.digest) {
+                return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
+              }
+              return yield* decodeStoredReceipt(committed.value, envelope).pipe(
+                Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution)),
+                Effect.flatMap((receipt) => projectReceipt(receipt, callerDefinition))
+              )
+            }
+            const client = yield* lockClient({
+              spaceId: envelope.spaceId,
+              clientId: envelope.clientId,
+              membershipIncarnation
+            }).pipe(Effect.mapError(StorageUnavailable.make))
+            if (envelope.localSequence <= client.expired_local_sequence) {
+              const manifest = yield* currentManifest(envelope.spaceId, storedSpace)
+              return yield* projectReceipt(
+                Protocol.ExpiredReceipt.make({
+                  spaceId: envelope.spaceId,
+                  clientId: envelope.clientId,
+                  membershipIncarnation,
+                  mutationId: envelope.mutationId,
+                  localSequence: envelope.localSequence,
+                  name: mutation.name,
+                  sourceSchema: options.definition.schemaIdentity,
+                  mutationVersion: mutation.mutationVersion,
+                  snapshotId: manifest.snapshotId,
+                  snapshotSequence: manifest.sequence,
+                  terminalSequenceThrough: manifest.terminalSequenceThrough
+                }),
+                callerDefinition
+              )
+            }
+            if (envelope.localSequence <= client.last_local_sequence) {
+              return yield* new ReplicaError.StorageCorrupt({
+                message: `Client ${envelope.clientId} is missing retained receipt ${envelope.localSequence}`
+              })
+            }
+            const expected = client.last_local_sequence + 1
+            if (envelope.localSequence !== expected) {
+              return yield* new ReplicaError.OutOfOrderMutation({ expected, actual: envelope.localSequence })
+            }
+            if (storedSpace.retained_receipt_count >= options.maximumReceipts) {
+              return yield* new ReplicaError.CapacityExceeded({
+                resource: "server receipts",
+                limit: options.maximumReceipts
+              })
+            }
+            if (storedSpace.next_terminal_sequence >= Number.MAX_SAFE_INTEGER) {
+              return yield* new ReplicaError.CapacityExceeded({
+                resource: "terminal sequence",
+                limit: Number.MAX_SAFE_INTEGER - 1
+              })
+            }
+            const terminalSequence = Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
+            const receipt = Protocol.RejectedReceipt.make({
+              spaceId: envelope.spaceId,
+              clientId: envelope.clientId,
+              membershipIncarnation,
+              mutationId: envelope.mutationId,
+              localSequence: envelope.localSequence,
+              name: mutation.name,
+              sourceSchema: options.definition.schemaIdentity,
+              mutationVersion: mutation.mutationVersion,
+              origin: "Quarantine",
+              terminalSequence,
+              rejection: { _tag: "Quarantined" }
+            })
+            yield* sql`INSERT INTO effect_local_server_receipts
+              (space_id, client_id, membership_incarnation, local_sequence, mutation_id, digest,
+                terminal_sequence, server_sequence, receipt_json, digest_version, source_schema_version,
+                source_schema_hash, mutation_version, mutation_name, rejection_origin)
+              VALUES (${envelope.spaceId}, ${envelope.clientId}, ${membershipIncarnation},
+                ${envelope.localSequence}, ${envelope.mutationId}, ${envelope.digest},
+                ${terminalSequence}, NULL, ${yield* Codec.stringify(receipt)},
+                ${envelope.digestVersion}, ${receipt.sourceSchema.version}, ${receipt.sourceSchema.hash},
+                ${receipt.mutationVersion}, ${receipt.name}, ${receipt.origin})`
+            yield* sql`UPDATE effect_local_server_spaces SET next_terminal_sequence = next_terminal_sequence + 1
+              WHERE space_id = ${envelope.spaceId}`
+            yield* sql`UPDATE effect_local_server_clients SET last_local_sequence = ${envelope.localSequence}
+              WHERE space_id = ${envelope.spaceId} AND client_id = ${envelope.clientId}
+                AND membership_incarnation = ${membershipIncarnation}`
+            return yield* projectReceipt(receipt, callerDefinition)
+          }))
+        }).pipe(
+          Effect.catchIf(
+            SqlError.isSqlError,
+            (cause) =>
+              Effect.fail(
+                new ReplicaError.UnknownCommitOutcome({
+                  mutationId: submittedEnvelope.mutationId,
+                  cause
+                })
+              )
+          ),
+          Effect.withSpan("ServerStore.discard", {
+            attributes: { "mutation.id": submittedEnvelope.mutationId, "space.id": submittedEnvelope.spaceId }
           })
         )
       }
@@ -1313,7 +1566,41 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         authorization: {
           scope: authorizeReadScope,
           entity: authorizeReadEntity
-        }
+        },
+        resolveDefinition: validateCallerSchema,
+        projectEntity: (target, entity, value) =>
+          Effect.gen(function*() {
+            if (!target.modelByName.has(entity.model)) return Option.none()
+            if (
+              target.schemaIdentity.version === options.definition.schemaIdentity.version &&
+              target.schemaIdentity.hash === options.definition.schemaIdentity.hash
+            ) return Option.some({ entity, value })
+            const migrated = yield* Evolution.migrateModelTo({
+              evolution,
+              source: options.definition.schemaIdentity,
+              target: target.schemaIdentity,
+              model: entity.model,
+              modelVersion: entity.modelVersion,
+              key: entity.key,
+              value
+            })
+            if (migrated.value === undefined) {
+              return yield* new ReplicaError.SchemaEvolutionUnsupported({
+                sourceVersion: options.definition.schemaIdentity.version,
+                sourceHash: options.definition.schemaIdentity.hash,
+                targetVersion: target.schemaIdentity.version,
+                targetHash: target.schemaIdentity.hash
+              })
+            }
+            return Option.some({
+              entity: Protocol.EntityKey.make({
+                model: entity.model,
+                modelVersion: migrated.modelVersion,
+                key: migrated.key
+              }),
+              value: migrated.value
+            })
+          })
       })
       const countAcknowledgedEntities = SqlSchema.findOne({
         Request: Schema.Struct({
@@ -1415,6 +1702,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
       return ServerStore.of({
         submit: (request) => admit(trustedSubmitRequest(request), null),
         admit,
+        discard,
         pull: (input) => {
           const request = trustedPullRequest(input)
           return prepareSpace(request.spaceId, request.schema).pipe(

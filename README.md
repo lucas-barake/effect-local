@@ -289,6 +289,177 @@ pnpm circular
 pnpm bench
 ```
 
+## Rolling schema and protocol deployments
+
+A rolling deployment can keep the previous application bundle online while the new server and client bundle roll
+out. Application schema compatibility and wire protocol compatibility are separate controls. The server schema window
+determines which old domain definitions can still sync. Protocol negotiation determines whether two library versions
+can speak the same wire format.
+
+Deploy the compatible server first. A new client cannot negotiate with a server that does not expose the negotiation
+RPC, and an old client needs the new server to project current data back to its schema.
+
+### Define both migration directions
+
+Forward transforms let the current server execute an old mutation. Downgrade transforms let that server return
+receipts, pull entries, and bootstrap snapshots that the old client can decode. For example, suppose version 2 adds a
+`completed` field to `Task` and `PutTask`:
+
+```ts
+import * as Evolution from "@lucas-barake/effect-local/Evolution"
+
+export const evolution = Evolution.make({
+  current: definitionV2,
+  steps: [Evolution.step({
+    id: "definition/1-to-2",
+    from: definitionV1,
+    to: definitionV2,
+    models: [Evolution.model({
+      id: "task/1-to-2",
+      from: TaskV1,
+      to: TaskV2,
+      value: ({ value }) => ({ ...value, completed: false }),
+      downgradeValue: ({ value }) => ({
+        id: value.id,
+        title: value.title
+      })
+    })],
+    mutations: [Evolution.mutation({
+      id: "put-task/1-to-2",
+      from: PutTaskV1,
+      to: PutTaskV2,
+      payload: (payload) => ({ ...payload, completed: false }),
+      success: (success) => ({ ...success, completed: false }),
+      downgradePayload: ({ id, title }) => ({ id, title }),
+      downgradeSuccess: ({ id, title }) => ({ id, title })
+    })]
+  })]
+})
+```
+
+Pass the same `evolution` catalog to the server and the current `SqlReplica`. The client uses it to promote durable
+local state and pending mutations. The server uses it to admit old callers and project current data to them.
+
+### Open the server schema window
+
+`acceptedSchemaVersions` counts immediately preceding definitions in the evolution chain. A value of `1` accepts the
+current definition and version N minus 1. Server layer construction fails with `InvalidConfiguration` if the requested
+window is missing a required downgrade transform.
+
+```ts
+import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
+
+export const ServerLive = ServerStore.layer({
+  ...serverHistory,
+  definition: definitionV2,
+  evolution,
+  acceptedSchemaVersions: 1,
+  authorizeAccess: ({ clientId, principal, spaceId }) => authorizeClient({ clientId, principal, spaceId }),
+  authorizeMutation: ({ mutation, principal }) => authorizeMutation({ mutation, principal }),
+  authorizeRead: ({ principal, spaceId }) => authorizeRead({ principal, spaceId })
+})
+```
+
+The authorization functions above are application Effects. `ServerStore.layerTrusted` remains for tests and already
+trusted processes. Do not use a digest as authorization. Client and space ownership belongs in `authorizeAccess`.
+
+### Negotiate one protocol for sync and presence
+
+During a protocol rollout, advertise the overlap on the server and share one client `ProtocolSession` between sync and
+presence. Sharing the session gives both services one selected version and one renegotiation gate.
+
+```ts
+import * as PresenceClient from "@lucas-barake/effect-local-rpc/PresenceClient"
+import * as ProtocolSession from "@lucas-barake/effect-local-rpc/ProtocolSession"
+import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
+import * as SyncServer from "@lucas-barake/effect-local-rpc/SyncServer"
+import * as Layer from "effect/Layer"
+
+export const ServerRpcLive = SyncServer.layerWithOptions({
+  supportedProtocolVersions: [1, 2]
+})
+
+const session = ProtocolSession.layerWithOptions({
+  supportedProtocolVersions: [1, 2]
+})
+
+export const ClientRpcLive = Layer.merge(
+  SyncClient.layerFromSession,
+  PresenceClient.layerFromSession
+).pipe(
+  Layer.provide(session),
+  Layer.provide(RpcProtocolLive),
+  Layer.provide(AuthenticationLive)
+)
+```
+
+Negotiation selects the highest shared version. A rolling peer that rejects a cached version causes one renegotiation
+and retry. If there is no common version, the client receives terminal `UpgradeRequired` instead of retrying a decode
+failure forever.
+
+### Prompt compatible old clients to reload
+
+An accepted old client continues syncing. Its space status changes to `SchemaUpdateAvailable`, which includes the
+server schema identity so the application can show a reload prompt without treating the replica as failed.
+
+```ts
+import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as Effect from "effect/Effect"
+
+export const promptForReload = Replica.Replica.use((replica) =>
+  Effect.gen(function*() {
+    const space = yield* replica.space(spaceId)
+    const status = yield* space.status
+
+    if (status._tag === "SchemaUpdateAvailable") {
+      yield* showReloadPrompt({ serverVersion: status.serverSchema.version })
+    }
+  })
+)
+```
+
+### Recover a rejected pending mutation
+
+If a pending mutation cannot be replayed during client schema promotion, startup still completes. The original
+envelope and typed rejection move to durable quarantine. That item blocks later pending work from passing its local
+sequence until the application resubmits a corrected payload or explicitly discards it.
+
+```ts
+import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as Effect from "effect/Effect"
+
+export const recoverQuarantine = Replica.Replica.use((replica) =>
+  Effect.gen(function*() {
+    const space = yield* replica.space(spaceId)
+    const [item] = yield* space.quarantine
+
+    if (item !== undefined) {
+      const result = yield* space.resubmitQuarantined(
+        item.envelope.mutationId,
+        PutTaskV2,
+        { id: "task-1", title: "Ship safely", completed: false }
+      )
+
+      if (result._tag === "Resubmitted") {
+        yield* showRecoveredMutation(result.pending.envelope.mutationId)
+      }
+    }
+  })
+)
+```
+
+Use `space.discardQuarantined(item.envelope.mutationId)` when the operation should never run. Discard advances the
+server side client sequence without executing the mutation handler. Both operations are idempotent across interruption
+and restart.
+
+The complete deployment sequence is:
+
+1. Deploy a server that accepts the old schema and advertises both protocol versions.
+2. Deploy the new client bundle with the same evolution catalog and protocol overlap.
+3. Prompt compatible old clients to reload and monitor their remaining usage.
+4. Reduce `acceptedSchemaVersions` only after the application deprecation horizon.
+5. Remove the old protocol version only after no deployed client requires it.
+
 ## Guarantees and limits
 
 - Local mutation commit is atomic in SQLite and does not require a network.
@@ -307,8 +478,7 @@ pnpm bench
   a runner starts again.
 - The server is an authority, not a peer. Conflict behavior is arrival order unless a handler explicitly applies field
   semantics.
-- SQL schemas advance through an ordered checksum validated migration catalog. Stop all old server writers before the
-  lifecycle migration. The migrated schema rejects their legacy write shape so mixed writer versions cannot silently
-  violate retention metadata. There is no backward migration,
-  protocol version negotiation, multi writer browser ownership coordinator, encryption layer, or stable v1
-  compatibility promise yet.
+- SQL storage schemas advance through an ordered checksum validated migration catalog. A lifecycle migration still
+  requires old server writers to stop before they can issue a legacy SQL write shape. This is separate from the
+  supported mixed application schema and wire protocol window. There is no backward SQL migration, multi writer
+  browser ownership coordinator, encryption layer, or stable v1 compatibility promise yet.

@@ -33,6 +33,7 @@ export const layer: Layer.Layer<
           }
           return receipt
         }),
+      discard: (request) => online(request.envelope.spaceId).pipe(Effect.andThen(server.discard(request, null))),
       pull: (request) =>
         Effect.gen(function*() {
           yield* online(request.spaceId)

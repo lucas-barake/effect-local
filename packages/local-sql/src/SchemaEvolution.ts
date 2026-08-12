@@ -15,6 +15,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as Codec from "./internal/codec.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
+import * as TerminalRejection from "./internal/TerminalRejection.js"
 import * as SqlTransaction from "./internal/transaction.js"
 import { MutationRuntime } from "./MutationRuntime.js"
 
@@ -1122,23 +1123,46 @@ export const client = (options: ClientOptions) =>
               yield* registerLineage(change.entity.model, migrated)
             }
             const changes: Array<Protocol.EntityChange> = []
-            const executed = yield* runtime.executeEnvelope(
-              envelope,
-              SqlTransaction.local({
-                sql,
-                table: "visible",
-                spaceId: options.spaceId,
-                schemaGeneration: state.generation,
-                projectionGeneration: state.target_projection_generation,
+            const executed = yield* sql.withTransaction(
+              runtime.executeEnvelope(
+                envelope,
+                SqlTransaction.local({
+                  sql,
+                  table: "visible",
+                  spaceId: options.spaceId,
+                  schemaGeneration: state.generation,
+                  projectionGeneration: state.target_projection_generation,
+                  changes
+                }),
                 changes
-              }),
-              changes
+              ).pipe(
+                Effect.flatMap((result) => {
+                  if (Result.isSuccess(result)) return Effect.succeed(result.success)
+                  return Effect.fail(
+                    new TerminalRejection.TerminalRejection({
+                      origin: "Mutation",
+                      rejection: result.failure
+                    })
+                  )
+                })
+              )
+            ).pipe(
+              Effect.map(Result.succeed),
+              Effect.catchTag("TerminalRejection", ({ rejection }) => Effect.succeed(Result.fail(rejection)))
             )
             if (Result.isFailure(executed)) {
-              return yield* new ReplicaError.PendingMutationEvolutionRejected({
-                mutationId: envelope.mutationId,
-                rejection: executed.failure
-              })
+              yield* sql`INSERT INTO effect_local_client_quarantine
+                (space_id, membership_incarnation, mutation_id, local_sequence, basis, name, payload_json,
+                  digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
+                  rejection_json, target_schema_version, target_schema_hash)
+                VALUES (${options.spaceId}, ${envelope.membershipIncarnation}, ${envelope.mutationId},
+                  ${envelope.localSequence}, ${envelope.basis}, ${envelope.name},
+                  ${yield* Codec.stringify(envelope.payload)}, ${envelope.digest}, ${envelope.digestVersion},
+                  ${envelope.sourceSchema.version}, ${envelope.sourceSchema.hash}, ${envelope.mutationVersion},
+                  ${yield* Codec.stringify(executed.failure)}, ${options.definition.schemaIdentity.version},
+                  ${options.definition.schemaIdentity.hash})
+                ON CONFLICT (space_id, mutation_id) DO NOTHING`
+              continue
             }
             yield* sql`INSERT INTO effect_local_client_pending_data
               (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, basis, name,

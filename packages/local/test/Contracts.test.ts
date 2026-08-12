@@ -201,4 +201,53 @@ describe("domain contracts", () => {
       Schema.decodeUnknownSync(Protocol.MutationEnvelope)({ ...current, membershipIncarnation: undefined })
     )
   })
+
+  it("requires a negotiated protocol version on every operation payload", () => {
+    const spaceId = "spc_00000000-0000-4000-8000-000000000001"
+    const schema = Definition.make({ version: 1, models: [], mutations: [] }).schemaIdentity
+    const envelope = {
+      spaceId,
+      clientId: "cli_00000000-0000-4000-8000-000000000001",
+      membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
+      mutationId: "mut_00000000-0000-4000-8000-000000000001",
+      localSequence: 1,
+      basis: 0,
+      name: "Put",
+      payload: null,
+      digestVersion: 3,
+      sourceSchema: schema,
+      mutationVersion: 1,
+      digest: "0".repeat(64)
+    }
+    const operations = [
+      [Protocol.VersionedSubmitRequest, { envelope, schema }],
+      [Protocol.VersionedDiscardRequest, { envelope, schema }],
+      [Protocol.VersionedPullRequest, { spaceId, schema, after: 0, limit: 1 }],
+      [Protocol.VersionedWatchRequest, { spaceId, schema }],
+      [Protocol.VersionedBootstrapRequest, {
+        spaceId,
+        schema,
+        snapshotId: "snp_00000000-0000-4000-8000-000000000001",
+        afterOrdinal: -1,
+        limit: 1
+      }],
+      [Protocol.VersionedPresenceUpdate, {
+        spaceId,
+        clientId: envelope.clientId,
+        value: null,
+        ttlMillis: 1
+      }],
+      [Protocol.VersionedWatchPresenceRequest, { spaceId }]
+    ] as const
+
+    for (const [contract, operation] of operations) {
+      assert.throws(() => Schema.decodeUnknownSync(contract)(operation))
+      assert.doesNotThrow(() =>
+        Schema.decodeUnknownSync(contract)({
+          ...operation,
+          protocolVersion: Protocol.currentProtocolVersion
+        })
+      )
+    }
+  })
 })

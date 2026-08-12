@@ -145,6 +145,7 @@ const directSync = (server: ServerStore.Service) =>
     SyncEngine.SyncEngine,
     SyncEngine.SyncEngine.of({
       submit: server.submit,
+      discard: (request) => server.discard(request, null),
       pull: server.pull,
       bootstrap: server.bootstrap,
       watch: server.watch
@@ -823,7 +824,8 @@ describe("server reconciled mutation log", () => {
         const stalled = yield* local.stageBootstrapPage(Protocol.BootstrapPage.make({
           manifest: page.manifest,
           entries: [],
-          hasMore: true
+          hasMore: true,
+          serverSchema: page.serverSchema
         })).pipe(Effect.flip)
         assert.strictEqual(stalled._tag, "ProtocolInvalid")
         assert.strictEqual(yield* local.cursor, 0)
@@ -1141,6 +1143,7 @@ describe("server reconciled mutation log", () => {
         const submissions = yield* Ref.make(0)
         const server = yield* service(ServerStore.ServerStore, serverLayer())
         const remote = SyncEngine.SyncEngine.of({
+          discard: () => Effect.die("unexpected discard"),
           submit: (submitted) =>
             Ref.update(submissions, (count) => count + 1).pipe(
               Effect.as(Protocol.RejectedReceipt.make({
@@ -1703,6 +1706,7 @@ describe("server reconciled mutation log", () => {
       let submissions = 0
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
+        discard: () => Effect.die("unexpected discard"),
         submit: ({ envelope: submitted }) =>
           Effect.gen(function*() {
             submissions++
@@ -1958,6 +1962,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: server.pull,
           bootstrap: server.bootstrap,
@@ -2007,6 +2012,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: () => Ref.update(pulls, (count) => count + 1).pipe(Effect.andThen(Effect.fail(stale))),
           bootstrap: () => Effect.fail(stale),
@@ -2038,6 +2044,44 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual((yield* scheduler.status)._tag, "Failed")
     })))
 
+  it.effect("clears the schema update status when the server returns to the client schema", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const observed = yield* Ref.make<Identity.SchemaIdentity>({
+        version: Identity.SchemaVersion.make(Domain.definition.schemaIdentity.version + 1),
+        hash: Identity.SchemaHash.make("ffffffffffffffff")
+      })
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      const remote = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          discard: () => Effect.die("unexpected discard"),
+          submit: () => Effect.die("unexpected submit"),
+          pull: (request) =>
+            Effect.all([server.pull(request), Ref.get(observed)]).pipe(
+              Effect.map(([result, serverSchema]) => ({ ...result, serverSchema }))
+            ),
+          bootstrap: (request) =>
+            Effect.all([server.bootstrap(request), Ref.get(observed)]).pipe(
+              Effect.map(([page, serverSchema]) => ({ ...page, serverSchema }))
+            ),
+          watch: () => Stream.never
+        })
+      )
+      const context = yield* Layer.build(
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(localLayer()),
+          Layer.provide(remote)
+        )
+      )
+      const reconciliation = Context.get(context, Reconciler.Reconciliation)
+      yield* reconciliation.sync
+      assert.strictEqual((yield* reconciliation.status)._tag, "SchemaUpdateAvailable")
+
+      yield* Ref.set(observed, Domain.definition.schemaIdentity)
+      yield* reconciliation.sync
+      assert.strictEqual((yield* reconciliation.status)._tag, "Online")
+    })))
+
   it.effect("retries pending mutations after an interrupted submit", () =>
     Effect.scoped(Effect.gen(function*() {
       const firstAttempt = yield* Deferred.make<void>()
@@ -2047,6 +2091,7 @@ describe("server reconciled mutation log", () => {
       const remote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          discard: () => Effect.die("unexpected discard"),
           submit: ({ envelope: submitted }) =>
             Effect.suspend(() => {
               attempts++

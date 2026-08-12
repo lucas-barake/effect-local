@@ -46,6 +46,7 @@ const remote = Layer.succeed(
   SyncEngine.SyncEngine,
   SyncEngine.SyncEngine.of({
     submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+    discard: () => Effect.die("unexpected discard"),
     pull: () => Effect.never,
     bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
     watch: () => Stream.never
@@ -199,6 +200,7 @@ describe("multi space Replica", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          discard: () => Effect.die("unexpected discard"),
           pull: () => Effect.never,
           bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           watch: () =>
@@ -410,6 +412,7 @@ describe("multi space Replica", () => {
         SyncEngine.SyncEngine.of({
           submit: () =>
             Effect.fail(new ReplicaError.ServerUnavailable()),
+          discard: () => Effect.die("unexpected discard"),
           pull: () =>
             Effect.acquireUseRelease(
               Ref.updateAndGet(current, (count) => count + 1).pipe(

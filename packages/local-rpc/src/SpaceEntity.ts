@@ -30,6 +30,15 @@ export class Submit extends Rpc.make("Submit", {
   error: ReplicaError.ReplicaError
 }).annotateMerge(volatileAnnotations) {}
 
+export class Discard extends Rpc.make("Discard", {
+  payload: {
+    request: Protocol.DiscardRequest,
+    assertion: PrincipalAssertion.PrincipalAssertion
+  },
+  success: Protocol.Receipt,
+  error: ReplicaError.ReplicaError
+}).annotateMerge(volatileAnnotations) {}
+
 export class Pull extends Rpc.make("Pull", {
   payload: {
     request: Protocol.PullRequest,
@@ -72,6 +81,7 @@ export class WatchPresence extends Rpc.make("WatchPresence", {
 
 export const SpaceEntity = Entity.make("EffectLocal/Space", [
   Submit,
+  Discard,
   Pull,
   Bootstrap,
   Watch,
@@ -83,6 +93,11 @@ export interface ClientService {
   readonly submit: (
     spaceId: Identity.SpaceId,
     request: Protocol.SubmitRequest,
+    assertion: PrincipalAssertion.PrincipalAssertion
+  ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
+  readonly discard: (
+    spaceId: Identity.SpaceId,
+    request: Protocol.DiscardRequest,
     assertion: PrincipalAssertion.PrincipalAssertion
   ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
   readonly pull: (
@@ -118,6 +133,14 @@ export class Client extends Context.Service<Client, ClientService>()(
 const mapClient = (makeClient: Effect.Success<typeof SpaceEntity.client>): ClientService => ({
   submit: (spaceId, request, assertion) =>
     makeClient(spaceId).Submit({ request, assertion }).pipe(
+      Effect.catchTags({
+        MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
+      })
+    ),
+  discard: (spaceId, request, assertion) =>
+    makeClient(spaceId).Discard({ request, assertion }).pipe(
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -193,6 +216,16 @@ export const layerHandlers = (options: HandlerOptions = {}) =>
           }
           return verifier.verify(payload.assertion).pipe(
             Effect.flatMap((principal) => store.admit(payload.request, principal))
+          )
+        },
+        Discard: ({ payload }) => {
+          if (spaceId === undefined || payload.request.envelope.spaceId !== spaceId) {
+            return Effect.fail(
+              new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
+            )
+          }
+          return verifier.verify(payload.assertion).pipe(
+            Effect.flatMap((principal) => store.discard(payload.request, principal))
           )
         },
         Pull: ({ payload }) =>

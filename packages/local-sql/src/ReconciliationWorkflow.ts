@@ -283,6 +283,7 @@ const handler = (
             result.failure._tag === "StaleSchema" ||
             result.failure._tag === "SpaceUnavailable" ||
             result.failure._tag === "StaleReplicationScope" ||
+            result.failure._tag === "UpgradeRequired" ||
             attempt >= configuration.maximumAttempts
           ) {
             yield* result.failure

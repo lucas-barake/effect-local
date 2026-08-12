@@ -35,6 +35,17 @@ export interface Options {
   readonly maximumSnapshotBytes: number
   readonly maximumBootstrapPageBytes: number
   readonly authorization: Authorization
+  readonly resolveDefinition: (
+    schema: Identity.SchemaIdentity
+  ) => Effect.Effect<Definition.Any, ReplicaError.ReplicaError>
+  readonly projectEntity: (
+    target: Definition.Any,
+    entity: Protocol.EntityKey,
+    value: typeof Schema.Json.Type
+  ) => Effect.Effect<
+    Option.Option<{ readonly entity: Protocol.EntityKey; readonly value: typeof Schema.Json.Type }>,
+    ReplicaError.ReplicaError
+  >
 }
 
 interface MaterializedEntity {
@@ -43,6 +54,8 @@ interface MaterializedEntity {
   readonly entity: Protocol.EntityKey
   readonly value: typeof Schema.Json.Type
   readonly valueJson: string
+  readonly sourceEntity: Protocol.EntityKey
+  readonly sourceValue: typeof Schema.Json.Type
 }
 
 const identityOf = (model: string, entityKey: string) => `${model}\u0000${entityKey}`
@@ -130,7 +143,6 @@ export const make = (options: Options) => {
     )
 
   const validatePreparedSpace = (
-    request: Protocol.PullRequest | Protocol.BootstrapRequest,
     expectedGeneration: number,
     space: typeof Rows.ReplicationSpaceRow.Type
   ) => {
@@ -147,11 +159,14 @@ export const make = (options: Options) => {
         })
       )
     }
-    if (space.schema_version !== request.schema.version || space.schema_hash !== request.schema.hash) {
+    if (
+      space.schema_version !== options.definition.schemaIdentity.version ||
+      space.schema_hash !== options.definition.schemaIdentity.hash
+    ) {
       return Effect.fail(
         new ReplicaError.StaleSchema({
-          expectedVersion: request.schema.version,
-          expectedHash: request.schema.hash,
+          expectedVersion: options.definition.schemaIdentity.version,
+          expectedHash: options.definition.schemaIdentity.hash,
           actualVersion: space.schema_version,
           actualHash: space.schema_hash
         })
@@ -221,7 +236,9 @@ export const make = (options: Options) => {
           entityKey: keyJson,
           entity,
           value,
-          valueJson
+          valueJson,
+          sourceEntity: entity,
+          sourceValue: value
         })
       }
       return entities
@@ -233,21 +250,43 @@ export const make = (options: Options) => {
       Effect.flatMap((rows) => decodeAuthoritative(spaceId, rows))
     )
 
-  const visible = (
+  const projectVisible = (
     request: Protocol.PullRequest | Protocol.BootstrapRequest,
     principal: typeof Schema.Json.Type,
-    all: ReadonlyMap<string, MaterializedEntity>
+    source: ReadonlyMap<string, MaterializedEntity>,
+    targetDefinition: Definition.Any
   ) =>
     Effect.gen(function*() {
       const selected = new Set(request.scope.models)
+      const all = new Map<string, MaterializedEntity>()
       const target = new Map<string, MaterializedEntity>()
-      for (const candidate of all.values()) {
-        if (!selected.has(candidate.entity.model)) continue
+      for (const candidate of source.values()) {
+        const projected = yield* options.projectEntity(targetDefinition, candidate.entity, candidate.value)
+        if (Option.isNone(projected)) continue
+        const entityKey = yield* Codec.stringify(projected.value.entity.key)
+        const identity = identityOf(projected.value.entity.model, entityKey)
+        if (all.has(identity)) {
+          return yield* new ReplicaError.SchemaKeyCollision({
+            model: projected.value.entity.model,
+            key: entityKey
+          })
+        }
+        const materialized: MaterializedEntity = {
+          identity,
+          entityKey,
+          entity: projected.value.entity,
+          value: projected.value.value,
+          valueJson: yield* Codec.stringify(projected.value.value),
+          sourceEntity: candidate.entity,
+          sourceValue: candidate.value
+        }
+        all.set(identity, materialized)
+        if (!selected.has(materialized.entity.model)) continue
         if (yield* options.authorization.entity(request, principal, candidate.entity, candidate.value)) {
-          target.set(candidate.identity, candidate)
+          target.set(identity, materialized)
         }
       }
-      return target
+      return { all, target }
     })
 
   const manifestFromRow = (row: typeof Rows.ScopedSnapshotManifestRow.Type) =>
@@ -330,7 +369,8 @@ export const make = (options: Options) => {
     principalHash: Protocol.MutationDigest
   ) =>
     Effect.gen(function*() {
-      const normalized = yield* Protocol.validateReplicationScope(options.definition, request.scope)
+      const targetDefinition = yield* options.resolveDefinition(request.schema)
+      const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
       const normalizedDigest = yield* scopeDigest(normalized)
       const space = yield* findSpace(request.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
       const previous = yield* findView({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
@@ -342,10 +382,10 @@ export const make = (options: Options) => {
           actual: request.scopeGeneration
         })
       }
-      const all = yield* authoritative(request.spaceId)
-      const target = yield* visible({ ...request, scope: normalized }, principal, all)
+      const source = yield* authoritative(request.spaceId)
+      const projected = yield* projectVisible({ ...request, scope: normalized }, principal, source, targetDefinition)
       const changes: Array<Protocol.ViewChange> = []
-      for (const entity of target.values()) {
+      for (const entity of projected.target.values()) {
         changes.push(Protocol.Upsert.make({ entity: entity.entity, value: entity.value }))
       }
       const orderedChanges = changes.toSorted((left, right) => {
@@ -396,7 +436,7 @@ export const make = (options: Options) => {
           scope_json, scope_digest, definition_hash, schema_version, schema_hash, server_sequence)
         VALUES (${request.spaceId}, ${request.clientId}, ${principalHash}, ${viewId}, 0,
           ${request.scopeGeneration}, ${yield* Codec.stringify(normalized)}, ${normalizedDigest},
-          ${space.definition_hash}, ${space.schema_version}, ${space.schema_hash},
+          ${targetDefinition.hash}, ${targetDefinition.schemaIdentity.version}, ${targetDefinition.schemaIdentity.hash},
           ${space.next_server_sequence - 1})
         ON CONFLICT (space_id, client_id) DO UPDATE SET principal_digest = excluded.principal_digest,
           view_id = excluded.view_id, view_revision = excluded.view_revision,
@@ -410,7 +450,7 @@ export const make = (options: Options) => {
           schema_hash, scope_json, scope_digest, scope_generation, view_id, view_revision,
           server_sequence, terminal_sequence, entry_count, content_bytes, digest)
         VALUES (${snapshotId}, ${request.spaceId}, ${request.clientId}, ${principalHash},
-          ${space.definition_hash}, ${space.schema_version}, ${space.schema_hash},
+          ${targetDefinition.hash}, ${targetDefinition.schemaIdentity.version}, ${targetDefinition.schemaIdentity.hash},
           ${yield* Codec.stringify(normalized)}, ${normalizedDigest}, ${request.scopeGeneration},
           ${viewId}, 0, ${space.next_server_sequence - 1}, ${space.next_terminal_sequence - 1},
           ${entries.length}, ${bytes}, ${rolling})`
@@ -428,8 +468,8 @@ export const make = (options: Options) => {
       return Protocol.SnapshotManifest.make({
         spaceId: request.spaceId,
         clientId: request.clientId,
-        definitionHash: space.definition_hash,
-        schema: Identity.SchemaIdentity.make({ version: space.schema_version, hash: space.schema_hash }),
+        definitionHash: targetDefinition.hash,
+        schema: targetDefinition.schemaIdentity,
         scopeDigest: normalizedDigest,
         scopeGeneration: request.scopeGeneration,
         cursor,
@@ -448,7 +488,12 @@ export const make = (options: Options) => {
     principalHash: Protocol.MutationDigest
   ) =>
     createSnapshot(request, principal, principalHash).pipe(
-      Effect.map((manifest) => Protocol.BootstrapRequired.make({ manifest }))
+      Effect.map((manifest) =>
+        Protocol.BootstrapRequired.make({
+          manifest,
+          serverSchema: options.definition.schemaIdentity
+        })
+      )
     )
 
   const pageFromRow = (row: typeof Rows.ReplicationPageRow.Type) =>
@@ -462,7 +507,8 @@ export const make = (options: Options) => {
           changes,
           contentBytes: row.content_bytes,
           digest: row.digest,
-          hasMore: row.has_more === 1
+          hasMore: row.has_more === 1,
+          serverSchema: options.definition.schemaIdentity
         })
       )
     )
@@ -482,7 +528,7 @@ export const make = (options: Options) => {
             current === undefined || !request.scope.models.includes(current.entity.model) ||
             change.entity.modelVersion !== current.entity.modelVersion ||
             (yield* Codec.stringify(change.value)) !== current.valueJson ||
-            !(yield* options.authorization.entity(request, principal, change.entity, change.value))
+            !(yield* options.authorization.entity(request, principal, current.sourceEntity, current.sourceValue))
           ) return false
         }
         if (change._tag === "Delete" && current !== undefined) return false
@@ -490,7 +536,7 @@ export const make = (options: Options) => {
           if (current === undefined) return false
           if (
             request.scope.models.includes(current.entity.model) &&
-            (yield* options.authorization.entity(request, principal, current.entity, current.value))
+            (yield* options.authorization.entity(request, principal, current.sourceEntity, current.sourceValue))
           ) return false
         }
       }
@@ -609,7 +655,8 @@ export const make = (options: Options) => {
           changes: candidate,
           contentBytes: Protocol.encodedBytes(candidate),
           digest: Protocol.MutationDigest.make("0".repeat(64)),
-          hasMore: candidate.length < changes.length
+          hasMore: candidate.length < changes.length,
+          serverSchema: options.definition.schemaIdentity
         })
         if (Protocol.encodedBytes(candidatePage) <= Protocol.maximumBatchBytes) lower = length
         else upper = length - 1
@@ -631,7 +678,8 @@ export const make = (options: Options) => {
         digest: yield* Protocol.viewChangesDigest(selected).pipe(
           Effect.provideService(Crypto.Crypto, options.crypto)
         ),
-        hasMore: selected.length < changes.length
+        hasMore: selected.length < changes.length,
+        serverSchema: options.definition.schemaIdentity
       })
       const scopeJson = yield* Codec.stringify(normalized)
       let hasMore = 0
@@ -659,8 +707,9 @@ export const make = (options: Options) => {
     sql.withTransaction(Effect.gen(function*() {
       yield* options.authorization.scope(request, principal)
       const space = yield* lockSpace(request.spaceId)
-      yield* validatePreparedSpace(request, expectedGeneration, space)
-      const normalized = yield* Protocol.validateReplicationScope(options.definition, request.scope)
+      yield* validatePreparedSpace(expectedGeneration, space)
+      const targetDefinition = yield* options.resolveDefinition(request.schema)
+      const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
       const normalizedDigest = yield* scopeDigest(normalized)
       const principalHash = yield* principalDigest(principal)
       const stored = yield* findView({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
@@ -674,7 +723,7 @@ export const make = (options: Options) => {
       }
       if (
         request.cursor === null || Option.isNone(stored) || stored.value.principal_digest !== principalHash ||
-        stored.value.definition_hash !== options.definition.hash ||
+        stored.value.definition_hash !== targetDefinition.hash ||
         stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
         request.cursor.viewId !== stored.value.view_id || request.scopeGeneration < stored.value.scope_generation
       ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
@@ -687,7 +736,8 @@ export const make = (options: Options) => {
       const pageRow = yield* findPage({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
         Effect.mapError(StorageUnavailable.make)
       )
-      const all = yield* authoritative(request.spaceId)
+      const source = yield* authoritative(request.spaceId)
+      const projected = yield* projectVisible({ ...request, scope: normalized }, principal, source, targetDefinition)
       if (Option.isSome(pageRow)) {
         const row = pageRow.value
         if (
@@ -701,7 +751,7 @@ export const make = (options: Options) => {
           (row.scope_generation !== request.scopeGeneration || row.scope_digest !== normalizedDigest)
         ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
         if (request.cursor.revision === row.base_revision) {
-          if (!(yield* pageSafe({ ...request, scope: normalized }, principal, page, all))) {
+          if (!(yield* pageSafe({ ...request, scope: normalized }, principal, page, projected.all))) {
             return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
           }
           return page
@@ -725,8 +775,12 @@ export const make = (options: Options) => {
         clientId: request.clientId,
         viewId: currentView.view_id
       }).pipe(Effect.mapError(StorageUnavailable.make))
-      const target = yield* visible({ ...request, scope: normalized }, principal, all)
-      const changes = yield* diff({ ...request, scope: normalized }, acknowledged, all, target)
+      const changes = yield* diff(
+        { ...request, scope: normalized },
+        acknowledged,
+        projected.all,
+        projected.target
+      )
       return yield* persistNextPage(
         request,
         principalHash,
@@ -746,15 +800,16 @@ export const make = (options: Options) => {
     sql.withTransaction(Effect.gen(function*() {
       yield* options.authorization.scope(request, principal)
       const space = yield* lockSpace(request.spaceId)
-      yield* validatePreparedSpace(request, expectedGeneration, space)
-      const normalized = yield* Protocol.validateReplicationScope(options.definition, request.scope)
+      yield* validatePreparedSpace(expectedGeneration, space)
+      const targetDefinition = yield* options.resolveDefinition(request.schema)
+      const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
       const normalizedDigest = yield* scopeDigest(normalized)
       const principalHash = yield* principalDigest(principal)
       let stored = yield* findSnapshot(request.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
       if (
         Option.isNone(stored) || stored.value.space_id !== request.spaceId ||
         stored.value.client_id !== request.clientId || stored.value.principal_digest !== principalHash ||
-        stored.value.definition_hash !== options.definition.hash ||
+        stored.value.definition_hash !== targetDefinition.hash ||
         stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
         stored.value.scope_digest !== normalizedDigest || stored.value.scope_generation !== request.scopeGeneration ||
         stored.value.view_id !== request.cursor.viewId || stored.value.view_revision !== request.cursor.revision
@@ -768,17 +823,18 @@ export const make = (options: Options) => {
       let row = stored.value
       let rows = yield* findSnapshotEntries(row.snapshot_id).pipe(Effect.mapError(StorageUnavailable.make))
       let entries = yield* decodeSnapshotEntries(rows)
-      const all = yield* authoritative(request.spaceId)
+      const source = yield* authoritative(request.spaceId)
+      const projected = yield* projectVisible({ ...request, scope: normalized }, principal, source, targetDefinition)
       let valid = true
       for (const entry of entries) {
         const key = yield* Codec.stringify(entry.change.entity.key)
-        const current = all.get(identityOf(entry.change.entity.model, key))
+        const current = projected.all.get(identityOf(entry.change.entity.model, key))
         if (
           entry.change._tag !== "Upsert" || current === undefined ||
           !normalized.models.includes(current.entity.model) ||
           entry.change.entity.modelVersion !== current.entity.modelVersion ||
           (yield* Codec.stringify(entry.change.value)) !== current.valueJson ||
-          !(yield* options.authorization.entity(request, principal, entry.change.entity, entry.change.value))
+          !(yield* options.authorization.entity(request, principal, current.sourceEntity, current.sourceValue))
         ) {
           valid = false
           break
@@ -810,7 +866,8 @@ export const make = (options: Options) => {
         const candidate = Protocol.BootstrapPage.make({
           manifest: manifestFromRow(row),
           entries: remaining.slice(0, length),
-          hasMore: length < remaining.length
+          hasMore: length < remaining.length,
+          serverSchema: options.definition.schemaIdentity
         })
         if (Protocol.encodedBytes(candidate) <= options.maximumBootstrapPageBytes) lower = length
         else upper = length - 1
@@ -825,7 +882,8 @@ export const make = (options: Options) => {
       return Protocol.BootstrapPage.make({
         manifest: manifestFromRow(row),
         entries: selected,
-        hasMore: selected.length < remaining.length
+        hasMore: selected.length < remaining.length,
+        serverSchema: options.definition.schemaIdentity
       })
     })).pipe(Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause))))
 

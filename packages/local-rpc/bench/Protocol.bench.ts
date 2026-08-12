@@ -27,7 +27,11 @@ const page = Protocol.PullPage.make({
   changes,
   contentBytes: Protocol.encodedBytes(changes),
   digest: Protocol.MutationDigest.make(digest),
-  hasMore: true
+  hasMore: true,
+  serverSchema: Identity.SchemaIdentity.make({
+    version: Identity.SchemaVersion.make(1),
+    hash: Identity.SchemaHash.make("0123456789abcdef")
+  })
 })
 const codec = Schema.toCodecJson(Protocol.PullPage)
 const encode = Schema.encodeSync(codec)

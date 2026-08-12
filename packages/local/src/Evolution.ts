@@ -20,6 +20,12 @@ export interface ModelMigration<From extends Model.Any, To extends Model.Any,> {
     readonly targetKey: Model.Key<To>
     readonly value: Model.Value<From>
   }): Model.Value<To>
+  downgradeKey?(key: Model.Key<To>): Model.Key<From>
+  downgradeValue?(input: {
+    readonly key: Model.Key<To>
+    readonly targetKey: Model.Key<From>
+    readonly value: Model.Value<To>
+  }): Model.Value<From>
 }
 
 export interface MutationMigration<From extends Mutation.Any, To extends Mutation.Any,> {
@@ -29,6 +35,9 @@ export interface MutationMigration<From extends Mutation.Any, To extends Mutatio
   migratePayload?(payload: Mutation.Payload<From>): Mutation.Payload<To>
   migrateSuccess?(success: Mutation.Success<From>): Mutation.Success<To>
   migrateRejection?(rejection: Mutation.Rejection<From>): Mutation.Rejection<To>
+  downgradePayload?(payload: Mutation.Payload<To>): Mutation.Payload<From>
+  downgradeSuccess?(success: Mutation.Success<To>): Mutation.Success<From>
+  downgradeRejection?(rejection: Mutation.Rejection<To>): Mutation.Rejection<From>
 }
 
 type AnyModelMigration = ModelMigration<Model.Any, Model.Any>
@@ -56,6 +65,7 @@ export interface Evolution {
   readonly migrationHash: Identity.SchemaHash
   readonly definitionByIdentity: ReadonlyMap<string, Definition.Any>
   readonly stepBySourceIdentity: ReadonlyMap<string, Step>
+  readonly stepByTargetIdentity: ReadonlyMap<string, Step>
   readonly legacyBaselineByHash: ReadonlyMap<string, LegacyBaseline>
 }
 
@@ -138,6 +148,14 @@ export const model = <From extends Model.Any, To extends Model.Any,>(options: {
       readonly value: Model.Value<From>
     }) => Model.Value<To>)
     | undefined
+  readonly downgradeKey?: ((key: Model.Key<To>) => Model.Key<From>) | undefined
+  readonly downgradeValue?:
+    | ((input: {
+      readonly key: Model.Key<To>
+      readonly targetKey: Model.Key<From>
+      readonly value: Model.Value<To>
+    }) => Model.Value<From>)
+    | undefined
 }): ModelMigration<From, To> => {
   assertStableId("model", options.id)
   if (options.from.name !== options.to.name) {
@@ -164,6 +182,12 @@ export const model = <From extends Model.Any, To extends Model.Any,>(options: {
       readonly targetKey: Model.Key<To>
       readonly value: Model.Value<From>
     }) => Model.Value<To>
+    downgradeKey?: (key: Model.Key<To>) => Model.Key<From>
+    downgradeValue?: (input: {
+      readonly key: Model.Key<To>
+      readonly targetKey: Model.Key<From>
+      readonly value: Model.Value<To>
+    }) => Model.Value<From>
   } = {
     id: options.id,
     from: options.from,
@@ -171,6 +195,8 @@ export const model = <From extends Model.Any, To extends Model.Any,>(options: {
   }
   if (options.key !== undefined) migration.migrateKey = options.key
   if (options.value !== undefined) migration.migrateValue = options.value
+  if (options.downgradeKey !== undefined) migration.downgradeKey = options.downgradeKey
+  if (options.downgradeValue !== undefined) migration.downgradeValue = options.downgradeValue
   return Object.freeze(migration)
 }
 
@@ -181,6 +207,9 @@ export const mutation = <From extends Mutation.Any, To extends Mutation.Any,>(op
   readonly payload?: ((payload: Mutation.Payload<From>) => Mutation.Payload<To>) | undefined
   readonly success?: ((success: Mutation.Success<From>) => Mutation.Success<To>) | undefined
   readonly rejection?: ((rejection: Mutation.Rejection<From>) => Mutation.Rejection<To>) | undefined
+  readonly downgradePayload?: ((payload: Mutation.Payload<To>) => Mutation.Payload<From>) | undefined
+  readonly downgradeSuccess?: ((success: Mutation.Success<To>) => Mutation.Success<From>) | undefined
+  readonly downgradeRejection?: ((rejection: Mutation.Rejection<To>) => Mutation.Rejection<From>) | undefined
 }): MutationMigration<From, To> => {
   assertStableId("mutation", options.id)
   if (options.from.name !== options.to.name) {
@@ -211,6 +240,9 @@ export const mutation = <From extends Mutation.Any, To extends Mutation.Any,>(op
     migratePayload?: (payload: Mutation.Payload<From>) => Mutation.Payload<To>
     migrateSuccess?: (success: Mutation.Success<From>) => Mutation.Success<To>
     migrateRejection?: (rejection: Mutation.Rejection<From>) => Mutation.Rejection<To>
+    downgradePayload?: (payload: Mutation.Payload<To>) => Mutation.Payload<From>
+    downgradeSuccess?: (success: Mutation.Success<To>) => Mutation.Success<From>
+    downgradeRejection?: (rejection: Mutation.Rejection<To>) => Mutation.Rejection<From>
   } = {
     id: options.id,
     from: options.from,
@@ -219,6 +251,9 @@ export const mutation = <From extends Mutation.Any, To extends Mutation.Any,>(op
   if (options.payload !== undefined) migration.migratePayload = options.payload
   if (options.success !== undefined) migration.migrateSuccess = options.success
   if (options.rejection !== undefined) migration.migrateRejection = options.rejection
+  if (options.downgradePayload !== undefined) migration.downgradePayload = options.downgradePayload
+  if (options.downgradeSuccess !== undefined) migration.downgradeSuccess = options.downgradeSuccess
+  if (options.downgradeRejection !== undefined) migration.downgradeRejection = options.downgradeRejection
   return Object.freeze(migration)
 }
 
@@ -368,6 +403,7 @@ export const make = (options: {
   const migrationIds = new Set<string>()
   const definitionByIdentity = new Map<string, Definition.Any>()
   const stepBySourceIdentity = new Map<string, Step>()
+  const stepByTargetIdentity = new Map<string, Step>()
   const addDefinition = (definition: Definition.Any): void => {
     const key = identityKey(definition.schemaIdentity)
     const existing = definitionByIdentity.get(key)
@@ -385,6 +421,7 @@ export const make = (options: {
       return Defect.invalid(`Duplicate schema evolution source identity: ${sourceKey}`)
     }
     stepBySourceIdentity.set(sourceKey, entry)
+    stepByTargetIdentity.set(identityKey(entry.to.schemaIdentity), entry)
     addDefinition(entry.from)
     addDefinition(entry.to)
     for (const migration of [...entry.models.values(), ...entry.mutations.values()]) {
@@ -432,63 +469,135 @@ export const make = (options: {
     })),
     definitionByIdentity,
     stepBySourceIdentity,
+    stepByTargetIdentity,
     legacyBaselineByHash
   })
 }
 
-const pathFrom = (
+type DirectionalStep = {
+  readonly step: Step
+  readonly direction: "Forward" | "Backward"
+}
+
+const pathBetween = (
   evolution: Evolution,
-  source: Identity.SchemaIdentity
-): Effect.Effect<ReadonlyArray<Step>, ReplicaError.SchemaEvolutionUnsupported> => {
-  if (sameIdentity(source, evolution.current.schemaIdentity)) return Effect.succeed([])
-  if (!evolution.definitionByIdentity.has(identityKey(source))) {
+  source: Identity.SchemaIdentity,
+  target: Identity.SchemaIdentity
+): Effect.Effect<ReadonlyArray<DirectionalStep>, ReplicaError.SchemaEvolutionUnsupported> => {
+  if (sameIdentity(source, target)) return Effect.succeed([])
+  if (
+    !evolution.definitionByIdentity.has(identityKey(source)) ||
+    !evolution.definitionByIdentity.has(identityKey(target))
+  ) {
     return Effect.fail(
       new ReplicaError.SchemaEvolutionUnsupported({
         sourceVersion: source.version,
         sourceHash: source.hash,
-        targetVersion: evolution.current.schemaIdentity.version,
-        targetHash: evolution.current.schemaIdentity.hash
+        targetVersion: target.version,
+        targetHash: target.hash
       })
     )
   }
-  const path: Array<Step> = []
+  const forward: Array<DirectionalStep> = []
   let identity = source
-  while (!sameIdentity(identity, evolution.current.schemaIdentity)) {
+  while (!sameIdentity(identity, target)) {
     const next = evolution.stepBySourceIdentity.get(identityKey(identity))
-    if (next === undefined) {
+    if (next === undefined) break
+    forward.push({ step: next, direction: "Forward" })
+    identity = next.to.schemaIdentity
+  }
+  if (sameIdentity(identity, target)) return Effect.succeed(forward)
+  const backward: Array<DirectionalStep> = []
+  identity = source
+  while (!sameIdentity(identity, target)) {
+    const previous = evolution.stepByTargetIdentity.get(identityKey(identity))
+    if (previous === undefined) {
       return Effect.fail(
         new ReplicaError.SchemaEvolutionUnsupported({
           sourceVersion: source.version,
           sourceHash: source.hash,
-          targetVersion: evolution.current.schemaIdentity.version,
-          targetHash: evolution.current.schemaIdentity.hash
+          targetVersion: target.version,
+          targetHash: target.hash
         })
       )
     }
-    path.push(next)
-    identity = next.to.schemaIdentity
+    backward.push({ step: previous, direction: "Backward" })
+    identity = previous.from.schemaIdentity
   }
-  return Effect.succeed(path)
+  return Effect.succeed(backward)
 }
 
-export const migrateModel = (options: {
+export const validateDowngradeTarget = (
+  evolution: Evolution,
+  target: Identity.SchemaIdentity
+): Effect.Effect<void, ReplicaError.SchemaEvolutionUnsupported> =>
+  Effect.gen(function*() {
+    const path = yield* pathBetween(evolution, evolution.current.schemaIdentity, target)
+    for (const traversal of path) {
+      if (traversal.direction !== "Backward") {
+        return yield* new ReplicaError.SchemaEvolutionUnsupported({
+          sourceVersion: evolution.current.schemaIdentity.version,
+          sourceHash: evolution.current.schemaIdentity.hash,
+          targetVersion: target.version,
+          targetHash: target.hash
+        })
+      }
+      const entry = traversal.step
+      for (const older of entry.from.models) {
+        const newer = entry.to.modelByName.get(older.name)
+        if (newer === undefined) continue
+        const migration = entry.models.get(older.name)
+        if (
+          (!sameSchema(newer.key, older.key) && migration?.downgradeKey === undefined) ||
+          (!sameSchema(newer.schema, older.schema) && migration?.downgradeValue === undefined)
+        ) {
+          return yield* new ReplicaError.SchemaEvolutionUnsupported({
+            sourceVersion: evolution.current.schemaIdentity.version,
+            sourceHash: evolution.current.schemaIdentity.hash,
+            targetVersion: target.version,
+            targetHash: target.hash
+          })
+        }
+      }
+      for (const older of entry.from.mutations) {
+        const newer = entry.to.mutationByName.get(older.name)
+        if (newer === undefined) continue
+        const migration = entry.mutations.get(older.name)
+        if (
+          (!sameSchema(newer.successSchema, older.successSchema) && migration?.downgradeSuccess === undefined) ||
+          (!sameSchema(newer.rejectionSchema, older.rejectionSchema) && migration?.downgradeRejection === undefined)
+        ) {
+          return yield* new ReplicaError.SchemaEvolutionUnsupported({
+            sourceVersion: evolution.current.schemaIdentity.version,
+            sourceHash: evolution.current.schemaIdentity.hash,
+            targetVersion: target.version,
+            targetHash: target.hash
+          })
+        }
+      }
+    }
+    return yield* Effect.void
+  })
+
+export const migrateModelTo = (options: {
   readonly evolution: Evolution
   readonly source: Identity.SchemaIdentity
+  readonly target: Identity.SchemaIdentity
   readonly model: string
   readonly modelVersion: Identity.SchemaVersion
   readonly key: typeof Schema.Json.Type
   readonly value?: typeof Schema.Json.Type | undefined
 }): Effect.Effect<MigratedModel, ReplicaError.SchemaEvolutionUnsupported | ReplicaError.SchemaEvolutionFailed> =>
   Effect.gen(function*() {
-    const path = yield* pathFrom(options.evolution, options.source)
+    const path = yield* pathBetween(options.evolution, options.source, options.target)
     const sourceDefinition = options.evolution.definitionByIdentity.get(identityKey(options.source))
     const sourceModel = sourceDefinition?.modelByName.get(options.model)
     if (sourceModel === undefined || sourceModel.version !== options.modelVersion) {
       return yield* new ReplicaError.SchemaEvolutionUnsupported({
         sourceVersion: options.source.version,
         sourceHash: options.source.hash,
-        targetVersion: options.evolution.current.schemaIdentity.version,
-        targetHash: options.evolution.current.schemaIdentity.hash
+        targetVersion: options.target.version,
+        targetHash: options.target.hash
       })
     }
     let key = options.key
@@ -496,18 +605,45 @@ export const migrateModel = (options: {
     let version = options.modelVersion
     let identity = options.source
     const aliases: Array<ModelAlias> = [{ schemaIdentity: identity, modelVersion: version, key }]
-    for (const entry of path) {
-      const source = entry.from.modelByName.get(options.model)
-      const target = entry.to.modelByName.get(options.model)
+    for (const traversal of path) {
+      const entry = traversal.step
+      let fromDefinition = entry.from
+      let toDefinition = entry.to
+      if (traversal.direction === "Backward") {
+        fromDefinition = entry.to
+        toDefinition = entry.from
+      }
+      const source = fromDefinition.modelByName.get(options.model)
+      const target = toDefinition.modelByName.get(options.model)
       if (source === undefined || target === undefined || source.version !== version) {
         return yield* new ReplicaError.SchemaEvolutionUnsupported({
           sourceVersion: options.source.version,
           sourceHash: options.source.hash,
-          targetVersion: options.evolution.current.schemaIdentity.version,
-          targetHash: options.evolution.current.schemaIdentity.hash
+          targetVersion: options.target.version,
+          targetHash: options.target.hash
         })
       }
       const migration = entry.models.get(options.model)
+      if (traversal.direction === "Backward") {
+        if (!sameSchema(source.key, target.key) && migration?.downgradeKey === undefined) {
+          return yield* new ReplicaError.SchemaEvolutionUnsupported({
+            sourceVersion: options.source.version,
+            sourceHash: options.source.hash,
+            targetVersion: options.target.version,
+            targetHash: options.target.hash
+          })
+        }
+        if (
+          value !== undefined && !sameSchema(source.schema, target.schema) && migration?.downgradeValue === undefined
+        ) {
+          return yield* new ReplicaError.SchemaEvolutionUnsupported({
+            sourceVersion: options.source.version,
+            sourceHash: options.source.hash,
+            targetVersion: options.target.version,
+            targetHash: options.target.hash
+          })
+        }
+      }
       const sourceKey = yield* Schema.decodeUnknownEffect(source.key)(key).pipe(
         Effect.mapError((cause) =>
           new ReplicaError.SchemaEvolutionFailed({
@@ -522,7 +658,11 @@ export const migrateModel = (options: {
         )
       )
       let migratedKey = sourceKey
-      if (migration?.migrateKey !== undefined) migratedKey = migration.migrateKey(sourceKey)
+      if (traversal.direction === "Forward" && migration?.migrateKey !== undefined) {
+        migratedKey = migration.migrateKey(sourceKey)
+      } else if (traversal.direction === "Backward" && migration?.downgradeKey !== undefined) {
+        migratedKey = migration.downgradeKey(sourceKey)
+      }
       const targetKey = yield* Schema.decodeUnknownEffect(Schema.toType(target.key))(migratedKey).pipe(
         Effect.mapError((cause) =>
           new ReplicaError.SchemaEvolutionFailed({
@@ -579,8 +719,10 @@ export const migrateModel = (options: {
           )
         )
         let migratedValue = sourceValue
-        if (migration?.migrateValue !== undefined) {
+        if (traversal.direction === "Forward" && migration?.migrateValue !== undefined) {
           migratedValue = migration.migrateValue({ key: sourceKey, targetKey, value: sourceValue })
+        } else if (traversal.direction === "Backward" && migration?.downgradeValue !== undefined) {
+          migratedValue = migration.downgradeValue({ key: sourceKey, targetKey, value: sourceValue })
         }
         const targetValue = yield* Schema.decodeUnknownEffect(Schema.toType(target.schema))(migratedValue).pipe(
           Effect.mapError((cause) =>
@@ -625,11 +767,11 @@ export const migrateModel = (options: {
         )
       }
       version = target.version
-      identity = entry.to.schemaIdentity
+      identity = toDefinition.schemaIdentity
       aliases.push({ schemaIdentity: identity, modelVersion: version, key })
     }
     return {
-      schemaIdentity: options.evolution.current.schemaIdentity,
+      schemaIdentity: options.target,
       modelVersion: version,
       key,
       value,
@@ -637,9 +779,13 @@ export const migrateModel = (options: {
     }
   })
 
+export const migrateModel = (options: Omit<Parameters<typeof migrateModelTo>[0], "target">) =>
+  migrateModelTo({ ...options, target: options.evolution.current.schemaIdentity })
+
 const migrateMutationPart = (options: {
   readonly evolution: Evolution
   readonly source: Identity.SchemaIdentity
+  readonly target: Identity.SchemaIdentity
   readonly mutation: string
   readonly mutationVersion: Identity.SchemaVersion
   readonly value: typeof Schema.Json.Type
@@ -649,28 +795,35 @@ const migrateMutationPart = (options: {
   ReplicaError.SchemaEvolutionUnsupported | ReplicaError.SchemaEvolutionFailed
 > =>
   Effect.gen(function*() {
-    const path = yield* pathFrom(options.evolution, options.source)
+    const path = yield* pathBetween(options.evolution, options.source, options.target)
     const sourceDefinition = options.evolution.definitionByIdentity.get(identityKey(options.source))
     const sourceMutation = sourceDefinition?.mutationByName.get(options.mutation)
     if (sourceMutation === undefined || sourceMutation.version !== options.mutationVersion) {
       return yield* new ReplicaError.SchemaEvolutionUnsupported({
         sourceVersion: options.source.version,
         sourceHash: options.source.hash,
-        targetVersion: options.evolution.current.schemaIdentity.version,
-        targetHash: options.evolution.current.schemaIdentity.hash
+        targetVersion: options.target.version,
+        targetHash: options.target.hash
       })
     }
     let value = options.value
     let version = options.mutationVersion
-    for (const entry of path) {
-      const source = entry.from.mutationByName.get(options.mutation)
-      const target = entry.to.mutationByName.get(options.mutation)
+    for (const traversal of path) {
+      const entry = traversal.step
+      let fromDefinition = entry.from
+      let toDefinition = entry.to
+      if (traversal.direction === "Backward") {
+        fromDefinition = entry.to
+        toDefinition = entry.from
+      }
+      const source = fromDefinition.mutationByName.get(options.mutation)
+      const target = toDefinition.mutationByName.get(options.mutation)
       if (source === undefined || target === undefined || source.version !== version) {
         return yield* new ReplicaError.SchemaEvolutionUnsupported({
           sourceVersion: options.source.version,
           sourceHash: options.source.hash,
-          targetVersion: options.evolution.current.schemaIdentity.version,
-          targetHash: options.evolution.current.schemaIdentity.hash
+          targetVersion: options.target.version,
+          targetHash: options.target.hash
         })
       }
       const migration = entry.mutations.get(options.mutation)
@@ -681,20 +834,56 @@ const migrateMutationPart = (options: {
         case "Payload":
           fromSchema = source.payloadSchema
           toSchema = target.payloadSchema
-          if (migration?.migratePayload === undefined) migrate = (input) => input
-          else migrate = migration.migratePayload.bind(undefined)
+          if (traversal.direction === "Forward") {
+            if (migration?.migratePayload === undefined) migrate = (input) => input
+            else migrate = migration.migratePayload.bind(undefined)
+          } else if (migration?.downgradePayload === undefined) {
+            if (!sameSchema(fromSchema, toSchema)) {
+              return yield* new ReplicaError.SchemaEvolutionUnsupported({
+                sourceVersion: options.source.version,
+                sourceHash: options.source.hash,
+                targetVersion: options.target.version,
+                targetHash: options.target.hash
+              })
+            }
+            migrate = (input) => input
+          } else migrate = migration.downgradePayload.bind(undefined)
           break
         case "Success":
           fromSchema = source.successSchema
           toSchema = target.successSchema
-          if (migration?.migrateSuccess === undefined) migrate = (input) => input
-          else migrate = migration.migrateSuccess.bind(undefined)
+          if (traversal.direction === "Forward") {
+            if (migration?.migrateSuccess === undefined) migrate = (input) => input
+            else migrate = migration.migrateSuccess.bind(undefined)
+          } else if (migration?.downgradeSuccess === undefined) {
+            if (!sameSchema(fromSchema, toSchema)) {
+              return yield* new ReplicaError.SchemaEvolutionUnsupported({
+                sourceVersion: options.source.version,
+                sourceHash: options.source.hash,
+                targetVersion: options.target.version,
+                targetHash: options.target.hash
+              })
+            }
+            migrate = (input) => input
+          } else migrate = migration.downgradeSuccess.bind(undefined)
           break
         case "Rejection":
           fromSchema = source.rejectionSchema
           toSchema = target.rejectionSchema
-          if (migration?.migrateRejection === undefined) migrate = (input) => input
-          else migrate = migration.migrateRejection.bind(undefined)
+          if (traversal.direction === "Forward") {
+            if (migration?.migrateRejection === undefined) migrate = (input) => input
+            else migrate = migration.migrateRejection.bind(undefined)
+          } else if (migration?.downgradeRejection === undefined) {
+            if (!sameSchema(fromSchema, toSchema)) {
+              return yield* new ReplicaError.SchemaEvolutionUnsupported({
+                sourceVersion: options.source.version,
+                sourceHash: options.source.hash,
+                targetVersion: options.target.version,
+                targetHash: options.target.hash
+              })
+            }
+            migrate = (input) => input
+          } else migrate = migration.downgradeRejection.bind(undefined)
           break
       }
       const sourceValue = yield* Schema.decodeUnknownEffect(fromSchema)(value).pipe(
@@ -755,17 +944,29 @@ const migrateMutationPart = (options: {
       version = target.version
     }
     return {
-      schemaIdentity: options.evolution.current.schemaIdentity,
+      schemaIdentity: options.target,
       mutationVersion: version,
       value
     }
   })
 
-export const migrateMutationPayload = (options: Omit<Parameters<typeof migrateMutationPart>[0], "part">) =>
+type MigrationPartOptions = Omit<Parameters<typeof migrateMutationPart>[0], "part">
+type CurrentMigrationPartOptions = Omit<MigrationPartOptions, "target">
+
+export const migrateMutationPayloadTo = (options: MigrationPartOptions) =>
   migrateMutationPart({ ...options, part: "Payload" })
 
-export const migrateMutationSuccess = (options: Omit<Parameters<typeof migrateMutationPart>[0], "part">) =>
+export const migrateMutationSuccessTo = (options: MigrationPartOptions) =>
   migrateMutationPart({ ...options, part: "Success" })
 
-export const migrateMutationRejection = (options: Omit<Parameters<typeof migrateMutationPart>[0], "part">) =>
+export const migrateMutationRejectionTo = (options: MigrationPartOptions) =>
   migrateMutationPart({ ...options, part: "Rejection" })
+
+export const migrateMutationPayload = (options: CurrentMigrationPartOptions) =>
+  migrateMutationPayloadTo({ ...options, target: options.evolution.current.schemaIdentity })
+
+export const migrateMutationSuccess = (options: CurrentMigrationPartOptions) =>
+  migrateMutationSuccessTo({ ...options, target: options.evolution.current.schemaIdentity })
+
+export const migrateMutationRejection = (options: CurrentMigrationPartOptions) =>
+  migrateMutationRejectionTo({ ...options, target: options.evolution.current.schemaIdentity })

@@ -1256,6 +1256,63 @@ const clientV8 = makeMigration({
   }
 })
 
+const clientV9 = makeMigration({
+  id: 9,
+  name: "pending-mutation-quarantine",
+  statements: [
+    `CREATE TABLE effect_local_client_quarantine (
+      space_id TEXT NOT NULL,
+      membership_incarnation TEXT NOT NULL,
+      mutation_id TEXT NOT NULL,
+      local_sequence INTEGER NOT NULL,
+      basis INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      digest_version INTEGER NOT NULL CHECK (digest_version = 3),
+      source_schema_version INTEGER NOT NULL,
+      source_schema_hash TEXT NOT NULL,
+      mutation_version INTEGER NOT NULL,
+      rejection_json TEXT NOT NULL,
+      target_schema_version INTEGER NOT NULL,
+      target_schema_hash TEXT NOT NULL,
+      PRIMARY KEY (space_id, mutation_id),
+      UNIQUE (space_id, membership_incarnation, local_sequence),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`
+  ]
+})
+
+const clientV10 = makeMigration({
+  id: 10,
+  name: "quarantine-resubmission-intents",
+  statements: [
+    `CREATE TABLE effect_local_client_quarantine_resubmissions (
+      space_id TEXT NOT NULL,
+      original_mutation_id TEXT NOT NULL,
+      replacement_mutation_id TEXT NOT NULL,
+      PRIMARY KEY (space_id, original_mutation_id),
+      UNIQUE (space_id, replacement_mutation_id),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`
+  ]
+})
+
+const clientV11 = makeMigration({
+  id: 11,
+  name: "quarantine-cancellation-continuations",
+  statements: [
+    `CREATE TABLE effect_local_client_quarantine_cancellations (
+      space_id TEXT NOT NULL,
+      root_mutation_id TEXT NOT NULL,
+      current_mutation_id TEXT NOT NULL,
+      PRIMARY KEY (space_id, root_mutation_id),
+      UNIQUE (space_id, current_mutation_id),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`
+  ]
+})
+
 export const clientCatalog = Object.freeze([
   clientV1,
   clientV2,
@@ -1264,7 +1321,10 @@ export const clientCatalog = Object.freeze([
   clientV5,
   clientV6,
   clientV7,
-  clientV8
+  clientV8,
+  clientV9,
+  clientV10,
+  clientV11
 ])
 
 const serverV6 = makeMigration({
@@ -1531,6 +1591,44 @@ const serverV8 = makeMigration({
   ]
 })
 
+const serverV9 = makeMigration({
+  id: 9,
+  name: "snapshot-schema-projections",
+  statements: [
+    `CREATE TABLE effect_local_server_snapshot_projections (
+      space_id TEXT NOT NULL,
+      snapshot_id TEXT NOT NULL,
+      target_schema_version INTEGER NOT NULL,
+      target_schema_hash TEXT NOT NULL,
+      definition_hash TEXT NOT NULL,
+      entity_count INTEGER NOT NULL CHECK (entity_count >= 0),
+      content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
+      digest TEXT NOT NULL,
+      PRIMARY KEY (space_id, snapshot_id, target_schema_version, target_schema_hash)
+    )`,
+    `CREATE TABLE effect_local_server_snapshot_projection_entities (
+      space_id TEXT NOT NULL,
+      snapshot_id TEXT NOT NULL,
+      target_schema_version INTEGER NOT NULL,
+      target_schema_hash TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL,
+      entity_key TEXT NOT NULL,
+      wire_json TEXT NOT NULL,
+      wire_bytes INTEGER NOT NULL CHECK (wire_bytes > 0),
+      PRIMARY KEY (space_id, snapshot_id, target_schema_version, target_schema_hash, ordinal),
+      UNIQUE (space_id, snapshot_id, target_schema_version, target_schema_hash, model, entity_key)
+    )`,
+    `CREATE TRIGGER effect_local_delete_snapshot_projections AFTER DELETE ON effect_local_server_snapshots BEGIN
+      DELETE FROM effect_local_server_snapshot_projection_entities
+        WHERE space_id = OLD.space_id AND snapshot_id = OLD.snapshot_id;
+      DELETE FROM effect_local_server_snapshot_projections
+        WHERE space_id = OLD.space_id AND snapshot_id = OLD.snapshot_id;
+    END`
+  ]
+})
+
 export const serverCatalog = Object.freeze([
   serverV1,
   serverV2,
@@ -1539,7 +1637,8 @@ export const serverCatalog = Object.freeze([
   serverV5,
   serverV6,
   serverV7,
-  serverV8
+  serverV8,
+  serverV9
 ])
 
 export const client = (options: {
