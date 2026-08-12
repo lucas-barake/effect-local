@@ -167,22 +167,23 @@ export const makeManager = (options: {
         })))
       )
 
+    const selectWork = (work: Work) => {
+      const current = spaces.get(work.spaceId)
+      if (current === undefined || current.generation !== work.generation || !current.queued) return undefined
+      current.queued = false
+      if (current.running) return undefined
+      current.running = true
+      return { space: current, epoch: current.dirtyEpoch }
+    }
+
     const worker = Effect.forever(Effect.gen(function*() {
       const work = yield* Queue.take(queue)
-      const selected = yield* Effect.sync(() => {
-        const current = spaces.get(work.spaceId)
-        if (current === undefined || current.generation !== work.generation || !current.queued) return undefined
-        current.queued = false
-        if (current.running) return undefined
-        current.running = true
-        return { space: current, epoch: current.dirtyEpoch }
-      })
+      const selected = selectWork(work)
       if (selected === undefined) return
       const fiber = yield* FiberMap.run(
         turns,
         managedKey(selected.space.spaceId, selected.space.generation),
-        runTurn(selected.space, selected.epoch),
-        { startImmediately: true }
+        runTurn(selected.space, selected.epoch)
       )
       yield* Fiber.await(fiber)
     }))
@@ -205,7 +206,7 @@ export const makeManager = (options: {
           running: false,
           dirtyEpoch: 0
         }
-        yield* Effect.sync(() => spaces.set(space.spaceId, state))
+        spaces.set(space.spaceId, state)
         yield* FiberMap.run(
           watches,
           managedKey(space.spaceId, space.generation),
@@ -220,8 +221,7 @@ export const makeManager = (options: {
               ),
               Effect.andThen(Effect.sleep(retryDelayMillis))
             )
-          ),
-          { startImmediately: true }
+          )
         )
         yield* enqueue(state)
       }).pipe(Effect.onError(() => unregister(space.spaceId, space.generation)))

@@ -250,19 +250,24 @@ const makeLayer = <D extends Definition.Any, R,>(
           )
         })
 
+      const reserveJoin = (
+        spaceId: Identity.SpaceId,
+        completion: Deferred.Deferred<Replica.Space, ReplicaError.ReplicaError>
+      ) => {
+        const current = entries.get(spaceId)
+        if (current?._tag === "Active") return { _tag: "Active" as const, entry: current }
+        if (current?._tag === "Joining") return { _tag: "WaitJoin" as const, completion: current.completion }
+        if (current?._tag === "Leaving") return { _tag: "WaitLeave" as const, completion: current.completion }
+        const generation = ++nextGeneration
+        entries.set(spaceId, { _tag: "Joining", generation, completion })
+        return { _tag: "Initialize" as const, generation, completion }
+      }
+
       const join = (spaceId: Identity.SpaceId): Effect.Effect<Replica.Space, ReplicaError.ReplicaError> =>
         Effect.uninterruptibleMask((restore) =>
           Effect.gen(function*() {
             const completion = yield* Deferred.make<Replica.Space, ReplicaError.ReplicaError>()
-            const decision = yield* Effect.sync(() => {
-              const current = entries.get(spaceId)
-              if (current?._tag === "Active") return { _tag: "Active" as const, entry: current }
-              if (current?._tag === "Joining") return { _tag: "WaitJoin" as const, completion: current.completion }
-              if (current?._tag === "Leaving") return { _tag: "WaitLeave" as const, completion: current.completion }
-              const generation = ++nextGeneration
-              entries.set(spaceId, { _tag: "Joining", generation, completion })
-              return { _tag: "Initialize" as const, generation, completion }
-            })
+            const decision = reserveJoin(spaceId, completion)
             if (decision._tag === "Active") return decision.entry.handle
             if (decision._tag === "WaitJoin") return yield* restore(Deferred.await(decision.completion))
             if (decision._tag === "WaitLeave") {
@@ -271,15 +276,13 @@ const makeLayer = <D extends Definition.Any, R,>(
             }
             const result = yield* restore(initialize(spaceId, decision.generation)).pipe(Effect.exit)
             if (result._tag === "Success") {
-              yield* Effect.sync(() => entries.set(spaceId, result.value))
+              entries.set(spaceId, result.value)
               yield* Deferred.succeed(decision.completion, result.value.handle)
               yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
               return result.value.handle
             }
-            yield* Effect.sync(() => {
-              const current = entries.get(spaceId)
-              if (current?._tag === "Joining" && current.generation === decision.generation) entries.delete(spaceId)
-            })
+            const current = entries.get(spaceId)
+            if (current?._tag === "Joining" && current.generation === decision.generation) entries.delete(spaceId)
             const handleResult = Exit.map(result, (entry) => entry.handle)
             yield* Deferred.done(decision.completion, handleResult)
             return yield* handleResult
@@ -292,22 +295,27 @@ const makeLayer = <D extends Definition.Any, R,>(
           Effect.catchIf(SqlError.isSqlError, (cause) => Effect.fail(StorageUnavailable.make(cause)))
         )
 
+      const reserveLeave = (
+        spaceId: Identity.SpaceId,
+        completion: Deferred.Deferred<void, ReplicaError.ReplicaError>
+      ) => {
+        const current = entries.get(spaceId)
+        if (current === undefined) return { _tag: "Missing" as const }
+        if (current._tag === "Joining") return { _tag: "WaitJoin" as const, completion: current.completion }
+        if (current._tag === "Leaving") return { _tag: "WaitLeave" as const, completion: current.completion }
+        entries.set(spaceId, {
+          _tag: "Leaving",
+          generation: current.generation,
+          completion
+        })
+        return { _tag: "Evict" as const, entry: current, completion }
+      }
+
       const leave = (spaceId: Identity.SpaceId): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.uninterruptibleMask((restore) =>
           Effect.gen(function*() {
             const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
-            const decision = yield* Effect.sync(() => {
-              const current = entries.get(spaceId)
-              if (current === undefined) return { _tag: "Missing" as const }
-              if (current._tag === "Joining") return { _tag: "WaitJoin" as const, completion: current.completion }
-              if (current._tag === "Leaving") return { _tag: "WaitLeave" as const, completion: current.completion }
-              entries.set(spaceId, {
-                _tag: "Leaving",
-                generation: current.generation,
-                completion
-              })
-              return { _tag: "Evict" as const, entry: current, completion }
-            })
+            const decision = reserveLeave(spaceId, completion)
             if (decision._tag === "Missing") return yield* restore(evictMembership(spaceId))
             if (decision._tag === "WaitJoin") {
               yield* restore(Deferred.await(decision.completion))
@@ -331,15 +339,13 @@ const makeLayer = <D extends Definition.Any, R,>(
               )
             )).pipe(Effect.exit)
             if (result._tag === "Success") {
-              yield* Effect.sync(() => entries.delete(spaceId))
+              entries.delete(spaceId)
               yield* Deferred.succeed(decision.completion, undefined)
               yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
               return yield* Effect.void
             }
-            yield* Effect.sync(() => {
-              if (scopeClosed) entries.delete(spaceId)
-              else entries.set(spaceId, decision.entry)
-            })
+            if (scopeClosed) entries.delete(spaceId)
+            else entries.set(spaceId, decision.entry)
             yield* Deferred.done(decision.completion, result)
             return yield* result
           })
@@ -360,11 +366,9 @@ const makeLayer = <D extends Definition.Any, R,>(
       )
 
       const status = Effect.gen(function*() {
-        const active = yield* Effect.sync(() =>
-          Array.from(entries.values())
-            .filter((entry): entry is ActiveEntry => entry._tag === "Active")
-            .toSorted((left, right) => left.handle.spaceId.localeCompare(right.handle.spaceId))
-        )
+        const active = Array.from(entries.values())
+          .filter((entry): entry is ActiveEntry => entry._tag === "Active")
+          .toSorted((left, right) => left.handle.spaceId.localeCompare(right.handle.spaceId))
         if (active.length === 0) return aggregateStatus([])
         const readPendingCounts = SqlSchema.findAll({
           Request: Schema.Array(Identity.SpaceId),
