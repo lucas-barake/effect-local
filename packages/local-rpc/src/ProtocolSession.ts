@@ -62,39 +62,37 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
         const cached = yield* Ref.get(selected)
         if (cached !== undefined) return cached
         const negotiated = yield* client.Negotiate(request).pipe(
-          Effect.catchTag(
+          Effect.catchReasons(
             "RpcClientError",
-            (error): Effect.Effect<never, ReplicaError.ServerUnavailable | ReplicaError.ProtocolInvalid> => {
-              switch (error.reason._tag) {
-                case "WorkerSpawnError":
-                case "WorkerSendError":
-                case "WorkerReceiveError":
-                case "WorkerUnknownError":
-                case "SocketReadError":
-                case "SocketWriteError":
-                case "SocketOpenError":
-                case "SocketCloseError":
+            {
+              WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              HttpError: (reason, error) => {
+                if (reason.kind === "TransportError") {
                   return Effect.fail(new ReplicaError.ServerUnavailable())
-                case "HttpError":
-                  if (error.reason.kind === "TransportError") {
-                    return Effect.fail(new ReplicaError.ServerUnavailable())
-                  }
-                  return Effect.fail(
-                    new ReplicaError.ProtocolInvalid({
-                      message: "The protocol negotiation failed",
-                      cause: error
-                    })
-                  )
-                case "RpcClientDefect":
-                  return Effect.fail(
-                    new ReplicaError.ProtocolInvalid({
-                      message: "The protocol negotiation failed",
-                      cause: error
-                    })
-                  )
-              }
-              return Effect.die(error)
-            }
+                }
+                return Effect.fail(
+                  new ReplicaError.ProtocolInvalid({
+                    message: "The protocol negotiation failed",
+                    cause: error
+                  })
+                )
+              },
+              RpcClientDefect: (_, error) =>
+                Effect.fail(
+                  new ReplicaError.ProtocolInvalid({
+                    message: "The protocol negotiation failed",
+                    cause: error
+                  })
+                )
+            },
+            (_, error) => Effect.die(error)
           ),
           Effect.withSpan("ProtocolSession.negotiate")
         )

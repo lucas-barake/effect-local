@@ -22,7 +22,7 @@ export interface Options extends ProtocolSession.Options {
 export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.Layer<
   SyncEngine.SyncEngine,
   ReplicaError.InvalidConfiguration,
-  Authentication.CredentialLifecycle | ProtocolSession.ProtocolSession
+  Authentication.CredentialProvider | ProtocolSession.ProtocolSession
 > =>
   Layer.effect(
     SyncEngine.SyncEngine,
@@ -32,46 +32,45 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
         options?.rpcTimeout ?? "10 seconds"
       )
       const session = yield* ProtocolSession.ProtocolSession
-      const credentialLifecycle = yield* Authentication.CredentialLifecycle
+      const credentialProvider = yield* Authentication.CredentialProvider
       const client = session.client
       return SyncEngine.SyncEngine.of({
-        waitForCredentialChange: (rejectedGeneration) => credentialLifecycle.awaitChange(rejectedGeneration),
+        waitForCredentialChange: (rejectedGeneration) =>
+          credentialProvider.awaitChange(rejectedGeneration).pipe(Effect.asVoid),
         submit: (request) =>
           ProtocolSessionRetry.run(session, (version) =>
             client.Submit({ ...request, protocolVersion: version }).pipe(
-              Effect.catchTag(
+              Effect.catchReasons(
                 "RpcClientError",
-                (error): Effect.Effect<never, ReplicaError.ServerUnavailable | ReplicaError.ProtocolInvalid> => {
-                  switch (error.reason._tag) {
-                    case "WorkerSpawnError":
-                    case "WorkerSendError":
-                    case "WorkerReceiveError":
-                    case "WorkerUnknownError":
-                    case "SocketReadError":
-                    case "SocketWriteError":
-                    case "SocketOpenError":
-                    case "SocketCloseError":
+                {
+                  WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  HttpError: (reason, error) => {
+                    if (reason.kind === "TransportError") {
                       return Effect.fail(new ReplicaError.ServerUnavailable())
-                    case "HttpError":
-                      if (error.reason.kind === "TransportError") {
-                        return Effect.fail(new ReplicaError.ServerUnavailable())
-                      }
-                      return Effect.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The Submit RPC failed",
-                          cause: error
-                        })
-                      )
-                    case "RpcClientDefect":
-                      return Effect.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The Submit RPC failed",
-                          cause: error
-                        })
-                      )
-                  }
-                  return Effect.die(error)
-                }
+                    }
+                    return Effect.fail(
+                      new ReplicaError.ProtocolInvalid({
+                        message: "The Submit RPC failed",
+                        cause: error
+                      })
+                    )
+                  },
+                  RpcClientDefect: (_, error) =>
+                    Effect.fail(
+                      new ReplicaError.ProtocolInvalid({
+                        message: "The Submit RPC failed",
+                        cause: error
+                      })
+                    )
+                },
+                (_, error) => Effect.die(error)
               ),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
@@ -94,39 +93,37 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
         discard: (request) =>
           ProtocolSessionRetry.run(session, (version) =>
             client.Discard({ ...request, protocolVersion: version }).pipe(
-              Effect.catchTag(
+              Effect.catchReasons(
                 "RpcClientError",
-                (error): Effect.Effect<never, ReplicaError.ServerUnavailable | ReplicaError.ProtocolInvalid> => {
-                  switch (error.reason._tag) {
-                    case "WorkerSpawnError":
-                    case "WorkerSendError":
-                    case "WorkerReceiveError":
-                    case "WorkerUnknownError":
-                    case "SocketReadError":
-                    case "SocketWriteError":
-                    case "SocketOpenError":
-                    case "SocketCloseError":
+                {
+                  WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  HttpError: (reason, error) => {
+                    if (reason.kind === "TransportError") {
                       return Effect.fail(new ReplicaError.ServerUnavailable())
-                    case "HttpError":
-                      if (error.reason.kind === "TransportError") {
-                        return Effect.fail(new ReplicaError.ServerUnavailable())
-                      }
-                      return Effect.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The Discard RPC failed",
-                          cause: error
-                        })
-                      )
-                    case "RpcClientDefect":
-                      return Effect.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The Discard RPC failed",
-                          cause: error
-                        })
-                      )
-                  }
-                  return Effect.die(error)
-                }
+                    }
+                    return Effect.fail(
+                      new ReplicaError.ProtocolInvalid({
+                        message: "The Discard RPC failed",
+                        cause: error
+                      })
+                    )
+                  },
+                  RpcClientDefect: (_, error) =>
+                    Effect.fail(
+                      new ReplicaError.ProtocolInvalid({
+                        message: "The Discard RPC failed",
+                        cause: error
+                      })
+                    )
+                },
+                (_, error) => Effect.die(error)
               ),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
@@ -149,39 +146,37 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
         pull: (request) =>
           ProtocolSessionRetry.run(session, (version) =>
             client.Pull({ ...request, protocolVersion: version }).pipe(
-              Effect.catchTag(
+              Effect.catchReasons(
                 "RpcClientError",
-                (error): Effect.Effect<never, ReplicaError.ServerUnavailable | ReplicaError.ProtocolInvalid> => {
-                  switch (error.reason._tag) {
-                    case "WorkerSpawnError":
-                    case "WorkerSendError":
-                    case "WorkerReceiveError":
-                    case "WorkerUnknownError":
-                    case "SocketReadError":
-                    case "SocketWriteError":
-                    case "SocketOpenError":
-                    case "SocketCloseError":
+                {
+                  WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  HttpError: (reason, error) => {
+                    if (reason.kind === "TransportError") {
                       return Effect.fail(new ReplicaError.ServerUnavailable())
-                    case "HttpError":
-                      if (error.reason.kind === "TransportError") {
-                        return Effect.fail(new ReplicaError.ServerUnavailable())
-                      }
-                      return Effect.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The Pull RPC failed",
-                          cause: error
-                        })
-                      )
-                    case "RpcClientDefect":
-                      return Effect.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The Pull RPC failed",
-                          cause: error
-                        })
-                      )
-                  }
-                  return Effect.die(error)
-                }
+                    }
+                    return Effect.fail(
+                      new ReplicaError.ProtocolInvalid({
+                        message: "The Pull RPC failed",
+                        cause: error
+                      })
+                    )
+                  },
+                  RpcClientDefect: (_, error) =>
+                    Effect.fail(
+                      new ReplicaError.ProtocolInvalid({
+                        message: "The Pull RPC failed",
+                        cause: error
+                      })
+                    )
+                },
+                (_, error) => Effect.die(error)
               ),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
@@ -206,39 +201,37 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
         bootstrap: (request) =>
           ProtocolSessionRetry.run(session, (version) =>
             client.Bootstrap({ ...request, protocolVersion: version }).pipe(
-              Effect.catchTag(
+              Effect.catchReasons(
                 "RpcClientError",
-                (error): Effect.Effect<never, ReplicaError.ServerUnavailable | ReplicaError.ProtocolInvalid> => {
-                  switch (error.reason._tag) {
-                    case "WorkerSpawnError":
-                    case "WorkerSendError":
-                    case "WorkerReceiveError":
-                    case "WorkerUnknownError":
-                    case "SocketReadError":
-                    case "SocketWriteError":
-                    case "SocketOpenError":
-                    case "SocketCloseError":
+                {
+                  WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  HttpError: (reason, error) => {
+                    if (reason.kind === "TransportError") {
                       return Effect.fail(new ReplicaError.ServerUnavailable())
-                    case "HttpError":
-                      if (error.reason.kind === "TransportError") {
-                        return Effect.fail(new ReplicaError.ServerUnavailable())
-                      }
-                      return Effect.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The Bootstrap RPC failed",
-                          cause: error
-                        })
-                      )
-                    case "RpcClientDefect":
-                      return Effect.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The Bootstrap RPC failed",
-                          cause: error
-                        })
-                      )
-                  }
-                  return Effect.die(error)
-                }
+                    }
+                    return Effect.fail(
+                      new ReplicaError.ProtocolInvalid({
+                        message: "The Bootstrap RPC failed",
+                        cause: error
+                      })
+                    )
+                  },
+                  RpcClientDefect: (_, error) =>
+                    Effect.fail(
+                      new ReplicaError.ProtocolInvalid({
+                        message: "The Bootstrap RPC failed",
+                        cause: error
+                      })
+                    )
+                },
+                (_, error) => Effect.die(error)
               ),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
@@ -280,41 +273,37 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                     Effect.ensuring(Fiber.interrupt(acquisition))
                   )
                   return Stream.fromQueue(queue).pipe(
-                    Stream.catchTag(
+                    Stream.catchReasons(
                       "RpcClientError",
-                      (
-                        error
-                      ): Stream.Stream<never, ReplicaError.ServerUnavailable | ReplicaError.ProtocolInvalid> => {
-                        switch (error.reason._tag) {
-                          case "WorkerSpawnError":
-                          case "WorkerSendError":
-                          case "WorkerReceiveError":
-                          case "WorkerUnknownError":
-                          case "SocketReadError":
-                          case "SocketWriteError":
-                          case "SocketOpenError":
-                          case "SocketCloseError":
+                      {
+                        WorkerSpawnError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                        WorkerSendError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                        WorkerReceiveError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                        WorkerUnknownError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                        SocketReadError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                        SocketWriteError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                        SocketOpenError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                        SocketCloseError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                        HttpError: (reason, error) => {
+                          if (reason.kind === "TransportError") {
                             return Stream.fail(new ReplicaError.ServerUnavailable())
-                          case "HttpError":
-                            if (error.reason.kind === "TransportError") {
-                              return Stream.fail(new ReplicaError.ServerUnavailable())
-                            }
-                            return Stream.fail(
-                              new ReplicaError.ProtocolInvalid({
-                                message: "The Watch RPC failed",
-                                cause: error
-                              })
-                            )
-                          case "RpcClientDefect":
-                            return Stream.fail(
-                              new ReplicaError.ProtocolInvalid({
-                                message: "The Watch RPC failed",
-                                cause: error
-                              })
-                            )
-                        }
-                        return Stream.die(error)
-                      }
+                          }
+                          return Stream.fail(
+                            new ReplicaError.ProtocolInvalid({
+                              message: "The Watch RPC failed",
+                              cause: error
+                            })
+                          )
+                        },
+                        RpcClientDefect: (_, error) =>
+                          Stream.fail(
+                            new ReplicaError.ProtocolInvalid({
+                              message: "The Watch RPC failed",
+                              cause: error
+                            })
+                          )
+                      },
+                      (_, error) => Stream.die(error)
                     ),
                     Stream.timeoutOrElse({
                       duration: rpcTimeoutMillis,
@@ -341,7 +330,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
 export const layerWithOptions = (options?: Options): Layer.Layer<
   SyncEngine.SyncEngine,
   ReplicaError.InvalidConfiguration,
-  Authentication.CredentialLifecycle | RpcClient.Protocol | RpcMiddleware.ForClient<Authentication.Authentication>
+  Authentication.CredentialProvider | RpcClient.Protocol | RpcMiddleware.ForClient<Authentication.Authentication>
 > => layerFromSession(options).pipe(Layer.provide(ProtocolSession.layerWithOptions(options)))
 
 export const layer = layerFromSession().pipe(Layer.provide(ProtocolSession.layer))

@@ -2438,7 +2438,64 @@ describe("server reconciled mutation log", () => {
       yield* service(Reconciler.Reconciler, reconciler)
       yield* firstSubscribed.await
       yield* TestClock.adjust("1 minute")
-      yield* Effect.yieldNow
+      assert.strictEqual(yield* Ref.get(subscriptions), 1)
+    })))
+
+  it.effect("does not resubscribe a transient watch while authentication is paused", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const local = yield* service(LocalStore.Store, localLayer())
+      const subscriptions = yield* Ref.make(0)
+      const watchFailed = yield* Deferred.make<void>()
+      const releasePull = yield* Deferred.make<void>()
+      const credentialWaitStarted = yield* Deferred.make<void>()
+      const remote = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () =>
+            Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
+          discard: () => Effect.die("unexpected discard"),
+          submit: () => Effect.die("unexpected submit"),
+          pull: () =>
+            Deferred.await(releasePull).pipe(
+              Effect.andThen(Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 0 })))
+            ),
+          bootstrap: () => Effect.die("unexpected bootstrap"),
+          watch: () =>
+            Stream.unwrap(
+              Ref.updateAndGet(subscriptions, (count) => count + 1).pipe(
+                Effect.flatMap((count) => {
+                  if (count === 1) {
+                    return Deferred.succeed(watchFailed, undefined).pipe(
+                      Effect.as(Stream.fail(new ReplicaError.ServerUnavailable()))
+                    )
+                  }
+                  return Effect.succeed(Stream.never)
+                })
+              )
+            )
+        })
+      )
+      const reconciliationContext = yield* Layer.build(
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(Layer.succeed(LocalStore.Store, local)),
+          Layer.provide(remote)
+        )
+      )
+      const manager = yield* Reconciler.makeManager().pipe(Effect.provide(remote))
+      yield* manager.register({
+        spaceId,
+        generation: 1,
+        definition: Domain.definition,
+        local,
+        reconciliation: Context.get(reconciliationContext, Reconciler.Reconciliation),
+        retryDelay: "1 second"
+      })
+      yield* Deferred.await(watchFailed)
+      yield* Deferred.succeed(releasePull, undefined)
+      yield* Deferred.await(credentialWaitStarted)
+
+      yield* TestClock.adjust("1 second")
+
       assert.strictEqual(yield* Ref.get(subscriptions), 1)
     })))
 
@@ -2526,6 +2583,47 @@ describe("server reconciled mutation log", () => {
       yield* Ref.set(observed, Domain.definition.schemaIdentity)
       yield* reconciliation.sync
       assert.strictEqual((yield* reconciliation.status)._tag, "Online")
+    })))
+
+  it.effect("keeps authentication status when an earlier sync completes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const pullEntered = yield* Deferred.make<void>()
+      const releasePull = yield* Deferred.make<void>()
+      const remote = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
+          discard: () => Effect.die("unexpected discard"),
+          submit: () => Effect.die("unexpected submit"),
+          pull: () =>
+            Deferred.succeed(pullEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releasePull)),
+              Effect.as(
+                {
+                  entries: [],
+                  hasMore: false,
+                  serverSchema: Domain.definition.schemaIdentity
+                } as const
+              )
+            ),
+          bootstrap: () => Effect.die("unexpected bootstrap"),
+          watch: () => Stream.never
+        })
+      )
+      const context = yield* Layer.build(
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(localLayer()),
+          Layer.provide(remote)
+        )
+      )
+      const reconciliation = Context.get(context, Reconciler.Reconciliation)
+      const syncing = yield* reconciliation.sync.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.await(pullEntered)
+      yield* reconciliation.failed(new ReplicaError.CredentialRejected({ credentialGeneration: 0 }))
+      yield* Deferred.succeed(releasePull, undefined)
+      yield* Fiber.join(syncing)
+
+      assert.strictEqual((yield* reconciliation.status)._tag, "NeedsAuthentication")
     })))
 
   it.effect("retries pending mutations after an interrupted submit", () =>

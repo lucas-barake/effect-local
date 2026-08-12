@@ -191,7 +191,11 @@ export const makeManager = (options: {
               yield* Deferred.succeed(gate, undefined)
               yield* enqueue(current)
             }))),
-            Effect.catchCause(() => Effect.void)
+            Effect.orDie,
+            Effect.catchCause((cause) => {
+              if (Cause.hasInterruptsOnly(cause)) return Effect.void
+              return Effect.failCause(cause)
+            })
           )
         )
         return gate
@@ -212,7 +216,11 @@ export const makeManager = (options: {
               current.retrying = false
               yield* enqueue(current)
             }))),
-            Effect.catchCause(() => Effect.void)
+            Effect.orDie,
+            Effect.catchCause((cause) => {
+              if (Cause.hasInterruptsOnly(cause)) return Effect.void
+              return Effect.failCause(cause)
+            })
           )
         )
       })
@@ -314,8 +322,12 @@ export const makeManager = (options: {
         spaces.set(space.spaceId, state)
         let watchAttempt = 0
         const watch = (): Effect.Effect<void> =>
-          Effect.suspend(() =>
-            remote.watch({ spaceId: space.spaceId, schema: space.definition.schemaIdentity }).pipe(
+          Effect.suspend(() => {
+            const authenticationGate = state.authenticationGate
+            if (authenticationGate !== undefined) {
+              return Deferred.await(authenticationGate).pipe(Effect.andThen(watch()))
+            }
+            return remote.watch({ spaceId: space.spaceId, schema: space.definition.schemaIdentity }).pipe(
               Stream.runForEach(() => {
                 watchAttempt = 0
                 return enqueue(state)
@@ -330,9 +342,9 @@ export const makeManager = (options: {
                   return Effect.sleep(delay).pipe(Effect.andThen(watch()))
                 },
                 onFailure: (error) => {
-                  const authenticationGate = state.authenticationGate
-                  if (authenticationGate !== undefined && error._tag !== "CredentialRejected") {
-                    return Deferred.await(authenticationGate).pipe(Effect.andThen(watch()))
+                  const activeAuthenticationGate = state.authenticationGate
+                  if (activeAuthenticationGate !== undefined && error._tag !== "CredentialRejected") {
+                    return Deferred.await(activeAuthenticationGate).pipe(Effect.andThen(watch()))
                   }
                   let policy: Effect.Effect<void>
                   if (error._tag === "CredentialRejected") {
@@ -359,7 +371,7 @@ export const makeManager = (options: {
                 }
               })
             )
-          )
+          })
         yield* FiberMap.run(
           watches,
           managedKey(space.spaceId, space.generation),
@@ -429,6 +441,7 @@ export const layerOnePass = (
           })
         )
       const succeeded = Effect.gen(function*() {
+        if ((yield* Ref.get(status))._tag === "NeedsAuthentication") return
         const pending = yield* local.pendingCount
         const cursor = yield* local.cursor
         const serverSchema = yield* Ref.get(updateAvailable)

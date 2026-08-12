@@ -21,10 +21,6 @@ export class CredentialProvider extends Context.Service<CredentialProvider, {
   readonly awaitChange: (rejectedGeneration: number) => Effect.Effect<Credential>
 }>()("@lucas-barake/effect-local-rpc/CredentialProvider") {}
 
-export class CredentialLifecycle extends Context.Service<CredentialLifecycle, {
-  readonly awaitChange: (rejectedGeneration: number) => Effect.Effect<void>
-}>()("@lucas-barake/effect-local-rpc/CredentialLifecycle") {}
-
 export const AuthenticationError = Schema.Union([
   ReplicaError.CredentialRejected,
   ReplicaError.AuthenticatorUnavailable
@@ -47,18 +43,10 @@ export class Authentication extends RpcMiddleware.Service<Authentication, {
 
 const credentialGenerationHeader = "x-effect-local-credential-generation"
 
-const requestCredentialGeneration = (headers: Headers.Headers) => {
-  const raw = headers[credentialGenerationHeader]
-  if (raw === undefined || raw.trim() === "") return undefined
-  const generation = Number(raw)
-  if (!Number.isSafeInteger(generation) || generation < 0) return undefined
-  return generation
-}
-
-const credentialRejected = (credentialGeneration: number | undefined) => {
-  if (credentialGeneration === undefined) return new ReplicaError.CredentialRejected()
-  return new ReplicaError.CredentialRejected({ credentialGeneration })
-}
+const CredentialGenerationHeader = Schema.NumberFromString.check(
+  Schema.isInt(),
+  Schema.isGreaterThanOrEqualTo(0)
+)
 
 export const layerServer: Layer.Layer<Authentication, never, Authenticator> = Layer.effect(
   Authentication,
@@ -67,15 +55,21 @@ export const layerServer: Layer.Layer<Authentication, never, Authenticator> = La
     return Authentication.of((effect, options) =>
       Effect.gen(function*() {
         const authorization = options.headers.authorization
-        const credentialGeneration = requestCredentialGeneration(options.headers)
+        const credentialGeneration = yield* Schema.decodeUnknownEffect(
+          Schema.UndefinedOr(CredentialGenerationHeader)
+        )(options.headers[credentialGenerationHeader]).pipe(Effect.orElseSucceed(() => undefined))
         if (authorization === undefined || !authorization.startsWith("Bearer ")) {
-          return yield* credentialRejected(credentialGeneration)
+          if (credentialGeneration === undefined) return yield* new ReplicaError.CredentialRejected()
+          return yield* new ReplicaError.CredentialRejected({ credentialGeneration })
         }
         const credential = Redacted.make(authorization.slice("Bearer ".length))
         const principal = yield* authenticator.authenticate(credential).pipe(
           Effect.catchTag(
             "CredentialRejected",
-            () => Effect.fail(credentialRejected(credentialGeneration))
+            () => {
+              if (credentialGeneration === undefined) return Effect.fail(new ReplicaError.CredentialRejected())
+              return Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration }))
+            }
           )
         )
         return yield* effect.pipe(Effect.provideService(Principal, principal))
@@ -114,13 +108,7 @@ const layerClientMiddleware = RpcMiddleware.layerClient(
   ))
 )
 
-const layerCredentialLifecycle = Layer.effect(
-  CredentialLifecycle,
-  CredentialProvider.pipe(Effect.map((provider) =>
-    CredentialLifecycle.of({
-      awaitChange: (rejectedGeneration) => provider.awaitChange(rejectedGeneration).pipe(Effect.asVoid)
-    })
-  ))
+export const layerClient = Layer.merge(
+  layerClientMiddleware,
+  Layer.effect(CredentialProvider, CredentialProvider)
 )
-
-export const layerClient = Layer.merge(layerClientMiddleware, layerCredentialLifecycle)

@@ -575,7 +575,6 @@ describe("WebSocket synchronization", () => {
 
       yield* TestClock.adjust("1 minute")
       yield* space.mutate(PutTodo, { id: "still-expired", title: "must stay local" })
-      yield* Effect.yieldNow
       assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
     }))
 
@@ -662,19 +661,16 @@ describe("WebSocket synchronization", () => {
       yield* space.mutate(PutTodo, { id: "outage", title: "backoff" })
       assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
       assert.strictEqual((yield* Fiber.join(offline))._tag, "Offline")
-      yield* Effect.yieldNow
 
       yield* TestClock.adjust("999 millis")
       assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
       yield* TestClock.adjust("1 millis")
       assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
-      yield* Effect.yieldNow
 
       yield* TestClock.adjust("1999 millis")
       assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
       yield* TestClock.adjust("1 millis")
       assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
-      yield* Effect.yieldNow
 
       const online = yield* awaitStatus(reactivity, space, "Online").pipe(
         Effect.forkChild({ startImmediately: true })

@@ -3,7 +3,9 @@ import * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -193,15 +195,23 @@ const layerRetryConfiguration = (options: Options) =>
           message: "maximumAttempts must be a positive safe integer"
         })
       }
+      const retryDelayMillis = yield* Configuration.positiveFiniteDurationMillis(
+        "retryDelay",
+        options.retryDelay ?? Duration.seconds(1)
+      )
+      const maximumRetryDelayMillis = yield* Configuration.positiveFiniteDurationMillis(
+        "maximumRetryDelay",
+        options.maximumRetryDelay ?? Duration.minutes(1)
+      )
+      if (maximumRetryDelayMillis < retryDelayMillis) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "maximumRetryDelay",
+          message: "maximumRetryDelay must be greater than or equal to retryDelay"
+        })
+      }
       return RetryConfiguration.of({
-        retryDelayMillis: yield* Configuration.positiveFiniteDurationMillis(
-          "retryDelay",
-          options.retryDelay ?? Duration.seconds(1)
-        ),
-        maximumRetryDelayMillis: yield* Configuration.positiveFiniteDurationMillis(
-          "maximumRetryDelay",
-          options.maximumRetryDelay ?? Duration.minutes(1)
-        ),
+        retryDelayMillis,
+        maximumRetryDelayMillis,
         maximumAttempts
       })
     })
@@ -425,12 +435,63 @@ const layerSchedulerWithConfiguration = (
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
       const supervisorRetryAttempt = yield* Ref.make(0)
       const watchRetryAttempt = yield* Ref.make(0)
+      interface AuthenticationPause {
+        readonly generation: number
+        readonly gate: Deferred.Deferred<void>
+      }
+      const authenticationPause = yield* Ref.make<Option.Option<AuthenticationPause>>(Option.none())
+      const awaitAuthenticationChange = Ref.get(authenticationPause).pipe(
+        Effect.flatMap(Option.match({
+          onNone: () => Effect.void,
+          onSome: (pause) => Deferred.await(pause.gate)
+        }))
+      )
+      const pauseForCredential = (generation: number) =>
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function*() {
+            const candidate = {
+              generation,
+              gate: yield* Deferred.make<void>()
+            }
+            const admitted = yield* Ref.modify(authenticationPause, (
+              current
+            ): readonly [
+              { readonly pause: AuthenticationPause; readonly owner: boolean },
+              Option.Option<AuthenticationPause>
+            ] =>
+              Option.match(current, {
+                onNone: () => [{ pause: candidate, owner: true }, Option.some(candidate)],
+                onSome: (pause) => [{ pause, owner: false }, Option.some(pause)]
+              }))
+            if (admitted.owner) {
+              yield* remote.waitForCredentialChange(admitted.pause.generation).pipe(
+                Effect.andThen(Effect.uninterruptible(Effect.gen(function*() {
+                  const owned = yield* Ref.modify(authenticationPause, (current) => {
+                    if (Option.isSome(current) && current.value === admitted.pause) {
+                      return [true, Option.none()] as const
+                    }
+                    return [false, current] as const
+                  })
+                  if (owned) yield* Deferred.succeed(admitted.pause.gate, undefined)
+                }))),
+                Effect.catchCause((cause) => {
+                  if (Cause.hasInterruptsOnly(cause)) return Effect.void
+                  return Effect.failCause(cause)
+                }),
+                Effect.forkScoped
+              )
+            }
+            yield* restore(Deferred.await(admitted.pause.gate))
+          })
+        )
 
       const supervise = Effect.gen(function*() {
         while (true) {
           yield* Queue.take(wake)
+          yield* awaitAuthenticationChange
           const result = yield* Effect.gen(function*() {
             while (true) {
+              yield* awaitAuthenticationChange
               const generations = yield* local.reconciliationGenerations
               if (generations.completed >= generations.requested) return
               const state = yield* local.replicationState
@@ -460,7 +521,7 @@ const layerSchedulerWithConfiguration = (
               yield* Effect.logWarning("Rejected credential did not include its generation")
               return
             }
-            yield* remote.waitForCredentialChange(error.credentialGeneration)
+            yield* pauseForCredential(error.credentialGeneration)
             yield* Ref.set(supervisorRetryAttempt, 0)
             yield* requestAndNotify
             continue
@@ -484,6 +545,7 @@ const layerSchedulerWithConfiguration = (
       const supervisorFiber = yield* Effect.forkScoped(supervise)
       const watch = Effect.gen(function*() {
         while (true) {
+          yield* awaitAuthenticationChange
           const result = yield* Stream.unwrap(local.replicationState.pipe(
             Effect.map((state) =>
               remote.watch({
@@ -512,7 +574,7 @@ const layerSchedulerWithConfiguration = (
               yield* Effect.logWarning("Rejected watch credential did not include its generation")
               return
             }
-            yield* remote.waitForCredentialChange(error.credentialGeneration)
+            yield* pauseForCredential(error.credentialGeneration)
             yield* Ref.set(watchRetryAttempt, 0)
             continue
           }

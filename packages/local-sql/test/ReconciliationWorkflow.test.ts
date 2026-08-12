@@ -109,6 +109,34 @@ const directSync = (server: ServerStore.Service) =>
   )
 
 describe("reconciliation workflow", () => {
+  it.effect("rejects a maximum retry delay below the initial delay", () =>
+    Effect.gen(function*() {
+      const serverContext = yield* Layer.build(serverLayer)
+      const server = Context.get(serverContext, ServerStore.ServerStore)
+      const invalid = SqlReplica.layerWorkflow({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId,
+        retryDelay: "2 seconds",
+        maximumRetryDelay: "1 second"
+      }).pipe(
+        Layer.provide(Domain.handlers),
+        Layer.provide(database()),
+        Layer.provide(directSync(server)),
+        Layer.provideMerge(WorkflowEngine.layerMemory)
+      )
+      yield* Layer.build(invalid).pipe(
+        Effect.flip,
+        Effect.map((error) => {
+          assert.strictEqual(error._tag, "InvalidConfiguration")
+          if (error._tag === "InvalidConfiguration") {
+            assert.strictEqual(error.option, "maximumRetryDelay")
+          }
+        })
+      )
+    }))
+
   it.effect("runs finite generation keyed reconciliation over the durable SQLite outbox", () =>
     Effect.gen(function*() {
       const serverContext = yield* Layer.build(serverLayer)
@@ -247,6 +275,63 @@ describe("reconciliation workflow", () => {
       yield* replica.leave(spaceId)
 
       assert.isTrue(yield* Deferred.isDone(pullInterrupted))
+    }))
+
+  it.effect("does not resubscribe a transient watch while authentication is paused", () =>
+    Effect.gen(function*() {
+      const subscriptions = yield* Ref.make(0)
+      const watchFailed = yield* Deferred.make<void>()
+      const releasePull = yield* Deferred.make<void>()
+      const credentialWaitStarted = yield* Deferred.make<void>()
+      const remote = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () =>
+            Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
+          discard: () => Effect.die("unexpected discard"),
+          submit: () => Effect.die("unexpected submit"),
+          pull: () =>
+            Deferred.await(releasePull).pipe(
+              Effect.andThen(Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 0 })))
+            ),
+          bootstrap: () => Effect.die("unexpected bootstrap"),
+          watch: () =>
+            Stream.unwrap(
+              Ref.updateAndGet(subscriptions, (count) => count + 1).pipe(
+                Effect.flatMap((count) => {
+                  if (count === 1) {
+                    return Deferred.succeed(watchFailed, undefined).pipe(
+                      Effect.as(Stream.fail(new ReplicaError.ServerUnavailable()))
+                    )
+                  }
+                  return Effect.succeed(Stream.never)
+                })
+              )
+            )
+        })
+      )
+      const replicaLayer = SqlReplica.layerWorkflow({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId,
+        retryDelay: "1 second",
+        maximumRetryDelay: "1 second"
+      }).pipe(
+        Layer.provide(Domain.handlers),
+        Layer.provide(database()),
+        Layer.provide(remote),
+        Layer.provideMerge(WorkflowEngine.layerMemory)
+      )
+      const context = yield* Layer.build(replicaLayer)
+      yield* Context.get(context, Replica.Replica).space(spaceId)
+      yield* Deferred.await(watchFailed)
+      yield* Deferred.succeed(releasePull, undefined)
+      yield* Deferred.await(credentialWaitStarted)
+
+      yield* TestClock.adjust("1 second")
+
+      assert.strictEqual(yield* Ref.get(subscriptions), 1)
     }))
 
   it.effect("rejects a workflow handle addressed to another replica", () =>
