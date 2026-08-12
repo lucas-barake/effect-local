@@ -20,7 +20,7 @@ are partitioned by `space_id`. Each membership contains:
 - normalized desired replication scope, scope generation, principal bound view cursor, and durable retractions
 - canonical entities from accepted server entries
 - visible entities after optimistic pending mutations
-- pending envelopes, results, and write sets ordered by local sequence
+- pending envelopes, results, write sets, submission states, and attempt counts ordered by local sequence
 - a bounded accepted server suffix ordered by server sequence
 - bounded terminal accepted, rejected, and expired receipts
 - one resumable scoped bootstrap stage and its verified authorized entities
@@ -62,10 +62,21 @@ application data authority.
    Completion replaces canonical state, locally retracts prior canonical identities absent from the authorized
    snapshot, preserves pending only optimistic identities, and advances both cursors in one transaction.
 8. The client removes settled pending mutations, restores touched visible entities from canonical state, and replays
-   remaining pending mutations in local order.
+   remaining pending mutations in local order. Only after that projection is visible does it publish the terminal
+   settlement to current subscribers. Mutation rejections are decoded through the originating mutation schema.
 9. Successful reconciliation advances the completed generation idempotently. A newer requested generation starts a
    new finite Workflow.
-10. Effect `Reactivity` invalidates affected models, receipts, and status after the SQL transaction commits.
+10. Effect `Reactivity` invalidates affected models, pending inspection, receipts, and status after the SQL transaction
+    commits.
+
+The local commit and server settlement contracts are separate. `mutate` returns after the optimistic SQLite commit and
+never widens its error channel with a later server outcome. Durable pending inspection exposes the decoded payload,
+submission state, and attempt count. Settlement notifications use a bounded, replay free PubSub per space, exposed as
+a Stream. The space scope owns and shuts down that PubSub. Its configured capacity bounds the live feed, so a slow
+subscriber backpressures settlement publication and reconciliation completion without delaying the local mutation
+commit. Publication occurs after durable pending removal, projection rebuild, and reactive invalidation. Duplicate
+receipt delivery cannot publish twice because only the transition that removes an existing pending row creates a
+settlement. A process crash may lose the live notification. Retained receipts remain the durable lookup path.
 
 ## Handler contract
 

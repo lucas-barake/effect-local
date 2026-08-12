@@ -336,9 +336,20 @@ export const VersionedPresenceUpdate = PresenceUpdate.pipe(withProtocolVersion)
 
 export const VersionedWatchPresenceRequest = Schema.Struct({ spaceId: Identity.SpaceId }).pipe(withProtocolVersion)
 
+export const SubmissionState = Schema.Literals([
+  "Queued",
+  "Submitting",
+  "Retrying",
+  "Submitted",
+  "AwaitingReceipt"
+])
+export type SubmissionState = typeof SubmissionState.Type
+
 export const PendingMutation = Schema.Struct({
   envelope: MutationEnvelope,
   optimisticResult: Schema.Json,
-  changes: Schema.Array(EntityChange)
+  changes: Schema.Array(EntityChange),
+  submissionState: SubmissionState,
+  attempts: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 })
 export type PendingMutation = typeof PendingMutation.Type

@@ -415,17 +415,21 @@ export const layerOnePass = (
       const submitPending = Effect.gen(function*() {
         yield* local.settleReceipts
         while (true) {
-          const pending = yield* local.pending
+          const pending = yield* local.pendingToSubmit
           let installedExpiredSnapshot = false
           for (const mutation of pending) {
-            const receipt = yield* remote.submit({
-              envelope: mutation.envelope,
-              schema: options.definition.schemaIdentity
-            })
-            yield* local.persistReceipt(receipt)
+            const receipt = yield* Effect.gen(function*() {
+              yield* local.markSubmitting(mutation.envelope.mutationId)
+              const remoteReceipt = yield* remote.submit({
+                envelope: mutation.envelope,
+                schema: options.definition.schemaIdentity
+              })
+              yield* local.persistReceipt(remoteReceipt)
+              return remoteReceipt
+            }).pipe(Effect.tapError(() => local.markRetrying(mutation.envelope.mutationId)))
             if (receipt._tag === "Expired") {
               yield* local.settleReceipts
-              const unresolved = (yield* local.pending).some(
+              const unresolved = (yield* local.pendingToSubmit).some(
                 (candidate) => candidate.envelope.mutationId === receipt.mutationId
               )
               if (!unresolved) continue

@@ -8,6 +8,8 @@ import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
+import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
@@ -88,6 +90,7 @@ const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migra
 const clientHistory = {
   scope,
   retainedReceipts: 256,
+  settlementCapacity: 64,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
   maximumBootstrapEntities: 10_000,
@@ -301,13 +304,359 @@ describe("server reconciled mutation log", () => {
         localSequence: pending.envelope.localSequence,
         membershipIncarnation: pending.envelope.membershipIncarnation,
         ...putTodoProvenance,
-        origin: "Mutation",
+        origin: "Legacy",
         terminalSequence: Identity.TerminalSequence.make(1),
         rejection: "denied"
       }))
 
       const error = yield* local.settleReceipts.pipe(Effect.flip)
       assert.strictEqual(error._tag, "StorageCorrupt")
+      assert.strictEqual(yield* local.pendingCount, 1)
+
+      yield* sql`DELETE FROM effect_local_client_canonical_entities_data
+        WHERE space_id = ${spaceId} AND schema_generation = ${meta.active_schema_generation}
+          AND model = ${Domain.Todo.name} AND entity_key = ${Canonical.stringify("corrupt-index-refresh")}`
+      const pull = yield* Stream.toPull(local.settlements)
+      yield* local.settleReceipts
+      assert.deepStrictEqual(
+        (yield* pull).map((settlement) => settlement.pending.envelope.mutationId),
+        [pending.envelope.mutationId]
+      )
+      assert.strictEqual(yield* local.pendingCount, 0)
+    })))
+
+  it.effect("finishes a committed settlement batch after its caller is interrupted", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const local = yield* service(
+        LocalStore.Store,
+        LocalStore.layer({
+          ...clientHistory,
+          settlementCapacity: 1,
+          definition: Domain.definition,
+          spaceId,
+          clientId
+        }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(database())
+        )
+      )
+      const pending = yield* Effect.forEach(
+        ["settlement-a", "settlement-b", "settlement-c", "settlement-d"],
+        (id) => local.mutate(Domain.PutTodo, Domain.todo(id))
+      )
+      const pull = yield* Stream.toPull(local.settlements)
+      const admitted = yield* Deferred.make<void>()
+      const settling = yield* local.applyReceipts(pending.map((item) =>
+        Protocol.RejectedReceipt.make({
+          spaceId,
+          clientId,
+          mutationId: item.envelope.mutationId,
+          localSequence: item.envelope.localSequence,
+          membershipIncarnation: item.envelope.membershipIncarnation,
+          ...putTodoProvenance,
+          origin: "Legacy",
+          terminalSequence: Identity.TerminalSequence.make(item.envelope.localSequence),
+          rejection: "denied"
+        })
+      )).pipe(
+        Effect.tap(() => Deferred.succeed(admitted, undefined)),
+        Effect.forkChild({ startImmediately: true })
+      )
+
+      assert.isFalse(yield* Deferred.isDone(admitted))
+      const first = yield* pull
+      const interruption = yield* Fiber.interrupt(settling).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      const remainder = yield* Effect.gen(function*() {
+        const values: Array<Replica.MutationSettlement> = []
+        while (values.length < 3) values.push(...(yield* pull))
+        return values
+      }).pipe(Effect.forkChild({ startImmediately: true }))
+      const result = yield* Fiber.join(remainder)
+      yield* Fiber.join(interruption)
+
+      assert.deepStrictEqual(
+        [...first, ...result].map((settlement) => settlement.pending.envelope.mutationId),
+        pending.map((item) => item.envelope.mutationId)
+      )
+      assert.strictEqual(yield* local.pendingCount, 0)
+    })))
+
+  it.effect("publishes a settlement when interrupted after durable deletion", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const invalidateStarted = yield* Deferred.make<void>()
+      const releaseInvalidation = yield* Deferred.make<void>()
+      const blockInvalidation = yield* Ref.make(false)
+      const blockedQueryReactivity = QueryReactivity.QueryReactivity.of({
+        retain: () => Effect.succeed(Effect.void),
+        record: () => Effect.void,
+        affected: () =>
+          Effect.gen(function*() {
+            if (!(yield* Ref.get(blockInvalidation))) return []
+            yield* Deferred.succeed(invalidateStarted, undefined)
+            yield* Deferred.await(releaseInvalidation)
+            return []
+          })
+      })
+      const local = yield* service(
+        LocalStore.Store,
+        LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(
+            Layer.mergeAll(
+              SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+              NodeCrypto.layer,
+              Reactivity.layer,
+              Layer.succeed(QueryReactivity.QueryReactivity, blockedQueryReactivity)
+            )
+          )
+        )
+      )
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("commit-to-publish"))
+      yield* Ref.set(blockInvalidation, true)
+      const pull = yield* Stream.toPull(local.settlements)
+      const settling = yield* local.applyReceipt(Protocol.RejectedReceipt.make({
+        spaceId,
+        clientId,
+        mutationId: pending.envelope.mutationId,
+        localSequence: pending.envelope.localSequence,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
+        ...putTodoProvenance,
+        origin: "Legacy",
+        terminalSequence: Identity.TerminalSequence.make(pending.envelope.localSequence),
+        rejection: "denied"
+      })).pipe(Effect.forkChild)
+
+      yield* Deferred.await(invalidateStarted)
+      const interruptionStarted = yield* Deferred.make<void>()
+      const interruption = yield* Deferred.succeed(interruptionStarted, undefined).pipe(
+        Effect.andThen(Fiber.interrupt(settling)),
+        Effect.forkChild
+      )
+      yield* Deferred.await(interruptionStarted)
+      yield* Deferred.succeed(releaseInvalidation, undefined)
+      yield* Fiber.join(interruption)
+
+      assert.deepStrictEqual(
+        (yield* pull).map((settlement) => settlement.pending.envelope.mutationId),
+        [pending.envelope.mutationId]
+      )
+      assert.strictEqual(yield* local.pendingCount, 0)
+    })))
+
+  it.effect("does not republish a deferred settlement after bootstrap removes its pending row", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const bounded = {
+        ...serverHistory,
+        retainedHistoryEntries: 0,
+        maximumHistoryEntries: 8
+      }
+      const local = yield* service(LocalStore.Store, localLayer())
+      const server = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(database())
+        )
+      )
+      yield* installFreshView(local, server)
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("bootstrap-deferred"))
+      const receipt = yield* server.submit(pending.envelope)
+      const page = incremental(
+        yield* server.pull(pullRequest((yield* local.replicationState).cursor))
+      )
+      const pull = yield* Stream.toPull(local.settlements)
+
+      yield* local.persistReceipt(receipt)
+      yield* local.applyViewPage({ ...page, hasMore: true })
+      yield* server.maintain(spaceId)
+      const required = yield* server.pull(pullRequest())
+      if (!("_tag" in required)) assert.fail("expected bootstrap")
+      const bootstrap = yield* server.bootstrap(bootstrapRequest(required.manifest))
+      yield* local.prepareBootstrap(bootstrap.manifest)
+      assert.isTrue(yield* local.stageBootstrapPage(bootstrap))
+      yield* local.installBootstrap(bootstrap.manifest)
+
+      assert.deepStrictEqual(
+        (yield* pull).map((settlement) => settlement.pending.envelope.mutationId),
+        [pending.envelope.mutationId]
+      )
+      yield* local.applyViewPage(incremental(
+        yield* server.pull(pullRequest((yield* local.replicationState).cursor))
+      ))
+      const duplicate = yield* pull.pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* TestClock.adjust("1 second")
+      assert.isTrue(Option.isNone(yield* Fiber.join(duplicate)))
+    })))
+
+  it.effect("keeps a deferred settlement pending when invalidation preparation fails", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const failPreparation = yield* Ref.make(false)
+      const queryReactivity = QueryReactivity.QueryReactivity.of({
+        retain: () => Effect.succeed(Effect.void),
+        record: () => Effect.void,
+        affected: () =>
+          Effect.gen(function*() {
+            if (yield* Ref.getAndSet(failPreparation, false)) {
+              return yield* Effect.die("invalidation preparation failed")
+            }
+            return []
+          })
+      })
+      const local = yield* service(
+        LocalStore.Store,
+        LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(
+            Layer.mergeAll(
+              SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+              NodeCrypto.layer,
+              Reactivity.layer,
+              Layer.succeed(QueryReactivity.QueryReactivity, queryReactivity)
+            )
+          )
+        )
+      )
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      yield* installFreshView(local, server)
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("deferred-invalidation"))
+      const receipt = yield* server.submit(pending.envelope)
+      const page = incremental(
+        yield* server.pull(pullRequest((yield* local.replicationState).cursor))
+      )
+      const pull = yield* Stream.toPull(local.settlements)
+
+      yield* local.persistReceipt(receipt)
+      yield* Ref.set(failPreparation, true)
+      const failed = yield* local.applyViewPage(page).pipe(Effect.exit)
+
+      assert.strictEqual(failed._tag, "Failure")
+      assert.strictEqual(yield* local.pendingCount, 1)
+
+      yield* local.applyViewPage(incremental(
+        yield* server.pull(pullRequest((yield* local.replicationState).cursor))
+      ))
+      assert.deepStrictEqual(
+        (yield* pull).map((settlement) => settlement.pending.envelope.mutationId),
+        [pending.envelope.mutationId]
+      )
+      assert.strictEqual(yield* local.pendingCount, 0)
+    })))
+
+  it.effect("keeps a quarantine settlement recoverable when final invalidation preparation fails", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const affectedCalls = yield* Ref.make(0)
+      const queryReactivity = QueryReactivity.QueryReactivity.of({
+        retain: () => Effect.succeed(Effect.void),
+        record: () => Effect.void,
+        affected: () =>
+          Effect.gen(function*() {
+            const call = yield* Ref.updateAndGet(affectedCalls, (count) => count + 1)
+            if (call === 2) return yield* Effect.die("final invalidation preparation failed")
+            return []
+          })
+      })
+      const clientDatabase = Layer.mergeAll(
+        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        NodeCrypto.layer,
+        Reactivity.layer,
+        Layer.succeed(QueryReactivity.QueryReactivity, queryReactivity)
+      )
+      const live = LocalStore.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId
+      }).pipe(
+        Layer.provide(runtime),
+        Layer.provide(clientDatabase)
+      )
+      const context = yield* Layer.build(Layer.merge(live, clientDatabase))
+      const local = Context.get(context, LocalStore.Store)
+      const sql = Context.get(context, SqlClient.SqlClient)
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("quarantine-finalization"))
+      yield* Ref.set(affectedCalls, 0)
+      yield* sql.withTransaction(Effect.gen(function*() {
+        yield* sql`INSERT INTO effect_local_client_quarantine
+          (space_id, membership_incarnation, mutation_id, local_sequence, basis, name, payload_json,
+            digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
+            rejection_json, target_schema_version, target_schema_hash)
+          SELECT space_id, membership_incarnation, mutation_id, local_sequence, basis, name, payload_json,
+            digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
+            ${yield* Canonical.stringifyEffect("schema-policy-rejected")},
+            ${Domain.definition.schemaIdentity.version}, ${Domain.definition.schemaIdentity.hash}
+          FROM effect_local_client_pending_data WHERE space_id = ${spaceId}
+            AND mutation_id = ${pending.envelope.mutationId}`
+        yield* sql`DELETE FROM effect_local_client_pending_data
+          WHERE space_id = ${spaceId} AND mutation_id = ${pending.envelope.mutationId}`
+      }))
+      const receipt = Protocol.RejectedReceipt.make({
+        ...putTodoProvenance,
+        spaceId,
+        clientId,
+        mutationId: pending.envelope.mutationId,
+        localSequence: pending.envelope.localSequence,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
+        origin: "Quarantine",
+        terminalSequence: Identity.TerminalSequence.make(1),
+        rejection: "discarded"
+      })
+      const pull = yield* Stream.toPull(local.settlements)
+
+      const failed = yield* local.resolveQuarantine(receipt).pipe(Effect.exit)
+
+      assert.strictEqual(failed._tag, "Failure")
+      assert.isTrue(Option.isNone(yield* local.quarantineByMutation(pending.envelope.mutationId)))
+      assert.strictEqual(yield* local.pendingCount, 1)
+      assert.isTrue(Option.isSome(yield* local.receipt(pending.envelope.mutationId)))
+
+      yield* local.settleReceipts
+      assert.deepStrictEqual(
+        (yield* pull).map((settlement) => settlement.pending.envelope.mutationId),
+        [pending.envelope.mutationId]
+      )
+      assert.strictEqual(yield* local.pendingCount, 0)
+      yield* local.settleReceipts
+      const duplicate = yield* pull.pipe(
+        Effect.timeoutOption("1 second"),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* TestClock.adjust("1 second")
+      assert.isTrue(Option.isNone(yield* Fiber.join(duplicate)))
+    })))
+
+  it.effect("replays accepted pending without authoritative coverage while settling a rejection", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const local = yield* service(LocalStore.Store, localLayer())
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      const acceptedPending = yield* local.mutate(Domain.PutTodo, Domain.todo("accepted-uncovered"))
+      const rejectedPending = yield* local.mutate(Domain.PutTodo, Domain.todo("rejected-covered"))
+      const accepted = yield* server.submit(acceptedPending.envelope)
+
+      yield* local.persistReceipt(accepted)
+      yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+        spaceId,
+        clientId,
+        mutationId: rejectedPending.envelope.mutationId,
+        localSequence: rejectedPending.envelope.localSequence,
+        membershipIncarnation: rejectedPending.envelope.membershipIncarnation,
+        ...putTodoProvenance,
+        origin: "Legacy",
+        terminalSequence: Identity.TerminalSequence.make(2),
+        rejection: "denied"
+      }))
+      yield* local.settleReceipts
+
+      assert.deepStrictEqual(
+        Option.getOrThrow(yield* local.get(Domain.Todo, "accepted-uncovered")),
+        Domain.todo("accepted-uncovered")
+      )
+      assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "rejected-covered")))
+      assert.strictEqual(yield* local.pendingCount, 1)
     })))
 
   it.effect("filters, orders, paginates, and streams through a declared secondary index", () =>
@@ -1173,7 +1522,7 @@ describe("server reconciled mutation log", () => {
           mutationId: first.envelope.mutationId,
           localSequence: first.envelope.localSequence,
           ...putTodoProvenance,
-          origin: "Mutation",
+          origin: "Legacy",
           terminalSequence: Identity.TerminalSequence.make(1),
           rejection: "denied"
         }))
@@ -1184,7 +1533,7 @@ describe("server reconciled mutation log", () => {
           mutationId: second.envelope.mutationId,
           localSequence: second.envelope.localSequence,
           ...putTodoProvenance,
-          origin: "Mutation",
+          origin: "Legacy",
           terminalSequence: Identity.TerminalSequence.make(1),
           rejection: "denied"
         })
@@ -1224,7 +1573,7 @@ describe("server reconciled mutation log", () => {
           mutationId: pending.envelope.mutationId,
           localSequence: pending.envelope.localSequence,
           ...putTodoProvenance,
-          origin: "Mutation",
+          origin: "Legacy",
           rejection: "Rejected"
         }))
         const submissions = yield* Ref.make(0)
@@ -1240,7 +1589,7 @@ describe("server reconciled mutation log", () => {
                 mutationId: submitted.envelope.mutationId,
                 localSequence: submitted.envelope.localSequence,
                 ...putTodoProvenance,
-                origin: "Mutation",
+                origin: "Legacy",
                 terminalSequence: Identity.TerminalSequence.make(1),
                 rejection: "Rejected"
               }))
@@ -2602,4 +2951,112 @@ describe("server reconciled mutation log", () => {
         }))
       }).pipe(Effect.provide(NodeFileSystem.layer))
     ))
+
+  it.effect("recovers an interrupted durable submission as retrying without incrementing attempts", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const fs = yield* FileSystem.FileSystem
+        const directory = yield* fs.makeTempDirectoryScoped()
+        const filename = `${directory}/submitting-recovery.db`
+        const persistentDatabase = () =>
+          Layer.mergeAll(
+            SqliteClient.layer({ filename, disableWAL: true }),
+            NodeCrypto.layer,
+            Reactivity.layer,
+            QueryReactivity.layer
+          )
+        const makeLocal = () =>
+          LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+            Layer.provide(runtime),
+            Layer.provide(persistentDatabase())
+          )
+
+        const mutationId = yield* Effect.scoped(Effect.gen(function*() {
+          const local = yield* service(LocalStore.Store, makeLocal())
+          const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("submitting-recovery"))
+          yield* local.markSubmitting(pending.envelope.mutationId)
+          const submitting = (yield* local.pending)[0]
+          assert.strictEqual(submitting.submissionState, "Submitting")
+          assert.strictEqual(submitting.attempts, 1)
+          return pending.envelope.mutationId
+        }))
+
+        yield* Effect.scoped(Effect.gen(function*() {
+          const local = yield* service(LocalStore.Store, makeLocal())
+          const recovered = (yield* local.pending)[0]
+          assert.strictEqual(recovered.envelope.mutationId, mutationId)
+          assert.strictEqual(recovered.submissionState, "Retrying")
+          assert.strictEqual(recovered.attempts, 1)
+        }))
+      }).pipe(Effect.provide(NodeFileSystem.layer))
+    ))
+
+  it.effect("restores Submitted and invalidates pending for an identical duplicate receipt", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const sharedDatabase = database()
+      const localLayerWithDatabase = LocalStore.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId
+      }).pipe(Layer.provide(runtime), Layer.provide(sharedDatabase))
+      const context = yield* Layer.build(Layer.merge(localLayerWithDatabase, sharedDatabase))
+      const local = Context.get(context, LocalStore.Store)
+      const sql = Context.get(context, SqlClient.SqlClient)
+      const reactivity = Context.get(context, Reactivity.Reactivity)
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("duplicate-state"))
+      const receipt = Protocol.RejectedReceipt.make({
+        spaceId,
+        clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
+        mutationId: pending.envelope.mutationId,
+        localSequence: pending.envelope.localSequence,
+        ...putTodoProvenance,
+        origin: "Authorization",
+        rejection: "denied"
+      })
+      yield* local.persistReceipt(receipt)
+      yield* sql`UPDATE effect_local_client_pending_data SET submission_state = 'Retrying'
+        WHERE space_id = ${spaceId} AND mutation_id = ${pending.envelope.mutationId}`
+      let invalidations = 0
+      const cancel = reactivity.registerUnsafe([ReactivityKey.pending(spaceId)], () => invalidations++)
+      yield* Effect.addFinalizer(() => Effect.sync(cancel))
+
+      yield* local.persistReceipt(receipt)
+
+      const restored = (yield* local.pending)[0]
+      assert.strictEqual(restored.submissionState, "Submitted")
+      assert.strictEqual(invalidations, 1)
+    })))
+
+  it.effect("rejects named receipt provenance outside the current definition", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const local = yield* service(LocalStore.Store, localLayer())
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("receipt-provenance"))
+      const receipt = Protocol.AcceptedReceipt.make({
+        spaceId,
+        clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
+        mutationId: pending.envelope.mutationId,
+        localSequence: pending.envelope.localSequence,
+        ...putTodoProvenance,
+        serverSequence: Identity.ServerSequence.make(1),
+        result: pending.optimisticResult
+      })
+      const wrongSchema = Protocol.AcceptedReceipt.make({
+        ...receipt,
+        sourceSchema: { ...Domain.definition.schemaIdentity, hash: Identity.SchemaHash.make("0".repeat(16)) }
+      })
+      const wrongVersion = Protocol.AcceptedReceipt.make({
+        ...receipt,
+        mutationVersion: Identity.SchemaVersion.make(receipt.mutationVersion + 1)
+      })
+
+      for (const invalid of [wrongSchema, wrongVersion]) {
+        const error = yield* local.persistReceipt(invalid).pipe(Effect.flip)
+        assert.strictEqual(error._tag, "ProtocolInvalid")
+        assert.isTrue(Option.isNone(yield* local.receipt(pending.envelope.mutationId)))
+        assert.strictEqual((yield* local.pending)[0].submissionState, "Queued")
+      }
+    })))
 })

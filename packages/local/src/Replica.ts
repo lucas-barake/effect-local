@@ -1,6 +1,8 @@
 import * as Context from "effect/Context"
 import type * as Effect from "effect/Effect"
 import type * as Option from "effect/Option"
+import type * as Schema from "effect/Schema"
+import type * as Stream from "effect/Stream"
 import type * as Identity from "./Identity.js"
 import type * as Model from "./Model.js"
 import type * as Mutation from "./Mutation.js"
@@ -9,6 +11,53 @@ import type * as Quarantine from "./Quarantine.js"
 import type * as Query from "./Query.js"
 import type * as ReplicaError from "./ReplicaError.js"
 import type * as ReplicaStatus from "./ReplicaStatus.js"
+
+export type PendingMutation<M extends Mutation.Any = Mutation.Any,> =
+  & Omit<Protocol.PendingMutation, "optimisticResult">
+  & {
+    readonly payload: Mutation.Payload<M>
+  }
+
+export type AcceptedReceipt<M extends Mutation.Any,> = Omit<Protocol.AcceptedReceipt, "name" | "result"> & {
+  readonly name: M["name"]
+  readonly result: Mutation.Success<M>
+}
+
+type RawRejectedReceipt<M extends Mutation.Any, Origin extends Protocol.RejectionOrigin,> =
+  & Omit<Protocol.RejectedReceipt, "name" | "origin" | "rejection">
+  & {
+    readonly name: M["name"]
+    readonly origin: Origin
+    readonly rejection: typeof Schema.Json.Type
+  }
+
+export type MutationRejectedReceipt<M extends Mutation.Any,> =
+  & Omit<Protocol.RejectedReceipt, "name" | "origin" | "rejection">
+  & {
+    readonly name: M["name"]
+    readonly origin: "Mutation"
+    readonly rejection: Mutation.Rejection<M>
+  }
+
+export type RejectedReceipt<M extends Mutation.Any,> =
+  | MutationRejectedReceipt<M>
+  | RawRejectedReceipt<M, Exclude<Protocol.RejectionOrigin, "Mutation">>
+
+export type Receipt<M extends Mutation.Any,> =
+  | AcceptedReceipt<M>
+  | RejectedReceipt<M>
+  | Protocol.LegacyReceipt
+  | Protocol.ExpiredReceipt
+
+export type MutationSettlement<M extends Mutation.Any = Mutation.Any,> =
+  | {
+    readonly pending: PendingMutation<M>
+    readonly receipt: Exclude<Receipt<M>, Protocol.LegacyReceipt>
+  }
+  | {
+    readonly pending: Protocol.PendingMutation
+    readonly receipt: Protocol.LegacyReceipt
+  }
 
 export interface Space {
   readonly spaceId: Identity.SpaceId
@@ -24,9 +73,18 @@ export interface Space {
     query: Q,
     payload: Q["payloadSchema"]["Type"]
   ) => Effect.Effect<Q["successSchema"]["Type"], ReplicaError.ReplicaError | Q["errorSchema"]["Type"]>
-  readonly receipt: (
+  readonly receipt: <M extends Mutation.Any,>(
+    mutation: M,
     mutationId: Identity.MutationId
-  ) => Effect.Effect<Option.Option<Protocol.Receipt>, ReplicaError.ReplicaError>
+  ) => Effect.Effect<Option.Option<Receipt<M>>, ReplicaError.ReplicaError>
+  readonly pending: Effect.Effect<ReadonlyArray<PendingMutation>, ReplicaError.ReplicaError>
+  readonly pendingFor: <M extends Mutation.Any,>(
+    mutation: M
+  ) => Effect.Effect<ReadonlyArray<PendingMutation<M>>, ReplicaError.ReplicaError>
+  readonly settlements: Stream.Stream<MutationSettlement>
+  readonly settlementsFor: <M extends Mutation.Any,>(
+    mutation: M
+  ) => Stream.Stream<MutationSettlement<M>, ReplicaError.ReplicaError>
   readonly quarantine: Effect.Effect<ReadonlyArray<Quarantine.QuarantinedMutation>, ReplicaError.ReplicaError>
   readonly discardQuarantined: (
     mutationId: Identity.MutationId

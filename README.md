@@ -214,6 +214,7 @@ const DatabaseLive = Layer.mergeAll(
 )
 
 const history = {
+  settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 1_024,
   retainedHistoryEntries: 256,
@@ -244,15 +245,17 @@ const program = Replica.Replica.use((replica) =>
       title: "Ship the mutation log",
       completed: false
     })
+    const inFlight = yield* space.pendingFor(PutTask)
     const task = yield* space.get(Task, "task-1")
     const tasks = yield* space.query(ListTasks, { completed: false })
-    return { pending, task, tasks }
+    return { pending, inFlight, task, tasks }
   })
 ).pipe(Effect.provide(ReplicaLive), Effect.scoped)
 ```
 
 Call `replica.join(spaceId)` to add membership, `replica.leave(spaceId)` to evict that space, and `replica.spaces` to
-list the current handles. Each handle scopes mutation, entity, query, receipt, cursor, and status state to its space.
+list the current handles. Each handle scopes mutation, entity, query, pending, settlement, receipt, cursor, and status
+state to its space.
 Leaving cascades through every client table without changing the durable client identity or any other space. A stale
 handle returns `SpaceUnavailable`, including after the same space is joined again with a fresh membership incarnation.
 
@@ -262,6 +265,17 @@ space does not block another space, while all requests still share the one `Sync
 Per space status is available on each handle. `replica.status` returns the sorted aggregate with total pending work.
 The explicit Workflow composition persists only reconciliation execution control. Application data stays in the same
 SQLite tables used by the in memory composition.
+
+`space.mutate` still completes at the local optimistic commit. It never waits for the server and its error channel
+contains only failures from that local run. Use `space.pending` to inspect every in flight mutation, including its
+decoded payload, submission state, and attempt count. Use `space.pendingFor(PutTask)` when the mutation specific type
+matters. `space.settlements` is a bounded live Stream of terminal `{ pending, receipt }` values. A current subscriber
+receives each terminal settlement once after rollback and pending replay have completed. The Stream has no
+history. Durable recovery remains `space.receipt(PutTask, mutationId)`. Mutation rejections from either surface are
+decoded through `PutTask.rejectionSchema`; authorization, capacity, legacy, and quarantine rejections remain distinct
+origin tagged JSON branches. `settlementCapacity` bounds each space's live feed. A subscriber that does not keep up
+backpressures settlement delivery and reconciliation, but never the local `mutate` commit. Leaving the space or closing
+the replica scope shuts down its settlement Stream.
 
 Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect Workflow. Supply
 `ClusterWorkflowEngine.layer` and the official runner Layer separately. For one SQLite owner this is normally
@@ -353,6 +367,8 @@ export const graph = BrowserReplica.make(ReplicaLive)
 export const taskAtom = graph.entity(spaceId, Task)("task-1")
 export const tasksAtom = graph.query(spaceId, ListTasks)({ completed: false })
 export const putTaskAtom = graph.mutation(spaceId, PutTask)
+export const pendingTasksAtom = graph.pendingFor(spaceId, PutTask)
+export const taskSettlementsAtom = graph.settlementsFor(spaceId, PutTask)
 export const spaceStatusAtom = graph.status(spaceId)
 export const replicaStatusAtom = graph.aggregateStatus
 export const spacesAtom = graph.spaces
@@ -362,10 +378,11 @@ export const leaveAtom = graph.leave
 
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
 atoms register exact space addressed keys. Query atoms also retain the entity keys and index ranges their handler
-actually read. Local commits and reconciliation batches refresh only affected mounted reads. Mutation, receipt, and
-status atoms also require a space address. The membership and aggregate atoms
-share the same runtime. Mutation atoms are concurrent and preserve their typed result. Pass an application factory
-with `options.factory` when the application already owns a deliberate custom runtime.
+actually read. Local commits and reconciliation batches refresh only affected mounted reads. Mutation, pending,
+receipt, and status atoms also require a space address. A settlement atom resolves to the lazy live Stream. Mounting
+the atom does not consume or replay events. Materializing that Stream owns one scoped subscription. The membership and
+aggregate atoms share the same runtime. Mutation atoms are concurrent and preserve their typed result. Pass an
+application factory with `options.factory` when the application already owns a deliberate custom runtime.
 
 ## Selective field semantics
 

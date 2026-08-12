@@ -47,6 +47,7 @@ const history = {
   migration
 }
 const clientHistory = {
+  settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,

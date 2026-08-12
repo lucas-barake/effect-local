@@ -34,6 +34,7 @@ const scope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
 const clientHistory = {
   scope,
   retainedReceipts: 256,
+  settlementCapacity: 64,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
   maximumBootstrapEntities: 10_000,
