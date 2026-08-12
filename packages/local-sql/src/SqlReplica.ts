@@ -279,28 +279,30 @@ const makeLayer = <D extends Definition.Any, R,>(
                 mutation: M,
                 payload: Mutation.Payload<M>
               ) =>
-                admit(Effect.gen(function*() {
-                  const found = yield* local.quarantineByMutation(mutationId)
-                  if (Option.isNone(found)) {
-                    const continuation = yield* local.quarantineCancellation(mutationId)
-                    yield* continueCancellation(continuation)
-                    return Quarantine.AlreadyResolved.make({ receipt: yield* findReceipt(mutationId) })
-                  }
-                  const item = found.value
-                  if (mutation.name !== item.envelope.name) {
-                    return yield* new ReplicaError.ProtocolInvalid({
-                      message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
-                    })
-                  }
-                  const pending = yield* local.ensureQuarantineResubmission(mutationId, mutation, payload)
-                  const receipt = yield* remote.discard({ envelope: item.envelope, schema: local.schema })
-                  if (receipt._tag !== "Rejected" || receipt.origin !== "Quarantine") {
+                admit(
+                  Effect.gen(function*() {
+                    const found = yield* local.quarantineByMutation(mutationId)
+                    if (Option.isNone(found)) {
+                      const continuation = yield* local.quarantineCancellation(mutationId)
+                      yield* continueCancellation(continuation)
+                      return Quarantine.AlreadyResolved.make({ receipt: yield* findReceipt(mutationId) })
+                    }
+                    const item = found.value
+                    if (mutation.name !== item.envelope.name) {
+                      return yield* new ReplicaError.ProtocolInvalid({
+                        message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
+                      })
+                    }
+                    const pending = yield* local.ensureQuarantineResubmission(mutationId, mutation, payload)
+                    const receipt = yield* remote.discard({ envelope: item.envelope, schema: local.schema })
+                    if (receipt._tag !== "Rejected" || receipt.origin !== "Quarantine") {
+                      yield* resolveDisposition(receipt, "Resubmit")
+                      return Quarantine.AlreadyResolved.make({ receipt })
+                    }
                     yield* resolveDisposition(receipt, "Resubmit")
-                    return Quarantine.AlreadyResolved.make({ receipt })
-                  }
-                  yield* resolveDisposition(receipt, "Resubmit")
-                  return Quarantine.Resubmitted.make({ pending })
-                }).pipe(Effect.ensuring(reconciler.notify))),
+                    return Quarantine.Resubmitted.make({ pending })
+                  }).pipe(Effect.ensuring(reconciler.notify))
+                ),
               status: admit(
                 Effect.all([reconciler.status, local.pendingCount]).pipe(
                   Effect.map(([status, pending]) => addressedStatus(spaceId, { ...status, pending }))

@@ -188,6 +188,7 @@ describe("reconciliation workflow", () => {
       const blockedSync = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: () =>
             Deferred.succeed(pullEntered, undefined).pipe(
