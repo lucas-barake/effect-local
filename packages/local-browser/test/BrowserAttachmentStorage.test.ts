@@ -1,4 +1,4 @@
-/* oxlint-disable effect/noNewPromise, effect/noNewError, effect/noTernary, effect/noThrowStatement, effect-local/noFunctionEffectGen, effect-local/noNestedCalls -- These tests model native MessagePort and OPFS host boundaries. */
+/* oxlint-disable effect/noAs, effect/noNewPromise, effect/noNewError, effect/noTernary, effect/noThrowStatement, effect-local/noFunctionEffectGen, effect-local/noNestedCalls, typescript/no-unsafe-type-assertion -- These tests model native MessagePort and OPFS host boundaries. */
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as AttachmentStorage from "@lucas-barake/effect-local-sql/AttachmentStorage"
@@ -28,18 +28,17 @@ const collectBytes = <E extends { readonly _tag: string }, R,>(stream: Stream.St
 const makeDirectory = () => {
   const files = new Map<AttachmentStorage.ObjectKey, Uint8Array>()
   let writes = 0
-  const notFound = (key: AttachmentStorage.ObjectKey) => new Attachment.AttachmentNotFound({ key })
   const service = AttachmentDirectory.AttachmentDirectory.of({
     create: (key) => Effect.sync(() => files.set(key, new Uint8Array(0))),
     offset: (key) => {
       const bytes = files.get(key)
-      if (bytes === undefined) return Effect.fail(notFound(key))
+      if (bytes === undefined) return Effect.fail(new Attachment.AttachmentNotFound({ key }))
       return Effect.succeed(bytes.length)
     },
     write: (key, expectedOffset, bytes) => {
       writes++
       const current = files.get(key)
-      if (current === undefined) return Effect.fail(notFound(key))
+      if (current === undefined) return Effect.fail(new Attachment.AttachmentNotFound({ key }))
       if (current.length !== expectedOffset) {
         return Effect.fail(
           new Attachment.AttachmentOffsetConflict({ expected: expectedOffset, actual: current.length })
@@ -55,7 +54,7 @@ const makeDirectory = () => {
     },
     read: (key, offset, length) => {
       const bytes = files.get(key)
-      if (bytes === undefined) return Effect.fail(notFound(key))
+      if (bytes === undefined) return Effect.fail(new Attachment.AttachmentNotFound({ key }))
       return Effect.succeed(bytes.slice(offset, offset + length))
     },
     exists: (key) => Effect.succeed(files.has(key)),
@@ -182,7 +181,6 @@ describe("browser attachment storage", () => {
       const allowCreate = yield* Deferred.make<void>()
       const createCompleted = yield* Deferred.make<void>()
       const files = new Set<AttachmentStorage.ObjectKey>()
-      const notFound = (key: AttachmentStorage.ObjectKey) => new Attachment.AttachmentNotFound({ key })
       const directory = AttachmentDirectory.AttachmentDirectory.of({
         create: (key) =>
           Effect.gen(function*() {
@@ -191,9 +189,12 @@ describe("browser attachment storage", () => {
             yield* Deferred.await(allowCreate)
             yield* Deferred.succeed(createCompleted, undefined)
           }),
-        offset: (key) => files.has(key) ? Effect.succeed(0) : Effect.fail(notFound(key)),
-        write: (key) => files.has(key) ? Effect.succeed(0) : Effect.fail(notFound(key)),
-        read: (key) => files.has(key) ? Effect.succeed(new Uint8Array(0)) : Effect.fail(notFound(key)),
+        offset: (key) => files.has(key) ? Effect.succeed(0) : Effect.fail(new Attachment.AttachmentNotFound({ key })),
+        write: (key) => files.has(key) ? Effect.succeed(0) : Effect.fail(new Attachment.AttachmentNotFound({ key })),
+        read: (key) =>
+          files.has(key)
+            ? Effect.succeed(new Uint8Array(0))
+            : Effect.fail(new Attachment.AttachmentNotFound({ key })),
         exists: (key) => Effect.succeed(files.has(key)),
         remove: (key) => Effect.sync(() => void files.delete(key))
       })
@@ -220,6 +221,37 @@ describe("browser attachment storage", () => {
       yield* Deferred.await(createCompleted)
       yield* Fiber.join(interruption)
       assert.strictEqual(files.size, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "forgets a request callback when postMessage throws",
+    Effect.fnUntraced(function*() {
+      let messageError: ((event: MessageEvent<unknown>) => void) | undefined
+      const port = {
+        addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => {
+          if (type === "messageerror") messageError = listener as (event: MessageEvent<unknown>) => void
+        },
+        removeEventListener: () => undefined,
+        start: () => undefined,
+        postMessage: () => {
+          throw new Error("send failed")
+        }
+      } as unknown as MessagePort
+      const context = yield* Layer.build(makeLayer(port, 8))
+      const storage = Context.get(context, AttachmentStorage.AttachmentStorage)
+      const result = yield* storage.create().pipe(Effect.result)
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, "AttachmentStorageError")
+
+      let dataReads = 0
+      messageError?.({
+        get data() {
+          dataReads++
+          return undefined
+        }
+      } as MessageEvent<unknown>)
+      assert.strictEqual(dataReads, 0)
     }, Effect.scoped)
   )
 

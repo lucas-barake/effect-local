@@ -73,6 +73,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
             if (transfer !== undefined) transfers.push(...transfer)
             port.postMessage({ ...message, id }, transfers)
           } catch (cause) {
+            pending.delete(id)
             resume(Effect.fail(new Attachment.AttachmentStorageError({ operation: "request.send", cause })))
           }
           return Effect.sync(() => pending.delete(id))
