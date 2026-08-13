@@ -81,7 +81,7 @@ export const layer = <D extends Definition.Any,>(
         })
         return {
           get: (model, key) =>
-            record({ _tag: "Entity", key: ReactivityKey.entity(spaceId, model.name, key) }).pipe(
+            record({ _tag: "Entity", spaceId, key: ReactivityKey.entity(spaceId, model.name, key) }).pipe(
               Effect.andThen(transaction.get(model, key))
             ),
           from: (model, index) => {

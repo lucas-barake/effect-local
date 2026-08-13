@@ -5,7 +5,7 @@ import * as EffectLayer from "effect/Layer"
 import type * as IndexStore from "./IndexStore.js"
 
 export type Read =
-  | { readonly _tag: "Entity"; readonly key: string }
+  | { readonly _tag: "Entity"; readonly spaceId: Identity.SpaceId; readonly key: string }
   | { readonly _tag: "Index"; readonly footprint: IndexStore.Footprint }
 
 export interface Changes {
@@ -81,7 +81,8 @@ const pointMatches = (footprint: IndexStore.Footprint, point: IndexStore.Point):
 
 const make = (): Service => {
   const retained = new Map<string, number>()
-  const readsByKey = new Map<string, ReadonlyArray<Read>>()
+  const readsBySpace = new Map<Identity.SpaceId, Map<string, ReadonlyArray<Read>>>()
+  const spaceByKey = new Map<string, Identity.SpaceId>()
   return {
     retain: (key) => {
       const cleanup = Effect.sync(() => {
@@ -91,7 +92,13 @@ const make = (): Service => {
           return
         }
         retained.delete(key)
+        const spaceId = spaceByKey.get(key)
+        if (spaceId === undefined) return
+        spaceByKey.delete(key)
+        const readsByKey = readsBySpace.get(spaceId)
+        if (readsByKey === undefined) return
         readsByKey.delete(key)
+        if (readsByKey.size === 0) readsBySpace.delete(spaceId)
       })
       return Effect.sync(() => {
         retained.set(key, (retained.get(key) ?? 0) + 1)
@@ -99,7 +106,21 @@ const make = (): Service => {
     },
     record: (key, reads) =>
       Effect.sync(() => {
-        if (retained.has(key)) readsByKey.set(key, reads)
+        if (!retained.has(key) || reads.length === 0) return
+        const first = reads[0]
+        let spaceId: Identity.SpaceId
+        if (first._tag === "Entity") spaceId = first.spaceId
+        else spaceId = first.footprint.spaceId
+        const previousSpaceId = spaceByKey.get(key)
+        if (previousSpaceId !== undefined && previousSpaceId !== spaceId) {
+          const previous = readsBySpace.get(previousSpaceId)
+          previous?.delete(key)
+          if (previous?.size === 0) readsBySpace.delete(previousSpaceId)
+        }
+        spaceByKey.set(key, spaceId)
+        const readsByKey = readsBySpace.get(spaceId)
+        if (readsByKey === undefined) readsBySpace.set(spaceId, new Map([[key, reads]]))
+        else readsByKey.set(key, reads)
       }),
     affected: (changes) =>
       Effect.sync(() => {
@@ -113,10 +134,11 @@ const make = (): Service => {
           else points.push(point)
         }
         const affected: Array<string> = []
+        const readsByKey = readsBySpace.get(changes.spaceId)
+        if (readsByKey === undefined) return affected
         for (const [key, reads] of readsByKey) {
           const matches = reads.some((read) => {
             if (read._tag === "Entity") return changes.entityKeys.has(read.key)
-            if (read.footprint.spaceId !== changes.spaceId) return false
             if (changes.broadModels.has(read.footprint.model)) return true
             return pointsByDescriptor.get(read.footprint.descriptor)?.some((point) =>
               pointMatches(read.footprint, point)
