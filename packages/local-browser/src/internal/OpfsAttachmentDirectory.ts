@@ -1,6 +1,7 @@
 import type * as AttachmentStorage from "@lucas-barake/effect-local-sql/AttachmentStorage"
 import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as AttachmentDirectory from "./AttachmentDirectory.js"
 
@@ -23,11 +24,11 @@ export const layer = (options: Options) =>
       const root = yield* Effect.tryPromise({
         try: () => navigator.storage.getDirectory(),
         catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.root", cause })
-      })
+      }).pipe(Effect.withSpan("OpfsAttachmentDirectory.root"))
       const directory = yield* Effect.tryPromise({
         try: () => root.getDirectoryHandle(options.directory, { create: true }),
         catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.initialize", cause })
-      })
+      }).pipe(Effect.withSpan("OpfsAttachmentDirectory.initialize"))
 
       const open = (key: AttachmentStorage.ObjectKey) =>
         Effect.tryPromise({
@@ -66,7 +67,9 @@ export const layer = (options: Options) =>
             )
         )
 
-      const create: AttachmentDirectory.Service["create"] = Effect.fnUntraced(function*(key) {
+      const create: AttachmentDirectory.Service["create"] = Effect.fn("OpfsAttachmentDirectory.create")(function*(
+        key
+      ) {
         const existing = yield* Effect.tryPromise({
           try: () => directory.getFileHandle(fileName(key)),
           catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.create.inspect", cause })
@@ -82,47 +85,65 @@ export const layer = (options: Options) =>
         if (existing) {
           yield* new Attachment.AttachmentStorageError({ operation: "opfs.create.collision", cause: key })
         }
-        const file = yield* Effect.tryPromise({
-          try: () => directory.getFileHandle(fileName(key), { create: true }),
-          catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.create", cause })
-        })
         yield* Effect.acquireUseRelease(
           Effect.tryPromise({
-            try: () => file.createSyncAccessHandle(),
-            catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.create.access", cause })
+            try: () => directory.getFileHandle(fileName(key), { create: true }),
+            catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.create", cause })
           }),
-          (handle) =>
-            Effect.try({
-              try: () => {
-                handle.truncate(0)
-                handle.flush()
-              },
-              catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.create.initialize", cause })
-            }),
-          (handle) =>
-            Effect.try({
-              try: () => handle.close(),
-              catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.create.close", cause })
-            }).pipe(
-              Effect.catchTag("AttachmentStorageError", (error) =>
-                Effect.logWarning("Failed to close a new OPFS attachment handle").pipe(
-                  Effect.annotateLogs("operation", error.operation)
-                ))
-            )
+          (file) =>
+            Effect.acquireUseRelease(
+              Effect.tryPromise({
+                try: () => file.createSyncAccessHandle(),
+                catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.create.access", cause })
+              }),
+              (handle) =>
+                Effect.try({
+                  try: () => {
+                    handle.truncate(0)
+                    handle.flush()
+                  },
+                  catch: (cause) =>
+                    new Attachment.AttachmentStorageError({ operation: "opfs.create.initialize", cause })
+                }),
+              (handle) =>
+                Effect.try({
+                  try: () => handle.close(),
+                  catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.create.close", cause })
+                }).pipe(
+                  Effect.catchTag("AttachmentStorageError", (error) =>
+                    Effect.logWarning("Failed to close a new OPFS attachment handle").pipe(
+                      Effect.annotateLogs("operation", error.operation)
+                    ))
+                )
+            ),
+          Effect.fnUntraced(function*(_, exit) {
+            if (Exit.isFailure(exit)) {
+              yield* Effect.tryPromise({
+                try: () => directory.removeEntry(fileName(key)),
+                catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.create.cleanup", cause })
+              }).pipe(
+                Effect.catchTag("AttachmentStorageError", (error) =>
+                  Effect.logWarning("Failed to remove an uninitialized OPFS attachment").pipe(
+                    Effect.annotateLogs("operation", error.operation)
+                  ))
+              )
+            }
+          })
         )
       })
 
       const offset: AttachmentDirectory.Service["offset"] = (key) =>
         useHandle(key, (handle) =>
           Effect.try({
-            try: () => handle.getSize(),
+            try: () =>
+              handle.getSize(),
             catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.offset", cause })
-          }))
+          })).pipe(Effect.withSpan("OpfsAttachmentDirectory.offset"))
 
       const write: AttachmentDirectory.Service["write"] = (key, expectedOffset, bytes) =>
         useHandle(
           key,
-          Effect.fnUntraced(function*(handle) {
+          Effect.fn("OpfsAttachmentDirectory.write")(function*(handle) {
             const actual = yield* Effect.try({
               try: () => handle.getSize(),
               catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.write.offset", cause })
@@ -162,7 +183,7 @@ export const layer = (options: Options) =>
               return bytes.slice(0, bytesRead)
             },
             catch: (cause) => new Attachment.AttachmentStorageError({ operation: "opfs.read", cause })
-          }))
+          })).pipe(Effect.withSpan("OpfsAttachmentDirectory.read"))
 
       const exists: AttachmentDirectory.Service["exists"] = (key) =>
         Effect.tryPromise({
@@ -175,7 +196,8 @@ export const layer = (options: Options) =>
               return Effect.succeed(false)
             }
             return Effect.fail(error)
-          })
+          }),
+          Effect.withSpan("OpfsAttachmentDirectory.exists")
         )
 
       const remove: AttachmentDirectory.Service["remove"] = (key) =>
@@ -186,7 +208,8 @@ export const layer = (options: Options) =>
           Effect.catchTag("AttachmentStorageError", (error) => {
             if (error.cause instanceof DOMException && error.cause.name === "NotFoundError") return Effect.void
             return Effect.fail(error)
-          })
+          }),
+          Effect.withSpan("OpfsAttachmentDirectory.remove")
         )
 
       return AttachmentDirectory.AttachmentDirectory.of({ create, offset, write, read, exists, remove })

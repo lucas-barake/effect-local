@@ -1,7 +1,6 @@
 import * as AttachmentStorage from "@lucas-barake/effect-local-sql/AttachmentStorage"
 import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import * as Crypto from "effect/Crypto"
-import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
@@ -15,6 +14,8 @@ export interface Options {
   readonly maximumBytes: number
   readonly readChunkBytes: number
 }
+
+const writeChunkBytes = 256 * 1_024
 
 export const layerMessagePort = (port: MessagePort, options: Options) =>
   Layer.effect(
@@ -36,16 +37,15 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
       const maximumBytes = options.maximumBytes
       const readChunkBytes = options.readChunkBytes
       const locks = yield* RcMap.make({ lookup: () => Semaphore.make(1) })
-      const pending = new Map<number, Deferred.Deferred<unknown>>()
+      const pending = new Map<number, (value: unknown) => void>()
       let nextRequestId = 0
       const receive = (event: MessageEvent<unknown>) => {
         const data = event.data
         if (typeof data !== "object" || data === null || !("id" in data) || typeof data.id !== "number") return
-        const deferred = pending.get(data.id)
-        if (deferred !== undefined) Deferred.doneUnsafe(deferred, Exit.succeed(data))
+        pending.get(data.id)?.(data)
       }
       const messageError = (event: MessageEvent<unknown>) => {
-        for (const deferred of pending.values()) Deferred.doneUnsafe(deferred, Exit.succeed(event.data))
+        for (const complete of pending.values()) complete(event.data)
       }
       yield* Effect.acquireRelease(
         Effect.sync(() => {
@@ -60,30 +60,26 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
           })
       )
 
-      const request = Effect.fnUntraced(function*(
+      const request = Effect.fn("BrowserAttachmentStorage.request")(function*(
         message: AttachmentWorkerProtocol.RequestWithoutId,
         transfer?: ReadonlyArray<Transferable>
       ): Effect.fn.Return<AttachmentWorkerProtocol.Response, Attachment.AttachmentStorageError> {
         const id = nextRequestId++
-        const completion = yield* Deferred.make<unknown>()
-        return yield* Effect.acquireUseRelease(
-          Effect.sync(() => pending.set(id, completion)),
-          () => {
+        const response = yield* Effect.callback<unknown, Attachment.AttachmentStorageError>((resume) => {
+          pending.set(id, (value) => resume(Effect.succeed(value)))
+          // oxlint-disable-next-line effect/noTryCatch -- MessagePort postMessage is the synchronous host boundary inside callback registration.
+          try {
             const transfers: Array<Transferable> = []
             if (transfer !== undefined) transfers.push(...transfer)
-            return Effect.try({
-              try: () => port.postMessage({ ...message, id }, transfers),
-              catch: (cause) => new Attachment.AttachmentStorageError({ operation: "request.send", cause })
-            }).pipe(
-              Effect.andThen(Deferred.await(completion)),
-              Effect.flatMap(Schema.decodeUnknownEffect(AttachmentWorkerProtocol.Response)),
-              Effect.mapError((cause) => {
-                if (cause._tag === "AttachmentStorageError") return cause
-                return new Attachment.AttachmentStorageError({ operation: "response.decode", cause })
-              })
-            )
-          },
-          () => Effect.sync(() => pending.delete(id))
+            port.postMessage({ ...message, id }, transfers)
+          } catch (cause) {
+            resume(Effect.fail(new Attachment.AttachmentStorageError({ operation: "request.send", cause })))
+          }
+          return Effect.sync(() => pending.delete(id))
+        })
+        pending.delete(id)
+        return yield* Schema.decodeUnknownEffect(AttachmentWorkerProtocol.Response)(response).pipe(
+          Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "response.decode", cause }))
         )
       })
 
@@ -96,7 +92,81 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
           Effect.scoped
         )
 
-      const create: AttachmentStorage.Service["create"] = Effect.fnUntraced(function*() {
+      const writeCoalesced = <E extends { readonly _tag: string }, R, E2 extends { readonly _tag: string },>(
+        bytes: Stream.Stream<Uint8Array, E, R>,
+        limit: number,
+        reportedLimit: number,
+        write: (bytes: Uint8Array) => Effect.Effect<void, E2>
+      ): Effect.Effect<number, E | E2 | Attachment.AttachmentTooLarge, R> => {
+        const buffer = new Uint8Array(Math.min(writeChunkBytes, Math.max(1, limit)))
+        let buffered = 0
+        let observed = 0
+        const flush = Effect.suspend(() => {
+          if (buffered === 0) return Effect.void
+          const outgoing = buffer.slice(0, buffered)
+          buffered = 0
+          return write(outgoing)
+        })
+        const consume = Effect.fnUntraced(function*(chunk: Uint8Array) {
+          if (observed + chunk.length > limit) {
+            return yield* Effect.fail<E2 | Attachment.AttachmentTooLarge>(
+              new Attachment.AttachmentTooLarge({ limit: reportedLimit })
+            )
+          }
+          observed += chunk.length
+          let sourceOffset = 0
+          while (sourceOffset < chunk.length) {
+            const copied = Math.min(buffer.length - buffered, chunk.length - sourceOffset)
+            buffer.set(chunk.subarray(sourceOffset, sourceOffset + copied), buffered)
+            buffered += copied
+            sourceOffset += copied
+            if (buffered === buffer.length) yield* flush
+          }
+          return undefined
+        })
+        return Stream.runForEach(bytes, consume).pipe(
+          Effect.onExit(() => flush),
+          Effect.as(observed)
+        )
+      }
+
+      const hashCoalesced = <E extends { readonly _tag: string }, R, E2 extends { readonly _tag: string },>(
+        bytes: Stream.Stream<Uint8Array, E, R>,
+        write: (bytes: Uint8Array) => Effect.Effect<void, E2>
+      ): Effect.Effect<Attachment.HashResult, E | E2 | Attachment.AttachmentTooLarge, R> => {
+        const buffer = new Uint8Array(Math.min(writeChunkBytes, maximumBytes))
+        let buffered = 0
+        let observed = 0
+        const flush = Effect.suspend(() => {
+          if (buffered === 0) return Effect.void
+          const outgoing = buffer.slice(0, buffered)
+          buffered = 0
+          return write(outgoing)
+        })
+        const stored = Stream.mapEffect(
+          bytes,
+          Effect.fnUntraced(function*(chunk) {
+            if (observed + chunk.length > maximumBytes) {
+              return yield* Effect.fail<E2 | Attachment.AttachmentTooLarge>(
+                new Attachment.AttachmentTooLarge({ limit: maximumBytes })
+              )
+            }
+            observed += chunk.length
+            let sourceOffset = 0
+            while (sourceOffset < chunk.length) {
+              const copied = Math.min(buffer.length - buffered, chunk.length - sourceOffset)
+              buffer.set(chunk.subarray(sourceOffset, sourceOffset + copied), buffered)
+              buffered += copied
+              sourceOffset += copied
+              if (buffered === buffer.length) yield* flush
+            }
+            return chunk
+          })
+        )
+        return Attachment.hash(stored, { maximumBytes }).pipe(Effect.onExit(() => flush))
+      }
+
+      const create: AttachmentStorage.Service["create"] = Effect.fn("BrowserAttachmentStorage.create")(function*() {
         const uuid = yield* crypto.randomUUIDv4.pipe(
           Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "create.key", cause }))
         )
@@ -110,7 +180,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
         return key
       })
 
-      const offset: AttachmentStorage.Service["offset"] = Effect.fnUntraced(function*(key) {
+      const offset: AttachmentStorage.Service["offset"] = Effect.fn("BrowserAttachmentStorage.offset")(function*(key) {
         const response = yield* request({ _tag: "Offset", key })
         if (response._tag === "NotFound") return yield* new Attachment.AttachmentNotFound({ key: response.key })
         if (response._tag !== "Offset") {
@@ -135,7 +205,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
               })
             }
           })
-        )
+        ).pipe(Effect.withSpan("BrowserAttachmentStorage.remove"))
 
       const append = <E extends { readonly _tag: string }, R,>(
         key: AttachmentStorage.ObjectKey,
@@ -157,15 +227,14 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
             const limit = Math.min(reference.bytes, maximumBytes)
             if (actual > limit) return yield* new Attachment.AttachmentTooLarge({ limit })
             let written = actual
-            yield* Stream.runForEach(
+            yield* writeCoalesced(
               bytes,
+              limit - actual,
+              limit,
               Effect.fnUntraced(function*(chunk): Effect.fn.Return<
                 void,
                 AttachmentStorage.StorageFailure | Attachment.AttachmentOffsetConflict | Attachment.AttachmentTooLarge
               > {
-                if (written + chunk.length > limit) {
-                  yield* new Attachment.AttachmentTooLarge({ limit })
-                }
                 const outgoing = Uint8Array.from(chunk)
                 const response = yield* request(
                   { _tag: "Write", key, expectedOffset: written, bytes: outgoing },
@@ -197,24 +266,17 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
             )
             return written
           })
-        )
+        ).pipe(Effect.withSpan("BrowserAttachmentStorage.append"))
 
       const stage: AttachmentStorage.Service["stage"] = Effect.fnUntraced(function*<
         E extends { readonly _tag: string },
         R,
       >(bytes: Stream.Stream<Uint8Array, E, R>) {
-        const key = yield* create()
-        const write = Effect.gen(function*() {
-          let written = 0
-          const stored = Stream.mapEffect(
-            bytes,
-            Effect.fnUntraced(function*(chunk): Effect.fn.Return<
-              Uint8Array,
-              Attachment.AttachmentStorageError | Attachment.AttachmentTooLarge
-            > {
-              if (written + chunk.length > maximumBytes) {
-                return yield* new Attachment.AttachmentTooLarge({ limit: maximumBytes })
-              }
+        return yield* Effect.acquireUseRelease(
+          create(),
+          Effect.fnUntraced(function*(key) {
+            let written = 0
+            const write = Effect.fnUntraced(function*(chunk: Uint8Array) {
               const outgoing = Uint8Array.from(chunk)
               const response = yield* request(
                 { _tag: "Write", key, expectedOffset: written, bytes: outgoing },
@@ -232,21 +294,25 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
                 })
               }
               written = response.offset
-              return chunk
+              return undefined
             })
-          )
-          const hashed = yield* Attachment.hash(stored, { maximumBytes })
-          return {
-            key,
-            reference: Attachment.Reference.make({ _tag: "Attachment", ...hashed })
-          }
-        })
-        return yield* write.pipe(
-          Effect.onExit((exit) => {
-            if (Exit.isFailure(exit)) return remove(key)
-            return Effect.void
+            const hashed = yield* hashCoalesced(bytes, write)
+            return {
+              key,
+              reference: Attachment.Reference.make({ _tag: "Attachment", ...hashed })
+            }
+          }),
+          Effect.fnUntraced(function*(key, exit) {
+            if (Exit.isFailure(exit)) {
+              yield* remove(key).pipe(
+                Effect.catchTag("AttachmentStorageError", (error) =>
+                  Effect.logWarning("Failed to remove an interrupted staged attachment").pipe(
+                    Effect.annotateLogs("operation", error.operation)
+                  ))
+              )
+            }
           })
-        )
+        ).pipe(Effect.withSpan("BrowserAttachmentStorage.stage"))
       })
 
       const read: AttachmentStorage.Service["read"] = (key, reference, range) => {
@@ -258,10 +324,14 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
           if (actual !== reference.bytes) {
             return yield* new Attachment.AttachmentLengthMismatch({ expected: reference.bytes, actual })
           }
-          if (range === undefined) return { start: 0, end: reference.bytes }
+          if (range === undefined) {
+            return { start: 0, end: reference.bytes }
+          }
           const start = range.offset
           let length = reference.bytes - start
-          if (range.length !== undefined) length = range.length
+          if (range.length !== undefined) {
+            length = range.length
+          }
           if (
             !Number.isSafeInteger(start) || start < 0 ||
             !Number.isSafeInteger(length) || length <= 0 ||
@@ -282,7 +352,9 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
               readonly [Uint8Array, number] | undefined,
               AttachmentStorage.StorageFailure
             > {
-              if (position >= end) return undefined
+              if (position >= end) {
+                return undefined
+              }
               const length = Math.min(readChunkBytes, end - position)
               const response = yield* request({ _tag: "Read", key, offset: position, length })
               if (response._tag === "NotFound") {
@@ -307,10 +379,13 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
               return [response.bytes, position + response.bytes.length] as const
             })
           )
-        )))
+        ))).pipe(Stream.withSpan("BrowserAttachmentStorage.read"))
       }
 
-      const verify: AttachmentStorage.Service["verify"] = Effect.fnUntraced(function*(key, reference) {
+      const verify: AttachmentStorage.Service["verify"] = Effect.fn("BrowserAttachmentStorage.verify")(function*(
+        key,
+        reference
+      ) {
         const actual = yield* offset(key)
         if (actual !== reference.bytes) {
           yield* new Attachment.AttachmentLengthMismatch({ expected: reference.bytes, actual })
@@ -318,7 +393,8 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
         const hashed = yield* Attachment.hash(read(key, reference), { maximumBytes }).pipe(
           Effect.catchTag(
             "InvalidAttachmentRange",
-            (error) => Effect.fail(new Attachment.AttachmentStorageError({ operation: "verify.range", cause: error }))
+            (error) =>
+              Effect.fail(new Attachment.AttachmentStorageError({ operation: "verify.range", cause: error }))
           )
         )
         if (hashed.digest !== reference.digest) {
@@ -329,11 +405,13 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
         }
       })
 
-      const exists: AttachmentStorage.Service["exists"] = Effect.fnUntraced(function*(key) {
+      const exists: AttachmentStorage.Service["exists"] = Effect.fn("BrowserAttachmentStorage.exists")(function*(key) {
         const response = yield* request({ _tag: "Exists", key })
         if (response._tag !== "Exists") {
           let operation: string = response._tag
-          if (response._tag === "StorageError") operation = response.operation
+          if (response._tag === "StorageError") {
+            operation = response.operation
+          }
           return yield* new Attachment.AttachmentStorageError({ operation: `worker.${operation}`, cause: operation })
         }
         return response.exists

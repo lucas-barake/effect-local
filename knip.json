@@ -3,6 +3,14 @@
   "includeEntryExports": false,
   "workspaces": {
     "packages/local-browser": {
+      "entry": [
+        "src/index.ts",
+        "bench/attachment-byte-path.ts",
+        "bench/attachment-opfs-worker.ts",
+        "bench/attachment-sqlite-worker.ts",
+        "bench/attachment-storage-smoke.ts",
+        "bench/attachment-storage-smoke-worker.ts"
+      ],
       "ignoreDependencies": ["@effect/platform-browser"]
     },
     "packages/local-test": {

@@ -9,5 +9,6 @@ export interface Options {
 
 export const serveMessagePort = (port: MessagePort, options: Options) =>
   AttachmentWorkerProtocol.serve(port, { maximumBytes: options.maximumBytes }).pipe(
-    Effect.provide(OpfsAttachmentDirectory.layer({ directory: options.directory }))
+    Effect.provide(OpfsAttachmentDirectory.layer({ directory: options.directory })),
+    Effect.withSpan("BrowserAttachmentWorker.serveMessagePort")
   )

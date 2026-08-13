@@ -1,18 +1,23 @@
+/* oxlint-disable effect/noNewPromise, effect/noNewError, effect/noTernary, effect/noThrowStatement, effect-local/noFunctionEffectGen, effect-local/noNestedCalls -- These tests model native MessagePort and OPFS host boundaries. */
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as AttachmentStorage from "@lucas-barake/effect-local-sql/AttachmentStorage"
 import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Result from "effect/Result"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as BrowserAttachmentStorage from "../src/BrowserAttachmentStorage.js"
 import * as AttachmentDirectory from "../src/internal/AttachmentDirectory.js"
 import * as AttachmentWorkerProtocol from "../src/internal/AttachmentWorkerProtocol.js"
+import * as OpfsAttachmentDirectory from "../src/internal/OpfsAttachmentDirectory.js"
 
 const collectBytes = <E extends { readonly _tag: string }, R,>(stream: Stream.Stream<Uint8Array, E, R>) =>
   stream.pipe(
@@ -22,6 +27,7 @@ const collectBytes = <E extends { readonly _tag: string }, R,>(stream: Stream.St
 
 const makeDirectory = () => {
   const files = new Map<AttachmentStorage.ObjectKey, Uint8Array>()
+  let writes = 0
   const notFound = (key: AttachmentStorage.ObjectKey) => new Attachment.AttachmentNotFound({ key })
   const service = AttachmentDirectory.AttachmentDirectory.of({
     create: (key) => Effect.sync(() => files.set(key, new Uint8Array(0))),
@@ -31,6 +37,7 @@ const makeDirectory = () => {
       return Effect.succeed(bytes.length)
     },
     write: (key, expectedOffset, bytes) => {
+      writes++
       const current = files.get(key)
       if (current === undefined) return Effect.fail(notFound(key))
       if (current.length !== expectedOffset) {
@@ -54,8 +61,20 @@ const makeDirectory = () => {
     exists: (key) => Effect.succeed(files.has(key)),
     remove: (key) => Effect.sync(() => void files.delete(key))
   })
-  return { files, service }
+  return {
+    files,
+    get writes() {
+      return writes
+    },
+    service
+  }
 }
+
+const makeLayer = (port: MessagePort, maximumBytes: number) =>
+  BrowserAttachmentStorage.layerMessagePort(port, {
+    maximumBytes,
+    readChunkBytes: 2
+  }).pipe(Layer.provide(NodeCrypto.layer))
 
 describe("browser attachment storage", () => {
   it.effect(
@@ -73,10 +92,7 @@ describe("browser attachment storage", () => {
         Effect.provideService(AttachmentDirectory.AttachmentDirectory, directory.service),
         Effect.forkScoped({ startImmediately: true })
       )
-      const layer = BrowserAttachmentStorage.layerMessagePort(channel.port2, {
-        maximumBytes: 5,
-        readChunkBytes: 2
-      }).pipe(Layer.provide(NodeCrypto.layer))
+      const layer = makeLayer(channel.port2, 5)
 
       const firstScope = yield* Scope.make()
       const first = yield* Layer.buildWithScope(layer, firstScope)
@@ -119,4 +135,148 @@ describe("browser attachment storage", () => {
       yield* Scope.close(secondScope, Exit.void)
     }, Effect.scoped)
   )
+
+  it.effect(
+    "coalesces one byte fragments and durably flushes the final prefix on failure",
+    Effect.fnUntraced(function*() {
+      const directory = makeDirectory()
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          channel.port1.close()
+          channel.port2.close()
+        })
+      )
+      yield* AttachmentWorkerProtocol.serve(channel.port1, { maximumBytes: 1_024 }).pipe(
+        Effect.provideService(AttachmentDirectory.AttachmentDirectory, directory.service),
+        Effect.forkScoped({ startImmediately: true })
+      )
+      const context = yield* Layer.build(makeLayer(channel.port2, 1_024))
+      const storage = Context.get(context, AttachmentStorage.AttachmentStorage)
+      const bytes = Array.from({ length: 1_024 }, (_, index) => Uint8Array.of(index % 251))
+      const staged = yield* storage.stage(Stream.fromIterable(bytes))
+      assert.strictEqual(staged.reference.bytes, 1_024)
+      assert.strictEqual(directory.writes, 1)
+
+      const key = yield* storage.create()
+      const interrupted = Stream.concat(
+        Stream.fromIterable([Uint8Array.of(1), Uint8Array.of(2), Uint8Array.of(3)]),
+        Stream.fail(new Attachment.AttachmentStorageError({ operation: "test.interrupted", cause: "interrupted" }))
+      )
+      const append = yield* storage.append(
+        key,
+        Attachment.Reference.make({ _tag: "Attachment", digest: staged.reference.digest, bytes: 5 }),
+        0,
+        interrupted
+      ).pipe(Effect.result)
+      assert.isTrue(Result.isFailure(append))
+      assert.strictEqual(yield* storage.offset(key), 3)
+      assert.strictEqual(directory.writes, 2)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "removes an object when staging is interrupted while Create is in flight",
+    Effect.fnUntraced(function*() {
+      const createStarted = yield* Deferred.make<void>()
+      const allowCreate = yield* Deferred.make<void>()
+      const createCompleted = yield* Deferred.make<void>()
+      const files = new Set<AttachmentStorage.ObjectKey>()
+      const notFound = (key: AttachmentStorage.ObjectKey) => new Attachment.AttachmentNotFound({ key })
+      const directory = AttachmentDirectory.AttachmentDirectory.of({
+        create: (key) =>
+          Effect.gen(function*() {
+            files.add(key)
+            yield* Deferred.succeed(createStarted, undefined)
+            yield* Deferred.await(allowCreate)
+            yield* Deferred.succeed(createCompleted, undefined)
+          }),
+        offset: (key) => files.has(key) ? Effect.succeed(0) : Effect.fail(notFound(key)),
+        write: (key) => files.has(key) ? Effect.succeed(0) : Effect.fail(notFound(key)),
+        read: (key) => files.has(key) ? Effect.succeed(new Uint8Array(0)) : Effect.fail(notFound(key)),
+        exists: (key) => Effect.succeed(files.has(key)),
+        remove: (key) => Effect.sync(() => void files.delete(key))
+      })
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          channel.port1.close()
+          channel.port2.close()
+        })
+      )
+      yield* AttachmentWorkerProtocol.serve(channel.port1, { maximumBytes: 8 }).pipe(
+        Effect.provideService(AttachmentDirectory.AttachmentDirectory, directory),
+        Effect.forkScoped({ startImmediately: true })
+      )
+      const context = yield* Layer.build(makeLayer(channel.port2, 8))
+      const storage = Context.get(context, AttachmentStorage.AttachmentStorage)
+      const fiber = yield* storage.stage(Stream.make(Uint8Array.of(1))).pipe(
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Deferred.await(createStarted)
+      const interruption = yield* Fiber.interrupt(fiber).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Effect.yieldNow
+      yield* Deferred.succeed(allowCreate, undefined)
+      yield* Deferred.await(createCompleted)
+      yield* Fiber.join(interruption)
+      assert.strictEqual(files.size, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect("removes the exact OPFS entry when access or initialization fails after creation", () => {
+    const originalNavigator = globalThis.navigator
+    const removed: Array<string> = []
+    let creations = 0
+    const directory = {
+      getFileHandle: (name: string, options?: { readonly create?: boolean }) => {
+        if (options?.create === true) {
+          creations++
+          return Promise.resolve({
+            createSyncAccessHandle: () =>
+              creations === 1
+                ? Promise.reject(new Error("access denied"))
+                : Promise.resolve({
+                  truncate: () => {
+                    throw new Error("truncate failed")
+                  },
+                  flush: () => undefined,
+                  close: () => undefined
+                })
+          })
+        }
+        return Promise.reject(new DOMException("missing", "NotFoundError"))
+      },
+      removeEntry: (name: string) => {
+        removed.push(name)
+        return Promise.resolve()
+      }
+    }
+    return Effect.acquireUseRelease(
+      Effect.sync(() => {
+        Object.defineProperty(globalThis, "navigator", {
+          configurable: true,
+          value: {
+            storage: { getDirectory: () => Promise.resolve({ getDirectoryHandle: () => Promise.resolve(directory) }) }
+          }
+        })
+      }),
+      () =>
+        Effect.gen(function*() {
+          const context = yield* Layer.build(OpfsAttachmentDirectory.layer({ directory: "test-attachments" }))
+          const service = Context.get(context, AttachmentDirectory.AttachmentDirectory)
+          const accessKey = AttachmentStorage.ObjectKey.make("0123456789abcdef0123456789abcdef")
+          const initializeKey = AttachmentStorage.ObjectKey.make("fedcba9876543210fedcba9876543210")
+          assert.isTrue(Result.isFailure(yield* service.create(accessKey).pipe(Effect.result)))
+          assert.isTrue(Result.isFailure(yield* service.create(initializeKey).pipe(Effect.result)))
+          assert.deepStrictEqual(removed, [`${accessKey}.blob`, `${initializeKey}.blob`])
+        }),
+      () =>
+        Effect.sync(() =>
+          Object.defineProperty(globalThis, "navigator", {
+            configurable: true,
+            value: originalNavigator
+          })
+        )
+    )
+  })
 })

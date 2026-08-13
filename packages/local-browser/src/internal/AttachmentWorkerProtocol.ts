@@ -181,10 +181,11 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
           Effect.logWarning("Attachment worker rejected a malformed request").pipe(
             Effect.annotateLogs("operation", error.operation)
           )
-      )
+      ),
+      Effect.withSpan("AttachmentWorkerProtocol.handleRequest")
     )
   yield* Stream.fromQueue(queue).pipe(
     Stream.mapEffect(handleRequestSafely),
     Stream.runDrain
   )
-}, Effect.scoped)
+}, (effect) => Effect.scoped(effect).pipe(Effect.withSpan("AttachmentWorkerProtocol.serve")))
