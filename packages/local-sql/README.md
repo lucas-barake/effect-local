@@ -101,6 +101,17 @@ transaction or space row write per publication. `wakeCapacity` is the optional s
 `maximumWatchersPerSpace` is the separate live watcher allowance. Excess streams fail with typed
 `CapacityExceeded { resource: "sync watchers", limit }`.
 
+The optional `offlineWake` configuration adds a provider-neutral durable path for clients without a live Watch.
+`recipients({ spaceId })` returns authoritative member client IDs. `deliver({ wakeId, spaceId, clientId })` maps one
+client to the application's FCM, APNs, web push, or other endpoint. It receives no mutation or entity content. Keep the
+provider payload content-free and use the stable `wakeId` to make at-least-once calls idempotent.
+
+Accepted mutations transactionally advance a per-space high water mark. The scoped dispatcher resolves membership
+outside admission, coalesces client work, retries failures with capped exponential backoff, and bounds recipient
+resolution and delivery separately. SQL Watch leases suppress the push path across every runtime sharing the database.
+Pull acknowledgement retires work at or below the acknowledged fence. All durations, batch sizes, concurrency limits,
+lease intervals, hook timeout, and recipient capacity are explicit in `OfflineWake.Options`.
+
 `authorizeRead` receives a tagged union. `_tag: "Scope"` authorizes the client and requested model set before space or
 schema disclosure. `_tag: "Entity"` authorizes one Schema encoded entity key and value. Only entities that pass both
 scope selection and entity policy can enter pull or bootstrap responses. Policy-only revocations are discovered by

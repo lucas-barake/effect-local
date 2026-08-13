@@ -560,6 +560,41 @@ The authorization functions above are application Effects. Their requirements pr
 `ServerStore.layerTrusted` remains for tests and already trusted processes. Do not use a digest as authorization.
 Client and space ownership belongs in `authorizeAccess`.
 
+### Wake disconnected clients
+
+Add `offlineWake` when accepted mutations should notify clients without a live Watch. The library stores, coalesces,
+retries, and retires wake work. The application supplies authoritative space membership and provider delivery.
+
+```ts
+import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
+
+export const ServerLive = ServerStore.layer({
+  ...serverOptions,
+  offlineWake: {
+    recipients: ({ spaceId }) => Memberships.clientIds(spaceId),
+    deliver: ({ wakeId, spaceId, clientId }) => Push.sendContentFree({ idempotencyKey: wakeId, spaceId, clientId }),
+    coalescingWindow: "2 seconds",
+    pollInterval: "1 second",
+    retryDelay: "1 second",
+    maximumRetryDelay: "1 minute",
+    claimLeaseDuration: "30 seconds",
+    hookTimeout: "10 seconds",
+    presenceLeaseDuration: "30 seconds",
+    presenceHeartbeatInterval: "10 seconds",
+    claimBatchSize: 128,
+    maximumConcurrentRecipientResolutions: 8,
+    maximumConcurrentDeliveries: 32,
+    maximumRecipientsPerSpace: 10_000
+  }
+})
+```
+
+The hook receives no mutation or entity content. Its IDs are for application routing and idempotency. Keep the actual
+FCM, APNs, or web push payload content-free. Calls are at least once with a stable `wakeId` until success, so provider
+integration must tolerate duplicates. Mutations inside one coalescing window share a high water fence. A live Watch
+suppresses delivery across all server runtimes that share the database. An acknowledged Pull cursor retires obsolete
+work. See [synchronization](docs/sync.md#offline-wake-delivery) for the delivery and recovery contract.
+
 ### Negotiate one protocol for sync and presence
 
 During a protocol rollout, advertise the overlap on the server and share one client `ProtocolSession` between sync and

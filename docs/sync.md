@@ -28,6 +28,34 @@ one execution's history and repairs a lost wake when the next runner starts. A t
 mutation or server wake to request a new generation. Completed execution retention belongs to the selected Workflow
 storage.
 
+## Offline wake delivery
+
+`ServerStore.layer` can accept an `offlineWake` option for push notifications without depending on a provider. An
+accepted mutation commits a per-space high water mark in the admission transaction. A scoped dispatcher later asks
+the application's `recipients({ spaceId })` callback for the authoritative client membership, then creates one durable
+delivery row per client. Mutation admission never waits for membership lookup or push delivery.
+
+`deliver({ wakeId, spaceId, clientId })` is the provider boundary. It carries routing and idempotency values only. It
+does not contain a mutation, entity key, sender, message count, or server sequence. The application resolves the
+client's current FCM, APNs, or web push endpoint and should send a content-free signal that tells the app to sync.
+`wakeId` stays stable across retries, so the application can deduplicate a provider call. Do not copy `wakeId`,
+`spaceId`, or `clientId` into provider-visible notification content.
+
+Delivery attempts are at least once. A callback failure, defect, or timeout keeps the same `wakeId` and schedules
+capped exponential retry. A successful callback records that high water as notified. Later mutations rotate to a new
+identity after `coalescingWindow`; mutations accumulated before that point share one delivery opportunity. SQLite and
+an external provider cannot commit atomically, so the callback must tolerate the same identity more than once.
+
+A client is online only while its production Watch has an active SQL presence lease. The Watch does not become ready
+while a delivery claim for that client is in flight. Every server runtime sharing the database checks the same leases,
+and scope finalizers remove them. Expiration recovers from crashed runtimes. Connected clients keep using the live
+payload-free Watch stream and do not enter the push path.
+
+Pull is the durable acknowledgement. When a client presents the cursor for an applied incremental page, the same
+transaction advances a separate wake acknowledgement fence and retires delivery rows at or below that fence. The
+separate fence matters during bootstrap because installing a snapshot initializes replication state at the server head
+before the client has acknowledged a later pull.
+
 ## History lifecycle
 
 The server retains a configurable dense accepted suffix and a configurable terminal receipt suffix. Hard caps are
@@ -103,11 +131,11 @@ Authentication and authorization failures remain distinct:
 Other terminal protocol, schema, capacity, and storage failures report `Failed`. Presence operations expose the same
 typed failures directly, but presence is outside reconciliation and does not change replica status.
 
-The space entity is the single live owner and relay for a space. Its operations are deliberately volatile. A wire wake
-contains only the space ID. Entity changes wake a client only when they are currently in scope and visible, or could
-remove something from its acknowledged view. Periodic authorization refresh hints ensure policy-only revocations are
-eventually pulled as retractions. Wakes never carry an entity or the global server sequence. Durable
-mutation custody has two owners at different stages. Before admission, the client keeps the pending envelope in its
+The space entity is the single live owner and relay for a space. Its operations are deliberately volatile. A live wire
+wake contains only the space ID. Entity changes wake a connected client only when they are currently in scope and
+visible, or could remove something from its acknowledged view. Periodic authorization refresh hints ensure policy-only
+revocations are eventually pulled as retractions. Live and offline wakes never carry an entity or global sequence.
+Durable mutation custody has two owners at different stages. Before admission, the client keeps the pending envelope in its
 SQLite outbox. After admission, `ServerStore` keeps the terminal receipt and accepted event in
 `effect_local_server_receipts` and `effect_local_authoritative_log`. If a runner fails before SQL commit, the entity call
 fails and the client resubmits. If SQL committed before the reply was lost, exact resubmission returns the stored receipt.
