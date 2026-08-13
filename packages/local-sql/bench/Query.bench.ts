@@ -5,7 +5,6 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Effect from "effect/Effect"
-import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Schema from "effect/Schema"
@@ -74,14 +73,14 @@ const definition = Definition.make({
   mutations: [],
   queries: [Indexed, MultiColumn]
 })
-const handlers = Indexed.toLayer(({ payload, query }) =>
+const Handlers = Indexed.toLayer(({ payload, query }) =>
   query.from(Item, "byScore").where({ score: { gte: payload.minimum } }).limit(25).page().pipe(
     Effect.map((page) => page.items)
   )
 ).pipe(
   (indexed) =>
-    MultiColumn.toLayer(({ query }) =>
-      Effect.gen(function*() {
+    MultiColumn.toLayer(
+      Effect.fnUntraced(function*({ query }) {
         const builder = query.from(Item, "byBucketScore").limit(25)
         const first = yield* builder.page()
         if (first.next === undefined) return []
@@ -89,17 +88,18 @@ const handlers = Indexed.toLayer(({ payload, query }) =>
       })
     ).pipe((multiColumn) => Layer.mergeAll(indexed, multiColumn))
 )
-const database = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
+const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
   Layer.merge(Reactivity.layer)
 )
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
-const dependencies = Layer.mergeAll(database, handlers, QueryReactivity.layer)
-const executor = QueryExecutor.layer(definition, spaceId).pipe(Layer.provide(dependencies))
-const runtime = Layer.merge(executor, dependencies).pipe((layer) => ManagedRuntime.make(layer))
+const Dependencies = Layer.mergeAll(Database, Handlers, QueryReactivity.Layer)
+const Executor = QueryExecutor.layer(definition, spaceId).pipe(Layer.provide(Dependencies))
+const runtime = ManagedRuntime.make(Layer.merge(Executor, Dependencies))
 
 beforeAll(async () => {
-  await Effect.gen(function*() {
+  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this asynchronous benchmark fixture setup boundary.
+  await runtime.runPromise(Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
     yield* Migrations.client({
       definition,
@@ -121,17 +121,14 @@ beforeAll(async () => {
     })
     for (let offset = 0; offset < rows.length; offset += 500) {
       yield* sql`INSERT INTO effect_local_client_visible_entities_data
-        ${pipe(rows.slice(offset, offset + 500), (batch) => sql.insert(batch))}`
+        ${sql.insert(rows.slice(offset, offset + 500))}`
     }
     yield* IndexStore.install(sql, definition, {
       spaceId,
       schemaGeneration: 0,
       projectionGeneration: 0
     })
-  }).pipe(
-    // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this asynchronous benchmark fixture setup boundary.
-    (effect) => runtime.runPromise(effect)
-  )
+  }))
   decodedRows = 0
 })
 
@@ -142,29 +139,28 @@ afterAll(async () => {
 
 bench("indexed selective page avoids decoding the complete model", async () => {
   decodedRows = 0
-  const result = await QueryExecutor.QueryExecutor.use((service) => service.execute(Indexed, { minimum: 9_900 }))
-    .pipe(
-      // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
-      (effect) => runtime.runPromise(effect)
-    )
+  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
+  const result = await runtime.runPromise(
+    QueryExecutor.QueryExecutor.use((service) => service.execute(Indexed, { minimum: 9_900 }))
+  )
   assert.strictEqual(result.length, 25)
   assert.strictEqual(decodedRows, 50)
 }, { iterations: 20, time: 0, warmupIterations: 3, warmupTime: 0, throws: true })
 
 bench("low cardinality multicolumn cursor returns a stable second page", async () => {
   decodedRows = 0
-  const result = await QueryExecutor.QueryExecutor.use((service) => service.execute(MultiColumn, undefined))
-    .pipe(
-      // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
-      (effect) => runtime.runPromise(effect)
-    )
+  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
+  const result = await runtime.runPromise(
+    QueryExecutor.QueryExecutor.use((service) => service.execute(MultiColumn, undefined))
+  )
   assert.strictEqual(result.length, 25)
   assert.strictEqual(decodedRows, 75)
 }, { iterations: 20, time: 0, warmupIterations: 3, warmupTime: 0, throws: true })
 
 bench("explicit unindexed scan decodes the complete model", async () => {
   decodedRows = 0
-  const result = await Effect.gen(function*() {
+  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
+  const result = await runtime.runPromise(Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
     const rows = yield* SqlSchema.findAll({
       Request: Schema.Void,
@@ -178,10 +174,7 @@ bench("explicit unindexed scan decodes the complete model", async () => {
       Codec.parse(row.value_json).pipe(
         Effect.flatMap((encoded) => Codec.decode(Item.schema, encoded))
       ))
-  }).pipe(
-    // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
-    (effect) => runtime.runPromise(effect)
-  )
+  }))
   assert.strictEqual(result.length, 10_000)
   assert.strictEqual(decodedRows, 10_000)
 }, { iterations: 5, time: 0, warmupIterations: 1, warmupTime: 0, throws: true })

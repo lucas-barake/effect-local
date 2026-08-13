@@ -3,7 +3,6 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
-import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Metric from "effect/Metric"
 import * as PubSub from "effect/PubSub"
@@ -48,95 +47,97 @@ export const layer = <R = never,>(options: {
     input: AuthorizationInput
   ) => Effect.Effect<void, ReplicaError.AuthorizationDenied, R>
 }): Layer.Layer<PresenceHub, ReplicaError.InvalidConfiguration, R> =>
-  Effect.gen(function*() {
-    const context = yield* Effect.context<R>()
-    const capacity = options.capacity ?? 1_024
-    if (!Number.isSafeInteger(capacity) || capacity <= 0) {
-      return yield* new ReplicaError.InvalidConfiguration({
-        option: "capacity",
-        message: "capacity must be a positive safe integer"
+  Layer.effect(
+    PresenceHub,
+    Effect.gen(function*() {
+      const context = yield* Effect.context<R>()
+      const capacity = options.capacity ?? 1_024
+      if (!Number.isSafeInteger(capacity) || capacity <= 0) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "capacity",
+          message: "capacity must be a positive safe integer"
+        })
+      }
+      if (!Number.isSafeInteger(options.maximumWatchersPerSpace) || options.maximumWatchersPerSpace <= 0) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "maximumWatchersPerSpace",
+          message: "maximumWatchersPerSpace must be a positive safe integer"
+        })
+      }
+      const watcherCount = Metric.gauge("effect_local_server_presence_watcher_count")
+      const updates = yield* RcMap.make({
+        lookup: () =>
+          Effect.acquireRelease(
+            Effect.gen(function*() {
+              const channel = yield* PubSub.sliding<Protocol.PresenceUpdate>(capacity)
+              const watcherPermits = yield* Semaphore.make(options.maximumWatchersPerSpace)
+              return { channel, watcherPermits } as const
+            }),
+            ({ channel }) => PubSub.shutdown(channel)
+          )
       })
-    }
-    if (!Number.isSafeInteger(options.maximumWatchersPerSpace) || options.maximumWatchersPerSpace <= 0) {
-      return yield* new ReplicaError.InvalidConfiguration({
-        option: "maximumWatchersPerSpace",
-        message: "maximumWatchersPerSpace must be a positive safe integer"
-      })
-    }
-    const watcherCount = Metric.gauge("effect_local_server_presence_watcher_count")
-    const updates = yield* RcMap.make({
-      lookup: () =>
-        Effect.gen(function*() {
-          const channel = yield* PubSub.sliding<Protocol.PresenceUpdate>(capacity)
-          const watcherPermits = yield* Semaphore.make(options.maximumWatchersPerSpace)
-          return { channel, watcherPermits } as const
-        }).pipe((acquire) => Effect.acquireRelease(acquire, ({ channel }) => PubSub.shutdown(channel)))
-    })
-    return PresenceHub.of({
-      publish: (update, principal) =>
-        Effect.suspend(() => {
+      return PresenceHub.of({
+        publish: Effect.fn("PresenceHub.publish")(function*(update, principal) {
           const spaceId = update.spaceId
           const clientId = update.clientId
-          return Effect.gen(function*() {
-            yield* pipe(
-              PublishAuthorization.make({ spaceId, clientId, principal }),
-              options.authorize
-            ).pipe(
-              Effect.provide(context)
-            )
-            if ((yield* Protocol.encodedBytesEffect(update)) > Protocol.maximumPresenceBytes) {
-              return yield* new ReplicaError.CapacityExceeded({
-                resource: "presence bytes",
-                limit: Protocol.maximumPresenceBytes
-              })
-            }
-            if (yield* RcMap.has(updates, spaceId)) {
-              yield* RcMap.get(updates, spaceId).pipe(
-                Effect.flatMap(({ channel }) => PubSub.publish(channel, update)),
-                Effect.scoped
-              )
-            }
-            return yield* Effect.void
-          }).pipe(
-            Effect.asVoid,
-            Effect.withSpan("PresenceHub.publish", {
-              attributes: {
-                "presence.space_id": spaceId,
-                "presence.client_id": clientId
-              }
-            })
-          )
-        }),
-      watch: (spaceId, principal) =>
-        Effect.gen(function*() {
-          yield* pipe(
-            WatchAuthorization.make({ spaceId, principal }),
-            options.authorize
-          ).pipe(
+          yield* Effect.annotateCurrentSpan({
+            "presence.space_id": spaceId,
+            "presence.client_id": clientId
+          })
+          yield* options.authorize(PublishAuthorization.make({
+            spaceId,
+            clientId,
+            principal
+          })).pipe(
             Effect.provide(context)
           )
-          const { channel, watcherPermits } = yield* RcMap.get(updates, spaceId)
-          yield* Effect.gen(function*() {
-            if (!(yield* Semaphore.takeIfAvailable(watcherPermits, 1))) {
-              yield* new ReplicaError.CapacityExceeded({
-                resource: "presence watchers",
-                limit: options.maximumWatchersPerSpace
-              })
-            }
-          }).pipe((acquire) => Effect.acquireRelease(acquire, () => Semaphore.release(watcherPermits, 1)))
-          yield* Metric.modify(watcherCount, 1).pipe((acquire) =>
-            Effect.acquireRelease(acquire, () => Metric.modify(watcherCount, -1))
+          if ((yield* Protocol.encodedBytesEffect(update)) > Protocol.maximumPresenceBytes) {
+            return yield* new ReplicaError.CapacityExceeded({
+              resource: "presence bytes",
+              limit: Protocol.maximumPresenceBytes
+            })
+          }
+          if (yield* RcMap.has(updates, spaceId)) {
+            yield* RcMap.get(updates, spaceId).pipe(
+              Effect.flatMap(({ channel }) => PubSub.publish(channel, update)),
+              Effect.scoped
+            )
+          }
+          return yield* Effect.void
+        }),
+        watch: (spaceId, principal) =>
+          Stream.unwrap(
+            Effect.gen(function*() {
+              yield* options.authorize(WatchAuthorization.make({ spaceId, principal })).pipe(
+                Effect.provide(context)
+              )
+              const { channel, watcherPermits } = yield* RcMap.get(updates, spaceId)
+              yield* Effect.acquireRelease(
+                Effect.gen(function*() {
+                  if (!(yield* Semaphore.takeIfAvailable(watcherPermits, 1))) {
+                    yield* new ReplicaError.CapacityExceeded({
+                      resource: "presence watchers",
+                      limit: options.maximumWatchersPerSpace
+                    })
+                  }
+                }),
+                () => Semaphore.release(watcherPermits, 1)
+              )
+              yield* Effect.acquireRelease(
+                Metric.modify(watcherCount, 1),
+                () => Metric.modify(watcherCount, -1)
+              )
+              const subscription = yield* PubSub.subscribe(channel)
+              return Stream.fromSubscription(subscription)
+            })
+          ).pipe(
+            Stream.withSpan("PresenceHub.watch", {
+              attributes: { "presence.space_id": spaceId }
+            })
           )
-          const subscription = yield* PubSub.subscribe(channel)
-          return Stream.fromSubscription(subscription)
-        }).pipe(
-          Stream.unwrap,
-          Stream.withSpan("PresenceHub.watch", {
-            attributes: { "presence.space_id": spaceId }
-          })
-        )
+      })
     })
-  }).pipe(Layer.effect(PresenceHub))
+  )
 
 export const layerTrusted = (options: {
   readonly capacity?: number

@@ -6,15 +6,21 @@ import { resolve } from "node:path"
 import { Testing } from "oxlint-plugin-effect/rule-bindings"
 import {
   chainedPipeMessage,
+  effectCatchDieMessage,
+  effectOrDieMessage,
+  functionEffectGenMessage,
   manualBoundaryMessage,
   nestedCallMessage,
+  noFunctionEffectGen,
+  noImplicitDefectConversion,
   noNestedCalls,
   noSemaphoreEffectSync,
   noUnnecessaryEffectForwarding,
   noYieldEffectSync,
-  unnecessaryEffectForwardingMessage
+  unnecessaryEffectForwardingMessage,
+  unnecessaryPipeForwardingMessage
 } from "./oxlint-plugin.mjs"
-import { makeTaggedEffectErrorChecker } from "./tagged-effect-errors.mjs"
+import { makeEffectTypePolicyChecker } from "./tagged-effect-errors.mjs"
 
 const effectImport = Testing.importDeclWithSpecifiers(
   "effect/Effect",
@@ -37,47 +43,11 @@ pipe(
 pipe(
   Testing.callOfMember("Other", "sync"),
   (otherSyncCall) =>
-    pipe(
-      Testing.runRuleMulti(noYieldEffectSync, [
-        ["ImportDeclaration", effectImport],
-        ["YieldExpression", Testing.yieldExpr(syncCall, false)],
-        ["YieldExpression", Testing.yieldExpr(otherSyncCall, true)]
-      ]),
-      (diagnostics) => Testing.expectNoDiagnostics(diagnostics)
-    )
-)
-
-const innermostCall = Testing.callExpr("h")
-const innerCall = Testing.callExpr("g", [innermostCall])
-
-pipe(
-  Testing.runRuleMulti(noNestedCalls, [
-    ["CallExpression", Testing.callExpr("f", [innerCall])],
-    ["CallExpression", innerCall]
-  ]),
-  (diagnostics) =>
-    Testing.expectDiagnostics(
-      diagnostics,
-      [{ message: nestedCallMessage }, { message: nestedCallMessage }]
-    )
-)
-
-pipe(
-  Testing.callExpr("source"),
-  (sourceCall) =>
-    pipe(
-      Testing.callExpr("pipe", [sourceCall]),
-      (pipeCall) => Testing.runRule(noNestedCalls, "CallExpression", pipeCall)
-    ),
-  (diagnostics) => Testing.expectDiagnostics(diagnostics, [{ message: nestedCallMessage }])
-)
-
-pipe(
-  Testing.runRuleMulti(noNestedCalls, [
-    ["CallExpression", Testing.callOfMember("source", "pipe", [Testing.callExpr("transform")])],
-    ["CallExpression", Testing.callExpr("standalone")]
-  ]),
-  (diagnostics) => Testing.expectNoDiagnostics(diagnostics)
+    Testing.expectNoDiagnostics(Testing.runRuleMulti(noYieldEffectSync, [
+      ["ImportDeclaration", effectImport],
+      ["YieldExpression", Testing.yieldExpr(syncCall, false)],
+      ["YieldExpression", Testing.yieldExpr(otherSyncCall, true)]
+    ]))
 )
 
 const importedPipe = Testing.variable("compose")
@@ -91,11 +61,8 @@ const pipeImport = Testing.importDeclWithSpecifiers(
   [Testing.importSpecifier("pipe", "compose")]
 )
 importedPipeVisitors.ImportDeclaration(pipeImport)
-pipe(
-  Testing.callExpr("source"),
-  (sourceCall) => Testing.callExpr("compose", [sourceCall]),
-  (node) => importedPipeVisitors.CallExpression(node)
-)
+const composedSource = Testing.callExpr("source")
+importedPipeVisitors.CallExpression(Testing.callExpr("compose", [composedSource]))
 Testing.expectNoDiagnostics(importedPipeTest.diagnostics)
 
 const importedFunction = Testing.variable("Function")
@@ -136,7 +103,7 @@ importedFunctionTest.context.sourceCode.getAncestors = (node) => {
 importedFunctionVisitors.CallExpression(computedNamespacePipeCall)
 importedFunctionVisitors.CallExpression(computedNamespaceData)
 importedFunctionVisitors.CallExpression(computedNamespaceOperator)
-Testing.expectDiagnostics(importedFunctionTest.diagnostics, [{ message: nestedCallMessage }])
+Testing.expectNoDiagnostics(importedFunctionTest.diagnostics)
 
 const firstReceiverPipe = Testing.callOfMember("value", "pipe", [Testing.callExpr("first")])
 const chainedReceiverPipe = {
@@ -237,18 +204,15 @@ pipe(
     )
 )
 
-pipe(
-  Testing.runRuleMulti(noSemaphoreEffectSync, [
-    ["ImportDeclaration", effectImport],
-    ["CallExpression", {
-      type: "CallExpression",
-      callee: Testing.memberExpr("gate", "withPermit"),
-      arguments: [Testing.callOfMember("Fx", "gen")],
-      optional: false
-    }]
-  ]),
-  (diagnostics) => Testing.expectNoDiagnostics(diagnostics)
-)
+Testing.expectNoDiagnostics(Testing.runRuleMulti(noSemaphoreEffectSync, [
+  ["ImportDeclaration", effectImport],
+  ["CallExpression", {
+    type: "CallExpression",
+    callee: Testing.memberExpr("gate", "withPermit"),
+    arguments: [Testing.callOfMember("Fx", "gen")],
+    optional: false
+  }]
+]))
 
 const worktree = resolve(import.meta.dirname, "..")
 
@@ -293,9 +257,28 @@ const runOxlintFixture = (name, source, rules) => {
   }
 }
 
-const nestedCallDiagnostics = runOxlintFixture(
-  "no-nested-calls-fixture.mjs",
-  `import * as Effect from "effect/Effect"
+const utf8Offset = (text, position) => Buffer.byteLength(text.slice(0, position))
+const offsetOf = (source, needle, from = 0) => {
+  const position = source.indexOf(needle, from)
+  assert.notEqual(position, -1, `Missing fixture marker: ${needle}`)
+  return utf8Offset(source, position)
+}
+const offsetAfter = (source, marker, needle) => offsetOf(source, needle, source.indexOf(marker))
+const diagnosticOffsets = (diagnostics) =>
+  diagnostics.map((diagnostic) => diagnostic.labels[0].span.offset).toSorted((left, right) => left - right)
+const diagnosticSpans = (diagnostics) =>
+  diagnostics
+    .map((diagnostic) => {
+      const { length, offset } = diagnostic.labels[0].span
+      return { length, offset }
+    })
+    .toSorted((left, right) => left.offset - right.offset || left.length - right.length)
+const fixtureSpan = (source, marker, expression) => ({
+  length: Buffer.byteLength(expression),
+  offset: offsetAfter(source, marker, expression)
+})
+
+const nestedCallFixtureSource = `import * as Effect from "effect/Effect"
 import { pipe, pipe as compose } from "effect/Function"
 import * as Function from "effect/Function"
 
@@ -307,7 +290,7 @@ const g = null
 const operator = null
 const finish = null
 
-const _nested = f(g(value))
+const _allowedNested = f(g(value))
 const _wrappedArgument = f((g(value)))
 const _receiverInput = f(g(value)).pipe(operator)
 const _directInput = pipe(f(g(value)), operator)
@@ -317,6 +300,9 @@ const _namespaceInput = Function.pipe(f(g(value)), operator)
 const _wrappedNamespaceInput = (Function).pipe(f(g(value)), operator)
 const _computedReceiverInput = f(g(value))["pipe"](operator)
 const _dynamicMember = value[dynamicPipe](f(value))
+const _tooDeep = f(g(f(value)))
+const _receiverTooDeep = f(g(f(value))).pipe(operator)
+const _directTooDeep = pipe(f(g(f(value))), operator)
 const _chained = value.pipe(operator).pipe(operator)
 const _deeper = value.pipe(operator).pipe(operator).pipe(operator)
 const _computedChain = value["pipe"](operator)["pipe"](operator)
@@ -325,14 +311,18 @@ const _parenthesizedChain = (value.pipe(operator)).pipe(operator)
 const _optionalPropertyChain = value?.pipe(operator)?.pipe(operator)
 const _optionalCallChain = value.pipe?.(operator).pipe?.(operator)
 
-const _receiverOperator = value.pipe(Effect.ensuring(finish(g(value), token)))
-const _computedReceiverOperator = value["pipe"](Effect.ensuring(finish(g(value), token)))
-const _directOperator = pipe(value, Effect.ensuring(finish(g(value), token)))
-const _wrappedDirectOperator = (pipe)(value, Effect.ensuring(finish(g(value), token)))
-const _aliasedOperator = compose(value, Effect.ensuring(finish(g(value), token)))
-const _namespaceOperator = Function.pipe(value, Effect.ensuring(finish(g(value), token)))
-const _wrappedNamespaceOperator = (Function).pipe(value, Effect.ensuring(finish(g(value), token)))
-`,
+const _receiverOperator = value.pipe(Effect.ensuring(finish(value, token)))
+const _computedReceiverOperator = value["pipe"](Effect.ensuring(finish(value, token)))
+const _directOperator = pipe(value, Effect.ensuring(finish(value, token)))
+const _wrappedDirectOperator = (pipe)(value, Effect.ensuring(finish(value, token)))
+const _aliasedOperator = compose(value, Effect.ensuring(finish(value, token)))
+const _namespaceOperator = Function.pipe(value, Effect.ensuring(finish(value, token)))
+const _wrappedNamespaceOperator = (Function).pipe(value, Effect.ensuring(finish(value, token)))
+const _operatorTooDeep = value.pipe(Effect.ensuring(finish(g(value), token)))
+`
+const nestedCallDiagnostics = runOxlintFixture(
+  "no-nested-calls-fixture.mjs",
+  nestedCallFixtureSource,
   ["noNestedCalls"]
 )
 const onlyNestedCallDiagnostics = nestedCallDiagnostics.every(
@@ -346,30 +336,58 @@ const nestedCompositionDiagnostics = nestedCallDiagnostics.filter(
 const chainedReceiverDiagnostics = nestedCallDiagnostics.filter(
   (diagnostic) => diagnostic.message === chainedPipeMessage
 )
-assert.equal(nestedCompositionDiagnostics.length, 10, nestedCallDetail)
+assert.equal(nestedCompositionDiagnostics.length, 4, nestedCallDetail)
 assert.equal(chainedReceiverDiagnostics.length, 8, nestedCallDetail)
+assert.deepEqual(
+  diagnosticOffsets(nestedCompositionDiagnostics),
+  [
+    offsetOf(nestedCallFixtureSource, "f(value)", nestedCallFixtureSource.indexOf("const _tooDeep")),
+    offsetOf(nestedCallFixtureSource, "f(value)", nestedCallFixtureSource.indexOf("const _receiverTooDeep")),
+    offsetOf(nestedCallFixtureSource, "f(value)", nestedCallFixtureSource.indexOf("const _directTooDeep")),
+    offsetOf(nestedCallFixtureSource, "g(value)", nestedCallFixtureSource.indexOf("const _operatorTooDeep"))
+  ].toSorted((left, right) => left - right),
+  nestedCallDetail
+)
+assert.deepEqual(
+  diagnosticSpans(chainedReceiverDiagnostics),
+  [
+    fixtureSpan(nestedCallFixtureSource, "const _chained", "value.pipe(operator).pipe(operator)"),
+    fixtureSpan(nestedCallFixtureSource, "const _deeper", "value.pipe(operator).pipe(operator)"),
+    fixtureSpan(nestedCallFixtureSource, "const _deeper", "value.pipe(operator).pipe(operator).pipe(operator)"),
+    fixtureSpan(nestedCallFixtureSource, "const _computedChain", "value[\"pipe\"](operator)[\"pipe\"](operator)"),
+    fixtureSpan(nestedCallFixtureSource, "const _templateChain", "value[`pipe`](operator)[`pipe`](operator)"),
+    fixtureSpan(nestedCallFixtureSource, "const _parenthesizedChain", "(value.pipe(operator)).pipe(operator)"),
+    fixtureSpan(nestedCallFixtureSource, "const _optionalPropertyChain", "value?.pipe(operator)?.pipe(operator)"),
+    fixtureSpan(nestedCallFixtureSource, "const _optionalCallChain", "value.pipe?.(operator).pipe?.(operator)")
+  ].toSorted((left, right) => left.offset - right.offset || left.length - right.length),
+  nestedCallDetail
+)
 
-const shadowedPipeDiagnostics = runOxlintFixture(
-  "shadowed-pipe-fixture.mjs",
-  `import { pipe as compose } from "effect/Function"
+const shadowedPipeFixtureSource = `import { pipe as compose } from "effect/Function"
 
 const value = null
 const f = null
 const operator = null
 
 const _composed = compose(value, operator)
-const _shadowed = (pipe) => pipe(f(value), operator)
-`,
+const _shadowed = (pipe) => pipe(f(g(value)), operator)
+`
+const shadowedPipeDiagnostics = runOxlintFixture(
+  "shadowed-pipe-fixture.mjs",
+  shadowedPipeFixtureSource,
   ["noNestedCalls"]
 )
 const shadowedPipeDetail = JSON.stringify(shadowedPipeDiagnostics)
 assert.equal(shadowedPipeDiagnostics.length, 1, shadowedPipeDetail)
 assert.equal(shadowedPipeDiagnostics[0].code, "effect-local(noNestedCalls)")
 assert.equal(shadowedPipeDiagnostics[0].message, nestedCallMessage)
+assert.deepEqual(
+  diagnosticOffsets(shadowedPipeDiagnostics),
+  [offsetAfter(shadowedPipeFixtureSource, "const _shadowed", "g(value)")],
+  shadowedPipeDetail
+)
 
-const forwardingDiagnostics = runOxlintFixture(
-  "unnecessary-effect-forwarding-fixture.mjs",
-  `import * as Context from "effect/Context"
+const forwardingFixtureSource = `import * as Context from "effect/Context"
 import { get as lookup } from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -378,6 +396,7 @@ import * as Option from "effect/Option"
 import * as Semaphore from "effect/Semaphore"
 import * as Root from "effect"
 import { Layer as RootLayer } from "effect"
+import { pipe } from "effect/Function"
 
 const Tag = null
 const OtherTag = null
@@ -406,6 +425,8 @@ const _forEach = value.pipe((self) => Effect.forEach(self, use, { discard: true 
 const _acquireRelease = value.pipe((self) => Effect.acquireRelease(self, release))
 const _acquireUseRelease = value.pipe((self) => Effect.acquireUseRelease(self, use, release))
 const _memberMethod = value.pipe((self) => runtime.atom(self))
+const _genericReceiver = value.pipe((self) => use(self))
+const _genericImported = pipe(value, (self) => runtime.atom(self))
 const _shadowedNamespace = ((Context) => value.pipe((self) => Context.get(self, Tag)))(Fake)
 const _shadowedDirect = ((lookup) => value.pipe((self) => lookup(self, Tag)))(Fake)
 const _repeated = value.pipe((self) => Context.get(self, self))
@@ -421,11 +442,41 @@ const _control = value.pipe((self) => condition ? Context.get(self, Tag) : Other
 const _computed = value.pipe((self) => Context["get"](self, Tag))
 const _unofficial = value.pipe((self) => Fake.get(self, Tag))
 const _functionExpression = value.pipe(function(self) { return Context.get(self, Tag) })
-`,
+const _nonPipe = (self) => runtime.atom(self)
+const _optionalCall = value.pipe((self) => runtime.atom?.(self))
+const _computedMember = value.pipe((self) => runtime["atom"](self))
+const _extraArgument = value.pipe((self) => runtime.atom(self, other))
+`
+const forwardingDiagnostics = runOxlintFixture(
+  "unnecessary-effect-forwarding-fixture.mjs",
+  forwardingFixtureSource,
   ["noUnnecessaryEffectForwarding"]
 )
 const forwardingDetail = JSON.stringify(forwardingDiagnostics)
-assert.equal(forwardingDiagnostics.length, 13, forwardingDetail)
+assert.equal(forwardingDiagnostics.length, 16, forwardingDetail)
+assert.deepEqual(
+  diagnosticOffsets(forwardingDiagnostics),
+  [
+    "_context",
+    "_directAlias",
+    "_rootNamespace",
+    "_rootNamedModule",
+    "_layerSucceed",
+    "_layerEffect",
+    "_layerMerge",
+    "_layerBuild",
+    "_metric",
+    "_option",
+    "_semaphore",
+    "_semaphoreAvailable",
+    "_forEach",
+    "_memberMethod",
+    "_genericReceiver",
+    "_genericImported"
+  ].map((marker) => offsetAfter(forwardingFixtureSource, `const ${marker}`, "(self) =>"))
+    .toSorted((left, right) => left - right),
+  forwardingDetail
+)
 const forwardingCodes = new Set(forwardingDiagnostics.map((diagnostic) => diagnostic.code))
 const expectedContextMessage = unnecessaryEffectForwardingMessage("Context.get", "Context.get(Tag)")
 const expectedSemaphoreMessage = unnecessaryEffectForwardingMessage(
@@ -436,16 +487,254 @@ const forwardingMessages = new Set(forwardingDiagnostics.map((diagnostic) => dia
 assert.deepEqual(forwardingCodes, new Set(["effect-local(noUnnecessaryEffectForwarding)"]), forwardingDetail)
 pipe(forwardingMessages.has(expectedContextMessage), (found) => assert.equal(found, true, forwardingDetail))
 pipe(forwardingMessages.has(expectedSemaphoreMessage), (found) => assert.equal(found, true, forwardingDetail))
+pipe(
+  forwardingMessages.has(unnecessaryPipeForwardingMessage("runtime.atom", "value")),
+  (found) => assert.equal(found, true, forwardingDetail)
+)
 
-const boundaryDiagnostics = runOxlintFixture(
-  "manual-boundary-fixture.mjs",
-  `import * as Effect from "effect/Effect"
+const functionEffectGenFixtureSource = `import * as Effect from "effect/Effect"
+import { gen as generate } from "effect/Effect"
+import { Effect as RootEffect } from "effect"
+import * as Root from "effect"
+import { pipe as compose } from "effect/Function"
+import * as Function from "effect/Function"
+
+const operator = Effect.asVoid
+const _arrow = () => Effect.gen(function*() {})
+function block() { return generate(function*() {}) }
+const _rootNamed = () => RootEffect.gen(function*() {})
+const _rootNamespace = () => Root.Effect.gen(function*() {})
+const _receiver = () => Effect.gen(function*() {}).pipe(operator)
+const _functionPipe = () => compose(Effect.gen(function*() {}), operator)
+const _namespacePipe = () => Function.pipe(Effect.gen(function*() {}), operator)
+const _callback = [1].map(() => Effect.gen(function*() {}))
+const localGenerate = Effect.gen
+const _localAlias = () => localGenerate(function*() {})
+const localGenerateAgain = localGenerate
+const _localAliasChain = () => localGenerateAgain(function*() {})
+const { gen: destructuredGenerate } = Effect
+const _destructuredAlias = () => destructuredGenerate(function*() {})
+let mutableGenerate = Effect.gen
+const _mutableAlias = () => mutableGenerate(function*() {})
+
+const _value = Effect.gen(function*() {})
+const _async = async () => Effect.gen(function*() {})
+function* generator() { return Effect.gen(function*() {}) }
+const _notRooted = () => Effect.succeed(Effect.gen(function*() {}))
+const _shadowed = ((Effect) => () => Effect.gen(function*() {}))({ gen: () => Effect.void })
+`
+const functionEffectGenFixtureDiagnostics = runOxlintFixture(
+  "function-effect-gen-fixture.ts",
+  functionEffectGenFixtureSource,
+  ["noFunctionEffectGen"]
+)
+const functionEffectGenDiagnostics = functionEffectGenFixtureDiagnostics.filter(
+  (diagnostic) => diagnostic.code === "effect-local(noFunctionEffectGen)"
+)
+const functionEffectGenDetail = JSON.stringify(functionEffectGenDiagnostics)
+assert.equal(functionEffectGenDiagnostics.length, 11, functionEffectGenDetail)
+assert.equal(
+  functionEffectGenDiagnostics.every((diagnostic) => diagnostic.message === functionEffectGenMessage),
+  true,
+  functionEffectGenDetail
+)
+assert.match(functionEffectGenMessage, /Effect\.fnUntraced\(function\* \(\) \{\}, x, y, z\)/)
+assert.match(functionEffectGenMessage, /Effect\.fn\("spanName"\)\(function\* \(\) \{\}, x, y, z\)/)
+assert.match(functionEffectGenMessage, /first argument is the generator body/)
+assert.deepEqual(
+  diagnosticOffsets(functionEffectGenDiagnostics),
+  [
+    offsetAfter(functionEffectGenFixtureSource, "const _arrow", "Effect.gen"),
+    offsetAfter(functionEffectGenFixtureSource, "function block", "generate"),
+    offsetAfter(functionEffectGenFixtureSource, "const _rootNamed", "RootEffect.gen"),
+    offsetAfter(functionEffectGenFixtureSource, "const _rootNamespace", "Root.Effect.gen"),
+    offsetAfter(functionEffectGenFixtureSource, "const _receiver", "Effect.gen"),
+    offsetAfter(functionEffectGenFixtureSource, "const _functionPipe", "Effect.gen"),
+    offsetAfter(functionEffectGenFixtureSource, "const _namespacePipe", "Effect.gen"),
+    offsetAfter(functionEffectGenFixtureSource, "const _callback", "Effect.gen"),
+    offsetAfter(functionEffectGenFixtureSource, "const _localAlias", "localGenerate"),
+    offsetAfter(functionEffectGenFixtureSource, "const _localAliasChain", "localGenerateAgain"),
+    offsetAfter(functionEffectGenFixtureSource, "const _destructuredAlias", "destructuredGenerate")
+  ].toSorted((left, right) => left - right),
+  functionEffectGenDetail
+)
+
+const implicitDefectFixtureSource = `import * as Effect from "effect/Effect"
+import { catch as catchAll, die as terminate, orDie as fatal } from "effect/Effect"
+import * as Root from "effect"
+import * as Layer from "effect/Layer"
+
+const _pipe = Effect.void.pipe(Effect.orDie)
+const _dataFirst = Effect.orDie(Effect.void)
+const _named = fatal(Effect.void)
+const _root = Root.Effect["orDie"](Effect.void)
+const extracted = Effect.orDie
+const _extractedUse = extracted(Effect.void)
+const extractedAgain = extracted
+const _aliasChain = extractedAgain(Effect.void)
+const { orDie: destructured } = Effect
+const _destructuredUse = destructured(Effect.void)
+const _catchArrow = Effect.void.pipe(Effect.catch((failure) => Effect.die(failure)))
+const _catchBlock = catchAll(Effect.void, (cause) => { return terminate(cause) })
+
+const _standaloneDie = Effect.die("defect")
+const _tagged = Effect.void.pipe(Effect.catchTag("Tagged", (error) => Effect.die(error)))
+const _transformed = Effect.void.pipe(Effect.catch((error) => Effect.die(error.cause)))
+const _extra = Effect.void.pipe(Effect.catch((error) => { void error; return Effect.die(error) }))
+const _layer = Layer.orDie
+const _shadowed = ((Effect) => Effect.orDie)({ orDie: null })
+`
+const implicitDefectDiagnostics = runOxlintFixture(
+  "implicit-defect-fixture.ts",
+  implicitDefectFixtureSource,
+  ["noImplicitDefectConversion"]
+)
+const implicitDetail = JSON.stringify(implicitDefectDiagnostics)
+const orDieDiagnostics = implicitDefectDiagnostics.filter(
+  (diagnostic) => diagnostic.message === effectOrDieMessage
+)
+const catchDieDiagnostics = implicitDefectDiagnostics.filter(
+  (diagnostic) => diagnostic.message === effectCatchDieMessage
+)
+assert.equal(orDieDiagnostics.length, 9, implicitDetail)
+assert.equal(catchDieDiagnostics.length, 2, implicitDetail)
+assert.deepEqual(
+  diagnosticOffsets(orDieDiagnostics),
+  [
+    ["_pipe", "Effect.orDie"],
+    ["_dataFirst", "Effect.orDie"],
+    ["_named", "fatal"],
+    ["_root", "Root.Effect"],
+    ["const extracted", "Effect.orDie"],
+    ["_extractedUse", "extracted("],
+    ["const extractedAgain", "extracted\n"],
+    ["_aliasChain", "extractedAgain("],
+    ["_destructuredUse", "destructured("]
+  ].map(([marker, needle]) => offsetAfter(implicitDefectFixtureSource, marker, needle))
+    .toSorted((left, right) => left - right),
+  implicitDetail
+)
+assert.deepEqual(
+  diagnosticOffsets(catchDieDiagnostics),
+  [
+    offsetAfter(implicitDefectFixtureSource, "_catchArrow", "Effect.catch"),
+    offsetAfter(implicitDefectFixtureSource, "_catchBlock", "catchAll")
+  ].toSorted((left, right) => left - right),
+  implicitDetail
+)
+
+const implicitDefectReexportSource = `export { orDie, orDie as fatal } from "effect/Effect"`
+const implicitDefectReexportDiagnostics = runOxlintFixture(
+  "implicit-defect-reexport-fixture.ts",
+  implicitDefectReexportSource,
+  ["noImplicitDefectConversion"]
+).filter((diagnostic) => diagnostic.code === "effect-local(noImplicitDefectConversion)")
+assert.equal(implicitDefectReexportDiagnostics.length, 2, JSON.stringify(implicitDefectReexportDiagnostics))
+assert.deepEqual(
+  diagnosticOffsets(implicitDefectReexportDiagnostics),
+  [offsetOf(implicitDefectReexportSource, "orDie"), offsetAfter(implicitDefectReexportSource, ", orDie", "orDie")],
+  JSON.stringify(implicitDefectReexportDiagnostics)
+)
+
+const layerFixtureSource = `import * as Layer from "effect/Layer"
+import { Layer as RootLayer } from "effect"
+
+declare const tag: any
+declare const value: any
+const lower = Layer.succeed(tag, value)
+const alsoLower: Layer.Layer<any> = Layer.empty
+const GoodLayer = RootLayer.empty
+const makeLayer = () => Layer.empty
+function buildLayer(): Layer.Layer<never> { return Layer.empty }
+const factoryExpression = function() { return Layer.empty }
+const mixed: Layer.Layer<never> | undefined = undefined
+const structural: { readonly "~effect/Layer": unknown } = { "~effect/Layer": undefined }
+const { empty: destructured } = Layer
+`
+const layerDiagnostics = runOxlintFixture(
+  "layer-name-fixture.ts",
+  layerFixtureSource,
+  ["requireLayerPascalCase"]
+).filter((diagnostic) => diagnostic.code === "effect-local(requireLayerPascalCase)")
+const layerDetail = JSON.stringify(layerDiagnostics)
+assert.equal(layerDiagnostics.length, 2, layerDetail)
+assert.deepEqual(
+  diagnosticOffsets(layerDiagnostics),
+  [
+    offsetAfter(layerFixtureSource, "const lower", "lower"),
+    offsetAfter(layerFixtureSource, "const alsoLower", "alsoLower")
+  ],
+  layerDetail
+)
+
+const serviceMapFixtureSource = `import * as Context from "effect/Context"
+import * as Effect from "effect/Effect"
+import { map as transform } from "effect/Effect"
+import { pipe } from "effect/Function"
+
+const Service = Context.Service<{ readonly value: number }>("Service")
+const Other = Context.Service<{ readonly value: number }>("Other")
+declare const ordinary: Effect.Effect<number>
+declare const callback: (service: { readonly value: number }) => number
+const localMap = Effect.map
+const localMapAgain = localMap
+
+const _receiver = Service.pipe(Effect.map(callback))
+const _computed = Service["pipe"](Effect.map(callback))
+const _function = pipe(Service, transform(callback), Effect.asVoid)
+const _dataFirst = Effect.map(Service, callback)
+const _twoMaps = Other.pipe(Effect.map(callback), Effect.map(String))
+const _localAlias = Service.pipe(localMap(callback))
+const _localAliasChain = Service.pipe(localMapAgain(callback))
+const _ordinary = ordinary.pipe(Effect.map(String))
+const _flatMap = Service.pipe(Effect.flatMap((service) => Effect.succeed(service.value)))
+const _laterMap = Service.pipe(Effect.asVoid, Effect.map(String))
+const _use = Service.use((service) => Effect.succeed(service.value))
+`
+const serviceMapDiagnostics = runOxlintFixture(
+  "service-map-fixture.ts",
+  serviceMapFixtureSource,
+  ["noServiceTagMap"]
+).filter((diagnostic) => diagnostic.code === "effect-local(noServiceTagMap)")
+const serviceMapDetail = JSON.stringify(serviceMapDiagnostics)
+assert.equal(serviceMapDiagnostics.length, 7, serviceMapDetail)
+const serviceMapTarget = new Map([
+  ["_dataFirst", "Service"],
+  ["_twoMaps", "Other"]
+])
+assert.deepEqual(
+  diagnosticOffsets(serviceMapDiagnostics),
+  ["_receiver", "_computed", "_function", "_dataFirst", "_twoMaps", "_localAlias", "_localAliasChain"]
+    .map((marker) => offsetAfter(serviceMapFixtureSource, `const ${marker}`, serviceMapTarget.get(marker) ?? "Service"))
+    .toSorted((left, right) => left - right),
+  serviceMapDetail
+)
+
+const manualBoundaryFixtureSource = `import * as Effect from "effect/Effect"
 import { runPromise as execute } from "effect/Effect"
+import * as Schema from "effect/Schema"
 import { make as makeRuntime } from "effect/ManagedRuntime"
+import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as SchemaParser from "effect/SchemaParser"
+import * as Layer from "effect/Layer"
 import * as Root from "effect"
 
 const layer = null
+const Fx = Effect
+const Parser = SchemaParser
+const directRunner = Effect["runCallback"]
+const directRunnerAgain = directRunner
+const directDecoder = Schema.decodeSync
+const directParserEncoder = SchemaParser.encodePromise
+const { runSyncExit } = Effect
+const { ["runPromiseExit"]: computedRunner } = Effect
+const { decodeUnknownSync } = Schema
+const { decodePromise } = SchemaParser
+const { [\`encodeSync\`]: computedEncoder } = SchemaParser
+declare const typedRuntime: ManagedRuntime.ManagedRuntime<never, never>
+declare const holder: { readonly runtime: ManagedRuntime.ManagedRuntime<never, never> }
+declare const getRuntime: () => ManagedRuntime.ManagedRuntime<never, never>
+declare const acceptsRuntime: (runtime: ManagedRuntime.ManagedRuntime<never, never>) => void
 
 Effect.runSync(Effect.void)
 void execute(Effect.void)
@@ -457,23 +746,88 @@ const runtime = Root.ManagedRuntime.make(layer)
 void runtime.runPromise(Effect.void)
 const pipedRuntime = layer.pipe((value) => makeRuntime(value))
 void pipedRuntime.dispose()
+Fx.runFork(Effect.void)
+void directRunner(Effect.void)
+void directRunnerAgain(Effect.void)
+directDecoder(Schema.String)("value")
+directParserEncoder(Schema.String)("value")
+runSyncExit(Effect.void)
+void computedRunner(Effect.void)
+decodeUnknownSync(Schema.String)("value")
+Schema[\`decodeSync\`](Schema.String)("value")
+Parser["encodeSync"](Schema.String)("value")
+decodePromise(Schema.String)("value")
+computedEncoder(Schema.String)("value")
+void typedRuntime.runPromise(Effect.void)
+holder.runtime["runSync"](Effect.void)
+getRuntime().runFork(Effect.void)
+acceptsRuntime(typedRuntime)
+const _consumeRuntime = (runtime: ManagedRuntime.ManagedRuntime<never, never>) => runtime.runCallback(Effect.void)
+const { runPromiseExit } = typedRuntime
+void runPromiseExit(Effect.void)
+void typedRuntime[Symbol.asyncDispose]()
+const { dispose } = ManagedRuntime.make(Layer.empty)
+void dispose()
 // A process entry point must state why it owns execution and lifecycle.
 // oxlint-disable-next-line effect-local/noManualEffectBoundary
 Effect.runSync(Effect.void)
-`,
+`
+const boundaryDiagnostics = runOxlintFixture(
+  "manual-boundary-fixture.ts",
+  manualBoundaryFixtureSource,
   ["noManualEffectBoundary"]
 )
 
 const manualDiagnostics = boundaryDiagnostics.filter(
   (diagnostic) => diagnostic.code === "effect-local(noManualEffectBoundary)"
 )
-assert.equal(manualDiagnostics.length, 8)
+assert.equal(manualDiagnostics.length, 33, JSON.stringify(manualDiagnostics))
 const onlyManualDiagnostics = boundaryDiagnostics.every(
   (diagnostic) => diagnostic.code === "effect-local(noManualEffectBoundary)"
 )
-assert.equal(onlyManualDiagnostics, true)
+assert.equal(onlyManualDiagnostics, true, JSON.stringify(boundaryDiagnostics))
 const hasGuidance = boundaryDiagnostics.every((diagnostic) => diagnostic.message === manualBoundaryMessage)
 assert.equal(hasGuidance, true)
+assert.deepEqual(
+  diagnosticOffsets(manualDiagnostics),
+  [
+    ["const directRunner", "Effect[\"runCallback\"]"],
+    ["const directRunnerAgain =", "directRunner\n"],
+    ["const directDecoder", "Schema.decodeSync"],
+    ["const directParserEncoder", "SchemaParser.encodePromise"],
+    ["Effect.runSync", "Effect.runSync"],
+    ["void execute", "execute"],
+    ["void Root.Effect", "Root.Effect.runPromise"],
+    ["Root.Schema.decodeUnknownSync", "Root.Schema.decodeUnknownSync"],
+    ["const _decode", "SchemaParser.decodePromise"],
+    ["Root.Runtime.makeRunMain", "Root.Runtime.makeRunMain"],
+    ["void runtime.runPromise", "runtime.runPromise"],
+    ["void pipedRuntime.dispose", "pipedRuntime.dispose"],
+    ["Fx.runFork", "Fx.runFork"],
+    ["void directRunner(", "directRunner"],
+    ["void directRunnerAgain", "directRunnerAgain"],
+    ["directDecoder(", "directDecoder"],
+    ["directParserEncoder(", "directParserEncoder"],
+    ["runSyncExit(", "runSyncExit"],
+    ["void computedRunner", "computedRunner"],
+    ["\ndecodeUnknownSync(", "decodeUnknownSync"],
+    ["Schema[`decodeSync`]", "Schema[`decodeSync`]"],
+    ["Parser[\"encodeSync\"]", "Parser[\"encodeSync\"]"],
+    ["\ndecodePromise(", "decodePromise"],
+    ["computedEncoder(", "computedEncoder"],
+    ["void typedRuntime.runPromise", "typedRuntime.runPromise"],
+    ["holder.runtime[\"runSync\"]", "holder.runtime[\"runSync\"]"],
+    ["getRuntime().runFork", "getRuntime().runFork"],
+    ["runtime: ManagedRuntime.ManagedRuntime", "runtime.runCallback"],
+    ["const { runPromiseExit } = typedRuntime", "runPromiseExit"],
+    ["void runPromiseExit", "runPromiseExit"],
+    ["typedRuntime[Symbol.asyncDispose]", "typedRuntime[Symbol.asyncDispose]"],
+    ["const { dispose }", "dispose"],
+    ["void dispose()", "dispose"]
+  ].map(([marker, needle]) => offsetAfter(manualBoundaryFixtureSource, marker, needle))
+    .toSorted((left, right) => left - right),
+  JSON.stringify(manualDiagnostics)
+)
 
 const taggedFixtureSource = `import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
@@ -544,7 +898,7 @@ const taggedDiagnostics = runOxlintFixture(
 
 const repeatedFixtureName = ".oxlint-tagged-repeated-fixture.ts"
 const repeatedFixturePath = resolve(worktree, repeatedFixtureName)
-const taggedChecker = makeTaggedEffectErrorChecker({ cwd: worktree })
+const taggedChecker = makeEffectTypePolicyChecker({ cwd: worktree })
 writeFileSync(repeatedFixturePath, taggedFixtureSource)
 try {
   const firstDiagnostics = taggedChecker.find({
@@ -576,25 +930,24 @@ const taggedOffsets = new Set(untaggedDiagnostics.map((diagnostic) => diagnostic
 const taggedMessageByOffset = new Map(
   untaggedDiagnostics.map((diagnostic) => [diagnostic.labels[0].span.offset, diagnostic.message])
 )
-const utf8Offset = (text, position) => pipe(text.slice(0, position), (value) => Buffer.byteLength(value))
-const offsetOf = (needle, fromEnd = false) => {
+const taggedOffsetOf = (needle, fromEnd = false) => {
   let position = taggedFixtureSource.indexOf(needle)
   if (fromEnd) position = taggedFixtureSource.lastIndexOf(needle)
   return utf8Offset(taggedFixtureSource, position)
 }
-const nestedOuter = offsetOf("Effect.succeed(\"start\")")
-const nestedInner = offsetOf("Effect.fail(\"nested\")")
-const genericOuter = offsetOf("Effect.suspend(() => effect)")
-const genericInner = offsetOf("effect)", true)
-const partialOuter = offsetOf("widen(Effect.fail(\"partial\"))")
-const partialInner = offsetOf("Effect.fail(\"partial\")")
-const effectUnhandledOffset = offsetOf("Effect.fail(effectUnhandled)")
-const userUnhandledOffset = offsetOf("Effect.fail(userUnhandled)")
-const socketGenericOffset = offsetOf("socketResult\n", true)
-const socketConcreteOffset = offsetOf("Effect.fail(\"socket concrete\")")
-const localGenericOffset = offsetOf("localResult\n", true)
-const declaredStringOffset = offsetOf("Effect.Effect<void, string>")
-const declaredNumberOffset = offsetOf("Effect.Effect<void, number>")
+const nestedOuter = taggedOffsetOf("Effect.succeed(\"start\")")
+const nestedInner = taggedOffsetOf("Effect.fail(\"nested\")")
+const genericOuter = taggedOffsetOf("Effect.suspend(() => effect)")
+const genericInner = taggedOffsetOf("effect)", true)
+const partialOuter = taggedOffsetOf("widen(Effect.fail(\"partial\"))")
+const partialInner = taggedOffsetOf("Effect.fail(\"partial\")")
+const effectUnhandledOffset = taggedOffsetOf("Effect.fail(effectUnhandled)")
+const userUnhandledOffset = taggedOffsetOf("Effect.fail(userUnhandled)")
+const socketGenericOffset = taggedOffsetOf("socketResult\n", true)
+const socketConcreteOffset = taggedOffsetOf("Effect.fail(\"socket concrete\")")
+const localGenericOffset = taggedOffsetOf("localResult\n", true)
+const declaredStringOffset = taggedOffsetOf("Effect.Effect<void, string>")
+const declaredNumberOffset = taggedOffsetOf("Effect.Effect<void, number>")
 const hasNestedOuter = taggedOffsets.has(nestedOuter)
 const hasNestedInner = taggedOffsets.has(nestedInner)
 const hasGenericOuter = taggedOffsets.has(genericOuter)

@@ -122,26 +122,28 @@ const membershipIncarnation = Identity.MembershipIncarnation.make(
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 
 let nextSequence = 1
-const envelope = (name: string, payload: typeof Protocol.MutationEnvelope.Type["payload"]) =>
-  Effect.gen(function*() {
-    const localSequence = nextSequence++
-    const identity = {
-      spaceId,
-      clientId: writerId,
-      mutationId: Identity.MutationId.make(
-        `mut_00000000-0000-4000-8000-${String(localSequence).padStart(12, "0")}`
-      ),
-      localSequence: Identity.LocalSequence.make(localSequence),
-      basis: Identity.ServerSequence.make(0),
-      name,
-      payload,
-      digestVersion: 3 as const,
-      membershipIncarnation,
-      sourceSchema: Domain.definition.schemaIdentity,
-      mutationVersion: Identity.SchemaVersion.make(1)
-    }
-    return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
-  })
+const envelope = Effect.fnUntraced(function*(
+  name: string,
+  payload: typeof Protocol.MutationEnvelope.Type["payload"]
+) {
+  const localSequence = nextSequence++
+  const identity = {
+    spaceId,
+    clientId: writerId,
+    mutationId: Identity.MutationId.make(
+      `mut_00000000-0000-4000-8000-${String(localSequence).padStart(12, "0")}`
+    ),
+    localSequence: Identity.LocalSequence.make(localSequence),
+    basis: Identity.ServerSequence.make(0),
+    name,
+    payload,
+    digestVersion: 3 as const,
+    membershipIncarnation,
+    sourceSchema: Domain.definition.schemaIdentity,
+    mutationVersion: Identity.SchemaVersion.make(1)
+  }
+  return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
+})
 
 const windowedScope = Protocol.ReplicationScope.make({
   models: [],
@@ -149,15 +151,14 @@ const windowedScope = Protocol.ReplicationScope.make({
 })
 
 const layers = () => {
-  const sqlite = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
-  const database = Layer.mergeAll(
-    sqlite,
+  const Database = Layer.mergeAll(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
     Reactivity.layer,
-    QueryReactivity.layer
+    QueryReactivity.Layer
   )
-  const runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.handlers))
-  const server = ServerStore.layer({
+  const Runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.Handlers))
+  const Server = ServerStore.layer({
     definition: Domain.definition,
     wakeCapacity: 16,
     maximumWatchersPerSpace: 1_024,
@@ -180,7 +181,7 @@ const layers = () => {
     authorizeAccess: () => Effect.void,
     authorizeMutation: () => Effect.void,
     authorizeRead: () => Effect.void
-  }).pipe(Layer.provide(runtime), Layer.provide(database))
+  }).pipe(Layer.provide(Runtime), Layer.provide(Database))
   const remoteEffect = Effect.gen(function*() {
     const store = yield* ServerStore.ServerStore
     return SyncEngine.SyncEngine.of({
@@ -192,8 +193,8 @@ const layers = () => {
       watch: (request) => store.watchAuthorized(request, "reader").pipe(Stream.unwrap)
     })
   })
-  const remote = Layer.effect(SyncEngine.SyncEngine, remoteEffect).pipe(Layer.provide(server))
-  const local = LocalStore.layer({
+  const Remote = Layer.effect(SyncEngine.SyncEngine, remoteEffect).pipe(Layer.provide(Server))
+  const Local = LocalStore.layer({
     settlementCapacity: 64,
     retainedReceipts: 256,
     maximumReceipts: 100_000,
@@ -206,12 +207,12 @@ const layers = () => {
     spaceId,
     clientId: readerId,
     scope: windowedScope
-  }).pipe(Layer.provide(runtime), Layer.provide(database))
-  const reconciler = Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
-    Layer.provide(local),
-    Layer.provide(remote)
+  }).pipe(Layer.provide(Runtime), Layer.provide(Database))
+  const ReconcilerLayer = Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+    Layer.provide(Local),
+    Layer.provide(Remote)
   )
-  return Layer.mergeAll(local, reconciler, server, database)
+  return Layer.mergeAll(Local, ReconcilerLayer, Server, Database)
 }
 
 describe("entity lookup query plans", () => {

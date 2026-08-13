@@ -28,22 +28,16 @@ const Todo = Model.make("Todo", {
 })
 const definition = Definition.make({ version: 1, models: [Todo], mutations: [] })
 const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
-const runtime = MutationRuntime.layer(definition)
-const database = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
-  (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer)
+const Runtime = MutationRuntime.layer(definition)
+const Database = Layer.mergeAll(
+  SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+  NodeCrypto.layer,
+  Reactivity.layer
 )
-const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
-  effect.pipe(
-    Effect.result,
-    Effect.map((result) => {
-      if (Result.isFailure(result)) return result.failure
-      return assert.fail("expected Effect failure")
-    })
-  )
 class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationError, Schema.JsonObject>(
   "@lucas-barake/effect-local-rpc/test/PrincipalAssertion/TestAuthorizationError"
 )("TestAuthorizationError", { reason: Schema.String }) {}
-const store = ServerStore.layer({
+const Store = ServerStore.layer({
   definition,
   readAuthorizationRefreshInterval: "1 second",
   maximumWatchersPerSpace: 1_024,
@@ -68,64 +62,71 @@ const store = ServerStore.layer({
     if (principal !== null && typeof principal === "object" && "subject" in principal) return Effect.void
     return Effect.fail(new TestAuthorizationError({ reason: "missing principal" }))
   }
-}).pipe(Layer.provide(runtime), Layer.provide(database))
+}).pipe(Layer.provide(Runtime), Layer.provide(Database))
+const TestShardingConfig = ShardingConfig.layer({
+  shardsPerGroup: 32,
+  entityMailboxCapacity: 32,
+  entityTerminationTimeout: 0,
+  entityMessagePollInterval: 5_000,
+  sendRetryInterval: 100
+})
+const provideTestShardingConfig = Effect.provide(TestShardingConfig)
+const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
 
 describe("principal assertions", () => {
-  it.effect("rejects a forged internal assertion before reaching entity authorization", () => {
-    return Effect.gen(function*() {
-      const verifier = PrincipalAssertion.layerVerifier((assertion) => {
-        if (assertion === PrincipalAssertion.PrincipalAssertion.make("trusted")) {
-          return Effect.succeed({ subject: "reader" })
-        }
-        return Effect.fail(new ReplicaError.AuthorizationDenied({ reason: "forged assertion" }))
-      })
-      const handlers = SpaceEntity.layerHandlers({
-        admissionMailboxCapacity: 32,
-        readMailboxCapacity: 32,
-        watchMailboxCapacity: 32,
-        presencePublicationMailboxCapacity: 32,
-        maximumConcurrentBootstrapAuthorizations: 16,
-        maximumConcurrentBootstrapPagesPerSpace: 4,
-        maximumConcurrentPresencePublicationsPerSpace: 16
-      })
-      const liveHandlers = handlers.pipe(
-        Layer.provide(store),
-        Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
-        Layer.provide(verifier)
-      )
-      const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, liveHandlers)
-      const client = yield* makeClient(spaceId)
-      const request = Protocol.PullRequest.make({
-        spaceId,
-        clientId,
-        schema: definition.schemaIdentity,
-        scope,
-        scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
-        cursor: null,
-        limit: 10
-      })
+  it.effect(
+    "rejects a forged internal assertion before reaching entity authorization",
+    Effect.fnUntraced(
+      function*() {
+        const Verifier = PrincipalAssertion.layerVerifier((assertion) => {
+          if (assertion === PrincipalAssertion.PrincipalAssertion.make("trusted")) {
+            return Effect.succeed({ subject: "reader" })
+          }
+          return Effect.fail(new ReplicaError.AuthorizationDenied({ reason: "forged assertion" }))
+        })
+        const Handlers = SpaceEntity.layerHandlers({
+          admissionMailboxCapacity: 32,
+          readMailboxCapacity: 32,
+          watchMailboxCapacity: 32,
+          presencePublicationMailboxCapacity: 32,
+          maximumConcurrentBootstrapAuthorizations: 16,
+          maximumConcurrentBootstrapPagesPerSpace: 4,
+          maximumConcurrentPresencePublicationsPerSpace: 16
+        })
+        const LiveHandlers = Handlers.pipe(
+          Layer.provide(Store),
+          Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+          Layer.provide(Verifier)
+        )
+        const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, LiveHandlers)
+        const client = yield* makeClient(spaceId)
+        const request = Protocol.PullRequest.make({
+          spaceId,
+          clientId,
+          schema: definition.schemaIdentity,
+          scope,
+          scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+          cursor: null,
+          limit: 10
+        })
 
-      const forged = yield* client.Pull({
-        request,
-        assertion: PrincipalAssertion.PrincipalAssertion.make("forged")
-      }).pipe(failureOf)
-      if (forged._tag !== "AuthorizationDenied") assert.fail("expected forged assertion denial")
-      assert.strictEqual(forged.reason, "forged assertion")
+        const forgedResult = yield* client.Pull({
+          request,
+          assertion: PrincipalAssertion.PrincipalAssertion.make("forged")
+        }).pipe(Effect.result)
+        if (!Result.isFailure(forgedResult)) assert.fail("expected forged assertion denial")
+        const forged = forgedResult.failure
+        if (forged._tag !== "AuthorizationDenied") assert.fail("expected forged assertion denial")
+        assert.strictEqual(forged.reason, "forged assertion")
 
-      const accepted = yield* client.Pull({
-        request,
-        assertion: PrincipalAssertion.PrincipalAssertion.make("trusted")
-      })
-      assert.strictEqual("_tag" in accepted, true)
-    }).pipe(
-      Effect.provide(ShardingConfig.layer({
-        shardsPerGroup: 32,
-        entityMailboxCapacity: 32,
-        entityTerminationTimeout: 0,
-        entityMessagePollInterval: 5_000,
-        sendRetryInterval: 100
-      })),
-      Effect.provide(NodeCrypto.layer)
+        const accepted = yield* client.Pull({
+          request,
+          assertion: PrincipalAssertion.PrincipalAssertion.make("trusted")
+        })
+        assert.strictEqual("_tag" in accepted, true)
+      },
+      provideTestShardingConfig,
+      provideNodeCrypto
     )
-  })
+  )
 })

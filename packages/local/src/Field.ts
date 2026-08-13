@@ -23,11 +23,10 @@ export const register = <Value extends Schema.Top,>(schema: Value) => {
   return make({
     schema,
     operation,
-    apply: (_current, update) => {
-      const decode = schema.pipe(Schema.toType, Schema.decodeUnknownEffect)
-      const value = Reflect.get(update, "value")
-      return decode(value).pipe(Effect.orDie)
-    }
+    apply: (_current, update) =>
+      Schema.decodeUnknownEffect(Schema.toType(schema))(Reflect.get(update, "value")).pipe(
+        Effect.catchTag("SchemaError", (error) => Effect.die(error))
+      )
   })
 }
 
@@ -47,14 +46,13 @@ export const growOnlySet = <Item extends Schema.Top,>(item: Item) => {
   return make({
     schema: Schema.Array(item),
     operation,
-    apply: (current, update) =>
-      Effect.gen(function*() {
-        const decode = item.pipe(Schema.toType, Schema.decodeUnknownEffect)
-        const input = Reflect.get(update, "value")
-        const value = yield* decode(input).pipe(Effect.orDie)
-        const encoded = Canonical.stringify(value)
-        if (current.some((currentValue) => Canonical.stringify(currentValue) === encoded)) return current
-        return [...current, value]
-      })
+    apply: Effect.fnUntraced(function*(current: ReadonlyArray<Item["Type"]>, update: typeof operation.Type) {
+      const value = yield* Schema.decodeUnknownEffect(Schema.toType(item))(Reflect.get(update, "value")).pipe(
+        Effect.catchTag("SchemaError", (error) => Effect.die(error))
+      )
+      const encoded = Canonical.stringify(value)
+      if (current.some((currentValue) => Canonical.stringify(currentValue) === encoded)) return current
+      return [...current, value]
+    })
   })
 }

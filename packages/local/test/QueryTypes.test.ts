@@ -92,6 +92,5 @@ Mutation.make("UntaggedRejection", { version: 1, rejection: Schema.String })
 void typeContracts
 
 it("preserves declared secondary index names at runtime", () => {
-  const indexNames = Object.keys(Todo.indexes)
-  assert.deepStrictEqual(indexNames, ["byProjectCreatedAt", "byPriority"])
+  assert.deepStrictEqual(Object.keys(Todo.indexes), ["byProjectCreatedAt", "byPriority"])
 })

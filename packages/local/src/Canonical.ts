@@ -46,8 +46,7 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
     result = value.map((item) => normalize(item, ancestors))
   } else {
     const entries = Object.keys(value).toSorted().map((key) => {
-      const property = Reflect.get(value, key)
-      return [key, normalize(property, ancestors)] as const
+      return [key, normalize(Reflect.get(value, key), ancestors)] as const
     })
     result = Object.fromEntries(entries)
   }
@@ -56,12 +55,10 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
 }
 
 export const stringify = (value: unknown): string => {
-  const schema = Schema.fromJsonString(Schema.Unknown)
   // Canonical hashing, cache keys, and SQL interpolation require this public codec to return synchronously.
   // oxlint-disable-next-line effect-local/noManualEffectBoundary
-  const encode = Schema.encodeSync(schema)
-  const normalized = normalize(value, new WeakSet())
-  return encode(normalized)
+  const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
+  return encode(normalize(value, new WeakSet()))
 }
 
 export const stringifyEffect = (value: unknown): Effect.Effect<string, ReplicaError.CanonicalEncodeError> =>
@@ -74,8 +71,7 @@ export const hash = (value: unknown): string => {
   const input = stringify(value)
   let current = 0xcbf29ce484222325n
   for (let index = 0; index < input.length; index++) {
-    const character = input.charCodeAt(index)
-    current ^= BigInt(character)
+    current ^= BigInt(input.charCodeAt(index))
     current = BigInt.asUintN(64, current * 0x100000001b3n)
   }
   return current.toString(16).padStart(16, "0")

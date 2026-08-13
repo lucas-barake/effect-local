@@ -387,7 +387,7 @@ retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted
 tests and already trusted processes.
 
 `SyncRpc.Rpcs` multiplexes submit, pull, bootstrap, watch, and presence on one Effect RPC WebSocket. The server uses
-`Authentication.layerServer`. The client uses `Authentication.layerClient` with an application supplied
+`Authentication.LayerServer`. The client uses `Authentication.LayerClient` with an application supplied
 `CredentialProvider`. Its `acquire` Effect runs for every RPC and returns a redacted bearer credential plus its
 nonnegative generation. `awaitChange(rejectedGeneration)` signals when `acquire` can return a different generation.
 A rejected credential changes the space to `NeedsAuthentication` and pauses that generation. Publishing a new
@@ -471,7 +471,7 @@ the enclosing model through the same transaction. These semantics are domain too
 
 ## Testing
 
-`TestServer.layer` adapts the real authoritative store to a production shaped `SyncEngine`. `FaultInjection` can
+`TestServer.TestServerLayer` adapts the real authoritative store to a production shaped `SyncEngine`. `FaultInjection` can
 partition and heal the link, drop the next receipt after the server commits it, and duplicate the next catch up page.
 `TestReplica.layer` is the same `SqlReplica` composition used in production.
 

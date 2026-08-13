@@ -24,6 +24,18 @@ interface EncodedEntity<M extends Model.Any,> extends EncodedEntityKey<M> {
   readonly valueJson: string
 }
 
+const encodeEntityEffect = Effect.fnUntraced(function*<M extends Model.Any,>(
+  model: M,
+  key: Model.Key<M>,
+  value?: Model.Value<M>
+): Effect.fn.Return<EncodedEntityKey<M> | EncodedEntity<M>, ReplicaError.StorageCorrupt> {
+  const encodedKey = yield* Codec.encode(model.key, key)
+  const keyJson = yield* Codec.stringify(encodedKey)
+  if (value === undefined) return { encodedKey, keyJson }
+  const encodedValue = yield* Codec.encode(model.schema, value)
+  return { encodedKey, keyJson, encodedValue, valueJson: yield* Codec.stringify(encodedValue) }
+})
+
 function encodeEntity<M extends Model.Any,>(
   model: M,
   key: Model.Key<M>
@@ -38,13 +50,7 @@ function encodeEntity<M extends Model.Any,>(
   key: Model.Key<M>,
   value?: Model.Value<M>
 ): Effect.Effect<EncodedEntityKey<M> | EncodedEntity<M>, ReplicaError.StorageCorrupt> {
-  return Effect.gen(function*() {
-    const encodedKey = yield* Codec.encode(model.key, key)
-    const keyJson = yield* Codec.stringify(encodedKey)
-    if (value === undefined) return { encodedKey, keyJson }
-    const encodedValue = yield* Codec.encode(model.schema, value)
-    return { encodedKey, keyJson, encodedValue, valueJson: yield* Codec.stringify(encodedValue) }
-  })
+  return encodeEntityEffect(model, key, value)
 }
 
 export const local = (options: {
@@ -75,66 +81,63 @@ export const local = (options: {
     }
   })
   return {
-    get: (model, key) =>
-      Effect.gen(function*() {
-        const { keyJson } = yield* encodeEntity(model, key)
-        const row = yield* find({ model: model.name, key: keyJson }).pipe(
-          Effect.mapError(StorageUnavailable.make)
-        )
-        if (Option.isNone(row)) return Option.none()
-        const value = yield* Codec.parse(row.value.value_json).pipe(
-          Effect.flatMap((encoded) => Codec.decode(model.schema, encoded))
-        )
-        return Option.some(value)
-      }),
-    set: (model, key, value) =>
-      Effect.gen(function*() {
-        const encoded = yield* encodeEntity(model, key, value)
-        if (options.table === "visible") {
-          yield* options.sql`INSERT INTO effect_local_client_visible_entities_data
+    get: Effect.fnUntraced(function*(model, key) {
+      const { keyJson } = yield* encodeEntity(model, key)
+      const row = yield* find({ model: model.name, key: keyJson }).pipe(
+        Effect.mapError(StorageUnavailable.make)
+      )
+      if (Option.isNone(row)) return Option.none()
+      const value = yield* Codec.parse(row.value.value_json).pipe(
+        Effect.flatMap((encoded) => Codec.decode(model.schema, encoded))
+      )
+      return Option.some(value)
+    }),
+    set: Effect.fnUntraced(function*(model, key, value) {
+      const encoded = yield* encodeEntity(model, key, value)
+      if (options.table === "visible") {
+        yield* options.sql`INSERT INTO effect_local_client_visible_entities_data
           (space_id, schema_generation, projection_generation, model, entity_key, value_json, model_version)
           VALUES (${options.spaceId}, ${options.schemaGeneration}, ${options.projectionGeneration},
             ${model.name}, ${encoded.keyJson}, ${encoded.valueJson}, ${model.version})
           ON CONFLICT (space_id, schema_generation, projection_generation, model, entity_key) DO UPDATE SET
             value_json = excluded.value_json, model_version = excluded.model_version`
-        } else {
-          yield* options.sql`INSERT INTO effect_local_client_canonical_entities_data
+      } else {
+        yield* options.sql`INSERT INTO effect_local_client_canonical_entities_data
           (space_id, schema_generation, model, entity_key, value_json, model_version)
           VALUES (${options.spaceId}, ${options.schemaGeneration}, ${model.name}, ${encoded.keyJson},
             ${encoded.valueJson}, ${model.version})
           ON CONFLICT (space_id, schema_generation, model, entity_key) DO UPDATE SET
             value_json = excluded.value_json, model_version = excluded.model_version`
-        }
-        if (options.table === "visible") {
-          yield* (options.onVisibleChange?.(model.name, encoded.keyJson) ?? Effect.void)
-        }
-        options.changes?.push({
-          _tag: "Upsert",
-          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
-          value: encoded.encodedValue
-        })
-      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
-    delete: (model, key) =>
-      Effect.gen(function*() {
-        const encoded = yield* encodeEntity(model, key)
-        if (options.table === "visible") {
-          yield* options.sql`DELETE FROM effect_local_client_visible_entities_data
+      }
+      if (options.table === "visible") {
+        yield* (options.onVisibleChange?.(model.name, encoded.keyJson) ?? Effect.void)
+      }
+      options.changes?.push({
+        _tag: "Upsert",
+        entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
+        value: encoded.encodedValue
+      })
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+    delete: Effect.fnUntraced(function*(model, key) {
+      const encoded = yield* encodeEntity(model, key)
+      if (options.table === "visible") {
+        yield* options.sql`DELETE FROM effect_local_client_visible_entities_data
           WHERE space_id = ${options.spaceId} AND schema_generation = ${options.schemaGeneration}
             AND projection_generation = ${options.projectionGeneration}
             AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
-        } else {
-          yield* options.sql`DELETE FROM effect_local_client_canonical_entities_data
+      } else {
+        yield* options.sql`DELETE FROM effect_local_client_canonical_entities_data
           WHERE space_id = ${options.spaceId} AND schema_generation = ${options.schemaGeneration}
             AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
-        }
-        if (options.table === "visible") {
-          yield* (options.onVisibleChange?.(model.name, encoded.keyJson) ?? Effect.void)
-        }
-        options.changes?.push({
-          _tag: "Delete",
-          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }
-        })
-      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+      }
+      if (options.table === "visible") {
+        yield* (options.onVisibleChange?.(model.name, encoded.keyJson) ?? Effect.void)
+      }
+      options.changes?.push({
+        _tag: "Delete",
+        entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }
+      })
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)
   }
 }
@@ -155,76 +158,72 @@ export const server = (options: {
         AND model = ${model} AND entity_key = ${key}`
   })
   return {
-    get: (model, key) =>
-      Effect.gen(function*() {
-        const { keyJson } = yield* encodeEntity(model, key)
-        const row = yield* find({ spaceId: options.spaceId, model: model.name, key: keyJson }).pipe(
-          Effect.mapError(StorageUnavailable.make)
-        )
-        if (Option.isNone(row)) return Option.none()
-        const value = yield* Codec.parse(row.value.value_json).pipe(
-          Effect.flatMap((encoded) => Codec.decode(model.schema, encoded))
-        )
-        return Option.some(value)
-      }),
-    set: (model, key, value) =>
-      Effect.gen(function*() {
-        const encoded = yield* encodeEntity(model, key, value)
-        const entityBytes = yield* Protocol.encodedBytesEffect({
-          model: model.name,
-          modelVersion: model.version,
-          key: encoded.encodedKey,
-          value: encoded.encodedValue
-        })
-        yield* options.sql`INSERT INTO effect_local_server_entities_data
+    get: Effect.fnUntraced(function*(model, key) {
+      const { keyJson } = yield* encodeEntity(model, key)
+      const row = yield* find({ spaceId: options.spaceId, model: model.name, key: keyJson }).pipe(
+        Effect.mapError(StorageUnavailable.make)
+      )
+      if (Option.isNone(row)) return Option.none()
+      const value = yield* Codec.parse(row.value.value_json).pipe(
+        Effect.flatMap((encoded) => Codec.decode(model.schema, encoded))
+      )
+      return Option.some(value)
+    }),
+    set: Effect.fnUntraced(function*(model, key, value) {
+      const encoded = yield* encodeEntity(model, key, value)
+      const entityBytes = yield* Protocol.encodedBytesEffect({
+        model: model.name,
+        modelVersion: model.version,
+        key: encoded.encodedKey,
+        value: encoded.encodedValue
+      })
+      yield* options.sql`INSERT INTO effect_local_server_entities_data
           (space_id, generation, model, model_version, entity_key, value_json, entity_bytes)
         VALUES (${options.spaceId}, ${options.generation}, ${model.name}, ${model.version},
           ${encoded.keyJson}, ${encoded.valueJson}, ${entityBytes})
         ON CONFLICT (space_id, generation, model, entity_key) DO UPDATE
           SET model_version = excluded.model_version, value_json = excluded.value_json,
             entity_bytes = excluded.entity_bytes`
-        options.changes.push({
-          _tag: "Upsert",
-          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
-          value: encoded.encodedValue
-        })
-      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
-    delete: (model, key) =>
-      Effect.gen(function*() {
-        const encoded = yield* encodeEntity(model, key)
-        yield* options.sql`DELETE FROM effect_local_server_entities_data
+      options.changes.push({
+        _tag: "Upsert",
+        entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
+        value: encoded.encodedValue
+      })
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+    delete: Effect.fnUntraced(function*(model, key) {
+      const encoded = yield* encodeEntity(model, key)
+      yield* options.sql`DELETE FROM effect_local_server_entities_data
         WHERE space_id = ${options.spaceId} AND generation = ${options.generation}
           AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
-        options.changes.push({
-          _tag: "Delete",
-          entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }
-        })
-      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+      options.changes.push({
+        _tag: "Delete",
+        entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }
+      })
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)
   }
 }
 
-export const applyCanonicalChange = (
+export const applyCanonicalChange = Effect.fnUntraced(function*(
   sql: SqlClient.SqlClient,
   spaceId: Identity.SpaceId,
   schemaGeneration: number,
   change: Protocol.EntityChange
-) =>
-  Effect.gen(function*() {
-    const keyJson = yield* Codec.stringify(change.entity.key)
-    if (change._tag === "Delete") {
-      yield* sql`DELETE FROM effect_local_client_canonical_entities_data
+) {
+  const keyJson = yield* Codec.stringify(change.entity.key)
+  if (change._tag === "Delete") {
+    yield* sql`DELETE FROM effect_local_client_canonical_entities_data
         WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
           AND model = ${change.entity.model} AND entity_key = ${keyJson}`
-      return
-    }
-    const valueJson = yield* Codec.stringify(change.value)
-    yield* sql`INSERT INTO effect_local_client_canonical_entities_data
+    return
+  }
+  const valueJson = yield* Codec.stringify(change.value)
+  yield* sql`INSERT INTO effect_local_client_canonical_entities_data
         (space_id, schema_generation, model, entity_key, value_json, model_version)
         VALUES (${spaceId}, ${schemaGeneration}, ${change.entity.model}, ${keyJson}, ${valueJson},
           ${change.entity.modelVersion})
         ON CONFLICT (space_id, schema_generation, model, entity_key) DO UPDATE SET
           value_json = excluded.value_json, model_version = excluded.model_version`
-  }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+}, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const entityKey = (entity: Protocol.EntityKey) => `${entity.model}\u0000${Canonical.stringify(entity.key)}`

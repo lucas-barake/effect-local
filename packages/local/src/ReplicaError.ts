@@ -1,12 +1,9 @@
 import * as Schema from "effect/Schema"
 
-const defect = Schema.Defect()
-const optionalDefect = Schema.optionalKey(defect)
-const nonNegative = Schema.isGreaterThanOrEqualTo(0)
-const nonNegativeInt = Schema.Int.check(nonNegative)
+const optionalDefect = Schema.optionalKey(Schema.Defect())
+const nonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 const optionalNonNegativeInt = Schema.optionalKey(nonNegativeInt)
-const positive = Schema.isGreaterThan(0)
-const positiveInt = Schema.Int.check(positive)
+const positiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 
 export class CanonicalEncodeError extends Schema.TaggedErrorClass<CanonicalEncodeError>(
   "@lucas-barake/effect-local/CanonicalEncodeError"

@@ -20,18 +20,15 @@ export const make = Effect.gen(function*() {
 
   return {
     recordBootstrapInstall: Metric.update(bootstrapInstall, 1),
-    initializePending: (count: number) =>
-      Effect.gen(function*() {
-        const delta = count - pendingContribution
-        pendingContribution = count
-        yield* Metric.update(pendingMutationCount, delta)
-      }),
-    updatePending: (delta: number) => {
-      if (delta === 0) return Effect.void
-      return Effect.gen(function*() {
-        pendingContribution += delta
-        yield* Metric.update(pendingMutationCount, delta)
-      })
-    }
+    initializePending: Effect.fnUntraced(function*(count: number) {
+      const delta = count - pendingContribution
+      pendingContribution = count
+      yield* Metric.update(pendingMutationCount, delta)
+    }),
+    updatePending: Effect.fnUntraced(function*(delta: number) {
+      if (delta === 0) return
+      pendingContribution += delta
+      yield* Metric.update(pendingMutationCount, delta)
+    })
   }
 })

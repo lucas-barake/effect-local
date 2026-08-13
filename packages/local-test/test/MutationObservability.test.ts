@@ -15,7 +15,6 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
-import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
@@ -53,15 +52,11 @@ const RejectTodo = Mutation.make("RejectTodo", {
 })
 
 const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo, RejectTodo] })
-const clientHandlers = PutTodo.toLayer(({ payload, transaction }) =>
-  transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
-).pipe(
-  (putTodo) =>
-    RejectTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload)).pipe(
-      (rejectTodo) => Layer.mergeAll(putTodo, rejectTodo)
-    )
+const ClientHandlers = Layer.mergeAll(
+  PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
+  RejectTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload))
 )
-const serverHandlers = PutTodo.toLayer(({ payload, transaction }) =>
+const ServerHandlers = PutTodo.toLayer(({ payload, transaction }) =>
   transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
 ).pipe(
   (putTodo) =>
@@ -73,7 +68,7 @@ const serverHandlers = PutTodo.toLayer(({ payload, transaction }) =>
       (rejectTodo) => Layer.mergeAll(putTodo, rejectTodo)
     )
 )
-const runtime = MutationRuntime.layer(definition).pipe(Layer.provide(serverHandlers))
+const Runtime = MutationRuntime.layer(definition).pipe(Layer.provide(ServerHandlers))
 
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } as const
 const clientHistory = {
@@ -108,8 +103,11 @@ const serverHistory = {
 }
 
 const database = () =>
-  SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
-    (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
+  Layer.mergeAll(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer,
+    Reactivity.layer,
+    QueryReactivity.Layer
   )
 
 const service = <I, S, E extends { readonly _tag: string }, R,>(
@@ -118,31 +116,35 @@ const service = <I, S, E extends { readonly _tag: string }, R,>(
 ) => Layer.build(layer).pipe(Effect.map(Context.get(tag)))
 
 const makeServices = Effect.gen(function*() {
-  const serverLayer = ServerStore.layerTrusted({ ...serverHistory, definition })
-  const server = yield* serverLayer.pipe(
-    Layer.provide(runtime),
-    Layer.provide(database()),
-    (layer) => service(ServerStore.ServerStore, layer)
+  const server = yield* service(
+    ServerStore.ServerStore,
+    ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
+      Layer.provide(Runtime),
+      Layer.provide(database())
+    )
   )
-  const faults = yield* service(FaultInjection.FaultInjection, FaultInjection.layer)
-  const sync = yield* TestServer.layer.pipe(
-    Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
-    Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults)),
-    Layer.provide(NodeCrypto.layer),
-    (layer) => service(SyncEngine.SyncEngine, layer)
+  const faults = yield* service(FaultInjection.FaultInjection, FaultInjection.FaultInjectionLayer)
+  const sync = yield* service(
+    SyncEngine.SyncEngine,
+    TestServer.TestServerLayer.pipe(
+      Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
+      Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults)),
+      Layer.provide(NodeCrypto.layer)
+    )
   )
-  const replicaLayer = TestReplica.layer({
-    ...clientHistory,
-    definition,
-    clientId,
-    initialSpaces: [spaceId],
-    retryDelay: "1 millis"
-  })
-  const replica = yield* replicaLayer.pipe(
-    Layer.provide(clientHandlers),
-    Layer.provide(database()),
-    Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync)),
-    (layer) => service(Replica.Replica, layer)
+  const replica = yield* service(
+    Replica.Replica,
+    TestReplica.layer({
+      ...clientHistory,
+      definition,
+      clientId,
+      initialSpaces: [spaceId],
+      retryDelay: "1 millis"
+    }).pipe(
+      Layer.provide(ClientHandlers),
+      Layer.provide(database()),
+      Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
+    )
   )
   return { faults, replica }
 })
@@ -154,11 +156,12 @@ const subscribe = <A, E,>(stream: Stream.Stream<A, E>) =>
   )
 
 describe("mutation observability", () => {
-  it.effect("decodes a server rejection through the originating mutation schema", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "decodes a server rejection through the originating mutation schema",
+    Effect.fnUntraced(function*() {
       const { replica } = yield* makeServices
       const space = yield* replica.space(spaceId)
-      const settlementFiber = yield* space.settlementsFor(RejectTodo).pipe(subscribe)
+      const settlementFiber = yield* subscribe(space.settlementsFor(RejectTodo))
 
       const pending = yield* space.mutate(RejectTodo, { id: "typed", title: "optimistic" })
       const settlement = Option.getOrThrow(yield* Fiber.join(settlementFiber))
@@ -176,14 +179,16 @@ describe("mutation observability", () => {
         assert.strictEqual(durable.rejection._tag, "RejectTodoError")
         assert.strictEqual(durable.rejection.code, 409)
       }
-    }))
+    })
+  )
 
-  it.effect("emits one settlement when the same receipt is persisted twice across reconnect", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "emits one settlement when the same receipt is persisted twice across reconnect",
+    Effect.fnUntraced(function*() {
       const { faults, replica } = yield* makeServices
       const space = yield* replica.space(spaceId)
-      const firstCollector = yield* space.settlementsFor(PutTodo).pipe(Stream.toQueue({ capacity: "unbounded" }))
-      const secondCollector = yield* space.settlementsFor(PutTodo).pipe(Stream.toQueue({ capacity: "unbounded" }))
+      const firstCollector = yield* Stream.toQueue(space.settlementsFor(PutTodo), { capacity: "unbounded" })
+      const secondCollector = yield* Stream.toQueue(space.settlementsFor(PutTodo), { capacity: "unbounded" })
       yield* faults.withholdPullEvidence(spaceId)
       yield* faults.dropNextReceipt(spaceId)
 
@@ -210,31 +215,32 @@ describe("mutation observability", () => {
       yield* faults.releasePullEvidence(spaceId)
       yield* faults.awaitPullCompletedAfterReceipt(spaceId)
 
-      const collectThroughBarrier = (collector: typeof firstCollector) =>
-        Effect.gen(function*() {
-          const settlements: Array<Replica.MutationSettlement<typeof PutTodo>> = []
-          while (true) {
-            const settlement = yield* Queue.take(collector)
-            settlements.push(settlement)
-            if (settlement.pending.envelope.mutationId === barrier.envelope.mutationId) return settlements
-          }
-        })
+      const collectThroughBarrier = Effect.fnUntraced(function*(collector: typeof firstCollector) {
+        const settlements: Array<Replica.MutationSettlement<typeof PutTodo>> = []
+        while (true) {
+          const settlement = yield* Queue.take(collector)
+          settlements.push(settlement)
+          if (settlement.pending.envelope.mutationId === barrier.envelope.mutationId) return settlements
+        }
+      })
       const received = yield* Effect.all([
         collectThroughBarrier(firstCollector),
         collectThroughBarrier(secondCollector)
       ], { concurrency: "unbounded" })
       for (const settlements of received) {
-        pipe(
+        assert.lengthOf(
           settlements.filter(
             (settlement) => settlement.pending.envelope.mutationId === pending.envelope.mutationId
           ),
-          (matching) => assert.lengthOf(matching, 1)
+          1
         )
       }
-    }))
+    })
+  )
 
-  it.effect("publishes rejection only after rollback and later pending replay", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "publishes rejection only after rollback and later pending replay",
+    Effect.fnUntraced(function*() {
       const { faults, replica } = yield* makeServices
       const space = yield* replica.space(spaceId)
       yield* faults.holdNextReceipt(spaceId)
@@ -258,7 +264,8 @@ describe("mutation observability", () => {
       yield* faults.releaseHeldReceipt(spaceId)
 
       const state = yield* Deferred.await(observed)
-      pipe(Option.isNone(state.rejected), (isNone) => assert.isTrue(isNone))
-      pipe(Option.getOrThrow(state.later), (later) => assert.deepStrictEqual(later, { id: "later", title: "replayed" }))
-    }))
+      assert.isTrue(Option.isNone(state.rejected))
+      assert.deepStrictEqual(Option.getOrThrow(state.later), { id: "later", title: "replayed" })
+    })
+  )
 })

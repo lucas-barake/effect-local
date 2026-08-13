@@ -16,92 +16,86 @@ export interface Options {
   readonly supportedProtocolVersions?: ReadonlyArray<number>
 }
 
-const makeLayerHandlers = (options?: Options) => {
-  return Effect.gen(function*() {
-    const configured = options?.supportedProtocolVersions ?? [Protocol.currentProtocolVersion]
-    const decoded = yield* Schema.decodeUnknownEffect(Protocol.NegotiateRequest)({
-      supportedVersions: configured
-    }).pipe(
-      Effect.mapError(() =>
-        new ReplicaError.InvalidConfiguration({
-          option: "supportedProtocolVersions",
-          message: "supportedProtocolVersions must be a nonempty list of positive safe integers"
-        })
-      )
+const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
+  const configured = options?.supportedProtocolVersions ?? [Protocol.currentProtocolVersion]
+  const decoded = yield* Schema.decodeUnknownEffect(Protocol.NegotiateRequest)({
+    supportedVersions: configured
+  }).pipe(
+    Effect.mapError(() =>
+      new ReplicaError.InvalidConfiguration({
+        option: "supportedProtocolVersions",
+        message: "supportedProtocolVersions must be a nonempty list of positive safe integers"
+      })
     )
-    const supportedVersions = [...decoded.supportedVersions].toSorted((left, right) => right - left)
-    const requireVersion = (version: Protocol.ProtocolVersion) => {
-      if (supportedVersions.includes(version)) return Effect.void
-      return Effect.fail(new ReplicaError.ProtocolVersionRejected({ version, serverVersions: supportedVersions }))
-    }
-    const client = yield* SpaceEntity.Client
-    const issuer = yield* PrincipalAssertion.Issuer
-    const issueAssertion = Authentication.Principal.pipe(Effect.flatMap(issuer.issue))
-    return SyncRpc.Rpcs.of({
-      Negotiate: ({ supportedVersions: clientVersions }) => {
-        const version = supportedVersions.find((candidate) => clientVersions.includes(candidate))
-        if (version !== undefined) return Effect.succeed({ version })
-        return Effect.fail(new ReplicaError.UpgradeRequired({ clientVersions, serverVersions: supportedVersions }))
-      },
-      Submit: (request) =>
-        requireVersion(request.protocolVersion).pipe(
-          Effect.andThen(issueAssertion),
-          Effect.flatMap((assertion) => client.submit(request.envelope.spaceId, request, assertion))
-        ),
-      Discard: (request) =>
-        requireVersion(request.protocolVersion).pipe(
-          Effect.andThen(issueAssertion),
-          Effect.flatMap((assertion) => client.discard(request.envelope.spaceId, request, assertion))
-        ),
-      Pull: (request) =>
-        requireVersion(request.protocolVersion).pipe(
-          Effect.andThen(issueAssertion),
-          Effect.flatMap((assertion) => client.pull(request.spaceId, request, assertion))
-        ),
-      Bootstrap: (request) =>
-        requireVersion(request.protocolVersion).pipe(
-          Effect.andThen(issueAssertion),
-          Effect.flatMap((assertion) => client.bootstrap(request.spaceId, request, assertion))
-        ),
-      Watch: (request) =>
-        requireVersion(request.protocolVersion).pipe(
-          Stream.fromEffect,
-          Stream.flatMap(() =>
-            Stream.unwrap(
-              issueAssertion.pipe(
-                Effect.map((assertion) => client.watch(request.spaceId, request, assertion))
-              )
-            )
-          )
-        ),
-      PublishPresence: (update) => {
-        const { protocolVersion, ...presence } = update
-        return requireVersion(protocolVersion).pipe(
-          Effect.andThen(issueAssertion),
-          Effect.flatMap((assertion) => client.publishPresence(update.spaceId, presence, assertion)),
-          Effect.as(null)
+  )
+  const supportedVersions = [...decoded.supportedVersions].toSorted((left, right) => right - left)
+  const requireVersion = (version: Protocol.ProtocolVersion) => {
+    if (supportedVersions.includes(version)) return Effect.void
+    return Effect.fail(new ReplicaError.ProtocolVersionRejected({ version, serverVersions: supportedVersions }))
+  }
+  const client = yield* SpaceEntity.Client
+  const issuer = yield* PrincipalAssertion.Issuer
+  const issueAssertion = Authentication.Principal.pipe(Effect.flatMap(issuer.issue))
+  return SyncRpc.Rpcs.of({
+    Negotiate: ({ supportedVersions: clientVersions }) => {
+      const version = supportedVersions.find((candidate) => clientVersions.includes(candidate))
+      if (version !== undefined) return Effect.succeed({ version })
+      return Effect.fail(new ReplicaError.UpgradeRequired({ clientVersions, serverVersions: supportedVersions }))
+    },
+    Submit: (request) =>
+      requireVersion(request.protocolVersion).pipe(
+        Effect.andThen(issueAssertion),
+        Effect.flatMap((assertion) => client.submit(request.envelope.spaceId, request, assertion))
+      ),
+    Discard: (request) =>
+      requireVersion(request.protocolVersion).pipe(
+        Effect.andThen(issueAssertion),
+        Effect.flatMap((assertion) => client.discard(request.envelope.spaceId, request, assertion))
+      ),
+    Pull: (request) =>
+      requireVersion(request.protocolVersion).pipe(
+        Effect.andThen(issueAssertion),
+        Effect.flatMap((assertion) => client.pull(request.spaceId, request, assertion))
+      ),
+    Bootstrap: (request) =>
+      requireVersion(request.protocolVersion).pipe(
+        Effect.andThen(issueAssertion),
+        Effect.flatMap((assertion) => client.bootstrap(request.spaceId, request, assertion))
+      ),
+    Watch: (request) =>
+      Stream.fromEffect(requireVersion(request.protocolVersion)).pipe(
+        Stream.flatMap(() =>
+          Stream.unwrap(issueAssertion.pipe(
+            Effect.map((assertion) => client.watch(request.spaceId, request, assertion))
+          ))
         )
-      },
-      WatchPresence: ({ spaceId, protocolVersion }) =>
-        requireVersion(protocolVersion).pipe(
-          Stream.fromEffect,
-          Stream.flatMap(() =>
-            Stream.unwrap(
-              issueAssertion.pipe(
-                Effect.map((assertion) => client.watchPresence(spaceId, assertion))
-              )
-            )
-          )
+      ),
+    PublishPresence: (update) => {
+      const { protocolVersion, ...presence } = update
+      return requireVersion(protocolVersion).pipe(
+        Effect.andThen(issueAssertion),
+        Effect.flatMap((assertion) => client.publishPresence(update.spaceId, presence, assertion)),
+        Effect.as(null)
+      )
+    },
+    WatchPresence: ({ spaceId, protocolVersion }) =>
+      Stream.fromEffect(requireVersion(protocolVersion)).pipe(
+        Stream.flatMap(() =>
+          Stream.unwrap(issueAssertion.pipe(
+            Effect.map((assertion) => client.watchPresence(spaceId, assertion))
+          ))
         )
-    })
-  }).pipe((handlers) => SyncRpc.Rpcs.toLayer(handlers))
-}
+      )
+  })
+})
 
-export const layerHandlers = makeLayerHandlers()
+const makeLayerHandlers = (options?: Options) => SyncRpc.Rpcs.toLayer(makeHandlers(options))
+
+export const LayerHandlers = makeLayerHandlers()
 export const layerHandlersWithOptions = (options: Options) => makeLayerHandlers(options)
 
-export const layer = RpcServer.layer(SyncRpc.Rpcs, { disableFatalDefects: true }).pipe(
-  Layer.provide(layerHandlers)
+export const Default = RpcServer.layer(SyncRpc.Rpcs, { disableFatalDefects: true }).pipe(
+  Layer.provide(LayerHandlers)
 )
 
 export const layerWithOptions = (options: Options) =>

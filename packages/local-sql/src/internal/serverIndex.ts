@@ -7,7 +7,6 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as SchemaDescriptor from "@lucas-barake/effect-local/SchemaDescriptor"
 import type * as SecondaryIndex from "@lucas-barake/effect-local/SecondaryIndex"
 import * as Effect from "effect/Effect"
-import { pipe } from "effect/Function"
 import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
@@ -62,9 +61,7 @@ export interface Runtime {
 const EntityKeyRow = Schema.Struct({ entity_key: Schema.String })
 
 const StateRow = Schema.Struct({ built: Schema.Literals([0, 1]) })
-
-const descriptorHashPattern = Schema.isPattern(/^[0-9a-f]{16}$/)
-const DescriptorHash = Schema.String.check(descriptorHashPattern)
+const DescriptorHash = Schema.String.check(Schema.isPattern(/^[0-9a-f]{16}$/))
 
 const BuiltDescriptorRow = Schema.Struct({ descriptor_hash: DescriptorHash })
 
@@ -80,9 +77,7 @@ const BackfillRow = Schema.Struct({
   entity_key: Schema.String,
   value_json: Schema.String
 })
-
-const PartitionValue = Schema.Union([Schema.String, Schema.Number])
-const PartitionValues = Schema.Array(PartitionValue)
+const PartitionValues = Schema.Array(Schema.Union([Schema.String, Schema.Number]))
 
 const backfillPageSize = 500
 
@@ -159,18 +154,17 @@ const indexRow = (
   return row
 }
 
-export const make = (
-  sql: SqlClient.SqlClient,
-  definition: Definition.Any
-): Effect.Effect<Runtime, ReplicaError.ReplicaError> =>
-  Effect.gen(function*() {
+export const make = Effect.fn("ServerIndex.make")(
+  function*(
+    sql: SqlClient.SqlClient,
+    definition: Definition.Any
+  ) {
     const all = definition.models.flatMap((model) =>
       Object.entries(model.indexes).map(([indexName, index]) => makeDescriptor(model, indexName, index))
     )
     const byModel = new Map<string, ReadonlyArray<Descriptor>>()
     for (const model of definition.models) {
-      const descriptors = all.filter((descriptor) => descriptor.model === model)
-      byModel.set(model.name, descriptors)
+      byModel.set(model.name, all.filter((descriptor) => descriptor.model === model))
     }
     const byLabel = new Map(
       all.map((descriptor) => [Canonical.stringify([descriptor.model.name, descriptor.indexName]), descriptor])
@@ -191,8 +185,10 @@ export const make = (
         sql`SELECT model, index_name, descriptor_hash, table_name, scan_index_name
         FROM effect_local_server_index_catalog`
     })(undefined).pipe(
-      Effect.catchTag("SchemaError", (cause) =>
-        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause })))
+      Effect.catchTag(
+        "SchemaError",
+        (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
+      )
     )
     const byHash = new Map(all.map((descriptor) => [descriptor.hash, descriptor]))
     for (const row of catalog) {
@@ -251,8 +247,7 @@ export const make = (
         return sql`${column} = excluded.${column}`
       })
       const assignments = sql.join(", ", false)(assignmentClauses)
-      const batchSize = pipe(Math.floor(900 / (columns.length + 3)), (size) =>
-        Math.max(1, size))
+      const batchSize = Math.max(1, Math.floor(900 / (columns.length + 3)))
       const batches = Array.from(
         { length: Math.ceil(rows.length / batchSize) },
         (_, position) => rows.slice(position * batchSize, (position + 1) * batchSize)
@@ -272,125 +267,119 @@ export const make = (
     const decodeValue = (model: Model.Any, valueJson: string) =>
       Codec.parse(valueJson).pipe(Effect.flatMap((parsed) => Codec.decode(model.schema, parsed)))
 
-    const backfill = (
+    const backfill = Effect.fnUntraced(function*(
       spaceId: Identity.SpaceId,
       schemaGeneration: number,
       descriptor: Descriptor
-    ) =>
-      Effect.gen(function*() {
-        const table = sql(descriptor.tableName)
-        yield* sql`DELETE FROM ${table} WHERE space_id = ${spaceId} AND schema_generation <> ${schemaGeneration}`
-        yield* sql`DELETE FROM ${table} WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}`
-        let after = ""
-        while (true) {
-          const rows = yield* SqlSchema.findAll({
-            Request: Schema.Struct({ spaceId: Schema.String, after: Schema.String, limit: Schema.Int }),
-            Result: BackfillRow,
-            execute: ({ after: cursor, limit, spaceId: requestedSpaceId }) =>
-              sql`SELECT entity_key, value_json FROM effect_local_server_entities
+    ) {
+      const table = sql(descriptor.tableName)
+      yield* sql`DELETE FROM ${table} WHERE space_id = ${spaceId} AND schema_generation <> ${schemaGeneration}`
+      yield* sql`DELETE FROM ${table} WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}`
+      let after = ""
+      while (true) {
+        const rows = yield* SqlSchema.findAll({
+          Request: Schema.Struct({ spaceId: Schema.String, after: Schema.String, limit: Schema.Int }),
+          Result: BackfillRow,
+          execute: ({ after: cursor, limit, spaceId: requestedSpaceId }) =>
+            sql`SELECT entity_key, value_json FROM effect_local_server_entities
               WHERE space_id = ${requestedSpaceId} AND model = ${descriptor.model.name}
                 AND entity_key > ${cursor}
               ORDER BY entity_key LIMIT ${limit}`
-          })({ spaceId, after, limit: backfillPageSize }).pipe(
-            Effect.catchTag(
-              "SchemaError",
-              (cause) =>
-                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity row is invalid", cause }))
-            )
+        })({ spaceId, after, limit: backfillPageSize }).pipe(
+          Effect.catchTag(
+            "SchemaError",
+            (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity row is invalid", cause }))
           )
-          if (rows.length === 0) break
-          const encoded: Array<Record<string, unknown>> = []
-          for (const row of rows) {
-            const value = yield* decodeValue(descriptor.model, row.value_json)
-            const values = yield* encodedComponents(descriptor.index, value)
-            const encodedRow = indexRow(descriptor, spaceId, schemaGeneration, row.entity_key, values)
-            encoded.push(encodedRow)
-          }
-          yield* writeRows(descriptor, encoded)
-          after = rows[rows.length - 1].entity_key
-          if (rows.length < backfillPageSize) break
+        )
+        if (rows.length === 0) break
+        const encoded: Array<Record<string, unknown>> = []
+        for (const row of rows) {
+          const value = yield* decodeValue(descriptor.model, row.value_json)
+          const values = yield* encodedComponents(descriptor.index, value)
+          encoded.push(indexRow(descriptor, spaceId, schemaGeneration, row.entity_key, values))
         }
-        yield* sql`DELETE FROM effect_local_server_index_state
+        yield* writeRows(descriptor, encoded)
+        after = rows[rows.length - 1].entity_key
+        if (rows.length < backfillPageSize) break
+      }
+      yield* sql`DELETE FROM effect_local_server_index_state
           WHERE space_id = ${spaceId} AND descriptor_hash = ${descriptor.hash}
             AND schema_generation <> ${schemaGeneration}`
-        yield* sql`INSERT INTO effect_local_server_index_state
+      yield* sql`INSERT INTO effect_local_server_index_state
           (space_id, schema_generation, descriptor_hash, built)
           VALUES (${spaceId}, ${schemaGeneration}, ${descriptor.hash}, 1)
           ON CONFLICT (space_id, schema_generation, descriptor_hash) DO UPDATE SET built = 1`
-      })
+    })
 
-    const ensureBuilt = (
+    const ensureBuilt = Effect.fnUntraced(function*(
       spaceId: Identity.SpaceId,
       schemaGeneration: number,
       descriptor: Descriptor
-    ) =>
-      Effect.gen(function*() {
-        const state = yield* findState({ spaceId, schemaGeneration, descriptorHash: descriptor.hash }).pipe(
-          Effect.catchTag(
-            "SchemaError",
-            (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index state is invalid", cause }))
-          )
+    ) {
+      const state = yield* findState({ spaceId, schemaGeneration, descriptorHash: descriptor.hash }).pipe(
+        Effect.catchTag(
+          "SchemaError",
+          (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index state is invalid", cause }))
         )
-        if (state._tag === "Some" && state.value.built === 1) return
-        yield* backfill(spaceId, schemaGeneration, descriptor)
-      })
+      )
+      if (state._tag === "Some" && state.value.built === 1) return
+      yield* backfill(spaceId, schemaGeneration, descriptor)
+    })
 
-    const readPartitions = (
+    const readPartitions = Effect.fnUntraced(function*(
       descriptor: Descriptor,
       spaceId: Identity.SpaceId,
       schemaGeneration: number,
       entityKeys: ReadonlyArray<string>
-    ) =>
-      Effect.gen(function*() {
-        const found = new Map<string, ReadonlyArray<SqlValue>>()
-        const partitions = partitionColumns(descriptor)
-        for (let offset = 0; offset < entityKeys.length; offset += 100) {
-          const batch = entityKeys.slice(offset, offset + 100)
-          if (partitions.length === 0) {
-            const rows = yield* SqlSchema.findAll({
-              Request: Schema.Void,
-              Result: EntityKeyRow,
-              execute: () =>
-                sql`SELECT entity_key FROM ${sql(descriptor.tableName)}
-                WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
-                  AND entity_key IN ${sql.in(batch)}`
-            })(undefined).pipe(
-              Effect.catchTag(
-                "SchemaError",
-                (cause) =>
-                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index row is invalid", cause }))
-              )
-            )
-            for (const row of rows) found.set(row.entity_key, [])
-            continue
-          }
-          const partitionIdentifiers = partitions.map((name) => sql.literal(name))
-          const valuesJson = sql.csv(partitionIdentifiers)
+    ) {
+      const found = new Map<string, ReadonlyArray<SqlValue>>()
+      const partitions = partitionColumns(descriptor)
+      for (let offset = 0; offset < entityKeys.length; offset += 100) {
+        const batch = entityKeys.slice(offset, offset + 100)
+        if (partitions.length === 0) {
           const rows = yield* SqlSchema.findAll({
             Request: Schema.Void,
-            Result: Schema.Struct({ entity_key: Schema.String, values_json: Schema.String }),
+            Result: EntityKeyRow,
             execute: () =>
-              sql`SELECT entity_key, json_array(${valuesJson}) AS values_json
-              FROM ${sql(descriptor.tableName)}
-              WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
-                AND entity_key IN ${sql.in(batch)}`
+              sql`SELECT entity_key FROM ${sql(descriptor.tableName)}
+                WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
+                  AND entity_key IN ${sql.in(batch)}`
           })(undefined).pipe(
             Effect.catchTag(
               "SchemaError",
               (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index row is invalid", cause }))
             )
           )
-          for (const row of rows) {
-            found.set(
-              row.entity_key,
-              yield* Codec.parse(row.values_json).pipe(
-                Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed))
-              )
-            )
-          }
+          for (const row of rows) found.set(row.entity_key, [])
+          continue
         }
-        return found
-      })
+        const partitionIdentifiers = partitions.map((name) => sql.literal(name))
+        const valuesJson = sql.csv(partitionIdentifiers)
+        const rows = yield* SqlSchema.findAll({
+          Request: Schema.Void,
+          Result: Schema.Struct({ entity_key: Schema.String, values_json: Schema.String }),
+          execute: () =>
+            sql`SELECT entity_key, json_array(${valuesJson}) AS values_json
+              FROM ${sql(descriptor.tableName)}
+              WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
+                AND entity_key IN ${sql.in(batch)}`
+        })(undefined).pipe(
+          Effect.catchTag(
+            "SchemaError",
+            (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index row is invalid", cause }))
+          )
+        )
+        for (const row of rows) {
+          found.set(
+            row.entity_key,
+            yield* Codec.parse(row.values_json).pipe(
+              Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed))
+            )
+          )
+        }
+      }
+      return found
+    })
 
     const writePartitionLogs = (rows: ReadonlyArray<Record<string, unknown>>) => {
       if (rows.length === 0) return Effect.void
@@ -409,83 +398,84 @@ export const make = (
       )
     }
 
-    const apply: Runtime["apply"] = (spaceId, schemaGeneration, serverSequence, changes) =>
-      Effect.gen(function*() {
-        const states = yield* findBuiltDescriptors({ spaceId, schemaGeneration }).pipe(
-          Effect.catchTag(
-            "SchemaError",
-            (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index state is invalid", cause }))
-          )
+    const apply: Runtime["apply"] = Effect.fnUntraced(function*(
+      spaceId,
+      schemaGeneration,
+      serverSequence,
+      changes
+    ) {
+      const states = yield* findBuiltDescriptors({ spaceId, schemaGeneration }).pipe(
+        Effect.catchTag(
+          "SchemaError",
+          (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index state is invalid", cause }))
         )
-        const built = new Set(states.map((row) => row.descriptor_hash))
-        for (const [modelName, descriptors] of byModel) {
-          const active = descriptors.filter((descriptor) => built.has(descriptor.hash))
-          if (active.length === 0) continue
-          const modelChanges = changes.filter((change) => change.entity.model === modelName)
-          if (modelChanges.length === 0) continue
-          const prepared: Array<{
-            readonly change: Protocol.EntityChange
-            readonly entityKey: string
-            readonly value: unknown
-          }> = []
-          const model = definition.modelByName.get(modelName)
-          if (model === undefined) continue
-          for (const change of modelChanges) {
-            let value: unknown
-            if (change._tag === "Upsert") {
-              value = yield* Codec.decode(model.schema, change.value)
-            }
-            prepared.push({
-              change,
-              entityKey: yield* Codec.stringify(change.entity.key),
-              value
+      )
+      const built = new Set(states.map((row) => row.descriptor_hash))
+      for (const [modelName, descriptors] of byModel) {
+        const active = descriptors.filter((descriptor) => built.has(descriptor.hash))
+        if (active.length === 0) continue
+        const modelChanges = changes.filter((change) => change.entity.model === modelName)
+        if (modelChanges.length === 0) continue
+        const prepared: Array<{
+          readonly change: Protocol.EntityChange
+          readonly entityKey: string
+          readonly value: unknown
+        }> = []
+        const model = definition.modelByName.get(modelName)
+        if (model === undefined) continue
+        for (const change of modelChanges) {
+          let value: unknown
+          if (change._tag === "Upsert") {
+            value = yield* Codec.decode(model.schema, change.value)
+          }
+          prepared.push({
+            change,
+            entityKey: yield* Codec.stringify(change.entity.key),
+            value
+          })
+        }
+        for (const descriptor of active) {
+          const previousByKey = yield* readPartitions(
+            descriptor,
+            spaceId,
+            schemaGeneration,
+            prepared.map((item) => item.entityKey)
+          )
+          const logs: Array<Record<string, unknown>> = []
+          const rows: Array<Record<string, unknown>> = []
+          const deleted: Array<string> = []
+          const log = (values: ReadonlyArray<SqlValue>) => {
+            logs.push({
+              space_id: spaceId,
+              schema_generation: schemaGeneration,
+              server_sequence: serverSequence,
+              descriptor_hash: descriptor.hash,
+              partition_json: Canonical.stringify(values)
             })
           }
-          for (const descriptor of active) {
-            const entityKeys = prepared.map((item) => item.entityKey)
-            const previousByKey = yield* readPartitions(
-              descriptor,
-              spaceId,
-              schemaGeneration,
-              entityKeys
-            )
-            const logs: Array<Record<string, unknown>> = []
-            const rows: Array<Record<string, unknown>> = []
-            const deleted: Array<string> = []
-            const log = (values: ReadonlyArray<SqlValue>) => {
-              logs.push({
-                space_id: spaceId,
-                schema_generation: schemaGeneration,
-                server_sequence: serverSequence,
-                descriptor_hash: descriptor.hash,
-                partition_json: Canonical.stringify(values)
-              })
+          for (const item of prepared) {
+            const previous = previousByKey.get(item.entityKey)
+            if (item.change._tag === "Delete") {
+              if (previous !== undefined) log(previous)
+              deleted.push(item.entityKey)
+              continue
             }
-            for (const item of prepared) {
-              const previous = previousByKey.get(item.entityKey)
-              if (item.change._tag === "Delete") {
-                if (previous !== undefined) log(previous)
-                deleted.push(item.entityKey)
-                continue
-              }
-              const values = yield* encodedComponents(descriptor.index, item.value)
-              const next = values.slice(0, descriptor.index.partition.length)
-              if (previous !== undefined && Canonical.stringify(previous) !== Canonical.stringify(next)) log(previous)
-              log(next)
-              const row = indexRow(descriptor, spaceId, schemaGeneration, item.entityKey, values)
-              rows.push(row)
-            }
-            for (let offset = 0; offset < deleted.length; offset += 100) {
-              const batch = deleted.slice(offset, offset + 100)
-              yield* sql`DELETE FROM ${sql(descriptor.tableName)}
-                WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
-                  AND entity_key IN ${sql.in(batch)}`
-            }
-            yield* writePartitionLogs(logs)
-            yield* writeRows(descriptor, rows)
+            const values = yield* encodedComponents(descriptor.index, item.value)
+            const next = values.slice(0, descriptor.index.partition.length)
+            if (previous !== undefined && Canonical.stringify(previous) !== Canonical.stringify(next)) log(previous)
+            log(next)
+            rows.push(indexRow(descriptor, spaceId, schemaGeneration, item.entityKey, values))
           }
+          for (let offset = 0; offset < deleted.length; offset += 100) {
+            yield* sql`DELETE FROM ${sql(descriptor.tableName)}
+                WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
+                  AND entity_key IN ${sql.in(deleted.slice(offset, offset + 100))}`
+          }
+          yield* writePartitionLogs(logs)
+          yield* writeRows(descriptor, rows)
         }
-      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      }
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
     const encodedPartitionKey = (
       descriptor: Descriptor,
@@ -509,123 +499,118 @@ export const make = (
       return sql.and(clauses)
     }
 
-    const boundsClauses = (
+    const boundsClauses = Effect.fnUntraced(function*(
       descriptor: Descriptor,
       bounds: Protocol.ReplicationWindowBounds
-    ) =>
-      Effect.gen(function*() {
-        const leading = descriptor.index.sort[0]
-        const column = sql(sortColumns(descriptor)[0])
-        const clauses: Array<Statement.Fragment> = []
-        if (bounds.gt !== undefined) clauses.push(sql`${column} > ${yield* encodedPrimitive(leading, bounds.gt)}`)
-        if (bounds.gte !== undefined) clauses.push(sql`${column} >= ${yield* encodedPrimitive(leading, bounds.gte)}`)
-        if (bounds.lt !== undefined) clauses.push(sql`${column} < ${yield* encodedPrimitive(leading, bounds.lt)}`)
-        if (bounds.lte !== undefined) clauses.push(sql`${column} <= ${yield* encodedPrimitive(leading, bounds.lte)}`)
-        return clauses
-      })
+    ) {
+      const leading = descriptor.index.sort[0]
+      const column = sql(sortColumns(descriptor)[0])
+      const clauses: Array<Statement.Fragment> = []
+      if (bounds.gt !== undefined) clauses.push(sql`${column} > ${yield* encodedPrimitive(leading, bounds.gt)}`)
+      if (bounds.gte !== undefined) clauses.push(sql`${column} >= ${yield* encodedPrimitive(leading, bounds.gte)}`)
+      if (bounds.lt !== undefined) clauses.push(sql`${column} < ${yield* encodedPrimitive(leading, bounds.lt)}`)
+      if (bounds.lte !== undefined) clauses.push(sql`${column} <= ${yield* encodedPrimitive(leading, bounds.lte)}`)
+      return clauses
+    })
 
-    const membership: Runtime["membership"] = (spaceId, schemaGeneration, window) =>
-      Effect.gen(function*() {
-        const label = Canonical.stringify([window.model, window.index])
-        const descriptor = byLabel.get(label)
-        if (descriptor === undefined) {
-          return yield* new ReplicaError.ProtocolInvalid({
-            message: `Unknown replication window index: ${window.model}/${window.index}`
-          })
-        }
-        yield* ensureBuilt(spaceId, schemaGeneration, descriptor)
-        const table = sql(descriptor.tableName)
-        const partitions = partitionColumns(descriptor)
-        const sorts = sortColumns(descriptor)
-        const orderColumns = [...sorts, "entity_key"].map((name) => {
-          const column = sql(name)
-          return sql`${column} DESC`
+    const membership: Runtime["membership"] = Effect.fnUntraced(function*(spaceId, schemaGeneration, window) {
+      const descriptor = byLabel.get(Canonical.stringify([window.model, window.index]))
+      if (descriptor === undefined) {
+        return yield* new ReplicaError.ProtocolInvalid({
+          message: `Unknown replication window index: ${window.model}/${window.index}`
         })
-        const orderTuple = sql.join(", ", false)(
-          orderColumns
-        )
-        const selected = new Set<string>()
-        const overrides = window.partitions ?? []
-        const overrideValues: Array<ReadonlyArray<SqlValue>> = []
-        for (const override of overrides) {
-          overrideValues.push(yield* encodedPartitionKey(descriptor, override.key))
-        }
-        const collect = (statement: Statement.Statement<any>) =>
-          SqlSchema.findAll({
-            Request: Schema.Void,
-            Result: EntityKeyRow,
-            execute: () => statement
-          })(undefined).pipe(
-            Effect.catchTag(
-              "SchemaError",
-              (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index row is invalid", cause }))
-            ),
-            Effect.map((rows) => {
-              for (const row of rows) selected.add(row.entity_key)
-            })
-          )
-        let exclusion = sql`1 = 1`
-        if (overrideValues.length > 0) {
-          const overrideClauses = partitions.map((name, position) => {
-            const column = sql(name)
-            return sql`${column} = json_extract(override.value, ${`$[${position}]`})`
+      }
+      yield* ensureBuilt(spaceId, schemaGeneration, descriptor)
+      const table = sql(descriptor.tableName)
+      const partitions = partitionColumns(descriptor)
+      const sorts = sortColumns(descriptor)
+      const orderColumns = [...sorts, "entity_key"].map((name) => {
+        const column = sql(name)
+        return sql`${column} DESC`
+      })
+      const orderTuple = sql.join(", ", false)(
+        orderColumns
+      )
+      const selected = new Set<string>()
+      const overrides = window.partitions ?? []
+      const overrideValues: Array<ReadonlyArray<SqlValue>> = []
+      for (const override of overrides) {
+        overrideValues.push(yield* encodedPartitionKey(descriptor, override.key))
+      }
+      const collect = (statement: Statement.Statement<any>) =>
+        SqlSchema.findAll({
+          Request: Schema.Void,
+          Result: EntityKeyRow,
+          execute: () => statement
+        })(undefined).pipe(
+          Effect.catchTag(
+            "SchemaError",
+            (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index row is invalid", cause }))
+          ),
+          Effect.map((rows) => {
+            for (const row of rows) selected.add(row.entity_key)
           })
-          const overrideMatch = sql.and(overrideClauses)
-          exclusion = sql`NOT EXISTS (
+        )
+      let exclusion = sql`1 = 1`
+      if (overrideValues.length > 0) {
+        const overrideClauses = partitions.map((name, position) => {
+          const column = sql(name)
+          return sql`${column} = json_extract(override.value, ${`$[${position}]`})`
+        })
+        const overrideMatch = sql.and(overrideClauses)
+        exclusion = sql`NOT EXISTS (
             SELECT 1 FROM json_each(${Canonical.stringify(overrideValues)}) AS override
             WHERE ${overrideMatch}
           )`
-        }
-        if (partitions.length === 0) {
-          if (overrideValues.length === 0) {
-            yield* collect(
-              sql`SELECT entity_key FROM ${table}
+      }
+      if (partitions.length === 0) {
+        if (overrideValues.length === 0) {
+          yield* collect(
+            sql`SELECT entity_key FROM ${table}
               WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
               ORDER BY ${orderTuple} LIMIT ${window.count}`
-            )
-          }
-        } else {
-          const partitionIdentifiers = partitions.map((name) => {
-            const column = sql(name)
-            return sql`${column}`
-          })
-          const partitionTuple = sql.join(", ", false)(partitionIdentifiers)
-          yield* collect(
-            sql`SELECT entity_key FROM (
+          )
+        }
+      } else {
+        const partitionIdentifiers = partitions.map((name) => {
+          const column = sql(name)
+          return sql`${column}`
+        })
+        const partitionTuple = sql.join(", ", false)(partitionIdentifiers)
+        yield* collect(
+          sql`SELECT entity_key FROM (
               SELECT entity_key, ${partitionTuple},
                 ROW_NUMBER() OVER (PARTITION BY ${partitionTuple} ORDER BY ${orderTuple}) AS window_rank
               FROM ${table}
               WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration} AND ${exclusion}
             ) WHERE window_rank <= ${window.count}`
-          )
-        }
-        for (let position = 0; position < overrides.length; position++) {
-          const override = overrides[position]
-          const matches = partitionMatches(descriptor, overrideValues[position])
-          const count = override.count ?? window.count
-          yield* collect(
-            sql`SELECT entity_key FROM ${table}
+        )
+      }
+      for (let position = 0; position < overrides.length; position++) {
+        const override = overrides[position]
+        const matches = partitionMatches(descriptor, overrideValues[position])
+        const count = override.count ?? window.count
+        yield* collect(
+          sql`SELECT entity_key FROM ${table}
             WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration} AND ${matches}
             ORDER BY ${orderTuple} LIMIT ${count}`
-          )
-          if (override.bounds !== undefined) {
-            const clauses = yield* boundsClauses(descriptor, override.bounds)
-            if (clauses.length > 0) {
-              const bounds = sql.and(clauses)
-              yield* collect(
-                sql`SELECT entity_key FROM ${table}
+        )
+        if (override.bounds !== undefined) {
+          const clauses = yield* boundsClauses(descriptor, override.bounds)
+          if (clauses.length > 0) {
+            yield* collect(
+              sql`SELECT entity_key FROM ${table}
                 WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration} AND ${matches}
-                  AND ${bounds}`
-              )
-            }
+                  AND ${sql.and(clauses)}`
+            )
           }
         }
-        return selected
-      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      }
+      return selected
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
     const resolveDescriptor = (window: Protocol.ReplicationWindow) => {
-      const label = Canonical.stringify([window.model, window.index])
-      const descriptor = byLabel.get(label)
+      const descriptor = byLabel.get(Canonical.stringify([window.model, window.index]))
       if (descriptor === undefined) {
         return Effect.fail(
           new ReplicaError.ProtocolInvalid({
@@ -636,158 +621,155 @@ export const make = (
       return Effect.succeed(descriptor)
     }
 
-    const overrideByPartition = (
+    const overrideByPartition = Effect.fnUntraced(function*(
       descriptor: Descriptor,
       window: Protocol.ReplicationWindow
-    ) =>
-      Effect.gen(function*() {
-        const overrides = new Map<string, Protocol.ReplicationWindowPartition>()
-        for (const override of window.partitions ?? []) {
-          const values = yield* encodedPartitionKey(descriptor, override.key)
-          const label = Canonical.stringify(values)
-          overrides.set(label, override)
-        }
-        return overrides
-      })
+    ) {
+      const overrides = new Map<string, Protocol.ReplicationWindowPartition>()
+      for (const override of window.partitions ?? []) {
+        const values = yield* encodedPartitionKey(descriptor, override.key)
+        overrides.set(Canonical.stringify(values), override)
+      }
+      return overrides
+    })
 
-    const partitionMembership: Runtime["partitionMembership"] = (
+    const partitionMembership: Runtime["partitionMembership"] = Effect.fnUntraced(function*(
       spaceId,
       schemaGeneration,
       window,
       partitions
-    ) =>
-      Effect.gen(function*() {
-        const descriptor = yield* resolveDescriptor(window)
-        yield* ensureBuilt(spaceId, schemaGeneration, descriptor)
-        const table = sql(descriptor.tableName)
-        const sorts = sortColumns(descriptor)
-        const orderColumns = [...sorts, "entity_key"].map((name) => {
-          const column = sql(name)
-          return sql`${column} DESC`
-        })
-        const orderTuple = sql.join(", ", false)(orderColumns)
-        const overrides = yield* overrideByPartition(descriptor, window)
-        const selected = new Set<string>()
-        const visited = new Set<string>()
-        const collect = (statement: Statement.Statement<any>) =>
-          SqlSchema.findAll({
-            Request: Schema.Void,
-            Result: EntityKeyRow,
-            execute: () => statement
-          })(undefined).pipe(
-            Effect.catchTag(
-              "SchemaError",
-              (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index row is invalid", cause }))
-            ),
-            Effect.map((rows) => {
-              for (const row of rows) selected.add(row.entity_key)
-            })
-          )
-        for (const partition of partitions) {
-          const label = Canonical.stringify(partition)
-          if (visited.has(label)) continue
-          visited.add(label)
-          const override = overrides.get(label)
-          const matches = partitionMatches(descriptor, partition)
-          const count = override?.count ?? window.count
-          yield* collect(
-            sql`SELECT entity_key FROM ${table}
+    ) {
+      const descriptor = yield* resolveDescriptor(window)
+      yield* ensureBuilt(spaceId, schemaGeneration, descriptor)
+      const table = sql(descriptor.tableName)
+      const sorts = sortColumns(descriptor)
+      const orderColumns = [...sorts, "entity_key"].map((name) => {
+        const column = sql(name)
+        return sql`${column} DESC`
+      })
+      const orderTuple = sql.join(", ", false)(orderColumns)
+      const overrides = yield* overrideByPartition(descriptor, window)
+      const selected = new Set<string>()
+      const visited = new Set<string>()
+      const collect = (statement: Statement.Statement<any>) =>
+        SqlSchema.findAll({
+          Request: Schema.Void,
+          Result: EntityKeyRow,
+          execute: () => statement
+        })(undefined).pipe(
+          Effect.catchTag(
+            "SchemaError",
+            (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index row is invalid", cause }))
+          ),
+          Effect.map((rows) => {
+            for (const row of rows) selected.add(row.entity_key)
+          })
+        )
+      for (const partition of partitions) {
+        const label = Canonical.stringify(partition)
+        if (visited.has(label)) continue
+        visited.add(label)
+        const override = overrides.get(label)
+        const matches = partitionMatches(descriptor, partition)
+        const count = override?.count ?? window.count
+        yield* collect(
+          sql`SELECT entity_key FROM ${table}
             WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration} AND ${matches}
             ORDER BY ${orderTuple} LIMIT ${count}`
-          )
-          if (override?.bounds !== undefined) {
-            const clauses = yield* boundsClauses(descriptor, override.bounds)
-            if (clauses.length > 0) {
-              const bounds = sql.and(clauses)
-              yield* collect(
-                sql`SELECT entity_key FROM ${table}
+        )
+        if (override?.bounds !== undefined) {
+          const clauses = yield* boundsClauses(descriptor, override.bounds)
+          if (clauses.length > 0) {
+            yield* collect(
+              sql`SELECT entity_key FROM ${table}
                 WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration} AND ${matches}
-                  AND ${bounds}`
-              )
-            }
+                  AND ${sql.and(clauses)}`
+            )
           }
         }
-        return selected
-      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      }
+      return selected
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
-    const partitionsOf: Runtime["partitionsOf"] = (spaceId, schemaGeneration, window, entityKeys) =>
-      Effect.gen(function*() {
-        const descriptor = yield* resolveDescriptor(window)
-        yield* ensureBuilt(spaceId, schemaGeneration, descriptor)
-        const table = sql(descriptor.tableName)
-        const partitions = partitionColumns(descriptor)
-        const found = new Map<string, ReadonlyArray<SqlValue>>()
-        if (partitions.length === 0) {
-          for (const entityKey of entityKeys) found.set(entityKey, [])
-          return found
-        }
-        const RowSchema = Schema.Struct({
-          entity_key: Schema.String,
-          values_json: Schema.String
-        })
-        for (let offset = 0; offset < entityKeys.length; offset += 100) {
-          const batch = entityKeys.slice(offset, offset + 100)
-          const partitionIdentifiers = partitions.map((name) => sql.literal(name))
-          const valuesJson = sql.csv(partitionIdentifiers)
-          const rows = yield* SqlSchema.findAll({
-            Request: Schema.Void,
-            Result: RowSchema,
-            execute: () =>
-              sql`SELECT entity_key, json_array(${valuesJson}) AS values_json FROM ${table}
+    const partitionsOf: Runtime["partitionsOf"] = Effect.fnUntraced(function*(
+      spaceId,
+      schemaGeneration,
+      window,
+      entityKeys
+    ) {
+      const descriptor = yield* resolveDescriptor(window)
+      yield* ensureBuilt(spaceId, schemaGeneration, descriptor)
+      const table = sql(descriptor.tableName)
+      const partitions = partitionColumns(descriptor)
+      const found = new Map<string, ReadonlyArray<SqlValue>>()
+      if (partitions.length === 0) {
+        for (const entityKey of entityKeys) found.set(entityKey, [])
+        return found
+      }
+      const RowSchema = Schema.Struct({
+        entity_key: Schema.String,
+        values_json: Schema.String
+      })
+      for (let offset = 0; offset < entityKeys.length; offset += 100) {
+        const batch = entityKeys.slice(offset, offset + 100)
+        const partitionIdentifiers = partitions.map((name) => sql.literal(name))
+        const valuesJson = sql.csv(partitionIdentifiers)
+        const rows = yield* SqlSchema.findAll({
+          Request: Schema.Void,
+          Result: RowSchema,
+          execute: () =>
+            sql`SELECT entity_key, json_array(${valuesJson}) AS values_json FROM ${table}
               WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
                 AND entity_key IN ${sql.in(batch)}`
-          })(undefined).pipe(
-            Effect.catchTag(
-              "SchemaError",
-              (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index row is invalid", cause }))
-            )
+        })(undefined).pipe(
+          Effect.catchTag(
+            "SchemaError",
+            (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index row is invalid", cause }))
           )
-          for (const row of rows) {
-            const values = yield* Codec.parse(row.values_json).pipe(
-              Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed))
-            )
-            found.set(row.entity_key, values)
-          }
+        )
+        for (const row of rows) {
+          const values = yield* Codec.parse(row.values_json).pipe(
+            Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed))
+          )
+          found.set(row.entity_key, values)
         }
-        return found
-      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      }
+      return found
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
-    const affectedPartitions: Runtime["affectedPartitions"] = (
+    const affectedPartitions: Runtime["affectedPartitions"] = Effect.fnUntraced(function*(
       spaceId,
       schemaGeneration,
       window,
       afterSequence
-    ) =>
-      Effect.gen(function*() {
-        const descriptor = yield* resolveDescriptor(window)
-        const PartitionLogRow = Schema.Struct({ partition_json: Schema.String })
-        const rows = yield* SqlSchema.findAll({
-          Request: Schema.Void,
-          Result: PartitionLogRow,
-          execute: () =>
-            sql`SELECT DISTINCT partition_json FROM effect_local_server_index_partition_log
+    ) {
+      const descriptor = yield* resolveDescriptor(window)
+      const rows = yield* SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Schema.Struct({ partition_json: Schema.String }),
+        execute: () =>
+          sql`SELECT DISTINCT partition_json FROM effect_local_server_index_partition_log
             WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
               AND descriptor_hash = ${descriptor.hash} AND server_sequence > ${afterSequence}`
-        })(undefined).pipe(
-          Effect.catchTag(
-            "SchemaError",
-            (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index partition log is invalid", cause }))
+      })(undefined).pipe(
+        Effect.catchTag(
+          "SchemaError",
+          (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index partition log is invalid", cause }))
+        )
+      )
+      const partitions: Array<ReadonlyArray<SqlValue>> = []
+      for (const row of rows) {
+        partitions.push(
+          yield* Codec.parse(row.partition_json).pipe(
+            Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed))
           )
         )
-        const partitions: Array<ReadonlyArray<SqlValue>> = []
-        for (const row of rows) {
-          partitions.push(
-            yield* Codec.parse(row.partition_json).pipe(
-              Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed))
-            )
-          )
-        }
-        return partitions
-      }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      }
+      return partitions
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
     return { apply, membership, partitionMembership, partitionsOf, affectedPartitions }
-  }).pipe(
-    Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
-    Effect.withSpan("ServerIndex.make")
-  )
+  },
+  Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+)

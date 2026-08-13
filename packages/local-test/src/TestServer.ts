@@ -10,26 +10,26 @@ import * as Ref from "effect/Ref"
 import * as Stream from "effect/Stream"
 import * as FaultInjection from "./FaultInjection.js"
 
-export const layer: Layer.Layer<
+export const TestServerLayer: Layer.Layer<
   SyncEngine.SyncEngine,
   never,
   ServerStore.ServerStore | FaultInjection.FaultInjection | Crypto.Crypto
-> = Effect.gen(function*() {
-  const server = yield* ServerStore.ServerStore
-  const faults = yield* FaultInjection.FaultInjection
-  const crypto = yield* Crypto.Crypto
-  const visibleSequences = yield* Ref.make(new Map<string, Protocol.PullPage["serverSequence"]>())
-  const online = (spaceId: Protocol.SubmitRequest["envelope"]["spaceId"]) =>
-    Effect.gen(function*() {
+> = Layer.effect(
+  SyncEngine.SyncEngine,
+  Effect.gen(function*() {
+    const server = yield* ServerStore.ServerStore
+    const faults = yield* FaultInjection.FaultInjection
+    const crypto = yield* Crypto.Crypto
+    const visibleSequences = yield* Ref.make(new Map<string, Protocol.PullPage["serverSequence"]>())
+    const online = Effect.fnUntraced(function*(spaceId: Protocol.SubmitRequest["envelope"]["spaceId"]) {
       if (!(yield* faults.state(spaceId)).online) {
         yield* faults.emit({ _tag: "RequestRejectedOffline", spaceId })
         yield* new ReplicaError.ServerUnavailable()
       }
     })
-  return SyncEngine.SyncEngine.of({
-    waitForCredentialChange: () => Effect.never,
-    submit: (request) =>
-      Effect.gen(function*() {
+    return SyncEngine.SyncEngine.of({
+      waitForCredentialChange: () => Effect.never,
+      submit: Effect.fnUntraced(function*(request) {
         yield* online(request.envelope.spaceId)
         const receipt = yield* server.submit(request)
         yield* faults.emit({ _tag: "ReceiptCommitted", spaceId: request.envelope.spaceId, receipt })
@@ -45,9 +45,8 @@ export const layer: Layer.Layer<
         yield* faults.markReceiptReturned(request.envelope.spaceId)
         return receipt
       }),
-    discard: (request) => online(request.envelope.spaceId).pipe(Effect.andThen(server.discard(request, null))),
-    pull: (request) =>
-      Effect.gen(function*() {
+      discard: (request) => online(request.envelope.spaceId).pipe(Effect.andThen(server.discard(request, null))),
+      pull: Effect.fnUntraced(function*(request) {
         yield* online(request.spaceId)
         let page = yield* server.pull(request)
         if (yield* faults.takePostReceiptPull(request.spaceId)) {
@@ -96,11 +95,12 @@ export const layer: Layer.Layer<
         if (Protocol.encodedBytes(duplicate) > Protocol.maximumBatchBytes) return page
         return duplicate
       }),
-    bootstrap: (request) => online(request.spaceId).pipe(Effect.andThen(server.bootstrap(request))),
-    watch: (request) =>
-      server.watch(request).pipe(
-        Stream.filterEffect(() => faults.state(request.spaceId).pipe(Effect.map((state) => state.online))),
-        Stream.mapError(() => new ReplicaError.ServerUnavailable())
-      )
+      bootstrap: (request) => online(request.spaceId).pipe(Effect.andThen(server.bootstrap(request))),
+      watch: (request) =>
+        server.watch(request).pipe(
+          Stream.filterEffect(() => faults.state(request.spaceId).pipe(Effect.map((state) => state.online))),
+          Stream.mapError(() => new ReplicaError.ServerUnavailable())
+        )
+    })
   })
-}).pipe(Layer.effect(SyncEngine.SyncEngine))
+)

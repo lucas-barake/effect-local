@@ -339,8 +339,7 @@ const fromAST = (
       return { _tag: "Cycle", back: Math.max(1, state.stack.size - ancestor) }
     }
     state.suspends.set(ast, state.stack.size)
-    const suspended = ast.thunk()
-    const result = fromAST(suspended, state, trustedBehavior)
+    const result = fromAST(ast.thunk(), state, trustedBehavior)
     state.suspends.delete(ast)
     return result
   }
@@ -449,8 +448,7 @@ const fromAST = (
       break
     }
     case "Suspend": {
-      const suspended = ast.thunk()
-      node.suspended = fromAST(suspended, state, trustedBehavior)
+      node.suspended = fromAST(ast.thunk(), state, trustedBehavior)
       break
     }
   }

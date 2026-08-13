@@ -37,10 +37,10 @@ const Todo = Model.make("Todo", {
 })
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
 const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo] })
-const handlers = PutTodo.toLayer(({ payload, transaction }) =>
+const Handlers = PutTodo.toLayer(({ payload, transaction }) =>
   transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
 )
-const runtime = MutationRuntime.layer(definition).pipe(Layer.provide(handlers))
+const Runtime = MutationRuntime.layer(definition).pipe(Layer.provide(Handlers))
 const migration = {
   retryDelay: "1 millis",
   maximumAttempts: 8
@@ -76,8 +76,11 @@ const serverHistory = {
   migration
 }
 const database = () =>
-  SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
-    (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
+  Layer.mergeAll(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer,
+    Reactivity.layer,
+    QueryReactivity.Layer
   )
 
 const service = <I, S, E extends { readonly _tag: string }, R,>(
@@ -86,29 +89,33 @@ const service = <I, S, E extends { readonly _tag: string }, R,>(
 ) => Layer.build(layer).pipe(Effect.map(Context.get(tag)))
 
 const makeSyncServices = Effect.gen(function*() {
-  const serverLayer = ServerStore.layerTrusted({ ...serverHistory, definition })
-  const server = yield* serverLayer.pipe(
-    Layer.provide(runtime),
-    Layer.provide(database()),
-    (layer) => service(ServerStore.ServerStore, layer)
+  const server = yield* service(
+    ServerStore.ServerStore,
+    ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
+      Layer.provide(Runtime),
+      Layer.provide(database())
+    )
   )
-  const faults = yield* service(FaultInjection.FaultInjection, FaultInjection.layer)
-  const sync = yield* TestServer.layer.pipe(
-    Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
-    Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults)),
-    Layer.provide(NodeCrypto.layer),
-    (layer) => service(SyncEngine.SyncEngine, layer)
+  const faults = yield* service(FaultInjection.FaultInjection, FaultInjection.FaultInjectionLayer)
+  const sync = yield* service(
+    SyncEngine.SyncEngine,
+    TestServer.TestServerLayer.pipe(
+      Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
+      Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults)),
+      Layer.provide(NodeCrypto.layer)
+    )
   )
   return { faults, sync }
 })
 
 const makeServices = Effect.gen(function*() {
   const { faults, sync } = yield* makeSyncServices
-  const localLayer = LocalStore.layer({ ...clientHistory, definition, spaceId, clientId })
-  const local = yield* localLayer.pipe(
-    Layer.provide(runtime),
-    Layer.provide(database()),
-    (layer) => service(LocalStore.Store, layer)
+  const local = yield* service(
+    LocalStore.Store,
+    LocalStore.layer({ ...clientHistory, definition, spaceId, clientId }).pipe(
+      Layer.provide(Runtime),
+      Layer.provide(database())
+    )
   )
   return { faults, local, sync }
 })
@@ -125,20 +132,18 @@ const pullRequest = (state: LocalStore.ReplicationState) =>
   })
 
 const synchronize = (local: LocalStore.Service, sync: SyncEngine.Service) =>
-  Reconciler.layerOnePass({ definition, spaceId, pageSize: 10 }).pipe(
-    (reconciliationLayer) => {
-      return reconciliationLayer.pipe(
-        Layer.provide(Layer.succeed(LocalStore.Store, local)),
-        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
-      )
-    },
-    (layer) => service(Reconciler.Reconciliation, layer),
-    Effect.flatMap((reconciliation) => reconciliation.sync)
-  )
+  service(
+    Reconciler.Reconciliation,
+    Reconciler.layerOnePass({ definition, spaceId, pageSize: 10 }).pipe(
+      Layer.provide(Layer.succeed(LocalStore.Store, local)),
+      Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
+    )
+  ).pipe(Effect.flatMap((reconciliation) => reconciliation.sync))
 
 describe("test synchronization faults", () => {
-  it.effect("routes synchronization events without stealing another space's event", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "routes synchronization events without stealing another space's event",
+    Effect.fnUntraced(function*() {
       const { faults } = yield* makeServices
       yield* faults.emit({ _tag: "RequestRejectedOffline", spaceId: secondSpaceId })
       yield* faults.emit({ _tag: "RequestRejectedOffline", spaceId })
@@ -150,10 +155,12 @@ describe("test synchronization faults", () => {
       )
       yield* TestClock.adjust("1 second")
       assert.strictEqual(Option.getOrThrow(yield* Fiber.join(second)).spaceId, secondSpaceId)
-    }))
+    })
+  )
 
-  it.effect("partitions and consumes one-shot faults by space", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "partitions and consumes one-shot faults by space",
+    Effect.fnUntraced(function*() {
       const { faults } = yield* makeServices
       yield* faults.partition(spaceId)
       yield* faults.dropNextReceipt(spaceId)
@@ -171,53 +178,51 @@ describe("test synchronization faults", () => {
       assert.isTrue(yield* faults.takeDuplicatePage(spaceId))
       yield* faults.heal(spaceId)
       assert.isTrue((yield* faults.state(spaceId)).online)
-    }))
+    })
+  )
 
-  it.effect("lets one space settle while another space is partitioned", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "lets one space settle while another space is partitioned",
+    Effect.fnUntraced(function*() {
       const { faults, sync } = yield* makeSyncServices
       yield* faults.partition(spaceId)
-      const replicaLayer = SqlReplica.layer({
-        ...clientHistory,
-        definition,
-        clientId,
-        initialSpaces: [spaceId, secondSpaceId],
-        retryDelay: "1 millis"
-      })
-      const root = yield* replicaLayer.pipe(
-        Layer.provide(handlers),
-        Layer.provide(database()),
-        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync)),
-        (layer) => service(Replica.Replica, layer)
+      const root = yield* service(
+        Replica.Replica,
+        SqlReplica.layer({
+          ...clientHistory,
+          definition,
+          clientId,
+          initialSpaces: [spaceId, secondSpaceId],
+          retryDelay: "1 millis"
+        }).pipe(
+          Layer.provide(Handlers),
+          Layer.provide(database()),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
+        )
       )
       const first = yield* root.space(spaceId)
       const second = yield* root.space(secondSpaceId)
       const firstPending = yield* first.mutate(PutTodo, { id: "shared", title: "first" })
       const secondPending = yield* second.mutate(PutTodo, { id: "shared", title: "second" })
-      const awaitReceipt = (space: Replica.Space, mutationId: Identity.MutationId) =>
-        Effect.gen(function*() {
-          while (true) {
-            const receipt = yield* space.receipt(PutTodo, mutationId)
-            if (Option.isSome(receipt)) return receipt.value
-            yield* Effect.yieldNow
-          }
-        })
-      const awaitStatus = (space: Replica.Space, tag: "Offline" | "Online") =>
-        Effect.gen(function*() {
-          while (true) {
-            const status = yield* space.status
-            if (status._tag === tag) return status
-            yield* Effect.yieldNow
-          }
-        })
+      const awaitReceipt = Effect.fnUntraced(function*(space: Replica.Space, mutationId: Identity.MutationId) {
+        while (true) {
+          const receipt = yield* space.receipt(PutTodo, mutationId)
+          if (Option.isSome(receipt)) return receipt.value
+          yield* Effect.yieldNow
+        }
+      })
+      const awaitStatus = Effect.fnUntraced(function*(space: Replica.Space, tag: "Offline" | "Online") {
+        while (true) {
+          const status = yield* space.status
+          if (status._tag === tag) return status
+          yield* Effect.yieldNow
+        }
+      })
 
       const secondReceipt = yield* awaitReceipt(second, secondPending.envelope.mutationId)
       assert.strictEqual(secondReceipt._tag, "Accepted")
-      pipe(
-        yield* first.receipt(PutTodo, firstPending.envelope.mutationId),
-        Option.isNone,
-        (isNone) => assert.isTrue(isNone)
-      )
+      const firstReceiptBeforeHealing = yield* first.receipt(PutTodo, firstPending.envelope.mutationId)
+      assert.isTrue(Option.isNone(firstReceiptBeforeHealing))
       yield* awaitStatus(first, "Offline")
       yield* awaitStatus(second, "Online")
 
@@ -226,10 +231,12 @@ describe("test synchronization faults", () => {
       const firstReceipt = yield* awaitReceipt(first, firstPending.envelope.mutationId)
       assert.strictEqual(firstReceipt._tag, "Accepted")
       yield* awaitStatus(first, "Online")
-    }))
+    })
+  )
 
-  it.effect("keeps optimistic state while partitioned and reconciles after healing", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "keeps optimistic state while partitioned and reconciles after healing",
+    Effect.fnUntraced(function*() {
       const { faults, local, sync } = yield* makeServices
       yield* synchronize(local, sync)
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "offline" })
@@ -247,16 +254,18 @@ describe("test synchronization faults", () => {
       yield* faults.heal(spaceId)
       const receipt = yield* sync.submit(request)
       yield* local.applyReceipt(receipt)
-      const page = yield* pipe(yield* local.replicationState, pullRequest, (pullInput) => sync.pull(pullInput))
+      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
       yield* local.applyViewPage(page)
       yield* local.settleReceipts
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.strictEqual(yield* local.cursor, 1)
-    }))
+    })
+  )
 
-  it.effect("resolves a dropped receipt through an exact retry", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "resolves a dropped receipt through an exact retry",
+    Effect.fnUntraced(function*() {
       const { faults, local, sync } = yield* makeServices
       yield* synchronize(local, sync)
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "ambiguous" })
@@ -267,28 +276,28 @@ describe("test synchronization faults", () => {
       const receipt = yield* sync.submit(request)
       assert.strictEqual(receipt._tag, "Accepted")
       if (receipt._tag === "Accepted") assert.strictEqual(receipt.serverSequence, 1)
-      const page = yield* pipe(yield* local.replicationState, pullRequest, (pullInput) => sync.pull(pullInput))
+      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
       assert.strictEqual(page.changes.length, 1)
-    }))
+    })
+  )
 
-  it.effect("duplicates a catch up entry without corrupting local order", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "duplicates a catch up entry without corrupting local order",
+    Effect.fnUntraced(function*() {
       const { faults, local, sync } = yield* makeServices
       yield* synchronize(local, sync)
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "duplicate" })
       const receipt = yield* sync.submit({ envelope: pending.envelope, schema: definition.schemaIdentity })
       yield* local.applyReceipt(receipt)
       yield* faults.duplicateNextPage(spaceId)
-      const page = yield* pipe(yield* local.replicationState, pullRequest, (pullInput) => sync.pull(pullInput))
+      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
-      pipe(
-        page.changes.map((change) => change._tag),
-        (tags) => assert.deepStrictEqual(tags, ["Upsert", "Upsert"])
-      )
+      assert.deepStrictEqual(page.changes.map((change) => change._tag), ["Upsert", "Upsert"])
       yield* local.applyViewPage(page)
       yield* local.settleReceipts
       assert.strictEqual(yield* local.cursor, 1)
       assert.strictEqual(yield* local.pendingCount, 0)
-    }))
+    })
+  )
 })

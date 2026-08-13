@@ -28,6 +28,7 @@ Read this file before any work. Treat these rules as required for every package.
 - Never pair `Effect.catchIf`, `catchFilter`, or another predicate catch with a broad `isXError` guard for a tagged failure. A runtime guard can accept values that the call site's typed failure channel did not establish. Catch a tagged wrapper with `Effect.catchTag` or `catchTags`, and catch a nested tagged reason with `catchReason` or `catchReasons`. Use guards only at genuinely untyped boundaries such as an `unknown` value or a preserved `Cause`, where tag combinators cannot prove the type.
 - Use `Effect.catchIf`, `catchFilter`, or a specialized predicate combinator only for conditions that are not represented by a stable tag.
 - Use `Effect.catch` only when one handler intentionally covers the complete typed failure channel. It does not catch defects or interruption.
+- Do not use official `Effect.orDie` in any call or reference form. Do not reproduce it with official `Effect.catch` when the handler only passes the complete caught error to official `Effect.die`. When a typed failure is intentionally unrecoverable, select it at the call site with `Effect.catchTag`, `catchTags`, `catchReason`, or `catchReasons`, and call `Effect.die(error)` in every selected branch. Leave every unselected tag or reason in the typed error channel. Do not hide the branches in a shared helper.
 - Use `Effect.catchCause` only when the full `Cause` is required. Preserve or repropagate every cause case that is not intentionally recovered.
 - Preserve interruption. Treat defects as defects by default. Translate a defect only at a documented integration boundary and retain the original cause as structured context.
 - Preserve useful structured error context without including secrets or sensitive payloads.
@@ -80,7 +81,7 @@ Read this file before any work. Treat these rules as required for every package.
 - Express a configurable duration as `Duration.Input`, never as a bare number named with a unit suffix such as `Millis`. `Duration.Input` lets a consumer write `"30 seconds"`, `Duration.minutes(5)`, or a raw number, and it states the unit in the type instead of in the identifier.
 - Convert a configured duration once, with `Duration.toMillis`, at the point the Layer or service is constructed, and close over the result. Do not convert per call and do not thread `Duration.Input` into arithmetic.
 - A duration that crosses a wire protocol or is persisted stays a plain number with its unit in the name. `Duration` has no stable serialized encoding, so a protocol or column must name its unit.
-- Use `camelCase` for values and functions. Use `PascalCase` for types, services, schemas, and error classes.
+- Use `PascalCase` for Layer values, types, services, schemas, and error classes. Use `camelCase` for other values and for functions, including functions that return a Layer.
 - Add an `Error` suffix when it improves clarity. Preserve established class names and serialized `_tag` values for public or protocol errors.
 - Name Layer values and constructors so their implementation, configuration, or lifecycle is clear.
 - Keep internal modules under `src/internal`. Export only deliberate consumer APIs from package entry points.

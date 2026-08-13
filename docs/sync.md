@@ -68,9 +68,9 @@ full private result was reclaimed.
 
 `SyncRpc.Rpcs` uses one Effect RPC group for negotiation, submit, discard, pull, bootstrap, watch, presence publish,
 and presence watch. Effect's RPC
-Schema codecs define the external contract. `SyncServer.layer` is the authenticated facade. It routes each operation
+Schema codecs define the external contract. `SyncServer.Default` is the authenticated facade. It routes each operation
 through the Effect Cluster entity named by the request's space. The entity validates that embedded space identity
-matches its Cluster address, then calls `ServerStore` or `PresenceHub`. `SyncClient.layer` maps the generated client
+matches its Cluster address, then calls `ServerStore` or `PresenceHub`. `SyncClient.Default` maps the generated client
 to `SyncEngine` while preserving typed replica failures.
 
 Authentication is RPC middleware. `CredentialProvider.acquire` is evaluated for every request and returns a redacted
