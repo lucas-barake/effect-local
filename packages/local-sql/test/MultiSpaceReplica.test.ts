@@ -13,6 +13,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
 import * as Scope from "effect/Scope"
@@ -66,6 +67,14 @@ const layerLive = SqlReplica.layer({
   Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
   Layer.provide(NodeCrypto.layer),
   Layer.provide(Reactivity.layer)
+)
+
+const activeChildFibers = Metric.snapshot.pipe(
+  Effect.map((snapshots) => {
+    const active = snapshots.find((snapshot) => snapshot.id === "child_fibers_active")
+    if (active?.type !== "Gauge") return 0
+    return Number(active.state.value)
+  })
 )
 
 describe("multi space Replica", () => {
@@ -680,13 +689,20 @@ describe("multi space Replica", () => {
 
       assert.lengthOf(remembered, 1_000)
       assert.strictEqual(yield* Ref.get(activeWatches), 0)
+      assert.strictEqual(yield* activeChildFibers, 5)
       assert.isTrue(activations.every((activation) => activation === "Inactive"))
       yield* remembered[0].activate
       yield* Effect.yieldNow
       assert.strictEqual(yield* Ref.get(activeWatches), 1)
       yield* remembered[0].deactivate
       assert.strictEqual(yield* Ref.get(activeWatches), 0)
-    }, Effect.scoped)
+      assert.strictEqual(yield* activeChildFibers, 5)
+    }, (effect) =>
+      effect.pipe(
+        Metric.enableRuntimeMetrics,
+        Effect.provideService(Metric.MetricRegistry, new Map()),
+        Effect.scoped
+      ))
   )
 
   it.effect(

@@ -3,10 +3,12 @@
 SQLite persistence and authoritative mutation ordering for Effect Local.
 
 `SqlReplica.layer` provides one public replica for many spaces in one SQLite database. Membership is durable and every
-client table is partitioned by `space_id`. Each `Replica.Space` handle owns its operations and status. The root service
-joins, leaves, lists, and addresses handles, and reports aggregate status. One dispatcher schedules keyed watches and
-turns over the shared `SyncEngine`, so the RPC composition uses one WebSocket while spaces make progress independently.
-`reconciliationConcurrency` bounds how many finite turns the lightweight `SqlReplica.layer` dispatcher can run at once.
+client table is partitioned by `space_id`. Each `Replica.Space` handle owns its operations, replication scope,
+activation, and status. Membership is lightweight. Addressed operations activate foreground LRU residents, while
+inactive spaces with pending mutations use short lived background runtimes. `maximumActiveSpaces` bounds all per space
+runtimes and `foregroundActiveSpaces` reserves capacity for addressed work. `foregroundReconciliationConcurrency`
+reserves foreground turns within the total `reconciliationConcurrency`. Active logical watches share the one
+`SyncEngine` and RPC WebSocket.
 
 `SqlReplica.layerWorkflow` uses the same store, query executor, and idempotent reconciliation pass with finite Effect
 Workflow generations. Local SQLite stores canonical entities, visible entities, pending mutations, bounded terminal
@@ -43,8 +45,12 @@ const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
 const layerReplica = SqlReplica.layerWorkflow({
   definition,
   clientId,
-  scope,
+  defaultScope: scope,
   initialSpaces: [spaceId],
+  maximumActiveSpaces: 8,
+  foregroundActiveSpaces: 4,
+  reconciliationConcurrency: 8,
+  foregroundReconciliationConcurrency: 2,
   retainedReceipts: 256,
   maximumReceipts: 1_024,
   retainedHistoryEntries: 256,
@@ -57,14 +63,16 @@ const layerReplica = SqlReplica.layerWorkflow({
 )
 ```
 
-`initialSpaces` seeds first startup. Later calls to `Replica.join` persist membership and restart restores every joined
-space automatically. `Replica.leave` closes the space runtime before one cascading delete removes its local state.
-The database keeps the singleton `clientId`. Rejoining creates a new membership incarnation and local sequence.
+`initialSpaces` seeds remembered membership without opening every space. Later calls to `Replica.join` persist
+membership and restart restores every handle inactive. Data operations and `space.activate` acquire foreground
+capacity. `space.deactivate` closes its runtime without deleting data. Pending work still drains in the background.
+`Replica.leave` closes any runtime before one cascading delete removes local state. The database keeps the singleton
+`clientId`. Rejoining creates a new membership incarnation and local sequence.
 
-The required `scope` is a model subscription shared by the replica's joined spaces. Changing the configured scope on
-the next startup advances a durable generation. A wider scope backfills through incremental pull. A narrower scope
-receives `Retract` changes and evicts the excluded canonical and visible entities without a new bootstrap. The current
-scope contract does not express key ranges, rolling windows, lazy fetches, or automatic cache eviction.
+The required `defaultScope` initializes only new membership. Every handle exposes its durable `space.scope` and
+`space.setScope`. Changing one space advances its generation, restarts its active watch, and reconciles it as foreground
+work. A wider scope backfills through incremental pull. A narrower scope receives `Retract` changes without a new
+bootstrap. Scopes support complete models and bounded secondary index windows with per partition overrides.
 
 `retryDelay`, `maximumRetryDelay`, and `maximumAttempts` bound exponential retries within one Workflow execution. A
 terminal failed generation stays failed until a later mutation or server wake requests a new generation. Effect
@@ -211,7 +219,8 @@ counts committed deleted rows with `resource=history|receipt`.
 `LocalStore` increments `effect_local_client_bootstrap_install` after a snapshot installation commits and maintains
 `effect_local_client_pending_mutation_count` as the pending population across active stores. Metric labels use bounded
 outcomes and resource classes. They do not contain space, client, mutation, request, or principal identifiers. The
-production watcher benchmark is `../local-rpc/bench/Fanout.bench.ts`.
+production watcher benchmark is `../local-rpc/bench/Fanout.bench.ts`. `bench/ReplicaScale.bench.ts` compares retained
+heap, child fibers, watches, and startup time for eager and lazy clients from 1 through 1,000 remembered spaces.
 
 See the [repository guide](https://github.com/lucas-barake/effect-local#readme) and
 [durability notes](https://github.com/lucas-barake/effect-local/blob/main/docs/durability.md).
