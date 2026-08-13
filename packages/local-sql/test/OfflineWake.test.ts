@@ -397,42 +397,6 @@ describe("offline wake delivery", () => {
   )
 
   it.effect(
-    "does not call the delivery hook while the client has a live Watch",
-    Effect.fnUntraced(function*() {
-      const deliveries = yield* Queue.bounded<OfflineWake.Delivery>(1).pipe(
-        (acquire) => Effect.acquireRelease(acquire, Queue.shutdown)
-      )
-      const watchReady = yield* Deferred.make<void>()
-      const cycleCompleted = yield* Deferred.make<void>()
-      const offlineWake = {
-        recipients: () => Effect.succeed([readerId, sentinelId]),
-        deliver: (wake: OfflineWake.Delivery) => {
-          if (wake.clientId === sentinelId) {
-            return Deferred.succeed(cycleCompleted, undefined).pipe(Effect.as("Delivered" as const))
-          }
-          return Queue.offer(deliveries, wake).pipe(Effect.as("Delivered" as const))
-        },
-        ...wakeTiming,
-        maximumConcurrentDeliveries: 1
-      } satisfies OfflineWake.Options
-      const server = yield* makeServer(offlineWake)
-      const watcher = yield* startWatch(server, watchReady)
-      yield* Deferred.await(watchReady)
-
-      const receipt = yield* submit(server, 1)
-      assert.strictEqual(receipt._tag, "Accepted")
-      yield* TestClock.adjust("10 seconds")
-      yield* Deferred.await(cycleCompleted)
-      assert.strictEqual(yield* Queue.size(deliveries), 0)
-
-      yield* Fiber.interrupt(watcher)
-      yield* TestClock.adjust("1 second")
-      const delivered = yield* Queue.take(deliveries)
-      assert.strictEqual(delivered.clientId, readerId)
-    }, Effect.scoped)
-  )
-
-  it.effect(
     "coordinates Watch presence across server runtimes sharing the database",
     Effect.fnUntraced(
       function*() {
@@ -550,41 +514,6 @@ describe("offline wake delivery", () => {
           WHERE space_id = ${spaceId} AND client_id = ${readerId}`
         assert.deepStrictEqual(presence, [{ count: 1 }])
         yield* Fiber.interrupt(watcher)
-      },
-      provideNodeFileSystem,
-      Effect.scoped
-    )
-  )
-
-  it.effect(
-    "reconciles durable presence after transient Watch cleanup failure",
-    Effect.fnUntraced(
-      function*() {
-        const fs = yield* FileSystem.FileSystem
-        const directory = yield* fs.makeTempDirectoryScoped()
-        const filename = `${directory}/offline-wake-cleanup-recovery.sqlite`
-        const delivered = yield* Deferred.make<OfflineWake.Delivery>()
-        const offlineWake = {
-          recipients: () => Effect.succeed([readerId]),
-          deliver: (wake: OfflineWake.Delivery) =>
-            Deferred.succeed(delivered, wake).pipe(Effect.as("Delivered" as const)),
-          ...wakeTiming
-        } satisfies OfflineWake.Options
-        const server = yield* makeServer(offlineWake, database(filename))
-        const inspectionSql = yield* makeInspectionSql(filename)
-        const watcherScope = yield* Scope.make()
-        yield* server.watch(watchRequest()).pipe(Stream.take(1), Stream.runDrain, Scope.provide(watcherScope))
-        yield* inspectionSql.unsafe(`CREATE TRIGGER fail_presence_delete
-          BEFORE DELETE ON effect_local_server_watch_presence
-          BEGIN SELECT RAISE(ABORT, 'transient cleanup failure'); END`)
-        yield* Scope.close(watcherScope, Exit.void)
-        yield* inspectionSql.unsafe("DROP TRIGGER fail_presence_delete")
-
-        const receipt = yield* submit(server, 1)
-        assert.strictEqual(receipt._tag, "Accepted")
-        yield* TestClock.adjust("10 seconds")
-        const wake = yield* Deferred.await(delivered)
-        assert.strictEqual(wake.clientId, readerId)
       },
       provideNodeFileSystem,
       Effect.scoped

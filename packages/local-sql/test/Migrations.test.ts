@@ -34,7 +34,6 @@ const NameRow = Schema.Struct({ name: Schema.String })
 const CountRow = Schema.Struct({ count: Schema.Number })
 const UpgradedScopedRow = Schema.Struct({
   delivered_sequence: Schema.Number,
-  wake_ack_sequence: Schema.Number,
   read_auth_epoch: Schema.Number,
   view_layout: Schema.String,
   snapshot_layout: Schema.String
@@ -202,6 +201,7 @@ describe("storage migration catalogs", () => {
         "effect_local_server_replication_views",
         "effect_local_server_replication_view_entities",
         "effect_local_server_replication_pages",
+        "effect_local_server_offline_wake_acknowledgements",
         "effect_local_server_offline_wake_spaces",
         "effect_local_server_offline_wakes",
         "effect_local_server_watch_presence",
@@ -214,6 +214,15 @@ describe("storage migration catalogs", () => {
       assert.notInclude(names, "effect_local_bootstrap")
       assert.notInclude(names, "effect_local_bootstrap_entities")
       assert.include((yield* indexNames(sql)).map((row) => row.name), "effect_local_server_watch_presence_runtime")
+      yield* sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at) VALUES ('runtime', 1)`
+      yield* sql`INSERT INTO effect_local_server_watch_presence
+        (space_id, client_id, watcher_id, runtime_id) VALUES (${spaceId}, ${clientId}, 'watcher', 'runtime')`
+      const duplicatePresence = yield* sql`INSERT INTO effect_local_server_watch_presence
+        (space_id, client_id, watcher_id, runtime_id)
+        VALUES ('spc_00000000-0000-4000-8000-000000000002', ${clientId}, 'watcher', 'runtime')`.pipe(
+        Effect.exit
+      )
+      assert.isTrue(SqlError.isSqlError(expectedFailure(duplicatePresence).pipe(Option.getOrThrow)))
     }, provideDatabase)
   )
 
@@ -242,7 +251,7 @@ describe("storage migration catalogs", () => {
         Request: Schema.Void,
         Result: UpgradedScopedRow,
         execute: () =>
-          sql`SELECT v.delivered_sequence, v.wake_ack_sequence, v.read_auth_epoch,
+          sql`SELECT v.delivered_sequence, v.read_auth_epoch,
             v.index_layout_hash AS view_layout,
             s.index_layout_hash AS snapshot_layout
           FROM effect_local_server_replication_views AS v
@@ -251,7 +260,6 @@ describe("storage migration catalogs", () => {
       })(undefined)
       assert.deepStrictEqual(upgraded, {
         delivered_sequence: 7,
-        wake_ack_sequence: 0,
         read_auth_epoch: 0,
         view_layout: "",
         snapshot_layout: ""

@@ -599,7 +599,9 @@ mutation or entity content. Keep provider-visible notification content free of t
 delivery starts, it is at least once: a failure, defect, timeout, or database failure after the provider send can retry
 the same `wakeId`, so the send must be idempotent. The dispatcher coalesces mutations behind a high water fence. A live
 Watch suppresses delivery across all server runtimes sharing the database. An acknowledged Pull cursor retires covered
-work. See [synchronization](docs/sync.md#offline-wake-delivery) for the full delivery and recovery contract.
+work. Configure the same `offlineWake` adapter on every runtime that shares the database and accepts Watch streams so
+each runtime publishes its live presence. See [synchronization](docs/sync.md#offline-wake-delivery) for the full
+delivery and recovery contract.
 
 ### Negotiate one protocol for sync and presence
 

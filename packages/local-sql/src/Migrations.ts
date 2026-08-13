@@ -1693,7 +1693,12 @@ const serverV12 = makeMigration({
   id: 12,
   name: "durable-offline-wakes",
   statements: [
-    "ALTER TABLE effect_local_server_replication_views ADD COLUMN wake_ack_sequence INTEGER NOT NULL DEFAULT 0 CHECK (wake_ack_sequence >= 0 AND wake_ack_sequence <= delivered_sequence)",
+    `CREATE TABLE effect_local_server_offline_wake_acknowledgements (
+      space_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      acknowledged_sequence INTEGER NOT NULL CHECK (acknowledged_sequence >= 0),
+      PRIMARY KEY (space_id, client_id)
+    )`,
     `CREATE TABLE effect_local_server_offline_wake_spaces (
       space_id TEXT PRIMARY KEY,
       high_water_sequence INTEGER NOT NULL CHECK (high_water_sequence > 0),
@@ -1733,13 +1738,14 @@ const serverV12 = makeMigration({
       expires_at INTEGER NOT NULL CHECK (expires_at >= 0)
     )`,
     `CREATE INDEX effect_local_server_watch_runtimes_expiry
-      ON effect_local_server_watch_runtimes (expires_at)`,
+      ON effect_local_server_watch_runtimes (expires_at, runtime_id)`,
     `CREATE TABLE effect_local_server_watch_presence (
       space_id TEXT NOT NULL,
       client_id TEXT NOT NULL,
       watcher_id TEXT NOT NULL,
       runtime_id TEXT NOT NULL,
-      PRIMARY KEY (space_id, client_id, watcher_id)
+      PRIMARY KEY (space_id, client_id, watcher_id),
+      UNIQUE (runtime_id, watcher_id)
     )`,
     `CREATE INDEX effect_local_server_watch_presence_active
       ON effect_local_server_watch_presence (space_id, client_id, runtime_id)`,

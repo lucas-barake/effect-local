@@ -28,6 +28,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as AcceptedLog from "./internal/acceptedLog.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
+import * as OfflineWakeRuntime from "./internal/offlineWake.js"
 import * as ReadAuthorization from "./internal/readAuthorization.js"
 import * as Rows from "./internal/rows.js"
 import * as ScopedReplication from "./internal/scopedReplication.js"
@@ -40,7 +41,7 @@ import * as WakeVisibility from "./internal/wakeVisibility.js"
 import * as WindowSchema from "./internal/windowSchema.js"
 import * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
-import * as OfflineWake from "./OfflineWake.js"
+import type * as OfflineWake from "./OfflineWake.js"
 import * as SchemaEvolution from "./SchemaEvolution.js"
 
 export interface HistoryOptions {
@@ -313,7 +314,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         })
       }
       yield* Migrations.server(options.migration)
-      const offlineWake = yield* OfflineWake.make(options.offlineWake, context)
+      const offlineWake = yield* OfflineWakeRuntime.make(options.offlineWake, context)
       const serverIndexes = yield* ServerIndex.make(sql, options.definition)
       const metrics = ServerMetrics.make({
         history: options.maximumHistoryEntries,
@@ -2146,23 +2147,26 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
     })
   )
 
-export const layerTrusted = (
-  options: {
-    readonly definition: Definition.Any
-    readonly evolution?: Evolution.Evolution
-    readonly schemaEvolutionBatchSize?: number
-    readonly schemaEvolutionBatchBytes?: number
-    readonly readAuthorizationRefreshInterval: Duration.Input
-    readonly wakeCapacity?: number
-    readonly maximumWatchersPerSpace: number
-    readonly maximumConcurrentReadAuthorizations: number
-    readonly maximumPendingReadAuthorizations: number
-    readonly readAuthorizationCacheCapacity: number
-  } & HistoryOptions
+export interface TrustedOptions<R = never,> extends HistoryOptions {
+  readonly definition: Definition.Any
+  readonly evolution?: Evolution.Evolution
+  readonly schemaEvolutionBatchSize?: number
+  readonly schemaEvolutionBatchBytes?: number
+  readonly readAuthorizationRefreshInterval: Duration.Input
+  readonly wakeCapacity?: number
+  readonly maximumWatchersPerSpace: number
+  readonly maximumConcurrentReadAuthorizations: number
+  readonly maximumPendingReadAuthorizations: number
+  readonly readAuthorizationCacheCapacity: number
+  readonly offlineWake?: OfflineWake.Options<R>
+}
+
+export const layerTrusted = <R = never,>(
+  options: TrustedOptions<R>
 ): Layer.Layer<
   ServerStore,
   ReplicaError.ReplicaError,
-  SqlClient.SqlClient | Crypto.Crypto | MutationRuntime.MutationRuntime
+  SqlClient.SqlClient | Crypto.Crypto | MutationRuntime.MutationRuntime | R
 > =>
   layer({
     ...options,

@@ -36,7 +36,7 @@ the application's `recipients({ spaceId })` callback for the authoritative clien
 delivery row per client. Mutation admission never waits for membership lookup or push delivery.
 
 The delivery hook must decide current membership and send inside one application-owned serialized operation. It
-returns `"Delivered"` after sending or `"NotRecipient"` when membership has ended. `"NotRecipient"` retires the row,
+returns `"Delivered"` after sending or `"NotRecipient"` when membership has ended. `"NotRecipient"` retires the current work,
 so removal after expansion also blocks retries without a check-to-send race.
 
 `deliver({ wakeId, spaceId, clientId })` is the provider boundary. It carries routing and idempotency values only. It
@@ -46,8 +46,8 @@ signal that tells the app to sync. Do not copy `wakeId`, `spaceId`, or `clientId
 content.
 
 A live Watch or acknowledged Pull can make work obsolete before the hook runs. Once delivery starts, it is at least
-once. A callback failure, defect, timeout, or database failure after the provider send can retry the same `wakeId` with
-capped exponential backoff. This prevents lost work but permits duplicate provider calls.
+once. A callback failure, defect, or timeout retries the same `wakeId` with capped exponential backoff. A database
+failure after the provider send can also retry that ID. This prevents lost work but permits duplicate provider calls.
 
 The dispatcher waits `coalescingWindow` before expanding newly idle space work. An unnotified client wake keeps its
 `wakeId` while later mutations raise its high water fence. After the current work finishes, any remaining work receives
@@ -55,7 +55,8 @@ a new identity and another coalescing delay.
 
 A client is online only while its production Watch has an active SQL presence lease. The Watch does not become ready
 while a delivery claim for that client is in flight. Every server runtime sharing the database checks the same leases,
-and scope finalizers remove them. Expiration recovers from crashed runtimes. Connected clients keep using the live
+and scope finalizers remove them. Every runtime that accepts Watch streams must configure the same `offlineWake`
+adapter so it publishes those leases. Expiration recovers from crashed runtimes. Connected clients keep using the live
 payload-free Watch stream and do not enter the push path.
 
 Pull is the durable acknowledgement. When a client presents the cursor for an applied incremental page, the same

@@ -112,8 +112,10 @@ the same `wakeId`, so the provider send must be idempotent.
 Accepted mutations transactionally advance a per-space high water mark. The scoped dispatcher resolves membership
 outside admission, coalesces client work, retries failures with capped exponential backoff, and bounds recipient
 resolution and delivery separately. SQL Watch leases suppress the push path across every runtime sharing the database.
-A Pull cursor acknowledgement retires work at or below the acknowledged fence. All durations, batch sizes, concurrency
-limits, lease intervals, hook timeout, and recipient capacity are explicit in `OfflineWake.Options`.
+Every runtime that shares the database and accepts Watch streams must configure the same `offlineWake` adapter so its
+presence is visible to dispatchers. A Pull cursor acknowledgement retires work at or below the acknowledged fence. All
+durations, batch sizes, concurrency limits, lease intervals, hook timeout, and recipient capacity are explicit in
+`OfflineWake.Options`.
 
 `authorizeRead` receives a tagged union. `_tag: "Scope"` authorizes the client and requested model set before space or
 schema disclosure. `_tag: "Entity"` authorizes one Schema encoded entity key and value. Only entities that pass both
