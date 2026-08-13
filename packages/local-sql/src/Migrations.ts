@@ -1738,11 +1738,13 @@ const serverV12 = makeMigration({
       space_id TEXT NOT NULL,
       client_id TEXT NOT NULL,
       watcher_id TEXT NOT NULL,
-      runtime_id TEXT NOT NULL REFERENCES effect_local_server_watch_runtimes(runtime_id) ON DELETE CASCADE,
+      runtime_id TEXT NOT NULL,
       PRIMARY KEY (space_id, client_id, watcher_id)
     )`,
     `CREATE INDEX effect_local_server_watch_presence_active
-      ON effect_local_server_watch_presence (space_id, client_id, runtime_id)`
+      ON effect_local_server_watch_presence (space_id, client_id, runtime_id)`,
+    `CREATE INDEX effect_local_server_watch_presence_runtime
+      ON effect_local_server_watch_presence (runtime_id)`
   ]
 })
 

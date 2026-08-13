@@ -94,6 +94,7 @@ const ClientRow = Schema.Struct({
 
 const WatcherRow = Schema.Struct({ watcher_id: Schema.String })
 const RuntimeRow = Schema.Struct({ runtime_id: Schema.String })
+const CountRow = Schema.Struct({ count: NonNegativeInt })
 
 const randomToken = (crypto: Crypto.Crypto) =>
   crypto.randomUUIDv4.pipe(
@@ -169,22 +170,25 @@ export const make = Effect.fnUntraced(function*<R,>(
     readonly clientId: Identity.ClientId
   }>()
   const presenceGate = yield* Semaphore.make(1)
+  let presenceDirty = false
   const prompt = yield* Queue.dropping<void>(1).pipe(
     (acquire) => Effect.acquireRelease(acquire, Queue.shutdown)
   )
   const notify = Queue.offer(prompt, undefined).pipe(Effect.asVoid)
   const runtimeStartedAt = yield* Clock.currentTimeMillis
-  yield* sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
+  yield* Effect.acquireRelease(
+    sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
       VALUES (${runtimeId}, ${runtimeStartedAt + presenceLeaseMillis})`.pipe(
-    Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
-  )
-  yield* Effect.addFinalizer(() =>
-    presenceGate.withPermit(
-      sql`DELETE FROM effect_local_server_watch_runtimes WHERE runtime_id = ${runtimeId}`
-    ).pipe(
-      Effect.catchTag("SqlError", (cause) => Effect.logWarning("Offline wake runtime cleanup failed", cause)),
-      Effect.asVoid
-    )
+      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+      Effect.as(runtimeId)
+    ),
+    () =>
+      presenceGate.withPermit(
+        sql`DELETE FROM effect_local_server_watch_runtimes WHERE runtime_id = ${runtimeId}`
+      ).pipe(
+        Effect.catchTag("SqlError", (cause) => Effect.logWarning("Offline wake runtime cleanup failed", cause)),
+        Effect.asVoid
+      )
   )
 
   const claimSpaces = SqlSchema.findAll({
@@ -246,11 +250,7 @@ export const make = Effect.fnUntraced(function*<R,>(
         yield* Effect.failCause(recipientsExit.cause)
       }
       yield* failSpaceClaim(row, now)
-      let log = Effect.logWarning("Offline wake recipient resolution failed")
-      if (Cause.hasDies(recipientsExit.cause)) {
-        log = Effect.logWarning("Offline wake recipient resolution failed", recipientsExit.cause)
-      }
-      yield* log.pipe(
+      yield* Effect.logWarning("Offline wake recipient resolution failed").pipe(
         Effect.annotateLogs({
           "space.id": row.space_id,
           "failure.kind": Cause.findErrorOption(recipientsExit.cause).pipe(Option.match({
@@ -459,11 +459,7 @@ export const make = Effect.fnUntraced(function*<R,>(
         yield* Effect.failCause(delivered.cause)
       }
       yield* failClientClaim(row, completedAt)
-      let log = Effect.logWarning("Offline wake delivery failed")
-      if (Cause.hasDies(delivered.cause)) {
-        log = Effect.logWarning("Offline wake delivery failed", delivered.cause)
-      }
-      yield* log.pipe(
+      yield* Effect.logWarning("Offline wake delivery failed").pipe(
         Effect.annotateLogs({
           "wake.id": row.wake_id,
           "space.id": row.space_id,
@@ -488,9 +484,23 @@ export const make = Effect.fnUntraced(function*<R,>(
       return
     }
     if (delivered.value.value === "NotRecipient") {
-      yield* sql`DELETE FROM effect_local_server_offline_wakes
-            WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
-              AND claim_token = ${row.claim_token}`.pipe(
+      const nextWakeId = yield* Identity.makeWakeId.pipe(
+        Effect.provideService(Crypto.Crypto, crypto),
+        Effect.mapError(StorageUnavailable.make)
+      )
+      yield* sql.withTransaction(Effect.gen(function*() {
+        yield* sql`UPDATE effect_local_server_offline_wakes SET
+          wake_id = ${nextWakeId}, attempt_count = 0,
+          next_attempt_at = ${completedAt + coalescingWindowMillis},
+          claim_token = NULL, claimed_until = NULL
+          WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
+            AND claim_token = ${row.claim_token}
+            AND high_water_sequence > ${row.high_water_sequence}`
+        yield* sql`DELETE FROM effect_local_server_offline_wakes
+          WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
+            AND claim_token = ${row.claim_token}
+            AND high_water_sequence <= ${row.high_water_sequence}`
+      })).pipe(
         Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
       )
       return
@@ -515,7 +525,17 @@ export const make = Effect.fnUntraced(function*<R,>(
 
   const run = Effect.gen(function*() {
     const now = yield* Clock.currentTimeMillis
-    yield* sql`DELETE FROM effect_local_server_watch_runtimes WHERE expires_at <= ${now}`.pipe(
+    yield* sql`DELETE FROM effect_local_server_watch_runtimes WHERE rowid IN (
+      SELECT rowid FROM effect_local_server_watch_runtimes
+      WHERE expires_at <= ${now} ORDER BY expires_at, runtime_id LIMIT ${options.claimBatchSize}
+    )`.pipe(
+      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+    )
+    yield* sql`DELETE FROM effect_local_server_watch_presence WHERE rowid IN (
+      SELECT presence.rowid FROM effect_local_server_watch_presence AS presence
+      LEFT JOIN effect_local_server_watch_runtimes AS runtime ON runtime.runtime_id = presence.runtime_id
+      WHERE runtime.runtime_id IS NULL LIMIT ${options.claimBatchSize}
+    )`.pipe(
       Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
     )
     let spaceClaims = 0
@@ -621,26 +641,42 @@ export const make = Effect.fnUntraced(function*<R,>(
         if (Option.isSome(inserted)) {
           registered = true
         } else {
-          yield* Effect.sleep(presenceRegistrationRetryMillis)
+          yield* Effect.sleep(presenceRegistrationRetryMillis).pipe(Effect.interruptible)
         }
       }
       presences.set(watcherId, { spaceId, clientId })
+      return watcherId
     })
-    yield* presenceGate.withPermit(register)
-    yield* Effect.addFinalizer(() => {
-      const removePresence = Effect.sync(() => presences.delete(watcherId))
-      const cleanup = removePresence.pipe(
-        Effect.andThen(
-          sql`DELETE FROM effect_local_server_watch_presence
-                WHERE space_id = ${spaceId} AND client_id = ${clientId} AND watcher_id = ${watcherId}`
-        )
-      )
-      return presenceGate.withPermit(cleanup).pipe(
-        Effect.andThen(notify),
-        Effect.catchTag("SqlError", (cause) => Effect.logWarning("Offline wake presence cleanup failed", cause)),
-        Effect.asVoid
-      )
-    })
+    yield* Effect.acquireRelease(
+      presenceGate.withPermit(register),
+      () =>
+        presenceGate.withPermit(Effect.gen(function*() {
+          presences.delete(watcherId)
+          yield* sql`DELETE FROM effect_local_server_watch_presence
+            WHERE space_id = ${spaceId} AND client_id = ${clientId} AND watcher_id = ${watcherId}`.pipe(
+            Effect.catchTag("SqlError", (cause) => {
+              presenceDirty = true
+              return Effect.logWarning("Offline wake presence cleanup failed", cause)
+            })
+          )
+          yield* notify
+        }))
+    )
+  })
+
+  const countPresenceDifferences = SqlSchema.findOne({
+    Request: Schema.Struct({ databaseRuntimeId: Schema.String, encoded: Schema.String }),
+    Result: CountRow,
+    execute: ({ databaseRuntimeId, encoded }) =>
+      sql`SELECT
+        (SELECT COUNT(*) FROM json_each(${encoded}) AS local_presence
+          WHERE NOT EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS durable
+            WHERE durable.runtime_id = ${databaseRuntimeId}
+              AND durable.watcher_id = json_extract(local_presence.value, '$.watcherId')))
+        + (SELECT COUNT(*) FROM effect_local_server_watch_presence AS durable
+          WHERE durable.runtime_id = ${databaseRuntimeId}
+            AND NOT EXISTS (SELECT 1 FROM json_each(${encoded}) AS local_presence
+              WHERE json_extract(local_presence.value, '$.watcherId') = durable.watcher_id)) AS count`
   })
 
   const heartbeat = Effect.fnUntraced(function*(heartbeatAt: number) {
@@ -648,7 +684,8 @@ export const make = Effect.fnUntraced(function*<R,>(
       databaseRuntimeId: runtimeId,
       expiresAt: heartbeatAt + presenceLeaseMillis
     })
-    if (Option.isSome(updated)) return
+    if (Option.isSome(updated) && !presenceDirty) return
+    presenceDirty = true
     yield* presenceGate.withPermit(Effect.gen(function*() {
       const encoded = yield* Codec.stringify([...presences].map(([watcherId, presence]) => ({
         watcherId,
@@ -670,16 +707,21 @@ export const make = Effect.fnUntraced(function*<R,>(
                 AND wake.claim_token IS NOT NULL AND wake.claimed_until > ${heartbeatAt})
             ON CONFLICT (space_id, client_id, watcher_id) DO UPDATE SET
               runtime_id = excluded.runtime_id`
+        yield* sql`DELETE FROM effect_local_server_watch_presence
+          WHERE runtime_id = ${runtimeId}
+            AND watcher_id NOT IN (SELECT json_extract(value, '$.watcherId') FROM json_each(${encoded}))`
       }))
+      const differences = yield* countPresenceDifferences({ databaseRuntimeId: runtimeId, encoded })
+      presenceDirty = differences.count > 0
     }))
   })
 
   yield* Effect.sleep(presenceHeartbeatMillis).pipe(
     Effect.andThen(Clock.currentTimeMillis),
     Effect.flatMap(heartbeat),
-    Effect.catchTags({
-      SqlError: (cause) => Effect.logWarning("Offline wake presence heartbeat failed", cause),
-      StorageUnavailable: (cause) => Effect.logWarning("Offline wake presence heartbeat failed", cause)
+    Effect.catchCause((cause) => {
+      if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+      return Effect.logWarning("Offline wake presence heartbeat failed", cause)
     }),
     Effect.forever,
     Effect.forkScoped
@@ -689,10 +731,10 @@ export const make = Effect.fnUntraced(function*<R,>(
   const polled = Effect.sleep(pollIntervalMillis)
   yield* Effect.raceFirst(prompted, polled).pipe(
     Effect.andThen(run),
-    Effect.catchTag("StorageUnavailable", () =>
-      Effect.logError("Offline wake dispatch failed").pipe(
-        Effect.annotateLogs({ "failure.tag": "StorageUnavailable" })
-      )),
+    Effect.catchCause((cause) => {
+      if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+      return Effect.logError("Offline wake dispatch failed", cause)
+    }),
     Effect.forever,
     Effect.forkScoped
   )

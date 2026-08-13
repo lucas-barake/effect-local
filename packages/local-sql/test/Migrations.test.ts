@@ -67,6 +67,13 @@ const tableNames = (sql: SqlClient.SqlClient) =>
     execute: () => sql`SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`
   })(undefined)
 
+const indexNames = (sql: SqlClient.SqlClient) =>
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: NameRow,
+    execute: () => sql`SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name`
+  })(undefined)
+
 const probeCount = (sql: SqlClient.SqlClient) =>
   SqlSchema.findOne({
     Request: Schema.Void,
@@ -206,6 +213,7 @@ describe("storage migration catalogs", () => {
       ])
       assert.notInclude(names, "effect_local_bootstrap")
       assert.notInclude(names, "effect_local_bootstrap_entities")
+      assert.include((yield* indexNames(sql)).map((row) => row.name), "effect_local_server_watch_presence_runtime")
     }, provideDatabase)
   )
 
