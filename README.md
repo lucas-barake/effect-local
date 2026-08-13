@@ -560,6 +560,49 @@ The authorization functions above are application Effects. Their requirements pr
 `ServerStore.layerTrusted` remains for tests and already trusted processes. Do not use a digest as authorization.
 Client and space ownership belongs in `authorizeAccess`.
 
+### Wake disconnected clients
+
+Add `offlineWake` when accepted mutations should notify clients without a live Watch. The library stores, coalesces,
+retries, and retires wake work. The application supplies authoritative space membership and provider delivery.
+
+```ts
+import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
+
+export const ServerLive = ServerStore.layer({
+  ...serverOptions,
+  offlineWake: {
+    recipients: ({ spaceId }) => Memberships.clientIds(spaceId),
+    deliver: (wake) =>
+      Memberships.deliverIfCurrent(
+        wake,
+        ({ wakeId, spaceId, clientId }) => Push.sendContentFree({ idempotencyKey: wakeId, spaceId, clientId })
+      ),
+    coalescingWindow: "2 seconds",
+    pollInterval: "1 second",
+    retryDelay: "1 second",
+    maximumRetryDelay: "1 minute",
+    claimLeaseDuration: "30 seconds",
+    hookTimeout: "10 seconds",
+    presenceLeaseDuration: "30 seconds",
+    presenceHeartbeatInterval: "10 seconds",
+    claimBatchSize: 128,
+    maximumConcurrentRecipientResolutions: 8,
+    maximumConcurrentDeliveries: 32,
+    maximumRecipientsPerSpace: 10_000
+  }
+})
+```
+
+The delivery hook must serialize its final membership check with the provider send, then return `"Delivered"` or
+`"NotRecipient"`. `"NotRecipient"` retires the current work. The hook receives routing and idempotency IDs, but no
+mutation or entity content. Keep provider-visible notification content free of those IDs and all sync data. Once
+delivery starts, it is at least once: a failure, defect, timeout, or database failure after the provider send can retry
+the same `wakeId`, so the send must be idempotent. The dispatcher coalesces mutations behind a high water fence. A live
+Watch suppresses delivery across all server runtimes sharing the database. An acknowledged Pull cursor retires covered
+work. Configure the same `offlineWake` adapter on every runtime that shares the database and accepts Watch streams so
+each runtime publishes its live presence. See [synchronization](docs/sync.md#offline-wake-delivery) for the full
+delivery and recovery contract.
+
 ### Negotiate one protocol for sync and presence
 
 During a protocol rollout, advertise the overlap on the server and share one client `ProtocolSession` between sync and

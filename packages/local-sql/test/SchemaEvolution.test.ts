@@ -422,7 +422,7 @@ const buildServer = <D extends Definition.Any,>(
   serverOptions?: Partial<Pick<ServerStore.Options, "acceptedSchemaVersions" | "retainedHistoryEntries">>
 ) => {
   const layerRuntime = MutationRuntime.layer(definition, configuredEvolution).pipe(Layer.provide(handlers))
-  let options: Parameters<typeof ServerStore.layerTrusted>[0] = {
+  let options: ServerStore.TrustedOptions = {
     ...serverHistory,
     definition,
     schemaEvolutionBatchSize: 1
@@ -1373,11 +1373,17 @@ describe("client schema evolution", () => {
         const sql = yield* SqlClient.SqlClient
         const localV1 = yield* buildStore(definitionV1, layerHandlersV1)
         const serverV1 = yield* buildServer(definitionV1, layerHandlersV1)
+        yield* sql`INSERT INTO effect_local_server_offline_wake_acknowledgements
+          (space_id, client_id, acknowledged_sequence) VALUES (${spaceId}, ${clientId}, 1)`
         const accepted = yield* localV1.mutate(PutTodoV1, { id: "4", title: "accepted-old" })
         assert.strictEqual((yield* serverV1.submit(accepted.envelope))._tag, "Accepted")
         const offline = yield* localV1.mutate(PutTodoV1, { id: "5", title: "offline-old" })
 
         const serverV2 = yield* buildServer(definitionV2, layerHandlersV2, evolution)
+        const wakeAcknowledgements = yield* sql<{ readonly acknowledged_sequence: number }>`
+          SELECT acknowledged_sequence FROM effect_local_server_offline_wake_acknowledgements
+          WHERE space_id = ${spaceId} AND client_id = ${clientId}`
+        assert.deepStrictEqual(wakeAcknowledgements, [{ acknowledged_sequence: 1 }])
         yield* serverV2.pull(pullRequest(definitionV2))
 
         const offlineReceipt = yield* serverV2.submit({

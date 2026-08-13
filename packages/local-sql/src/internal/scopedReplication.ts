@@ -1221,6 +1221,14 @@ export const make = (options: Options) => {
           onSome: Effect.succeed
         }))
       )
+      yield* sql`INSERT INTO effect_local_server_offline_wake_acknowledgements
+        (space_id, client_id, acknowledged_sequence)
+        VALUES (${request.spaceId}, ${request.clientId}, ${currentView.delivered_sequence})
+        ON CONFLICT (space_id, client_id) DO UPDATE SET
+          acknowledged_sequence = MAX(acknowledged_sequence, excluded.acknowledged_sequence)`
+      yield* sql`DELETE FROM effect_local_server_offline_wakes
+        WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}
+          AND high_water_sequence <= ${currentView.delivered_sequence}`
       let changes: ReadonlyArray<Protocol.ViewChange> | undefined
       if (
         schemaIsCurrent && currentView.scope_digest === normalizedDigest &&
