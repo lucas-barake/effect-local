@@ -1,17 +1,21 @@
-import { NodeCrypto } from "@effect/platform-node"
+import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Model from "@lucas-barake/effect-local/Model"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
+import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -299,6 +303,645 @@ describe("scoped replication", () => {
         assert.deepStrictEqual(revokedBootstrap.entries, [])
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
+
+  it.effect("authorizes only changed and acknowledged entities on a steady pull", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let entityAuthorizations = 0
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer((input) => {
+            if (input._tag !== "Entity") return Effect.void
+            entityAuthorizations++
+            if (
+              typeof input.entity.key === "string" && input.entity.key.startsWith("hidden-") &&
+              input.principal !== "owner"
+            ) {
+              return Effect.fail("hidden")
+            }
+            return Effect.void
+          })
+        )
+        for (let index = 0; index < 28; index++) {
+          yield* server.submit(yield* envelope(`hidden-${index}`, index + 1))
+        }
+        yield* server.submit(yield* envelope("visible-a", 29))
+        yield* server.submit(yield* envelope("visible-b", 30))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        const bootstrap = yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        assert.isFalse(bootstrap.hasMore)
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        assert.deepStrictEqual(settled.changes, [])
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        yield* server.submit(yield* envelope("visible-a", 31, "renamed"))
+        entityAuthorizations = 0
+        const page = yield* server.pullAuthorized(pullRequest(acknowledged.cursor), "reader")
+        if ("_tag" in page) assert.fail("expected incremental page")
+        assert.deepStrictEqual(page.changes.map((change) => change._tag), ["Upsert"])
+        assert.isAtMost(entityAuthorizations, 10)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("delivers a diff larger than the page limit completely across pulls", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        yield* server.submit(yield* envelope("seed", 1))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        yield* server.submit(yield* putManyEnvelope(250, 2))
+        let cursor = acknowledged.cursor
+        const delivered = new Map<string, string>()
+        const pageSizes: Array<number> = []
+        for (let round = 0; round < 10; round++) {
+          const page = yield* server.pullAuthorized(pullRequest(cursor), "reader")
+          if ("_tag" in page) assert.fail("expected incremental page")
+          pageSizes.push(page.changes.length)
+          assert.isAtMost(page.changes.length, 100)
+          for (const change of page.changes) {
+            assert.strictEqual(change._tag, "Upsert")
+            delivered.set(yield* Codec.stringify(change.entity.key), change._tag)
+          }
+          cursor = page.cursor
+          if (!page.hasMore && page.changes.length === 0) break
+        }
+        assert.strictEqual(delivered.size, 250)
+        assert.deepStrictEqual(pageSizes, [100, 100, 50, 0])
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("delivers a widened scope larger than the page limit completely across pulls", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        const empty = Protocol.ReplicationScope.make({ models: [] })
+        yield* server.submit(yield* putManyEnvelope(250, 1))
+        const required = yield* server.pullAuthorized(pullRequest(null, empty, 1), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(
+          Protocol.BootstrapRequest.make({ ...bootstrapRequest(required.manifest), scope: empty }),
+          "reader"
+        )
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor, empty, 1), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        assert.deepStrictEqual(settled.changes, [])
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor, empty, 1), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        let cursor = acknowledged.cursor
+        const delivered = new Set<string>()
+        const pageSizes: Array<number> = []
+        for (let round = 0; round < 10; round++) {
+          const page = yield* server.pullAuthorized(pullRequest(cursor, scope, 2), "reader")
+          if ("_tag" in page) assert.fail("expected incremental page")
+          pageSizes.push(page.changes.length)
+          assert.isAtMost(page.changes.length, 100)
+          for (const change of page.changes) {
+            assert.strictEqual(change._tag, "Upsert")
+            delivered.add(yield* Codec.stringify(change.entity.key))
+          }
+          cursor = page.cursor
+          if (!page.hasMore && page.changes.length === 0) break
+        }
+        assert.strictEqual(delivered.size, 250)
+        assert.deepStrictEqual(pageSizes, [100, 100, 50, 0])
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("retracts an acknowledged entity when authorization is revoked without a change", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let secondVisible = true
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer((input) => {
+            if (input._tag === "Entity" && input.entity.key === "second" && !secondVisible) {
+              return Effect.fail("revoked")
+            }
+            return Effect.void
+          })
+        )
+        yield* server.submit(yield* envelope("first", 1))
+        yield* server.submit(yield* envelope("second", 2))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        secondVisible = false
+        const revoked = yield* server.pullAuthorized(pullRequest(acknowledged.cursor), "reader")
+        if ("_tag" in revoked) assert.fail("expected incremental page")
+        assert.deepStrictEqual(
+          revoked.changes.map((change) => [change._tag, change.entity.key]),
+          [["Retract", "second"]]
+        )
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("reveals an unchanged entity only after read authorization is invalidated", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let hiddenVisible = false
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer((input) => {
+            if (input._tag === "Entity" && input.entity.key === "hidden" && !hiddenVisible) {
+              return Effect.fail("hidden")
+            }
+            return Effect.void
+          })
+        )
+        yield* server.submit(yield* envelope("open", 1))
+        yield* server.submit(yield* envelope("hidden", 2))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        hiddenVisible = true
+        const unchanged = yield* server.pullAuthorized(pullRequest(acknowledged.cursor), "reader")
+        if ("_tag" in unchanged) assert.fail("expected incremental page")
+        assert.deepStrictEqual(unchanged.changes, [])
+
+        yield* server.invalidateReadAuthorization(spaceId)
+        const revealed = yield* server.pullAuthorized(pullRequest(unchanged.cursor), "reader")
+        if ("_tag" in revealed) assert.fail("expected incremental page")
+        assert.deepStrictEqual(
+          revealed.changes.map((change) => [change._tag, change.entity.key]),
+          [["Upsert", "hidden"]]
+        )
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("falls back to a full derive when the log suffix is pruned", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer(defaultAuthorizeRead, { retainedHistoryEntries: 0 })
+        )
+        yield* server.submit(yield* envelope("seed", 1))
+        const required = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        yield* server.submit(yield* envelope("late-a", 2))
+        yield* server.submit(yield* envelope("late-b", 3))
+        yield* server.maintain(spaceId)
+
+        const recovered = yield* server.pullAuthorized(pullRequest(acknowledged.cursor), "reader")
+        if ("_tag" in recovered) assert.fail("expected incremental page")
+        const labels: Array<string> = []
+        for (const change of recovered.changes) {
+          labels.push(`${change._tag}:${yield* Codec.stringify(change.entity.key)}`)
+        }
+        assert.deepStrictEqual(
+          labels.toSorted((left, right) => left.localeCompare(right)),
+          ["Upsert:\"late-a\"", "Upsert:\"late-b\""]
+        )
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("replicates a bounded window per chat, pages older history on demand, and evicts it", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        const message = (id: string, chatId: string, sentAt: number, sequence: number) =>
+          Effect.gen(function*() {
+            const identity = {
+              spaceId,
+              clientId: writerId,
+              mutationId: Identity.MutationId.make(
+                `mut_00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`
+              ),
+              localSequence: Identity.LocalSequence.make(sequence),
+              basis: Identity.ServerSequence.make(0),
+              name: Domain.PutMessage.name,
+              payload: { id, chatId, sentAt, body: `body-${id}` },
+              digestVersion: 3 as const,
+              membershipIncarnation,
+              sourceSchema: Domain.definition.schemaIdentity,
+              mutationVersion: Domain.PutMessage.version
+            }
+            return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
+          })
+        let sequence = 0
+        for (let sentAt = 1; sentAt <= 10; sentAt++) {
+          yield* server.submit(yield* message(`a-${sentAt}`, "chat-a", sentAt, ++sequence))
+        }
+        for (let sentAt = 1; sentAt <= 5; sentAt++) {
+          yield* server.submit(yield* message(`b-${sentAt}`, "chat-b", sentAt, ++sequence))
+        }
+        const windowScope = (partitions?: ReadonlyArray<Protocol.ReplicationWindowPartition>) => {
+          let window = Protocol.ReplicationWindow.make({
+            model: Domain.Message.name,
+            index: "byChat",
+            count: 3
+          })
+          if (partitions !== undefined) window = Protocol.ReplicationWindow.make({ ...window, partitions })
+          return Protocol.ReplicationScope.make({ models: [], windows: [window] })
+        }
+        const keyOf = (change: Protocol.ViewChange) => {
+          if (typeof change.entity.key !== "string") assert.fail("expected string message key")
+          return change.entity.key
+        }
+        const keysOf = (changes: ReadonlyArray<Protocol.ViewChange>, tag: string) =>
+          changes.filter((change) => change._tag === tag)
+            .map(keyOf)
+            .toSorted((left, right) => left.localeCompare(right))
+
+        const required = yield* server.pullAuthorized(pullRequest(null, windowScope(), 1), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        const bootstrap = yield* server.bootstrapAuthorized(
+          Protocol.BootstrapRequest.make({
+            ...bootstrapRequest(required.manifest),
+            scope: windowScope()
+          }),
+          "reader"
+        )
+        assert.isFalse(bootstrap.hasMore)
+        assert.deepStrictEqual(
+          bootstrap.entries.map((entry) => keyOf(entry.change)).toSorted((left, right) => left.localeCompare(right)),
+          ["a-10", "a-8", "a-9", "b-3", "b-4", "b-5"]
+        )
+        const settled = yield* server.pullAuthorized(
+          pullRequest(required.manifest.cursor, windowScope(), 1),
+          "reader"
+        )
+        if ("_tag" in settled) assert.fail("expected steady page")
+        assert.deepStrictEqual(settled.changes, [])
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor, windowScope(), 1), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        yield* server.submit(yield* message("a-11", "chat-a", 11, ++sequence))
+        const slid = yield* server.pullAuthorized(pullRequest(acknowledged.cursor, windowScope(), 1), "reader")
+        if ("_tag" in slid) assert.fail("expected incremental page")
+        assert.deepStrictEqual(keysOf(slid.changes, "Upsert"), ["a-11"])
+        assert.deepStrictEqual(keysOf(slid.changes, "Retract"), ["a-8"])
+
+        const widened = windowScope([
+          Protocol.ReplicationWindowPartition.make({ key: ["chat-a"], count: 6 })
+        ])
+        const scrolled = yield* server.pullAuthorized(pullRequest(slid.cursor, widened, 2), "reader")
+        if ("_tag" in scrolled) assert.fail("expected incremental page after widening")
+        assert.deepStrictEqual(keysOf(scrolled.changes, "Upsert"), ["a-6", "a-7", "a-8"])
+        assert.deepStrictEqual(keysOf(scrolled.changes, "Retract"), [])
+
+        const evicted = yield* server.pullAuthorized(pullRequest(scrolled.cursor, windowScope(), 3), "reader")
+        if ("_tag" in evicted) assert.fail("expected incremental page after narrowing")
+        assert.deepStrictEqual(keysOf(evicted.changes, "Upsert"), [])
+        assert.deepStrictEqual(keysOf(evicted.changes, "Retract"), ["a-6", "a-7", "a-8"])
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("withholds unauthorized entities from a replication window", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        let hiddenVisible = false
+        const server = yield* service(
+          ServerStore.ServerStore,
+          makeServer((input) => {
+            if (
+              input._tag === "Entity" && typeof input.entity.key === "string" &&
+              input.entity.key.startsWith("secret") && !hiddenVisible
+            ) {
+              return Effect.fail("hidden")
+            }
+            return Effect.void
+          })
+        )
+        const message = (id: string, chatId: string, sentAt: number, sequence: number) =>
+          Effect.gen(function*() {
+            const identity = {
+              spaceId,
+              clientId: writerId,
+              mutationId: Identity.MutationId.make(
+                `mut_00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`
+              ),
+              localSequence: Identity.LocalSequence.make(sequence),
+              basis: Identity.ServerSequence.make(0),
+              name: Domain.PutMessage.name,
+              payload: { id, chatId, sentAt, body: `body-${id}` },
+              digestVersion: 3 as const,
+              membershipIncarnation,
+              sourceSchema: Domain.definition.schemaIdentity,
+              mutationVersion: Domain.PutMessage.version
+            }
+            return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
+          })
+        yield* server.submit(yield* message("open-1", "chat-a", 1, 1))
+        yield* server.submit(yield* message("secret-2", "chat-a", 2, 2))
+        yield* server.submit(yield* message("open-3", "chat-a", 3, 3))
+        const windowed = Protocol.ReplicationScope.make({
+          models: [],
+          windows: [Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "byChat", count: 3 })]
+        })
+        const required = yield* server.pullAuthorized(pullRequest(null, windowed, 1), "reader")
+        if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+        const bootstrap = yield* server.bootstrapAuthorized(
+          Protocol.BootstrapRequest.make({ ...bootstrapRequest(required.manifest), scope: windowed }),
+          "reader"
+        )
+        assert.deepStrictEqual(
+          bootstrap.entries.map((entry) => {
+            if (typeof entry.change.entity.key !== "string") assert.fail("expected string message key")
+            return entry.change.entity.key
+          }).toSorted((left, right) => left.localeCompare(right)),
+          ["open-1", "open-3"]
+        )
+        const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor, windowed, 1), "reader")
+        if ("_tag" in settled) assert.fail("expected steady page")
+        const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor, windowed, 1), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        yield* server.submit(yield* message("secret-4", "chat-a", 4, 4))
+        const withheld = yield* server.pullAuthorized(pullRequest(acknowledged.cursor, windowed, 1), "reader")
+        if ("_tag" in withheld) assert.fail("expected incremental page")
+        assert.deepStrictEqual(
+          withheld.changes.map((change) => [change._tag, change.entity.key]),
+          [["Retract", "open-1"]]
+        )
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rotates a staged snapshot when an entity leaves its window", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        const message = (id: string, sentAt: number) =>
+          Effect.gen(function*() {
+            const identity = {
+              spaceId,
+              clientId: writerId,
+              mutationId: Identity.MutationId.make(
+                `mut_00000000-0000-4000-8000-${String(sentAt).padStart(12, "0")}`
+              ),
+              localSequence: Identity.LocalSequence.make(sentAt),
+              basis: Identity.ServerSequence.make(0),
+              name: Domain.PutMessage.name,
+              payload: { id, chatId: "chat-a", sentAt, body: id },
+              digestVersion: 3 as const,
+              membershipIncarnation,
+              sourceSchema: Domain.definition.schemaIdentity,
+              mutationVersion: Domain.PutMessage.version
+            }
+            return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
+          })
+        const windowed = Protocol.ReplicationScope.make({
+          models: [],
+          windows: [Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "byChat", count: 1 })]
+        })
+        yield* server.submit(yield* message("m-1", 1))
+        const required = yield* server.pullAuthorized(pullRequest(null, windowed), "reader")
+        if (!("_tag" in required)) assert.fail("expected bootstrap")
+
+        yield* server.submit(yield* message("m-2", 2))
+        const page = yield* server.bootstrapAuthorized(
+          Protocol.BootstrapRequest.make({ ...bootstrapRequest(required.manifest), scope: windowed }),
+          "reader"
+        )
+        assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["m-2"])
+        assert.notStrictEqual(page.manifest.snapshotId, required.manifest.snapshotId)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rotates an outstanding page when an upsert leaves its window", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        const message = (id: string, sentAt: number) =>
+          Effect.gen(function*() {
+            const identity = {
+              spaceId,
+              clientId: writerId,
+              mutationId: Identity.MutationId.make(
+                `mut_00000000-0000-4000-8000-${String(sentAt).padStart(12, "0")}`
+              ),
+              localSequence: Identity.LocalSequence.make(sentAt),
+              basis: Identity.ServerSequence.make(0),
+              name: Domain.PutMessage.name,
+              payload: { id, chatId: "chat-a", sentAt, body: id },
+              digestVersion: 3 as const,
+              membershipIncarnation,
+              sourceSchema: Domain.definition.schemaIdentity,
+              mutationVersion: Domain.PutMessage.version
+            }
+            return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
+          })
+        const windowed = Protocol.ReplicationScope.make({
+          models: [],
+          windows: [Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "byChat", count: 1 })]
+        })
+        const required = yield* server.pullAuthorized(pullRequest(null, windowed), "reader")
+        if (!("_tag" in required)) assert.fail("expected bootstrap")
+        yield* server.bootstrapAuthorized(
+          Protocol.BootstrapRequest.make({ ...bootstrapRequest(required.manifest), scope: windowed }),
+          "reader"
+        )
+        const steady = yield* server.pullAuthorized(pullRequest(required.manifest.cursor, windowed), "reader")
+        if ("_tag" in steady) assert.fail("expected steady page")
+        const acknowledged = yield* server.pullAuthorized(pullRequest(steady.cursor, windowed), "reader")
+        if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+        yield* server.submit(yield* message("m-1", 1))
+        const outstanding = yield* server.pullAuthorized(pullRequest(acknowledged.cursor, windowed), "reader")
+        if ("_tag" in outstanding) assert.fail("expected outstanding page")
+        yield* server.submit(yield* message("m-2", 2))
+        const replacement = yield* server.pullAuthorized(pullRequest(acknowledged.cursor, windowed), "reader")
+        assert.isTrue("_tag" in replacement)
+        if ("_tag" in replacement) assert.strictEqual(replacement._tag, "BootstrapRequired")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects a replication window naming an inherited index property", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        yield* server.submit(yield* envelope("public", 1))
+        const windowed = Protocol.ReplicationScope.make({
+          models: [],
+          windows: [
+            Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "constructor", count: 1 })
+          ]
+        })
+        const outcome = yield* server.pullAuthorized(pullRequest(null, windowed, 1), "reader").pipe(Effect.result)
+        if (outcome._tag !== "Failure") assert.fail("expected a protocol rejection")
+        assert.strictEqual(outcome.failure._tag, "ProtocolInvalid")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects a replication window bound whose type does not match the sort component", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        yield* server.submit(yield* envelope("public", 1))
+        const windowed = Protocol.ReplicationScope.make({
+          models: [],
+          windows: [
+            Protocol.ReplicationWindow.make({
+              model: Domain.Message.name,
+              index: "byChat",
+              count: 1,
+              partitions: [
+                Protocol.ReplicationWindowPartition.make({
+                  key: ["chat-a"],
+                  bounds: Protocol.ReplicationWindowBounds.make({ gt: true })
+                })
+              ]
+            })
+          ]
+        })
+        const outcome = yield* server.pullAuthorized(pullRequest(null, windowed, 1), "reader").pipe(Effect.result)
+        if (outcome._tag !== "Failure") assert.fail("expected a protocol rejection")
+        assert.strictEqual(outcome.failure._tag, "ProtocolInvalid")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("accepts the maximum bounded partition override set", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        const windowed = Protocol.ReplicationScope.make({
+          models: [],
+          windows: [
+            Protocol.ReplicationWindow.make({
+              model: Domain.Message.name,
+              index: "byChat",
+              count: 1,
+              partitions: Array.from(
+                { length: Protocol.maximumReplicationWindowPartitions },
+                (_, index) => Protocol.ReplicationWindowPartition.make({ key: [`chat-${index}`] })
+              )
+            })
+          ]
+        })
+        const result = yield* server.pullAuthorized(pullRequest(null, windowed, 1), "reader")
+        assert.isTrue("_tag" in result)
+        if ("_tag" in result) assert.strictEqual(result._tag, "BootstrapRequired")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("replaces a windowed view when the index layout changes", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const fs = yield* FileSystem.FileSystem
+        const directory = yield* fs.makeTempDirectoryScoped()
+        const filename = `${directory}/index-layout.sqlite`
+        const reorderedMessage = Model.make(Domain.Message.name, {
+          version: Domain.Message.version,
+          key: Domain.Message.key,
+          schema: Domain.Message.schema,
+          indexes: {
+            byChat: {
+              version: 2,
+              partition: Domain.Message.indexes.byChat.partition,
+              sort: [{
+                name: "body",
+                affinity: "text",
+                schema: Schema.String,
+                extract: (message: typeof Domain.Message.schema.Type) => message.body
+              }]
+            }
+          }
+        })
+        const reorderedDefinition = Definition.make({
+          version: Domain.definition.version,
+          models: [Domain.Todo, reorderedMessage],
+          mutations: Domain.definition.mutations,
+          queries: Domain.definition.queries
+        })
+        assert.deepStrictEqual(reorderedDefinition.schemaIdentity, Domain.definition.schemaIdentity)
+        assert.strictEqual(reorderedDefinition.hash, Domain.definition.hash)
+        assert.notStrictEqual(reorderedDefinition.indexLayoutHash, Domain.definition.indexLayoutHash)
+        const persistentDatabase = () =>
+          Layer.mergeAll(
+            SqliteClient.layer({ filename, disableWAL: true }),
+            NodeCrypto.layer,
+            Reactivity.layer,
+            QueryReactivity.layer
+          )
+        const build = (definition: Definition.Any) =>
+          Layer.build(
+            ServerStore.layer({
+              ...history,
+              definition,
+              readAuthorizationRefreshInterval: "1 second",
+              authorizeAccess: () => Effect.void,
+              authorizeMutation: () => Effect.void,
+              authorizeRead: () => Effect.void
+            }).pipe(
+              Layer.provide(MutationRuntime.layer(definition).pipe(Layer.provide(Domain.handlers))),
+              Layer.provideMerge(persistentDatabase())
+            )
+          ).pipe(Effect.map((context) => Context.get(context, ServerStore.ServerStore)))
+        const message = (id: string, sentAt: number, body: string) =>
+          Effect.gen(function*() {
+            const identity = {
+              spaceId,
+              clientId: writerId,
+              mutationId: Identity.MutationId.make(
+                `mut_00000000-0000-4000-8000-${String(sentAt).padStart(12, "0")}`
+              ),
+              localSequence: Identity.LocalSequence.make(sentAt),
+              basis: Identity.ServerSequence.make(0),
+              name: Domain.PutMessage.name,
+              payload: { id, chatId: "chat-a", sentAt, body },
+              digestVersion: 3 as const,
+              membershipIncarnation,
+              sourceSchema: Domain.definition.schemaIdentity,
+              mutationVersion: Domain.PutMessage.version
+            }
+            return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
+          })
+        const windowed = Protocol.ReplicationScope.make({
+          models: [],
+          windows: [Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "byChat", count: 2 })]
+        })
+
+        const first = yield* build(Domain.definition)
+        yield* first.submit(yield* message("m-1", 1, "z"))
+        yield* first.submit(yield* message("m-2", 2, "a"))
+        yield* first.submit(yield* message("m-3", 3, "b"))
+        const required = yield* first.pullAuthorized(pullRequest(null, windowed), "reader")
+        if (!("_tag" in required)) assert.fail("expected bootstrap")
+        const page = yield* first.bootstrapAuthorized(
+          Protocol.BootstrapRequest.make({ ...bootstrapRequest(required.manifest), scope: windowed }),
+          "reader"
+        )
+        assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["m-2", "m-3"])
+
+        const second = yield* build(reorderedDefinition)
+        const replacement = yield* second.pullAuthorized(
+          pullRequest(required.manifest.cursor, windowed),
+          "reader"
+        )
+        assert.isTrue("_tag" in replacement)
+        if ("_tag" in replacement) {
+          assert.strictEqual(replacement._tag, "BootstrapRequired")
+          assert.notStrictEqual(replacement.manifest.cursor.viewId, required.manifest.cursor.viewId)
+        }
+      })
+    ).pipe(Effect.provide(Layer.merge(NodeFileSystem.layer, NodeCrypto.layer))))
 
   it.effect("emits a periodic revocation hint", () =>
     Effect.scoped(
@@ -903,6 +1546,79 @@ describe("scoped replication", () => {
         assert.isTrue(Result.isFailure(outcome))
         if (Result.isFailure(outcome)) assert.strictEqual(outcome.failure._tag, "StorageCorrupt")
       }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects authoritative log metadata that conflicts with its entry", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const context = yield* Layer.build(
+          ServerStore.layer({
+            ...history,
+            definition: Domain.definition,
+            readAuthorizationRefreshInterval: "1 second",
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => Effect.void
+          }).pipe(Layer.provide(runtime), Layer.provideMerge(database))
+        )
+        const server = Context.get(context, ServerStore.ServerStore)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const initial = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in initial)) assert.fail("expected bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(initial.manifest), "reader")
+
+        yield* server.submit(yield* envelope("corrupt-log", 1))
+        yield* sql`UPDATE effect_local_authoritative_log SET client_id = ${readerId}
+          WHERE space_id = ${spaceId} AND server_sequence = 1`
+
+        const outcome = yield* server.pullAuthorized(pullRequest(initial.manifest.cursor), "reader").pipe(
+          Effect.result
+        )
+        assert.isTrue(Result.isFailure(outcome))
+        if (Result.isFailure(outcome)) assert.strictEqual(outcome.failure._tag, "StorageCorrupt")
+        const pages = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_replication_pages WHERE space_id = ${spaceId} AND client_id = ${readerId}`
+        assert.deepStrictEqual(pages, [{ count: 0 }])
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects corrupt server index catalog object names before cleanup", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const fs = yield* FileSystem.FileSystem
+        const directory = yield* fs.makeTempDirectoryScoped()
+        const filename = `${directory}/corrupt-index-catalog.sqlite`
+        const persistentDatabase = () =>
+          Layer.mergeAll(
+            SqliteClient.layer({ filename, disableWAL: true }),
+            NodeCrypto.layer,
+            Reactivity.layer,
+            QueryReactivity.layer
+          )
+        const serverLayer = () =>
+          ServerStore.layer({
+            ...history,
+            definition: Domain.definition,
+            readAuthorizationRefreshInterval: "1 second",
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => Effect.void
+          }).pipe(Layer.provide(runtime), Layer.provideMerge(persistentDatabase()))
+        const context = yield* Layer.build(serverLayer())
+        const sql = Context.get(context, SqlClient.SqlClient)
+        yield* sql`CREATE TABLE unrelated_user_data (value INTEGER NOT NULL)`
+        yield* sql`INSERT INTO unrelated_user_data VALUES (1)`
+        yield* sql`INSERT INTO effect_local_server_index_catalog
+          (model, index_name, descriptor_hash, table_name, scan_index_name)
+          VALUES (${"obsolete"}, ${"obsolete"}, ${"0".repeat(16)},
+            ${"unrelated_user_data"}, ${"unrelated_user_data_scan"})`
+
+        const outcome = yield* Layer.build(serverLayer()).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(outcome))
+        if (Result.isFailure(outcome)) assert.strictEqual(outcome.failure._tag, "StorageCorrupt")
+        const rows = yield* sql<{ readonly value: number }>`SELECT value FROM unrelated_user_data`
+        assert.deepStrictEqual(rows, [{ value: 1 }])
+      }).pipe(Effect.provide(Layer.merge(NodeFileSystem.layer, NodeCrypto.layer)))
     ))
 
   it.effect("rotates a snapshot when its persisted value is no longer current", () =>

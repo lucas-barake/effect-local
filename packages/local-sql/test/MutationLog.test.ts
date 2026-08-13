@@ -1016,7 +1016,6 @@ describe("server reconciled mutation log", () => {
         yield* server.pull(pullRequest((yield* local.replicationState).cursor))
       )
       const pull = yield* Stream.toPull(local.settlements)
-
       yield* local.persistReceipt(receipt)
       yield* local.applyViewPage({ ...page, hasMore: true })
       yield* server.maintain(spaceId)
@@ -1077,8 +1076,10 @@ describe("server reconciled mutation log", () => {
       const page = incremental(
         yield* server.pull(pullRequest((yield* local.replicationState).cursor))
       )
-      const pull = yield* Stream.toPull(local.settlements)
-
+      const settlementFiber = yield* local.settlements.pipe(
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
       yield* local.persistReceipt(receipt)
       yield* Ref.set(failPreparation, true)
       const failed = yield* local.applyViewPage(page).pipe(Effect.exit)
@@ -1089,10 +1090,8 @@ describe("server reconciled mutation log", () => {
       yield* local.applyViewPage(incremental(
         yield* server.pull(pullRequest((yield* local.replicationState).cursor))
       ))
-      assert.deepStrictEqual(
-        (yield* pull).map((settlement) => settlement.pending.envelope.mutationId),
-        [pending.envelope.mutationId]
-      )
+      const delivered = Option.getOrThrow(yield* Fiber.join(settlementFiber))
+      assert.strictEqual(delivered.pending.envelope.mutationId, pending.envelope.mutationId)
       assert.strictEqual(yield* local.pendingCount, 0)
     })))
 
@@ -2235,9 +2234,71 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(pending.envelope.mutationId))._tag, "Accepted")
     })))
 
+  it.effect("rebases pending reads over an incrementally applied page", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const clientDatabase = database()
+        const live = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+          Layer.provide(runtime),
+          Layer.provide(clientDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(live, clientDatabase))
+        const local = Context.get(context, LocalStore.Store)
+        const server = yield* service(ServerStore.ServerStore, serverLayer())
+
+        yield* installFreshView(local, server)
+        const base = yield* local.mutate(Domain.PutTodo, Domain.todo("base"))
+        const baseReceipt = yield* server.submit(base.envelope)
+        yield* local.applyReceipt(baseReceipt)
+        const settledState = yield* local.replicationState
+        yield* local.applyViewPage(incremental(yield* server.pull(pullRequest(settledState.cursor))))
+
+        yield* local.mutate(Domain.IncrementTodo, { id: "base", delta: 1 })
+        assert.strictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "base")).count, 1)
+
+        const remoteIncarnation = Identity.MembershipIncarnation.make(
+          "inc_00000000-0000-4000-8000-000000000099"
+        )
+        yield* server.submit(
+          yield* envelope(
+            Domain.PutTodo.name,
+            { ...Domain.todo("base"), count: 5 },
+            1,
+            Identity.MutationId.make("mut_00000000-0000-4000-8099-000000000001"),
+            remoteIncarnation
+          )
+        )
+
+        const state = yield* local.replicationState
+        yield* local.applyViewPage(incremental(yield* server.pull(pullRequest(state.cursor))))
+
+        assert.strictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "base")).count, 6)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("publishes a complete projection after bounded replay", () =>
     Effect.scoped(Effect.gen(function*() {
-      const clientDatabase = database()
+      const actualSql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
+        Effect.provide(Reactivity.layer)
+      )
+      const statements: Array<{ readonly sql: string; readonly parameters: ReadonlyArray<unknown> }> = []
+      const observedSql = new Proxy(actualSql, {
+        apply: (target, thisArgument, argumentsList) => {
+          if (Array.isArray(argumentsList[0])) {
+            statements.push({
+              sql: argumentsList[0].join("?").replace(/\s+/g, " ").trim(),
+              parameters: argumentsList.slice(1)
+            })
+          }
+          return Reflect.apply(target, thisArgument, argumentsList)
+        }
+      })
+      const clientDatabase = Layer.mergeAll(
+        Layer.succeed(SqlClient.SqlClient, observedSql),
+        NodeCrypto.layer,
+        Reactivity.layer,
+        QueryReactivity.layer
+      )
       const live = LocalStore.layer({
         ...clientHistory,
         definition: Domain.definition,
@@ -2255,14 +2316,28 @@ describe("server reconciled mutation log", () => {
 
       yield* installFreshView(local, server)
 
-      const first = yield* local.mutate(Domain.PutTodo, Domain.todo("projection-1"))
-      yield* local.mutate(Domain.PutTodo, Domain.todo("projection-2"))
-      const receipt = yield* server.submit(first.envelope)
+      const pending = yield* Effect.forEach(
+        Array.from({ length: 12 }, (_, index) => `projection-${index + 1}`),
+        (id) => local.mutate(Domain.PutTodo, Domain.todo(id))
+      )
+      const receipt = yield* server.submit(pending[0].envelope)
       const state = yield* local.replicationState
       const page = incremental(yield* server.pull(pullRequest(state.cursor)))
 
       yield* local.applyReceipt(receipt)
+      statements.length = 0
       yield* local.applyViewPage(page)
+
+      const identityReads = statements.filter(({ sql: query }) =>
+        query.startsWith("SELECT local_sequence, changes_json FROM effect_local_client_pending_data")
+      )
+      const fullReads = statements.filter(({ parameters, sql: query }) =>
+        query.startsWith("SELECT p.membership_incarnation") && query.includes("ORDER BY p.local_sequence LIMIT") &&
+        parameters.at(-1) === 1
+      )
+      assert.isAtLeast(identityReads.length, 13)
+      assert.isAtLeast(fullReads.length, 13)
+      assert.isTrue(identityReads.every(({ parameters }) => parameters.at(-1) === 1))
 
       const projection = yield* SqlSchema.findOne({
         Request: Schema.Void,
@@ -2283,11 +2358,11 @@ describe("server reconciled mutation log", () => {
           WHERE s.space_id = ${spaceId}`
       })(undefined)
       assert.isNull(projection.replay)
-      assert.strictEqual(projection.active_rows, 2)
+      assert.strictEqual(projection.active_rows, 12)
       assert.strictEqual(projection.inactive_rows, 0)
       assert.deepStrictEqual(
-        Option.getOrThrow(yield* local.get(Domain.Todo, "projection-2")),
-        Domain.todo("projection-2")
+        Option.getOrThrow(yield* local.get(Domain.Todo, "projection-12")),
+        Domain.todo("projection-12")
       )
     })))
 

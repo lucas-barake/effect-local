@@ -285,11 +285,41 @@ new generation after a terminal failure. `SqlReplica.layer` remains the explicit
 
 ## Replication scope and read authorization
 
-`scope` is the model subscription for the replica. It applies to every joined space. The current scope shape is an
-explicit set of model names. An empty set is valid. Key ranges, rolling time windows, lazy fetches, and time based
-eviction are not part of this contract. When a replica starts with a changed configured scope, it advances a durable
-scope generation. Widening backfills newly selected entities through ordinary pull pages. Narrowing sends `Retract`
-changes so excluded entities disappear locally without replacing the database or doing a full bootstrap.
+`scope` is the replication subscription for the replica. It applies to every joined space. A scope names fully
+replicated models and, separately, windowed models. An empty scope is valid. When a replica starts with a changed
+configured scope, it advances a durable scope generation. Widening backfills newly selected entities through ordinary
+pull pages. Narrowing sends `Retract` changes so excluded entities disappear locally without replacing the database or
+doing a full bootstrap.
+
+A window bounds a model to the newest `count` entities per partition of one of its secondary indexes, ordered by the
+index sort descending. Per-partition overrides raise the count or add a leading-sort-component range, which is how a
+client pages older history in and evicts it again. Scroll-back and eviction are plain scope changes, so they reuse the
+same generation fencing, pages, and retractions as any other scope transition. The client needs no window logic: slid
+or evicted entities arrive as retractions. A windowed scope requires the caller to be on the current server schema;
+clients mid rolling upgrade keep full model scopes until they upgrade.
+One scope can contain at most 1,000 windows, 1,000 partition overrides in total, and 4 MiB of encoded data.
+
+```ts
+const scope = Protocol.ReplicationScope.make({
+  models: [],
+  windows: [Protocol.ReplicationWindow.make({ model: "Message", index: "byChat", count: 50 })]
+})
+
+const scrolledBack = Protocol.ReplicationScope.make({
+  models: [],
+  windows: [Protocol.ReplicationWindow.make({
+    model: "Message",
+    index: "byChat",
+    count: 50,
+    partitions: [Protocol.ReplicationWindowPartition.make({ key: ["chat-42"], count: 200 })]
+  })]
+})
+```
+
+Steady pulls are derived from the authoritative log suffix since a per-view delivered watermark: the server touches
+only the entities that changed, the partitions those changes affected, and the client's acknowledged view, instead of
+rescanning the space. The full re-derive remains the fallback for scope changes, schema changes, pruned history, and
+read authorization invalidation.
 
 The server computes effective visibility as the intersection of the requested scope and `authorizeRead`. It first
 calls the policy with `_tag: "Scope"`, before disclosing space or schema state. It then calls the policy with
@@ -330,6 +360,12 @@ client's scope or visibility. A retraction removes canonical and visible state a
 optimistic mutation cannot resurrect revoked data. Later authorization can send an `Upsert` and clear the fence.
 Watches carry only wake hints. Pull rechecks the policy. `readAuthorizationRefreshInterval` supplies periodic hints so
 a policy-only revocation is eventually retracted even when no mutation changes that entity.
+
+Every pull re-evaluates `authorizeRead` for each entity the client currently holds, so a revocation retracts on the
+next pull even when the entity itself never changed. The reverse direction is not free under incremental pulls: a
+policy flip that newly grants an entity untouched since the client's watermark stays invisible until something changes
+it. When authorization depends on external state, call `ServerStore.invalidateReadAuthorization(spaceId)` after that
+state changes; the next pull of each affected client re-derives its complete view.
 
 ## Server and WebSocket RPC
 
@@ -629,6 +665,10 @@ The complete deployment sequence is:
 - Accepted server sequences are dense per space. Clients install only contiguous entries.
 - Pull entries expose only public mutation identity and canonical changes. Payloads and success results are not in the
   shared authoritative log.
+- Steady sync cost is proportional to the changed entities and the client's acknowledged view, not to space size. A
+  windowed scope bounds the acknowledged view, so per-message sync stays flat as server history grows. Received pages
+  and settlements apply incrementally on the client; the full projection rebuild remains for bootstrap, revocation,
+  schema evolution, and crash recovery.
 - A terminal rejection rolls back its optimistic write set and replays remaining pending mutations.
 - Queues, mutation payloads, presence payloads, pull pages, bootstrap pages, snapshots, receipts, and retained history
   are bounded by explicit configuration.

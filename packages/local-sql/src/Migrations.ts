@@ -1309,6 +1309,21 @@ const clientV12 = makeMigration({
   ]
 })
 
+const clientV13 = makeMigration({
+  id: 13,
+  name: "projection-dirty-entities",
+  statements: [
+    `CREATE TABLE effect_local_client_projection_dirty (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL CHECK (model_version > 0),
+      entity_key TEXT NOT NULL,
+      PRIMARY KEY (space_id, schema_generation, model, entity_key)
+    )`
+  ]
+})
+
 export const clientCatalog = Object.freeze([
   clientV1,
   clientV2,
@@ -1321,7 +1336,8 @@ export const clientCatalog = Object.freeze([
   clientV9,
   clientV10,
   clientV11,
-  clientV12
+  clientV12,
+  clientV13
 ])
 
 const serverV6 = makeMigration({
@@ -1630,6 +1646,50 @@ const serverV9 = makeMigration({
   ]
 })
 
+const serverV10 = makeMigration({
+  id: 10,
+  name: "server-secondary-indexes",
+  statements: [
+    `CREATE TABLE effect_local_server_index_catalog (
+      model TEXT NOT NULL,
+      index_name TEXT NOT NULL,
+      descriptor_hash TEXT NOT NULL,
+      table_name TEXT NOT NULL UNIQUE,
+      scan_index_name TEXT NOT NULL UNIQUE,
+      PRIMARY KEY (model, index_name, descriptor_hash)
+    )`,
+    `CREATE TABLE effect_local_server_index_state (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
+      descriptor_hash TEXT NOT NULL,
+      built INTEGER NOT NULL DEFAULT 0 CHECK (built IN (0, 1)),
+      PRIMARY KEY (space_id, schema_generation, descriptor_hash)
+    )`,
+    `CREATE TABLE effect_local_server_index_partition_log (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
+      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
+      descriptor_hash TEXT NOT NULL,
+      partition_json TEXT NOT NULL CHECK (json_valid(partition_json)),
+      PRIMARY KEY (space_id, server_sequence, descriptor_hash, partition_json)
+    )`
+  ]
+})
+
+const serverV11 = makeMigration({
+  id: 11,
+  name: "scoped-replication-fences",
+  statements: [
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)",
+    "ALTER TABLE effect_local_server_replication_views ADD COLUMN delivered_sequence INTEGER NOT NULL DEFAULT 0 CHECK (delivered_sequence >= 0)",
+    "UPDATE effect_local_server_replication_views SET delivered_sequence = server_sequence",
+    "ALTER TABLE effect_local_server_replication_views ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)",
+    "ALTER TABLE effect_local_server_replication_pages ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)",
+    "ALTER TABLE effect_local_server_replication_views ADD COLUMN index_layout_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE effect_local_server_scoped_snapshots ADD COLUMN index_layout_hash TEXT NOT NULL DEFAULT ''"
+  ]
+})
+
 export const serverCatalog = Object.freeze([
   serverV1,
   serverV2,
@@ -1639,7 +1699,9 @@ export const serverCatalog = Object.freeze([
   serverV6,
   serverV7,
   serverV8,
-  serverV9
+  serverV9,
+  serverV10,
+  serverV11
 ])
 
 export const client = (options: {

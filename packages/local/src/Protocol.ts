@@ -4,12 +4,16 @@ import * as Canonical from "./Canonical.js"
 import type * as Definition from "./Definition.js"
 import * as Identity from "./Identity.js"
 import * as ReplicaError from "./ReplicaError.js"
+import type * as SecondaryIndex from "./SecondaryIndex.js"
 
 export const maximumMutationBytes = 256 * 1024
 export const maximumBatchEntries = 1_000
 export const maximumBatchBytes = 4 * 1024 * 1024
 export const maximumReceiptBytes = 4 * 1024 * 1024
 export const maximumPresenceBytes = 16 * 1024
+export const maximumReplicationScopeBytes = 4 * 1024 * 1024
+export const maximumReplicationWindows = 1_000
+export const maximumReplicationWindowPartitions = 1_000
 export const maximumPresenceTtlMillis = 60_000
 export const maximumBootstrapEntries = 1_000
 
@@ -112,29 +116,231 @@ export type ViewChange = typeof ViewChange.Type
 
 const ReplicationModelName = Schema.NonEmptyString.check(Schema.isMaxLength(256))
 
+const WindowComponentValue = Schema.Union([Schema.String, Schema.Number, Schema.Boolean])
+export type WindowComponentValue = typeof WindowComponentValue.Type
+
+export const ReplicationWindowBounds = Schema.Struct({
+  gt: Schema.optionalKey(WindowComponentValue),
+  gte: Schema.optionalKey(WindowComponentValue),
+  lt: Schema.optionalKey(WindowComponentValue),
+  lte: Schema.optionalKey(WindowComponentValue)
+})
+export type ReplicationWindowBounds = typeof ReplicationWindowBounds.Type
+
+export const ReplicationWindowPartition = Schema.Struct({
+  key: Schema.Array(WindowComponentValue),
+  count: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
+  bounds: Schema.optionalKey(ReplicationWindowBounds)
+})
+export type ReplicationWindowPartition = typeof ReplicationWindowPartition.Type
+
+export const ReplicationWindow = Schema.Struct({
+  model: ReplicationModelName,
+  index: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  count: Schema.Int.check(Schema.isGreaterThan(0)),
+  partitions: Schema.optionalKey(
+    Schema.Array(ReplicationWindowPartition).check(Schema.isMaxLength(maximumReplicationWindowPartitions))
+  )
+})
+export type ReplicationWindow = typeof ReplicationWindow.Type
+
 export const ReplicationScope = Schema.Struct({
-  models: Schema.Array(ReplicationModelName).check(Schema.isUnique())
+  models: Schema.Array(ReplicationModelName).check(Schema.isUnique()),
+  windows: Schema.optionalKey(Schema.Array(ReplicationWindow).check(Schema.isMaxLength(maximumReplicationWindows)))
 })
 export type ReplicationScope = typeof ReplicationScope.Type
 
 export const replicationScopeDigest = (scope: ReplicationScope) =>
   Canonical.digest({ format: 1, scope }).pipe(Effect.map((value) => MutationDigest.make(value)))
 
-export const normalizeReplicationScope = (scope: ReplicationScope): ReplicationScope =>
-  ReplicationScope.make({ models: scope.models.toSorted() })
+const comparePartitionKeys = (left: ReplicationWindowPartition, right: ReplicationWindowPartition) => {
+  const leftKey = Canonical.stringify(left.key)
+  const rightKey = Canonical.stringify(right.key)
+  if (leftKey < rightKey) return -1
+  if (leftKey > rightKey) return 1
+  return 0
+}
+
+export const normalizeReplicationScope = (scope: ReplicationScope): ReplicationScope => {
+  if (scope.windows === undefined || scope.windows.length === 0) {
+    return ReplicationScope.make({ models: scope.models.toSorted() })
+  }
+  const windows = scope.windows.map((window) => {
+    if (window.partitions === undefined) return window
+    const partitions = window.partitions.toSorted(comparePartitionKeys)
+    return ReplicationWindow.make({ ...window, partitions })
+  }).toSorted((left, right) => {
+    if (left.model < right.model) return -1
+    if (left.model > right.model) return 1
+    if (left.index < right.index) return -1
+    if (left.index > right.index) return 1
+    return 0
+  })
+  return ReplicationScope.make({ models: scope.models.toSorted(), windows })
+}
+
+const affinityMatches = (
+  affinity: "text" | "real" | "integer",
+  value: WindowComponentValue
+): boolean => {
+  if (affinity === "text") return typeof value === "string"
+  if (affinity === "real") return typeof value === "number"
+  return typeof value === "boolean" || (typeof value === "number" && Number.isSafeInteger(value))
+}
+
+const canonicalPartitionValue = (value: WindowComponentValue): string | number => {
+  if (value === true) return 1
+  if (value === false) return 0
+  return value
+}
 
 export const validateReplicationScope = (
   definition: Definition.Any,
   scope: ReplicationScope
-): Effect.Effect<ReplicationScope, ReplicaError.ProtocolInvalid> => {
-  const normalized = normalizeReplicationScope(scope)
-  for (const model of normalized.models) {
-    if (!definition.modelByName.has(model)) {
-      return Effect.fail(new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${model}` }))
+): Effect.Effect<ReplicationScope, ReplicaError.ProtocolInvalid> =>
+  Effect.gen(function*() {
+    const scopeBytes = yield* encodedBytesEffect(scope).pipe(
+      Effect.mapError((cause) =>
+        new ReplicaError.ProtocolInvalid({ message: "Replication scope cannot be canonically encoded", cause })
+      )
+    )
+    if (scopeBytes > maximumReplicationScopeBytes) {
+      return yield* new ReplicaError.ProtocolInvalid({
+        message: `Replication scope exceeds ${maximumReplicationScopeBytes} encoded bytes`
+      })
     }
-  }
-  return Effect.succeed(normalized)
-}
+    const normalized = normalizeReplicationScope(scope)
+    for (const model of normalized.models) {
+      if (!definition.modelByName.has(model)) {
+        return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${model}` })
+      }
+    }
+    if (normalized.windows === undefined) return normalized
+    const seen = new Set<string>()
+    let partitionCount = 0
+    for (const window of normalized.windows) {
+      const label = `${window.model}/${window.index}`
+      const identity = Canonical.stringify([window.model, window.index])
+      if (normalized.models.includes(window.model)) {
+        return yield* new ReplicaError.ProtocolInvalid({
+          message: `Model ${window.model} cannot be both fully replicated and windowed`
+        })
+      }
+      if (seen.has(identity)) {
+        return yield* new ReplicaError.ProtocolInvalid({ message: `Duplicate replication window: ${label}` })
+      }
+      seen.add(identity)
+      const model = definition.modelByName.get(window.model)
+      if (model === undefined) {
+        return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${window.model}` })
+      }
+      let index: SecondaryIndex.Any | undefined
+      if (Object.hasOwn(model.indexes, window.index)) index = model.indexes[window.index]
+      if (index === undefined) {
+        return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown replication window index: ${label}` })
+      }
+      if (index.sort.length === 0) {
+        return yield* new ReplicaError.ProtocolInvalid({
+          message: `Replication window index ${label} has no sort component`
+        })
+      }
+      partitionCount += window.partitions?.length ?? 0
+      if (partitionCount > maximumReplicationWindowPartitions) {
+        return yield* new ReplicaError.ProtocolInvalid({
+          message: `Replication scope exceeds ${maximumReplicationWindowPartitions} partition overrides`
+        })
+      }
+      const seenPartitions = new Set<string>()
+      for (const partition of window.partitions ?? []) {
+        if (partition.key.length !== index.partition.length) {
+          return yield* new ReplicaError.ProtocolInvalid({
+            message: `Replication window partition for ${label} expects ${index.partition.length} key components`
+          })
+        }
+        for (let component = 0; component < partition.key.length; component++) {
+          const input = partition.key[component]
+          const descriptor = index.partition[component]
+          if (!affinityMatches(descriptor.affinity, input)) {
+            return yield* new ReplicaError.ProtocolInvalid({
+              message: `Replication window partition key for ${label} does not match the index component types`
+            })
+          }
+          const decoded = yield* Schema.decodeUnknownEffect(descriptor.schema)(input).pipe(
+            Effect.mapError((cause) =>
+              new ReplicaError.ProtocolInvalid({
+                message: `Replication window partition key for ${label} does not match the component schema`,
+                cause
+              })
+            )
+          )
+          const encoded = yield* Schema.encodeEffect(descriptor.schema)(decoded).pipe(
+            Effect.mapError((cause) =>
+              new ReplicaError.ProtocolInvalid({
+                message: `Replication window partition key for ${label} cannot be canonically encoded`,
+                cause
+              })
+            )
+          )
+          if (!Object.is(encoded, input)) {
+            return yield* new ReplicaError.ProtocolInvalid({
+              message: `Replication window partition key for ${label} is not the canonical encoding`
+            })
+          }
+        }
+        const partitionIdentity = Canonical.stringify(partition.key.map(canonicalPartitionValue))
+        if (seenPartitions.has(partitionIdentity)) {
+          return yield* new ReplicaError.ProtocolInvalid({
+            message: `Duplicate replication window partition for ${label}`
+          })
+        }
+        seenPartitions.add(partitionIdentity)
+        if (partition.bounds !== undefined) {
+          for (
+            const bound of [
+              partition.bounds.gt,
+              partition.bounds.gte,
+              partition.bounds.lt,
+              partition.bounds.lte
+            ]
+          ) {
+            if (bound === undefined) continue
+            const leading = index.sort[0]
+            if (!affinityMatches(leading.affinity, bound)) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Replication window bounds for ${label} do not match the leading sort component type`
+              })
+            }
+            const decoded = yield* Schema.decodeUnknownEffect(leading.schema)(bound).pipe(
+              Effect.mapError((cause) =>
+                new ReplicaError.ProtocolInvalid({
+                  message: `Replication window bounds for ${label} do not match the component schema`,
+                  cause
+                })
+              )
+            )
+            const encoded = yield* Schema.encodeEffect(leading.schema)(decoded).pipe(
+              Effect.mapError((cause) =>
+                new ReplicaError.ProtocolInvalid({
+                  message: `Replication window bound for ${label} cannot be canonically encoded`,
+                  cause
+                })
+              )
+            )
+            if (!Object.is(encoded, bound)) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Replication window bound for ${label} is not the canonical encoding`
+              })
+            }
+          }
+        }
+      }
+    }
+    return normalized
+  })
+
+export const replicationScopeCoversModel = (scope: ReplicationScope, model: string): boolean =>
+  scope.models.includes(model) ||
+  (scope.windows !== undefined && scope.windows.some((window) => window.model === model))
 
 export const ReplicationCursor = Schema.Struct({
   viewId: Identity.ReplicationViewId,

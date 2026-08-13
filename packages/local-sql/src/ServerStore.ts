@@ -24,16 +24,19 @@ import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as AcceptedLog from "./internal/acceptedLog.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
 import * as ReadAuthorization from "./internal/readAuthorization.js"
 import * as Rows from "./internal/rows.js"
 import * as ScopedReplication from "./internal/scopedReplication.js"
+import * as ServerIndex from "./internal/serverIndex.js"
 import * as ServerMetrics from "./internal/serverMetrics.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as TerminalRejection from "./internal/TerminalRejection.js"
 import * as SqlTransaction from "./internal/transaction.js"
 import * as WakeVisibility from "./internal/wakeVisibility.js"
+import * as WindowSchema from "./internal/windowSchema.js"
 import * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
 import * as SchemaEvolution from "./SchemaEvolution.js"
@@ -91,6 +94,9 @@ export interface Service {
   >
   readonly maintain: (spaceId: Identity.SpaceId) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly maintainAll: Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly invalidateReadAuthorization: (
+    spaceId: Identity.SpaceId
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly watchAuthorized: (
     request: Protocol.WatchRequest,
     principal: typeof Schema.Json.Type
@@ -303,6 +309,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         })
       }
       yield* Migrations.server(options.migration)
+      const serverIndexes = yield* ServerIndex.make(sql, options.definition)
       const metrics = ServerMetrics.make({
         history: options.maximumHistoryEntries,
         receipts: options.maximumReceipts
@@ -637,9 +644,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             onNone: () => Effect.succeed(undefined),
             onSome: (row) =>
               Effect.gen(function*() {
-                const entry = yield* Codec.parse(row.entry_json).pipe(
-                  Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
-                )
+                const entry = yield* AcceptedLog.decode(row)
                 if (
                   row.space_id !== envelope.spaceId ||
                   row.server_sequence !== receipt.serverSequence ||
@@ -647,21 +652,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   row.membership_incarnation !== envelope.membershipIncarnation ||
                   row.local_sequence !== envelope.localSequence ||
                   row.mutation_id !== envelope.mutationId ||
-                  row.digest !== envelope.digest ||
-                  row.source_schema_version !== entry.sourceSchema.version ||
-                  row.source_schema_hash !== entry.sourceSchema.hash ||
-                  entry.spaceId !== row.space_id ||
-                  entry.sequence !== row.server_sequence ||
-                  entry.clientId !== row.client_id ||
-                  entry.membershipIncarnation !== row.membership_incarnation ||
-                  entry.localSequence !== row.local_sequence ||
-                  entry.mutationId !== row.mutation_id ||
-                  entry.digest !== row.digest ||
-                  row.entry_bytes !== (yield* Protocol.encodedBytesEffect(entry)) ||
-                  row.entry_json !== (yield* Codec.stringify(entry))
+                  row.digest !== envelope.digest
                 ) {
                   return yield* new ReplicaError.StorageCorrupt({
-                    message: `Accepted entry ${row.server_sequence} conflicts with its durable metadata`
+                    message: `Accepted entry ${row.server_sequence} conflicts with its submitted mutation`
                   })
                 }
                 return entry.changes
@@ -1334,6 +1328,12 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                     ${envelope.mutationId}, ${envelope.digest}, ${entryBytes}, ${entryJson},
                     ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash},
                     ${mutation.mutationVersion})`
+                yield* serverIndexes.apply(
+                  envelope.spaceId,
+                  storedSpace.active_schema_generation,
+                  entry.sequence,
+                  entry.changes
+                )
                 wakeChanges = entry.changes
                 receipt = executed.success.receipt
               }
@@ -1677,6 +1677,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 const through = history.at(-1)!.server_sequence
                 yield* sql`DELETE FROM effect_local_authoritative_log
                   WHERE space_id = ${candidate.manifest.spaceId} AND server_sequence <= ${through}`
+                yield* sql`DELETE FROM effect_local_server_index_partition_log
+                  WHERE space_id = ${candidate.manifest.spaceId} AND server_sequence <= ${through}`
               }
               const receipts = yield* findReceiptPrune({
                 spaceId: candidate.manifest.spaceId,
@@ -1798,7 +1800,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           entity: authorizeReadEntity
         },
         resolveDefinition: validateCallerSchema,
-        projectEntity: projectScopedEntity
+        projectEntity: projectScopedEntity,
+        windows: serverIndexes
       })
       const preauthorizedScopedReplication = ScopedReplication.make({
         sql,
@@ -1812,7 +1815,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           entity: authorizeReadEntity
         },
         resolveDefinition: validateCallerSchema,
-        projectEntity: projectScopedEntity
+        projectEntity: projectScopedEntity,
+        windows: serverIndexes
       })
       const countAcknowledgedEntities = SqlSchema.findOne({
         Request: Schema.Struct({
@@ -1845,7 +1849,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         changes: ReadonlyArray<Protocol.EntityChange>
       ) =>
         Effect.gen(function*() {
-          const scoped = changes.filter((change) => request.scope.models.includes(change.entity.model))
+          const scoped = changes.filter((change) =>
+            Protocol.replicationScopeCoversModel(request.scope, change.entity.model)
+          )
           if (scoped.length === 0) return false
           const identities = yield* Effect.forEach(scoped, (change) =>
             Codec.stringify(change.entity.key).pipe(
@@ -2085,9 +2091,17 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         prepareBootstrapAuthorized,
         maintain,
         maintainAll,
+        invalidateReadAuthorization: (spaceId) =>
+          sql`UPDATE effect_local_server_spaces SET read_auth_epoch = read_auth_epoch + 1
+            WHERE space_id = ${spaceId}`.pipe(
+            Effect.asVoid,
+            Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+            Effect.withSpan("ServerStore.invalidateReadAuthorization", { attributes: { "space.id": spaceId } })
+          ),
         watch: (request) => {
           return Stream.unwrap(
             Protocol.validateReplicationScope(options.definition, request.scope).pipe(
+              Effect.tap((scope) => WindowSchema.validate(scope, request.schema, options.definition.schemaIdentity)),
               Effect.flatMap((scope) => prepareSpace(request.spaceId, request.schema).pipe(Effect.as(scope))),
               Effect.map((scope) => watch({ ...request, scope }, null))
             )
@@ -2098,6 +2112,11 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             const authorization = yield* captureReadAuthorization(request, principal)
             yield* readAuthorizations.authorize(authorization.key, authorization.lookup).pipe(
               Effect.tapErrorTag("CapacityExceeded", () => metrics.recordRejection("CapacityExceeded"))
+            )
+            yield* WindowSchema.validate(
+              authorization.request.scope,
+              authorization.request.schema,
+              options.definition.schemaIdentity
             )
             yield* prepareSpace(request.spaceId, request.schema)
             return watch(authorization.request, authorization.principal, authorization)

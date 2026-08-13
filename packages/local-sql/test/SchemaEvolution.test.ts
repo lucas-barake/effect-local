@@ -73,7 +73,19 @@ const serverHistory = {
 const TodoV1 = Model.make("Todo", {
   version: 1,
   key: Schema.String,
-  schema: Schema.Struct({ id: Schema.String, title: Schema.String })
+  schema: Schema.Struct({ id: Schema.String, title: Schema.String }),
+  indexes: {
+    byTitle: {
+      version: 1,
+      partition: [],
+      sort: [{
+        name: "title",
+        affinity: "text",
+        schema: Schema.String,
+        extract: (todo: { readonly title: string }) => todo.title
+      }]
+    }
+  }
 })
 const PutTodoV1 = Mutation.make("PutTodo", {
   version: 1,
@@ -89,7 +101,19 @@ const handlersV1 = PutTodoV1.toLayer(({ payload, transaction }) =>
 const TodoV2 = Model.make("Todo", {
   version: 2,
   key: Schema.Number,
-  schema: Schema.Struct({ id: Schema.Number, title: Schema.String, done: Schema.Boolean })
+  schema: Schema.Struct({ id: Schema.Number, title: Schema.String, done: Schema.Boolean }),
+  indexes: {
+    byTitle: {
+      version: 1,
+      partition: [],
+      sort: [{
+        name: "title",
+        affinity: "text",
+        schema: Schema.String,
+        extract: (todo: { readonly title: string }) => todo.title
+      }]
+    }
+  }
 })
 const PutTodoV2 = Mutation.make("PutTodo", {
   version: 2,
@@ -139,7 +163,19 @@ const rejectingHandlersV2 = PutTodoV2.toLayer(() => Effect.fail("schema-policy-r
 const TodoV3 = Model.make("Todo", {
   version: 3,
   key: Schema.Number,
-  schema: Schema.Struct({ id: Schema.Number, title: Schema.String, done: Schema.Boolean, priority: Schema.Number })
+  schema: Schema.Struct({ id: Schema.Number, title: Schema.String, done: Schema.Boolean, priority: Schema.Number }),
+  indexes: {
+    byTitle: {
+      version: 1,
+      partition: [],
+      sort: [{
+        name: "title",
+        affinity: "text",
+        schema: Schema.String,
+        extract: (todo: { readonly title: string }) => todo.title
+      }]
+    }
+  }
 })
 const PutTodoV3 = Mutation.make("PutTodo", {
   version: 3,
@@ -597,9 +633,9 @@ describe("client schema evolution", () => {
         rejection: "server-rejected"
       })
       yield* v1.persistReceipt(receipt)
-      yield* sql`CREATE TRIGGER fail_projection_promotion BEFORE UPDATE OF active_projection_generation
+      yield* sql`CREATE TRIGGER fail_projection_promotion BEFORE UPDATE OF visible_revision
         ON effect_local_client_spaces
-        WHEN NEW.active_projection_generation <> OLD.active_projection_generation
+        WHEN NEW.visible_revision <> OLD.visible_revision
         BEGIN SELECT RAISE(ABORT, 'projection failed'); END`
 
       const failedSettlement = yield* v1.settleReceipts.pipe(Effect.result)
@@ -1704,6 +1740,27 @@ describe("client schema evolution", () => {
           value: { id: "42", title: "mixed-version" }
         })
       }])
+    })).pipe(Effect.provide(database)))
+
+  it.effect("rejects a historical schema for a windowed watch", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const server = yield* buildServer(definitionV2, handlersV2, evolution, { acceptedSchemaVersions: 1 })
+      const outcome = yield* server.watchAuthorized(
+        Protocol.WatchRequest.make({
+          spaceId,
+          clientId,
+          schema: definitionV1.schemaIdentity,
+          scope: Protocol.ReplicationScope.make({
+            models: [],
+            windows: [Protocol.ReplicationWindow.make({ model: TodoV1.name, index: "byTitle", count: 1 })]
+          }),
+          scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+          cursor: null
+        }),
+        "principal"
+      ).pipe(Effect.result)
+      assert.isTrue(Result.isFailure(outcome))
+      if (Result.isFailure(outcome)) assert.strictEqual(outcome.failure._tag, "ProtocolInvalid")
     })).pipe(Effect.provide(database)))
 
   it.effect("rejects an accepted schema window without complete downgrade transforms", () =>
