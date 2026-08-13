@@ -2278,7 +2278,27 @@ describe("server reconciled mutation log", () => {
 
   it.effect("publishes a complete projection after bounded replay", () =>
     Effect.scoped(Effect.gen(function*() {
-      const clientDatabase = database()
+      const actualSql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
+        Effect.provide(Reactivity.layer)
+      )
+      const statements: Array<{ readonly sql: string; readonly parameters: ReadonlyArray<unknown> }> = []
+      const observedSql = new Proxy(actualSql, {
+        apply: (target, thisArgument, argumentsList) => {
+          if (Array.isArray(argumentsList[0])) {
+            statements.push({
+              sql: argumentsList[0].join("?").replace(/\s+/g, " ").trim(),
+              parameters: argumentsList.slice(1)
+            })
+          }
+          return Reflect.apply(target, thisArgument, argumentsList)
+        }
+      })
+      const clientDatabase = Layer.mergeAll(
+        Layer.succeed(SqlClient.SqlClient, observedSql),
+        NodeCrypto.layer,
+        Reactivity.layer,
+        QueryReactivity.layer
+      )
       const live = LocalStore.layer({
         ...clientHistory,
         definition: Domain.definition,
@@ -2305,7 +2325,19 @@ describe("server reconciled mutation log", () => {
       const page = incremental(yield* server.pull(pullRequest(state.cursor)))
 
       yield* local.applyReceipt(receipt)
+      statements.length = 0
       yield* local.applyViewPage(page)
+
+      const identityReads = statements.filter(({ sql: query }) =>
+        query.startsWith("SELECT local_sequence, changes_json FROM effect_local_client_pending_data")
+      )
+      const fullReads = statements.filter(({ parameters, sql: query }) =>
+        query.startsWith("SELECT p.membership_incarnation") && query.includes("ORDER BY p.local_sequence LIMIT") &&
+        parameters.at(-1) === 1
+      )
+      assert.isAtLeast(identityReads.length, 13)
+      assert.isAtLeast(fullReads.length, 13)
+      assert.isTrue(identityReads.every(({ parameters }) => parameters.at(-1) === 1))
 
       const projection = yield* SqlSchema.findOne({
         Request: Schema.Void,

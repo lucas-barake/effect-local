@@ -412,6 +412,16 @@ export const layer = (
           )
           ORDER BY p.local_sequence LIMIT ${limit}`
       })
+      const findReplayPendingChangesBatch = SqlSchema.findAll({
+        Request: Schema.Struct({ after: Schema.Int, limit: Schema.Int }),
+        Result: Schema.Struct({ local_sequence: Identity.LocalSequence, changes_json: Schema.String }),
+        execute: ({ after, limit }) =>
+          sql`SELECT local_sequence, changes_json FROM effect_local_client_pending_data
+          WHERE space_id = ${options.spaceId} AND schema_generation = (
+            SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+            AND local_sequence > ${after}
+          ORDER BY local_sequence LIMIT ${limit}`
+      })
       const deletePendingByMutationIds = SqlSchema.findAll({
         Request: Schema.Array(Identity.MutationId),
         Result: Schema.Struct({ mutation_id: Identity.MutationId }),
@@ -1552,13 +1562,15 @@ export const layer = (
         }
         let after = 0
         while (true) {
-          const batch = yield* findReplayPendingBatch({ after, limit: projectionReplayBatchSize }).pipe(
+          const batch = yield* findReplayPendingChangesBatch({ after, limit: projectionReplayBatchSize }).pipe(
             Effect.mapError(StorageUnavailable.make)
           )
           if (batch.length === 0) break
           for (const row of batch) {
-            const item = yield* decodePendingRow(row)
-            for (const change of item.changes) {
+            const changes = yield* Codec.parse(row.changes_json).pipe(
+              Effect.flatMap((value) => Codec.decode(Schema.Array(Protocol.EntityChange), value))
+            )
+            for (const change of changes) {
               record(change.entity, yield* Codec.stringify(change.entity.key))
             }
           }
