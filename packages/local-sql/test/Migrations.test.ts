@@ -21,6 +21,12 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000000
 const LedgerRow = Schema.Struct({ id: Schema.Number, name: Schema.String, checksum: Schema.String })
 const NameRow = Schema.Struct({ name: Schema.String })
 const CountRow = Schema.Struct({ count: Schema.Number })
+const UpgradedScopedRow = Schema.Struct({
+  delivered_sequence: Schema.Number,
+  read_auth_epoch: Schema.Number,
+  view_layout: Schema.String,
+  snapshot_layout: Schema.String
+})
 const ClientReplicationMetaRow = Schema.Struct({
   replication_view_id: Schema.NullOr(Schema.String),
   replication_view_revision: Schema.Number,
@@ -139,7 +145,7 @@ describe("storage migration catalogs", () => {
       )
       assert.deepStrictEqual(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
       )
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
@@ -176,6 +182,48 @@ describe("storage migration catalogs", () => {
       ])
       assert.notInclude(names, "effect_local_bootstrap")
       assert.notInclude(names, "effect_local_bootstrap_entities")
+    }).pipe(Effect.provide(database)))
+
+  it.effect("preserves released server migration checksums and upgrades scoped storage", () =>
+    Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      assert.strictEqual(Migrations.serverCatalog[6].checksum, "165fbc25e03ae1c8")
+      yield* Migrations.runCatalog("Server", Migrations.serverCatalog.slice(0, 9))
+      yield* sql`INSERT INTO effect_local_server_replication_views
+        (space_id, client_id, principal_digest, view_id, view_revision, scope_generation,
+          scope_json, scope_digest, definition_hash, schema_version, schema_hash, server_sequence)
+        VALUES (${spaceId}, ${clientId}, ${"0".repeat(64)}, ${"view-1"}, 0, 1,
+          ${"{\"models\":[]}"}, ${"1".repeat(64)}, ${"definition"}, 1, ${"schema"}, 7)`
+      yield* sql`INSERT INTO effect_local_server_scoped_snapshots
+        (snapshot_id, space_id, client_id, principal_digest, definition_hash, schema_version,
+          schema_hash, scope_json, scope_digest, scope_generation, view_id, view_revision,
+          server_sequence, terminal_sequence, entry_count, content_bytes, digest)
+        VALUES (${"snapshot-1"}, ${spaceId}, ${clientId}, ${"0".repeat(64)}, ${"definition"}, 1,
+          ${"schema"}, ${"{\"models\":[]}"}, ${"1".repeat(64)}, 1, ${"view-1"}, 0, 7, 7, 0, 0,
+          ${"2".repeat(64)})`
+
+      yield* Migrations.server()
+
+      const upgraded = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: UpgradedScopedRow,
+        execute: () =>
+          sql`SELECT v.delivered_sequence, v.read_auth_epoch, v.index_layout_hash AS view_layout,
+            s.index_layout_hash AS snapshot_layout
+          FROM effect_local_server_replication_views AS v
+          INNER JOIN effect_local_server_scoped_snapshots AS s
+            ON s.space_id = v.space_id AND s.client_id = v.client_id`
+      })(undefined)
+      assert.deepStrictEqual(upgraded, {
+        delivered_sequence: 7,
+        read_auth_epoch: 0,
+        view_layout: "",
+        snapshot_layout: ""
+      })
+      assert.deepStrictEqual(
+        (yield* serverMigrationLedger(sql)).map((row) => row.id),
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+      )
     }).pipe(Effect.provide(database)))
 
   it.effect("initializes scoped storage without fabricating a client view", () =>

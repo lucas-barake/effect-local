@@ -1354,7 +1354,6 @@ const serverV7 = makeMigration({
   name: "generation-owned-storage",
   statements: [
     "ALTER TABLE effect_local_server_spaces ADD COLUMN active_schema_generation INTEGER NOT NULL DEFAULT 0 CHECK (active_schema_generation >= 0)",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)",
     "ALTER TABLE effect_local_server_evolution ADD COLUMN source_generation INTEGER NOT NULL DEFAULT 0 CHECK (source_generation >= 0)",
     "ALTER TABLE effect_local_server_evolution ADD COLUMN target_entity_count INTEGER NOT NULL DEFAULT 0 CHECK (target_entity_count >= 0)",
     "ALTER TABLE effect_local_server_evolution ADD COLUMN target_entity_bytes INTEGER NOT NULL DEFAULT 0 CHECK (target_entity_bytes >= 0)",
@@ -1434,12 +1433,9 @@ const serverV7 = makeMigration({
       scope_json TEXT NOT NULL CHECK (json_valid(scope_json)),
       scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
       definition_hash TEXT NOT NULL,
-      index_layout_hash TEXT NOT NULL,
       schema_version INTEGER NOT NULL,
       schema_hash TEXT NOT NULL,
       server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
-      delivered_sequence INTEGER NOT NULL DEFAULT 0 CHECK (delivered_sequence >= 0),
-      read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0),
       PRIMARY KEY (space_id, client_id)
     )`,
     `CREATE TABLE effect_local_server_replication_view_entities (
@@ -1469,7 +1465,6 @@ const serverV7 = makeMigration({
       content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
       digest TEXT NOT NULL CHECK (length(digest) = 64),
       has_more INTEGER NOT NULL CHECK (has_more IN (0, 1)),
-      read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0),
       PRIMARY KEY (space_id, client_id)
     )`,
     `CREATE TABLE effect_local_server_scoped_snapshots (
@@ -1478,7 +1473,6 @@ const serverV7 = makeMigration({
       client_id TEXT NOT NULL,
       principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
       definition_hash TEXT NOT NULL,
-      index_layout_hash TEXT NOT NULL,
       schema_version INTEGER NOT NULL,
       schema_hash TEXT NOT NULL,
       scope_json TEXT NOT NULL CHECK (json_valid(scope_json)),
@@ -1682,6 +1676,20 @@ const serverV10 = makeMigration({
   ]
 })
 
+const serverV11 = makeMigration({
+  id: 11,
+  name: "scoped-replication-fences",
+  statements: [
+    "ALTER TABLE effect_local_server_spaces ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)",
+    "ALTER TABLE effect_local_server_replication_views ADD COLUMN delivered_sequence INTEGER NOT NULL DEFAULT 0 CHECK (delivered_sequence >= 0)",
+    "UPDATE effect_local_server_replication_views SET delivered_sequence = server_sequence",
+    "ALTER TABLE effect_local_server_replication_views ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)",
+    "ALTER TABLE effect_local_server_replication_pages ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)",
+    "ALTER TABLE effect_local_server_replication_views ADD COLUMN index_layout_hash TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE effect_local_server_scoped_snapshots ADD COLUMN index_layout_hash TEXT NOT NULL DEFAULT ''"
+  ]
+})
+
 export const serverCatalog = Object.freeze([
   serverV1,
   serverV2,
@@ -1692,7 +1700,8 @@ export const serverCatalog = Object.freeze([
   serverV7,
   serverV8,
   serverV9,
-  serverV10
+  serverV10,
+  serverV11
 ])
 
 export const client = (options: {
