@@ -21,6 +21,7 @@ import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as AttachmentClient from "../src/AttachmentClient.js"
+import * as AttachmentServer from "../src/AttachmentServer.js"
 import * as AttachmentTransfer from "../src/AttachmentTransfer.js"
 import * as FileSystemAttachmentStorage from "../src/FileSystemAttachmentStorage.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -167,27 +168,83 @@ describe("replica attachments", () => {
         const connected = yield* Deferred.make<void>()
         const submitted = yield* Deferred.make<void>()
         const events = yield* Ref.make<ReadonlyArray<string>>([])
-        const uploadedBytes = yield* Ref.make<Uint8Array | undefined>(undefined)
         const layerServerDatabase = SqliteClient.layer({ filename: `${root}/server.sqlite`, disableWAL: true })
+        const layerServerStorage = FileSystemAttachmentStorage.layer({
+          directory: `${root}/server-objects`,
+          maximumBytes: 8
+        })
+        const layerServerInfrastructure = Layer.merge(layerServerDatabase, layerServerStorage)
+        const layerServerAttachments = AttachmentServer.layer({
+          maximumObjectBytes: 8,
+          maximumObjectsPerSpace: 4,
+          maximumBytesPerSpace: 32,
+          uploadGrantLifetime: "1 hour",
+          uploadLeaseLifetime: "1 minute",
+          stagingLifetime: "1 day",
+          garbageCollectionGracePeriod: "1 hour",
+          deletionBatchSize: 8,
+          authorizeAccess: () => Effect.void,
+          authorizeUpload: () => Effect.void,
+          authorizeRead: () => Effect.void
+        }).pipe(Layer.provide(layerServerInfrastructure))
         const layerRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(layerHandlers))
         const layerServer = ServerStore.layerTrusted(serverOptions).pipe(
+          Layer.provide(layerServerAttachments),
           Layer.provide(layerRuntime),
           Layer.provide(layerServerDatabase),
           Layer.provide(NodeCrypto.layer),
           Layer.provide(Reactivity.layer)
         )
-        const serverContext = yield* Layer.build(layerServer)
+        const serverContext = yield* Layer.mergeAll(
+          layerServer,
+          layerServerAttachments,
+          layerServerInfrastructure
+        ).pipe(Layer.build)
         const server = Context.get(serverContext, ServerStore.ServerStore)
+        const serverAttachments = Context.get(serverContext, AttachmentServer.AttachmentServer)
         const layerTransfer = Layer.succeed(
           AttachmentTransfer.AttachmentTransfer,
           AttachmentTransfer.AttachmentTransfer.of({
-            upload: Effect.fnUntraced(function*({ bytes }) {
+            upload: Effect.fnUntraced(function*({
+              bytes,
+              clientId: requestedClientId,
+              membershipIncarnation,
+              reference,
+              spaceId: requestedSpaceId
+            }) {
               yield* Deferred.await(connected)
-              const uploaded = yield* collectBytes(bytes)
-              yield* Ref.set(uploadedBytes, uploaded)
+              const identity = {
+                spaceId: requestedSpaceId,
+                clientId: requestedClientId,
+                membershipIncarnation,
+                reference,
+                principal: null
+              }
+              const prepared = yield* serverAttachments.prepareUpload(identity)
+              yield* serverAttachments.appendUpload({
+                ...identity,
+                expectedOffset: prepared.offset,
+                bytes
+              })
               yield* Ref.update(events, (current) => [...current, "upload"])
             }),
-            download: () => Stream.fail(new ReplicaError.ServerUnavailable())
+            download: ({
+              clientId: requestedClientId,
+              membershipIncarnation,
+              range,
+              reference,
+              spaceId: requestedSpaceId
+            }) => {
+              let request: Parameters<AttachmentServer.Service["read"]>[0] = {
+                spaceId: requestedSpaceId,
+                clientId: requestedClientId,
+                membershipIncarnation,
+                reference,
+                principal: null
+              }
+              if (range !== undefined) request = { ...request, range }
+              return serverAttachments.read(request)
+            }
           })
         )
         const layerConnectedRemote = Layer.succeed(
@@ -229,7 +286,7 @@ describe("replica attachments", () => {
         const space = yield* replica.space(spaceId)
         const reference = yield* space.stageAttachment(Stream.make(hello))
 
-        yield* space.mutate(PutMessage, {
+        const pending = yield* space.mutate(PutMessage, {
           id: "message-upload",
           body: "queued offline",
           attachment: reference
@@ -240,7 +297,16 @@ describe("replica attachments", () => {
         yield* Deferred.await(submitted)
 
         assert.deepStrictEqual(yield* Ref.get(events), ["upload", "submit"])
-        assert.deepStrictEqual(yield* Ref.get(uploadedBytes), hello)
+        assert.deepStrictEqual(
+          yield* collectBytes(serverAttachments.read({
+            spaceId,
+            clientId,
+            membershipIncarnation: pending.envelope.membershipIncarnation,
+            reference,
+            principal: null
+          })),
+          hello
+        )
       },
       provideNodeServices,
       Effect.scoped

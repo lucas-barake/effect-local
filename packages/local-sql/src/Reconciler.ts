@@ -105,6 +105,8 @@ const managedKey = (spaceId: Identity.SpaceId, generation: number) => `${spaceId
 const isTransientFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "AuthenticatorUnavailable" ||
   error._tag === "ServerUnavailable" ||
+  error._tag === "AttachmentUnavailable" ||
+  error._tag === "AttachmentUploadBusy" ||
   error._tag === "OperationTimeout"
 
 export const makeManager = Effect.fnUntraced(function*(options: {
@@ -235,6 +237,8 @@ export const makeManager = Effect.fnUntraced(function*(options: {
           InvalidAttachmentReference: (error) => Effect.die(error),
           AttachmentTooLarge: (error) => Effect.die(error),
           AttachmentNotFound: (error) => Effect.die(error),
+          AttachmentUnavailable: (error) => Effect.die(error),
+          AttachmentUploadBusy: (error) => Effect.die(error),
           AttachmentStorageError: (error) => Effect.die(error),
           AttachmentOffsetConflict: (error) => Effect.die(error),
           AttachmentLengthMismatch: (error) => Effect.die(error),
@@ -300,6 +304,8 @@ export const makeManager = Effect.fnUntraced(function*(options: {
           InvalidAttachmentReference: (error) => Effect.die(error),
           AttachmentTooLarge: (error) => Effect.die(error),
           AttachmentNotFound: (error) => Effect.die(error),
+          AttachmentUnavailable: (error) => Effect.die(error),
+          AttachmentUploadBusy: (error) => Effect.die(error),
           AttachmentStorageError: (error) => Effect.die(error),
           AttachmentOffsetConflict: (error) => Effect.die(error),
           AttachmentLengthMismatch: (error) => Effect.die(error),
@@ -680,7 +686,12 @@ export const layerOnePass = (
                     message: "Attachment transfer is not configured"
                   })
                 }
-                yield* attachments.value.ensureUploaded(options.spaceId, references)
+                yield* attachments.value.ensureUploaded(
+                  options.spaceId,
+                  mutation.envelope.clientId,
+                  mutation.envelope.membershipIncarnation,
+                  references
+                )
               }
               yield* local.markSubmitting(mutation.envelope.mutationId)
               const remoteReceipt = yield* remote.submit({

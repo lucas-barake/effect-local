@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
+import * as Ref from "effect/Ref"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -44,6 +45,7 @@ describe("attachment client", () => {
         const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-client-" })
         const database = `${root}/client.sqlite`
         const objects = `${root}/objects`
+        const downloads = yield* Ref.make(0)
         const layerDatabase = SqliteClient.layer({ filename: database, disableWAL: true }).pipe(
           Layer.provide(Reactivity.layer)
         )
@@ -53,7 +55,10 @@ describe("attachment client", () => {
           AttachmentTransfer.AttachmentTransfer,
           AttachmentTransfer.AttachmentTransfer.of({
             upload: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-            download: () => Stream.fail(new ReplicaError.ServerUnavailable())
+            download: () =>
+              Stream.fromEffect(
+                Ref.update(downloads, (count) => count + 1).pipe(Effect.as(hello))
+              )
           })
         )
         const layerClient = AttachmentClient.layer.pipe(
@@ -77,7 +82,10 @@ describe("attachment client", () => {
         const second = yield* Layer.buildWithScope(layerRuntime, secondScope)
         const restarted = Context.get(second, AttachmentClient.AttachmentClient)
         const restartedSql = Context.get(second, SqlClient.SqlClient)
-        assert.deepStrictEqual(yield* collectBytes(restarted.read(spaceId, reference)), hello)
+        assert.deepStrictEqual(
+          yield* collectBytes(restarted.read(spaceId, clientId, membershipIncarnation, reference)),
+          hello
+        )
         const objectKey = yield* restarted.objectKey(spaceId, reference)
 
         yield* restartedSql.withTransaction(Effect.gen(function*() {
@@ -95,6 +103,15 @@ describe("attachment client", () => {
         assert.strictEqual(yield* restarted.drainDeletions(8), 1)
         const stored = Context.get(second, AttachmentStorage.AttachmentStorage)
         assert.strictEqual(yield* stored.exists(objectKey), false)
+        assert.deepStrictEqual(
+          yield* collectBytes(restarted.read(spaceId, clientId, membershipIncarnation, reference)),
+          hello
+        )
+        assert.deepStrictEqual(
+          yield* collectBytes(restarted.read(spaceId, clientId, membershipIncarnation, reference)),
+          hello
+        )
+        assert.strictEqual(yield* Ref.get(downloads), 1)
         yield* Scope.close(secondScope, Exit.void)
       },
       provideNodeServices,

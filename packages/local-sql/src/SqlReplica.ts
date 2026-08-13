@@ -883,7 +883,15 @@ const makeLayer = <D extends Definition.Any, R,>(
             return Stream.scoped(
               Stream.fromEffect(runtimeLease).pipe(
                 Stream.tap((runtime) => checkRuntime(entry, runtime)),
-                Stream.flatMap(() => attachments.value.read(entry.spaceId, reference, range))
+                Stream.flatMap((runtime) =>
+                  attachments.value.read(
+                    entry.spaceId,
+                    options.clientId,
+                    runtime.local.membershipIncarnation,
+                    reference,
+                    range
+                  )
+                )
               )
             )
           },

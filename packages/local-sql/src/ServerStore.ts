@@ -25,6 +25,7 @@ import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as AttachmentServer from "./AttachmentServer.js"
 import * as AcceptedLog from "./internal/acceptedLog.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
@@ -229,6 +230,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
       const sql = yield* SqlClient.SqlClient
       const crypto = yield* Crypto.Crypto
       const runtime = yield* MutationRuntime.MutationRuntime
+      const attachments = yield* Effect.serviceOption(AttachmentServer.AttachmentServer)
       const evolution = options.evolution ?? Evolution.make({ current: options.definition })
       const acceptedSchemaVersions = options.acceptedSchemaVersions ?? 0
       if (!Number.isSafeInteger(acceptedSchemaVersions) || acceptedSchemaVersions < 0) {
@@ -1206,13 +1208,20 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               const changes: Array<Protocol.EntityChange> = []
               const mutationName = mutation.name
               const mutationPayload = mutation.payload
-              const transaction = SqlTransaction.server({
+              let transactionOptions: Parameters<typeof SqlTransaction.server>[0] = {
                 sql,
                 definition: options.definition,
                 spaceId: envelope.spaceId,
                 generation: storedSpace.active_schema_generation,
                 changes
-              })
+              }
+              if (Option.isSome(attachments)) {
+                transactionOptions = {
+                  ...transactionOptions,
+                  replaceAttachmentReferences: attachments.value.replaceEntityReferences
+                }
+              }
+              const transaction = SqlTransaction.server(transactionOptions)
               const executedMutation = Effect.flatMap(
                 runtime.execute(
                   mutationName,

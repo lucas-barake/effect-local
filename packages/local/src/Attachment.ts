@@ -61,6 +61,14 @@ export class AttachmentNotFound extends Schema.TaggedErrorClass<AttachmentNotFou
   "@lucas-barake/effect-local/AttachmentNotFound"
 )("AttachmentNotFound", { key: Schema.String }) {}
 
+export class AttachmentUnavailable extends Schema.TaggedErrorClass<AttachmentUnavailable>(
+  "@lucas-barake/effect-local/AttachmentUnavailable"
+)("AttachmentUnavailable", { digest: Digest }) {}
+
+export class AttachmentUploadBusy extends Schema.TaggedErrorClass<AttachmentUploadBusy>(
+  "@lucas-barake/effect-local/AttachmentUploadBusy"
+)("AttachmentUploadBusy", { digest: Digest }) {}
+
 export class AttachmentStorageError extends Schema.TaggedErrorClass<AttachmentStorageError>(
   "@lucas-barake/effect-local/AttachmentStorageError"
 )("AttachmentStorageError", { operation: Schema.String, cause: Schema.Defect() }) {}

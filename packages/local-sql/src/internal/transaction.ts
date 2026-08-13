@@ -148,6 +148,14 @@ export const server = (options: {
   readonly spaceId: Identity.SpaceId
   readonly generation: number
   readonly changes: Array<Protocol.EntityChange>
+  readonly replaceAttachmentReferences?: (input: {
+    readonly spaceId: Identity.SpaceId
+    readonly schemaGeneration: number
+    readonly model: string
+    readonly modelVersion: Identity.SchemaVersion
+    readonly entityKey: string
+    readonly value?: Schema.Json
+  }) => Effect.Effect<void, ReplicaError.StorageError>
 }): Transaction.Transaction => {
   const find = SqlSchema.findOneOption({
     Request: Schema.Struct({ spaceId: Schema.String, model: Schema.String, key: Schema.String }),
@@ -184,6 +192,14 @@ export const server = (options: {
         ON CONFLICT (space_id, generation, model, entity_key) DO UPDATE
           SET model_version = excluded.model_version, value_json = excluded.value_json,
             entity_bytes = excluded.entity_bytes`
+      yield* (options.replaceAttachmentReferences?.({
+        spaceId: options.spaceId,
+        schemaGeneration: options.generation,
+        model: model.name,
+        modelVersion: model.version,
+        entityKey: encoded.keyJson,
+        value: encoded.encodedValue
+      }) ?? Effect.void)
       options.changes.push({
         _tag: "Upsert",
         entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
@@ -195,6 +211,13 @@ export const server = (options: {
       yield* options.sql`DELETE FROM effect_local_server_entities_data
         WHERE space_id = ${options.spaceId} AND generation = ${options.generation}
           AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
+      yield* (options.replaceAttachmentReferences?.({
+        spaceId: options.spaceId,
+        schemaGeneration: options.generation,
+        model: model.name,
+        modelVersion: model.version,
+        entityKey: encoded.keyJson
+      }) ?? Effect.void)
       options.changes.push({
         _tag: "Delete",
         entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }

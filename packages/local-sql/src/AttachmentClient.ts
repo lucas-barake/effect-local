@@ -53,6 +53,8 @@ export interface Service {
   ) => Effect.Effect<AttachmentStorage.ObjectKey, ClientFailure>
   readonly read: (
     spaceId: Identity.SpaceId,
+    clientId: Identity.ClientId,
+    membershipIncarnation: Identity.MembershipIncarnation,
     reference: Attachment.Reference,
     range?: Attachment.Range
   ) => Stream.Stream<Uint8Array, ClientFailure>
@@ -62,6 +64,8 @@ export interface Service {
   ) => Effect.Effect<void, ClientFailure>
   readonly ensureUploaded: (
     spaceId: Identity.SpaceId,
+    clientId: Identity.ClientId,
+    membershipIncarnation: Identity.MembershipIncarnation,
     references: ReadonlyArray<Attachment.Reference>
   ) => Effect.Effect<void, ClientFailure>
   readonly drainDeletions: (
@@ -278,9 +282,79 @@ export const layer: Layer.Layer<
       yield* drainInBackground
     })
 
-    const read: Service["read"] = (spaceId, reference, range) =>
+    const cacheRemote = Effect.fnUntraced(function*(
+      spaceId: Identity.SpaceId,
+      clientId: Identity.ClientId,
+      membershipIncarnation: Identity.MembershipIncarnation,
+      reference: Attachment.Reference
+    ) {
+      return yield* withLock(
+        spaceId,
+        reference.digest,
+        Effect.gen(function*() {
+          const existing = yield* find(spaceId, reference.digest)
+          if (Option.isSome(existing)) {
+            if (existing.value.bytes !== reference.bytes) {
+              return yield* new Attachment.AttachmentLengthMismatch({
+                expected: existing.value.bytes,
+                actual: reference.bytes
+              })
+            }
+            if (yield* storage.exists(existing.value.object_key)) return existing.value.object_key
+          }
+          const staged = yield* storage.stage(transfer.download({
+            spaceId,
+            clientId,
+            membershipIncarnation,
+            reference
+          }))
+          const persist = Effect.gen(function*() {
+            if (staged.reference.bytes !== reference.bytes) {
+              return yield* new Attachment.AttachmentLengthMismatch({
+                expected: reference.bytes,
+                actual: staged.reference.bytes
+              })
+            }
+            if (staged.reference.digest !== reference.digest) {
+              return yield* new Attachment.AttachmentDigestMismatch({
+                expected: reference.digest,
+                actual: staged.reference.digest
+              })
+            }
+            const now = yield* Clock.currentTimeMillis
+            yield* sql.withTransaction(Effect.gen(function*() {
+              if (Option.isSome(existing)) {
+                yield* sql`INSERT OR IGNORE INTO effect_local_client_attachment_deletions
+                (object_key, next_attempt_at, created_at)
+                VALUES (${existing.value.object_key}, ${now}, ${now})`
+                yield* sql`UPDATE effect_local_client_attachments SET object_key = ${staged.key},
+                remote_available = 1, last_accessed_at = ${now}
+                WHERE space_id = ${spaceId} AND digest = ${reference.digest}`
+              } else {
+                yield* sql`INSERT INTO effect_local_client_attachments
+                (space_id, digest, bytes, object_key, remote_available, created_at, last_accessed_at)
+                VALUES (${spaceId}, ${reference.digest}, ${reference.bytes}, ${staged.key}, 1, ${now}, ${now})`
+              }
+            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            return staged.key
+          })
+          return yield* persist.pipe(Effect.onError(() =>
+            storage.remove(staged.key).pipe(
+              Effect.tapError((error) =>
+                Effect.logWarning("Unused attachment cache file could not be removed").pipe(
+                  Effect.annotateLogs("error", error._tag)
+                )
+              ),
+              Effect.ignore
+            )
+          ))
+        })
+      )
+    })
+
+    const read: Service["read"] = (spaceId, clientId, membershipIncarnation, reference, range) =>
       Stream.unwrap(
-        objectKey(spaceId, reference).pipe(
+        cacheRemote(spaceId, clientId, membershipIncarnation, reference).pipe(
           Effect.map((key) => storage.read(key, reference, range))
         )
       )
@@ -293,7 +367,12 @@ export const layer: Layer.Layer<
         WHERE space_id = ${spaceId} AND digest = ${reference.digest}`)
     })
 
-    const ensureUploaded: Service["ensureUploaded"] = Effect.fnUntraced(function*(spaceId, references) {
+    const ensureUploaded: Service["ensureUploaded"] = Effect.fnUntraced(function*(
+      spaceId,
+      clientId,
+      membershipIncarnation,
+      references
+    ) {
       for (const reference of references) {
         yield* withLock(
           spaceId,
@@ -311,6 +390,8 @@ export const layer: Layer.Layer<
             if (!(yield* storage.exists(found.value.object_key))) return yield* notFound(reference)
             yield* transfer.upload({
               spaceId,
+              clientId,
+              membershipIncarnation,
               reference,
               bytes: storage.read(found.value.object_key, reference)
             })

@@ -7,12 +7,16 @@ import type * as Stream from "effect/Stream"
 
 export interface UploadRequest {
   readonly spaceId: Identity.SpaceId
+  readonly clientId: Identity.ClientId
+  readonly membershipIncarnation: Identity.MembershipIncarnation
   readonly reference: Attachment.Reference
   readonly bytes: Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
 }
 
 export interface DownloadRequest {
   readonly spaceId: Identity.SpaceId
+  readonly clientId: Identity.ClientId
+  readonly membershipIncarnation: Identity.MembershipIncarnation
   readonly reference: Attachment.Reference
   readonly range?: Attachment.Range
 }

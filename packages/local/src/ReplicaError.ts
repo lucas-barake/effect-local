@@ -166,7 +166,13 @@ export const StorageError = Schema.Union([
   StorageUnavailable,
   StorageCorrupt,
   CanonicalEncodeError,
-  Attachment.AttachmentStorageError
+  Attachment.InvalidAttachmentReference,
+  Attachment.AttachmentTooLarge,
+  Attachment.AttachmentUnavailable,
+  Attachment.AttachmentUploadBusy,
+  Attachment.AttachmentStorageError,
+  Attachment.AttachmentLengthMismatch,
+  Attachment.AttachmentDigestMismatch
 ])
 export type StorageError = typeof StorageError.Type
 
@@ -205,6 +211,8 @@ export const ReplicaError = Schema.Union([
   Attachment.InvalidAttachmentReference,
   Attachment.AttachmentTooLarge,
   Attachment.AttachmentNotFound,
+  Attachment.AttachmentUnavailable,
+  Attachment.AttachmentUploadBusy,
   Attachment.AttachmentStorageError,
   Attachment.AttachmentOffsetConflict,
   Attachment.AttachmentLengthMismatch,
