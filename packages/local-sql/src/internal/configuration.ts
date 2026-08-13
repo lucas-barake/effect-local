@@ -28,6 +28,27 @@ export const positiveFiniteDurationMillis = (
     }
   })
 
+export const positiveIntegerDurationMillis = (
+  option: string,
+  input: Duration.Input
+): Effect.Effect<number, ReplicaError.InvalidConfiguration> =>
+  positiveFiniteDurationMillis(option, input).pipe(
+    Effect.map((millis) => Math.max(1, Math.ceil(millis)))
+  )
+
+export const positiveSafeInteger = (
+  option: string,
+  value: number
+): Effect.Effect<number, ReplicaError.InvalidConfiguration> => {
+  if (Number.isSafeInteger(value) && value > 0) return Effect.succeed(value)
+  return Effect.fail(
+    new ReplicaError.InvalidConfiguration({
+      option,
+      message: `${option} must be a positive safe integer`
+    })
+  )
+}
+
 export interface RetryTiming {
   readonly retryDelayMillis: number
   readonly maximumRetryDelayMillis: number

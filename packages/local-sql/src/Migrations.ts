@@ -1707,7 +1707,8 @@ const serverV12 = makeMigration({
         (claim_token IS NOT NULL AND claimed_until IS NOT NULL AND claimed_until >= 0))
     )`,
     `CREATE INDEX effect_local_server_offline_wake_spaces_due
-      ON effect_local_server_offline_wake_spaces (next_attempt_at, claimed_until, space_id)`,
+      ON effect_local_server_offline_wake_spaces (next_attempt_at, space_id)
+      WHERE high_water_sequence > expanded_sequence`,
     `CREATE TABLE effect_local_server_offline_wakes (
       space_id TEXT NOT NULL,
       client_id TEXT NOT NULL,
@@ -1725,7 +1726,8 @@ const serverV12 = makeMigration({
         (claim_token IS NOT NULL AND claimed_until IS NOT NULL AND claimed_until >= 0))
     )`,
     `CREATE INDEX effect_local_server_offline_wakes_due
-      ON effect_local_server_offline_wakes (next_attempt_at, claimed_until, space_id, client_id)`,
+      ON effect_local_server_offline_wakes (next_attempt_at, space_id, client_id)
+      WHERE high_water_sequence > notified_sequence`,
     `CREATE TABLE effect_local_server_watch_presence (
       space_id TEXT NOT NULL,
       client_id TEXT NOT NULL,
@@ -1734,7 +1736,9 @@ const serverV12 = makeMigration({
       PRIMARY KEY (space_id, client_id, watcher_id)
     )`,
     `CREATE INDEX effect_local_server_watch_presence_active
-      ON effect_local_server_watch_presence (space_id, client_id, expires_at)`
+      ON effect_local_server_watch_presence (space_id, client_id, expires_at)`,
+    `CREATE INDEX effect_local_server_watch_presence_expiry
+      ON effect_local_server_watch_presence (expires_at)`
   ]
 })
 

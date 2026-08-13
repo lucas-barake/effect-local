@@ -102,9 +102,11 @@ transaction or space row write per publication. `wakeCapacity` is the optional s
 `CapacityExceeded { resource: "sync watchers", limit }`.
 
 The optional `offlineWake` configuration adds a provider-neutral durable path for clients without a live Watch.
-`recipients({ spaceId })` returns authoritative member client IDs. `deliver({ wakeId, spaceId, clientId })` maps one
-client to the application's FCM, APNs, web push, or other endpoint. It receives no mutation or entity content. Keep the
-provider payload content-free and use the stable `wakeId` to make at-least-once calls idempotent.
+`recipients({ spaceId })` returns authoritative member client IDs. `isRecipient({ spaceId, clientId })` rechecks
+membership immediately before every delivery attempt so a revoked client does not receive a later retry.
+`deliver({ wakeId, spaceId, clientId })` maps one client to the application's FCM, APNs, web push, or other endpoint.
+It receives no mutation or entity content. Keep the provider payload content-free and use the stable `wakeId` to make
+at-least-once calls idempotent.
 
 Accepted mutations transactionally advance a per-space high water mark. The scoped dispatcher resolves membership
 outside admission, coalesces client work, retries failures with capped exponential backoff, and bounds recipient

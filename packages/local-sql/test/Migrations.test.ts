@@ -87,6 +87,44 @@ describe("storage migration catalogs", () => {
         ORDER BY entity_bytes DESC, model, entity_key LIMIT 1`
       assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")))
 
+      const dueSpacePlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
+        SELECT space_id FROM effect_local_server_offline_wake_spaces
+        WHERE high_water_sequence > expanded_sequence AND next_attempt_at <= 1
+          AND (claim_token IS NULL OR claimed_until <= 1)
+        ORDER BY next_attempt_at, space_id LIMIT 10`
+      const dueSpaceUsesIndex = dueSpacePlan.some((row) =>
+        row.detail.includes("effect_local_server_offline_wake_spaces_due")
+      )
+      const dueSpaceSorts = dueSpacePlan.some((row) =>
+        row.detail.includes("TEMP B-TREE")
+      )
+      assert.isTrue(dueSpaceUsesIndex)
+      assert.isFalse(dueSpaceSorts)
+
+      const dueClientPlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
+        SELECT wake.space_id, wake.client_id FROM effect_local_server_offline_wakes AS wake
+        WHERE wake.high_water_sequence > wake.notified_sequence AND wake.next_attempt_at <= 1
+          AND (wake.claim_token IS NULL OR wake.claimed_until <= 1)
+          AND NOT EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS presence
+            WHERE presence.space_id = wake.space_id AND presence.client_id = wake.client_id
+              AND presence.expires_at > 1)
+        ORDER BY wake.next_attempt_at, wake.space_id, wake.client_id LIMIT 10`
+      const dueClientUsesIndex = dueClientPlan.some((row) =>
+        row.detail.includes("effect_local_server_offline_wakes_due")
+      )
+      const presenceUsesIndex = dueClientPlan.some((row) =>
+        row.detail.includes("effect_local_server_watch_presence_active")
+      )
+      const dueClientSorts = dueClientPlan.some((row) => row.detail.includes("TEMP B-TREE"))
+      assert.isTrue(dueClientUsesIndex)
+      assert.isTrue(presenceUsesIndex)
+      assert.isFalse(dueClientSorts)
+
+      const expiryPlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
+        DELETE FROM effect_local_server_watch_presence WHERE expires_at <= 1`
+      const expiryUsesIndex = expiryPlan.some((row) => row.detail.includes("effect_local_server_watch_presence_expiry"))
+      assert.isTrue(expiryUsesIndex)
+
       const result = yield* sql`INSERT INTO effect_local_server_spaces
         (space_id, definition_hash, next_server_sequence) VALUES (${spaceId}, 'definition', 1)`.pipe(Effect.exit)
       const error = expectedFailure(result).pipe(Option.getOrThrow)

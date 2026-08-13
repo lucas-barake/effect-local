@@ -572,6 +572,7 @@ export const ServerLive = ServerStore.layer({
   ...serverOptions,
   offlineWake: {
     recipients: ({ spaceId }) => Memberships.clientIds(spaceId),
+    isRecipient: ({ spaceId, clientId }) => Memberships.contains(spaceId, clientId),
     deliver: ({ wakeId, spaceId, clientId }) => Push.sendContentFree({ idempotencyKey: wakeId, spaceId, clientId }),
     coalescingWindow: "2 seconds",
     pollInterval: "1 second",
@@ -589,6 +590,7 @@ export const ServerLive = ServerStore.layer({
 })
 ```
 
+Membership is rechecked immediately before every delivery attempt, so revoked clients do not receive later retries.
 The hook receives no mutation or entity content. Its IDs are for application routing and idempotency. Keep the actual
 FCM, APNs, or web push payload content-free. Calls are at least once with a stable `wakeId` until success, so provider
 integration must tolerate duplicates. Mutations inside one coalescing window share a high water fence. A live Watch
