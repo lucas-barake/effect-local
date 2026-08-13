@@ -17,7 +17,7 @@ import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 
-const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+const NonNegativeInt = Schema.Natural
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 type HookRejection = Schema.JsonObject & { readonly _tag: string }
 

@@ -593,13 +593,13 @@ export const ServerLive = ServerStore.layer({
 })
 ```
 
-The delivery hook returns `"Delivered"` or `"NotRecipient"`. The application must decide current membership and send
-inside one serialized operation. `"NotRecipient"` retires the wake without retry.
-The hook receives no mutation or entity content. Its IDs are for application routing and idempotency. Keep the actual
-FCM, APNs, or web push payload content-free. Calls are at least once with a stable `wakeId` until success, so provider
-integration must tolerate duplicates. Mutations inside one coalescing window share a high water fence. A live Watch
-suppresses delivery across all server runtimes that share the database. An acknowledged Pull cursor retires obsolete
-work. See [synchronization](docs/sync.md#offline-wake-delivery) for the delivery and recovery contract.
+The delivery hook must serialize its final membership check with the provider send, then return `"Delivered"` or
+`"NotRecipient"`. `"NotRecipient"` retires the current work. The hook receives routing and idempotency IDs, but no
+mutation or entity content. Keep provider-visible notification content free of those IDs and all sync data. Once
+delivery starts, it is at least once: a failure, defect, timeout, or database failure after the provider send can retry
+the same `wakeId`, so the send must be idempotent. The dispatcher coalesces mutations behind a high water fence. A live
+Watch suppresses delivery across all server runtimes sharing the database. An acknowledged Pull cursor retires covered
+work. See [synchronization](docs/sync.md#offline-wake-delivery) for the full delivery and recovery contract.
 
 ### Negotiate one protocol for sync and presence
 

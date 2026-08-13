@@ -41,14 +41,17 @@ so removal after expansion also blocks retries without a check-to-send race.
 
 `deliver({ wakeId, spaceId, clientId })` is the provider boundary. It carries routing and idempotency values only. It
 does not contain a mutation, entity key, sender, message count, or server sequence. The application resolves the
-client's current FCM, APNs, or web push endpoint and should send a content-free signal that tells the app to sync.
-`wakeId` stays stable across retries, so the application can deduplicate a provider call. Do not copy `wakeId`,
-`spaceId`, or `clientId` into provider-visible notification content.
+client's current FCM, APNs, or web push endpoint and uses `wakeId` as the provider idempotency key. Send a content-free
+signal that tells the app to sync. Do not copy `wakeId`, `spaceId`, or `clientId` into provider-visible notification
+content.
 
-Delivery attempts are at least once. A callback failure, defect, or timeout keeps the same `wakeId` and schedules
-capped exponential retry. A successful callback records that high water as notified. Later mutations rotate to a new
-identity after `coalescingWindow`; mutations accumulated before that point share one delivery opportunity. SQLite and
-an external provider cannot commit atomically, so the callback must tolerate the same identity more than once.
+A live Watch or acknowledged Pull can make work obsolete before the hook runs. Once delivery starts, it is at least
+once. A callback failure, defect, timeout, or database failure after the provider send can retry the same `wakeId` with
+capped exponential backoff. This prevents lost work but permits duplicate provider calls.
+
+The dispatcher waits `coalescingWindow` before expanding newly idle space work. An unnotified client wake keeps its
+`wakeId` while later mutations raise its high water fence. After the current work finishes, any remaining work receives
+a new identity and another coalescing delay.
 
 A client is online only while its production Watch has an active SQL presence lease. The Watch does not become ready
 while a delivery claim for that client is in flight. Every server runtime sharing the database checks the same leases,

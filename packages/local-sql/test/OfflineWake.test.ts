@@ -34,9 +34,11 @@ const membershipIncarnation = Identity.MembershipIncarnation.make(
 )
 const scope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
 
-const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe((sqlite) =>
-  Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
-)
+const database = (filename: string) =>
+  SqliteClient.layer({ filename, disableWAL: true }).pipe((sqlite) =>
+    Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
+  )
+const Database = database(":memory:")
 const Runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.Handlers))
 const provideNodeFileSystem = Effect.provide(NodeFileSystem.layer)
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
@@ -89,12 +91,6 @@ const service = <I, S, E extends { readonly _tag: string }, R,>(
   layer: Layer.Layer<I, E, R>
 ) => Layer.build(layer).pipe(Effect.map(Context.get(tag)))
 
-const serviceInScope = <I, S, E extends { readonly _tag: string }, R,>(
-  tag: Context.Service<I, S>,
-  layer: Layer.Layer<I, E, R>,
-  owner: Scope.Scope
-) => Layer.build(layer).pipe(Scope.provide(owner), Effect.map(Context.get(tag)))
-
 const makeServer = (
   offlineWake: OfflineWake.Options,
   databaseLayer: typeof Database = Database
@@ -115,7 +111,7 @@ const makeServerInScope = (
     Layer.provide(Runtime),
     Layer.provide(databaseLayer)
   )
-  return serviceInScope(ServerStore.ServerStore, StoreLayer, owner)
+  return Layer.buildWithScope(StoreLayer, owner).pipe(Effect.map(Context.get(ServerStore.ServerStore)))
 }
 
 const envelope = Effect.fnUntraced(function*(sequence: number) {
@@ -157,6 +153,15 @@ const watchRequest = (): Protocol.WatchRequest =>
     scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
     cursor: null
   })
+
+const startWatch = (server: ServerStore.Service, ready: Deferred.Deferred<void>) =>
+  server.watch(watchRequest()).pipe(
+    Stream.tap(() => Deferred.succeed(ready, undefined)),
+    Stream.runDrain,
+    Effect.forkChild({ startImmediately: true })
+  )
+
+const makeInspectionSql = (filename: string) => SqliteClient.make({ filename }).pipe(Effect.provide(Reactivity.layer))
 
 const incremental = (result: Protocol.PullResult): Protocol.PullPage => {
   if ("_tag" in result) assert.fail("expected an incremental pull page")
@@ -219,19 +224,15 @@ describe("offline wake delivery", () => {
           ...wakeTiming,
           coalescingWindow: "5 seconds"
         } satisfies OfflineWake.Options
-        const persistentDatabase = () =>
-          SqliteClient.layer({ filename, disableWAL: true }).pipe((sqlite) =>
-            Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
-          )
         const acceptingScope = yield* Scope.make()
-        const AcceptingDatabase = persistentDatabase()
+        const AcceptingDatabase = database(filename)
         const acceptingServer = yield* makeServerInScope(offlineWake, AcceptingDatabase, acceptingScope)
         const receipt = yield* submit(acceptingServer, 1)
         assert.strictEqual(receipt._tag, "Accepted")
         yield* Scope.close(acceptingScope, Exit.void)
 
         const recoveringScope = yield* Scope.make()
-        const RecoveringDatabase = persistentDatabase()
+        const RecoveringDatabase = database(filename)
         yield* makeServerInScope(offlineWake, RecoveringDatabase, recoveringScope)
         yield* TestClock.adjust("5 seconds")
         const recovered = yield* Deferred.await(delivery)
@@ -317,11 +318,7 @@ describe("offline wake delivery", () => {
           ...wakeTiming,
           maximumConcurrentDeliveries: 1
         } satisfies OfflineWake.Options
-        const Sqlite = SqliteClient.layer({ filename, disableWAL: true })
-        const DatabaseLayer = Sqlite.pipe((layer) =>
-          Layer.mergeAll(layer, NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
-        )
-        const server = yield* makeServer(offlineWake, DatabaseLayer)
+        const server = yield* makeServer(offlineWake, database(filename))
 
         for (let sequence = 1; sequence <= 3; sequence++) {
           const receipt = yield* submit(server, sequence)
@@ -330,7 +327,7 @@ describe("offline wake delivery", () => {
         yield* TestClock.adjust("2 seconds")
         yield* Queue.take(deliveries)
         yield* Deferred.await(cycleCompleted)
-        const inspectionSql = yield* SqliteClient.make({ filename }).pipe(Effect.provide(Reactivity.layer))
+        const inspectionSql = yield* makeInspectionSql(filename)
         const fences = yield* inspectionSql<{
           readonly high_water_sequence: number
           readonly notified_sequence: number
@@ -363,11 +360,7 @@ describe("offline wake delivery", () => {
           ...wakeTiming,
           maximumConcurrentDeliveries: 1
         } satisfies OfflineWake.Options
-        const Sqlite = SqliteClient.layer({ filename, disableWAL: true })
-        const DatabaseLayer = Sqlite.pipe((layer) =>
-          Layer.mergeAll(layer, NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
-        )
-        const server = yield* makeServer(offlineWake, DatabaseLayer)
+        const server = yield* makeServer(offlineWake, database(filename))
 
         const bootstrap = yield* pull(server)
         if (!("_tag" in bootstrap)) assert.fail("expected bootstrap metadata")
@@ -375,19 +368,14 @@ describe("offline wake delivery", () => {
         let page = incremental(firstPage)
         const secondPage = yield* pull(server, page.cursor)
         page = incremental(secondPage)
-        const request = watchRequest()
-        const watcher = yield* server.watch(request).pipe(
-          Stream.tap(() => Deferred.succeed(watchReady, undefined)),
-          Stream.runDrain,
-          Effect.forkChild({ startImmediately: true })
-        )
+        const watcher = yield* startWatch(server, watchReady)
         yield* Deferred.await(watchReady)
 
         const receipt = yield* submit(server, 1)
         assert.strictEqual(receipt._tag, "Accepted")
         yield* TestClock.adjust("2 seconds")
         yield* Deferred.await(cycleCompleted)
-        const inspectionSql = yield* SqliteClient.make({ filename }).pipe(Effect.provide(Reactivity.layer))
+        const inspectionSql = yield* makeInspectionSql(filename)
         const pending = yield* inspectionSql<{ readonly count: number }>`SELECT COUNT(*) AS count
         FROM effect_local_server_offline_wakes
         WHERE space_id = ${spaceId} AND client_id = ${readerId}`
@@ -428,12 +416,7 @@ describe("offline wake delivery", () => {
         maximumConcurrentDeliveries: 1
       } satisfies OfflineWake.Options
       const server = yield* makeServer(offlineWake)
-      const request = watchRequest()
-      const watcher = yield* server.watch(request).pipe(
-        Stream.tap(() => Deferred.succeed(watchReady, undefined)),
-        Stream.runDrain,
-        Effect.forkChild({ startImmediately: true })
-      )
+      const watcher = yield* startWatch(server, watchReady)
       yield* Deferred.await(watchReady)
 
       const receipt = yield* submit(server, 1)
@@ -472,22 +455,10 @@ describe("offline wake delivery", () => {
           ...wakeTiming,
           maximumConcurrentDeliveries: 1
         } satisfies OfflineWake.Options
-        const persistentDatabase = () =>
-          SqliteClient.layer({ filename, disableWAL: true }).pipe((sqlite) =>
-            Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
-          )
-        const buildServer = () => {
-          const DatabaseLayer = persistentDatabase()
-          return makeServer(offlineWake, DatabaseLayer)
-        }
+        const buildServer = () => makeServer(offlineWake, database(filename))
         const connectedServer = yield* buildServer()
         const submittingServer = yield* buildServer()
-        const request = watchRequest()
-        const watcher = yield* connectedServer.watch(request).pipe(
-          Stream.tap(() => Deferred.succeed(watchReady, undefined)),
-          Stream.runDrain,
-          Effect.forkChild({ startImmediately: true })
-        )
+        const watcher = yield* startWatch(connectedServer, watchReady)
         yield* Deferred.await(watchReady)
 
         const receipt = yield* submit(submittingServer, 1)
@@ -530,20 +501,10 @@ describe("offline wake delivery", () => {
           ...wakeTiming,
           maximumConcurrentDeliveries: 1
         } satisfies OfflineWake.Options
-        const persistentDatabase = () =>
-          SqliteClient.layer({ filename, disableWAL: true }).pipe((sqlite) =>
-            Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
-          )
-        const DatabaseLayer = persistentDatabase()
-        const server = yield* makeServer(offlineWake, DatabaseLayer)
-        const request = watchRequest()
-        const watcher = yield* server.watch(request).pipe(
-          Stream.tap(() => Deferred.succeed(watchReady, undefined)),
-          Stream.runDrain,
-          Effect.forkChild({ startImmediately: true })
-        )
+        const server = yield* makeServer(offlineWake, database(filename))
+        const watcher = yield* startWatch(server, watchReady)
         yield* Deferred.await(watchReady)
-        const inspectionSql = yield* SqliteClient.make({ filename }).pipe(Effect.provide(Reactivity.layer))
+        const inspectionSql = yield* makeInspectionSql(filename)
         yield* inspectionSql`DELETE FROM effect_local_server_watch_runtimes`
 
         yield* TestClock.adjust(wakeTiming.presenceHeartbeatInterval)
@@ -576,21 +537,12 @@ describe("offline wake delivery", () => {
           deliver: () => Effect.succeed("Delivered" as const),
           ...wakeTiming
         } satisfies OfflineWake.Options
-        const persistentDatabase = () =>
-          SqliteClient.layer({ filename, disableWAL: true }).pipe((sqlite) =>
-            Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
-          )
-        const DatabaseLayer = persistentDatabase()
-        const server = yield* makeServer(offlineWake, DatabaseLayer)
-        const inspectionSql = yield* SqliteClient.make({ filename }).pipe(Effect.provide(Reactivity.layer))
+        const server = yield* makeServer(offlineWake, database(filename))
+        const inspectionSql = yield* makeInspectionSql(filename)
         yield* inspectionSql`DELETE FROM effect_local_server_watch_runtimes`
         const watchReady = yield* Deferred.make<void>()
 
-        const watcher = yield* server.watch(watchRequest()).pipe(
-          Stream.tap(() => Deferred.succeed(watchReady, undefined)),
-          Stream.runDrain,
-          Effect.forkChild({ startImmediately: true })
-        )
+        const watcher = yield* startWatch(server, watchReady)
         yield* Deferred.await(watchReady)
 
         const presence = yield* inspectionSql<{ readonly count: number }>`SELECT COUNT(*) AS count
@@ -618,12 +570,8 @@ describe("offline wake delivery", () => {
             Deferred.succeed(delivered, wake).pipe(Effect.as("Delivered" as const)),
           ...wakeTiming
         } satisfies OfflineWake.Options
-        const Sqlite = SqliteClient.layer({ filename, disableWAL: true })
-        const DatabaseLayer = Sqlite.pipe((layer) =>
-          Layer.mergeAll(layer, NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
-        )
-        const server = yield* makeServer(offlineWake, DatabaseLayer)
-        const inspectionSql = yield* SqliteClient.make({ filename }).pipe(Effect.provide(Reactivity.layer))
+        const server = yield* makeServer(offlineWake, database(filename))
+        const inspectionSql = yield* makeInspectionSql(filename)
         const watcherScope = yield* Scope.make()
         yield* server.watch(watchRequest()).pipe(Stream.take(1), Stream.runDrain, Scope.provide(watcherScope))
         yield* inspectionSql.unsafe(`CREATE TRIGGER fail_presence_delete

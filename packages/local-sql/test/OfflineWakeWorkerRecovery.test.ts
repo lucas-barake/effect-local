@@ -57,6 +57,15 @@ const withSqlDefect = (
   })
 }
 
+const makeMigratedSql = Effect.fnUntraced(function*(owner: Scope.Scope) {
+  const sql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
+    Effect.provide(Reactivity.layer),
+    Scope.provide(owner)
+  )
+  yield* Migrations.server().pipe(Effect.provideService(SqlClient.SqlClient, sql))
+  return sql
+})
+
 const makeService = Effect.fnUntraced(function*(
   sql: SqlClient.SqlClient,
   owner: Scope.Scope,
@@ -79,11 +88,7 @@ describe("offline wake worker recovery", () => {
     Effect.fnUntraced(
       function*() {
         const owner = yield* Scope.make()
-        const sql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
-          Effect.provide(Reactivity.layer),
-          Scope.provide(owner)
-        )
-        yield* Migrations.server().pipe(Effect.provideService(SqlClient.SqlClient, sql))
+        const sql = yield* makeMigratedSql(owner)
         const logs = yield* Queue.bounded<string>(1).pipe(
           (acquire) => Effect.acquireRelease(acquire, Queue.shutdown)
         )
@@ -119,11 +124,7 @@ describe("offline wake worker recovery", () => {
     Effect.fnUntraced(
       function*() {
         const owner = yield* Scope.make()
-        const actualSql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
-          Effect.provide(Reactivity.layer),
-          Scope.provide(owner)
-        )
-        yield* Migrations.server().pipe(Effect.provideService(SqlClient.SqlClient, actualSql))
+        const actualSql = yield* makeMigratedSql(owner)
         const sql = withSqlDefect(
           actualSql,
           (source) =>
@@ -153,11 +154,7 @@ describe("offline wake worker recovery", () => {
     Effect.fnUntraced(
       function*() {
         const owner = yield* Scope.make()
-        const actualSql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
-          Effect.provide(Reactivity.layer),
-          Scope.provide(owner)
-        )
-        yield* Migrations.server().pipe(Effect.provideService(SqlClient.SqlClient, actualSql))
+        const actualSql = yield* makeMigratedSql(owner)
         const sql = withSqlDefect(
           actualSql,
           (source) => source.includes("UPDATE effect_local_server_watch_runtimes SET expires_at")
@@ -191,11 +188,7 @@ describe("offline wake worker recovery", () => {
       function*() {
         const crypto = yield* Crypto.Crypto
         const owner = yield* Scope.make()
-        const sql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
-          Effect.provide(Reactivity.layer),
-          Scope.provide(owner)
-        )
-        yield* Migrations.server().pipe(Effect.provideService(SqlClient.SqlClient, sql))
+        const sql = yield* makeMigratedSql(owner)
         const membership = yield* Ref.make(true)
         const firstStarted = yield* Deferred.make<void>()
         const decideFirst = yield* Deferred.make<void>()
