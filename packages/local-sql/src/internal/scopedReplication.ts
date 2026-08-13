@@ -12,6 +12,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as AcceptedLog from "./acceptedLog.js"
 import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
+import type * as ServerIndex from "./serverIndex.js"
 import * as StorageUnavailable from "./storageUnavailable.js"
 import * as WindowSchema from "./windowSchema.js"
 
@@ -28,32 +29,6 @@ export interface Authorization {
   ) => Effect.Effect<boolean>
 }
 
-export interface WindowRuntime {
-  readonly membership: (
-    spaceId: Identity.SpaceId,
-    schemaGeneration: number,
-    window: Protocol.ReplicationWindow
-  ) => Effect.Effect<ReadonlySet<string>, ReplicaError.ReplicaError>
-  readonly partitionMembership: (
-    spaceId: Identity.SpaceId,
-    schemaGeneration: number,
-    window: Protocol.ReplicationWindow,
-    partitions: ReadonlyArray<ReadonlyArray<string | number>>
-  ) => Effect.Effect<ReadonlySet<string>, ReplicaError.ReplicaError>
-  readonly partitionsOf: (
-    spaceId: Identity.SpaceId,
-    schemaGeneration: number,
-    window: Protocol.ReplicationWindow,
-    entityKeys: ReadonlyArray<string>
-  ) => Effect.Effect<ReadonlyMap<string, ReadonlyArray<string | number>>, ReplicaError.ReplicaError>
-  readonly affectedPartitions: (
-    spaceId: Identity.SpaceId,
-    schemaGeneration: number,
-    window: Protocol.ReplicationWindow,
-    afterSequence: number
-  ) => Effect.Effect<ReadonlyArray<ReadonlyArray<string | number>>, ReplicaError.ReplicaError>
-}
-
 export interface Options {
   readonly sql: SqlClient.SqlClient
   readonly crypto: Crypto.Crypto
@@ -62,7 +37,7 @@ export interface Options {
   readonly maximumSnapshotBytes: number
   readonly maximumBootstrapPageBytes: number
   readonly authorization: Authorization
-  readonly windows: WindowRuntime
+  readonly windows: ServerIndex.Runtime
   readonly resolveDefinition: (
     schema: Identity.SchemaIdentity
   ) => Effect.Effect<Definition.Any, ReplicaError.ReplicaError>
