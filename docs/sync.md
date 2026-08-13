@@ -35,8 +35,9 @@ accepted mutation commits a per-space high water mark in the admission transacti
 the application's `recipients({ spaceId })` callback for the authoritative client membership, then creates one durable
 delivery row per client. Mutation admission never waits for membership lookup or push delivery.
 
-Before each delivery attempt, `isRecipient({ spaceId, clientId })` rechecks current membership. A false result retires
-the row without calling the provider, so removal after expansion also blocks retries.
+The delivery hook must decide current membership and send inside one application-owned serialized operation. It
+returns `"Delivered"` after sending or `"NotRecipient"` when membership has ended. `"NotRecipient"` retires the row,
+so removal after expansion also blocks retries without a check-to-send race.
 
 `deliver({ wakeId, spaceId, clientId })` is the provider boundary. It carries routing and idempotency values only. It
 does not contain a mutation, entity key, sender, message count, or server sequence. The application resolves the

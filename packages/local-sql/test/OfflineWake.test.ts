@@ -28,6 +28,7 @@ import * as Domain from "./Domain.js"
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const writerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const readerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+const sentinelId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000003")
 const membershipIncarnation = Identity.MembershipIncarnation.make(
   "inc_00000000-0000-4000-8000-000000000001"
 )
@@ -63,7 +64,6 @@ const serverOptions = {
 } satisfies ServerStore.Options
 
 const wakeTiming = {
-  isRecipient: () => Effect.succeed(true),
   coalescingWindow: "1 second",
   pollInterval: "1 second",
   retryDelay: "1 second",
@@ -180,7 +180,7 @@ describe("offline wake delivery", () => {
       )
       const offlineWake = {
         recipients: () => Effect.succeed([readerId]),
-        deliver: (wake: OfflineWake.Delivery) => Queue.offer(deliveries, wake),
+        deliver: (wake: OfflineWake.Delivery) => Queue.offer(deliveries, wake).pipe(Effect.as("Delivered" as const)),
         ...wakeTiming
       } satisfies OfflineWake.Options
       const server = yield* makeServer(offlineWake)
@@ -200,9 +200,6 @@ describe("offline wake delivery", () => {
       const wakeId = delivered.wakeId
       const wakeIdValid = isWakeId(wakeId)
       assert.isTrue(wakeIdValid)
-
-      yield* TestClock.adjust("10 seconds")
-      assert.strictEqual(yield* Queue.size(deliveries), 0)
     }).pipe(Effect.scoped))
 
   it.effect("recovers a durable wake after the accepting server runtime closes", () =>
@@ -213,7 +210,7 @@ describe("offline wake delivery", () => {
       const delivery = yield* Deferred.make<OfflineWake.Delivery>()
       const offlineWake = {
         recipients: () => Effect.succeed([readerId]),
-        deliver: (wake: OfflineWake.Delivery) => Deferred.succeed(delivery, wake),
+        deliver: (wake: OfflineWake.Delivery) => Deferred.succeed(delivery, wake).pipe(Effect.as("Delivered" as const)),
         ...wakeTiming,
         coalescingWindow: "5 seconds"
       } satisfies OfflineWake.Options
@@ -242,7 +239,7 @@ describe("offline wake delivery", () => {
       const delivery = yield* Deferred.make<OfflineWake.Delivery>()
       const offlineWake = {
         recipients: () => Effect.succeed([readerId]),
-        deliver: (wake: OfflineWake.Delivery) => Deferred.succeed(delivery, wake),
+        deliver: (wake: OfflineWake.Delivery) => Deferred.succeed(delivery, wake).pipe(Effect.as("Delivered" as const)),
         ...wakeTiming,
         coalescingWindow: "500 micros",
         pollInterval: "500 micros"
@@ -268,7 +265,7 @@ describe("offline wake delivery", () => {
             yield* Queue.offer(attempts, wake)
             const attempt = yield* Ref.updateAndGet(attemptCount, (value) => value + 1)
             if (attempt === 1) return yield* new TestWakeError({ reason: "provider unavailable" })
-            return yield* Effect.void
+            return "Delivered" as const
           }),
         ...wakeTiming
       } satisfies OfflineWake.Options
@@ -296,7 +293,7 @@ describe("offline wake delivery", () => {
       )
       const offlineWake = {
         recipients: () => Effect.succeed([readerId]),
-        deliver: (wake: OfflineWake.Delivery) => Queue.offer(deliveries, wake),
+        deliver: (wake: OfflineWake.Delivery) => Queue.offer(deliveries, wake).pipe(Effect.as("Delivered" as const)),
         ...wakeTiming
       } satisfies OfflineWake.Options
       const sqlite = SqliteClient.layer({ filename, disableWAL: true })
@@ -324,13 +321,25 @@ describe("offline wake delivery", () => {
 
   it.effect("retires a durable wake when the client acknowledges its pull", () =>
     Effect.gen(function*() {
-      const deliveries = yield* Ref.make<ReadonlyArray<OfflineWake.Delivery>>([])
+      const fs = yield* FileSystem.FileSystem
+      const directory = yield* fs.makeTempDirectoryScoped()
+      const filename = `${directory}/offline-wake-ack.sqlite`
+      const cycleCompleted = yield* Deferred.make<void>()
+      const watchReady = yield* Deferred.make<void>()
       const offlineWake = {
-        recipients: () => Effect.succeed([readerId]),
-        deliver: (wake: OfflineWake.Delivery) => Ref.update(deliveries, (current) => [...current, wake]),
-        ...wakeTiming
+        recipients: () => Effect.succeed([readerId, sentinelId]),
+        deliver: (wake: OfflineWake.Delivery) => {
+          if (wake.clientId !== sentinelId) return Effect.die("connected reader wake reached delivery")
+          return Deferred.succeed(cycleCompleted, undefined).pipe(Effect.as("Delivered" as const))
+        },
+        ...wakeTiming,
+        maximumConcurrentDeliveries: 1
       } satisfies OfflineWake.Options
-      const server = yield* makeServer(offlineWake)
+      const sqlite = SqliteClient.layer({ filename, disableWAL: true })
+      const databaseLayer = sqlite.pipe((layer) =>
+        Layer.mergeAll(layer, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
+      )
+      const server = yield* makeServer(offlineWake, databaseLayer)
 
       const bootstrap = yield* pull(server)
       if (!("_tag" in bootstrap)) assert.fail("expected bootstrap metadata")
@@ -338,18 +347,34 @@ describe("offline wake delivery", () => {
       let page = incremental(firstPage)
       const secondPage = yield* pull(server, page.cursor)
       page = incremental(secondPage)
+      const request = watchRequest()
+      const watcher = yield* server.watch(request).pipe(
+        Stream.tap(() => Deferred.succeed(watchReady, undefined)),
+        Stream.runDrain,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(watchReady)
 
       const receipt = yield* submit(server, 1)
       assert.strictEqual(receipt._tag, "Accepted")
+      yield* TestClock.adjust("2 seconds")
+      yield* Deferred.await(cycleCompleted)
+      const inspectionSql = yield* SqliteClient.make({ filename }).pipe(Effect.provide(Reactivity.layer))
+      const pending = yield* inspectionSql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        FROM effect_local_server_offline_wakes
+        WHERE space_id = ${spaceId} AND client_id = ${readerId}`
+      assert.deepStrictEqual(pending, [{ count: 1 }])
       const mutationPage = yield* pull(server, page.cursor)
       page = incremental(mutationPage)
       assert.strictEqual(page.serverSequence, 1)
       yield* pull(server, page.cursor)
 
-      yield* TestClock.adjust("10 seconds")
-      const delivered = yield* Ref.get(deliveries)
-      assert.lengthOf(delivered, 0)
-    }).pipe(Effect.scoped))
+      const rows = yield* inspectionSql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        FROM effect_local_server_offline_wakes
+        WHERE space_id = ${spaceId} AND client_id = ${readerId}`
+      assert.deepStrictEqual(rows, [{ count: 0 }])
+      yield* Fiber.interrupt(watcher)
+    }).pipe(Effect.provide(NodeFileSystem.layer), Effect.scoped))
 
   it.effect("does not call the delivery hook while the client has a live Watch", () =>
     Effect.gen(function*() {
@@ -357,10 +382,17 @@ describe("offline wake delivery", () => {
         (acquire) => Effect.acquireRelease(acquire, Queue.shutdown)
       )
       const watchReady = yield* Deferred.make<void>()
+      const cycleCompleted = yield* Deferred.make<void>()
       const offlineWake = {
-        recipients: () => Effect.succeed([readerId]),
-        deliver: (wake: OfflineWake.Delivery) => Queue.offer(deliveries, wake),
-        ...wakeTiming
+        recipients: () => Effect.succeed([readerId, sentinelId]),
+        deliver: (wake: OfflineWake.Delivery) => {
+          if (wake.clientId === sentinelId) {
+            return Deferred.succeed(cycleCompleted, undefined).pipe(Effect.as("Delivered" as const))
+          }
+          return Queue.offer(deliveries, wake).pipe(Effect.as("Delivered" as const))
+        },
+        ...wakeTiming,
+        maximumConcurrentDeliveries: 1
       } satisfies OfflineWake.Options
       const server = yield* makeServer(offlineWake)
       const request = watchRequest()
@@ -374,9 +406,11 @@ describe("offline wake delivery", () => {
       const receipt = yield* submit(server, 1)
       assert.strictEqual(receipt._tag, "Accepted")
       yield* TestClock.adjust("10 seconds")
+      yield* Deferred.await(cycleCompleted)
       assert.strictEqual(yield* Queue.size(deliveries), 0)
 
       yield* Fiber.interrupt(watcher)
+      yield* TestClock.adjust("1 second")
       const delivered = yield* Queue.take(deliveries)
       assert.strictEqual(delivered.clientId, readerId)
     }).pipe(Effect.scoped))
@@ -390,10 +424,17 @@ describe("offline wake delivery", () => {
         (acquire) => Effect.acquireRelease(acquire, Queue.shutdown)
       )
       const watchReady = yield* Deferred.make<void>()
+      const cycleCompleted = yield* Deferred.make<void>()
       const offlineWake = {
-        recipients: () => Effect.succeed([readerId]),
-        deliver: (wake: OfflineWake.Delivery) => Queue.offer(deliveries, wake),
-        ...wakeTiming
+        recipients: () => Effect.succeed([readerId, sentinelId]),
+        deliver: (wake: OfflineWake.Delivery) => {
+          if (wake.clientId === sentinelId) {
+            return Deferred.succeed(cycleCompleted, undefined).pipe(Effect.as("Delivered" as const))
+          }
+          return Queue.offer(deliveries, wake).pipe(Effect.as("Delivered" as const))
+        },
+        ...wakeTiming,
+        maximumConcurrentDeliveries: 1
       } satisfies OfflineWake.Options
       const persistentDatabase = () =>
         SqliteClient.layer({ filename, disableWAL: true }).pipe((sqlite) =>
@@ -416,45 +457,14 @@ describe("offline wake delivery", () => {
       const receipt = yield* submit(submittingServer, 1)
       assert.strictEqual(receipt._tag, "Accepted")
       yield* TestClock.adjust("10 seconds")
+      yield* Deferred.await(cycleCompleted)
       assert.strictEqual(yield* Queue.size(deliveries), 0)
 
       yield* Fiber.interrupt(watcher)
+      yield* TestClock.adjust("1 second")
       const delivered = yield* Queue.take(deliveries)
       assert.strictEqual(delivered.clientId, readerId)
     }).pipe(Effect.provide(NodeFileSystem.layer), Effect.scoped))
-
-  it.effect("registers Watch presence only after an in flight delivery releases its claim", () =>
-    Effect.gen(function*() {
-      const deliveryStarted = yield* Deferred.make<void>()
-      const releaseDelivery = yield* Deferred.make<void>()
-      const watchReady = yield* Deferred.make<void>()
-      const offlineWake = {
-        recipients: () => Effect.succeed([readerId]),
-        deliver: () => {
-          const released = Deferred.await(releaseDelivery)
-          return Deferred.succeed(deliveryStarted, undefined).pipe(Effect.andThen(released))
-        },
-        ...wakeTiming
-      } satisfies OfflineWake.Options
-      const server = yield* makeServer(offlineWake)
-
-      const receipt = yield* submit(server, 1)
-      assert.strictEqual(receipt._tag, "Accepted")
-      yield* TestClock.adjust("1 second")
-      yield* Deferred.await(deliveryStarted)
-      const request = watchRequest()
-      const watcher = yield* server.watch(request).pipe(
-        Stream.tap(() => Deferred.succeed(watchReady, undefined)),
-        Stream.runDrain,
-        Effect.forkChild({ startImmediately: true })
-      )
-      assert.isFalse(yield* Deferred.isDone(watchReady))
-
-      yield* Deferred.succeed(releaseDelivery, undefined)
-      yield* TestClock.adjust("1 second")
-      yield* Deferred.await(watchReady)
-      yield* Fiber.interrupt(watcher)
-    }).pipe(Effect.scoped))
 
   it.effect("restores a live Watch presence row after lease cleanup", () =>
     Effect.gen(function*() {
@@ -466,10 +476,17 @@ describe("offline wake delivery", () => {
       )
       const watchReady = yield* Deferred.make<void>()
       const resolved = yield* Deferred.make<void>()
+      const cycleCompleted = yield* Deferred.make<void>()
       const offlineWake = {
-        recipients: () => Deferred.succeed(resolved, undefined).pipe(Effect.as([readerId])),
-        deliver: (wake: OfflineWake.Delivery) => Queue.offer(deliveries, wake),
-        ...wakeTiming
+        recipients: () => Deferred.succeed(resolved, undefined).pipe(Effect.as([readerId, sentinelId])),
+        deliver: (wake: OfflineWake.Delivery) => {
+          if (wake.clientId === sentinelId) {
+            return Deferred.succeed(cycleCompleted, undefined).pipe(Effect.as("Delivered" as const))
+          }
+          return Queue.offer(deliveries, wake).pipe(Effect.as("Delivered" as const))
+        },
+        ...wakeTiming,
+        maximumConcurrentDeliveries: 1
       } satisfies OfflineWake.Options
       const persistentDatabase = () =>
         SqliteClient.layer({ filename, disableWAL: true }).pipe((sqlite) =>
@@ -485,8 +502,7 @@ describe("offline wake delivery", () => {
       )
       yield* Deferred.await(watchReady)
       const inspectionSql = yield* SqliteClient.make({ filename }).pipe(Effect.provide(Reactivity.layer))
-      yield* inspectionSql`DELETE FROM effect_local_server_watch_presence
-        WHERE space_id = ${spaceId} AND client_id = ${readerId}`
+      yield* inspectionSql`DELETE FROM effect_local_server_watch_runtimes`
 
       yield* TestClock.adjust(wakeTiming.presenceHeartbeatInterval)
       const presence = yield* inspectionSql<{ readonly count: number }>`SELECT COUNT(*) AS count
@@ -497,6 +513,7 @@ describe("offline wake delivery", () => {
       assert.strictEqual(receipt._tag, "Accepted")
       yield* TestClock.adjust("2 seconds")
       yield* Deferred.await(resolved)
+      yield* Deferred.await(cycleCompleted)
       assert.strictEqual(yield* Queue.size(deliveries), 0)
       yield* Fiber.interrupt(watcher)
     }).pipe(Effect.provide(NodeFileSystem.layer), Effect.scoped))
@@ -508,16 +525,20 @@ describe("offline wake delivery", () => {
         (acquire) => Effect.acquireRelease(acquire, Queue.shutdown)
       )
       const attemptCount = yield* Ref.make(0)
+      const membershipDecided = yield* Deferred.make<void>()
       const offlineWake = {
         ...wakeTiming,
         recipients: () => Effect.succeed([readerId]),
-        isRecipient: () => Ref.get(member),
         deliver: (wake: OfflineWake.Delivery) =>
           Effect.gen(function*() {
+            if (!(yield* Ref.get(member))) {
+              yield* Deferred.succeed(membershipDecided, undefined)
+              return "NotRecipient" as const
+            }
             yield* Queue.offer(attempts, wake)
             const attempt = yield* Ref.updateAndGet(attemptCount, (value) => value + 1)
             if (attempt === 1) return yield* new TestWakeError({ reason: "provider unavailable" })
-            return yield* Effect.void
+            return "Delivered" as const
           })
       } satisfies OfflineWake.Options
       const server = yield* makeServer(offlineWake)
@@ -528,6 +549,7 @@ describe("offline wake delivery", () => {
 
       yield* Ref.set(member, false)
       yield* TestClock.adjust("1 second")
+      yield* Deferred.await(membershipDecided)
       assert.strictEqual(yield* Queue.size(attempts), 0)
     }).pipe(Effect.scoped))
 })

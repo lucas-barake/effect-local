@@ -11,6 +11,7 @@ import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
+import * as Semaphore from "effect/Semaphore"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Codec from "./internal/codec.js"
@@ -27,15 +28,14 @@ export interface Delivery {
   readonly clientId: Identity.ClientId
 }
 
+export type DeliveryOutcome = "Delivered" | "NotRecipient"
+const DeliveryOutcome = Schema.Literals(["Delivered", "NotRecipient"])
+
 export interface Options<R = never,> {
   readonly recipients: (input: {
     readonly spaceId: Identity.SpaceId
   }) => Effect.Effect<ReadonlyArray<Identity.ClientId>, HookRejection, R>
-  readonly isRecipient: (input: {
-    readonly spaceId: Identity.SpaceId
-    readonly clientId: Identity.ClientId
-  }) => Effect.Effect<boolean, HookRejection, R>
-  readonly deliver: (wake: Delivery) => Effect.Effect<void, HookRejection, R>
+  readonly deliver: (wake: Delivery) => Effect.Effect<DeliveryOutcome, HookRejection, R>
   readonly coalescingWindow: Duration.Input
   readonly pollInterval: Duration.Input
   readonly retryDelay: Duration.Input
@@ -94,6 +94,7 @@ const ClientRow = Schema.Struct({
 })
 
 const WatcherRow = Schema.Struct({ watcher_id: Schema.String })
+const RuntimeRow = Schema.Struct({ runtime_id: Schema.String })
 
 const randomToken = (crypto: Crypto.Crypto) =>
   crypto.randomUUIDv4.pipe(
@@ -164,39 +165,45 @@ export const make = <R,>(
 
     const sql = yield* SqlClient.SqlClient
     const crypto = yield* Crypto.Crypto
+    const runtimeId = yield* randomToken(crypto)
     const presences = new Map<string, {
       readonly spaceId: Identity.SpaceId
       readonly clientId: Identity.ClientId
     }>()
+    const presenceGate = yield* Semaphore.make(1)
     const prompt = yield* Queue.dropping<void>(1).pipe(
       (acquire) => Effect.acquireRelease(acquire, Queue.shutdown)
     )
     const notify = Queue.offer(prompt, undefined).pipe(Effect.asVoid)
+    const runtimeStartedAt = yield* Clock.currentTimeMillis
+    yield* sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
+      VALUES (${runtimeId}, ${runtimeStartedAt + presenceLeaseMillis})`.pipe(
+      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+    )
+    yield* Effect.addFinalizer(() =>
+      presenceGate.withPermit(
+        sql`DELETE FROM effect_local_server_watch_runtimes WHERE runtime_id = ${runtimeId}`
+      ).pipe(
+        Effect.catchTag("SqlError", (cause) => Effect.logWarning("Offline wake runtime cleanup failed", cause)),
+        Effect.asVoid
+      )
+    )
 
-    const dueSpaces = SqlSchema.findAll({
-      Request: Schema.Struct({ now: NonNegativeInt, limit: PositiveInt }),
-      Result: SpaceRow,
-      execute: ({ now, limit }) =>
-        sql`SELECT space_id, high_water_sequence, expanded_sequence, membership_generation,
-          attempt_count, next_attempt_at, claim_token, claimed_until
-        FROM effect_local_server_offline_wake_spaces
-        WHERE high_water_sequence > expanded_sequence AND next_attempt_at <= ${now}
-          AND (claim_token IS NULL OR claimed_until <= ${now})
-        ORDER BY next_attempt_at, space_id LIMIT ${limit}`
-    })
-    const claimSpace = SqlSchema.findOneOption({
+    const claimSpaces = SqlSchema.findAll({
       Request: Schema.Struct({
-        spaceId: Identity.SpaceId,
         now: NonNegativeInt,
         token: Schema.String,
-        claimedUntil: NonNegativeInt
+        claimedUntil: NonNegativeInt,
+        limit: PositiveInt
       }),
       Result: SpaceRow,
-      execute: ({ spaceId, now, token, claimedUntil }) =>
+      execute: ({ now, token, claimedUntil, limit }) =>
         sql`UPDATE effect_local_server_offline_wake_spaces
         SET claim_token = ${token}, claimed_until = ${claimedUntil}
-        WHERE space_id = ${spaceId} AND high_water_sequence > expanded_sequence
-          AND next_attempt_at <= ${now} AND (claim_token IS NULL OR claimed_until <= ${now})
+        WHERE rowid IN (SELECT rowid FROM effect_local_server_offline_wake_spaces
+          WHERE high_water_sequence > expanded_sequence AND next_attempt_at <= ${now}
+            AND (claim_token IS NULL OR claimed_until <= ${now})
+          ORDER BY next_attempt_at, space_id LIMIT ${limit})
         RETURNING space_id, high_water_sequence, expanded_sequence, membership_generation,
           attempt_count, next_attempt_at, claim_token, claimed_until`
     })
@@ -231,7 +238,6 @@ export const make = <R,>(
       Effect.gen(function*() {
         const recipientsExit = yield* options.recipients({ spaceId: row.space_id }).pipe(
           Effect.provide(context),
-          Effect.flatMap((value) => Schema.decodeUnknownEffect(Schema.Array(Identity.ClientId))(value)),
           Effect.timeoutOption(hookTimeoutMillis),
           Effect.exit
         )
@@ -242,7 +248,11 @@ export const make = <R,>(
             yield* Effect.failCause(recipientsExit.cause)
           }
           yield* failSpaceClaim(row, now)
-          yield* Effect.logWarning("Offline wake recipient resolution failed").pipe(
+          let log = Effect.logWarning("Offline wake recipient resolution failed")
+          if (Cause.hasDies(recipientsExit.cause)) {
+            log = Effect.logWarning("Offline wake recipient resolution failed", recipientsExit.cause)
+          }
+          yield* log.pipe(
             Effect.annotateLogs({
               "space.id": row.space_id,
               "failure.kind": Cause.findErrorOption(recipientsExit.cause).pipe(Option.match({
@@ -260,21 +270,36 @@ export const make = <R,>(
           )
           return
         }
-        const uniqueRecipients = new Set<Identity.ClientId>()
-        for (const clientId of recipientsExit.value.value) {
-          uniqueRecipients.add(clientId)
-          if (uniqueRecipients.size > options.maximumRecipientsPerSpace) break
+        const candidates = recipientsExit.value.value
+        if (!Array.isArray(candidates)) {
+          yield* failSpaceClaim(row, now)
+          yield* Effect.logWarning("Offline wake recipients hook returned a non-array value").pipe(
+            Effect.annotateLogs({ "space.id": row.space_id })
+          )
+          return
         }
-        if (uniqueRecipients.size > options.maximumRecipientsPerSpace) {
+        if (candidates.length > options.maximumRecipientsPerSpace) {
           yield* failSpaceClaim(row, now)
           yield* Effect.logWarning("Offline wake recipient capacity exceeded").pipe(
             Effect.annotateLogs({
               "space.id": row.space_id,
-              recipients: uniqueRecipients.size,
+              recipients: candidates.length,
               limit: options.maximumRecipientsPerSpace
             })
           )
           return
+        }
+        const uniqueRecipients = new Set<Identity.ClientId>()
+        for (const candidate of candidates) {
+          const decoded = yield* Schema.decodeUnknownEffect(Identity.ClientId)(candidate).pipe(Effect.exit)
+          if (decoded._tag === "Failure") {
+            yield* failSpaceClaim(row, now)
+            yield* Effect.logWarning("Offline wake recipients hook returned an invalid client ID").pipe(
+              Effect.annotateLogs({ "space.id": row.space_id })
+            )
+            return
+          }
+          uniqueRecipients.add(decoded.value)
         }
         const recipients = [...uniqueRecipients].toSorted()
         const pending = yield* Effect.forEach(recipients, (clientId) =>
@@ -328,38 +353,25 @@ export const make = <R,>(
         )
       }).pipe(Effect.withSpan("OfflineWake.expand", { attributes: { "space.id": row.space_id } }))
 
-    const dueClients = SqlSchema.findAll({
-      Request: Schema.Struct({ now: NonNegativeInt, limit: PositiveInt }),
-      Result: ClientRow,
-      execute: ({ now, limit }) =>
-        sql`SELECT wake.space_id, wake.client_id, wake.wake_id, wake.high_water_sequence,
-          wake.notified_sequence, wake.membership_generation, wake.attempt_count,
-          wake.next_attempt_at, wake.claim_token, wake.claimed_until
-        FROM effect_local_server_offline_wakes AS wake
-        WHERE wake.high_water_sequence > wake.notified_sequence AND wake.next_attempt_at <= ${now}
-          AND (wake.claim_token IS NULL OR wake.claimed_until <= ${now})
-          AND NOT EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS presence
-            WHERE presence.space_id = wake.space_id AND presence.client_id = wake.client_id
-              AND presence.expires_at > ${now})
-        ORDER BY wake.next_attempt_at, wake.space_id, wake.client_id LIMIT ${limit}`
-    })
-    const claimClient = SqlSchema.findOneOption({
+    const claimClients = SqlSchema.findAll({
       Request: Schema.Struct({
-        spaceId: Identity.SpaceId,
-        clientId: Identity.ClientId,
         now: NonNegativeInt,
         token: Schema.String,
-        claimedUntil: NonNegativeInt
+        claimedUntil: NonNegativeInt,
+        limit: PositiveInt
       }),
       Result: ClientRow,
-      execute: ({ spaceId, clientId, now, token, claimedUntil }) =>
+      execute: ({ now, token, claimedUntil, limit }) =>
         sql`UPDATE effect_local_server_offline_wakes SET claim_token = ${token}, claimed_until = ${claimedUntil}
-        WHERE space_id = ${spaceId} AND client_id = ${clientId}
-          AND high_water_sequence > notified_sequence AND next_attempt_at <= ${now}
-          AND (claim_token IS NULL OR claimed_until <= ${now})
-          AND NOT EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS presence
-            WHERE presence.space_id = ${spaceId} AND presence.client_id = ${clientId}
-              AND presence.expires_at > ${now})
+        WHERE rowid IN (SELECT wake.rowid FROM effect_local_server_offline_wakes AS wake
+          WHERE wake.high_water_sequence > wake.notified_sequence AND wake.next_attempt_at <= ${now}
+            AND (wake.claim_token IS NULL OR wake.claimed_until <= ${now})
+            AND NOT EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS presence
+              INNER JOIN effect_local_server_watch_runtimes AS runtime
+                ON runtime.runtime_id = presence.runtime_id
+              WHERE presence.space_id = wake.space_id AND presence.client_id = wake.client_id
+                AND runtime.expires_at > ${now})
+          ORDER BY wake.next_attempt_at, wake.space_id, wake.client_id LIMIT ${limit})
         RETURNING space_id, client_id, wake_id, high_water_sequence, notified_sequence,
           membership_generation, attempt_count, next_attempt_at, claim_token, claimed_until`
     })
@@ -367,26 +379,35 @@ export const make = <R,>(
       Request: Schema.Struct({ spaceId: Identity.SpaceId, clientId: Identity.ClientId, now: NonNegativeInt }),
       Result: Schema.Struct({ count: NonNegativeInt }),
       execute: ({ spaceId, clientId, now }) =>
-        sql`SELECT COUNT(*) AS count FROM effect_local_server_watch_presence
-        WHERE space_id = ${spaceId} AND client_id = ${clientId} AND expires_at > ${now}`
+        sql`SELECT COUNT(*) AS count FROM effect_local_server_watch_presence AS presence
+        INNER JOIN effect_local_server_watch_runtimes AS runtime ON runtime.runtime_id = presence.runtime_id
+        WHERE presence.space_id = ${spaceId} AND presence.client_id = ${clientId}
+          AND runtime.expires_at > ${now}`
     })
     const insertPresence = SqlSchema.findOneOption({
       Request: Schema.Struct({
         spaceId: Identity.SpaceId,
         clientId: Identity.ClientId,
         watcherId: Schema.String,
-        now: NonNegativeInt,
-        expiresAt: NonNegativeInt
+        databaseRuntimeId: Schema.String,
+        now: NonNegativeInt
       }),
       Result: WatcherRow,
-      execute: ({ spaceId, clientId, watcherId, now, expiresAt }) =>
+      execute: ({ spaceId, clientId, watcherId, databaseRuntimeId, now }) =>
         sql`INSERT INTO effect_local_server_watch_presence
-          (space_id, client_id, watcher_id, expires_at)
-        SELECT ${spaceId}, ${clientId}, ${watcherId}, ${expiresAt}
+          (space_id, client_id, watcher_id, runtime_id)
+        SELECT ${spaceId}, ${clientId}, ${watcherId}, ${databaseRuntimeId}
         WHERE NOT EXISTS (SELECT 1 FROM effect_local_server_offline_wakes AS wake
           WHERE wake.space_id = ${spaceId} AND wake.client_id = ${clientId}
             AND wake.claim_token IS NOT NULL AND wake.claimed_until > ${now})
         RETURNING watcher_id`
+    })
+    const heartbeatRuntime = SqlSchema.findOneOption({
+      Request: Schema.Struct({ databaseRuntimeId: Schema.String, expiresAt: NonNegativeInt }),
+      Result: RuntimeRow,
+      execute: ({ databaseRuntimeId, expiresAt }) =>
+        sql`UPDATE effect_local_server_watch_runtimes SET expires_at = ${expiresAt}
+        WHERE runtime_id = ${databaseRuntimeId} RETURNING runtime_id`
     })
 
     const releaseClientClaim = (row: typeof ClientRow.Type, nextAttemptAt: number) =>
@@ -413,52 +434,6 @@ export const make = <R,>(
     const deliver = (row: typeof ClientRow.Type) =>
       Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
-        const membership = yield* options.isRecipient({
-          spaceId: row.space_id,
-          clientId: row.client_id
-        }).pipe(
-          Effect.provide(context),
-          Effect.timeoutOption(hookTimeoutMillis),
-          Effect.exit
-        )
-        if (membership._tag === "Failure") {
-          if (Cause.hasInterrupts(membership.cause)) {
-            yield* releaseClientClaim(row, now)
-            yield* Effect.failCause(membership.cause)
-          }
-          yield* failClientClaim(row, now)
-          yield* Effect.logWarning("Offline wake recipient revalidation failed").pipe(
-            Effect.annotateLogs({
-              "wake.id": row.wake_id,
-              "space.id": row.space_id,
-              "client.id": row.client_id,
-              "failure.kind": Cause.findErrorOption(membership.cause).pipe(Option.match({
-                onNone: () => "defect",
-                onSome: () => "failure"
-              }))
-            })
-          )
-          return
-        }
-        if (Option.isNone(membership.value)) {
-          yield* failClientClaim(row, now)
-          yield* Effect.logWarning("Offline wake recipient revalidation timed out").pipe(
-            Effect.annotateLogs({
-              "wake.id": row.wake_id,
-              "space.id": row.space_id,
-              "client.id": row.client_id
-            })
-          )
-          return
-        }
-        if (!membership.value.value) {
-          yield* sql`DELETE FROM effect_local_server_offline_wakes
-            WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
-              AND claim_token = ${row.claim_token}`.pipe(
-            Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
-          )
-          return
-        }
         const presence = yield* activePresence({ spaceId: row.space_id, clientId: row.client_id, now }).pipe(
           Effect.mapError(StorageUnavailable.make)
         )
@@ -472,6 +447,7 @@ export const make = <R,>(
           clientId: row.client_id
         }).pipe(
           Effect.provide(context),
+          Effect.flatMap((value) => Schema.decodeUnknownEffect(DeliveryOutcome)(value)),
           Effect.timeoutOption(hookTimeoutMillis),
           Effect.exit
         )
@@ -482,7 +458,11 @@ export const make = <R,>(
             yield* Effect.failCause(delivered.cause)
           }
           yield* failClientClaim(row, completedAt)
-          yield* Effect.logWarning("Offline wake delivery failed").pipe(
+          let log = Effect.logWarning("Offline wake delivery failed")
+          if (Cause.hasDies(delivered.cause)) {
+            log = Effect.logWarning("Offline wake delivery failed", delivered.cause)
+          }
+          yield* log.pipe(
             Effect.annotateLogs({
               "wake.id": row.wake_id,
               "space.id": row.space_id,
@@ -503,6 +483,14 @@ export const make = <R,>(
               "space.id": row.space_id,
               "client.id": row.client_id
             })
+          )
+          return
+        }
+        if (delivered.value.value === "NotRecipient") {
+          yield* sql`DELETE FROM effect_local_server_offline_wakes
+            WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
+              AND claim_token = ${row.claim_token}`.pipe(
+            Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
           )
           return
         }
@@ -532,59 +520,65 @@ export const make = <R,>(
 
     const run = Effect.gen(function*() {
       const now = yield* Clock.currentTimeMillis
-      yield* sql`DELETE FROM effect_local_server_watch_presence WHERE expires_at <= ${now}`.pipe(
+      yield* sql`DELETE FROM effect_local_server_watch_runtimes WHERE expires_at <= ${now}`.pipe(
         Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
       )
-      const spaces = yield* dueSpaces({ now, limit: options.claimBatchSize }).pipe(
-        Effect.mapError(StorageUnavailable.make)
-      )
-      yield* Effect.forEach(spaces, (candidate) =>
-        Effect.gen(function*() {
-          const claimNow = yield* Clock.currentTimeMillis
-          const token = yield* randomToken(crypto)
-          const claimed = yield* claimSpace({
-            spaceId: candidate.space_id,
-            now: claimNow,
-            token,
-            claimedUntil: claimNow + claimLeaseMillis
-          }).pipe(Effect.mapError(StorageUnavailable.make))
-          if (Option.isSome(claimed)) {
-            yield* expand(claimed.value).pipe(Effect.ensuring(
-              releaseSpaceClaim(claimed.value).pipe(
-                Effect.catch((error) => Effect.logWarning("Offline wake space claim cleanup failed", error))
-              )
-            ))
-          }
-        }), {
-        concurrency: options.maximumConcurrentRecipientResolutions,
-        discard: true
-      })
-      const clients = yield* dueClients({ now, limit: options.claimBatchSize }).pipe(
-        Effect.mapError(StorageUnavailable.make)
-      )
-      yield* Effect.forEach(clients, (candidate) =>
-        Effect.gen(function*() {
-          const claimNow = yield* Clock.currentTimeMillis
-          const token = yield* randomToken(crypto)
-          const claimed = yield* claimClient({
-            spaceId: candidate.space_id,
-            clientId: candidate.client_id,
-            now: claimNow,
-            token,
-            claimedUntil: claimNow + claimLeaseMillis
-          }).pipe(Effect.mapError(StorageUnavailable.make))
-          if (Option.isSome(claimed)) {
-            yield* deliver(claimed.value).pipe(Effect.ensuring(
-              Clock.currentTimeMillis.pipe(
-                Effect.flatMap((releasedAt) => releaseClientClaim(claimed.value, releasedAt)),
-                Effect.catch((error) => Effect.logWarning("Offline wake client claim cleanup failed", error))
-              )
-            ))
-          }
-        }), {
-        concurrency: options.maximumConcurrentDeliveries,
-        discard: true
-      })
+      let spaceClaims = 0
+      while (spaceClaims < options.claimBatchSize) {
+        const claimNow = yield* Clock.currentTimeMillis
+        const token = yield* randomToken(crypto)
+        const limit = Math.min(
+          options.maximumConcurrentRecipientResolutions,
+          options.claimBatchSize - spaceClaims
+        )
+        const spaces = yield* claimSpaces({
+          now: claimNow,
+          token,
+          claimedUntil: claimNow + claimLeaseMillis,
+          limit
+        }).pipe(Effect.mapError(StorageUnavailable.make))
+        if (spaces.length === 0) break
+        spaceClaims += spaces.length
+        const orderedSpaces = spaces.toSorted((left, right) => left.space_id.localeCompare(right.space_id))
+        yield* Effect.forEach(orderedSpaces, (claimed) =>
+          expand(claimed).pipe(Effect.ensuring(
+            releaseSpaceClaim(claimed).pipe(
+              Effect.catch((failure) => Effect.logWarning("Offline wake space claim cleanup failed", failure))
+            )
+          )), {
+          concurrency: options.maximumConcurrentRecipientResolutions,
+          discard: true
+        })
+      }
+      let clientClaims = 0
+      while (clientClaims < options.claimBatchSize) {
+        const claimNow = yield* Clock.currentTimeMillis
+        const token = yield* randomToken(crypto)
+        const limit = Math.min(options.maximumConcurrentDeliveries, options.claimBatchSize - clientClaims)
+        const clients = yield* claimClients({
+          now: claimNow,
+          token,
+          claimedUntil: claimNow + claimLeaseMillis,
+          limit
+        }).pipe(Effect.mapError(StorageUnavailable.make))
+        if (clients.length === 0) break
+        clientClaims += clients.length
+        const orderedClients = clients.toSorted((left, right) => {
+          const spaceOrder = left.space_id.localeCompare(right.space_id)
+          if (spaceOrder !== 0) return spaceOrder
+          return left.client_id.localeCompare(right.client_id)
+        })
+        yield* Effect.forEach(orderedClients, (claimed) =>
+          deliver(claimed).pipe(Effect.ensuring(
+            Clock.currentTimeMillis.pipe(
+              Effect.flatMap((releasedAt) => releaseClientClaim(claimed, releasedAt)),
+              Effect.catch((failure) => Effect.logWarning("Offline wake client claim cleanup failed", failure))
+            )
+          )), {
+          concurrency: options.maximumConcurrentDeliveries,
+          discard: true
+        })
+      }
     }).pipe(Effect.withSpan("OfflineWake.run"))
 
     const enqueue = (spaceId: Identity.SpaceId, sequence: Identity.ServerSequence) =>
@@ -610,34 +604,40 @@ export const make = <R,>(
     const registerWatch = (spaceId: Identity.SpaceId, clientId: Identity.ClientId) =>
       Effect.gen(function*() {
         const watcherId = yield* randomToken(crypto)
-        let registered = false
-        while (!registered) {
-          const now = yield* Clock.currentTimeMillis
-          const inserted = yield* insertPresence({
-            spaceId,
-            clientId,
-            watcherId,
-            now,
-            expiresAt: now + presenceLeaseMillis
-          }).pipe(Effect.mapError(StorageUnavailable.make))
-          if (Option.isSome(inserted)) {
-            registered = true
-          } else {
-            yield* Effect.sleep(presenceRegistrationRetryMillis)
+        const register = Effect.gen(function*() {
+          let registered = false
+          while (!registered) {
+            const now = yield* Clock.currentTimeMillis
+            const inserted = yield* insertPresence({
+              spaceId,
+              clientId,
+              watcherId,
+              databaseRuntimeId: runtimeId,
+              now
+            }).pipe(Effect.mapError(StorageUnavailable.make))
+            if (Option.isSome(inserted)) {
+              registered = true
+            } else {
+              yield* Effect.sleep(presenceRegistrationRetryMillis)
+            }
           }
-        }
-        presences.set(watcherId, { spaceId, clientId })
-        yield* Effect.addFinalizer(() =>
-          Effect.sync(() => presences.delete(watcherId)).pipe(
+          presences.set(watcherId, { spaceId, clientId })
+        })
+        yield* presenceGate.withPermit(register)
+        yield* Effect.addFinalizer(() => {
+          const removePresence = Effect.sync(() => presences.delete(watcherId))
+          const cleanup = removePresence.pipe(
             Effect.andThen(
               sql`DELETE FROM effect_local_server_watch_presence
                 WHERE space_id = ${spaceId} AND client_id = ${clientId} AND watcher_id = ${watcherId}`
-            ),
+            )
+          )
+          return presenceGate.withPermit(cleanup).pipe(
             Effect.andThen(notify),
             Effect.catchTag("SqlError", (cause) => Effect.logWarning("Offline wake presence cleanup failed", cause)),
             Effect.asVoid
           )
-        )
+        })
       }).pipe(Effect.withSpan("OfflineWake.registerWatch", {
         attributes: { "space.id": spaceId, "client.id": clientId }
       }))
@@ -646,22 +646,34 @@ export const make = <R,>(
       Effect.andThen(Clock.currentTimeMillis),
       Effect.flatMap((heartbeatAt) =>
         Effect.gen(function*() {
-          const encoded = yield* Codec.stringify([...presences].map(([watcherId, presence]) => ({
-            watcherId,
-            spaceId: presence.spaceId,
-            clientId: presence.clientId
-          }))).pipe(Effect.mapError(StorageUnavailable.make))
-          yield* sql`INSERT INTO effect_local_server_watch_presence
-          (space_id, client_id, watcher_id, expires_at)
-          SELECT json_extract(value, '$.spaceId'), json_extract(value, '$.clientId'),
-            json_extract(value, '$.watcherId'), ${heartbeatAt + presenceLeaseMillis}
-          FROM json_each(${encoded}) AS local_presence
-          WHERE NOT EXISTS (SELECT 1 FROM effect_local_server_offline_wakes AS wake
-            WHERE wake.space_id = json_extract(local_presence.value, '$.spaceId')
-              AND wake.client_id = json_extract(local_presence.value, '$.clientId')
-              AND wake.claim_token IS NOT NULL AND wake.claimed_until > ${heartbeatAt})
-          ON CONFLICT (space_id, client_id, watcher_id) DO UPDATE SET
-            expires_at = excluded.expires_at`
+          const updated = yield* heartbeatRuntime({
+            databaseRuntimeId: runtimeId,
+            expiresAt: heartbeatAt + presenceLeaseMillis
+          })
+          if (Option.isSome(updated)) return
+          yield* presenceGate.withPermit(Effect.gen(function*() {
+            const encoded = yield* Codec.stringify([...presences].map(([watcherId, presence]) => ({
+              watcherId,
+              spaceId: presence.spaceId,
+              clientId: presence.clientId
+            }))).pipe(Effect.mapError(StorageUnavailable.make))
+            yield* Effect.gen(function*() {
+              yield* sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
+                VALUES (${runtimeId}, ${heartbeatAt + presenceLeaseMillis})
+                ON CONFLICT (runtime_id) DO UPDATE SET expires_at = excluded.expires_at`
+              yield* sql`INSERT INTO effect_local_server_watch_presence
+                (space_id, client_id, watcher_id, runtime_id)
+                SELECT json_extract(value, '$.spaceId'), json_extract(value, '$.clientId'),
+                  json_extract(value, '$.watcherId'), ${runtimeId}
+                FROM json_each(${encoded}) AS local_presence
+                WHERE NOT EXISTS (SELECT 1 FROM effect_local_server_offline_wakes AS wake
+                  WHERE wake.space_id = json_extract(local_presence.value, '$.spaceId')
+                    AND wake.client_id = json_extract(local_presence.value, '$.clientId')
+                    AND wake.claim_token IS NOT NULL AND wake.claimed_until > ${heartbeatAt})
+                ON CONFLICT (space_id, client_id, watcher_id) DO UPDATE SET
+                  runtime_id = excluded.runtime_id`
+            }).pipe((effect) => sql.withTransaction(effect))
+          }))
         })
       ),
       Effect.catchTags({
@@ -676,10 +688,10 @@ export const make = <R,>(
     const polled = Effect.sleep(pollIntervalMillis)
     yield* Effect.raceFirst(prompted, polled).pipe(
       Effect.andThen(run),
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-        return Effect.logError("Offline wake dispatch failed", cause)
-      }),
+      Effect.catchTag("StorageUnavailable", () =>
+        Effect.logError("Offline wake dispatch failed").pipe(
+          Effect.annotateLogs({ "failure.tag": "StorageUnavailable" })
+        )),
       Effect.forever,
       Effect.forkScoped
     )

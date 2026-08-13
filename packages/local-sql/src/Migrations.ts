@@ -1728,17 +1728,21 @@ const serverV12 = makeMigration({
     `CREATE INDEX effect_local_server_offline_wakes_due
       ON effect_local_server_offline_wakes (next_attempt_at, space_id, client_id)
       WHERE high_water_sequence > notified_sequence`,
+    `CREATE TABLE effect_local_server_watch_runtimes (
+      runtime_id TEXT PRIMARY KEY,
+      expires_at INTEGER NOT NULL CHECK (expires_at >= 0)
+    )`,
+    `CREATE INDEX effect_local_server_watch_runtimes_expiry
+      ON effect_local_server_watch_runtimes (expires_at)`,
     `CREATE TABLE effect_local_server_watch_presence (
       space_id TEXT NOT NULL,
       client_id TEXT NOT NULL,
       watcher_id TEXT NOT NULL,
-      expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+      runtime_id TEXT NOT NULL REFERENCES effect_local_server_watch_runtimes(runtime_id) ON DELETE CASCADE,
       PRIMARY KEY (space_id, client_id, watcher_id)
     )`,
     `CREATE INDEX effect_local_server_watch_presence_active
-      ON effect_local_server_watch_presence (space_id, client_id, expires_at)`,
-    `CREATE INDEX effect_local_server_watch_presence_expiry
-      ON effect_local_server_watch_presence (expires_at)`
+      ON effect_local_server_watch_presence (space_id, client_id, runtime_id)`
   ]
 })
 
