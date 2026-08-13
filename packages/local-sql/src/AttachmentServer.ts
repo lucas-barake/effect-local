@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as RcMap from "effect/RcMap"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
@@ -109,6 +110,7 @@ const ReadableEntity = Schema.Struct({
   value_json: Schema.String
 })
 const DigestRow = Schema.Struct({ digest: Attachment.Digest })
+const LeaseTokenRow = Schema.Struct({ lease_token: Schema.String })
 
 export const layer = <R = never,>(options: Options<R>): Layer.Layer<
   AttachmentServer,
@@ -816,23 +818,60 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           ),
           Effect.ignore
         )
-        const renewalInterval = Math.floor(readLeaseLifetime / 2)
-        const renew = Effect.forever(
-          Effect.gen(function*() {
-            yield* Effect.sleep(Math.max(1, renewalInterval))
-            const renewedAt = yield* Clock.currentTimeMillis
-            yield* sql`UPDATE effect_local_server_attachment_read_leases
-              SET expires_at = ${renewedAt + readLeaseLifetime}
-              WHERE lease_token = ${leaseToken}`
-          }).pipe(
-            Effect.tapError((error) =>
-              Effect.logWarning("Attachment read lease renewal failed").pipe(
-                Effect.annotateLogs("error", error._tag)
-              )
-            ),
-            Effect.ignore
+        const renewExactLease = SqlSchema.findOneOption({
+          Request: Schema.Struct({ expiresAt: Schema.Number }),
+          Result: LeaseTokenRow,
+          execute: ({ expiresAt }) =>
+            sql`INSERT INTO effect_local_server_attachment_read_leases
+              (lease_token, space_id, digest, object_key, expires_at, created_at)
+              SELECT ${leaseToken}, o.space_id, o.digest, o.object_key, ${expiresAt}, ${now}
+              FROM effect_local_server_attachment_objects AS o
+              WHERE o.space_id = ${input.spaceId} AND o.digest = ${input.reference.digest}
+                AND o.object_key = ${object.object_key} AND o.bytes = ${input.reference.bytes}
+                AND o.state = 'Complete'
+              ON CONFLICT (lease_token) DO UPDATE SET expires_at = excluded.expires_at
+                WHERE effect_local_server_attachment_read_leases.space_id = excluded.space_id
+                  AND effect_local_server_attachment_read_leases.digest = excluded.digest
+                  AND effect_local_server_attachment_read_leases.object_key = excluded.object_key
+              RETURNING lease_token`
+        })
+        const renewOnce = Effect.fnUntraced(function*(renewedAt: number) {
+          const renewed = yield* renewExactLease({ expiresAt: renewedAt + readLeaseLifetime }).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({
+                    message: "Attachment read lease renewal state is corrupt",
+                    cause
+                  })
+                )
+            })
           )
-        )
+          if (Option.isNone(renewed)) {
+            return yield* new Attachment.AttachmentUnavailable({ digest: input.reference.digest })
+          }
+          return yield* Effect.void
+        }, Effect.withSpan("AttachmentServer.renewReadLease"))
+        const renewalInterval = Math.max(1, Math.floor(readLeaseLifetime / 2))
+        const retryInterval = Math.max(1, Math.floor(readLeaseLifetime / 4))
+        const renew = Effect.gen(function*() {
+          let delay = renewalInterval
+          while (true) {
+            yield* Effect.sleep(delay)
+            const renewedAt = yield* Clock.currentTimeMillis
+            const result = yield* renewOnce(renewedAt).pipe(Effect.result)
+            if (Result.isSuccess(result)) {
+              delay = renewalInterval
+              continue
+            }
+            yield* Effect.logWarning("Attachment read lease renewal failed").pipe(
+              Effect.annotateLogs("error", result.failure._tag)
+            )
+            if (result.failure._tag !== "StorageUnavailable") return yield* result.failure
+            delay = retryInterval
+          }
+        }).pipe(Effect.withSpan("AttachmentServer.maintainReadLease"))
         return storage.read(object.object_key, input.reference, input.range).pipe(
           Stream.drainFork(Stream.fromEffectDrain(renew)),
           Stream.ensuring(release)

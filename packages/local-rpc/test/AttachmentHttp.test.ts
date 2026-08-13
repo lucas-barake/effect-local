@@ -131,6 +131,7 @@ describe("attachment HTTP transport", () => {
         const server = Context.get(services, ServerStore.ServerStore)
         const attachments = Context.get(services, AttachmentServer.AttachmentServer)
         const sql = Context.get(services, SqlClient.SqlClient)
+        const testClock = yield* Clock.Clock
         yield* server.pull({
           spaceId,
           clientId,
@@ -147,8 +148,16 @@ describe("attachment HTTP transport", () => {
             return Effect.fail(new ReplicaError.CredentialRejected())
           }
         })
+        const routeAttachments = AttachmentServer.AttachmentServer.of({
+          ...attachments,
+          prepareRead: (input) =>
+            attachments.prepareRead(input).pipe(
+              Effect.provideService(Clock.Clock, testClock),
+              Effect.map(Stream.provideService(Clock.Clock, testClock))
+            )
+        })
         const layerRoute = AttachmentHttpServer.layer().pipe(
-          Layer.provide(Layer.succeed(AttachmentServer.AttachmentServer, attachments)),
+          Layer.provide(Layer.succeed(AttachmentServer.AttachmentServer, routeAttachments)),
           Layer.provide(Layer.succeed(Authentication.Authenticator, authenticator))
         )
         const web = HttpRouter.toWebHandler(layerRoute, { disableLogger: true })
@@ -256,6 +265,15 @@ describe("attachment HTTP transport", () => {
           Effect.forkChild
         )
         yield* readStarted.await
+        const initialLease = yield* sql<{ readonly expires_at: number }>`SELECT expires_at
+          FROM effect_local_server_attachment_read_leases WHERE space_id = ${spaceId}`
+        assert.lengthOf(initialLease, 1)
+        const initialLeaseExpiry = initialLease[0].expires_at
+        const failedRenewalExpiry = initialLeaseExpiry + 30_000
+        yield* sql.unsafe(`CREATE TRIGGER fail_first_http_attachment_read_renewal
+          BEFORE UPDATE OF expires_at ON effect_local_server_attachment_read_leases
+          WHEN NEW.expires_at = ${failedRenewalExpiry}
+          BEGIN SELECT RAISE(ABORT, 'transient HTTP read lease renewal failure'); END`)
         yield* attachments.replaceEntityReferences({
           spaceId,
           schemaGeneration: 0,
@@ -278,8 +296,23 @@ describe("attachment HTTP transport", () => {
           Layer.build
         )
         const secondServer = Context.get(secondContext, AttachmentServer.AttachmentServer)
-        yield* TestClock.adjust("2 minutes")
-        assert.strictEqual(yield* secondServer.maintain(spaceId), 0)
+        yield* TestClock.adjust("30 seconds")
+        yield* TestClock.adjust("15 seconds")
+        const maintenanceNow = initialLeaseExpiry + 1
+        const maintenanceNanos = BigInt(maintenanceNow) * 1_000_000n
+        const maintenanceClock: Clock.Clock = {
+          currentTimeMillisUnsafe: () => maintenanceNow,
+          currentTimeMillis: Effect.succeed(maintenanceNow),
+          currentTimeNanosUnsafe: () => maintenanceNanos,
+          currentTimeNanos: Effect.succeed(maintenanceNanos),
+          monotonicTimeNanosUnsafe: () => testClock.monotonicTimeNanosUnsafe(),
+          monotonicTimeNanos: testClock.monotonicTimeNanos,
+          sleep: (duration) => testClock.sleep(duration)
+        }
+        assert.strictEqual(
+          yield* secondServer.maintain(spaceId).pipe(Effect.provideService(Clock.Clock, maintenanceClock)),
+          0
+        )
         yield* releaseRead.open
         assert.deepStrictEqual(yield* Fiber.join(download), bytes)
         assert.strictEqual(downloadCacheControl, "private, no-store")
@@ -305,8 +338,8 @@ describe("attachment HTTP transport", () => {
         )
         assert.isNotNull(candidates[0].garbage_collect_after)
         yield* TestClock.adjust("2 minutes")
-        const maintenanceNow = yield* Clock.currentTimeMillis
-        assert.isAtMost(candidates[0].garbage_collect_after, maintenanceNow)
+        const collectionNow = yield* Clock.currentTimeMillis
+        assert.isAtMost(candidates[0].garbage_collect_after, collectionNow)
         assert.strictEqual(yield* secondServer.maintain(spaceId), 1)
         const storageService = Context.get(services, AttachmentStorage.AttachmentStorage)
         const prepared = yield* attachments.prepareUpload({ ...identity, principal: { subject: "reader" } })
