@@ -458,7 +458,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
   return Manager.of({ register, unregister, sync, notify, status })
 })
 
-export const LayerManager: Layer.Layer<Manager, ReplicaError.InvalidConfiguration, SyncEngine.SyncEngine> = Layer
+export const layerManager: Layer.Layer<Manager, ReplicaError.InvalidConfiguration, SyncEngine.SyncEngine> = Layer
   .effect(Manager, makeManager())
 
 export const layerOnePass = (

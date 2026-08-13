@@ -641,28 +641,91 @@ import { Layer as RootLayer } from "effect"
 
 declare const tag: any
 declare const value: any
-const lower = Layer.succeed(tag, value)
-const alsoLower: Layer.Layer<any> = Layer.empty
+const layer = Layer.succeed(tag, value)
+const layerTest: Layer.Layer<any> = Layer.empty
+const LayerValue = RootLayer.empty
 const GoodLayer = RootLayer.empty
+const testLayer = RootLayer.empty
+const lower = RootLayer.empty
+const layerlower = RootLayer.empty
+const object = { testLayer: RootLayer.empty, layerTest: RootLayer.empty }
+const tupleProperty = { partition: [] }
+const [, omittedBinding] = [undefined, undefined]
+const layerShorthand = RootLayer.empty
+const shorthandObject = { layerShorthand }
+const { testLayer: testLayerBinding } = object
+class Holder {
+  readonly testLayer = RootLayer.empty
+  readonly layerTest = RootLayer.empty
+}
+class ParameterHolder {
+  constructor(
+    readonly testLayer: Layer.Layer<never>,
+    readonly layerTest: Layer.Layer<never>,
+    ordinaryLayer: Layer.Layer<never>
+  ) {}
+}
+declare const dynamicName: string
+const namedObject = {
+  "testLayer": RootLayer.empty,
+  ["otherLayer"]: RootLayer.empty,
+  [\`anotherLayer\`]: RootLayer.empty,
+  "layerTest": RootLayer.empty,
+  [dynamicName]: RootLayer.empty
+}
+class NamedHolder {
+  readonly "testLayer" = RootLayer.empty
+  readonly [\`otherLayer\`] = RootLayer.empty
+  readonly #anotherLayer = RootLayer.empty
+  readonly "layerTest" = RootLayer.empty
+  readonly [\`layerOther\`] = RootLayer.empty
+  readonly #layerPrivate = RootLayer.empty
+}
 const makeLayer = () => Layer.empty
 function buildLayer(): Layer.Layer<never> { return Layer.empty }
 const factoryExpression = function() { return Layer.empty }
 const mixed: Layer.Layer<never> | undefined = undefined
+declare const anyLayer: Layer.Any
+declare const anyLayerValue: any
+declare const unknownLayerValue: unknown
 const structural: { readonly "~effect/Layer": unknown } = { "~effect/Layer": undefined }
+interface TypeOnlyProperties { readonly testLayer: Layer.Layer<never> }
 const { empty: destructured } = Layer
 `
 const layerDiagnostics = runOxlintFixture(
   "layer-name-fixture.ts",
   layerFixtureSource,
-  ["requireLayerPascalCase"]
-).filter((diagnostic) => diagnostic.code === "effect-local(requireLayerPascalCase)")
+  ["requireLayerName"]
+).filter((diagnostic) => diagnostic.code === "effect-local(requireLayerName)")
 const layerDetail = JSON.stringify(layerDiagnostics)
-assert.equal(layerDiagnostics.length, 2, layerDetail)
+assert.equal(layerDiagnostics.length, 16, layerDetail)
+assert.ok(
+  layerDiagnostics.every((diagnostic) =>
+    diagnostic.message.endsWith(
+      "must use layer or layerX with PascalCase descriptive suffix. xLayer is invalid. Functions returning Layer remain camelCase."
+    )
+  ),
+  layerDetail
+)
 assert.deepEqual(
   diagnosticOffsets(layerDiagnostics),
   [
+    offsetAfter(layerFixtureSource, "const LayerValue", "LayerValue"),
+    offsetAfter(layerFixtureSource, "const GoodLayer", "GoodLayer"),
+    offsetAfter(layerFixtureSource, "const testLayer", "testLayer"),
     offsetAfter(layerFixtureSource, "const lower", "lower"),
-    offsetAfter(layerFixtureSource, "const alsoLower", "alsoLower")
+    offsetAfter(layerFixtureSource, "const layerlower", "layerlower"),
+    offsetAfter(layerFixtureSource, "{ testLayer", "testLayer"),
+    offsetAfter(layerFixtureSource, "testLayer:", "testLayerBinding"),
+    offsetAfter(layerFixtureSource, "readonly testLayer", "testLayer"),
+    offsetAfter(layerFixtureSource, "constructor(\n    readonly testLayer", "testLayer"),
+    offsetAfter(layerFixtureSource, "namedObject = {\n  ", "\"testLayer\""),
+    offsetAfter(layerFixtureSource, "[\"otherLayer\"]", "\"otherLayer\""),
+    offsetAfter(layerFixtureSource, "[`anotherLayer`]", "`anotherLayer`"),
+    offsetAfter(layerFixtureSource, "class NamedHolder {\n  readonly ", "\"testLayer\""),
+    offsetAfter(layerFixtureSource, "readonly [`otherLayer`]", "`otherLayer`"),
+    offsetAfter(layerFixtureSource, "readonly #anotherLayer", "#anotherLayer"),
+    offsetAfter(layerFixtureSource, "empty: destructured", "destructured")
   ],
   layerDetail
 )

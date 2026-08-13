@@ -1114,8 +1114,8 @@ const taggedEffectErrorMessage = (errorTypes) => {
   return `Effect error channel contains an untagged type: ${displayedTypes}. Every non never Effect error must have a required _tag. Define library errors with Schema.TaggedErrorClass and propagate or handle them by _tag. Do not hide the error with a cast, unknown, any, or an unconstrained generic.`
 }
 
-const layerPascalCaseMessage = (name) =>
-  `Layer value ${name} must use PascalCase. Functions that return a Layer remain camelCase.`
+const layerNameMessage = (name) =>
+  `Layer value ${name} must use layer or layerX with PascalCase descriptive suffix. xLayer is invalid. Functions returning Layer remain camelCase.`
 
 const serviceTagMapMessage =
   "Do not access a Context service by mapping its key. Use Effect.gen and yield the service explicitly with const service = yield* Service. When defining a reusable function, use Effect.fnUntraced with the generator body as its first argument."
@@ -1166,11 +1166,11 @@ export const requireTaggedEffectError = makeTypePolicyRule({
   message: (violation) => taggedEffectErrorMessage(violation.errorTypes)
 })
 
-export const requireLayerPascalCase = makeTypePolicyRule({
-  description: "Require every Effect Layer value binding to use PascalCase.",
+export const requireLayerName = makeTypePolicyRule({
+  description: "Require every stored Effect Layer value to use layer or layerX naming.",
   failure: "Could not verify Layer value names. The type aware rule must run successfully",
-  select: (analysis) => analysis.layerNames,
-  message: (violation) => layerPascalCaseMessage(violation.name)
+  select: (analysis) => analysis.layerNameViolations,
+  message: (violation) => layerNameMessage(violation.name)
 })
 
 export const noServiceTagMap = makeTypePolicyRule({
@@ -1191,7 +1191,7 @@ export default Plugin.define({
     noImplicitDefectConversion,
     noManualEffectBoundary,
     requireTaggedEffectError,
-    requireLayerPascalCase,
+    requireLayerName,
     noServiceTagMap
   }
 })

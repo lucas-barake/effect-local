@@ -99,10 +99,10 @@ const database = () =>
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
     Reactivity.layer,
-    QueryReactivity.Layer
+    QueryReactivity.layer
   )
 
-const Runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.Handlers))
+const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
 
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
@@ -138,16 +138,16 @@ const serverHistory = {
 
 const localLayer = (id = clientId) =>
   LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId: id }).pipe(
-    Layer.provide(Runtime),
+    Layer.provide(layerRuntime),
     Layer.provide(database())
   )
 
 const serverLayer = (
   authorizeMutation?: ServerStore.Options["authorizeMutation"]
 ) => {
-  let ServerLayer = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition })
+  let layerServer = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition })
   if (authorizeMutation !== undefined) {
-    ServerLayer = ServerStore.layer({
+    layerServer = ServerStore.layer({
       definition: Domain.definition,
       ...serverHistory,
       authorizeAccess: () => Effect.void,
@@ -155,8 +155,8 @@ const serverLayer = (
       authorizeRead: () => Effect.void
     })
   }
-  return ServerLayer.pipe(
-    Layer.provide(Runtime),
+  return layerServer.pipe(
+    Layer.provide(layerRuntime),
     Layer.provide(database())
   )
 }
@@ -281,16 +281,16 @@ const acceptedMutation = (
   })
 
 const clientServices = (id: Identity.ClientId, server: ServerStore.Service) => {
-  const Local = localLayer(id)
-  const ReconciliationLayer = Reconciler.layer({
+  const layerLocal = localLayer(id)
+  const layerReconciliation = Reconciler.layer({
     definition: Domain.definition,
     spaceId,
     retryDelay: "10 millis"
   }).pipe(
-    Layer.provide(Local),
+    Layer.provide(layerLocal),
     Layer.provide(directSync(server))
   )
-  return Layer.merge(Local, ReconciliationLayer)
+  return Layer.merge(layerLocal, layerReconciliation)
 }
 
 describe("server reconciled mutation log", () => {
@@ -311,7 +311,7 @@ describe("server reconciled mutation log", () => {
               )
           }
         })
-        const Infrastructure = Layer.mergeAll(
+        const layerInfrastructure = Layer.mergeAll(
           Layer.succeed(SqlClient.SqlClient, observedSql),
           NodeCrypto.layer,
           Reactivity.layer
@@ -319,8 +319,8 @@ describe("server reconciled mutation log", () => {
         const server = yield* service(
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
-            Layer.provide(Runtime),
-            Layer.provide(Infrastructure)
+            Layer.provide(layerRuntime),
+            Layer.provide(layerInfrastructure)
           )
         )
         yield* observedSql`CREATE TABLE space_update_probe (count INTEGER NOT NULL)`
@@ -381,7 +381,7 @@ describe("server reconciled mutation log", () => {
             definition: Domain.definition,
             maximumWatchersPerSpace: 1
           }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -427,7 +427,7 @@ describe("server reconciled mutation log", () => {
             definition: Domain.definition,
             maximumWatchersPerSpace: 2
           }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -475,7 +475,7 @@ describe("server reconciled mutation log", () => {
         const server = yield* service(
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -546,7 +546,7 @@ describe("server reconciled mutation log", () => {
               return Effect.die("refresh defect")
             }
           }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -597,7 +597,7 @@ describe("server reconciled mutation log", () => {
               return Effect.fail(denial)
             }
           }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -643,7 +643,7 @@ describe("server reconciled mutation log", () => {
               return Effect.interrupt
             }
           }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -690,7 +690,7 @@ describe("server reconciled mutation log", () => {
                 Effect.andThen(Deferred.await(release))
               )
           }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -731,7 +731,7 @@ describe("server reconciled mutation log", () => {
               return Effect.fail(new TestAuthorizationError({ reason: "denied" }))
             }
           }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -765,7 +765,7 @@ describe("server reconciled mutation log", () => {
               return Effect.fail(new TestAuthorizationError({ reason: "denied" }))
             }
           }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -793,7 +793,7 @@ describe("server reconciled mutation log", () => {
         const server = yield* service(
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -869,17 +869,17 @@ describe("server reconciled mutation log", () => {
   it.effect(
     "classifies malformed visible rows during index maintenance as storage corruption",
     pipe(Effect.fnUntraced(function*() {
-      const ClientDatabase = database()
-      const Live = LocalStore.layer({
+      const layerClientDatabase = database()
+      const layerLive = LocalStore.layer({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(ClientDatabase)
+        Layer.provide(layerRuntime),
+        Layer.provide(layerClientDatabase)
       )
-      const context = yield* Layer.build(Layer.merge(Live, ClientDatabase))
+      const context = yield* Layer.build(Layer.merge(layerLive, layerClientDatabase))
       const local = Context.get(context, LocalStore.Store)
       const sql = Context.get(context, SqlClient.SqlClient)
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("corrupt-index-refresh"))
@@ -948,7 +948,7 @@ describe("server reconciled mutation log", () => {
           spaceId,
           clientId
         }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.provide(database())
         )
       )
@@ -1011,7 +1011,7 @@ describe("server reconciled mutation log", () => {
           return []
         })
       })
-      const ClientDatabase = Layer.mergeAll(
+      const layerClientDatabase = Layer.mergeAll(
         SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
         NodeCrypto.layer,
         Reactivity.layer,
@@ -1020,8 +1020,8 @@ describe("server reconciled mutation log", () => {
       const local = yield* service(
         LocalStore.Store,
         LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ClientDatabase)
+          Layer.provide(layerRuntime),
+          Layer.provide(layerClientDatabase)
         )
       )
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("commit-to-publish"))
@@ -1067,7 +1067,7 @@ describe("server reconciled mutation log", () => {
       const server = yield* service(
         ServerStore.ServerStore,
         ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.provide(database())
         )
       )
@@ -1117,7 +1117,7 @@ describe("server reconciled mutation log", () => {
           return []
         })
       })
-      const ClientDatabase = Layer.mergeAll(
+      const layerClientDatabase = Layer.mergeAll(
         SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
         NodeCrypto.layer,
         Reactivity.layer,
@@ -1126,8 +1126,8 @@ describe("server reconciled mutation log", () => {
       const local = yield* service(
         LocalStore.Store,
         LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ClientDatabase)
+          Layer.provide(layerRuntime),
+          Layer.provide(layerClientDatabase)
         )
       )
       const server = yield* service(ServerStore.ServerStore, serverLayer())
@@ -1170,22 +1170,22 @@ describe("server reconciled mutation log", () => {
           return []
         })
       })
-      const ClientDatabase = Layer.mergeAll(
+      const layerClientDatabase = Layer.mergeAll(
         SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
         NodeCrypto.layer,
         Reactivity.layer,
         Layer.succeed(QueryReactivity.QueryReactivity, queryReactivity)
       )
-      const Live = LocalStore.layer({
+      const layerLive = LocalStore.layer({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(ClientDatabase)
+        Layer.provide(layerRuntime),
+        Layer.provide(layerClientDatabase)
       )
-      const context = yield* Layer.build(Layer.merge(Live, ClientDatabase))
+      const context = yield* Layer.build(Layer.merge(layerLive, layerClientDatabase))
       const local = Context.get(context, LocalStore.Store)
       const sql = Context.get(context, SqlClient.SqlClient)
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("quarantine-finalization"))
@@ -1273,11 +1273,11 @@ describe("server reconciled mutation log", () => {
   it.effect(
     "filters, orders, paginates, and streams through a declared secondary index",
     pipe(Effect.fnUntraced(function*() {
-      const Local = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
-        Layer.provide(Runtime)
+      const layerLocal = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+        Layer.provide(layerRuntime)
       )
-      const Queries = QueryExecutor.layer(Domain.definition, spaceId).pipe(Layer.provide(Domain.Handlers))
-      const context = yield* Layer.build(Layer.merge(Local, Queries).pipe(Layer.provide(database())))
+      const layerQueries = QueryExecutor.layer(Domain.definition, spaceId).pipe(Layer.provide(Domain.layerHandlers))
+      const context = yield* Layer.build(Layer.merge(layerLocal, layerQueries).pipe(Layer.provide(database())))
       const store = Context.get(context, LocalStore.Store)
       const executor = Context.get(context, QueryExecutor.QueryExecutor)
       for (const [id, count] of [["low", 1], ["middle", 3], ["high", 5], ["highest", 7]] as const) {
@@ -1312,7 +1312,7 @@ describe("server reconciled mutation log", () => {
         const server = yield* service(
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -1360,7 +1360,7 @@ describe("server reconciled mutation log", () => {
     "publishes a snapshot before bounding history and receipts",
     pipe(Effect.fnUntraced(
       function*() {
-        const ServerDatabase = database()
+        const layerServerDatabase = database()
         const bounded = {
           ...serverHistory,
           retainedHistoryEntries: 1,
@@ -1368,11 +1368,11 @@ describe("server reconciled mutation log", () => {
           retainedReceipts: 1,
           maximumReceipts: 4
         }
-        const Live = ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ServerDatabase)
+        const layerLive = ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
         )
-        const context = yield* Layer.build(Layer.merge(Live, ServerDatabase))
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
         const server = Context.get(context, ServerStore.ServerStore)
         const sql = Context.get(context, SqlClient.SqlClient)
         const submitted: Array<Protocol.MutationEnvelope> = []
@@ -1462,16 +1462,16 @@ describe("server reconciled mutation log", () => {
     "pages every space during global history maintenance",
     pipe(Effect.fnUntraced(
       function*() {
-        const ServerDatabase = database()
-        const Live = ServerStore.layerTrusted({
+        const layerServerDatabase = database()
+        const layerLive = ServerStore.layerTrusted({
           ...serverHistory,
           definition: Domain.definition,
           maintenanceSpaceBatchSize: 2
         }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ServerDatabase)
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
         )
-        const context = yield* Layer.build(Layer.merge(Live, ServerDatabase))
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
         const server = Context.get(context, ServerStore.ServerStore)
         const sql = Context.get(context, SqlClient.SqlClient)
         for (let index = 1; index <= 3; index++) {
@@ -1524,7 +1524,7 @@ describe("server reconciled mutation log", () => {
         const server = yield* service(
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -1560,12 +1560,12 @@ describe("server reconciled mutation log", () => {
     "rejects corrupted retained row counters before admission",
     pipe(Effect.fnUntraced(
       function*() {
-        const ServerDatabase = database()
-        const Live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ServerDatabase)
+        const layerServerDatabase = database()
+        const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
         )
-        const context = yield* Layer.build(Layer.merge(Live, ServerDatabase))
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
         const server = Context.get(context, ServerStore.ServerStore)
         const sql = Context.get(context, SqlClient.SqlClient)
         yield* server.submit(
@@ -1615,7 +1615,7 @@ describe("server reconciled mutation log", () => {
             authorizeMutation: () => Effect.fail(new TestAuthorizationError({ reason: "denied" })),
             authorizeRead: () => Effect.void
           }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -1655,16 +1655,16 @@ describe("server reconciled mutation log", () => {
     "terminally rejects state that cannot fit a future snapshot",
     pipe(Effect.fnUntraced(
       function*() {
-        const ServerDatabase = database()
+        const layerServerDatabase = database()
         const bounded = {
           ...serverHistory,
           maximumSnapshotBytes: 1
         }
-        const Live = ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ServerDatabase)
+        const layerLive = ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
         )
-        const context = yield* Layer.build(Layer.merge(Live, ServerDatabase))
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
         const server = Context.get(context, ServerStore.ServerStore)
         const sql = Context.get(context, SqlClient.SqlClient)
         const item = yield* envelope(
@@ -1714,7 +1714,7 @@ describe("server reconciled mutation log", () => {
         const server = yield* service(
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -1733,24 +1733,24 @@ describe("server reconciled mutation log", () => {
         yield* server.maintain(spaceId)
 
         const freshClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000099")
-        const Local = LocalStore.layer({
+        const layerLocal = LocalStore.layer({
           ...clientHistory,
           definition: Domain.definition,
           spaceId,
           clientId: freshClientId
         }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.provide(database())
         )
-        const ReconciliationLayer = Reconciler.layerOnePass({
+        const layerReconciliation = Reconciler.layerOnePass({
           definition: Domain.definition,
           spaceId,
           pageSize: 2
         }).pipe(
-          Layer.provide(Local),
+          Layer.provide(layerLocal),
           Layer.provide(directSync(server))
         )
-        const context = yield* Layer.build(Layer.merge(Local, ReconciliationLayer))
+        const context = yield* Layer.build(Layer.merge(layerLocal, layerReconciliation))
         const store = Context.get(context, LocalStore.Store)
         yield* Context.get(context, Reconciler.Reconciliation).sync
 
@@ -1787,25 +1787,25 @@ describe("server reconciled mutation log", () => {
 
         const databaseContext = yield* Layer.build(database())
         const sql = Context.get(databaseContext, SqlClient.SqlClient)
-        const CryptoLayer = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
-        const ReactivityLayer = Layer.succeed(
+        const layerCrypto = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
+        const layerReactivity = Layer.succeed(
           Reactivity.Reactivity,
           Context.get(databaseContext, Reactivity.Reactivity)
         )
-        const QueryReactivityLayer = Layer.succeed(
+        const layerQueryReactivity = Layer.succeed(
           QueryReactivity.QueryReactivity,
           Context.get(databaseContext, QueryReactivity.QueryReactivity)
         )
-        const Services = Layer.mergeAll(
+        const layerServices = Layer.mergeAll(
           Layer.succeed(SqlClient.SqlClient, sql),
-          CryptoLayer,
-          ReactivityLayer,
-          QueryReactivityLayer
+          layerCrypto,
+          layerReactivity,
+          layerQueryReactivity
         )
         const localContext = yield* Layer.build(
           LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
-            Layer.provide(Runtime),
-            Layer.provide(Services)
+            Layer.provide(layerRuntime),
+            Layer.provide(layerServices)
           )
         )
         const local = Context.get(localContext, LocalStore.Store)
@@ -1844,11 +1844,11 @@ describe("server reconciled mutation log", () => {
             SqliteClient.layer({ filename, disableWAL: true }),
             NodeCrypto.layer,
             Reactivity.layer,
-            QueryReactivity.Layer
+            QueryReactivity.layer
           )
         const makeLocal = () =>
           LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(persistentDatabase())
           )
         const bounded = {
@@ -1861,7 +1861,7 @@ describe("server reconciled mutation log", () => {
         const server = yield* service(
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -1920,7 +1920,7 @@ describe("server reconciled mutation log", () => {
         const server = yield* service(
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
@@ -1975,26 +1975,28 @@ describe("server reconciled mutation log", () => {
         const server = yield* service(
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
-        const ClientDatabase = database()
-        const LocalLayerWithDatabase = LocalStore.layer({
+        const layerClientDatabase = database()
+        const layerLocalLayerWithDatabase = LocalStore.layer({
           ...clientHistory,
           retainedReceipts: 1,
           definition: Domain.definition,
           spaceId,
           clientId
         }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ClientDatabase)
+          Layer.provide(layerRuntime),
+          Layer.provide(layerClientDatabase)
         )
-        const ReconciliationLayer = Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
-          Layer.provide(LocalLayerWithDatabase),
+        const layerReconciliation = Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(layerLocalLayerWithDatabase),
           Layer.provide(directSync(server))
         )
-        const context = yield* Layer.build(Layer.mergeAll(LocalLayerWithDatabase, ReconciliationLayer, ClientDatabase))
+        const context = yield* Layer.build(
+          Layer.mergeAll(layerLocalLayerWithDatabase, layerReconciliation, layerClientDatabase)
+        )
         const local = Context.get(context, LocalStore.Store)
         const sync = Context.get(context, Reconciler.Reconciliation)
         const sql = Context.get(context, SqlClient.SqlClient)
@@ -2077,25 +2079,25 @@ describe("server reconciled mutation log", () => {
             },
             authorizeRead: () => Effect.void
           }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
-        const LocalLive = LocalStore.layer({
+        const layerLocalLive = LocalStore.layer({
           ...clientHistory,
           retainedReceipts: 2,
           definition: Domain.definition,
           spaceId,
           clientId
         }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.provide(database())
         )
-        const ReconciliationLive = Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
-          Layer.provide(LocalLive),
+        const layerReconciliationLive = Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(layerLocalLive),
           Layer.provide(directSync(server))
         )
-        const context = yield* Layer.build(Layer.merge(LocalLive, ReconciliationLive))
+        const context = yield* Layer.build(Layer.merge(layerLocalLive, layerReconciliationLive))
         const local = Context.get(context, LocalStore.Store)
         const reconciliation = Context.get(context, Reconciler.Reconciliation)
 
@@ -2141,16 +2143,17 @@ describe("server reconciled mutation log", () => {
         const server = yield* service(
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
-        const ClientDatabase = database()
-        const LocalLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ClientDatabase)
-        )
-        const context = yield* Layer.build(Layer.merge(LocalLive, ClientDatabase))
+        const layerClientDatabase = database()
+        const layerLocalLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId })
+          .pipe(
+            Layer.provide(layerRuntime),
+            Layer.provide(layerClientDatabase)
+          )
+        const context = yield* Layer.build(Layer.merge(layerLocalLive, layerClientDatabase))
         const local = Context.get(context, LocalStore.Store)
         const sql = Context.get(context, SqlClient.SqlClient)
 
@@ -2208,16 +2211,17 @@ describe("server reconciled mutation log", () => {
         const server = yield* service(
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
         )
-        const ClientDatabase = database()
-        const LocalLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ClientDatabase)
-        )
-        const context = yield* Layer.build(Layer.merge(LocalLive, ClientDatabase))
+        const layerClientDatabase = database()
+        const layerLocalLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId })
+          .pipe(
+            Layer.provide(layerRuntime),
+            Layer.provide(layerClientDatabase)
+          )
+        const context = yield* Layer.build(Layer.merge(layerLocalLive, layerClientDatabase))
         const local = Context.get(context, LocalStore.Store)
         const sql = Context.get(context, SqlClient.SqlClient)
         const first = yield* local.mutate(Domain.PutTodo, Domain.todo("receipt-a"))
@@ -2333,32 +2337,32 @@ describe("server reconciled mutation log", () => {
       yield* Migrations.client({ definition: Domain.definition, spaceId, clientId, migration }).pipe(
         Effect.provideService(SqlClient.SqlClient, sql)
       )
-      const CryptoLayer = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
-      const ReactivityLayer = Layer.succeed(
+      const layerCrypto = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
+      const layerReactivity = Layer.succeed(
         Reactivity.Reactivity,
         Context.get(databaseContext, Reactivity.Reactivity)
       )
-      const QueryReactivityLayer = Layer.succeed(
+      const layerQueryReactivity = Layer.succeed(
         QueryReactivity.QueryReactivity,
         Context.get(databaseContext, QueryReactivity.QueryReactivity)
       )
-      const Services = Layer.mergeAll(
+      const layerServices = Layer.mergeAll(
         Layer.succeed(SqlClient.SqlClient, sql),
-        CryptoLayer,
-        ReactivityLayer,
-        QueryReactivityLayer
+        layerCrypto,
+        layerReactivity,
+        layerQueryReactivity
       )
-      const Live = LocalStore.layer({
+      const layerLive = LocalStore.layer({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(Services)
+        Layer.provide(layerRuntime),
+        Layer.provide(layerServices)
       )
 
-      const context = yield* Layer.build(Live)
+      const context = yield* Layer.build(layerLive)
       const local = Context.get(context, LocalStore.Store)
       yield* sql`UPDATE effect_local_client_spaces SET desired_scope_digest = ${"0".repeat(64)}
         WHERE space_id = ${spaceId}`
@@ -2396,12 +2400,12 @@ describe("server reconciled mutation log", () => {
     "rebases pending reads over an incrementally applied page",
     pipe(Effect.fnUntraced(
       function*() {
-        const ClientDatabase = database()
-        const Live = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ClientDatabase)
+        const layerClientDatabase = database()
+        const layerLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerClientDatabase)
         )
-        const context = yield* pipe(Layer.merge(Live, ClientDatabase), Layer.build)
+        const context = yield* pipe(Layer.merge(layerLive, layerClientDatabase), Layer.build)
         const local = Context.get(context, LocalStore.Store)
         const server = yield* pipe(
           { layer: serverLayer(), tag: ServerStore.ServerStore },
@@ -2471,27 +2475,27 @@ describe("server reconciled mutation log", () => {
           return Reflect.apply(target, thisArgument, argumentsList)
         }
       })
-      const ClientDatabase = pipe(
+      const layerClientDatabase = pipe(
         {
-          sqlLayer: Layer.succeed(SqlClient.SqlClient, observedSql),
-          cryptoLayer: NodeCrypto.layer,
-          reactivityLayer: Reactivity.layer,
-          queryReactivityLayer: QueryReactivity.Layer
+          layerSql: Layer.succeed(SqlClient.SqlClient, observedSql),
+          layerCrypto: NodeCrypto.layer,
+          layerReactivity: Reactivity.layer,
+          layerQueryReactivity: QueryReactivity.layer
         },
-        ({ cryptoLayer, queryReactivityLayer, reactivityLayer, sqlLayer }) =>
-          Layer.mergeAll(sqlLayer, cryptoLayer, reactivityLayer, queryReactivityLayer)
+        ({ layerCrypto, layerQueryReactivity, layerReactivity, layerSql }) =>
+          Layer.mergeAll(layerSql, layerCrypto, layerReactivity, layerQueryReactivity)
       )
-      const Live = LocalStore.layer({
+      const layerLive = LocalStore.layer({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId,
         projectionReplayBatchSize: 1
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(ClientDatabase)
+        Layer.provide(layerRuntime),
+        Layer.provide(layerClientDatabase)
       )
-      const context = yield* pipe(Layer.merge(Live, ClientDatabase), Layer.build)
+      const context = yield* pipe(Layer.merge(layerLive, layerClientDatabase), Layer.build)
       const local = Context.get(context, LocalStore.Store)
       const sql = Context.get(context, SqlClient.SqlClient)
       const server = yield* pipe(
@@ -2618,7 +2622,7 @@ describe("server reconciled mutation log", () => {
     pipe(Effect.fnUntraced(
       function*() {
         const access = yield* Ref.make(true)
-        const Secured = ServerStore.layer({
+        const layerSecured = ServerStore.layer({
           ...serverHistory,
           definition: Domain.definition,
           authorizeAccess: () =>
@@ -2631,10 +2635,10 @@ describe("server reconciled mutation log", () => {
           authorizeMutation: () => Effect.void,
           authorizeRead: () => Effect.void
         }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.provide(database())
         )
-        const server = yield* service(ServerStore.ServerStore, Secured)
+        const server = yield* service(ServerStore.ServerStore, layerSecured)
         const submitted = yield* envelope(
           Domain.PutTodo.name,
           Domain.todo("1"),
@@ -2656,12 +2660,12 @@ describe("server reconciled mutation log", () => {
   it.effect("keeps mutation payloads and private results out of the authoritative log", () =>
     Effect.scoped(Effect.gen(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
-      const ServerDatabase = database()
-      const Live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(ServerDatabase)
+      const layerServerDatabase = database()
+      const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+        Layer.provide(layerRuntime),
+        Layer.provide(layerServerDatabase)
       )
-      const context = yield* Layer.build(Layer.merge(Live, ServerDatabase))
+      const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
       const server = Context.get(context, ServerStore.ServerStore)
       const sql = Context.get(context, SqlClient.SqlClient)
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("private", "secret"))
@@ -2677,12 +2681,12 @@ describe("server reconciled mutation log", () => {
     "pulls authoritative entities without materializing private receipt payloads",
     pipe(Effect.fnUntraced(
       function*() {
-        const ServerDatabase = database()
-        const Live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ServerDatabase)
+        const layerServerDatabase = database()
+        const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
         )
-        const context = yield* Layer.build(Layer.merge(Live, ServerDatabase))
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
         const server = Context.get(context, ServerStore.ServerStore)
         const sql = Context.get(context, SqlClient.SqlClient)
         const submitted = yield* envelope(
@@ -2733,13 +2737,16 @@ describe("server reconciled mutation log", () => {
     "stores matching authoritative entry and SQL identities",
     pipe(Effect.fnUntraced(
       function*() {
-        const ServerDatabase = database()
-        const ServerLayerWithDatabase = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition })
+        const layerServerDatabase = database()
+        const layerServerLayerWithDatabase = ServerStore.layerTrusted({
+          ...serverHistory,
+          definition: Domain.definition
+        })
           .pipe(
-            Layer.provide(Runtime),
-            Layer.provide(ServerDatabase)
+            Layer.provide(layerRuntime),
+            Layer.provide(layerServerDatabase)
           )
-        const context = yield* Layer.build(Layer.merge(ServerLayerWithDatabase, ServerDatabase))
+        const context = yield* Layer.build(Layer.merge(layerServerLayerWithDatabase, layerServerDatabase))
         const server = Context.get(context, ServerStore.ServerStore)
         const sql = Context.get(context, SqlClient.SqlClient)
         const submitted = yield* envelope(
@@ -2918,12 +2925,12 @@ describe("server reconciled mutation log", () => {
     "assigns dense authoritative log sequences",
     pipe(Effect.fnUntraced(
       function*() {
-        const ServerDatabase = database()
-        const Live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ServerDatabase)
+        const layerServerDatabase = database()
+        const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
         )
-        const context = yield* Layer.build(Layer.merge(Live, ServerDatabase))
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
         const server = Context.get(context, ServerStore.ServerStore)
         const sql = Context.get(context, SqlClient.SqlClient)
         yield* server.submit(
@@ -2954,12 +2961,12 @@ describe("server reconciled mutation log", () => {
     "rejects an exact retry whose durable receipt conflicts with its SQL identity",
     pipe(Effect.fnUntraced(
       function*() {
-        const ServerDatabase = database()
-        const Live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ServerDatabase)
+        const layerServerDatabase = database()
+        const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
         )
-        const context = yield* Layer.build(Layer.merge(Live, ServerDatabase))
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
         const server = Context.get(context, ServerStore.ServerStore)
         const sql = Context.get(context, SqlClient.SqlClient)
         const submitted = yield* envelope(
@@ -2993,12 +3000,12 @@ describe("server reconciled mutation log", () => {
     "rejects an accepted retry whose receipt sequence conflicts with the authoritative log",
     pipe(Effect.fnUntraced(
       function*() {
-        const ServerDatabase = database()
-        const Live = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ServerDatabase)
+        const layerServerDatabase = database()
+        const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
         )
-        const context = yield* Layer.build(Layer.merge(Live, ServerDatabase))
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
         const server = Context.get(context, ServerStore.ServerStore)
         const sql = Context.get(context, SqlClient.SqlClient)
         const submitted = yield* envelope(
@@ -3032,12 +3039,12 @@ describe("server reconciled mutation log", () => {
     "rejects a pending row whose durable digest does not match its reconstructed identity",
     pipe(Effect.fnUntraced(
       function*() {
-        const ClientDatabase = database()
-        const Live = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ClientDatabase)
+        const layerClientDatabase = database()
+        const layerLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerClientDatabase)
         )
-        const context = yield* Layer.build(Layer.merge(Live, ClientDatabase))
+        const context = yield* Layer.build(Layer.merge(layerLive, layerClientDatabase))
         const local = Context.get(context, LocalStore.Store)
         const sql = Context.get(context, SqlClient.SqlClient)
         const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("digest-corrupt"))
@@ -3099,12 +3106,12 @@ describe("server reconciled mutation log", () => {
 
   it.effect("invalidates the receipt dependency when a terminal receipt is stored", () =>
     Effect.scoped(Effect.gen(function*() {
-      const ClientDatabase = database()
-      const Local = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(ClientDatabase)
+      const layerClientDatabase = database()
+      const layerLocal = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
+        Layer.provide(layerRuntime),
+        Layer.provide(layerClientDatabase)
       )
-      const context = yield* Layer.build(Layer.merge(Local, ClientDatabase))
+      const context = yield* Layer.build(Layer.merge(layerLocal, layerClientDatabase))
       const store = Context.get(context, LocalStore.Store)
       const reactivity = Context.get(context, Reactivity.Reactivity)
       const pending = yield* store.mutate(Domain.PutTodo, Domain.todo("1"))
@@ -3179,7 +3186,7 @@ describe("server reconciled mutation log", () => {
           clientId,
           maximumPendingMutations: 0
         }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.provide(database())
         )
       ).pipe(expectedFailure)
@@ -3192,7 +3199,7 @@ describe("server reconciled mutation log", () => {
         ServerStore.ServerStore,
         ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition, wakeCapacity: 0 })
           .pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(database())
           )
       ).pipe(expectedFailure)
@@ -3208,7 +3215,7 @@ describe("server reconciled mutation log", () => {
           definition: Domain.definition,
           maximumPendingReadAuthorizations: 0
         }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.provide(database())
         )
       ).pipe(expectedFailure)
@@ -3218,15 +3225,15 @@ describe("server reconciled mutation log", () => {
       }
 
       const server = yield* service(ServerStore.ServerStore, serverLayer())
-      const InvalidPageSize = Reconciler.layer({ definition: Domain.definition, spaceId, pageSize: 0 }).pipe(
+      const layerInvalidPageSize = Reconciler.layer({ definition: Domain.definition, spaceId, pageSize: 0 }).pipe(
         Layer.provide(localLayer()),
         Layer.provide(directSync(server))
       )
-      const pageSizeError = yield* service(Reconciler.Reconciler, InvalidPageSize).pipe(expectedFailure)
+      const pageSizeError = yield* service(Reconciler.Reconciler, layerInvalidPageSize).pipe(expectedFailure)
       assert.strictEqual(pageSizeError._tag, "InvalidConfiguration")
       if (pageSizeError._tag === "InvalidConfiguration") assert.strictEqual(pageSizeError.option, "pageSize")
 
-      const InvalidRetryDelay = Reconciler.layer({
+      const layerInvalidRetryDelay = Reconciler.layer({
         definition: Domain.definition,
         spaceId,
         retryDelay: "0 millis"
@@ -3234,7 +3241,7 @@ describe("server reconciled mutation log", () => {
         Layer.provide(localLayer()),
         Layer.provide(directSync(server))
       )
-      const retryDelayError = yield* service(Reconciler.Reconciler, InvalidRetryDelay).pipe(expectedFailure)
+      const retryDelayError = yield* service(Reconciler.Reconciler, layerInvalidRetryDelay).pipe(expectedFailure)
       assert.strictEqual(retryDelayError._tag, "InvalidConfiguration")
       if (retryDelayError._tag === "InvalidConfiguration") assert.strictEqual(retryDelayError.option, "retryDelay")
     }, Effect.scoped))
@@ -3344,7 +3351,7 @@ describe("server reconciled mutation log", () => {
       const subscriptions = yield* Ref.make(0)
       const firstSubscribed = yield* Latch.make()
       const server = yield* service(ServerStore.ServerStore, serverLayer())
-      const Remote = Layer.succeed(
+      const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
@@ -3369,15 +3376,15 @@ describe("server reconciled mutation log", () => {
             )
         })
       )
-      const ReconciliationLayer = Reconciler.layer({
+      const layerReconciliation = Reconciler.layer({
         definition: Domain.definition,
         spaceId,
         retryDelay: "1 second"
       }).pipe(
         Layer.provide(localLayer()),
-        Layer.provide(Remote)
+        Layer.provide(layerRemote)
       )
-      yield* service(Reconciler.Reconciler, ReconciliationLayer)
+      yield* service(Reconciler.Reconciler, layerReconciliation)
       yield* firstSubscribed.await
       yield* TestClock.adjust("1 minute")
       assert.strictEqual(yield* Ref.get(subscriptions), 1)
@@ -3392,7 +3399,7 @@ describe("server reconciled mutation log", () => {
       const watchFailed = yield* Deferred.make<void>()
       const releasePull = yield* Deferred.make<void>()
       const credentialWaitStarted = yield* Deferred.make<void>()
-      const Remote = Layer.succeed(
+      const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () =>
@@ -3422,10 +3429,10 @@ describe("server reconciled mutation log", () => {
       const reconciliationContext = yield* Layer.build(
         Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
           Layer.provide(Layer.succeed(LocalStore.Store, local)),
-          Layer.provide(Remote)
+          Layer.provide(layerRemote)
         )
       )
-      const manager = yield* Reconciler.makeManager().pipe(Effect.provide(Remote))
+      const manager = yield* Reconciler.makeManager().pipe(Effect.provide(layerRemote))
       yield* manager.register({
         spaceId,
         generation: 1,
@@ -3452,7 +3459,7 @@ describe("server reconciled mutation log", () => {
       const releaseWatch = yield* Deferred.make<void>()
       const releasePull = yield* Deferred.make<void>()
       const credentialWaitStarted = yield* Deferred.make<void>()
-      const Remote = Layer.succeed(
+      const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () =>
@@ -3478,7 +3485,7 @@ describe("server reconciled mutation log", () => {
         Reconciler.Reconciler,
         Reconciler.layer({ definition: Domain.definition, spaceId, retryDelay: "1 second" }).pipe(
           Layer.provide(localLayer()),
-          Layer.provide(Remote)
+          Layer.provide(layerRemote)
         )
       )
       yield* Deferred.await(watchSubscribed)
@@ -3507,7 +3514,7 @@ describe("server reconciled mutation log", () => {
       const recoverySucceeded = yield* Deferred.make<void>()
       const pulls = yield* Ref.make(0)
       const server = yield* service(ServerStore.ServerStore, serverLayer())
-      const Remote = Layer.succeed(
+      const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () =>
@@ -3546,7 +3553,7 @@ describe("server reconciled mutation log", () => {
       const reconciliationContext = yield* Layer.build(
         Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
           Layer.provide(Layer.succeed(LocalStore.Store, local)),
-          Layer.provide(Remote)
+          Layer.provide(layerRemote)
         )
       )
       const baseReconciliation = Context.get(reconciliationContext, Reconciler.Reconciliation)
@@ -3565,7 +3572,7 @@ describe("server reconciled mutation log", () => {
         }).pipe(
           Layer.provide(Layer.succeed(LocalStore.Store, local)),
           Layer.provide(Layer.succeed(Reconciler.Reconciliation, reconciliation)),
-          Layer.provide(Remote)
+          Layer.provide(layerRemote)
         )
       )
       yield* Deferred.await(watchSubscribed)
@@ -3593,7 +3600,7 @@ describe("server reconciled mutation log", () => {
         actualVersion: 1,
         actualHash: "actual"
       })
-      const Remote = Layer.succeed(
+      const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
@@ -3610,15 +3617,15 @@ describe("server reconciled mutation log", () => {
             )
         })
       )
-      const ReconciliationLayer = Reconciler.layer({
+      const layerReconciliation = Reconciler.layer({
         definition: Domain.definition,
         spaceId,
         retryDelay: "1 second"
       }).pipe(
         Layer.provide(localLayer()),
-        Layer.provide(Remote)
+        Layer.provide(layerRemote)
       )
-      const scheduler = yield* service(Reconciler.Reconciler, ReconciliationLayer)
+      const scheduler = yield* service(Reconciler.Reconciler, layerReconciliation)
       yield* Deferred.await(subscribed)
       yield* Effect.yieldNow
       yield* TestClock.adjust("5 seconds")
@@ -3638,7 +3645,7 @@ describe("server reconciled mutation log", () => {
         hash: Identity.SchemaHash.make("ffffffffffffffff")
       })
       const server = yield* service(ServerStore.ServerStore, serverLayer())
-      const Remote = Layer.succeed(
+      const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
@@ -3658,7 +3665,7 @@ describe("server reconciled mutation log", () => {
       const context = yield* Layer.build(
         Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
           Layer.provide(localLayer()),
-          Layer.provide(Remote)
+          Layer.provide(layerRemote)
         )
       )
       const reconciliation = Context.get(context, Reconciler.Reconciliation)
@@ -3677,7 +3684,7 @@ describe("server reconciled mutation log", () => {
       const pullEntered = yield* Deferred.make<void>()
       const releasePull = yield* Deferred.make<void>()
       const server = yield* service(ServerStore.ServerStore, serverLayer())
-      const Remote = Layer.succeed(
+      const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
@@ -3695,7 +3702,7 @@ describe("server reconciled mutation log", () => {
       const context = yield* Layer.build(
         Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
           Layer.provide(localLayer()),
-          Layer.provide(Remote)
+          Layer.provide(layerRemote)
         )
       )
       const reconciliation = Context.get(context, Reconciler.Reconciliation)
@@ -3741,7 +3748,7 @@ describe("server reconciled mutation log", () => {
       const pullEntered = yield* Deferred.make<void>()
       const releasePull = yield* Deferred.make<void>()
       const server = yield* service(ServerStore.ServerStore, serverLayer())
-      const Remote = Layer.succeed(
+      const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
@@ -3759,7 +3766,7 @@ describe("server reconciled mutation log", () => {
       const context = yield* Layer.build(
         Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
           Layer.provide(localLayer()),
-          Layer.provide(Remote)
+          Layer.provide(layerRemote)
         )
       )
       const reconciliation = Context.get(context, Reconciler.Reconciliation)
@@ -3779,7 +3786,7 @@ describe("server reconciled mutation log", () => {
       const secondAttempt = yield* Deferred.make<void>()
       let attempts = 0
       const server = yield* service(ServerStore.ServerStore, serverLayer())
-      const Remote = Layer.succeed(
+      const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
@@ -3809,16 +3816,16 @@ describe("server reconciled mutation log", () => {
           watch: server.watch
         })
       )
-      const Local = localLayer()
-      const ReconciliationLayer = Reconciler.layer({
+      const layerLocal = localLayer()
+      const layerReconciliation = Reconciler.layer({
         definition: Domain.definition,
         spaceId,
         retryDelay: "1 second"
       }).pipe(
-        Layer.provide(Local),
-        Layer.provide(Remote)
+        Layer.provide(layerLocal),
+        Layer.provide(layerRemote)
       )
-      const services = yield* Layer.build(Layer.merge(Local, ReconciliationLayer))
+      const services = yield* Layer.build(Layer.merge(layerLocal, layerReconciliation))
       const store = Context.get(services, LocalStore.Store)
       const scheduler = Context.get(services, Reconciler.Reconciler)
       yield* store.mutate(Domain.PutTodo, Domain.todo("interrupted"))
@@ -3861,7 +3868,7 @@ describe("server reconciled mutation log", () => {
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition, wakeCapacity: 1 })
             .pipe(
-              Layer.provide(Runtime),
+              Layer.provide(layerRuntime),
               Layer.provide(database())
             )
         )
@@ -3950,7 +3957,7 @@ describe("server reconciled mutation log", () => {
       const reached = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       const writerStarted = yield* Deferred.make<void>()
-      const ReadPairLayer = Effect.gen(function*() {
+      const layerReadPair = Effect.gen(function*() {
         const gate = yield* QueryGate
         return ReadPair.toLayer(Effect.fnUntraced(function*({ query }) {
           const left = Option.getOrThrow(yield* query.get(Item, "left"))
@@ -3959,13 +3966,13 @@ describe("server reconciled mutation log", () => {
           return [left.value, right.value] as const
         }))
       }).pipe(Layer.unwrap)
-      const PutPairLayer = PutPair.toLayer(Effect.fnUntraced(function*({ payload, transaction }) {
+      const layerPutPair = PutPair.toLayer(Effect.fnUntraced(function*({ payload, transaction }) {
         if (payload.left === 1) yield* Deferred.succeed(writerStarted, undefined)
         yield* transaction.set(Item, "left", { id: "left", value: payload.left })
         yield* transaction.set(Item, "right", { id: "right", value: payload.right })
       }))
-      const Handlers = Layer.mergeAll(PutPairLayer, ReadPairLayer)
-      const Gate = Layer.succeed(
+      const layerHandlers = Layer.mergeAll(layerPutPair, layerReadPair)
+      const layerGate = Layer.succeed(
         QueryGate,
         QueryGate.of({
           betweenReads: Deferred.succeed(reached, undefined).pipe(
@@ -3974,24 +3981,27 @@ describe("server reconciled mutation log", () => {
         })
       )
       const pairDatabase = () =>
-        Layer.mergeAll(SqliteClient.layer({ filename }), NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
-      const PairRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(Handlers), Layer.provide(Gate))
-      const Local = LocalStore.layer({
+        Layer.mergeAll(SqliteClient.layer({ filename }), NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
+      const layerPairRuntime = MutationRuntime.layer(definition).pipe(
+        Layer.provide(layerHandlers),
+        Layer.provide(layerGate)
+      )
+      const layerLocal = LocalStore.layer({
         ...clientHistory,
         scope: Protocol.ReplicationScope.make({ models: [Item.name] }),
         definition,
         spaceId,
         clientId
       }).pipe(
-        Layer.provide(PairRuntime),
+        Layer.provide(layerPairRuntime),
         Layer.provide(pairDatabase())
       )
-      const Queries = QueryExecutor.layer(definition, spaceId).pipe(
-        Layer.provide(Handlers),
-        Layer.provide(Gate),
+      const layerQueries = QueryExecutor.layer(definition, spaceId).pipe(
+        Layer.provide(layerHandlers),
+        Layer.provide(layerGate),
         Layer.provide(pairDatabase())
       )
-      const context = yield* Layer.build(Layer.merge(Local, Queries))
+      const context = yield* Layer.build(Layer.merge(layerLocal, layerQueries))
       const store = Context.get(context, LocalStore.Store)
       const queryExecutor = Context.get(context, QueryExecutor.QueryExecutor)
       yield* store.mutate(PutPair, { left: 0, right: 0 })
@@ -4094,36 +4104,36 @@ describe("server reconciled mutation log", () => {
       })
       const workDefinition = Definition.make({ version: 1, models: [Item], mutations: [PutItem] })
       const executions = yield* Ref.make(0)
-      const WorkHandlers = PutItem.toLayer(({ payload, transaction }) =>
+      const layerWorkHandlers = PutItem.toLayer(({ payload, transaction }) =>
         Ref.update(executions, (count) => count + 1).pipe(
           Effect.andThen(transaction.set(Item, payload.id, payload)),
           Effect.as(payload)
         )
       )
-      const WorkRuntime = MutationRuntime.layer(workDefinition).pipe(Layer.provide(WorkHandlers))
+      const layerWorkRuntime = MutationRuntime.layer(workDefinition).pipe(Layer.provide(layerWorkHandlers))
 
-      const AuthoritativeLayer = ServerStore.layerTrusted({ ...serverHistory, definition: workDefinition }).pipe(
-        Layer.provide(WorkRuntime),
+      const layerAuthoritative = ServerStore.layerTrusted({ ...serverHistory, definition: workDefinition }).pipe(
+        Layer.provide(layerWorkRuntime),
         Layer.provide(database())
       )
-      const server = yield* service(ServerStore.ServerStore, AuthoritativeLayer)
+      const server = yield* service(ServerStore.ServerStore, layerAuthoritative)
 
       const workScope = Protocol.ReplicationScope.make({ models: [Item.name] })
-      const Local = LocalStore.layer({
+      const layerLocal = LocalStore.layer({
         ...clientHistory,
         scope: workScope,
         definition: workDefinition,
         spaceId,
         clientId
       }).pipe(
-        Layer.provide(WorkRuntime),
+        Layer.provide(layerWorkRuntime),
         Layer.provide(database())
       )
-      const ReconciliationLayer = Reconciler.layer({ definition: workDefinition, spaceId }).pipe(
-        Layer.provide(Local),
+      const layerReconciliation = Reconciler.layer({ definition: workDefinition, spaceId }).pipe(
+        Layer.provide(layerLocal),
         Layer.provide(directSync(server))
       )
-      const context = yield* Layer.build(Layer.merge(Local, ReconciliationLayer))
+      const context = yield* Layer.build(Layer.merge(layerLocal, layerReconciliation))
       const store = Context.get(context, LocalStore.Store)
       const sync = Context.get(context, Reconciler.Reconciler)
       yield* sync.sync
@@ -4177,27 +4187,27 @@ describe("server reconciled mutation log", () => {
             SqliteClient.layer({ filename, disableWAL: true }),
             NodeCrypto.layer,
             Reactivity.layer,
-            QueryReactivity.Layer
+            QueryReactivity.layer
           )
 
         const mutationId = yield* Effect.scoped(Effect.gen(function*() {
-          const LocalLayer = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId })
+          const layerLocal = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId })
             .pipe(
-              Layer.provide(Runtime),
+              Layer.provide(layerRuntime),
               Layer.provide(persistentDatabase())
             )
-          const local = yield* service(LocalStore.Store, LocalLayer)
+          const local = yield* service(LocalStore.Store, layerLocal)
           const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
           return pending.envelope.mutationId
         }))
 
         yield* Effect.scoped(Effect.gen(function*() {
-          const LocalLayer = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId })
+          const layerLocal = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId })
             .pipe(
-              Layer.provide(Runtime),
+              Layer.provide(layerRuntime),
               Layer.provide(persistentDatabase())
             )
-          const local = yield* service(LocalStore.Store, LocalLayer)
+          const local = yield* service(LocalStore.Store, layerLocal)
           assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "1")), Domain.todo("1"))
           const pending = yield* local.pending
           assert.deepStrictEqual(pending.map((item) => item.envelope.mutationId), [mutationId])
@@ -4220,11 +4230,11 @@ describe("server reconciled mutation log", () => {
             SqliteClient.layer({ filename, disableWAL: true }),
             NodeCrypto.layer,
             Reactivity.layer,
-            QueryReactivity.Layer
+            QueryReactivity.layer
           )
         const makeLocal = () =>
           LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
-            Layer.provide(Runtime),
+            Layer.provide(layerRuntime),
             Layer.provide(persistentDatabase())
           )
 
@@ -4253,14 +4263,14 @@ describe("server reconciled mutation log", () => {
 
   it.effect("restores Submitted and invalidates pending for an identical duplicate receipt", () =>
     Effect.scoped(Effect.gen(function*() {
-      const SharedDatabase = database()
-      const LocalLayerWithDatabase = LocalStore.layer({
+      const layerSharedDatabase = database()
+      const layerLocalLayerWithDatabase = LocalStore.layer({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId
-      }).pipe(Layer.provide(Runtime), Layer.provide(SharedDatabase))
-      const context = yield* Layer.build(Layer.merge(LocalLayerWithDatabase, SharedDatabase))
+      }).pipe(Layer.provide(layerRuntime), Layer.provide(layerSharedDatabase))
+      const context = yield* Layer.build(Layer.merge(layerLocalLayerWithDatabase, layerSharedDatabase))
       const local = Context.get(context, LocalStore.Store)
       const sql = Context.get(context, SqlClient.SqlClient)
       const reactivity = Context.get(context, Reactivity.Reactivity)

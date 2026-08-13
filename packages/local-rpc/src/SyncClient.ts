@@ -324,7 +324,7 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
   Authentication.CredentialProvider | RpcClient.Protocol | RpcMiddleware.ForClient<Authentication.Authentication>
 > => layerFromSession(options).pipe(Layer.provide(ProtocolSession.layerWithOptions(options)))
 
-export const Default = layerFromSession().pipe(Layer.provide(ProtocolSession.Default))
+export const layer = layerFromSession().pipe(Layer.provide(ProtocolSession.layer))
 
 export const layerProtocolSocket = (options?: {
   readonly retryTransientErrors?: boolean

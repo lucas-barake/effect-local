@@ -10,7 +10,7 @@ import * as Ref from "effect/Ref"
 import * as Stream from "effect/Stream"
 import * as FaultInjection from "./FaultInjection.js"
 
-export const TestServerLayer: Layer.Layer<
+export const layer: Layer.Layer<
   SyncEngine.SyncEngine,
   never,
   ServerStore.ServerStore | FaultInjection.FaultInjection | Crypto.Crypto

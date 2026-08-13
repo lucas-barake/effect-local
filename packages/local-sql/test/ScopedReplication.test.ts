@@ -71,13 +71,13 @@ const clientHistory = {
   migration
 }
 
-const Database = Layer.mergeAll(
+const layerDatabase = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   NodeCrypto.layer,
   Reactivity.layer,
-  QueryReactivity.Layer
+  QueryReactivity.layer
 )
-const Runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.Handlers))
+const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
 const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
 const provideNode = Effect.provide(Layer.merge(NodeFileSystem.layer, NodeCrypto.layer))
 
@@ -102,7 +102,7 @@ const makeServer = (
     authorizeAccess: () => Effect.void,
     authorizeMutation: () => Effect.void,
     authorizeRead
-  }).pipe(Layer.provide(Runtime), Layer.provide(Database))
+  }).pipe(Layer.provide(layerRuntime), Layer.provide(layerDatabase))
 
 const service = <I, S, E extends { readonly _tag: string }, R,>(
   tag: Context.Service<I, S>,
@@ -962,7 +962,7 @@ describe("scoped replication", () => {
           SqliteClient.layer({ filename, disableWAL: true }),
           NodeCrypto.layer,
           Reactivity.layer,
-          QueryReactivity.Layer
+          QueryReactivity.layer
         )
       const build = (definition: Definition.Any) => {
         return ServerStore.layer({
@@ -973,7 +973,7 @@ describe("scoped replication", () => {
           authorizeMutation: () => Effect.void,
           authorizeRead: () => Effect.void
         }).pipe(
-          Layer.provide(MutationRuntime.layer(definition).pipe(Layer.provide(Domain.Handlers))),
+          Layer.provide(MutationRuntime.layer(definition).pipe(Layer.provide(Domain.layerHandlers))),
           Layer.provideMerge(persistentDatabase()),
           Layer.build,
           Effect.map(Context.get(ServerStore.ServerStore))
@@ -1232,8 +1232,8 @@ describe("scoped replication", () => {
         clientId: readerId,
         scope
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(Database),
+        Layer.provide(layerRuntime),
+        Layer.provide(layerDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
@@ -1367,8 +1367,8 @@ describe("scoped replication", () => {
         clientId: readerId,
         scope
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(Database),
+        Layer.provide(layerRuntime),
+        Layer.provide(layerDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
@@ -1408,8 +1408,8 @@ describe("scoped replication", () => {
         clientId: readerId,
         scope
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(Database),
+        Layer.provide(layerRuntime),
+        Layer.provide(layerDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
@@ -1464,8 +1464,8 @@ describe("scoped replication", () => {
         clientId: readerId,
         scope
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(Database),
+        Layer.provide(layerRuntime),
+        Layer.provide(layerDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
@@ -1501,8 +1501,8 @@ describe("scoped replication", () => {
         clientId: readerId,
         scope
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(Database),
+        Layer.provide(layerRuntime),
+        Layer.provide(layerDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
@@ -1614,7 +1614,7 @@ describe("scoped replication", () => {
         authorizeAccess: () => Effect.void,
         authorizeMutation: () => Effect.void,
         authorizeRead: () => Effect.void
-      }).pipe(Layer.provide(Runtime), Layer.provideMerge(Database), Layer.build)
+      }).pipe(Layer.provide(layerRuntime), Layer.provideMerge(layerDatabase), Layer.build)
       const server = Context.get(context, ServerStore.ServerStore)
       const sql = Context.get(context, SqlClient.SqlClient)
       const request = (cursor: Protocol.ReplicationCursor | null) =>
@@ -1658,7 +1658,7 @@ describe("scoped replication", () => {
         authorizeAccess: () => Effect.void,
         authorizeMutation: () => Effect.void,
         authorizeRead: () => Effect.void
-      }).pipe(Layer.provide(Runtime), Layer.provideMerge(Database), Layer.build)
+      }).pipe(Layer.provide(layerRuntime), Layer.provideMerge(layerDatabase), Layer.build)
       const server = Context.get(context, ServerStore.ServerStore)
       const sql = Context.get(context, SqlClient.SqlClient)
       const initial = yield* server.pullAuthorized(pullRequest(), "reader")
@@ -1693,7 +1693,7 @@ describe("scoped replication", () => {
           authorizeAccess: () => Effect.void,
           authorizeMutation: () => Effect.void,
           authorizeRead: () => Effect.void
-        }).pipe(Layer.provide(Runtime), Layer.provideMerge(Database))
+        }).pipe(Layer.provide(layerRuntime), Layer.provideMerge(layerDatabase))
       )
       const server = Context.get(context, ServerStore.ServerStore)
       const sql = Context.get(context, SqlClient.SqlClient)
@@ -1731,7 +1731,7 @@ describe("scoped replication", () => {
           SqliteClient.layer({ filename, disableWAL: true }),
           NodeCrypto.layer,
           Reactivity.layer,
-          QueryReactivity.Layer
+          QueryReactivity.layer
         )
       const serverLayer = () => {
         return ServerStore.layer({
@@ -1742,7 +1742,7 @@ describe("scoped replication", () => {
           authorizeMutation: () => Effect.void,
           authorizeRead: () => Effect.void
         }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.provideMerge(persistentDatabase())
         )
       }
@@ -1800,7 +1800,7 @@ describe("scoped replication", () => {
       )
       yield* server.submit(yield* envelope("public", 1))
       const bootstrapCalls = yield* Ref.make(0)
-      const Remote = pipe(
+      const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
           discard: (request) => server.discard(request, "reader"),
@@ -1814,19 +1814,19 @@ describe("scoped replication", () => {
         }),
         Layer.succeed(SyncEngine.SyncEngine)
       )
-      const ClientDatabase = Database
-      const LocalLayer = LocalStore.layer({
+      const layerClientDatabase = layerDatabase
+      const layerLocal = LocalStore.layer({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId: readerId,
         scope
-      }).pipe(Layer.provide(Runtime), Layer.provide(ClientDatabase))
-      const ReconcilerLayer = Reconciler.layerOnePass({
+      }).pipe(Layer.provide(layerRuntime), Layer.provide(layerClientDatabase))
+      const layerReconciler = Reconciler.layerOnePass({
         definition: Domain.definition,
         spaceId
-      }).pipe(Layer.provide(LocalLayer), Layer.provide(Remote))
-      const context = yield* Layer.mergeAll(LocalLayer, ReconcilerLayer, ClientDatabase).pipe(Layer.build)
+      }).pipe(Layer.provide(layerLocal), Layer.provide(layerRemote))
+      const context = yield* Layer.mergeAll(layerLocal, layerReconciler, layerClientDatabase).pipe(Layer.build)
       const local = Context.get(context, LocalStore.Store)
       const reconciler = Context.get(context, Reconciler.Reconciliation)
 
@@ -1870,8 +1870,8 @@ describe("scoped replication", () => {
           return pipe(TestAuthorizationError.make({ reason: "read denied" }), Effect.fail)
         }
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(Database),
+        Layer.provide(layerRuntime),
+        Layer.provide(layerDatabase),
         Layer.build,
         Effect.map(Context.get(ServerStore.ServerStore))
       )
@@ -1883,12 +1883,12 @@ describe("scoped replication", () => {
         clientId: readerId,
         scope
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(Database),
+        Layer.provide(layerRuntime),
+        Layer.provide(layerDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
-      const Remote = pipe(
+      const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
           discard: (request) => server.discard(request, "reader"),
@@ -1899,10 +1899,10 @@ describe("scoped replication", () => {
         }),
         Layer.succeed(SyncEngine.SyncEngine)
       )
-      const ReconciliationLayer = Reconciler.layerOnePass({ definition: Domain.definition, spaceId })
-      const reconciliation = yield* ReconciliationLayer.pipe(
+      const layerReconciliation = Reconciler.layerOnePass({ definition: Domain.definition, spaceId })
+      const reconciliation = yield* layerReconciliation.pipe(
         Layer.provide(Layer.succeed(LocalStore.Store, local)),
-        Layer.provide(Remote),
+        Layer.provide(layerRemote),
         Layer.build,
         Effect.map(Context.get(Reconciler.Reconciliation))
       )
@@ -1935,8 +1935,8 @@ describe("scoped replication", () => {
         clientId: readerId,
         scope
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(Database),
+        Layer.provide(layerRuntime),
+        Layer.provide(layerDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
@@ -1949,7 +1949,7 @@ describe("scoped replication", () => {
         status: Effect.succeed({ _tag: "Offline", pending: 0 })
       })
       const engine = yield* service(WorkflowEngine.WorkflowEngine, WorkflowEngine.layerMemory)
-      const RegistrationLayer = ReconciliationWorkflow.layerRegistration({
+      const layerRegistration = ReconciliationWorkflow.layerRegistration({
         definition: Domain.definition,
         spaceId,
         clientId: readerId,
@@ -1957,7 +1957,7 @@ describe("scoped replication", () => {
         maximumRetryDelay: "1 millis",
         maximumAttempts: 3
       })
-      yield* RegistrationLayer.pipe(
+      yield* layerRegistration.pipe(
         Layer.provide(Layer.succeed(LocalStore.Store, local)),
         Layer.provide(Layer.succeed(Reconciler.Reconciliation, reconciliation)),
         Layer.provide(Layer.succeed(WorkflowEngine.WorkflowEngine, engine)),

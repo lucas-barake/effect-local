@@ -66,7 +66,7 @@ const makeLayer = Effect.fnUntraced(
   EffectLayer.unwrap
 )
 
-export const Layer = makeLayer()
+export const layer = makeLayer()
 
 export const layerMessagePort = (port: MessagePort) =>
   makeLayer().pipe(EffectLayer.provide(EffectLayer.succeed(DatabasePort, port)))

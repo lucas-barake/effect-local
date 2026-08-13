@@ -3,14 +3,14 @@
 Authenticated Effect RPC synchronization for Effect Local.
 
 One `SyncRpc.Rpcs` group carries mutation submission, ordered pulls, snapshot bootstrap pages, wake streams, presence
-publication, and presence watch streams over one WebSocket. `SyncServer.Default` keeps that public authenticated facade
-and routes each operation through `SpaceEntity.Client`. `SyncClient.Default` adapts the generated typed client to
+publication, and presence watch streams over one WebSocket. `SyncServer.layer` keeps that public authenticated facade
+and routes each operation through `SpaceEntity.Client`. `SyncClient.layer` adapts the generated typed client to
 `SyncEngine`.
 
 `SpaceEntity` routes one space through four volatile Cluster entity types. `SpaceAdmissionEntity` serializes Submit and
 Discard. `SpaceReadEntity` forks Pull and immutable Bootstrap page reads. `SpaceWatchEntity` forks long lived sync and
 presence streams. `SpacePresencePublishEntity` bounds concurrent presence publications. Separate finite mailboxes keep
-paused Bootstrap pages and long lived streams out of mutation admission. `SpaceEntity.LayerClient` aggregates the four
+paused Bootstrap pages and long lived streams out of mutation admission. `SpaceEntity.layerClient` aggregates the four
 generated clients for the public facade. `SpaceEntity.layer(options)` composes handlers and that client.
 
 ```ts
@@ -18,13 +18,13 @@ import * as PresenceHub from "@lucas-barake/effect-local-rpc/PresenceHub"
 import * as SpaceEntity from "@lucas-barake/effect-local-rpc/SpaceEntity"
 import * as Layer from "effect/Layer"
 
-const PresenceLive = PresenceHub.layer({
+const layerPresence = PresenceHub.layer({
   capacity: 1_024,
   maximumWatchersPerSpace: 1_024,
   authorize: authorizePresence
 })
 
-const SpaceLive = SpaceEntity.layer({
+const layerSpace = SpaceEntity.layer({
   admissionMailboxCapacity: 64,
   readMailboxCapacity: 64,
   watchMailboxCapacity: 2_048,
@@ -33,9 +33,9 @@ const SpaceLive = SpaceEntity.layer({
   maximumConcurrentBootstrapPagesPerSpace: 8,
   maximumConcurrentPresencePublicationsPerSpace: 64
 }).pipe(
-  Layer.provide(StoreLive),
-  Layer.provide(PresenceLive),
-  Layer.provide(RunnerLive)
+  Layer.provide(layerStore),
+  Layer.provide(layerPresence),
+  Layer.provide(layerRunner)
 )
 ```
 
@@ -62,7 +62,7 @@ current owner of the space.
 
 Authentication follows Effect RPC middleware conventions. The client calls `CredentialProvider.acquire` for every
 RPC, writes the redacted bearer credential to the request, and includes its nonnegative generation. The server uses
-`Authenticator` to provide a JSON `Principal`. `SyncServer.LayerHandlers` requires a `PrincipalAssertion.Issuer`, while
+`Authenticator` to provide a JSON `Principal`. `SyncServer.layerHandlers` requires a `PrincipalAssertion.Issuer`, while
 `SpaceEntity.layerHandlers` requires the matching `PrincipalAssertion.Verifier`. The assertion is opaque on the
 internal Cluster hop. The entity verifies it before deriving the principal, so browser payloads never carry or choose
 principal authority. Applications own assertion authenticity, expiry, and key rotation. Do not encode unsigned
@@ -102,7 +102,7 @@ const makeAuthentication = (initialBearer: Redacted.Redacted) =>
         )
     })
     return {
-      layer: Authentication.LayerClient.pipe(
+      layer: Authentication.layerClient.pipe(
         Layer.provide(Layer.succeed(Authentication.CredentialProvider, provider))
       ),
       rotate: (bearer: Redacted.Redacted) =>
@@ -139,7 +139,7 @@ the attempt count. `maximumRetryDelay` must be greater than or equal to `retryDe
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as Schedule from "effect/Schedule"
 
-const RpcProtocolLive = SyncClient.layerProtocolSocket({
+const layerRpcProtocol = SyncClient.layerProtocolSocket({
   retryTransientErrors: true,
   retryPolicy: Schedule.exponential("250 millis").pipe(
     Schedule.jittered,

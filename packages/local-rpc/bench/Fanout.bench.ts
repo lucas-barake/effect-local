@@ -53,16 +53,16 @@ const PutTodo = Mutation.make("FanoutBenchPutTodo", {
   success: Todo.schema
 })
 const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo] })
-const PutTodoHandlersLayer = PutTodo.toLayer(({ payload, transaction }) =>
+const layerPutTodoHandlers = PutTodo.toLayer(({ payload, transaction }) =>
   transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
 )
-const MutationRuntimeLayer = MutationRuntime.layer(definition).pipe(Layer.provide(PutTodoHandlersLayer))
-const DatabaseLayer = Layer.mergeAll(
+const layerMutationRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(layerPutTodoHandlers))
+const layerDatabase = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   NodeCrypto.layer,
   Reactivity.layer
 )
-const StoreLayer = ServerStore.layerTrusted({
+const layerStore = ServerStore.layerTrusted({
   definition,
   retainedHistoryEntries: 0,
   maximumHistoryEntries: 10_000,
@@ -82,13 +82,13 @@ const StoreLayer = ServerStore.layerTrusted({
   readAuthorizationCacheCapacity: 4_096,
   migration: { retryDelay: "1 millis", maximumAttempts: 8 }
 }).pipe(
-  Layer.provide(MutationRuntimeLayer),
-  Layer.provide(DatabaseLayer)
+  Layer.provide(layerMutationRuntime),
+  Layer.provide(layerDatabase)
 )
-const PresenceHubLayer = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })
+const layerPresenceHub = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })
 const assertion = PrincipalAssertion.PrincipalAssertion.make("fanout-benchmark")
-const AssertionVerifierLayer = PrincipalAssertion.layerVerifier(() => Effect.succeed(null))
-const ClusterLayer = SpaceEntity.layer({
+const layerAssertionVerifier = PrincipalAssertion.layerVerifier(() => Effect.succeed(null))
+const layerCluster = SpaceEntity.layer({
   admissionMailboxCapacity: 32,
   readMailboxCapacity: 32,
   watchMailboxCapacity: 1_024,
@@ -97,9 +97,9 @@ const ClusterLayer = SpaceEntity.layer({
   maximumConcurrentBootstrapPagesPerSpace: 4,
   maximumConcurrentPresencePublicationsPerSpace: 16
 }).pipe(
-  Layer.provide(StoreLayer),
-  Layer.provide(PresenceHubLayer),
-  Layer.provide(AssertionVerifierLayer),
+  Layer.provide(layerStore),
+  Layer.provide(layerPresenceHub),
+  Layer.provide(layerAssertionVerifier),
   Layer.provide(
     SingleRunner.layer({
       runnerStorage: "memory",
@@ -108,7 +108,7 @@ const ClusterLayer = SpaceEntity.layer({
         entityMessagePollInterval: 5_000,
         sendRetryInterval: 100
       }
-    }).pipe(Layer.provide(DatabaseLayer))
+    }).pipe(Layer.provide(layerDatabase))
   )
 )
 
@@ -135,7 +135,7 @@ class FanoutBench extends Context.Service<FanoutBench, FanoutBenchService>()(
   "@lucas-barake/effect-local-rpc/bench/FanoutBench"
 ) {}
 
-const FanoutBenchLayer = Layer.effect(
+const layerFanoutBench = Layer.effect(
   FanoutBench,
   Effect.gen(function*() {
     const client = yield* SpaceEntity.Client
@@ -224,10 +224,10 @@ const FanoutBenchLayer = Layer.effect(
     })
   })
 )
-const RuntimeLayer = FanoutBenchLayer.pipe(
-  Layer.provide(Layer.merge(ClusterLayer, DatabaseLayer))
+const layerRuntime = layerFanoutBench.pipe(
+  Layer.provide(Layer.merge(layerCluster, layerDatabase))
 )
-const runtime = ManagedRuntime.make(RuntimeLayer)
+const runtime = ManagedRuntime.make(layerRuntime)
 
 beforeAll(async () => {
   // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this asynchronous benchmark fixture setup boundary.

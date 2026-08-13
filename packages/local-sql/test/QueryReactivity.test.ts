@@ -44,7 +44,7 @@ const changes = (points: ReadonlyArray<IndexStore.Point>): QueryReactivity.Chang
   points,
   broadModels: new Set()
 })
-const provideQueryReactivity = Effect.provide(QueryReactivity.Layer)
+const provideQueryReactivity = Effect.provide(QueryReactivity.layer)
 
 describe("query range reactivity", () => {
   it.effect(

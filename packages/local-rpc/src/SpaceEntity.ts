@@ -286,7 +286,7 @@ export const layerHandlers = (options: HandlerOptions) =>
 
       const common = commonHandlerOptions(options)
       const bootstrapAuthorizations = yield* Semaphore.make(options.maximumConcurrentBootstrapAuthorizations)
-      const AdmissionHandlers = SpaceAdmissionEntity.toLayer(
+      const layerAdmissionHandlers = SpaceAdmissionEntity.toLayer(
         Effect.gen(function*() {
           const address = yield* Entity.CurrentAddress
           const store = yield* ServerStore.ServerStore
@@ -320,7 +320,7 @@ export const layerHandlers = (options: HandlerOptions) =>
         { ...common, concurrency: 1, mailboxCapacity: options.admissionMailboxCapacity }
       )
 
-      const ReadHandlers = SpaceReadEntity.toLayer(
+      const layerReadHandlers = SpaceReadEntity.toLayer(
         Effect.gen(function*() {
           const address = yield* Entity.CurrentAddress
           const store = yield* ServerStore.ServerStore
@@ -379,7 +379,7 @@ export const layerHandlers = (options: HandlerOptions) =>
         { ...common, concurrency: 1, mailboxCapacity: options.readMailboxCapacity }
       )
 
-      const WatchHandlers = SpaceWatchEntity.toLayer(
+      const layerWatchHandlers = SpaceWatchEntity.toLayer(
         Effect.gen(function*() {
           const address = yield* Entity.CurrentAddress
           const store = yield* ServerStore.ServerStore
@@ -418,7 +418,7 @@ export const layerHandlers = (options: HandlerOptions) =>
         { ...common, concurrency: 1, mailboxCapacity: options.watchMailboxCapacity }
       )
 
-      const PresencePublicationHandlers = SpacePresencePublishEntity.toLayer(
+      const layerPresencePublicationHandlers = SpacePresencePublishEntity.toLayer(
         Effect.gen(function*() {
           const address = yield* Entity.CurrentAddress
           const presence = yield* PresenceHub.PresenceHub
@@ -447,11 +447,16 @@ export const layerHandlers = (options: HandlerOptions) =>
         }
       )
 
-      return Layer.mergeAll(AdmissionHandlers, ReadHandlers, WatchHandlers, PresencePublicationHandlers)
+      return Layer.mergeAll(
+        layerAdmissionHandlers,
+        layerReadHandlers,
+        layerWatchHandlers,
+        layerPresencePublicationHandlers
+      )
     })
   )
 
-export const LayerClient: Layer.Layer<Client, never, Sharding.Sharding> = Layer.effect(
+export const layerClient: Layer.Layer<Client, never, Sharding.Sharding> = Layer.effect(
   Client,
   Effect.gen(function*() {
     const admission = yield* SpaceAdmissionEntity.client
@@ -462,4 +467,4 @@ export const LayerClient: Layer.Layer<Client, never, Sharding.Sharding> = Layer.
   })
 )
 
-export const layer = (options: HandlerOptions) => Layer.merge(layerHandlers(options), LayerClient)
+export const layer = (options: HandlerOptions) => Layer.merge(layerHandlers(options), layerClient)

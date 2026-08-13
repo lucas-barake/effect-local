@@ -90,7 +90,7 @@ export class FaultInjection extends Context.Service<FaultInjection, Service>()(
   "@lucas-barake/effect-local-test/FaultInjection"
 ) {}
 
-export const FaultInjectionLayer: Layer.Layer<FaultInjection> = Layer.effect(
+export const layer: Layer.Layer<FaultInjection> = Layer.effect(
   FaultInjection,
   Effect.gen(function*() {
     const initial = (): FaultState => ({

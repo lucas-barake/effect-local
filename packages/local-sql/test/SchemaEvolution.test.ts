@@ -106,7 +106,7 @@ const PutTodoV1 = Mutation.make("PutTodo", {
   rejection: SchemaPolicyRejectedError
 })
 const definitionV1 = Definition.make({ version: 1, models: [TodoV1], mutations: [PutTodoV1] })
-const HandlersV1 = PutTodoV1.toLayer(({ payload, transaction }) =>
+const layerHandlersV1 = PutTodoV1.toLayer(({ payload, transaction }) =>
   transaction.set(TodoV1, payload.id, payload).pipe(Effect.as(payload))
 )
 
@@ -167,10 +167,10 @@ const bootstrapRequest = (
     afterOrdinal,
     limit
   })
-const HandlersV2 = PutTodoV2.toLayer(({ payload, transaction }) =>
+const layerHandlersV2 = PutTodoV2.toLayer(({ payload, transaction }) =>
   transaction.set(TodoV2, payload.id, payload).pipe(Effect.as(payload))
 )
-const RejectingHandlersV2 = PutTodoV2.toLayer(() =>
+const layerRejectingHandlersV2 = PutTodoV2.toLayer(() =>
   Effect.fail(new SchemaPolicyRejectedError({ reason: "schema-policy-rejected" }))
 )
 
@@ -198,10 +198,10 @@ const PutTodoV3 = Mutation.make("PutTodo", {
   rejection: SchemaPolicyRejectedError
 })
 const definitionV3 = Definition.make({ version: 3, models: [TodoV3], mutations: [PutTodoV3] })
-const HandlersV3 = PutTodoV3.toLayer(({ payload, transaction }) =>
+const layerHandlersV3 = PutTodoV3.toLayer(({ payload, transaction }) =>
   transaction.set(TodoV3, payload.id, payload).pipe(Effect.as(payload))
 )
-const RejectingHandlersV3 = PutTodoV3.toLayer(() =>
+const layerRejectingHandlersV3 = PutTodoV3.toLayer(() =>
   Effect.fail(new SchemaPolicyRejectedError({ reason: "schema-policy-rejected-v3" }))
 )
 
@@ -223,7 +223,7 @@ const PutExpanded = Mutation.make("PutExpanded", {
 })
 const expandedDefinitionV1 = Definition.make({ version: 1, models: [ExpandedV1], mutations: [PutExpanded] })
 const expandedDefinitionV2 = Definition.make({ version: 2, models: [ExpandedV2], mutations: [PutExpanded] })
-const ExpandedHandlers = PutExpanded.toLayer(({ payload, transaction }) =>
+const layerExpandedHandlers = PutExpanded.toLayer(({ payload, transaction }) =>
   transaction.set(ExpandedV2, payload.id, payload).pipe(Effect.as(null))
 )
 const expandingEvolution = Evolution.make({
@@ -260,7 +260,7 @@ const PutLarge = Mutation.make("PutLarge", {
 })
 const compactDefinitionV1 = Definition.make({ version: 1, models: [CompactV1], mutations: [PutLarge] })
 const largeDefinitionV2 = Definition.make({ version: 2, models: [LargeV2], mutations: [PutLarge] })
-const LargeHandlers = PutLarge.toLayer(({ payload, transaction }) =>
+const layerLargeHandlers = PutLarge.toLayer(({ payload, transaction }) =>
   transaction.set(LargeV2, payload.id, { id: payload.id, text: "x".repeat(2_200_000) }).pipe(Effect.as(null))
 )
 const compactingEvolution = Evolution.make({
@@ -384,13 +384,13 @@ const evolutionV3 = Evolution.make({
   ]
 })
 
-const Database = Layer.mergeAll(
+const layerDatabase = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   NodeCrypto.layer,
   Reactivity.layer,
-  QueryReactivity.Layer
+  QueryReactivity.layer
 )
-const provideDatabase = Effect.provide(Database)
+const provideDatabase = Effect.provide(layerDatabase)
 const provideNodeFileSystem = Effect.provide(NodeFileSystem.layer)
 
 const buildStore = <D extends Definition.Any,>(
@@ -399,7 +399,7 @@ const buildStore = <D extends Definition.Any,>(
   configuredEvolution?: Evolution.Evolution,
   storeClientId: Identity.ClientId = clientId
 ) => {
-  const Runtime = MutationRuntime.layer(definition, configuredEvolution).pipe(Layer.provide(handlers))
+  const layerRuntime = MutationRuntime.layer(definition, configuredEvolution).pipe(Layer.provide(handlers))
   let options: LocalStore.Options = {
     ...clientHistory,
     definition,
@@ -409,7 +409,7 @@ const buildStore = <D extends Definition.Any,>(
   }
   if (configuredEvolution !== undefined) options = { ...options, evolution: configuredEvolution }
   return LocalStore.layer(options).pipe(
-    Layer.provide(Runtime),
+    Layer.provide(layerRuntime),
     Layer.build,
     Effect.map(Context.get(LocalStore.Store))
   )
@@ -421,7 +421,7 @@ const buildServer = <D extends Definition.Any,>(
   configuredEvolution?: Evolution.Evolution,
   serverOptions?: Partial<Pick<ServerStore.Options, "acceptedSchemaVersions" | "retainedHistoryEntries">>
 ) => {
-  const Runtime = MutationRuntime.layer(definition, configuredEvolution).pipe(Layer.provide(handlers))
+  const layerRuntime = MutationRuntime.layer(definition, configuredEvolution).pipe(Layer.provide(handlers))
   let options: Parameters<typeof ServerStore.layerTrusted>[0] = {
     ...serverHistory,
     definition,
@@ -432,7 +432,7 @@ const buildServer = <D extends Definition.Any,>(
     options = { ...options, ...serverOptions }
   }
   return ServerStore.layerTrusted(options).pipe(
-    Layer.provide(Runtime),
+    Layer.provide(layerRuntime),
     Layer.build,
     Effect.map(Context.get(ServerStore.ServerStore))
   )
@@ -506,8 +506,8 @@ describe("client schema evolution", () => {
     "rejects same-name mutation descriptors that are not registered in the definition",
     Effect.fnUntraced(
       function*() {
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution)
-        const replica = yield* buildReplica(definitionV2, HandlersV2, serverSync(server), evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution)
+        const replica = yield* buildReplica(definitionV2, layerHandlersV2, serverSync(server), evolution)
         const counterfeit = Mutation.make("PutTodo", {
           version: 2,
           payload: Schema.String,
@@ -543,7 +543,7 @@ describe("client schema evolution", () => {
     "atomically promotes canonical state, receipts, and replayed pending mutations",
     Effect.fnUntraced(
       function*() {
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const accepted = yield* v1.mutate(PutTodoV1, { id: "1", title: "accepted" })
         yield* pipe(
           Protocol.AcceptedReceipt.make({
@@ -573,7 +573,7 @@ describe("client schema evolution", () => {
         })])
         const pending = yield* v1.mutate(PutTodoV1, { id: "2", title: "pending" })
 
-        const v2 = yield* buildStore(definitionV2, HandlersV2, evolution)
+        const v2 = yield* buildStore(definitionV2, layerHandlersV2, evolution)
         pipe(
           Option.getOrThrow(yield* v2.get(TodoV2, 1)),
           (todo) => assert.deepStrictEqual(todo, { id: 1, title: "accepted", done: false })
@@ -612,7 +612,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "90", title: "optimistic" })
         yield* v1.markSubmitting(pending.envelope.mutationId)
         yield* v1.applyEntries([Protocol.AcceptedMutation.make({
@@ -636,7 +636,7 @@ describe("client schema evolution", () => {
         assert.strictEqual(awaiting.attempts, 1)
         assert.strictEqual(Option.getOrThrow(yield* v1.get(TodoV1, "90")).title, "authoritative")
 
-        const v2 = yield* buildStore(definitionV2, HandlersV2, evolution)
+        const v2 = yield* buildStore(definitionV2, layerHandlersV2, evolution)
 
         const promoted = (yield* v2.pending)[0]
         assert.strictEqual(promoted.submissionState, "AwaitingReceipt")
@@ -657,7 +657,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "92", title: "receipt-backed" })
         yield* v1.markSubmitting(pending.envelope.mutationId)
         const encodedRejection = yield* Schema.encodeEffect(SchemaPolicyRejectedError)(
@@ -690,7 +690,7 @@ describe("client schema evolution", () => {
         assert.isTrue(receiptIsPresent)
 
         yield* sql`DROP TRIGGER fail_projection_promotion`
-        const rejectingV2 = yield* buildStore(definitionV2, RejectingHandlersV2, evolution)
+        const rejectingV2 = yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
         const promoted = (yield* rejectingV2.pending)[0]
         assert.strictEqual(promoted.submissionState, "Submitted")
         assert.strictEqual(promoted.attempts, 1)
@@ -733,9 +733,9 @@ describe("client schema evolution", () => {
     "replays an old pending envelope after applying a current accepted entry",
     Effect.fnUntraced(
       function*() {
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         yield* v1.mutate(PutTodoV1, { id: "2", title: "pending" })
-        const v2 = yield* buildStore(definitionV2, HandlersV2, evolution)
+        const v2 = yield* buildStore(definitionV2, layerHandlersV2, evolution)
         yield* v2.applyEntries([Protocol.AcceptedMutation.make({
           sequence: Identity.ServerSequence.make(1),
           spaceId,
@@ -770,10 +770,10 @@ describe("client schema evolution", () => {
     "promotes pending optimistic changes across multiple schema versions",
     Effect.fnUntraced(
       function*() {
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "3", title: "multi-hop" })
-        yield* buildStore(definitionV2, HandlersV2, evolution)
-        const v3 = yield* buildStore(definitionV3, HandlersV3, evolutionV3)
+        yield* buildStore(definitionV2, layerHandlersV2, evolution)
+        const v3 = yield* buildStore(definitionV3, layerHandlersV3, evolutionV3)
 
         assert.deepStrictEqual((yield* v3.pendingToSubmit)[0].envelope, pending.envelope)
         pipe(
@@ -790,11 +790,11 @@ describe("client schema evolution", () => {
     "rejects a different client before it can promote the owned database",
     Effect.fnUntraced(
       function*() {
-        const owner = yield* buildStore(definitionV1, HandlersV1)
+        const owner = yield* buildStore(definitionV1, layerHandlersV1)
         yield* owner.mutate(PutTodoV1, { id: "4", title: "owned" })
         const otherClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
 
-        const result = yield* buildStore(definitionV2, HandlersV2, evolution, otherClientId).pipe(Effect.result)
+        const result = yield* buildStore(definitionV2, layerHandlersV2, evolution, otherClientId).pipe(Effect.result)
         const error = expectFailure(result)
         assert.strictEqual(error._tag, "ReplicaIdentityMismatch")
         pipe(
@@ -812,7 +812,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const remoteClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         yield* v1.applyEntries([Protocol.AcceptedMutation.make({
           sequence: Identity.ServerSequence.make(1),
           spaceId,
@@ -827,7 +827,7 @@ describe("client schema evolution", () => {
             value: { id: "01", title: "original" }
           })]
         })])
-        const v2 = yield* buildStore(definitionV2, HandlersV2, evolution)
+        const v2 = yield* buildStore(definitionV2, layerHandlersV2, evolution)
         const collision = Protocol.AcceptedMutation.make({
           sequence: Identity.ServerSequence.make(2),
           spaceId,
@@ -862,7 +862,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "5", title: "receipt" })
         const receipt = Protocol.AcceptedReceipt.make({
           spaceId,
@@ -885,7 +885,7 @@ describe("client schema evolution", () => {
         SET receipt_json = ${yield* Codec.stringify(conflicting)}
         WHERE space_id = ${spaceId} AND mutation_id = ${pending.envelope.mutationId}`
 
-        const result = yield* buildStore(definitionV2, HandlersV2, evolution).pipe(Effect.result)
+        const result = yield* buildStore(definitionV2, layerHandlersV2, evolution).pipe(Effect.result)
         assert.isTrue(Result.isFailure(result))
         if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, "StorageCorrupt")
       },
@@ -900,7 +900,7 @@ describe("client schema evolution", () => {
       function*() {
         const sql = yield* SqlClient.SqlClient
         const remoteClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const entry = Protocol.AcceptedMutation.make({
           sequence: Identity.ServerSequence.make(1),
           spaceId,
@@ -922,7 +922,7 @@ describe("client schema evolution", () => {
         })
         yield* sql`UPDATE effect_local_server_log SET entry_json = ${yield* Codec.stringify(conflicting)}`
 
-        const result = yield* buildStore(definitionV2, HandlersV2, evolution).pipe(Effect.result)
+        const result = yield* buildStore(definitionV2, layerHandlersV2, evolution).pipe(Effect.result)
         assert.isTrue(Result.isFailure(result))
         if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, "StorageCorrupt")
       },
@@ -936,7 +936,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "3", title: "resume" })
         yield* v1.applyEntries([Protocol.AcceptedMutation.make({
           sequence: Identity.ServerSequence.make(1),
@@ -967,7 +967,7 @@ describe("client schema evolution", () => {
           yield* Deferred.succeed(reached, undefined)
           yield* Effect.never
         }).pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
-        const RuntimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(HandlersV2))
+        const layerRuntimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(layerHandlersV2))
         const fiber = yield* SchemaEvolution.client({
           definition: definitionV2,
           evolution,
@@ -975,7 +975,7 @@ describe("client schema evolution", () => {
           clientId,
           batchSize: 1,
           afterBatch
-        }).pipe(Effect.provide(RuntimeV2), Effect.forkChild({ startImmediately: true }))
+        }).pipe(Effect.provide(layerRuntimeV2), Effect.forkChild({ startImmediately: true }))
         yield* Deferred.await(reached)
         yield* Fiber.interrupt(fiber)
 
@@ -992,7 +992,7 @@ describe("client schema evolution", () => {
         WHERE space_id = ${spaceId} AND schema_generation = ${progress.generation}`
         assert.strictEqual(copied[0].count, 1)
 
-        const v2 = yield* buildStore(definitionV2, HandlersV2, evolution)
+        const v2 = yield* buildStore(definitionV2, layerHandlersV2, evolution)
         pipe(
           Option.getOrThrow(yield* v2.get(TodoV2, 3)),
           (todo) => assert.deepStrictEqual(todo, { id: 3, title: "resume", done: false })
@@ -1009,7 +1009,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         yield* v1.applyEntries([Protocol.AcceptedMutation.make({
           sequence: Identity.ServerSequence.make(1),
           spaceId,
@@ -1072,7 +1072,7 @@ describe("client schema evolution", () => {
           SqlError: (error) => Effect.die(error),
           NoSuchElementError: (error) => Effect.die(error)
         }))
-        const RuntimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(HandlersV2))
+        const layerRuntimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(layerHandlersV2))
         const fiber = yield* SchemaEvolution.client({
           definition: definitionV2,
           evolution,
@@ -1080,7 +1080,7 @@ describe("client schema evolution", () => {
           clientId,
           batchSize: 1,
           afterBatch
-        }).pipe(Effect.provide(RuntimeV2), Effect.forkChild({ startImmediately: true }))
+        }).pipe(Effect.provide(layerRuntimeV2), Effect.forkChild({ startImmediately: true }))
         yield* Deferred.await(reached)
         yield* Fiber.interrupt(fiber)
 
@@ -1107,7 +1107,7 @@ describe("client schema evolution", () => {
         assert.strictEqual(targetRetractions.count, 1)
         assert.strictEqual(targetVisible.count, 0)
 
-        const v2 = yield* buildStore(definitionV2, HandlersV2, evolution)
+        const v2 = yield* buildStore(definitionV2, layerHandlersV2, evolution)
         const todoIsAbsent = Option.isNone(yield* v2.get(TodoV2, 3))
         assert.isTrue(todoIsAbsent)
         const final = yield* SqlSchema.findOne({
@@ -1141,7 +1141,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        yield* buildStore(definitionV1, HandlersV1)
+        yield* buildStore(definitionV1, layerHandlersV1)
         const source = (yield* sql<{
           readonly active_schema_generation: number
           readonly active_projection_generation: number
@@ -1183,7 +1183,7 @@ describe("client schema evolution", () => {
             yield* Effect.never
           }
         }).pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
-        const RuntimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(HandlersV2))
+        const layerRuntimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(layerHandlersV2))
         const fiber = yield* SchemaEvolution.client({
           definition: definitionV2,
           evolution,
@@ -1191,7 +1191,7 @@ describe("client schema evolution", () => {
           clientId,
           batchSize: 1,
           afterBatch
-        }).pipe(Effect.provide(RuntimeV2), Effect.forkChild({ startImmediately: true }))
+        }).pipe(Effect.provide(layerRuntimeV2), Effect.forkChild({ startImmediately: true }))
         yield* Deferred.await(flipped)
         yield* Fiber.interrupt(fiber)
 
@@ -1206,7 +1206,7 @@ describe("client schema evolution", () => {
           spaceId,
           clientId,
           batchSize: 1
-        }).pipe(Effect.provide(RuntimeV2))
+        }).pipe(Effect.provide(layerRuntimeV2))
         const remaining = yield* sql<{ readonly count: number }>`SELECT
         (SELECT COUNT(*) FROM effect_local_client_canonical_entities_data
           WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}) +
@@ -1228,7 +1228,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         yield* v1.mutate(PutTodoV1, { id: "7", title: "pending" })
         yield* v1.applyEntries([Protocol.AcceptedMutation.make({
           sequence: Identity.ServerSequence.make(1),
@@ -1268,7 +1268,7 @@ describe("client schema evolution", () => {
             return Effect.void
           })
         )
-        const RuntimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(HandlersV2))
+        const layerRuntimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(layerHandlersV2))
         yield* SchemaEvolution.client({
           definition: definitionV2,
           evolution,
@@ -1276,7 +1276,7 @@ describe("client schema evolution", () => {
           clientId,
           batchSize: 1,
           afterBatch
-        }).pipe(Effect.provide(RuntimeV2))
+        }).pipe(Effect.provide(layerRuntimeV2))
 
         const metadata = (yield* sql<{
           readonly projection_replay_generation: number | null
@@ -1290,7 +1290,7 @@ describe("client schema evolution", () => {
         WHERE space_id = ${spaceId} AND schema_generation = ${source.active_schema_generation}`
         assert.strictEqual(remaining[0].count, 0)
 
-        const v2 = yield* buildStore(definitionV2, HandlersV2, evolution)
+        const v2 = yield* buildStore(definitionV2, layerHandlersV2, evolution)
         assert.strictEqual(Option.getOrThrow(yield* v2.get(TodoV2, 7)).title, "pending")
         assert.strictEqual(Option.getOrThrow(yield* v2.get(TodoV2, 8)).title, "committed")
       },
@@ -1303,9 +1303,9 @@ describe("client schema evolution", () => {
     "rejects one evolution row larger than the configured byte budget",
     Effect.fnUntraced(
       function*() {
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         yield* v1.mutate(PutTodoV1, { id: "4", title: "x".repeat(256) })
-        const RuntimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(HandlersV2))
+        const layerRuntimeV2 = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(layerHandlersV2))
         const result = yield* SchemaEvolution.client({
           definition: definitionV2,
           evolution,
@@ -1313,7 +1313,7 @@ describe("client schema evolution", () => {
           clientId,
           batchSize: 10,
           batchBytes: 32
-        }).pipe(Effect.provide(RuntimeV2), Effect.result)
+        }).pipe(Effect.provide(layerRuntimeV2), Effect.result)
         const error = expectFailure(result)
         assert.strictEqual(error._tag, "CapacityExceeded")
         if (error._tag === "CapacityExceeded") {
@@ -1331,11 +1331,11 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         yield* v1.mutate(PutTodoV1, { id: "01", title: "first" })
         yield* v1.mutate(PutTodoV1, { id: "1", title: "second" })
 
-        const result = yield* buildStore(definitionV2, HandlersV2, evolution).pipe(Effect.result)
+        const result = yield* buildStore(definitionV2, layerHandlersV2, evolution).pipe(Effect.result)
         const error = expectFailure(result)
         assert.strictEqual(error._tag, "SchemaKeyCollision")
         const CountRow = Schema.Struct({ count: Schema.Number })
@@ -1371,13 +1371,13 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const localV1 = yield* buildStore(definitionV1, HandlersV1)
-        const serverV1 = yield* buildServer(definitionV1, HandlersV1)
+        const localV1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1)
         const accepted = yield* localV1.mutate(PutTodoV1, { id: "4", title: "accepted-old" })
         assert.strictEqual((yield* serverV1.submit(accepted.envelope))._tag, "Accepted")
         const offline = yield* localV1.mutate(PutTodoV1, { id: "5", title: "offline-old" })
 
-        const serverV2 = yield* buildServer(definitionV2, HandlersV2, evolution)
+        const serverV2 = yield* buildServer(definitionV2, layerHandlersV2, evolution)
         yield* serverV2.pull(pullRequest(definitionV2))
 
         const offlineReceipt = yield* serverV2.submit({
@@ -1407,10 +1407,10 @@ describe("client schema evolution", () => {
     "starts after quarantining a pending mutation rejected during promotion",
     Effect.fnUntraced(
       function*() {
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "42", title: "rejected-on-upgrade" })
 
-        const v2 = yield* buildStore(definitionV2, RejectingHandlersV2, evolution)
+        const v2 = yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
         const quarantined = yield* v2.quarantine
         assert.strictEqual(quarantined.length, 1)
         assert.strictEqual(quarantined[0].envelope.mutationId, pending.envelope.mutationId)
@@ -1419,7 +1419,7 @@ describe("client schema evolution", () => {
         assert.strictEqual(quarantineRejection.reason, "schema-policy-rejected")
         assert.strictEqual((yield* v2.pending).length, 0)
 
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution)
         const discarded = yield* server.discard({
           envelope: quarantined[0].envelope,
           schema: definitionV2.schemaIdentity
@@ -1429,7 +1429,7 @@ describe("client schema evolution", () => {
         yield* v2.resolveQuarantine(discarded)
         assert.deepStrictEqual(yield* v2.quarantine, [])
 
-        const writableV2 = yield* buildStore(definitionV2, HandlersV2, evolution)
+        const writableV2 = yield* buildStore(definitionV2, layerHandlersV2, evolution)
         const replacement = yield* writableV2.mutate(PutTodoV2, {
           id: 42,
           title: "corrected",
@@ -1453,11 +1453,11 @@ describe("client schema evolution", () => {
     "keeps quarantine intact when disposition receipt identity or provenance is invalid",
     Effect.fnUntraced(
       function*() {
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "91", title: "quarantined" })
-        const v2 = yield* buildStore(definitionV2, RejectingHandlersV2, evolution)
+        const v2 = yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
         const item = Option.getOrThrow(yield* v2.quarantineByMutation(pending.envelope.mutationId))
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution)
         const valid = yield* server.discard({ envelope: item.envelope, schema: v2.schema }, null)
         if (valid._tag !== "Rejected") assert.fail("expected rejected quarantine receipt")
         const invalidReceipts = [
@@ -1497,11 +1497,11 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "43", title: "atomic-disposition" })
-        const v2 = yield* buildStore(definitionV2, RejectingHandlersV2, evolution)
+        const v2 = yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
         const quarantined = yield* v2.quarantine
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution)
         const receipt = yield* server.discard({
           envelope: quarantined[0].envelope,
           schema: definitionV2.schemaIdentity
@@ -1512,7 +1512,7 @@ describe("client schema evolution", () => {
         assert.strictEqual((yield* v2.resolveQuarantine(receipt).pipe(Effect.flip))._tag, "StorageUnavailable")
         yield* sql`DROP TRIGGER fail_quarantine_receipt`
 
-        const reopened = yield* buildStore(definitionV2, HandlersV2, evolution)
+        const reopened = yield* buildStore(definitionV2, layerHandlersV2, evolution)
         assert.deepStrictEqual((yield* reopened.quarantine).map((item) => item.envelope.mutationId), [
           pending.envelope.mutationId
         ])
@@ -1527,11 +1527,11 @@ describe("client schema evolution", () => {
     "keeps a quarantined mutation inspectable when its replacement rejects",
     Effect.fnUntraced(
       function*() {
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const original = yield* v1.mutate(PutTodoV1, { id: "44", title: "retryable-resubmit" })
-        const rejecting = yield* buildStore(definitionV2, RejectingHandlersV2, evolution)
+        const rejecting = yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
         const item = (yield* rejecting.quarantine)[0]
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution)
         const receipt = yield* server.discard({ envelope: item.envelope, schema: definitionV2.schemaIdentity }, null)
 
         const rejectedResult = yield* rejecting.ensureQuarantineResubmission(original.envelope.mutationId, PutTodoV2, {
@@ -1548,7 +1548,7 @@ describe("client schema evolution", () => {
           original.envelope.mutationId
         ])
 
-        const writable = yield* buildStore(definitionV2, HandlersV2, evolution)
+        const writable = yield* buildStore(definitionV2, layerHandlersV2, evolution)
         const replacement = yield* writable.ensureQuarantineResubmission(original.envelope.mutationId, PutTodoV2, {
           id: 44,
           title: "corrected",
@@ -1576,11 +1576,11 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const original = yield* v1.mutate(PutTodoV1, { id: "45", title: "original" })
-        yield* buildStore(definitionV2, RejectingHandlersV2, evolution)
-        const stagingStore = yield* buildStore(definitionV2, HandlersV2, evolution)
-        const firstError = yield* buildReplica(definitionV2, HandlersV2, unavailableSync, evolution).pipe(
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        const stagingStore = yield* buildStore(definitionV2, layerHandlersV2, evolution)
+        const firstError = yield* buildReplica(definitionV2, layerHandlersV2, unavailableSync, evolution).pipe(
           Effect.flatMap((replica) =>
             replica.resubmitQuarantined(
               original.envelope.mutationId,
@@ -1605,7 +1605,7 @@ describe("client schema evolution", () => {
           Option.getOrThrow(yield* stagingStore.get(TodoV2, 45)),
           (todo) => assert.deepStrictEqual(todo, { id: 45, title: "staged", done: false })
         )
-        const conflict = yield* buildReplica(definitionV2, HandlersV2, unavailableSync, evolution).pipe(
+        const conflict = yield* buildReplica(definitionV2, layerHandlersV2, unavailableSync, evolution).pipe(
           Effect.flatMap((replica) =>
             replica.resubmitQuarantined(
               original.envelope.mutationId,
@@ -1642,8 +1642,8 @@ describe("client schema evolution", () => {
           })
         )
 
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution)
-        const replica = yield* buildReplica(definitionV2, HandlersV2, serverSync(server), evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution)
+        const replica = yield* buildReplica(definitionV2, layerHandlersV2, serverSync(server), evolution)
         const receipt = yield* replica.discardQuarantined(original.envelope.mutationId)
         assert.strictEqual(receipt._tag, "Rejected")
         assert.deepStrictEqual(yield* replica.quarantine, [])
@@ -1668,16 +1668,16 @@ describe("client schema evolution", () => {
     "submits intervening pending mutations before discarding a staged replacement",
     Effect.fnUntraced(
       function*() {
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const original = yield* v1.mutate(PutTodoV1, { id: "49", title: "original" })
-        yield* buildStore(definitionV2, RejectingHandlersV2, evolution)
-        const writable = yield* buildStore(definitionV2, HandlersV2, evolution)
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        const writable = yield* buildStore(definitionV2, layerHandlersV2, evolution)
         yield* writable.mutate(PutTodoV2, {
           id: 50,
           title: "intervening",
           done: false
         })
-        const staged = yield* buildReplica(definitionV2, HandlersV2, unavailableSync, evolution).pipe(
+        const staged = yield* buildReplica(definitionV2, layerHandlersV2, unavailableSync, evolution).pipe(
           Effect.flatMap((replica) =>
             replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
               id: 49,
@@ -1689,8 +1689,8 @@ describe("client schema evolution", () => {
         )
         assert.isTrue(pipe(staged, Schema.is(ReplicaError.ServerUnavailable)))
 
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution)
-        const replica = yield* buildReplica(definitionV2, HandlersV2, serverSync(server), evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution)
+        const replica = yield* buildReplica(definitionV2, layerHandlersV2, serverSync(server), evolution)
         yield* replica.discardQuarantined(original.envelope.mutationId)
 
         assert.deepStrictEqual(yield* replica.quarantine, [])
@@ -1715,17 +1715,17 @@ describe("client schema evolution", () => {
     "resumes staged replacement cancellation after an intervening submit failure",
     Effect.fnUntraced(
       function*() {
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const original = yield* v1.mutate(PutTodoV1, { id: "51", title: "original" })
-        yield* buildStore(definitionV2, RejectingHandlersV2, evolution)
-        const writable = yield* buildStore(definitionV2, HandlersV2, evolution)
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        const writable = yield* buildStore(definitionV2, layerHandlersV2, evolution)
         const intervening = yield* writable.mutate(PutTodoV2, {
           id: 52,
           title: "intervening",
           done: false
         })
         assert.strictEqual(intervening.envelope.localSequence, 2)
-        const staged = yield* buildReplica(definitionV2, HandlersV2, unavailableSync, evolution).pipe(
+        const staged = yield* buildReplica(definitionV2, layerHandlersV2, unavailableSync, evolution).pipe(
           Effect.flatMap((replica) =>
             replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
               id: 51,
@@ -1737,7 +1737,7 @@ describe("client schema evolution", () => {
         )
         assert.isTrue(pipe(staged, Schema.is(ReplicaError.ServerUnavailable)))
 
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution)
         const live = serverSync(server)
         const failSubmit = yield* Ref.make(true)
         const failOnce = SyncEngine.SyncEngine.of({
@@ -1748,7 +1748,7 @@ describe("client schema evolution", () => {
             return yield* live.submit(request)
           })
         })
-        const replica = yield* buildReplica(definitionV2, HandlersV2, failOnce, evolution)
+        const replica = yield* buildReplica(definitionV2, layerHandlersV2, failOnce, evolution)
         const firstError = yield* replica.discardQuarantined(original.envelope.mutationId).pipe(Effect.flip)
         assert.strictEqual(firstError._tag, "ServerUnavailable")
         yield* Ref.set(failSubmit, false)
@@ -1778,12 +1778,12 @@ describe("client schema evolution", () => {
     "resubmits a quarantined mutation through the public replica composition",
     Effect.fnUntraced(
       function*() {
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const original = yield* v1.mutate(PutTodoV1, { id: "48", title: "original" })
-        yield* buildStore(definitionV2, RejectingHandlersV2, evolution)
-        const writable = yield* buildStore(definitionV2, HandlersV2, evolution)
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution)
-        const replica = yield* buildReplica(definitionV2, HandlersV2, serverSync(server), evolution)
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        const writable = yield* buildStore(definitionV2, layerHandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution)
+        const replica = yield* buildReplica(definitionV2, layerHandlersV2, serverSync(server), evolution)
 
         const result = yield* replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
           id: 48,
@@ -1811,11 +1811,11 @@ describe("client schema evolution", () => {
     "keeps the original recoverable when its replacement is quarantined by promotion",
     Effect.fnUntraced(
       function*() {
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const original = yield* v1.mutate(PutTodoV1, { id: "46", title: "original" })
-        yield* buildStore(definitionV2, RejectingHandlersV2, evolution)
-        yield* buildStore(definitionV2, HandlersV2, evolution)
-        const firstError = yield* buildReplica(definitionV2, HandlersV2, unavailableSync, evolution).pipe(
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        yield* buildStore(definitionV2, layerHandlersV2, evolution)
+        const firstError = yield* buildReplica(definitionV2, layerHandlersV2, unavailableSync, evolution).pipe(
           Effect.flatMap((replica) =>
             replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, {
               id: 46,
@@ -1827,7 +1827,7 @@ describe("client schema evolution", () => {
         )
         assert.isTrue(pipe(firstError, Schema.is(ReplicaError.ServerUnavailable)))
 
-        const v3 = yield* buildStore(definitionV3, RejectingHandlersV3, evolutionV3)
+        const v3 = yield* buildStore(definitionV3, layerRejectingHandlersV3, evolutionV3)
         const quarantined = yield* v3.quarantine
         assert.strictEqual(quarantined.length, 2)
         const replacement = quarantined.find(({ envelope }) => envelope.mutationId !== original.envelope.mutationId)
@@ -1855,8 +1855,8 @@ describe("client schema evolution", () => {
         )
         assert.isTrue(replacementQuarantineIsPresent)
 
-        const server = yield* buildServer(definitionV3, HandlersV3, evolutionV3)
-        const currentReplica = yield* buildReplica(definitionV3, HandlersV3, serverSync(server), evolutionV3)
+        const server = yield* buildServer(definitionV3, layerHandlersV3, evolutionV3)
+        const currentReplica = yield* buildReplica(definitionV3, layerHandlersV3, serverSync(server), evolutionV3)
         yield* currentReplica.discardQuarantined(original.envelope.mutationId)
         assert.deepStrictEqual(yield* currentReplica.quarantine, [])
         assert.deepStrictEqual(yield* v3.pending, [])
@@ -1872,11 +1872,11 @@ describe("client schema evolution", () => {
       function*() {
         const sql = yield* SqlClient.SqlClient
         const reactivity = yield* Reactivity.Reactivity
-        const v1 = yield* buildStore(definitionV1, HandlersV1)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const original = yield* v1.mutate(PutTodoV1, { id: "47", title: "atomic-invalidation" })
-        const v2 = yield* buildStore(definitionV2, RejectingHandlersV2, evolution)
+        const v2 = yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
         const item = Option.getOrThrow(yield* v2.quarantineByMutation(original.envelope.mutationId))
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution)
         const receipt = yield* server.discard({ envelope: item.envelope, schema: v2.schema }, null)
         let invalidations = 0
         const cancel = reactivity.registerUnsafe([
@@ -1902,7 +1902,7 @@ describe("client schema evolution", () => {
     "serves schemas inside the configured window across source schema evolution",
     Effect.fnUntraced(
       function*() {
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution, {
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, {
           acceptedSchemaVersions: 1,
           retainedHistoryEntries: 0
         })
@@ -1944,7 +1944,7 @@ describe("client schema evolution", () => {
         )
         assert.isFalse(page.hasMore)
 
-        const serverV3 = yield* buildServer(definitionV3, HandlersV3, evolutionV3, { acceptedSchemaVersions: 2 })
+        const serverV3 = yield* buildServer(definitionV3, layerHandlersV3, evolutionV3, { acceptedSchemaVersions: 2 })
         const replacement = yield* serverV3.pullAuthorized(pullRequest(definitionV1), "principal")
         if (!("_tag" in replacement)) assert.fail("expected a replacement bootstrap manifest")
         assert.notStrictEqual(replacement.manifest.snapshotId, required.manifest.snapshotId)
@@ -1974,7 +1974,7 @@ describe("client schema evolution", () => {
     "rejects a historical schema for a windowed watch",
     Effect.fnUntraced(
       function*() {
-        const server = yield* buildServer(definitionV2, HandlersV2, evolution, { acceptedSchemaVersions: 1 })
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 1 })
         const request = Protocol.WatchRequest.make({
           spaceId,
           clientId,
@@ -1999,7 +1999,7 @@ describe("client schema evolution", () => {
     "rejects an accepted schema window without complete downgrade transforms",
     Effect.fnUntraced(
       function*() {
-        const result = yield* buildServer(definitionV2, HandlersV2, forwardOnlyEvolution, {
+        const result = yield* buildServer(definitionV2, layerHandlersV2, forwardOnlyEvolution, {
           acceptedSchemaVersions: 1
         }).pipe(Effect.result)
         const error = expectFailure(result)
@@ -2015,7 +2015,7 @@ describe("client schema evolution", () => {
     "paginates pull by the projected wire representation",
     Effect.fnUntraced(
       function*() {
-        const server = yield* buildServer(expandedDefinitionV2, ExpandedHandlers, expandingEvolution, {
+        const server = yield* buildServer(expandedDefinitionV2, layerExpandedHandlers, expandingEvolution, {
           acceptedSchemaVersions: 1
         })
         for (let sequence = 1; sequence <= 2; sequence++) {
@@ -2070,7 +2070,7 @@ describe("client schema evolution", () => {
     "pages by the compact projected representation instead of source entity bytes",
     Effect.fnUntraced(
       function*() {
-        const server = yield* buildServer(largeDefinitionV2, LargeHandlers, compactingEvolution, {
+        const server = yield* buildServer(largeDefinitionV2, layerLargeHandlers, compactingEvolution, {
           acceptedSchemaVersions: 1
         })
         for (let sequence = 1; sequence <= 2; sequence++) {
@@ -2114,7 +2114,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const server = yield* buildServer(definitionV2, HandlersV2, collidingProjectionEvolution, {
+        const server = yield* buildServer(definitionV2, layerHandlersV2, collidingProjectionEvolution, {
           acceptedSchemaVersions: 1,
           retainedHistoryEntries: 0
         })
@@ -2164,7 +2164,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const serverV1 = yield* buildServer(definitionV1, HandlersV1)
+        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1)
         const submitted = yield* v1Envelope(
           clientId,
           Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000101"),
@@ -2215,7 +2215,7 @@ describe("client schema evolution", () => {
         WHERE space_id = ${spaceId} AND generation = ${progress.generation}`
         assert.strictEqual(copied[0].count, 1)
 
-        const serverV2 = yield* buildServer(definitionV2, HandlersV2, evolution)
+        const serverV2 = yield* buildServer(definitionV2, layerHandlersV2, evolution)
         yield* pipe(pullRequest(definitionV2), serverV2.pull)
         const LogRow = Schema.Struct({ entry_json: Schema.String })
         const log = yield* SqlSchema.findOne({
@@ -2241,7 +2241,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const serverV1 = yield* buildServer(definitionV1, HandlersV1)
+        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1)
         const scopedEnvelope = yield* v1Envelope(
           clientId,
           Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000221"),
@@ -2401,7 +2401,7 @@ describe("client schema evolution", () => {
         assert.strictEqual(scopedRows.count, 0)
 
         yield* SchemaEvolution.server({ definition: definitionV2, evolution, spaceId, batchSize: 1 })
-        const serverV2 = yield* buildServer(definitionV2, HandlersV2, evolution)
+        const serverV2 = yield* buildServer(definitionV2, layerHandlersV2, evolution)
         const replacementRequest = Protocol.PullRequest.make({
           spaceId,
           clientId,
@@ -2432,8 +2432,8 @@ describe("client schema evolution", () => {
         const prepared = yield* Deferred.make<void>()
         const resume = yield* Deferred.make<void>()
         const scopeAuthorizations = yield* Ref.make(0)
-        const RuntimeV1 = MutationRuntime.layer(definitionV1).pipe(Layer.provide(HandlersV1))
-        const ServerLayerV1 = ServerStore.layer({
+        const layerRuntimeV1 = MutationRuntime.layer(definitionV1).pipe(Layer.provide(layerHandlersV1))
+        const layerServerLayerV1 = ServerStore.layer({
           ...serverHistory,
           definition: definitionV1,
           schemaEvolutionBatchSize: 1,
@@ -2449,8 +2449,8 @@ describe("client schema evolution", () => {
             )
           }
         })
-        const serverV1 = yield* ServerLayerV1.pipe(
-          Layer.provide(RuntimeV1),
+        const serverV1 = yield* layerServerLayerV1.pipe(
+          Layer.provide(layerRuntimeV1),
           Layer.provide(persistentDatabase()),
           Layer.build,
           Effect.map(Context.get(ServerStore.ServerStore))
@@ -2501,7 +2501,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const serverV1 = yield* buildServer(definitionV1, HandlersV1)
+        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1)
         const secondClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
         const first = yield* v1Envelope(
           clientId,
@@ -2520,7 +2520,7 @@ describe("client schema evolution", () => {
         yield* sql`UPDATE effect_local_server_receipts SET source_schema_version = NULL,
         source_schema_hash = NULL, mutation_version = NULL, mutation_name = NULL`
 
-        const serverV2 = yield* buildServer(definitionV2, HandlersV2, evolution)
+        const serverV2 = yield* buildServer(definitionV2, layerHandlersV2, evolution)
         yield* pipe(pullRequest(definitionV2), serverV2.pull)
         const migrated = yield* sql<{
           readonly client_id: string
@@ -2612,7 +2612,7 @@ describe("client schema evolution", () => {
     "authorizes the migrated current mutation view",
     Effect.fnUntraced(
       function*() {
-        const serverV1 = yield* buildServer(definitionV1, HandlersV1)
+        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1)
         const historical = yield* v1Envelope(
           clientId,
           Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000104"),
@@ -2627,7 +2627,7 @@ describe("client schema evolution", () => {
           { id: "10", title: "authorized" }
         )
         const authorizedPayload = yield* Ref.make<Schema.Json>(null)
-        const Runtime = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(HandlersV2))
+        const layerRuntime = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(layerHandlersV2))
         const server = yield* ServerStore.layer({
           ...serverHistory,
           definition: definitionV2,
@@ -2636,7 +2636,7 @@ describe("client schema evolution", () => {
           authorizeMutation: ({ mutation }) => Ref.set(authorizedPayload, mutation.payload),
           authorizeRead: () => Effect.void
         }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.build,
           Effect.map(Context.get(ServerStore.ServerStore))
         )
@@ -2654,7 +2654,7 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const Runtime = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(HandlersV2))
+        const layerRuntime = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(layerHandlersV2))
         const server = yield* ServerStore.layer({
           ...serverHistory,
           definition: definitionV2,
@@ -2666,7 +2666,7 @@ describe("client schema evolution", () => {
             return pipe(ReadDeniedError.make({}), Effect.fail)
           }
         }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.build,
           Effect.map(Context.get(ServerStore.ServerStore))
         )
@@ -2696,13 +2696,13 @@ describe("client schema evolution", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const Runtime = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(HandlersV2))
+        const layerRuntime = MutationRuntime.layer(definitionV2, evolution).pipe(Layer.provide(layerHandlersV2))
         const server = yield* ServerStore.layerTrusted({
           ...serverHistory,
           definition: definitionV2,
           evolution
         }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.build,
           Effect.map(Context.get(ServerStore.ServerStore))
         )

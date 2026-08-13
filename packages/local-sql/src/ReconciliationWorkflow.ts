@@ -631,15 +631,15 @@ export const layer = (
   ReplicaError.ReplicaError,
   LocalStore.Store | SyncEngine.SyncEngine | WorkflowEngine.WorkflowEngine
 > => {
-  const OnePass = Reconciler.layerOnePass(options)
-  const ConfigurationLayer = layerRetryConfiguration(options)
-  const RegistrationLayer = layerRegistrationWithConfiguration(options).pipe(
-    Layer.provideMerge(OnePass),
-    Layer.provideMerge(ConfigurationLayer)
+  const layerOnePass = Reconciler.layerOnePass(options)
+  const layerConfiguration = layerRetryConfiguration(options)
+  const layerConfiguredRegistration = layerRegistrationWithConfiguration(options).pipe(
+    Layer.provideMerge(layerOnePass),
+    Layer.provideMerge(layerConfiguration)
   )
   return layerSchedulerWithConfiguration(options).pipe(
-    Layer.provideMerge(OnePass),
-    Layer.provideMerge(ConfigurationLayer),
-    Layer.provideMerge(RegistrationLayer)
+    Layer.provideMerge(layerOnePass),
+    Layer.provideMerge(layerConfiguration),
+    Layer.provideMerge(layerConfiguredRegistration)
   )
 }

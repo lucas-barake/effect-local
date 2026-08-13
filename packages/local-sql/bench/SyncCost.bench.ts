@@ -65,11 +65,11 @@ interface Environment {
 }
 
 const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
-  const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
-    (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
+  const layerDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
+    (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
   )
-  const MutationRuntimeLayer = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.Handlers))
-  const ServerLayer = ServerStore.layer({
+  const layerMutationRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
+  const layerServer = ServerStore.layer({
     definition: Domain.definition,
     wakeCapacity: 16,
     maximumWatchersPerSpace: 1_024,
@@ -92,8 +92,8 @@ const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
     authorizeAccess: () => Effect.void,
     authorizeMutation: () => Effect.void,
     authorizeRead: () => Effect.void
-  }).pipe(Layer.provide(MutationRuntimeLayer), Layer.provide(Database))
-  const RemoteLayer = Effect.gen(function*() {
+  }).pipe(Layer.provide(layerMutationRuntime), Layer.provide(layerDatabase))
+  const layerRemote = Effect.gen(function*() {
     const server = yield* ServerStore.ServerStore
     return SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
@@ -103,8 +103,8 @@ const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
       bootstrap: (request) => server.bootstrapAuthorized(request, "reader"),
       watch: (request) => server.watchAuthorized(request, "reader").pipe(Stream.unwrap)
     })
-  }).pipe(Layer.effect(SyncEngine.SyncEngine), Layer.provide(ServerLayer))
-  const LocalLayer = LocalStore.layer({
+  }).pipe(Layer.effect(SyncEngine.SyncEngine), Layer.provide(layerServer))
+  const layerLocal = LocalStore.layer({
     settlementCapacity: 64,
     retainedReceipts: 256,
     maximumReceipts: 1_000_000,
@@ -117,13 +117,13 @@ const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
     spaceId,
     clientId: readerId,
     scope
-  }).pipe(Layer.provide(MutationRuntimeLayer), Layer.provide(Database))
-  const ReconcilerLayer = Reconciler.layerOnePass({
+  }).pipe(Layer.provide(layerMutationRuntime), Layer.provide(layerDatabase))
+  const layerReconciler = Reconciler.layerOnePass({
     definition: Domain.definition,
     spaceId
-  }).pipe(Layer.provide(LocalLayer), Layer.provide(RemoteLayer))
+  }).pipe(Layer.provide(layerLocal), Layer.provide(layerRemote))
   return {
-    runtime: ManagedRuntime.make(Layer.mergeAll(LocalLayer, ReconcilerLayer, ServerLayer, Database)),
+    runtime: ManagedRuntime.make(Layer.mergeAll(layerLocal, layerReconciler, layerServer, layerDatabase)),
     nextSequence: 1
   }
 }

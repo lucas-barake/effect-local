@@ -81,7 +81,7 @@ Read this file before any work. Treat these rules as required for every package.
 - Express a configurable duration as `Duration.Input`, never as a bare number named with a unit suffix such as `Millis`. `Duration.Input` lets a consumer write `"30 seconds"`, `Duration.minutes(5)`, or a raw number, and it states the unit in the type instead of in the identifier.
 - Convert a configured duration once, with `Duration.toMillis`, at the point the Layer or service is constructed, and close over the result. Do not convert per call and do not thread `Duration.Input` into arithmetic.
 - A duration that crosses a wire protocol or is persisted stays a plain number with its unit in the name. `Duration` has no stable serialized encoding, so a protocol or column must name its unit.
-- Use `PascalCase` for Layer values, types, services, schemas, and error classes. Use `camelCase` for other values and for functions, including functions that return a Layer.
+- Name every stored `Layer.Layer` value `layer` or `layerX`, where `X` is a PascalCase descriptive suffix. A suffix form such as `testLayer` is invalid. Use `PascalCase` for types, services, schemas, and error classes. Use `camelCase` for other values and for functions, including functions that return a Layer.
 - Add an `Error` suffix when it improves clarity. Preserve established class names and serialized `_tag` values for public or protocol errors.
 - Name Layer values and constructors so their implementation, configuration, or lifecycle is clear.
 - Keep internal modules under `src/internal`. Export only deliberate consumer APIs from package entry points.

@@ -53,11 +53,11 @@ const database = () => {
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
     Reactivity.layer,
-    QueryReactivity.Layer
+    QueryReactivity.layer
   )
 }
 
-const Runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.Handlers))
+const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
 
 const definitionV2 = Definition.make({
   version: 2,
@@ -101,14 +101,14 @@ const serverHistory = {
   migration
 }
 
-const ServerLayer = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
-  Layer.provide(Runtime),
+const layerServer = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+  Layer.provide(layerRuntime),
   Layer.provide(database())
 )
 
 const serverLayerFor = (definition: Definition.Any) =>
   ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
-    Layer.provide(MutationRuntime.layer(definition).pipe(Layer.provide(Domain.Handlers))),
+    Layer.provide(MutationRuntime.layer(definition).pipe(Layer.provide(Domain.layerHandlers))),
     Layer.provide(database())
   )
 
@@ -129,9 +129,9 @@ describe("reconciliation workflow", () => {
   it.effect(
     "rejects a maximum retry delay below the initial delay",
     Effect.fnUntraced(function*() {
-      const serverContext = yield* Layer.build(ServerLayer)
+      const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
-      const Invalid = SqlReplica.layerWorkflow({
+      const layerInvalid = SqlReplica.layerWorkflow({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
@@ -139,12 +139,12 @@ describe("reconciliation workflow", () => {
         retryDelay: "2 seconds",
         maximumRetryDelay: "1 second"
       }).pipe(
-        Layer.provide(Domain.Handlers),
+        Layer.provide(Domain.layerHandlers),
         Layer.provideMerge(database()),
         Layer.provide(directSync(server)),
         Layer.provideMerge(WorkflowEngine.layerMemory)
       )
-      const result = yield* Layer.build(Invalid).pipe(Effect.exit)
+      const result = yield* Layer.build(layerInvalid).pipe(Effect.exit)
       const error = expectedFailure(result).pipe(Option.getOrThrow)
       assert.strictEqual(error._tag, "InvalidConfiguration")
       if (error._tag === "InvalidConfiguration") {
@@ -156,22 +156,22 @@ describe("reconciliation workflow", () => {
   it.effect(
     "runs finite generation keyed reconciliation over the durable SQLite outbox",
     Effect.fnUntraced(function*() {
-      const serverContext = yield* Layer.build(ServerLayer)
+      const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
-      const WorkflowEngineLayer = WorkflowEngine.layerMemory
-      const ReplicaLayer = SqlReplica.layerWorkflow({
+      const layerWorkflowEngine = WorkflowEngine.layerMemory
+      const layerReplica = SqlReplica.layerWorkflow({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId,
         retryDelay: "1 millis"
       }).pipe(
-        Layer.provide(Domain.Handlers),
+        Layer.provide(Domain.layerHandlers),
         Layer.provideMerge(database()),
         Layer.provide(directSync(server)),
-        Layer.provideMerge(WorkflowEngineLayer)
+        Layer.provideMerge(layerWorkflowEngine)
       )
-      const context = yield* Layer.build(ReplicaLayer)
+      const context = yield* Layer.build(layerReplica)
 
       const space = yield* Context.get(context, Replica.Replica).space(spaceId)
 
@@ -220,21 +220,21 @@ describe("reconciliation workflow", () => {
   it.effect(
     "rejects a workflow retained from a membership that was left and rejoined",
     Effect.fnUntraced(function*() {
-      const serverContext = yield* Layer.build(ServerLayer)
+      const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
-      const ReplicaLayer = SqlReplica.layerWorkflow({
+      const layerReplica = SqlReplica.layerWorkflow({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId,
         retryDelay: "1 millis"
       }).pipe(
-        Layer.provide(Domain.Handlers),
+        Layer.provide(Domain.layerHandlers),
         Layer.provide(database()),
         Layer.provide(directSync(server)),
         Layer.provideMerge(WorkflowEngine.layerMemory)
       )
-      const context = yield* Layer.build(ReplicaLayer)
+      const context = yield* Layer.build(layerReplica)
       const replica = Context.get(context, Replica.Replica)
       const original = yield* replica.space(spaceId)
       const mutation = yield* original.mutate(Domain.PutTodo, Domain.todo("retained-workflow"))
@@ -265,7 +265,7 @@ describe("reconciliation workflow", () => {
     Effect.fnUntraced(function*() {
       const pullEntered = yield* Deferred.make<void>()
       const pullInterrupted = yield* Deferred.make<void>()
-      const BlockedSync = pipe(
+      const layerBlockedSync = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
@@ -280,19 +280,19 @@ describe("reconciliation workflow", () => {
         }),
         Layer.succeed(SyncEngine.SyncEngine)
       )
-      const ReplicaLayer = SqlReplica.layerWorkflow({
+      const layerReplica = SqlReplica.layerWorkflow({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId,
         retryDelay: "1 millis"
       }).pipe(
-        Layer.provide(Domain.Handlers),
+        Layer.provide(Domain.layerHandlers),
         Layer.provide(database()),
-        Layer.provide(BlockedSync),
+        Layer.provide(layerBlockedSync),
         Layer.provideMerge(WorkflowEngine.layerMemory)
       )
-      const context = yield* Layer.build(ReplicaLayer)
+      const context = yield* Layer.build(layerReplica)
       const replica = Context.get(context, Replica.Replica)
       const space = yield* replica.space(spaceId)
       yield* Deferred.await(pullEntered)
@@ -311,7 +311,7 @@ describe("reconciliation workflow", () => {
       const watchSubscribed = yield* Deferred.make<void>()
       const releaseWatch = yield* Deferred.make<void>()
       const credentialWaitStarted = yield* Deferred.make<void>()
-      const Remote = pipe(
+      const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
@@ -335,7 +335,7 @@ describe("reconciliation workflow", () => {
         }),
         Layer.succeed(SyncEngine.SyncEngine)
       )
-      const ReplicaLayer = SqlReplica.layerWorkflow({
+      const layerReplica = SqlReplica.layerWorkflow({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
@@ -343,12 +343,12 @@ describe("reconciliation workflow", () => {
         retryDelay: "1 second",
         maximumRetryDelay: "1 second"
       }).pipe(
-        Layer.provide(Domain.Handlers),
+        Layer.provide(Domain.layerHandlers),
         Layer.provideMerge(database()),
-        Layer.provide(Remote),
+        Layer.provide(layerRemote),
         Layer.provideMerge(WorkflowEngine.layerMemory)
       )
-      const context = yield* Layer.build(ReplicaLayer)
+      const context = yield* Layer.build(layerReplica)
       const space = yield* Context.get(context, Replica.Replica).space(spaceId)
       yield* Deferred.await(watchSubscribed)
       yield* Deferred.await(credentialWaitStarted)
@@ -370,9 +370,9 @@ describe("reconciliation workflow", () => {
       const firstExecutionFinished = yield* Deferred.make<void>()
       const secondExecutionStarted = yield* Deferred.make<void>()
       const executions = yield* Ref.make(0)
-      const serverContext = yield* Layer.build(ServerLayer)
+      const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
-      const Remote = pipe(
+      const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
           discard: (request) => server.discard(request, null),
@@ -425,20 +425,20 @@ describe("reconciliation workflow", () => {
             )
         }
       })
-      const ObservedEngine = Layer.succeed(WorkflowEngine.WorkflowEngine, observedEngineService)
-      const ReplicaDatabase = database()
-      const ReplicaLayer = SqlReplica.layerWorkflow({
+      const layerObservedEngine = Layer.succeed(WorkflowEngine.WorkflowEngine, observedEngineService)
+      const layerReplicaDatabase = database()
+      const layerReplica = SqlReplica.layerWorkflow({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId
       }).pipe(
-        Layer.provide(Domain.Handlers),
-        Layer.provide(ReplicaDatabase),
-        Layer.provide(Remote),
-        Layer.provideMerge(ObservedEngine)
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(layerReplicaDatabase),
+        Layer.provide(layerRemote),
+        Layer.provideMerge(layerObservedEngine)
       )
-      const context = yield* Layer.merge(ReplicaLayer, ReplicaDatabase).pipe(Layer.build)
+      const context = yield* Layer.merge(layerReplica, layerReplicaDatabase).pipe(Layer.build)
       const space = yield* Context.get(context, Replica.Replica).space(spaceId)
       const reactivity = Context.get(context, Reactivity.Reactivity)
       const online = yield* reactivity.stream([`effect-local:space:${spaceId}:status`], space.status).pipe(
@@ -459,20 +459,20 @@ describe("reconciliation workflow", () => {
   it.effect(
     "rejects a workflow handle addressed to another replica",
     Effect.fnUntraced(function*() {
-      const serverContext = yield* Layer.build(ServerLayer)
+      const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
-      const ReplicaLayer = SqlReplica.layerWorkflow({
+      const layerReplica = SqlReplica.layerWorkflow({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId
       }).pipe(
-        Layer.provide(Domain.Handlers),
+        Layer.provide(Domain.layerHandlers),
         Layer.provide(database()),
         Layer.provide(directSync(server)),
         Layer.provideMerge(WorkflowEngine.layerMemory)
       )
-      const context = yield* Layer.build(ReplicaLayer)
+      const context = yield* Layer.build(layerReplica)
 
       const registered = yield* Context.get(context, Replica.Replica).space(spaceId)
       const pending = yield* registered.mutate(Domain.PutTodo, Domain.todo("identity"))
@@ -499,28 +499,28 @@ describe("reconciliation workflow", () => {
   it.effect(
     "runs with the SQL backed Cluster Workflow engine",
     Effect.fnUntraced(function*() {
-      const serverContext = yield* Layer.build(ServerLayer)
+      const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
 
-      const Runner = SingleRunner.layer({ runnerStorage: "sql" }).pipe(
+      const layerRunner = SingleRunner.layer({ runnerStorage: "sql" }).pipe(
         Layer.provide(database())
       )
-      const WorkflowEngineLayer = ClusterWorkflowEngine.layer.pipe(
-        Layer.provideMerge(Runner)
+      const layerWorkflowEngine = ClusterWorkflowEngine.layer.pipe(
+        Layer.provideMerge(layerRunner)
       )
-      const ReplicaLayer = SqlReplica.layerWorkflow({
+      const layerReplica = SqlReplica.layerWorkflow({
         ...clientHistory,
         definition: Domain.definition,
         spaceId,
         clientId,
         retryDelay: "1 millis"
       }).pipe(
-        Layer.provide(Domain.Handlers),
+        Layer.provide(Domain.layerHandlers),
         Layer.provide(database()),
         Layer.provide(directSync(server)),
-        Layer.provideMerge(WorkflowEngineLayer)
+        Layer.provideMerge(layerWorkflowEngine)
       )
-      const context = yield* Layer.build(ReplicaLayer)
+      const context = yield* Layer.build(layerReplica)
       const replica = Context.get(context, Replica.Replica)
       const space = yield* replica.space(spaceId)
 
@@ -548,19 +548,19 @@ describe("reconciliation workflow", () => {
     Effect.fnUntraced(function*() {
       const databaseContext = yield* database().pipe(Layer.build)
 
-      const SqlLayer = Layer.succeed(SqlClient.SqlClient, Context.get(databaseContext, SqlClient.SqlClient))
+      const layerSql = Layer.succeed(SqlClient.SqlClient, Context.get(databaseContext, SqlClient.SqlClient))
 
-      const CryptoLayer = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
+      const layerCrypto = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
 
-      const ReactivityLayer = Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity))
+      const layerReactivity = Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity))
 
-      const QueryReactivityLayer = Layer.succeed(
+      const layerQueryReactivity = Layer.succeed(
         QueryReactivity.QueryReactivity,
         Context.get(databaseContext, QueryReactivity.QueryReactivity)
       )
-      const ReplicaDatabase = Layer.mergeAll(SqlLayer, CryptoLayer, ReactivityLayer, QueryReactivityLayer)
-      const Runner = SingleRunner.layer({ runnerStorage: "sql" }).pipe(Layer.provide(ReplicaDatabase))
-      const engineContext = yield* ClusterWorkflowEngine.layer.pipe(Layer.provideMerge(Runner), Layer.build)
+      const layerReplicaDatabase = Layer.mergeAll(layerSql, layerCrypto, layerReactivity, layerQueryReactivity)
+      const layerRunner = SingleRunner.layer({ runnerStorage: "sql" }).pipe(Layer.provide(layerReplicaDatabase))
+      const engineContext = yield* ClusterWorkflowEngine.layer.pipe(Layer.provideMerge(layerRunner), Layer.build)
       const engine = Context.get(engineContext, WorkflowEngine.WorkflowEngine)
 
       const register = Effect.fnUntraced(function*(
@@ -573,8 +573,8 @@ describe("reconciliation workflow", () => {
           spaceId,
           clientId
         }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(ReplicaDatabase),
+          Layer.provide(layerRuntime),
+          Layer.provide(layerReplicaDatabase),
           Layer.build
         )
         const local = Context.get(localContext, LocalStore.Store)
@@ -715,7 +715,7 @@ describe("reconciliation workflow", () => {
       const secondClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
       const engineContext = yield* Layer.build(WorkflowEngine.layerMemory)
       const engine = Context.get(engineContext, WorkflowEngine.WorkflowEngine)
-      const serverContext = yield* Layer.build(ServerLayer)
+      const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
       const register = Effect.fnUntraced(function*(
         registeredClientId: Identity.ClientId,
@@ -728,7 +728,7 @@ describe("reconciliation workflow", () => {
           spaceId,
           clientId: registeredClientId
         }).pipe(
-          Layer.provide(Runtime),
+          Layer.provide(layerRuntime),
           Layer.provide(database()),
           Layer.build
         )
@@ -812,12 +812,12 @@ describe("reconciliation workflow", () => {
         spaceId,
         clientId
       }).pipe(
-        Layer.provide(Runtime),
+        Layer.provide(layerRuntime),
         Layer.provide(database()),
         Layer.build
       )
       const local = Context.get(localContext, LocalStore.Store)
-      const serverContext = yield* Layer.build(ServerLayer)
+      const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
@@ -892,7 +892,7 @@ describe("reconciliation workflow", () => {
         spaceId,
         clientId
       }).pipe(
-        Layer.provide(Runtime),
+        Layer.provide(layerRuntime),
         Layer.provide(database()),
         Layer.build
       )

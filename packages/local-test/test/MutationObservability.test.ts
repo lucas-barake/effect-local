@@ -52,11 +52,11 @@ const RejectTodo = Mutation.make("RejectTodo", {
 })
 
 const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo, RejectTodo] })
-const ClientHandlers = Layer.mergeAll(
+const layerClientHandlers = Layer.mergeAll(
   PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
   RejectTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload))
 )
-const ServerHandlers = PutTodo.toLayer(({ payload, transaction }) =>
+const layerServerHandlers = PutTodo.toLayer(({ payload, transaction }) =>
   transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
 ).pipe(
   (putTodo) =>
@@ -68,7 +68,7 @@ const ServerHandlers = PutTodo.toLayer(({ payload, transaction }) =>
       (rejectTodo) => Layer.mergeAll(putTodo, rejectTodo)
     )
 )
-const Runtime = MutationRuntime.layer(definition).pipe(Layer.provide(ServerHandlers))
+const layerRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(layerServerHandlers))
 
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } as const
 const clientHistory = {
@@ -107,7 +107,7 @@ const database = () =>
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
     Reactivity.layer,
-    QueryReactivity.Layer
+    QueryReactivity.layer
   )
 
 const service = <I, S, E extends { readonly _tag: string }, R,>(
@@ -119,14 +119,14 @@ const makeServices = Effect.gen(function*() {
   const server = yield* service(
     ServerStore.ServerStore,
     ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
-      Layer.provide(Runtime),
+      Layer.provide(layerRuntime),
       Layer.provide(database())
     )
   )
-  const faults = yield* service(FaultInjection.FaultInjection, FaultInjection.FaultInjectionLayer)
+  const faults = yield* service(FaultInjection.FaultInjection, FaultInjection.layer)
   const sync = yield* service(
     SyncEngine.SyncEngine,
-    TestServer.TestServerLayer.pipe(
+    TestServer.layer.pipe(
       Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
       Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults)),
       Layer.provide(NodeCrypto.layer)
@@ -141,7 +141,7 @@ const makeServices = Effect.gen(function*() {
       initialSpaces: [spaceId],
       retryDelay: "1 millis"
     }).pipe(
-      Layer.provide(ClientHandlers),
+      Layer.provide(layerClientHandlers),
       Layer.provide(database()),
       Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
     )

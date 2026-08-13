@@ -52,7 +52,7 @@
     "effect-local/noImplicitDefectConversion": "error",
     "effect-local/noManualEffectBoundary": "error",
     "effect-local/requireTaggedEffectError": "error",
-    "effect-local/requireLayerPascalCase": "error",
+    "effect-local/requireLayerName": "error",
     "effect-local/noServiceTagMap": "error"
   },
   "overrides": [
