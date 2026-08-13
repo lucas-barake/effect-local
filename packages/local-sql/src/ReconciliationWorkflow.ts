@@ -338,6 +338,79 @@ const handler = (
     return undefined
   })
 
+const register = Effect.fnUntraced(function*(
+  options: Options,
+  configuration: RetryConfigurationService,
+  engine: WorkflowEngine.WorkflowEngine["Service"],
+  registrationScope: Scope.Scope,
+  membershipIncarnation: Identity.MembershipIncarnation,
+  lease: RuntimeLeaseService
+) {
+  const evolution = options.evolution ?? Evolution.make({ current: options.definition })
+  const registrationState = workflowRegistrationState(engine)
+  const identity = {
+    ...options,
+    membershipIncarnation
+  }
+  const replicaKey = yield* replicaIdentityKey(identity)
+  const workflow = make({
+    schemaIdentity: schemaIdentityKey(options.definition),
+    spaceId: options.spaceId,
+    clientId: options.clientId,
+    membershipIncarnation
+  })
+  const workflowHandler = handler(
+    options,
+    configuration,
+    registrationState,
+    membershipIncarnation,
+    lease
+  )
+  yield* engine.register(workflow, workflowHandler).pipe(Scope.provide(registrationScope))
+  const registered = registrationState.schemas.get(replicaKey)
+  if (
+    registered !== undefined &&
+    registered.version === options.definition.schemaIdentity.version &&
+    registered.hash !== options.definition.schemaIdentity.hash
+  ) {
+    return yield* new ReplicaError.InvalidConfiguration({
+      option: "definition",
+      message: `Reconciliation workflow schema version ${registered.version} is already registered with another hash`
+    })
+  }
+  if (registered === undefined || registered.version < options.definition.schemaIdentity.version) {
+    registrationState.schemas.set(replicaKey, options.definition.schemaIdentity)
+  }
+  const legacySchemas = new Map<string, Definition.Any>()
+  for (const step of evolution.steps) {
+    legacySchemas.set(schemaIdentityKey(step.from), step.from)
+  }
+  for (const baseline of evolution.legacyBaselines) {
+    legacySchemas.set(schemaIdentityKey(baseline.definition), baseline.definition)
+  }
+  legacySchemas.delete(schemaIdentityKey(options.definition))
+  for (const [legacyIdentity, definition] of legacySchemas) {
+    yield* engine.register(
+      make({
+        schemaIdentity: legacyIdentity,
+        spaceId: options.spaceId,
+        clientId: options.clientId,
+        membershipIncarnation
+      }),
+      Effect.fnUntraced(function*() {
+        const current = registrationState.schemas.get(replicaKey) ?? options.definition.schemaIdentity
+        return yield* new ReplicaError.StaleSchema({
+          expectedVersion: current.version,
+          expectedHash: current.hash,
+          actualVersion: definition.schemaIdentity.version,
+          actualHash: definition.schemaIdentity.hash
+        })
+      })
+    ).pipe(Scope.provide(registrationScope))
+  }
+  return Registration.of({ registered: true })
+})
+
 const layerRegistrationWithConfiguration = (
   options: Options
 ): Layer.Layer<
@@ -355,76 +428,21 @@ const layerRegistrationWithConfiguration = (
       yield* Effect.serviceOption(RegistrationScope),
       () => currentScope
     )
-    const evolution = options.evolution ?? Evolution.make({ current: options.definition })
-    const registrationState = workflowRegistrationState(engine)
-    const identity = {
-      ...options,
-      membershipIncarnation: local.membershipIncarnation
-    }
-    const replicaKey = yield* replicaIdentityKey(identity)
-    const workflow = make({
-      schemaIdentity: schemaIdentityKey(options.definition),
-      spaceId: options.spaceId,
-      clientId: options.clientId,
-      membershipIncarnation: local.membershipIncarnation
-    })
     const lease = RuntimeLease.of({
-      acquire: Effect.acquireRelease(
-        Effect.succeed({ local, reconciliation }),
-        () => Effect.void
-      ),
+      acquire: Effect.succeed({ local, reconciliation }),
       admit: (effect) => effect
     })
-    const workflowHandler = handler(
-      options,
-      configuration,
-      registrationState,
-      local.membershipIncarnation,
-      lease
+    return Layer.succeed(
+      Registration,
+      yield* register(
+        options,
+        configuration,
+        engine,
+        registrationScope,
+        local.membershipIncarnation,
+        lease
+      )
     )
-    yield* engine.register(workflow, workflowHandler).pipe(Scope.provide(registrationScope))
-    const registered = registrationState.schemas.get(replicaKey)
-    if (
-      registered !== undefined &&
-      registered.version === options.definition.schemaIdentity.version &&
-      registered.hash !== options.definition.schemaIdentity.hash
-    ) {
-      return yield* new ReplicaError.InvalidConfiguration({
-        option: "definition",
-        message: `Reconciliation workflow schema version ${registered.version} is already registered with another hash`
-      })
-    }
-    if (registered === undefined || registered.version < options.definition.schemaIdentity.version) {
-      registrationState.schemas.set(replicaKey, options.definition.schemaIdentity)
-    }
-    const legacySchemas = new Map<string, Definition.Any>()
-    for (const step of evolution.steps) {
-      legacySchemas.set(schemaIdentityKey(step.from), step.from)
-    }
-    for (const baseline of evolution.legacyBaselines) {
-      legacySchemas.set(schemaIdentityKey(baseline.definition), baseline.definition)
-    }
-    legacySchemas.delete(schemaIdentityKey(options.definition))
-    for (const [legacyIdentity, definition] of legacySchemas) {
-      yield* engine.register(
-        make({
-          schemaIdentity: legacyIdentity,
-          spaceId: options.spaceId,
-          clientId: options.clientId,
-          membershipIncarnation: local.membershipIncarnation
-        }),
-        Effect.fnUntraced(function*() {
-          const current = registrationState.schemas.get(replicaKey) ?? options.definition.schemaIdentity
-          return yield* new ReplicaError.StaleSchema({
-            expectedVersion: current.version,
-            expectedHash: current.hash,
-            actualVersion: definition.schemaIdentity.version,
-            actualHash: definition.schemaIdentity.hash
-          })
-        })
-      ).pipe(Scope.provide(registrationScope))
-    }
-    return pipe(Registration.of({ registered: true }), Layer.succeed(Registration))
   }))
 
 export const layerRegistration = (options: Options) => {
@@ -451,65 +469,17 @@ const layerDetachedRegistrationWithConfiguration = (
       yield* Effect.serviceOption(RegistrationScope),
       () => currentScope
     )
-    const evolution = options.evolution ?? Evolution.make({ current: options.definition })
-    const registrationState = workflowRegistrationState(engine)
-    const replicaKey = yield* replicaIdentityKey(options)
-    const workflow = make({
-      schemaIdentity: schemaIdentityKey(options.definition),
-      spaceId: options.spaceId,
-      clientId: options.clientId,
-      membershipIncarnation: options.membershipIncarnation
-    })
-    yield* engine.register(
-      workflow,
-      handler(
+    return Layer.succeed(
+      Registration,
+      yield* register(
         options,
         configuration,
-        registrationState,
+        engine,
+        registrationScope,
         options.membershipIncarnation,
         lease
       )
-    ).pipe(Scope.provide(registrationScope))
-    const registered = registrationState.schemas.get(replicaKey)
-    if (
-      registered !== undefined &&
-      registered.version === options.definition.schemaIdentity.version &&
-      registered.hash !== options.definition.schemaIdentity.hash
-    ) {
-      return yield* new ReplicaError.InvalidConfiguration({
-        option: "definition",
-        message: `Reconciliation workflow schema version ${registered.version} is already registered with another hash`
-      })
-    }
-    if (registered === undefined || registered.version < options.definition.schemaIdentity.version) {
-      registrationState.schemas.set(replicaKey, options.definition.schemaIdentity)
-    }
-    const legacySchemas = new Map<string, Definition.Any>()
-    for (const step of evolution.steps) legacySchemas.set(schemaIdentityKey(step.from), step.from)
-    for (const baseline of evolution.legacyBaselines) {
-      legacySchemas.set(schemaIdentityKey(baseline.definition), baseline.definition)
-    }
-    legacySchemas.delete(schemaIdentityKey(options.definition))
-    for (const [legacyIdentity, definition] of legacySchemas) {
-      yield* engine.register(
-        make({
-          schemaIdentity: legacyIdentity,
-          spaceId: options.spaceId,
-          clientId: options.clientId,
-          membershipIncarnation: options.membershipIncarnation
-        }),
-        Effect.fnUntraced(function*() {
-          const current = registrationState.schemas.get(replicaKey) ?? options.definition.schemaIdentity
-          return yield* new ReplicaError.StaleSchema({
-            expectedVersion: current.version,
-            expectedHash: current.hash,
-            actualVersion: definition.schemaIdentity.version,
-            actualHash: definition.schemaIdentity.hash
-          })
-        })
-      ).pipe(Scope.provide(registrationScope))
-    }
-    return Layer.succeed(Registration, { registered: true })
+    )
   }))
 
 export const layerDetachedRegistration = (options: DetachedRegistrationOptions) =>

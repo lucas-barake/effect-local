@@ -79,7 +79,6 @@ type BaseRequirements<D extends Definition.Any,> =
   | QueryExecutor.Handlers<D>
 
 interface ActiveRuntime {
-  readonly generation: number
   readonly foreground: boolean
   readonly scope: Scope.Closeable
   readonly operationGate: Semaphore.Semaphore
@@ -92,7 +91,6 @@ interface ActiveRuntime {
 
 interface RememberedEntry {
   readonly spaceId: Identity.SpaceId
-  readonly generation: number
   handle: Replica.Space
   replicationScope: Protocol.ReplicationScope
   activation: Replica.Activation
@@ -519,7 +517,6 @@ const makeLayer = <D extends Definition.Any, R,>(
           }
           const operationGate = yield* Semaphore.make(1)
           return {
-            generation,
             foreground,
             scope: childScope,
             operationGate,
@@ -998,7 +995,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         let handle: Replica.Space | undefined
         const entry: RememberedEntry = {
           spaceId: row.space_id,
-          generation: ++nextGeneration,
           get handle() {
             if (handle === undefined) handle = makeHandle(entry)
             return handle

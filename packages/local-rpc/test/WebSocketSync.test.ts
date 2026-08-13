@@ -163,7 +163,6 @@ const entityOptions = {
 } satisfies SpaceEntity.HandlerOptions
 const clientHistory = {
   defaultScope: scope,
-  scope: scope,
   maximumActiveSpaces: 4,
   foregroundActiveSpaces: 2,
   retainedReceipts: 256,
@@ -780,7 +779,6 @@ describe("WebSocket synchronization", () => {
           definition,
           evolution,
           clientId,
-          defaultScope: scope,
           initialSpaces: [spaceId, secondSpaceId],
           retryDelay: "1 millis"
         }).pipe(
