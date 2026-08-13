@@ -23,7 +23,7 @@ export const runStream = <A,>(
   self: Service,
   execute: (version: Protocol.ProtocolVersion) => Stream.Stream<A, ReplicaError.ReplicaError>
 ) =>
-  Stream.unwrap(self.version.pipe(
+  self.version.pipe(
     Effect.map((version) =>
       execute(version).pipe(
         Stream.catchTag(
@@ -31,5 +31,6 @@ export const runStream = <A,>(
           () => Stream.unwrap(self.rejected(version).pipe(Effect.map(execute)))
         )
       )
-    )
-  ))
+    ),
+    Stream.unwrap
+  )

@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Effect from "effect/Effect"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Canonical from "../src/Canonical.js"
 import * as Definition from "../src/Definition.js"
@@ -19,19 +20,24 @@ const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, suc
 const ListTodos = Query.make("ListTodos", { success: Schema.Array(Todo.schema) })
 
 describe("domain contracts", () => {
-  it("uses JSON null as the wire representation for void payloads and results", () => {
-    const mutation = Mutation.make("Touch", { version: 1 })
-    const query = Query.make("Count", {})
-    assert.strictEqual(Schema.encodeSync(mutation.payloadSchema)(undefined), null)
-    assert.strictEqual(Schema.decodeUnknownSync(mutation.successSchema)(null), undefined)
-    assert.strictEqual(Schema.encodeSync(query.payloadSchema)(undefined), null)
-  })
+  it.effect("uses JSON null as the wire representation for void payloads and results", () =>
+    Effect.gen(function*() {
+      const mutation = Mutation.make("Touch", { version: 1 })
+      const query = Query.make("Count", {})
+      const encodedPayload = yield* Schema.encodeEffect(mutation.payloadSchema)(undefined)
+      const decodedSuccess = yield* Schema.decodeUnknownEffect(mutation.successSchema)(null)
+      const encodedQuery = yield* Schema.encodeEffect(query.payloadSchema)(undefined)
+      assert.strictEqual(encodedPayload, null)
+      assert.strictEqual(decodedSuccess, undefined)
+      assert.strictEqual(encodedQuery, null)
+    }))
 
   it("builds a stable definition hash from Schema contracts", () => {
     const first = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
     const second = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
     assert.strictEqual(first.hash, second.hash)
-    assert.strictEqual(first.modelByName.get("Todo"), Todo)
+    const storedTodo = first.modelByName.get("Todo")
+    assert.strictEqual(storedTodo, Todo)
   })
 
   it("keeps local secondary index layouts outside wire and domain identity", () => {
@@ -57,8 +63,10 @@ describe("domain contracts", () => {
     assert.deepStrictEqual(indexed.schemaIdentity, plain.schemaIdentity)
     assert.strictEqual(indexed.hash, plain.hash)
     assert.notStrictEqual(indexed.indexLayoutHash, plain.indexLayoutHash)
-    assert.isTrue(Object.isFrozen(IndexedTodo.indexes))
-    assert.isTrue(Object.isFrozen(IndexedTodo.indexes.byTitle.sort))
+    const indexesFrozen = Object.isFrozen(IndexedTodo.indexes)
+    const sortFrozen = Object.isFrozen(IndexedTodo.indexes.byTitle.sort)
+    assert.isTrue(indexesFrozen)
+    assert.isTrue(sortFrozen)
   })
 
   it("validates secondary index and component names", () => {
@@ -134,41 +142,51 @@ describe("domain contracts", () => {
 
   it.effect("deduplicates grow only set values by canonical identity", () =>
     Effect.gen(function*() {
-      const semantics = Field.growOnlySet(Schema.Struct({ id: Schema.String, value: Schema.Number }))
+      const semantics = Schema.Struct({ id: Schema.String, value: Schema.Number }).pipe(Field.growOnlySet)
       assert.deepStrictEqual(
         yield* semantics.apply([{ id: "a", value: 1 }], { _tag: "Add", value: { value: 1, id: "a" } }),
         [{ id: "a", value: 1 }]
       )
     }))
 
-  it("canonicalizes object order and enforces protocol page limits", () => {
-    assert.strictEqual(Canonical.stringify({ b: 2, a: 1 }), Canonical.stringify({ a: 1, b: 2 }))
-    assert.throws(
-      () =>
-        Schema.decodeUnknownSync(Protocol.PullRequest)({
-          spaceId: "spc_00000000-0000-4000-8000-000000000001",
-          clientId: "cli_00000000-0000-4000-8000-000000000001",
-          schema: { version: 1, hash: "0123456789abcdef" },
-          scope: { models: ["Todo"] },
-          scopeGeneration: 1,
-          cursor: null,
-          limit: Protocol.maximumBatchEntries + 1
-        }),
-      /less than or equal to 1000/
-    )
-  })
+  it.effect("canonicalizes object order and enforces protocol page limits", () =>
+    Effect.gen(function*() {
+      const unordered = Canonical.stringify({ b: 2, a: 1 })
+      const ordered = Canonical.stringify({ a: 1, b: 2 })
+      assert.strictEqual(unordered, ordered)
+      const result = yield* Schema.decodeUnknownEffect(Protocol.PullRequest)({
+        spaceId: "spc_00000000-0000-4000-8000-000000000001",
+        clientId: "cli_00000000-0000-4000-8000-000000000001",
+        schema: { version: 1, hash: "0123456789abcdef" },
+        scope: { models: ["Todo"] },
+        scopeGeneration: 1,
+        cursor: null,
+        limit: Protocol.maximumBatchEntries + 1
+      }).pipe(Effect.result)
+      assert.strictEqual(result._tag, "Failure")
+      if (Result.isFailure(result)) {
+        const message = String(result.failure)
+        assert.match(message, /less than or equal to 1000/)
+      }
+    }))
 
-  it("decodes and normalizes a model replication scope", () => {
-    const decoded = Schema.decodeUnknownSync(Protocol.ReplicationScope)({ models: ["Todo", "Other"] })
-    assert.deepStrictEqual(decoded, { models: ["Todo", "Other"] })
-    assert.deepStrictEqual(Protocol.normalizeReplicationScope({ models: ["Todo", "Other"] }), {
-      models: ["Other", "Todo"]
-    })
-    assert.throws(
-      () => Schema.decodeUnknownSync(Protocol.ReplicationScope)({ models: ["Todo", "Todo"] }),
-      /unique/i
-    )
-  })
+  it.effect("decodes and normalizes a model replication scope", () =>
+    Effect.gen(function*() {
+      const decoded = yield* Schema.decodeUnknownEffect(Protocol.ReplicationScope)({ models: ["Todo", "Other"] })
+      const normalized = Protocol.normalizeReplicationScope({ models: ["Todo", "Other"] })
+      assert.deepStrictEqual(decoded, { models: ["Todo", "Other"] })
+      assert.deepStrictEqual(normalized, {
+        models: ["Other", "Todo"]
+      })
+      const result = yield* Schema.decodeUnknownEffect(Protocol.ReplicationScope)({
+        models: ["Todo", "Todo"]
+      }).pipe(Effect.result)
+      assert.strictEqual(result._tag, "Failure")
+      if (Result.isFailure(result)) {
+        const message = String(result.failure)
+        assert.match(message, /unique/i)
+      }
+    }))
 
   it.effect("validates replication scope model names against the definition", () =>
     Effect.gen(function*() {
@@ -177,11 +195,12 @@ describe("domain contracts", () => {
         yield* Protocol.validateReplicationScope(definition, { models: ["Todo"] }),
         { models: ["Todo"] }
       )
-      const failure = yield* Effect.flip(
-        Protocol.validateReplicationScope(definition, { models: ["Missing"] })
-      )
-      assert.instanceOf(failure, ReplicaError.ProtocolInvalid)
-      assert.match(failure.message, /Unknown replication model: Missing/)
+      const result = yield* Protocol.validateReplicationScope(definition, { models: ["Missing"] }).pipe(Effect.result)
+      assert.strictEqual(result._tag, "Failure")
+      if (Result.isFailure(result)) {
+        assert.instanceOf(result.failure, ReplicaError.ProtocolInvalid)
+        assert.match(result.failure.message, /Unknown replication model: Missing/)
+      }
     }))
 
   it.effect("rejects duplicate replication window partition keys", () =>
@@ -259,7 +278,8 @@ describe("domain contracts", () => {
 
   it.effect("validates replication window values with the component codecs", () =>
     Effect.gen(function*() {
-      const NumericString = Schema.String.check(Schema.isPattern(/^\d+$/)).annotate({
+      const numericStringPattern = Schema.isPattern(/^\d+$/)
+      const NumericString = Schema.String.check(numericStringPattern).annotate({
         identifier: "NumericString"
       })
       const Indexed = Model.make("Indexed", {
@@ -343,30 +363,33 @@ describe("domain contracts", () => {
       if (invalid._tag === "Failure") assert.match(invalid.failure.message, /canonical encoding/)
     }))
 
-  it("bounds replication windows and partition overrides", () => {
-    const windows = Array.from({ length: 1_001 }, (_, index) => ({
-      model: `Model${index}`,
-      index: "byRank",
-      count: 1
+  it.effect("bounds replication windows and partition overrides", () =>
+    Effect.gen(function*() {
+      const windows = Array.from({ length: 1_001 }, (_, index) => ({
+        model: `Model${index}`,
+        index: "byRank",
+        count: 1
+      }))
+      const windowsResult = yield* Schema.decodeUnknownEffect(Protocol.ReplicationScope)({
+        models: [],
+        windows
+      }).pipe(Effect.result)
+      assert.strictEqual(windowsResult._tag, "Failure")
+      if (Result.isFailure(windowsResult)) assert.match(windowsResult.failure.message, /length/i)
+
+      const partitions = Array.from({ length: 1_001 }, (_, index) => ({ key: [`group-${index}`] }))
+      const partitionsResult = yield* Schema.decodeUnknownEffect(Protocol.ReplicationScope)({
+        models: [],
+        windows: [{
+          model: "Indexed",
+          index: "byGroup",
+          count: 1,
+          partitions
+        }]
+      }).pipe(Effect.result)
+      assert.strictEqual(partitionsResult._tag, "Failure")
+      if (Result.isFailure(partitionsResult)) assert.match(partitionsResult.failure.message, /length/i)
     }))
-    assert.throws(
-      () => Schema.decodeUnknownSync(Protocol.ReplicationScope)({ models: [], windows }),
-      /length/i
-    )
-    assert.throws(
-      () =>
-        Schema.decodeUnknownSync(Protocol.ReplicationScope)({
-          models: [],
-          windows: [{
-            model: "Indexed",
-            index: "byGroup",
-            count: 1,
-            partitions: Array.from({ length: 1_001 }, (_, index) => ({ key: [`group-${index}`] }))
-          }]
-        }),
-      /length/i
-    )
-  })
 
   it.effect("rejects replication scopes larger than the encoded byte limit", () =>
     Effect.gen(function*() {
@@ -406,30 +429,30 @@ describe("domain contracts", () => {
       if (result._tag === "Failure") assert.match(result.failure.message, /encoded bytes/)
     }))
 
-  it("round trips scoped replication protocol values", () => {
-    const spaceId = "spc_00000000-0000-4000-8000-000000000001"
-    const clientId = "cli_00000000-0000-4000-8000-000000000002"
-    const viewId = "viw_00000000-0000-4000-8000-000000000003"
-    const schema = { version: 1, hash: "0000000000000000" }
-    const scope = { models: ["Todo"] }
-    const cursor = { viewId, revision: 0 }
+  it.effect("round trips scoped replication protocol values", () =>
+    Effect.gen(function*() {
+      const spaceId = "spc_00000000-0000-4000-8000-000000000001"
+      const clientId = "cli_00000000-0000-4000-8000-000000000002"
+      const viewId = "viw_00000000-0000-4000-8000-000000000003"
+      const schema = { version: 1, hash: "0000000000000000" }
+      const scope = { models: ["Todo"] }
+      const cursor = { viewId, revision: 0 }
 
-    const pull = Schema.decodeUnknownSync(Protocol.PullRequest)({
-      spaceId,
-      clientId,
-      schema,
-      scope,
-      scopeGeneration: 1,
-      cursor,
-      limit: 10
-    })
-    assert.strictEqual(pull.spaceId, spaceId)
-    assert.strictEqual(pull.clientId, clientId)
-    assert.deepStrictEqual(pull.scope.models, ["Todo"])
-    assert.strictEqual(pull.scopeGeneration, 1)
-    assert.strictEqual(pull.cursor?.viewId, viewId)
-    assert.deepStrictEqual(
-      Schema.decodeUnknownSync(Protocol.BootstrapRequest)({
+      const pull = yield* Schema.decodeUnknownEffect(Protocol.PullRequest)({
+        spaceId,
+        clientId,
+        schema,
+        scope,
+        scopeGeneration: 1,
+        cursor,
+        limit: 10
+      })
+      assert.strictEqual(pull.spaceId, spaceId)
+      assert.strictEqual(pull.clientId, clientId)
+      assert.deepStrictEqual(pull.scope.models, ["Todo"])
+      assert.strictEqual(pull.scopeGeneration, 1)
+      assert.strictEqual(pull.cursor?.viewId, viewId)
+      const bootstrap = yield* Schema.decodeUnknownEffect(Protocol.BootstrapRequest)({
         spaceId,
         clientId,
         schema,
@@ -439,22 +462,18 @@ describe("domain contracts", () => {
         snapshotId: "snp_00000000-0000-4000-8000-000000000004",
         afterOrdinal: -1,
         limit: 10
-      }).cursor,
-      cursor
-    )
-    assert.deepStrictEqual(
-      Schema.decodeUnknownSync(Protocol.WatchRequest)({
+      })
+      assert.deepStrictEqual(bootstrap.cursor, cursor)
+      const watch = yield* Schema.decodeUnknownEffect(Protocol.WatchRequest)({
         spaceId,
         clientId,
         schema,
         scope,
         scopeGeneration: 1,
         cursor
-      }).cursor,
-      cursor
-    )
-    assert.throws(() =>
-      Schema.decodeUnknownSync(Protocol.PullRequest)({
+      })
+      assert.deepStrictEqual(watch.cursor, cursor)
+      const invalid = yield* Schema.decodeUnknownEffect(Protocol.PullRequest)({
         spaceId,
         clientId,
         schema,
@@ -462,110 +481,120 @@ describe("domain contracts", () => {
         scopeGeneration: -1,
         cursor: { viewId, revision: -1 },
         limit: 10
-      })
-    )
-  })
+      }).pipe(Effect.result)
+      assert.strictEqual(invalid._tag, "Failure")
+    }))
 
-  it("represents revocation separately from authoritative deletion", () => {
-    const entity = { model: "Todo", modelVersion: 1, key: "a" }
-    const change = Schema.decodeUnknownSync(Protocol.ViewChange)({ _tag: "Retract", entity })
-    assert.strictEqual(change._tag, "Retract")
-    assert.deepStrictEqual(change.entity.key, "a")
-  })
+  it.effect("represents revocation separately from authoritative deletion", () =>
+    Effect.gen(function*() {
+      const entity = { model: "Todo", modelVersion: 1, key: "a" }
+      const change = yield* Schema.decodeUnknownEffect(Protocol.ViewChange)({ _tag: "Retract", entity })
+      assert.strictEqual(change._tag, "Retract")
+      assert.deepStrictEqual(change.entity.key, "a")
+    }))
 
-  it("accepts only the current mutation protocol with explicit membership", () => {
-    const current = {
-      spaceId: "spc_00000000-0000-4000-8000-000000000001",
-      clientId: "cli_00000000-0000-4000-8000-000000000001",
-      membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
-      mutationId: "mut_00000000-0000-4000-8000-000000000001",
-      localSequence: 1,
-      basis: 0,
-      name: "PutTodo",
-      payload: { id: "1", title: "current" },
-      digestVersion: 3,
-      sourceSchema: { version: 1, hash: "1111111111111111" },
-      mutationVersion: 1,
-      digest: "1".repeat(64)
-    }
-    assert.deepStrictEqual(Schema.decodeUnknownSync(Protocol.MutationEnvelope)(current).digestVersion, 3)
-    assert.throws(() => Schema.decodeUnknownSync(Protocol.MutationEnvelope)({ ...current, digestVersion: 2 }))
-    assert.throws(() =>
-      Schema.decodeUnknownSync(Protocol.MutationEnvelope)({ ...current, membershipIncarnation: undefined })
-    )
-  })
+  it.effect("accepts only the current mutation protocol with explicit membership", () =>
+    Effect.gen(function*() {
+      const current = {
+        spaceId: "spc_00000000-0000-4000-8000-000000000001",
+        clientId: "cli_00000000-0000-4000-8000-000000000001",
+        membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
+        mutationId: "mut_00000000-0000-4000-8000-000000000001",
+        localSequence: 1,
+        basis: 0,
+        name: "PutTodo",
+        payload: { id: "1", title: "current" },
+        digestVersion: 3,
+        sourceSchema: { version: 1, hash: "1111111111111111" },
+        mutationVersion: 1,
+        digest: "1".repeat(64)
+      }
+      const envelope = yield* Schema.decodeUnknownEffect(Protocol.MutationEnvelope)(current)
+      assert.deepStrictEqual(envelope.digestVersion, 3)
+      const oldDigestVersion = yield* Schema.decodeUnknownEffect(Protocol.MutationEnvelope)({
+        ...current,
+        digestVersion: 2
+      }).pipe(Effect.result)
+      assert.strictEqual(oldDigestVersion._tag, "Failure")
+      const missingMembership = yield* Schema.decodeUnknownEffect(Protocol.MutationEnvelope)({
+        ...current,
+        membershipIncarnation: undefined
+      }).pipe(Effect.result)
+      assert.strictEqual(missingMembership._tag, "Failure")
+    }))
 
-  it("requires a negotiated protocol version on every operation payload", () => {
-    const spaceId = "spc_00000000-0000-4000-8000-000000000001"
-    const schema = Definition.make({ version: 1, models: [], mutations: [] }).schemaIdentity
-    const envelope = {
-      spaceId,
-      clientId: "cli_00000000-0000-4000-8000-000000000001",
-      membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
-      mutationId: "mut_00000000-0000-4000-8000-000000000001",
-      localSequence: 1,
-      basis: 0,
-      name: "Put",
-      payload: null,
-      digestVersion: 3,
-      sourceSchema: schema,
-      mutationVersion: 1,
-      digest: "0".repeat(64)
-    }
-    const scope = { models: [] }
-    const scopeGeneration = 1
-    const cursor = null
-    const operations = [
-      [Protocol.VersionedSubmitRequest, { envelope, schema }],
-      [Protocol.VersionedDiscardRequest, { envelope, schema }],
-      [Protocol.VersionedPullRequest, {
+  it.effect("requires a negotiated protocol version on every operation payload", () =>
+    Effect.gen(function*() {
+      const spaceId = "spc_00000000-0000-4000-8000-000000000001"
+      const schema = Definition.make({ version: 1, models: [], mutations: [] }).schemaIdentity
+      const envelope = {
         spaceId,
-        clientId: envelope.clientId,
-        schema,
-        scope,
-        scopeGeneration,
-        cursor,
-        limit: 1
-      }],
-      [Protocol.VersionedWatchRequest, {
-        spaceId,
-        clientId: envelope.clientId,
-        schema,
-        scope,
-        scopeGeneration,
-        cursor
-      }],
-      [Protocol.VersionedBootstrapRequest, {
-        spaceId,
-        clientId: envelope.clientId,
-        schema,
-        scope,
-        scopeGeneration,
-        cursor: {
-          viewId: "viw_00000000-0000-4000-8000-000000000001",
-          revision: 0
-        },
-        snapshotId: "snp_00000000-0000-4000-8000-000000000001",
-        afterOrdinal: -1,
-        limit: 1
-      }],
-      [Protocol.VersionedPresenceUpdate, {
-        spaceId,
-        clientId: envelope.clientId,
-        value: null,
-        ttlMillis: 1
-      }],
-      [Protocol.VersionedWatchPresenceRequest, { spaceId }]
-    ] as const
+        clientId: "cli_00000000-0000-4000-8000-000000000001",
+        membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
+        mutationId: "mut_00000000-0000-4000-8000-000000000001",
+        localSequence: 1,
+        basis: 0,
+        name: "Put",
+        payload: null,
+        digestVersion: 3,
+        sourceSchema: schema,
+        mutationVersion: 1,
+        digest: "0".repeat(64)
+      }
+      const scope = { models: [] }
+      const scopeGeneration = 1
+      const cursor = null
+      const operations = [
+        [Protocol.VersionedSubmitRequest, { envelope, schema }],
+        [Protocol.VersionedDiscardRequest, { envelope, schema }],
+        [Protocol.VersionedPullRequest, {
+          spaceId,
+          clientId: envelope.clientId,
+          schema,
+          scope,
+          scopeGeneration,
+          cursor,
+          limit: 1
+        }],
+        [Protocol.VersionedWatchRequest, {
+          spaceId,
+          clientId: envelope.clientId,
+          schema,
+          scope,
+          scopeGeneration,
+          cursor
+        }],
+        [Protocol.VersionedBootstrapRequest, {
+          spaceId,
+          clientId: envelope.clientId,
+          schema,
+          scope,
+          scopeGeneration,
+          cursor: {
+            viewId: "viw_00000000-0000-4000-8000-000000000001",
+            revision: 0
+          },
+          snapshotId: "snp_00000000-0000-4000-8000-000000000001",
+          afterOrdinal: -1,
+          limit: 1
+        }],
+        [Protocol.VersionedPresenceUpdate, {
+          spaceId,
+          clientId: envelope.clientId,
+          value: null,
+          ttlMillis: 1
+        }],
+        [Protocol.VersionedWatchPresenceRequest, { spaceId }]
+      ] as const
 
-    for (const [contract, operation] of operations) {
-      assert.throws(() => Schema.decodeUnknownSync(contract)(operation))
-      assert.doesNotThrow(() =>
-        Schema.decodeUnknownSync(contract)({
+      for (const [contract, operation] of operations) {
+        const decode = Schema.decodeUnknownEffect(contract)
+        const missingVersion = yield* decode(operation).pipe(Effect.result)
+        assert.strictEqual(missingVersion._tag, "Failure")
+        yield* decode({
           ...operation,
           protocolVersion: Protocol.currentProtocolVersion
         })
-      )
-    }
-  })
+      }
+    }))
 })

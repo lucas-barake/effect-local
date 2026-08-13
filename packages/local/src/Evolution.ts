@@ -111,7 +111,10 @@ const assertStableId = (kind: string, id: string): void => {
   }
 }
 
-const descriptor = (schema: Schema.Top): string => Canonical.stringify(SchemaDescriptor.make(schema))
+const descriptor = (schema: Schema.Top): string => {
+  const schemaDescriptor = SchemaDescriptor.make(schema)
+  return Canonical.stringify(schemaDescriptor)
+}
 
 const sameSchema = (left: Schema.Top, right: Schema.Top): boolean => descriptor(left) === descriptor(right)
 
@@ -353,30 +356,31 @@ export const step = (options: {
   const mutations = indexedMigrations("mutation", options.mutations ?? [])
   validateModelChanges(options.from, options.to, models)
   validateMutationChanges(options.from, options.to, mutations)
+  const hash = Canonical.hash({
+    format: 1,
+    id: options.id,
+    from: options.from.schemaIdentity,
+    to: options.to.schemaIdentity,
+    models: [...models.values()].map((entry) => ({
+      id: entry.id,
+      name: entry.from.name,
+      from: entry.from.version,
+      to: entry.to.version
+    })).toSorted(byName),
+    mutations: [...mutations.values()].map((entry) => ({
+      id: entry.id,
+      name: entry.from.name,
+      from: entry.from.version,
+      to: entry.to.version
+    })).toSorted(byName)
+  })
   return Object.freeze({
     id: options.id,
     from: options.from,
     to: options.to,
     models,
     mutations,
-    hash: Identity.SchemaHash.make(Canonical.hash({
-      format: 1,
-      id: options.id,
-      from: options.from.schemaIdentity,
-      to: options.to.schemaIdentity,
-      models: Array.from(models.values()).map((entry) => ({
-        id: entry.id,
-        name: entry.from.name,
-        from: entry.from.version,
-        to: entry.to.version
-      })).toSorted(byName),
-      mutations: Array.from(mutations.values()).map((entry) => ({
-        id: entry.id,
-        name: entry.from.name,
-        from: entry.from.version,
-        to: entry.to.version
-      })).toSorted(byName)
-    }))
+    hash: Identity.SchemaHash.make(hash)
   })
 }
 
@@ -421,7 +425,8 @@ export const make = (options: {
       return Defect.invalid(`Duplicate schema evolution source identity: ${sourceKey}`)
     }
     stepBySourceIdentity.set(sourceKey, entry)
-    stepByTargetIdentity.set(identityKey(entry.to.schemaIdentity), entry)
+    const targetIdentityKey = identityKey(entry.to.schemaIdentity)
+    stepByTargetIdentity.set(targetIdentityKey, entry)
     addDefinition(entry.from)
     addDefinition(entry.to)
     for (const migration of [...entry.models.values(), ...entry.mutations.values()]) {
@@ -447,26 +452,28 @@ export const make = (options: {
     if (legacyBaselineByHash.has(baseline.hash)) {
       return Defect.invalid(`Duplicate legacy baseline hash: ${baseline.hash}`)
     }
-    if (!definitionByIdentity.has(identityKey(baseline.definition.schemaIdentity))) {
+    const definitionIdentityKey = identityKey(baseline.definition.schemaIdentity)
+    if (!definitionByIdentity.has(definitionIdentityKey)) {
       return Defect.invalid(`Legacy baseline ${baseline.id} does not map to a definition in the evolution chain`)
     }
     baselineIds.add(baseline.id)
     legacyBaselineByHash.set(baseline.hash, baseline)
   }
+  const migrationHash = Canonical.hash({
+    format: 1,
+    current: options.current.schemaIdentity,
+    steps: steps.map((entry) => ({ id: entry.id, hash: entry.hash })),
+    legacyBaselines: legacyBaselines.map((entry) => ({
+      id: entry.id,
+      hash: entry.hash,
+      schemaIdentity: entry.definition.schemaIdentity
+    })).toSorted(byId)
+  })
   return Object.freeze({
     current: options.current,
     steps: Object.freeze(steps),
     legacyBaselines: Object.freeze(legacyBaselines),
-    migrationHash: Identity.SchemaHash.make(Canonical.hash({
-      format: 1,
-      current: options.current.schemaIdentity,
-      steps: steps.map((entry) => ({ id: entry.id, hash: entry.hash })),
-      legacyBaselines: legacyBaselines.map((entry) => ({
-        id: entry.id,
-        hash: entry.hash,
-        schemaIdentity: entry.definition.schemaIdentity
-      })).toSorted(byId)
-    })),
+    migrationHash: Identity.SchemaHash.make(migrationHash),
     definitionByIdentity,
     stepBySourceIdentity,
     stepByTargetIdentity,
@@ -485,10 +492,9 @@ const pathBetween = (
   target: Identity.SchemaIdentity
 ): Effect.Effect<ReadonlyArray<DirectionalStep>, ReplicaError.SchemaEvolutionUnsupported> => {
   if (sameIdentity(source, target)) return Effect.succeed([])
-  if (
-    !evolution.definitionByIdentity.has(identityKey(source)) ||
-    !evolution.definitionByIdentity.has(identityKey(target))
-  ) {
+  const sourceKey = identityKey(source)
+  const targetKey = identityKey(target)
+  if (!evolution.definitionByIdentity.has(sourceKey) || !evolution.definitionByIdentity.has(targetKey)) {
     return Effect.fail(
       new ReplicaError.SchemaEvolutionUnsupported({
         sourceVersion: source.version,
@@ -501,7 +507,8 @@ const pathBetween = (
   const forward: Array<DirectionalStep> = []
   let identity = source
   while (!sameIdentity(identity, target)) {
-    const next = evolution.stepBySourceIdentity.get(identityKey(identity))
+    const key = identityKey(identity)
+    const next = evolution.stepBySourceIdentity.get(key)
     if (next === undefined) break
     forward.push({ step: next, direction: "Forward" })
     identity = next.to.schemaIdentity
@@ -510,7 +517,8 @@ const pathBetween = (
   const backward: Array<DirectionalStep> = []
   identity = source
   while (!sameIdentity(identity, target)) {
-    const previous = evolution.stepByTargetIdentity.get(identityKey(identity))
+    const key = identityKey(identity)
+    const previous = evolution.stepByTargetIdentity.get(key)
     if (previous === undefined) {
       return Effect.fail(
         new ReplicaError.SchemaEvolutionUnsupported({
@@ -590,7 +598,8 @@ export const migrateModelTo = (options: {
 }): Effect.Effect<MigratedModel, ReplicaError.SchemaEvolutionUnsupported | ReplicaError.SchemaEvolutionFailed> =>
   Effect.gen(function*() {
     const path = yield* pathBetween(options.evolution, options.source, options.target)
-    const sourceDefinition = options.evolution.definitionByIdentity.get(identityKey(options.source))
+    const sourceIdentityKey = identityKey(options.source)
+    const sourceDefinition = options.evolution.definitionByIdentity.get(sourceIdentityKey)
     const sourceModel = sourceDefinition?.modelByName.get(options.model)
     if (sourceModel === undefined || sourceModel.version !== options.modelVersion) {
       return yield* new ReplicaError.SchemaEvolutionUnsupported({
@@ -663,7 +672,7 @@ export const migrateModelTo = (options: {
       } else if (traversal.direction === "Backward" && migration?.downgradeKey !== undefined) {
         migratedKey = migration.downgradeKey(sourceKey)
       }
-      const targetKey = yield* Schema.decodeUnknownEffect(Schema.toType(target.key))(migratedKey).pipe(
+      const targetKey = yield* Schema.toType(target.key).pipe(Schema.decodeUnknownEffect)(migratedKey).pipe(
         Effect.mapError((cause) =>
           new ReplicaError.SchemaEvolutionFailed({
             stepId: entry.id,
@@ -724,7 +733,7 @@ export const migrateModelTo = (options: {
         } else if (traversal.direction === "Backward" && migration?.downgradeValue !== undefined) {
           migratedValue = migration.downgradeValue({ key: sourceKey, targetKey, value: sourceValue })
         }
-        const targetValue = yield* Schema.decodeUnknownEffect(Schema.toType(target.schema))(migratedValue).pipe(
+        const targetValue = yield* Schema.toType(target.schema).pipe(Schema.decodeUnknownEffect)(migratedValue).pipe(
           Effect.mapError((cause) =>
             new ReplicaError.SchemaEvolutionFailed({
               stepId: entry.id,
@@ -796,7 +805,8 @@ const migrateMutationPart = (options: {
 > =>
   Effect.gen(function*() {
     const path = yield* pathBetween(options.evolution, options.source, options.target)
-    const sourceDefinition = options.evolution.definitionByIdentity.get(identityKey(options.source))
+    const sourceIdentityKey = identityKey(options.source)
+    const sourceDefinition = options.evolution.definitionByIdentity.get(sourceIdentityKey)
     const sourceMutation = sourceDefinition?.mutationByName.get(options.mutation)
     if (sourceMutation === undefined || sourceMutation.version !== options.mutationVersion) {
       return yield* new ReplicaError.SchemaEvolutionUnsupported({
@@ -829,7 +839,7 @@ const migrateMutationPart = (options: {
       const migration = entry.mutations.get(options.mutation)
       let fromSchema: SchemaInput.WireSchema
       let toSchema: SchemaInput.WireSchema
-      let migrate: (input: unknown) => unknown
+      let migrate: (input: Mutation.TaggedError) => unknown
       switch (options.part) {
         case "Payload":
           fromSchema = source.payloadSchema
@@ -900,7 +910,7 @@ const migrateMutationPart = (options: {
         )
       )
       const migrated = migrate(sourceValue)
-      const targetValue = yield* Schema.decodeUnknownEffect(Schema.toType(toSchema))(migrated).pipe(
+      const targetValue = yield* Schema.toType(toSchema).pipe(Schema.decodeUnknownEffect)(migrated).pipe(
         Effect.mapError((cause) =>
           new ReplicaError.SchemaEvolutionFailed({
             stepId: entry.id,

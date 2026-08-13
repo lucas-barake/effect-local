@@ -17,7 +17,7 @@
     "check:tsc": "tsc -b tsconfig.json",
     "check:all": "pnpm check:tsc && pnpm check:pre-commit",
     "check:pre-commit": "pnpm lint && pnpm dead-code && pnpm check && pnpm test --run",
-    "lint": "node scripts/test-oxlint-rules.mjs && oxlint && dprint check",
+    "lint": "node scripts/test-oxlint-rules.mjs && oxlint --threads=1 && dprint check",
     "lint-fix": "oxlint --fix && dprint fmt",
     "precommit": "node scripts/pre-commit.mjs",
     "prepare": "git config core.hooksPath .githooks",

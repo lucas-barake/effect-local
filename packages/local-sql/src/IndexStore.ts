@@ -6,6 +6,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as SchemaDescriptor from "@lucas-barake/effect-local/SchemaDescriptor"
 import type * as SecondaryIndex from "@lucas-barake/effect-local/SecondaryIndex"
 import * as Effect from "effect/Effect"
+import { pipe } from "effect/Function"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
@@ -80,7 +81,11 @@ const CatalogRow = Schema.Struct({
 
 const StateRow = Schema.Struct({
   backfill_after_key: Schema.NullOr(Schema.String),
-  backfill_visible_revision: Schema.NullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  backfill_visible_revision: pipe(
+    Schema.isGreaterThanOrEqualTo(0),
+    (check) => Schema.Int.check(check),
+    Schema.NullOr
+  ),
   ready: Schema.Literals([0, 1])
 })
 
@@ -98,9 +103,9 @@ const ReadyRow = Schema.Struct({
 })
 
 const GenerationRow = Schema.Struct({
-  active_schema_generation: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  active_projection_generation: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  visible_revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+  active_schema_generation: pipe(Schema.isGreaterThanOrEqualTo(0), (check) => Schema.Int.check(check)),
+  active_projection_generation: pipe(Schema.isGreaterThanOrEqualTo(0), (check) => Schema.Int.check(check)),
+  visible_revision: pipe(Schema.isGreaterThanOrEqualTo(0), (check) => Schema.Int.check(check))
 })
 
 const IndexedEntityRow = Schema.Struct({
@@ -110,11 +115,13 @@ const IndexedEntityRow = Schema.Struct({
 
 const TupleRow = Schema.Struct({ values_json: Schema.String })
 const SqliteSchemaRow = Schema.Struct({ sql: Schema.String })
-const SqlValuesFromString = Schema.fromJsonString(Schema.Array(Schema.Union([Schema.String, Schema.Number])))
+const SqlValueSchema = Schema.Union([Schema.String, Schema.Number])
+const SqlValues = Schema.Array(SqlValueSchema)
+const SqlValuesFromString = Schema.fromJsonString(SqlValues)
 
 const CursorPayload = Schema.Struct({
   shape: Schema.String,
-  values: Schema.Array(Schema.Union([Schema.String, Schema.Number]))
+  values: SqlValues
 })
 
 const CursorFromString = Schema.fromJsonString(CursorPayload)
@@ -196,7 +203,7 @@ const encodedComponents = (
 ): Effect.Effect<ReadonlyArray<SqlValue>, ReplicaError.StorageCorrupt> =>
   Effect.forEach(
     [...descriptor.index.partition, ...descriptor.index.sort],
-    (component) => encodeComponent(component, component.extract(value))
+    (component) => pipe(component.extract(value), (extracted) => encodeComponent(component, extracted))
   )
 
 const point = (
@@ -253,20 +260,21 @@ const upsertRows = (
   if (rows.length === 0) return Effect.void
   const table = sql(descriptor.tableName)
   const columns = componentColumns(descriptor)
-  const assignments = sql.join(", ", false)(
-    columns.map((name) => sql`${sql(name)} = excluded.${sql(name)}`)
-  )
-  const batchSize = Math.max(1, Math.floor(900 / (columns.length + 4)))
-  return Effect.forEach(
+  const assignmentStatements = columns.map((name) => sql`${sql(name)} = excluded.${sql(name)}`)
+  const assignments = sql.join(", ", false)(assignmentStatements)
+  const batchSize = pipe(Math.floor(900 / (columns.length + 4)), (size) => Math.max(1, size))
+  return pipe(
     Array.from(
       { length: Math.ceil(rows.length / batchSize) },
       (_, position) => rows.slice(position * batchSize, (position + 1) * batchSize)
     ),
-    (batch) =>
-      sql`INSERT INTO ${table} ${sql.insert(batch)}
-      ON CONFLICT (space_id, index_schema_generation, index_projection_generation, index_entity_key)
-      DO UPDATE SET ${assignments}`,
-    { discard: true }
+    Effect.forEach(
+      (batch) =>
+        sql`INSERT INTO ${table} ${sql.insert(batch)}
+          ON CONFLICT (space_id, index_schema_generation, index_projection_generation, index_entity_key)
+          DO UPDATE SET ${assignments}`,
+      { discard: true }
+    )
   ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 }
 
@@ -288,10 +296,12 @@ const writeEntity = (
         entityKey: Schema.String
       }),
       Result: TupleRow,
-      execute: ({ entityKey: storedEntityKey, projectionGeneration, schemaGeneration, spaceId }) =>
-        sql`SELECT json_array(${sql.csv(columns.map(sql.literal))}) AS values_json
+      execute: ({ entityKey: storedEntityKey, projectionGeneration, schemaGeneration, spaceId }) => {
+        const selectedColumns = columns.map(sql.literal)
+        return sql`SELECT json_array(${sql.csv(selectedColumns)}) AS values_json
         FROM ${table} WHERE space_id = ${spaceId} AND index_schema_generation = ${schemaGeneration}
           AND index_projection_generation = ${projectionGeneration} AND index_entity_key = ${storedEntityKey}`
+      }
     })
     const old = yield* findOld({ ...address, entityKey }).pipe(
       Effect.catchTag("SchemaError", (cause) =>
@@ -306,7 +316,8 @@ const writeEntity = (
           new ReplicaError.StorageCorrupt({ message: "Stored secondary index tuple is invalid", cause })
         )
       )
-      points.push(point(address, descriptor, entityKey, values))
+      pipe(point(address, descriptor, entityKey, values), (pointValue) =>
+        points.push(pointValue))
     }
     if (value === undefined) {
       yield* sql`DELETE FROM ${table}
@@ -316,11 +327,10 @@ const writeEntity = (
     }
     const encoded = yield* makeIndexRow(descriptor, address, entityKey, value)
     yield* upsertRows(sql, descriptor, [encoded.row])
-    points.push(point(address, descriptor, entityKey, encoded.values))
+    pipe(point(address, descriptor, entityKey, encoded.values), (pointValue) => points.push(pointValue))
     return points
   }).pipe(
-    Effect.catchTag("SqlError", (cause) =>
-      Effect.fail(StorageUnavailable.make(cause))),
+    Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
     Effect.withSpan("IndexStore.writeEntity", {
       attributes: { "index.model": descriptor.model.name, "index.name": descriptor.indexName }
     })
@@ -334,14 +344,17 @@ const readPoint = (
 ): Effect.Effect<ReadonlyArray<Point>, ReplicaError.StorageError> => {
   const table = sql(descriptor.tableName)
   const columns = componentColumns(descriptor)
-  return SqlSchema.findOneOption({
+  const findPoint = SqlSchema.findOneOption({
     Request: Schema.Void,
     Result: TupleRow,
-    execute: () =>
-      sql`SELECT json_array(${sql.csv(columns.map(sql.literal))}) AS values_json FROM ${table}
+    execute: () => {
+      const selectedColumns = columns.map(sql.literal)
+      return sql`SELECT json_array(${sql.csv(selectedColumns)}) AS values_json FROM ${table}
       WHERE space_id = ${address.spaceId} AND index_schema_generation = ${address.schemaGeneration}
         AND index_projection_generation = ${address.projectionGeneration} AND index_entity_key = ${entityKey}`
-  })(undefined).pipe(
+    }
+  })(undefined)
+  return findPoint.pipe(
     Effect.catchTag(
       "SchemaError",
       (cause) =>
@@ -381,7 +394,7 @@ const ensureCatalog = (
     Result: SqliteSchemaRow,
     execute: ({ name, type }) => sql`SELECT sql FROM sqlite_schema WHERE type = ${type} AND name = ${name}`
   })
-  return sql.withTransaction(Effect.gen(function*() {
+  return Effect.gen(function*() {
     const stored = yield* findCatalog({
       model: descriptor.model.name,
       indexName: descriptor.indexName,
@@ -454,7 +467,8 @@ const ensureCatalog = (
           AND index_name = ${descriptor.indexName} AND descriptor_hash = ${descriptor.hash}`
     }
     return yield* Effect.void
-  })).pipe(
+  }).pipe(
+    sql.withTransaction,
     Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
     Effect.withSpan("IndexStore.ensureCatalog", {
       attributes: { "index.model": descriptor.model.name, "index.name": descriptor.indexName }
@@ -535,7 +549,7 @@ const backfill = (
     if (revision !== startingMeta.visible_revision) {
       revision = startingMeta.visible_revision
       after = null
-      yield* sql.withTransaction(Effect.gen(function*() {
+      yield* Effect.gen(function*() {
         const current = yield* findGeneration(sql, address.spaceId)
         if (!sameAddress(current, address)) {
           return yield* new ReplicaError.StorageCorrupt({
@@ -553,7 +567,7 @@ const backfill = (
             AND projection_generation = ${address.projectionGeneration} AND model = ${descriptor.model.name}
             AND index_name = ${descriptor.indexName} AND descriptor_hash = ${descriptor.hash}`
         return yield* Effect.void
-      }))
+      }).pipe(sql.withTransaction)
     }
     const findPage = SqlSchema.findAll({
       Request: Schema.Struct({
@@ -578,7 +592,7 @@ const backfill = (
       }
     })
     while (true) {
-      const result = yield* sql.withTransaction(Effect.gen(function*() {
+      const result = yield* Effect.gen(function*() {
         const current = yield* findGeneration(sql, address.spaceId)
         if (!sameAddress(current, address)) {
           return yield* new ReplicaError.StorageCorrupt({
@@ -634,7 +648,7 @@ const backfill = (
             AND index_name = ${descriptor.indexName} AND descriptor_hash = ${descriptor.hash}
             AND backfill_visible_revision = ${revision}`
         return { _tag: "Page" as const, after: nextAfter }
-      }))
+      }).pipe(sql.withTransaction)
       if (result._tag === "Done") {
         return yield* Effect.void
       }
@@ -707,7 +721,8 @@ export const install = (
     const all = descriptors(definition)
     const byModel = new Map<string, ReadonlyArray<Descriptor>>()
     for (const model of definition.models) {
-      byModel.set(model.name, all.filter((descriptor) => descriptor.model === model))
+      const matching = all.filter((descriptor) => descriptor.model === model)
+      byModel.set(model.name, matching)
     }
     for (const descriptor of all) yield* ensureCatalog(sql, descriptor)
     yield* cleanupObsolete(sql, all)
@@ -945,8 +960,10 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
         return yield* new ReplicaError.StorageCorrupt({ message: "Query cursor entity key must be a string" })
       }
       cursorValues = cursor.values
-      const tupleColumns = sql.csv(orderedColumns.map((name) => column(sql, name)))
-      const tupleValues = sql.csv(cursor.values.map((value) => sql`${value}`))
+      const tupleColumnFragments = orderedColumns.map((name) => column(sql, name))
+      const tupleColumns = sql.csv(tupleColumnFragments)
+      const tupleValueFragments = cursor.values.map((value) => sql`${value}`)
+      const tupleValues = sql.csv(tupleValueFragments)
       let token = "<"
       if (state.direction === "asc") token = ">"
       whereClauses.push(sql`(${tupleColumns}) ${sql.literal(token)} (${tupleValues})`)
@@ -997,13 +1014,12 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
       full
     })
     let completeRead: ((footprint: Footprint) => Effect.Effect<void>) | undefined
-    if (onRead !== undefined) completeRead = yield* onRead(makeFootprint(undefined, false, false))
+    if (onRead !== undefined) completeRead = yield* pipe(makeFootprint(undefined, false, false), onRead)
     const table = sql(descriptor.tableName)
     let orderDirection = sql.literal("ASC")
     if (state.direction === "desc") orderDirection = sql.literal("DESC")
-    const order = sql.csv(
-      orderedColumns.map((name) => sql`${column(sql, name)} ${orderDirection}`)
-    )
+    const orderFragments = orderedColumns.map((name) => sql`${column(sql, name)} ${orderDirection}`)
+    const order = sql.csv(orderFragments)
     const findRows = SqlSchema.findAll({
       Request: Schema.Void,
       Result: IndexedEntityRow,
@@ -1032,7 +1048,7 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
       const lastValue = items[items.length - 1]
       const values = yield* Effect.forEach(
         descriptor.index.sort,
-        (component) => encodeComponent(component, component.extract(lastValue))
+        (component) => pipe(component.extract(lastValue), (extracted) => encodeComponent(component, extracted))
       )
       const token = yield* Schema.encodeEffect(CursorFromString)({
         shape,
@@ -1051,11 +1067,11 @@ const runPage = <M extends Model.Any, Name extends keyof Model.Indexes<M> & stri
         const lastValue = items[items.length - 1]
         const values = yield* Effect.forEach(
           descriptor.index.sort,
-          (component) => encodeComponent(component, component.extract(lastValue))
+          (component) => pipe(component.extract(lastValue), (extracted) => encodeComponent(component, extracted))
         )
         boundary = [...values, lastRow.entity_key]
       }
-      yield* completeRead(makeFootprint(boundary, rows.length > state.limit, pageRows.length === state.limit))
+      yield* pipe(makeFootprint(boundary, rows.length > state.limit, pageRows.length === state.limit), completeRead)
     }
     return { items, next }
   }).pipe(

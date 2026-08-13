@@ -17,25 +17,43 @@ export const maximumReplicationWindowPartitions = 1_000
 export const maximumPresenceTtlMillis = 60_000
 export const maximumBootstrapEntries = 1_000
 
-export const ProtocolVersion = Schema.Int.check(Schema.isGreaterThan(0))
+const greaterThanZero = Schema.isGreaterThan(0)
+const greaterThanOrEqualToZero = Schema.isGreaterThanOrEqualTo(0)
+const greaterThanOrEqualToNegativeOne = Schema.isGreaterThanOrEqualTo(-1)
+const minimumLengthOne = Schema.isMinLength(1)
+const maximumLength256 = Schema.isMaxLength(256)
+const unique = Schema.isUnique()
+const digestPattern = Schema.isPattern(/^[0-9a-f]{64}$/)
+const maximumBatchLength = Schema.isMaxLength(maximumBatchEntries)
+const maximumBootstrapLength = Schema.isMaxLength(maximumBootstrapEntries)
+const maximumReplicationWindowsLength = Schema.isMaxLength(maximumReplicationWindows)
+const maximumReplicationWindowPartitionsLength = Schema.isMaxLength(maximumReplicationWindowPartitions)
+const maximumBatchLimit = Schema.isLessThanOrEqualTo(maximumBatchEntries)
+const maximumBootstrapLimit = Schema.isLessThanOrEqualTo(maximumBootstrapEntries)
+const maximumPresenceTtl = Schema.isLessThanOrEqualTo(maximumPresenceTtlMillis)
+
+export const ProtocolVersion = Schema.Int.check(greaterThanZero)
 export type ProtocolVersion = typeof ProtocolVersion.Type
 export const currentProtocolVersion = ProtocolVersion.make(1)
 const withProtocolVersion = Schema.fieldsAssign({ protocolVersion: ProtocolVersion })
 export const NegotiateRequest = Schema.Struct({
-  supportedVersions: Schema.Array(ProtocolVersion).check(Schema.isMinLength(1))
+  supportedVersions: Schema.Array(ProtocolVersion).check(minimumLengthOne)
 })
 export type NegotiateRequest = typeof NegotiateRequest.Type
 export const NegotiatedProtocol = Schema.Struct({ version: ProtocolVersion })
 export type NegotiatedProtocol = typeof NegotiatedProtocol.Type
 
-export const encodedBytes = (value: unknown): number => new TextEncoder().encode(Canonical.stringify(value)).byteLength
+export const encodedBytes = (value: unknown): number => {
+  const encoded = Canonical.stringify(value)
+  return new TextEncoder().encode(encoded).byteLength
+}
 
 export const encodedBytesEffect = (
   value: unknown
 ): Effect.Effect<number, ReplicaError.CanonicalEncodeError> =>
   Canonical.stringifyEffect(value).pipe(Effect.map((encoded) => new TextEncoder().encode(encoded).byteLength))
 
-export const MutationDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
+export const MutationDigest = Schema.String.check(digestPattern)
 export type MutationDigest = typeof MutationDigest.Type
 
 export const MutationDigestVersion = Schema.Literal(3)
@@ -47,7 +65,7 @@ const MutationIdentity = {
   mutationId: Identity.MutationId,
   localSequence: Identity.LocalSequence,
   basis: Identity.ServerSequence,
-  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  name: Schema.NonEmptyString.check(maximumLength256),
   payload: Schema.Json
 }
 
@@ -93,10 +111,13 @@ export const mutationDigestInput = (envelope: MutationDigestIdentity): unknown =
   }
 }
 
-export const mutationDigest = (envelope: MutationDigestIdentity) => Canonical.digest(mutationDigestInput(envelope))
+export const mutationDigest = (envelope: MutationDigestIdentity) => {
+  const input = mutationDigestInput(envelope)
+  return Canonical.digest(input)
+}
 
 export const EntityKey = Schema.Struct({
-  model: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  model: Schema.NonEmptyString.check(maximumLength256),
   modelVersion: Identity.SchemaVersion,
   key: Schema.Json
 })
@@ -114,7 +135,7 @@ export const Retract = Schema.TaggedStruct("Retract", { entity: EntityKey })
 export const ViewChange = Schema.Union([Upsert, Delete, Retract])
 export type ViewChange = typeof ViewChange.Type
 
-const ReplicationModelName = Schema.NonEmptyString.check(Schema.isMaxLength(256))
+const ReplicationModelName = Schema.NonEmptyString.check(maximumLength256)
 
 const WindowComponentValue = Schema.Union([Schema.String, Schema.Number, Schema.Boolean])
 export type WindowComponentValue = typeof WindowComponentValue.Type
@@ -129,24 +150,24 @@ export type ReplicationWindowBounds = typeof ReplicationWindowBounds.Type
 
 export const ReplicationWindowPartition = Schema.Struct({
   key: Schema.Array(WindowComponentValue),
-  count: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThan(0))),
+  count: Schema.Int.check(greaterThanZero).pipe(Schema.optionalKey),
   bounds: Schema.optionalKey(ReplicationWindowBounds)
 })
 export type ReplicationWindowPartition = typeof ReplicationWindowPartition.Type
 
 export const ReplicationWindow = Schema.Struct({
   model: ReplicationModelName,
-  index: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
-  count: Schema.Int.check(Schema.isGreaterThan(0)),
-  partitions: Schema.optionalKey(
-    Schema.Array(ReplicationWindowPartition).check(Schema.isMaxLength(maximumReplicationWindowPartitions))
+  index: Schema.NonEmptyString.check(maximumLength256),
+  count: Schema.Int.check(greaterThanZero),
+  partitions: Schema.Array(ReplicationWindowPartition).check(maximumReplicationWindowPartitionsLength).pipe(
+    Schema.optionalKey
   )
 })
 export type ReplicationWindow = typeof ReplicationWindow.Type
 
 export const ReplicationScope = Schema.Struct({
-  models: Schema.Array(ReplicationModelName).check(Schema.isUnique()),
-  windows: Schema.optionalKey(Schema.Array(ReplicationWindow).check(Schema.isMaxLength(maximumReplicationWindows)))
+  models: Schema.Array(ReplicationModelName).check(unique),
+  windows: Schema.Array(ReplicationWindow).check(maximumReplicationWindowsLength).pipe(Schema.optionalKey)
 })
 export type ReplicationScope = typeof ReplicationScope.Type
 
@@ -287,7 +308,8 @@ export const validateReplicationScope = (
             })
           }
         }
-        const partitionIdentity = Canonical.stringify(partition.key.map(canonicalPartitionValue))
+        const partitionKey = partition.key.map(canonicalPartitionValue)
+        const partitionIdentity = Canonical.stringify(partitionKey)
         if (seenPartitions.has(partitionIdentity)) {
           return yield* new ReplicaError.ProtocolInvalid({
             message: `Duplicate replication window partition for ${label}`
@@ -358,7 +380,7 @@ const ReceiptIdentity = {
 
 export const AcceptedReceipt = Schema.TaggedStruct("Accepted", {
   ...ReceiptIdentity,
-  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  name: Schema.NonEmptyString.check(maximumLength256),
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
   serverSequence: Identity.ServerSequence,
@@ -372,7 +394,7 @@ export type RejectionOrigin = typeof RejectionOrigin.Type
 
 export const RejectedReceipt = Schema.TaggedStruct("Rejected", {
   ...ReceiptIdentity,
-  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  name: Schema.NonEmptyString.check(maximumLength256),
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
   origin: RejectionOrigin,
@@ -392,7 +414,7 @@ export type LegacyReceipt = typeof LegacyReceipt.Type
 
 export const ExpiredReceipt = Schema.TaggedStruct("Expired", {
   ...ReceiptIdentity,
-  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  name: Schema.NonEmptyString.check(maximumLength256),
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
   snapshotId: Identity.SnapshotId,
@@ -428,7 +450,7 @@ const ReplicationRequestContext = {
 export const PullRequest = Schema.Struct({
   ...ReplicationRequestContext,
   cursor: Schema.NullOr(ReplicationCursor),
-  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBatchEntries))
+  limit: Schema.Int.check(greaterThanZero, maximumBatchLimit)
 })
 export type PullRequest = typeof PullRequest.Type
 export const VersionedPullRequest = PullRequest.pipe(withProtocolVersion)
@@ -444,8 +466,8 @@ export const PullPage = Schema.Struct({
   scopeGeneration: Identity.ReplicationScopeGeneration,
   cursor: ReplicationCursor,
   serverSequence: Identity.ServerSequence,
-  changes: Schema.Array(ViewChange).check(Schema.isMaxLength(maximumBatchEntries)),
-  contentBytes: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  changes: Schema.Array(ViewChange).check(maximumBatchLength),
+  contentBytes: Schema.Int.check(greaterThanOrEqualToZero),
   digest: MutationDigest,
   hasMore: Schema.Boolean,
   serverSchema: Identity.SchemaIdentity
@@ -455,9 +477,10 @@ export type PullPage = typeof PullPage.Type
 export const viewChangesDigest = (changes: ReadonlyArray<ViewChange>) =>
   Canonical.digest({ format: 1, changes }).pipe(Effect.map((value) => MutationDigest.make(value)))
 
-export const SnapshotDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
+export const SnapshotDigest = Schema.String.check(digestPattern)
 export type SnapshotDigest = typeof SnapshotDigest.Type
-export const initialSnapshotDigest = SnapshotDigest.make("0".repeat(64))
+const initialSnapshotDigestValue = "0".repeat(64)
+export const initialSnapshotDigest = SnapshotDigest.make(initialSnapshotDigestValue)
 
 export const SnapshotManifest = Schema.Struct({
   spaceId: Identity.SpaceId,
@@ -470,16 +493,16 @@ export const SnapshotManifest = Schema.Struct({
   snapshotId: Identity.SnapshotId,
   sequence: Identity.ServerSequence,
   terminalSequenceThrough: Identity.TerminalSequence,
-  entityCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  contentBytes: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  entityCount: Schema.Int.check(greaterThanOrEqualToZero),
+  contentBytes: Schema.Int.check(greaterThanOrEqualToZero),
   digest: SnapshotDigest
 })
 export type SnapshotManifest = typeof SnapshotManifest.Type
 
 export const SnapshotEntry = Schema.Struct({
-  ordinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  ordinal: Schema.Int.check(greaterThanOrEqualToZero),
   change: ViewChange,
-  entryBytes: Schema.Int.check(Schema.isGreaterThan(0))
+  entryBytes: Schema.Int.check(greaterThanZero)
 })
 export type SnapshotEntry = typeof SnapshotEntry.Type
 
@@ -487,12 +510,12 @@ export const snapshotEntryDigest = (previous: SnapshotDigest, entry: SnapshotEnt
   Canonical.digest({ previous, entry }).pipe(Effect.map((value) => SnapshotDigest.make(value)))
 
 export const SnapshotEntity = Schema.Struct({
-  ordinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  model: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  ordinal: Schema.Int.check(greaterThanOrEqualToZero),
+  model: Schema.NonEmptyString.check(maximumLength256),
   modelVersion: Identity.SchemaVersion,
   key: Schema.Json,
   value: Schema.Json,
-  entityBytes: Schema.Int.check(Schema.isGreaterThan(0))
+  entityBytes: Schema.Int.check(greaterThanZero)
 })
 export type SnapshotEntity = typeof SnapshotEntity.Type
 
@@ -509,15 +532,15 @@ export const BootstrapRequest = Schema.Struct({
   ...ReplicationRequestContext,
   cursor: ReplicationCursor,
   snapshotId: Identity.SnapshotId,
-  afterOrdinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1)),
-  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBootstrapEntries))
+  afterOrdinal: Schema.Int.check(greaterThanOrEqualToNegativeOne),
+  limit: Schema.Int.check(greaterThanZero, maximumBootstrapLimit)
 })
 export type BootstrapRequest = typeof BootstrapRequest.Type
 export const VersionedBootstrapRequest = BootstrapRequest.pipe(withProtocolVersion)
 
 export const BootstrapPage = Schema.Struct({
   manifest: SnapshotManifest,
-  entries: Schema.Array(SnapshotEntry).check(Schema.isMaxLength(maximumBootstrapEntries)),
+  entries: Schema.Array(SnapshotEntry).check(maximumBootstrapLength),
   hasMore: Schema.Boolean,
   serverSchema: Identity.SchemaIdentity
 })
@@ -532,10 +555,7 @@ export const PresenceUpdate = Schema.Struct({
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
   value: Schema.Json,
-  ttlMillis: Schema.Int.check(
-    Schema.isGreaterThan(0),
-    Schema.isLessThanOrEqualTo(maximumPresenceTtlMillis)
-  )
+  ttlMillis: Schema.Int.check(greaterThanZero, maximumPresenceTtl)
 })
 export type PresenceUpdate = typeof PresenceUpdate.Type
 export const VersionedPresenceUpdate = PresenceUpdate.pipe(withProtocolVersion)
@@ -556,6 +576,6 @@ export const PendingMutation = Schema.Struct({
   optimisticResult: Schema.Json,
   changes: Schema.Array(EntityChange),
   submissionState: SubmissionState,
-  attempts: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+  attempts: Schema.Int.check(greaterThanOrEqualToZero)
 })
 export type PendingMutation = typeof PendingMutation.Type

@@ -17,7 +17,7 @@ export interface Options {
 }
 
 const makeLayerHandlers = (options?: Options) => {
-  return SyncRpc.Rpcs.toLayer(Effect.gen(function*() {
+  return Effect.gen(function*() {
     const configured = options?.supportedProtocolVersions ?? [Protocol.currentProtocolVersion]
     const decoded = yield* Schema.decodeUnknownEffect(Protocol.NegotiateRequest)({
       supportedVersions: configured
@@ -64,11 +64,14 @@ const makeLayerHandlers = (options?: Options) => {
           Effect.flatMap((assertion) => client.bootstrap(request.spaceId, request, assertion))
         ),
       Watch: (request) =>
-        Stream.fromEffect(requireVersion(request.protocolVersion)).pipe(
+        requireVersion(request.protocolVersion).pipe(
+          Stream.fromEffect,
           Stream.flatMap(() =>
-            Stream.unwrap(issueAssertion.pipe(
-              Effect.map((assertion) => client.watch(request.spaceId, request, assertion))
-            ))
+            Stream.unwrap(
+              issueAssertion.pipe(
+                Effect.map((assertion) => client.watch(request.spaceId, request, assertion))
+              )
+            )
           )
         ),
       PublishPresence: (update) => {
@@ -80,15 +83,18 @@ const makeLayerHandlers = (options?: Options) => {
         )
       },
       WatchPresence: ({ spaceId, protocolVersion }) =>
-        Stream.fromEffect(requireVersion(protocolVersion)).pipe(
+        requireVersion(protocolVersion).pipe(
+          Stream.fromEffect,
           Stream.flatMap(() =>
-            Stream.unwrap(issueAssertion.pipe(
-              Effect.map((assertion) => client.watchPresence(spaceId, assertion))
-            ))
+            Stream.unwrap(
+              issueAssertion.pipe(
+                Effect.map((assertion) => client.watchPresence(spaceId, assertion))
+              )
+            )
           )
         )
     })
-  }))
+  }).pipe((handlers) => SyncRpc.Rpcs.toLayer(handlers))
 }
 
 export const layerHandlers = makeLayerHandlers()

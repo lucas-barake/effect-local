@@ -2,15 +2,17 @@ import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 
-const identifier = <const Name extends string,>(name: Name, prefix: string) =>
-  Schema.String.check(
-    Schema.isPattern(new RegExp(`^${prefix}_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`))
-  ).pipe(Schema.brand(`@lucas-barake/effect-local/${name}`))
-
-const sequence = <const Name extends string,>(name: Name, minimum: number) =>
-  Schema.Int.check(Schema.isGreaterThanOrEqualTo(minimum)).pipe(
-    Schema.brand(`@lucas-barake/effect-local/${name}`)
+const identifier = <const Name extends string,>(name: Name, prefix: string) => {
+  const pattern = Schema.isPattern(
+    new RegExp(`^${prefix}_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
   )
+  return Schema.String.check(pattern).pipe(Schema.brand(`@lucas-barake/effect-local/${name}`))
+}
+
+const sequence = <const Name extends string,>(name: Name, minimum: number) => {
+  const minimumCheck = Schema.isGreaterThanOrEqualTo(minimum)
+  return Schema.Int.check(minimumCheck).pipe(Schema.brand(`@lucas-barake/effect-local/${name}`))
+}
 
 export const SpaceId = identifier("SpaceId", "spc")
 export type SpaceId = typeof SpaceId.Type
@@ -55,7 +57,8 @@ export type ReplicationScopeGeneration = typeof ReplicationScopeGeneration.Type
 export const SchemaVersion = sequence("SchemaVersion", 1)
 export type SchemaVersion = typeof SchemaVersion.Type
 
-export const SchemaHash = Schema.String.check(Schema.isPattern(/^[0-9a-f]{16}$/)).pipe(
+const schemaHashPattern = Schema.isPattern(/^[0-9a-f]{16}$/)
+export const SchemaHash = Schema.String.check(schemaHashPattern).pipe(
   Schema.brand("@lucas-barake/effect-local/SchemaHash")
 )
 export type SchemaHash = typeof SchemaHash.Type

@@ -64,11 +64,8 @@ interface Environment {
 }
 
 const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
-  const database = Layer.mergeAll(
-    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
-    NodeCrypto.layer,
-    Reactivity.layer,
-    QueryReactivity.layer
+  const database = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
+    (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
   )
   const runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.handlers))
   const serverLayer = ServerStore.layer({
@@ -95,20 +92,17 @@ const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
     authorizeMutation: () => Effect.void,
     authorizeRead: () => Effect.void
   }).pipe(Layer.provide(runtime), Layer.provide(database))
-  const remote = Layer.effect(
-    SyncEngine.SyncEngine,
-    Effect.gen(function*() {
-      const server = yield* ServerStore.ServerStore
-      return SyncEngine.SyncEngine.of({
-        waitForCredentialChange: () => Effect.never,
-        discard: (request) => server.discard(request, "reader"),
-        submit: server.submit,
-        pull: (request) => server.pullAuthorized(request, "reader"),
-        bootstrap: (request) => server.bootstrapAuthorized(request, "reader"),
-        watch: (request) => Stream.unwrap(server.watchAuthorized(request, "reader"))
-      })
+  const remote = Effect.gen(function*() {
+    const server = yield* ServerStore.ServerStore
+    return SyncEngine.SyncEngine.of({
+      waitForCredentialChange: () => Effect.never,
+      discard: (request) => server.discard(request, "reader"),
+      submit: server.submit,
+      pull: (request) => server.pullAuthorized(request, "reader"),
+      bootstrap: (request) => server.bootstrapAuthorized(request, "reader"),
+      watch: (request) => server.watchAuthorized(request, "reader").pipe(Stream.unwrap)
     })
-  ).pipe(Layer.provide(serverLayer))
+  }).pipe(Layer.effect(SyncEngine.SyncEngine), Layer.provide(serverLayer))
   const localLayer = LocalStore.layer({
     settlementCapacity: 64,
     retainedReceipts: 256,
@@ -128,15 +122,15 @@ const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
     spaceId
   }).pipe(Layer.provide(localLayer), Layer.provide(remote))
   return {
-    runtime: ManagedRuntime.make(
-      Layer.mergeAll(localLayer, reconcilerLayer, serverLayer, database)
+    runtime: Layer.mergeAll(localLayer, reconcilerLayer, serverLayer, database).pipe((layer) =>
+      ManagedRuntime.make(layer)
     ),
     nextSequence: 1
   }
 }
 
 const seedTodos = (environment: Environment, entityCount: number) =>
-  environment.runtime.runPromise(Effect.gen(function*() {
+  Effect.gen(function*() {
     const server = yield* ServerStore.ServerStore
     const reconciler = yield* Reconciler.Reconciliation
     const local = yield* LocalStore.Store
@@ -144,11 +138,12 @@ const seedTodos = (environment: Environment, entityCount: number) =>
       yield* envelope(Domain.PutManyTodos.name, { count: entityCount }, environment.nextSequence++)
     )
     yield* reconciler.sync
-    assert.isTrue(Option.isSome(yield* local.get(Domain.Todo, `bulk-${entityCount - 1}`)))
-  }))
+    const lastTodo = yield* local.get(Domain.Todo, `bulk-${entityCount - 1}`)
+    lastTodo.pipe(Option.isSome, (present) => assert.isTrue(present))
+  }).pipe((effect) => environment.runtime.runPromise(effect))
 
 const seedMessages = (environment: Environment, entityCount: number) =>
-  environment.runtime.runPromise(Effect.gen(function*() {
+  Effect.gen(function*() {
     const server = yield* ServerStore.ServerStore
     const reconciler = yield* Reconciler.Reconciliation
     const local = yield* LocalStore.Store
@@ -156,23 +151,26 @@ const seedMessages = (environment: Environment, entityCount: number) =>
       yield* envelope(Domain.PutManyMessages.name, { count: entityCount, chats }, environment.nextSequence++)
     )
     yield* reconciler.sync
-    assert.isTrue(Option.isSome(yield* local.get(Domain.Message, `bulk-${entityCount - 1}`)))
-  }))
+    const lastMessage = yield* local.get(Domain.Message, `bulk-${entityCount - 1}`)
+    lastMessage.pipe(Option.isSome, (present) => assert.isTrue(present))
+  }).pipe((effect) => environment.runtime.runPromise(effect))
 
 const syncOneTodo = (environment: Environment) =>
-  environment.runtime.runPromise(Effect.gen(function*() {
+  Effect.gen(function*() {
     const server = yield* ServerStore.ServerStore
     const reconciler = yield* Reconciler.Reconciliation
     const local = yield* LocalStore.Store
     const sequence = environment.nextSequence++
     const id = `message-${String(sequence).padStart(8, "0")}`
-    yield* server.submit(yield* envelope(Domain.PutTodo.name, Domain.todo(id), sequence))
+    const todo = Domain.todo(id)
+    yield* server.submit(yield* envelope(Domain.PutTodo.name, todo, sequence))
     yield* reconciler.sync
-    assert.isTrue(Option.isSome(yield* local.get(Domain.Todo, id)))
-  }))
+    const syncedTodo = yield* local.get(Domain.Todo, id)
+    syncedTodo.pipe(Option.isSome, (present) => assert.isTrue(present))
+  }).pipe((effect) => environment.runtime.runPromise(effect))
 
 const syncOneMessage = (environment: Environment) =>
-  environment.runtime.runPromise(Effect.gen(function*() {
+  Effect.gen(function*() {
     const server = yield* ServerStore.ServerStore
     const reconciler = yield* Reconciler.Reconciliation
     const local = yield* LocalStore.Store
@@ -186,8 +184,9 @@ const syncOneMessage = (environment: Environment) =>
       )
     )
     yield* reconciler.sync
-    assert.isTrue(Option.isSome(yield* local.get(Domain.Message, id)))
-  }))
+    const syncedMessage = yield* local.get(Domain.Message, id)
+    syncedMessage.pipe(Option.isSome, (present) => assert.isTrue(present))
+  }).pipe((effect) => environment.runtime.runPromise(effect))
 
 const configurations = [
   { label: "full scope, space of 1000 entities", scope: fullScope, entityCount: 1_000, iterations: 10 },

@@ -26,35 +26,45 @@ export const make = (limits: { readonly history: number; readonly receipts: numb
 
   return {
     initializeDepths: (history: number, receipts: number) =>
-      update(
-        "initialize_depths",
-        Effect.all([
-          Metric.update(historyDepth, history),
-          Metric.update(historyLimit, limits.history),
-          Metric.update(receiptDepth, receipts),
-          Metric.update(receiptLimit, limits.receipts)
-        ], { discard: true })
-      ),
+      Effect.all([
+        Metric.update(historyDepth, history),
+        Metric.update(historyLimit, limits.history),
+        Metric.update(receiptDepth, receipts),
+        Metric.update(receiptLimit, limits.receipts)
+      ], { discard: true }).pipe((effect) => update("initialize_depths", effect)),
     recordAdmission: (outcome: "accepted" | "rejected" | "expired" | "failed") =>
-      update("record_admission", Metric.update(Metric.withAttributes(admission, { outcome }), 1)),
-    recordRejection: (rejectionClass: string) =>
-      update("record_rejection", Metric.update(Metric.withAttributes(rejection, { class: rejectionClass }), 1)),
-    changeDepths: (history: number, receipts: number) =>
-      update(
-        "change_depths",
-        Effect.all([
-          Metric.modify(historyDepth, history),
-          Metric.modify(receiptDepth, receipts)
-        ], { discard: true })
+      Metric.withAttributes(admission, { outcome }).pipe(
+        Metric.update(1),
+        (effect) => update("record_admission", effect)
       ),
-    changeWatchers: (delta: number) => update("change_watchers", Metric.modify(syncWatchers, delta)),
+    recordRejection: (rejectionClass: string) =>
+      Metric.withAttributes(rejection, { class: rejectionClass }).pipe(
+        Metric.update(1),
+        (effect) => update("record_rejection", effect)
+      ),
+    changeDepths: (history: number, receipts: number) =>
+      Effect.all([
+        Metric.modify(historyDepth, history),
+        Metric.modify(receiptDepth, receipts)
+      ], { discard: true }).pipe((effect) => update("change_depths", effect)),
+    changeWatchers: (delta: number) =>
+      Metric.modify(syncWatchers, delta).pipe((effect) => update("change_watchers", effect)),
     recordWakeFanout: (elapsedNanos: bigint) =>
-      update("record_wake_fanout", Metric.update(wakeFanout, Duration.nanos(elapsedNanos))),
+      Duration.nanos(elapsedNanos).pipe(
+        (duration) => Metric.update(wakeFanout, duration),
+        (effect) => update("record_wake_fanout", effect)
+      ),
     recordMaintenance: (outcome: "completed" | "failed") =>
-      update("record_maintenance", Metric.update(Metric.withAttributes(maintenance, { outcome }), 1)),
+      Metric.withAttributes(maintenance, { outcome }).pipe(
+        Metric.update(1),
+        (effect) => update("record_maintenance", effect)
+      ),
     recordPruned: (resource: "history" | "receipt", count: number) => {
       if (count === 0) return Effect.void
-      return update("record_pruned", Metric.update(Metric.withAttributes(pruned, { resource }), count))
+      return Metric.withAttributes(pruned, { resource }).pipe(
+        Metric.update(count),
+        (effect) => update("record_pruned", effect)
+      )
     }
   }
 }

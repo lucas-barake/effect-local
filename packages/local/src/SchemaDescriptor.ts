@@ -339,7 +339,8 @@ const fromAST = (
       return { _tag: "Cycle", back: Math.max(1, state.stack.size - ancestor) }
     }
     state.suspends.set(ast, state.stack.size)
-    const result = fromAST(ast.thunk(), state, trustedBehavior)
+    const suspended = ast.thunk()
+    const result = fromAST(suspended, state, trustedBehavior)
     state.suspends.delete(ast)
     return result
   }
@@ -447,9 +448,11 @@ const fromAST = (
       if (encodingChecks !== undefined) node.encodingChecks = encodingChecks
       break
     }
-    case "Suspend":
-      node.suspended = fromAST(ast.thunk(), state, trustedBehavior)
+    case "Suspend": {
+      const suspended = ast.thunk()
+      node.suspended = fromAST(suspended, state, trustedBehavior)
       break
+    }
   }
   const reference = intern(node, state)
   if (!state.cyclic.has(ast)) {
@@ -486,17 +489,16 @@ export const make = (schema: Schema.Constraint, options?: MakeOptions): Descript
     unknownStack: []
   }
   const root = fromAST(schema.ast, state, false)
+  const nodes = Array.from(state.nodes)
+    .toSorted(([left], [right]) => {
+      if (left < right) return -1
+      if (left > right) return 1
+      return 0
+    })
+    .map(([id, node]) => [id, node.descriptor] as const)
   return {
     version: 1,
     root,
-    nodes: Object.fromEntries(
-      Array.from(state.nodes)
-        .toSorted(([left], [right]) => {
-          if (left < right) return -1
-          if (left > right) return 1
-          return 0
-        })
-        .map(([id, node]) => [id, node.descriptor])
-    )
+    nodes: Object.fromEntries(nodes)
   }
 }

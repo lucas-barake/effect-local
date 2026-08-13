@@ -45,16 +45,24 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   if (Array.isArray(value)) {
     result = value.map((item) => normalize(item, ancestors))
   } else {
-    result = Object.fromEntries(
-      Object.keys(value).toSorted().map((key) => [key, normalize(Reflect.get(value, key), ancestors)])
-    )
+    const entries = Object.keys(value).toSorted().map((key) => {
+      const property = Reflect.get(value, key)
+      return [key, normalize(property, ancestors)] as const
+    })
+    result = Object.fromEntries(entries)
   }
   ancestors.delete(value)
   return result
 }
 
-export const stringify = (value: unknown): string =>
-  Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(normalize(value, new WeakSet()))
+export const stringify = (value: unknown): string => {
+  const schema = Schema.fromJsonString(Schema.Unknown)
+  // Canonical hashing, cache keys, and SQL interpolation require this public codec to return synchronously.
+  // oxlint-disable-next-line effect-local/noManualEffectBoundary
+  const encode = Schema.encodeSync(schema)
+  const normalized = normalize(value, new WeakSet())
+  return encode(normalized)
+}
 
 export const stringifyEffect = (value: unknown): Effect.Effect<string, ReplicaError.CanonicalEncodeError> =>
   Effect.try({
@@ -66,7 +74,8 @@ export const hash = (value: unknown): string => {
   const input = stringify(value)
   let current = 0xcbf29ce484222325n
   for (let index = 0; index < input.length; index++) {
-    current ^= BigInt(input.charCodeAt(index))
+    const character = input.charCodeAt(index)
+    current ^= BigInt(character)
     current = BigInt.asUintN(64, current * 0x100000001b3n)
   }
   return current.toString(16).padStart(16, "0")

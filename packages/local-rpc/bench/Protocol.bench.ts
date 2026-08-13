@@ -16,6 +16,7 @@ const changes: ReadonlyArray<Protocol.ViewChange> = Array.from({ length: 256 }, 
   }))
 const digest = Protocol.viewChangesDigest(changes).pipe(
   Effect.provide(NodeCrypto.layer),
+  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Benchmark module setup requires the synchronous digest before registering benchmark callbacks.
   Effect.runSync
 )
 const page = Protocol.PullPage.make({
@@ -35,7 +36,9 @@ const page = Protocol.PullPage.make({
   })
 })
 const codec = Schema.toCodecJson(Protocol.PullPage)
+// oxlint-disable-next-line effect-local/noManualEffectBoundary -- This benchmark intentionally measures the synchronous Schema encoder.
 const encode = Schema.encodeSync(codec)
+// oxlint-disable-next-line effect-local/noManualEffectBoundary -- This benchmark intentionally measures the synchronous Schema decoder.
 const decode = Schema.decodeUnknownSync(codec)
 const encoded = encode(page)
 

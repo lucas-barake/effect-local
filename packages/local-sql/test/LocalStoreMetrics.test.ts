@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Metric from "effect/Metric"
+import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -16,6 +17,10 @@ import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
 import * as Domain from "./Domain.js"
+
+class UnexpectedBootstrapInstallSuccess extends Schema.TaggedErrorClass<UnexpectedBootstrapInstallSuccess>(
+  "@lucas-barake/effect-local-sql/test/UnexpectedBootstrapInstallSuccess"
+)("UnexpectedBootstrapInstallSuccess", {}) {}
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const firstClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
@@ -34,19 +39,22 @@ const options = {
 }
 const runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.handlers))
 
-const database = () =>
-  Layer.mergeAll(
-    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+const database = () => {
+  const sqlite = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  return Layer.mergeAll(
+    sqlite,
     NodeCrypto.layer,
     Reactivity.layer,
     QueryReactivity.layer
   )
+}
 
-const localLayer = (clientId: Identity.ClientId) =>
-  LocalStore.layer({ ...options, definition: Domain.definition, spaceId, clientId }).pipe(
+const localLayer = (clientId: Identity.ClientId) => {
+  return LocalStore.layer({ ...options, definition: Domain.definition, spaceId, clientId }).pipe(
     Layer.provide(runtime),
     Layer.provide(database())
   )
+}
 
 const metricCount = (id: string) =>
   Metric.snapshot.pipe(Effect.map((snapshots) => {
@@ -66,14 +74,18 @@ describe("LocalStore metrics", () => {
     return Effect.gen(function*() {
       const firstScope = yield* Scope.make()
       const secondScope = yield* Scope.make()
-      const firstContext = yield* Layer.buildWithScope(localLayer(firstClientId), firstScope)
-      const secondContext = yield* Layer.buildWithScope(localLayer(secondClientId), secondScope)
+      const firstLayer = localLayer(firstClientId)
+      const secondLayer = localLayer(secondClientId)
+      const firstContext = yield* Layer.buildWithScope(firstLayer, firstScope)
+      const secondContext = yield* Layer.buildWithScope(secondLayer, secondScope)
       const first = Context.get(firstContext, LocalStore.Store)
       const second = Context.get(secondContext, LocalStore.Store)
 
       assert.strictEqual(yield* pendingCount, 0)
-      yield* first.mutate(Domain.PutTodo, Domain.todo("first"))
-      yield* second.mutate(Domain.PutTodo, Domain.todo("second"))
+      const firstTodo = Domain.todo("first")
+      const secondTodo = Domain.todo("second")
+      yield* first.mutate(Domain.PutTodo, firstTodo)
+      yield* second.mutate(Domain.PutTodo, secondTodo)
       assert.strictEqual(yield* pendingCount, 2)
 
       yield* Scope.close(firstScope, Exit.void)
@@ -105,16 +117,19 @@ describe("LocalStore metrics", () => {
     return Effect.gen(function*() {
       const firstScope = yield* Scope.make()
       const secondScope = yield* Scope.make()
-      const firstContext = yield* Layer.buildWithScope(localLayer(firstClientId), firstScope).pipe(
+      const firstLayer = localLayer(firstClientId)
+      const secondLayer = localLayer(secondClientId)
+      const firstContext = yield* Layer.buildWithScope(firstLayer, firstScope).pipe(
         Effect.provideService(Metric.MetricRegistry, firstRegistry)
       )
-      const secondContext = yield* Layer.buildWithScope(localLayer(secondClientId), secondScope).pipe(
+      const secondContext = yield* Layer.buildWithScope(secondLayer, secondScope).pipe(
         Effect.provideService(Metric.MetricRegistry, secondRegistry)
       )
       const first = Context.get(firstContext, LocalStore.Store)
       const second = Context.get(secondContext, LocalStore.Store)
 
-      yield* first.mutate(Domain.PutTodo, Domain.todo("first")).pipe(
+      const firstTodo = Domain.todo("first")
+      yield* first.mutate(Domain.PutTodo, firstTodo).pipe(
         Effect.provideService(Metric.MetricRegistry, firstRegistry)
       )
       assert.strictEqual(
@@ -126,7 +141,8 @@ describe("LocalStore metrics", () => {
         0
       )
 
-      yield* second.mutate(Domain.PutTodo, Domain.todo("second")).pipe(
+      const secondTodo = Domain.todo("second")
+      yield* second.mutate(Domain.PutTodo, secondTodo).pipe(
         Effect.provideService(Metric.MetricRegistry, secondRegistry)
       )
       assert.strictEqual(
@@ -145,7 +161,7 @@ describe("LocalStore metrics", () => {
 
   it.effect("counts pending rows once at recovery and then tracks durable row deltas", () => {
     const registry = new Map()
-    return Effect.scoped(Effect.gen(function*() {
+    return Effect.gen(function*() {
       const actualSql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
         Effect.provide(Reactivity.layer)
       )
@@ -161,28 +177,30 @@ describe("LocalStore metrics", () => {
           return statement
         }
       })
+      const observedSqlLayer = Layer.succeed(SqlClient.SqlClient, observedSql)
       const infrastructure = Layer.mergeAll(
-        Layer.succeed(SqlClient.SqlClient, observedSql),
+        observedSqlLayer,
         NodeCrypto.layer,
         Reactivity.layer,
         QueryReactivity.layer
       )
-      const context = yield* Layer.build(
-        LocalStore.layer({
-          ...options,
-          definition: Domain.definition,
-          spaceId,
-          clientId: firstClientId
-        }).pipe(
-          Layer.provide(runtime),
-          Layer.provide(infrastructure)
-        )
+      const context = yield* LocalStore.layer({
+        ...options,
+        definition: Domain.definition,
+        spaceId,
+        clientId: firstClientId
+      }).pipe(
+        Layer.provide(runtime),
+        Layer.provide(infrastructure),
+        Layer.build
       )
       const store = Context.get(context, LocalStore.Store)
 
       const mutations = []
       for (let index = 0; index < 4; index++) {
-        mutations.push(yield* store.mutate(Domain.PutTodo, Domain.todo(`pending-${index}`)))
+        const todo = Domain.todo(`pending-${index}`)
+        const mutation = yield* store.mutate(Domain.PutTodo, todo)
+        mutations.push(mutation)
       }
 
       assert.strictEqual(yield* pendingCount, 4)
@@ -207,7 +225,10 @@ describe("LocalStore metrics", () => {
       assert.strictEqual((yield* store.pending).length, 0)
       assert.strictEqual(yield* pendingCount, 0)
       assert.strictEqual(pendingReads, 5)
-    })).pipe(Effect.provideService(Metric.MetricRegistry, registry))
+    }).pipe(
+      Effect.scoped,
+      Effect.provideService(Metric.MetricRegistry, registry)
+    )
   })
 
   it.effect("removes an applied pending contribution when its update defects afterward", () => {
@@ -224,11 +245,12 @@ describe("LocalStore metrics", () => {
         Layer.provide(runtime),
         Layer.provide(clientDatabase)
       )
-      const context = yield* Layer.buildWithScope(Layer.merge(local, clientDatabase), scope)
+      const merged = Layer.merge(local, clientDatabase)
+      const context = yield* Layer.buildWithScope(merged, scope)
       const store = Context.get(context, LocalStore.Store)
-      const metadata = Array.from(registry.values()).find((entry) =>
-        entry.id === "effect_local_client_pending_mutation_count"
-      )
+      const values = registry.values()
+      const entries = Array.from(values)
+      const metadata = entries.find((entry) => entry.id === "effect_local_client_pending_mutation_count")
       assert.isDefined(metadata)
       const update = metadata.hooks.update.bind(metadata.hooks)
       let defectPendingIncrement = true
@@ -243,7 +265,8 @@ describe("LocalStore metrics", () => {
         }
       })
 
-      yield* store.mutate(Domain.PutTodo, Domain.todo("pending-metric-defect"))
+      const todo = Domain.todo("pending-metric-defect")
+      yield* store.mutate(Domain.PutTodo, todo)
       assert.strictEqual(yield* pendingCount, 1)
 
       yield* Scope.close(scope, Exit.void)
@@ -270,13 +293,11 @@ describe("LocalStore metrics", () => {
       return registrySet(key, { ...metadata, hooks })
     }
     return Effect.gen(function*() {
-      yield* Metric.update(
-        Metric.counter("effect_local_client_bootstrap_install", {
-          description: "Durable client bootstrap installations",
-          incremental: true
-        }),
-        0
-      )
+      const bootstrapInstall = Metric.counter("effect_local_client_bootstrap_install", {
+        description: "Durable client bootstrap installations",
+        incremental: true
+      })
+      yield* Metric.update(bootstrapInstall, 0)
       const scope = yield* Scope.make()
       const clientDatabase = database()
       const local = LocalStore.layer({
@@ -288,10 +309,12 @@ describe("LocalStore metrics", () => {
         Layer.provide(runtime),
         Layer.provide(clientDatabase)
       )
-      const context = yield* Layer.buildWithScope(Layer.merge(local, clientDatabase), scope)
+      const merged = Layer.merge(local, clientDatabase)
+      const context = yield* Layer.buildWithScope(merged, scope)
       const store = Context.get(context, LocalStore.Store)
       const sql = Context.get(context, SqlClient.SqlClient)
-      yield* store.mutate(Domain.PutTodo, Domain.todo("pending"))
+      const todo = Domain.todo("pending")
+      yield* store.mutate(Domain.PutTodo, todo)
       const manifest = Protocol.SnapshotManifest.make({
         spaceId,
         clientId: firstClientId,
@@ -311,20 +334,25 @@ describe("LocalStore metrics", () => {
         digest: Protocol.initialSnapshotDigest
       })
       yield* store.prepareBootstrap(manifest)
-      yield* store.stageBootstrapPage(Protocol.BootstrapPage.make({
+      const page = Protocol.BootstrapPage.make({
         manifest,
         entries: [],
         hasMore: false,
         serverSchema: Domain.definition.schemaIdentity
-      }))
+      })
+      yield* store.stageBootstrapPage(page)
       yield* sql`CREATE TRIGGER fail_projection_replay
         BEFORE INSERT ON effect_local_client_visible_entities_data
         BEGIN SELECT RAISE(FAIL, 'projection replay failed'); END`
       failBootstrapMetric = true
 
-      const error = yield* store.installBootstrap(manifest).pipe(Effect.flip)
+      const unexpectedSuccess = new UnexpectedBootstrapInstallSuccess()
+      const error = yield* store.installBootstrap(manifest).pipe(
+        Effect.as(unexpectedSuccess),
+        Effect.flip
+      )
 
-      assert.strictEqual(error._tag, "StorageUnavailable")
+      assert.strictEqual(error._tag, "StorageUnavailable", "bootstrap installation must fail during projection replay")
       assert.strictEqual(yield* store.cursor, 1)
       assert.strictEqual(yield* bootstrapInstallCount, 1)
       assert.strictEqual(yield* pendingCount, 1)

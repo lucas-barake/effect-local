@@ -1,13 +1,16 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
+import * as Result from "effect/Result"
 import * as Stream from "effect/Stream"
 import * as PresenceHub from "../src/PresenceHub.js"
 
@@ -17,6 +20,15 @@ const spaceC = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
 const spaceD = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000004")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const spoofedClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+
+const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(
+    Effect.result,
+    Effect.map((result) => {
+      if (Result.isFailure(result)) return result.failure
+      return assert.fail("expected Effect failure")
+    })
+  )
 
 const update = (spaceId: Identity.SpaceId): Protocol.PresenceUpdate => ({
   spaceId,
@@ -42,9 +54,12 @@ describe("PresenceHub", () => {
         Stream.runHead,
         Effect.forkChild({ startImmediately: true })
       )
-      yield* hub.publish(update(spaceA), { subject: "writer" })
+      yield* pipe(update(spaceA), (presence) => hub.publish(presence, { subject: "writer" }))
       const received = yield* Fiber.join(watcher)
-      assert.deepStrictEqual(Option.getOrUndefined(received), update(spaceA))
+      pipe(
+        Option.getOrUndefined(received),
+        (actual) => pipe(update(spaceA), (expected) => assert.deepStrictEqual(actual, expected))
+      )
 
       assert.deepStrictEqual(inputs, [
         {
@@ -65,24 +80,24 @@ describe("PresenceHub", () => {
   it.effect("uses an explicit trusted layer for applications without authorization", () =>
     Effect.gen(function*() {
       const hub = yield* PresenceHub.PresenceHub
-      yield* hub.publish(update(spaceA), null)
+      yield* pipe(update(spaceA), (presence) => hub.publish(presence, null))
     }).pipe(Effect.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 16 }))))
 
   it.effect("rejects an invalid channel capacity during layer construction", () =>
     Effect.gen(function*() {
-      const failure = yield* Layer.build(PresenceHub.layerTrusted({
+      const failure = yield* PresenceHub.layerTrusted({
         maximumWatchersPerSpace: 16,
         capacity: 0
-      })).pipe(Effect.flip)
+      }).pipe(Layer.build, failureOf)
       assert.strictEqual(failure._tag, "InvalidConfiguration")
       if (failure._tag === "InvalidConfiguration") assert.strictEqual(failure.option, "capacity")
     }))
 
   it.effect("rejects an invalid per-space watcher limit during layer construction", () =>
     Effect.gen(function*() {
-      const failure = yield* Layer.build(PresenceHub.layerTrusted({
+      const failure = yield* PresenceHub.layerTrusted({
         maximumWatchersPerSpace: 0
-      })).pipe(Effect.flip)
+      }).pipe(Layer.build, failureOf)
       assert.strictEqual(failure._tag, "InvalidConfiguration")
       if (failure._tag === "InvalidConfiguration") {
         assert.strictEqual(failure.option, "maximumWatchersPerSpace")
@@ -94,7 +109,7 @@ describe("PresenceHub", () => {
       maximumWatchersPerSpace: 16,
       authorize: (input) => {
         if (input._tag === "Publish" && input.clientId !== clientId) {
-          return Effect.fail("client identity mismatch")
+          return Effect.fail(new ReplicaError.AuthorizationDenied({ reason: "client identity mismatch" }))
         }
         return Effect.void
       }
@@ -105,7 +120,7 @@ describe("PresenceHub", () => {
       const failure = yield* hub.publish({
         ...update(spaceA),
         clientId: spoofedClientId
-      }, { subject: "writer" }).pipe(Effect.flip)
+      }, { subject: "writer" }).pipe(failureOf)
 
       assert.strictEqual(failure._tag, "AuthorizationDenied")
       if (failure._tag === "AuthorizationDenied") {
@@ -134,16 +149,16 @@ describe("PresenceHub", () => {
       yield* hub.publish({ ...update(spaceA), value: { cursor: 2 } }, null)
 
       const received = yield* Fiber.join(watchers[0])
-      assert.deepStrictEqual(Option.getOrUndefined(received)?.value, { cursor: 2 })
+      pipe(Option.getOrUndefined(received)?.value, (value) => assert.deepStrictEqual(value, { cursor: 2 }))
       yield* Effect.forEach(
         [spaceB, spaceC, spaceD],
         (spaceId, index) => hub.publish({ ...update(spaceId), value: { cursor: index + 3 } }, null),
         { discard: true }
       )
-      const isolated = yield* Fiber.joinAll(watchers.slice(1))
-      assert.deepStrictEqual(
+      const isolated = yield* pipe(watchers.slice(1), Fiber.joinAll)
+      pipe(
         isolated.map((entry) => Option.getOrUndefined(entry)?.value),
-        [{ cursor: 3 }, { cursor: 4 }, { cursor: 5 }]
+        (values) => assert.deepStrictEqual(values, [{ cursor: 3 }, { cursor: 4 }, { cursor: 5 }])
       )
     }).pipe(Effect.provide(live))
   })
@@ -154,7 +169,7 @@ describe("PresenceHub", () => {
       const failure = yield* hub.publish({
         ...update(spaceA),
         value: "x".repeat(Protocol.maximumPresenceBytes)
-      }, null).pipe(Effect.flip)
+      }, null).pipe(failureOf)
 
       assert.strictEqual(failure._tag, "CapacityExceeded")
       if (failure._tag === "CapacityExceeded") {
@@ -191,7 +206,7 @@ describe("PresenceHub", () => {
 
         const failure = yield* hub.watch(spaceA, null).pipe(
           Stream.runDrain,
-          Effect.flip
+          failureOf
         )
         assert.strictEqual(failure._tag, "CapacityExceeded")
         if (failure._tag === "CapacityExceeded") {
@@ -220,14 +235,17 @@ describe("PresenceHub", () => {
           Stream.runDrain,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* hub.publish(update(spaceA), null)
-        assert.deepStrictEqual(yield* Deferred.await(firstDelivered), update(spaceA))
+        yield* pipe(update(spaceA), (presence) => hub.publish(presence, null))
+        pipe(
+          yield* Deferred.await(firstDelivered),
+          (actual) => pipe(update(spaceA), (expected) => assert.deepStrictEqual(actual, expected))
+        )
         const active = (yield* Metric.snapshot).find(
           (snapshot) => snapshot.id === "effect_local_server_presence_watcher_count"
         )
         assert.isDefined(active)
 
-        const metadata = Array.from(registry.values()).find(
+        const metadata = pipe(registry.values(), (values) => Array.from(values)).find(
           (entry) => entry.id === "effect_local_server_presence_watcher_count"
         )
         assert.isDefined(metadata)
@@ -245,15 +263,18 @@ describe("PresenceHub", () => {
         })
 
         const defective = yield* hub.watch(spaceA, null).pipe(Stream.runDrain, Effect.exit)
-        assert.isTrue(Exit.isFailure(defective))
+        pipe(Exit.isFailure(defective), (isFailure) => assert.isTrue(isFailure))
 
         const replacement = yield* hub.watch(spaceA, null).pipe(
           Stream.runHead,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* hub.publish(update(spaceA), null)
+        yield* pipe(update(spaceA), (presence) => hub.publish(presence, null))
         const received = yield* Fiber.join(replacement)
-        assert.deepStrictEqual(Option.getOrUndefined(received), update(spaceA))
+        pipe(
+          Option.getOrUndefined(received),
+          (actual) => pipe(update(spaceA), (expected) => assert.deepStrictEqual(actual, expected))
+        )
         yield* Fiber.interrupt(first)
       }).pipe(Effect.provide(live))
     }).pipe(Effect.provideService(Metric.MetricRegistry, registry))
@@ -265,22 +286,27 @@ describe("PresenceHub", () => {
         maximumWatchersPerSpace: 1,
         authorize: (input) => {
           if (input._tag !== "Watch") return Effect.void
-          if (input.principal === "denied") return Effect.fail("denied")
+          if (input.principal === "denied") {
+            return Effect.fail(new ReplicaError.AuthorizationDenied({ reason: "denied" }))
+          }
           return Effect.void
         }
       })
 
       yield* Effect.gen(function*() {
         const hub = yield* PresenceHub.PresenceHub
-        const denied = yield* hub.watch(spaceA, "denied").pipe(Stream.runDrain, Effect.flip)
+        const denied = yield* hub.watch(spaceA, "denied").pipe(Stream.runDrain, failureOf)
         assert.strictEqual(denied._tag, "AuthorizationDenied")
 
         const replacement = yield* hub.watch(spaceA, "allowed").pipe(
           Stream.runHead,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* hub.publish(update(spaceA), null)
-        assert.deepStrictEqual(Option.getOrUndefined(yield* Fiber.join(replacement)), update(spaceA))
+        yield* pipe(update(spaceA), (presence) => hub.publish(presence, null))
+        pipe(
+          Option.getOrUndefined(yield* Fiber.join(replacement)),
+          (actual) => pipe(update(spaceA), (expected) => assert.deepStrictEqual(actual, expected))
+        )
       }).pipe(Effect.provide(live))
     })
   })
@@ -291,7 +317,9 @@ describe("PresenceHub", () => {
         maximumWatchersPerSpace: 1,
         authorize: (input) => {
           if (input._tag !== "Watch") return Effect.void
-          if (input.principal === "denied") return Effect.fail("denied")
+          if (input.principal === "denied") {
+            return Effect.fail(new ReplicaError.AuthorizationDenied({ reason: "denied" }))
+          }
           return Effect.void
         }
       })
@@ -304,8 +332,9 @@ describe("PresenceHub", () => {
           Stream.runDrain,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* hub.publish(update(spaceA), null)
-        assert.deepStrictEqual(yield* Deferred.await(delivered), update(spaceA))
+        yield* pipe(update(spaceA), (presence) => hub.publish(presence, null))
+        pipe(yield* Deferred.await(delivered), (actual) =>
+          pipe(update(spaceA), (expected) => assert.deepStrictEqual(actual, expected)))
 
         const excess = yield* hub.watch(spaceA, "allowed").pipe(Stream.runHead, Effect.flip)
         assert.strictEqual(excess._tag, "CapacityExceeded")
@@ -330,8 +359,9 @@ describe("PresenceHub", () => {
           Stream.runHead,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* hub.publish(update(spaceA), null)
-        assert.deepStrictEqual(Option.getOrUndefined(yield* Fiber.join(first)), update(spaceA))
+        yield* pipe(update(spaceA), (presence) => hub.publish(presence, null))
+        pipe(Option.getOrUndefined(yield* Fiber.join(first)), (actual) =>
+          pipe(update(spaceA), (expected) => assert.deepStrictEqual(actual, expected)))
 
         const replacement = yield* hub.watch(spaceA, null).pipe(
           Stream.runHead,
@@ -339,7 +369,8 @@ describe("PresenceHub", () => {
         )
         const next = { ...update(spaceA), value: { cursor: 2 } }
         yield* hub.publish(next, null)
-        assert.deepStrictEqual(Option.getOrUndefined(yield* Fiber.join(replacement)), next)
+        pipe(Option.getOrUndefined(yield* Fiber.join(replacement)), (actual) =>
+          assert.deepStrictEqual(actual, next))
       }).pipe(Effect.provide(live))
     }))
 
@@ -356,11 +387,13 @@ describe("PresenceHub", () => {
             Stream.runDrain,
             Effect.forkChild({ startImmediately: true })
           )
-          yield* hub.publish(update(spaceA), null)
-          assert.deepStrictEqual(yield* Deferred.await(delivered), update(spaceA))
+          yield* pipe(update(spaceA), (presence) => hub.publish(presence, null))
+          pipe(yield* Deferred.await(delivered), (actual) =>
+            pipe(update(spaceA), (expected) => assert.deepStrictEqual(actual, expected)))
 
           const active = (yield* Metric.snapshot).find(
-            (snapshot) => snapshot.id === "effect_local_server_presence_watcher_count"
+            (snapshot) =>
+              snapshot.id === "effect_local_server_presence_watcher_count"
           )
           assert.isDefined(active)
           assert.strictEqual(active.type, "Gauge")

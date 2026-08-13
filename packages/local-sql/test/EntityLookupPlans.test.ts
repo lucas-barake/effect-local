@@ -149,8 +149,9 @@ const windowedScope = Protocol.ReplicationScope.make({
 })
 
 const layers = () => {
+  const sqlite = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
   const database = Layer.mergeAll(
-    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    sqlite,
     NodeCrypto.layer,
     Reactivity.layer,
     QueryReactivity.layer
@@ -180,20 +181,18 @@ const layers = () => {
     authorizeMutation: () => Effect.void,
     authorizeRead: () => Effect.void
   }).pipe(Layer.provide(runtime), Layer.provide(database))
-  const remote = Layer.effect(
-    SyncEngine.SyncEngine,
-    Effect.gen(function*() {
-      const store = yield* ServerStore.ServerStore
-      return SyncEngine.SyncEngine.of({
-        waitForCredentialChange: () => Effect.never,
-        discard: (request) => store.discard(request, "reader"),
-        submit: store.submit,
-        pull: (request) => store.pullAuthorized(request, "reader"),
-        bootstrap: (request) => store.bootstrapAuthorized(request, "reader"),
-        watch: (request) => Stream.unwrap(store.watchAuthorized(request, "reader"))
-      })
+  const remoteEffect = Effect.gen(function*() {
+    const store = yield* ServerStore.ServerStore
+    return SyncEngine.SyncEngine.of({
+      waitForCredentialChange: () => Effect.never,
+      discard: (request) => store.discard(request, "reader"),
+      submit: store.submit,
+      pull: (request) => store.pullAuthorized(request, "reader"),
+      bootstrap: (request) => store.bootstrapAuthorized(request, "reader"),
+      watch: (request) => store.watchAuthorized(request, "reader").pipe(Stream.unwrap)
     })
-  ).pipe(Layer.provide(server))
+  })
+  const remote = Layer.effect(SyncEngine.SyncEngine, remoteEffect).pipe(Layer.provide(server))
   const local = LocalStore.layer({
     settlementCapacity: 64,
     retainedReceipts: 256,
@@ -216,8 +215,8 @@ const layers = () => {
 }
 
 describe("entity lookup query plans", () => {
-  it.effect("defers server index maintenance until the index is built", () =>
-    Effect.gen(function*() {
+  it.effect("defers server index maintenance until the index is built", () => {
+    const test = Effect.gen(function*() {
       nextSequence = 1
       const server = yield* ServerStore.ServerStore
       executions.length = 0
@@ -225,10 +224,12 @@ describe("entity lookup query plans", () => {
       yield* server.submit(yield* envelope(Domain.PutManyMessages.name, { count: 200, chats: 10 }))
       recording = false
       assert.strictEqual(serverIndexExecutions().length, 0)
-    }).pipe(Effect.provide(layers())), 120_000)
+    })
+    return test.pipe(Effect.provide(layers()))
+  }, 120_000)
 
-  it.effect("batches maintenance for a built server index", () =>
-    Effect.gen(function*() {
+  it.effect("batches maintenance for a built server index", () => {
+    const test = Effect.gen(function*() {
       nextSequence = 1
       const server = yield* ServerStore.ServerStore
       const reconciler = yield* Reconciler.Reconciliation
@@ -240,10 +241,12 @@ describe("entity lookup query plans", () => {
       yield* server.submit(yield* envelope(Domain.PutManyMessages.name, { count: 210, chats: 10 }))
       recording = false
       assert.isAtMost(serverIndexExecutions().length, 10)
-    }).pipe(Effect.provide(layers())), 120_000)
+    })
+    return test.pipe(Effect.provide(layers()))
+  }, 120_000)
 
-  it.effect("uses the server scan index for window ordering", () =>
-    Effect.gen(function*() {
+  it.effect("uses the server scan index for window ordering", () => {
+    const test = Effect.gen(function*() {
       nextSequence = 1
       const server = yield* ServerStore.ServerStore
       const reconciler = yield* Reconciler.Reconciliation
@@ -256,10 +259,12 @@ describe("entity lookup query plans", () => {
       assert.deepStrictEqual(plans.errors, [])
       assert.isAbove(plans.inspected, 0)
       assert.deepStrictEqual(plans.temporarySorts, [])
-    }).pipe(Effect.provide(layers())), 120_000)
+    })
+    return test.pipe(Effect.provide(layers()))
+  }, 120_000)
 
-  it.effect("resolves multi-entity lookups through the entity key index", () =>
-    Effect.gen(function*() {
+  it.effect("resolves multi-entity lookups through the entity key index", () => {
+    const test = Effect.gen(function*() {
       nextSequence = 1
       const server = yield* ServerStore.ServerStore
       const reconciler = yield* Reconciler.Reconciliation
@@ -274,5 +279,7 @@ describe("entity lookup query plans", () => {
       assert.deepStrictEqual(lookups.errors, [])
       assert.isAbove(lookups.inspected, 0)
       assert.deepStrictEqual(lookups.offenders, [])
-    }).pipe(Effect.provide(layers())), 120_000)
+    })
+    return test.pipe(Effect.provide(layers()))
+  }, 120_000)
 })

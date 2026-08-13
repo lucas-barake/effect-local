@@ -4,6 +4,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import { pipe } from "effect/Function"
 import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
@@ -54,13 +55,16 @@ export const makeMigration = (options: {
   const migration = {
     id: options.id,
     name: options.name,
-    checksum: Identity.SchemaHash.make(Canonical.hash({
-      format: 1,
-      id: options.id,
-      name: options.name,
-      statements,
-      effect: options.effect?.id ?? null
-    })),
+    checksum: pipe(
+      Canonical.hash({
+        format: 1,
+        id: options.id,
+        name: options.name,
+        statements,
+        effect: options.effect?.id ?? null
+      }),
+      (hash) => Identity.SchemaHash.make(hash)
+    ),
     statements
   }
   if (options.effect === undefined) return Object.freeze(migration)
@@ -68,12 +72,14 @@ export const makeMigration = (options: {
 }
 /* oxlint-enable effect/noThrowStatement, effect/noNewError */
 
+const PositiveInt = pipe(Schema.isGreaterThan(0), (check) => Schema.Int.check(check))
+const NonNegativeInt = pipe(Schema.isGreaterThanOrEqualTo(0), (check) => Schema.Int.check(check))
 const MigrationRow = Schema.Struct({
-  id: Schema.Int.check(Schema.isGreaterThan(0)),
+  id: PositiveInt,
   name: Schema.String,
   checksum: Identity.SchemaHash
 })
-const CountRow = Schema.Struct({ count: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) })
+const CountRow = Schema.Struct({ count: NonNegativeInt })
 const ForeignKeyCheckRow = Schema.Struct({
   table: Schema.String,
   rowid: Schema.NullOr(Schema.Int),
@@ -162,7 +168,7 @@ export const runCatalog = (
       let ledger = serverLedger
       if (catalog === "Client") ledger = clientLedger
       yield* sql.unsafe(ledger)
-      yield* sql.withTransaction(Effect.gen(function*() {
+      yield* Effect.gen(function*() {
         let read = readServer
         if (catalog === "Client") read = readClient
         const applied = yield* read(undefined).pipe(
@@ -205,7 +211,7 @@ export const runCatalog = (
           if (migration.effect !== undefined) yield* migration.effect(sql)
         }
         return yield* Effect.void
-      }))
+      }).pipe(sql.withTransaction)
     }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
     let attempt = 1

@@ -1,5 +1,13 @@
 import * as Schema from "effect/Schema"
 
+const defect = Schema.Defect()
+const optionalDefect = Schema.optionalKey(defect)
+const nonNegative = Schema.isGreaterThanOrEqualTo(0)
+const nonNegativeInt = Schema.Int.check(nonNegative)
+const optionalNonNegativeInt = Schema.optionalKey(nonNegativeInt)
+const positive = Schema.isGreaterThan(0)
+const positiveInt = Schema.Int.check(positive)
+
 export class CanonicalEncodeError extends Schema.TaggedErrorClass<CanonicalEncodeError>(
   "@lucas-barake/effect-local/CanonicalEncodeError"
 )("CanonicalEncodeError", { cause: Schema.Defect() }) {}
@@ -10,7 +18,7 @@ export class StorageUnavailable extends Schema.TaggedErrorClass<StorageUnavailab
 
 export class StorageCorrupt extends Schema.TaggedErrorClass<StorageCorrupt>(
   "@lucas-barake/effect-local/StorageCorrupt"
-)("StorageCorrupt", { message: Schema.String, cause: Schema.optionalKey(Schema.Defect()) }) {}
+)("StorageCorrupt", { message: Schema.String, cause: optionalDefect }) {}
 
 export class DefinitionMismatch extends Schema.TaggedErrorClass<DefinitionMismatch>(
   "@lucas-barake/effect-local/DefinitionMismatch"
@@ -115,7 +123,7 @@ export class UnknownCommitOutcome extends Schema.TaggedErrorClass<UnknownCommitO
 
 export class ProtocolInvalid extends Schema.TaggedErrorClass<ProtocolInvalid>(
   "@lucas-barake/effect-local/ProtocolInvalid"
-)("ProtocolInvalid", { message: Schema.String, cause: Schema.optionalKey(Schema.Defect()) }) {}
+)("ProtocolInvalid", { message: Schema.String, cause: optionalDefect }) {}
 
 export class UpgradeRequired extends Schema.TaggedErrorClass<UpgradeRequired>(
   "@lucas-barake/effect-local/UpgradeRequired"
@@ -138,7 +146,7 @@ export class ServerUnavailable extends Schema.TaggedErrorClass<ServerUnavailable
 export class CredentialRejected extends Schema.TaggedErrorClass<CredentialRejected>(
   "@lucas-barake/effect-local/CredentialRejected"
 )("CredentialRejected", {
-  credentialGeneration: Schema.optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
+  credentialGeneration: optionalNonNegativeInt
 }) {}
 
 export class AuthenticatorUnavailable extends Schema.TaggedErrorClass<AuthenticatorUnavailable>(
@@ -149,7 +157,7 @@ export class OperationTimeout extends Schema.TaggedErrorClass<OperationTimeout>(
   "@lucas-barake/effect-local/OperationTimeout"
 )("OperationTimeout", {
   operation: Schema.String,
-  timeoutMillis: Schema.Int.check(Schema.isGreaterThan(0))
+  timeoutMillis: positiveInt
 }) {}
 
 export class AuthorizationDenied extends Schema.TaggedErrorClass<AuthorizationDenied>(

@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest"
 import * as Schema from "effect/Schema"
 import * as Model from "../src/Model.js"
+import * as Mutation from "../src/Mutation.js"
 import * as Query from "../src/Query.js"
 import type * as SecondaryIndex from "../src/SecondaryIndex.js"
 import type * as Transaction from "../src/Transaction.js"
@@ -76,8 +77,21 @@ const typeContracts = (
 // @ts-expect-error static dependency fallbacks are not part of query declarations
 Query.make("LegacyDependencies", { dependsOn: [Todo] })
 
+class DeclaredFailure extends Schema.TaggedErrorClass<DeclaredFailure>(
+  "@lucas-barake/effect-local/test/DeclaredFailure"
+)("DeclaredFailure", {}) {}
+
+Query.make("TaggedFailure", { error: DeclaredFailure })
+Mutation.make("TaggedRejection", { version: 1, rejection: DeclaredFailure })
+
+// @ts-expect-error query errors must have a required _tag
+Query.make("UntaggedFailure", { error: Schema.String })
+// @ts-expect-error mutation rejections must have a required _tag
+Mutation.make("UntaggedRejection", { version: 1, rejection: Schema.String })
+
 void typeContracts
 
 it("preserves declared secondary index names at runtime", () => {
-  assert.deepStrictEqual(Object.keys(Todo.indexes), ["byProjectCreatedAt", "byPriority"])
+  const indexNames = Object.keys(Todo.indexes)
+  assert.deepStrictEqual(indexNames, ["byProjectCreatedAt", "byPriority"])
 })

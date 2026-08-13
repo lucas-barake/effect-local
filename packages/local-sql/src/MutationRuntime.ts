@@ -7,6 +7,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Result_ from "effect/Result"
 import * as Schema from "effect/Schema"
@@ -51,20 +52,24 @@ export type Handlers<D extends Definition.Any,> = D["mutations"][number] extends
   ? M extends Mutation.Mutation<infer Name, infer P, infer A, infer E> ? Mutation.HandlerService<Name, P, A, E> : never
   : never
 
+type AnyHandler = Mutation.HandlerService<
+  Mutation.Any["name"],
+  Mutation.Any["payloadSchema"],
+  Mutation.Any["successSchema"],
+  Mutation.ErrorSchema
+>
+
 export const layer = <D extends Definition.Any,>(
   definition: D,
   evolution: Evolution.Evolution = Evolution.make({ current: definition })
 ): Layer.Layer<MutationRuntime, never, Handlers<D>> =>
-  Layer.effect(
-    MutationRuntime,
+  pipe(
     Effect.gen(function*() {
       const context = yield* Effect.context<Handlers<D>>()
-      const handlers = new Map<string, Mutation.HandlerService<any, any, any, any>>()
+      const handlers = new Map<string, AnyHandler>()
       for (const mutation of definition.mutations) {
-        handlers.set(
-          mutation.name,
-          Context.getUnsafe<Mutation.HandlerService<any, any, any, any>, any>(mutation.handler)(context)
-        )
+        const handler = Context.getUnsafe<AnyHandler, AnyHandler>(mutation.handler)(context)
+        handlers.set(mutation.name, handler)
       }
       const execute = (
         name: string,
@@ -131,5 +136,6 @@ export const layer = <D extends Definition.Any,>(
             Effect.flatMap((current) => execute(current.name, current.payload, transaction, changes))
           )
       })
-    })
+    }),
+    Layer.effect(MutationRuntime)
   )

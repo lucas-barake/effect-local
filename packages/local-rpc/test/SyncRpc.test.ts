@@ -1,13 +1,25 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
+import * as Result from "effect/Result"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as SyncRpc from "../src/SyncRpc.js"
 
 const serialization = (maximumFrameBytes: number) =>
-  Layer.build(SyncRpc.layerJson({ maximumFrameBytes })).pipe(
-    Effect.map((context) => Context.get(context, RpcSerialization.RpcSerialization))
+  SyncRpc.layerJson({ maximumFrameBytes }).pipe(
+    Layer.build,
+    Effect.map(Context.get(RpcSerialization.RpcSerialization))
+  )
+
+const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(
+    Effect.result,
+    Effect.map((result) => {
+      if (Result.isFailure(result)) return result.failure
+      return assert.fail("expected Effect failure")
+    })
   )
 
 describe("SyncRpc serialization", () => {
@@ -17,7 +29,7 @@ describe("SyncRpc serialization", () => {
       const parser = service.makeUnsafe()
 
       assert.isFalse(service.includesFraming)
-      assert.deepStrictEqual(parser.decode("[{\"_tag\":\"Ping\"}]"), [{ _tag: "Ping" }])
+      pipe(parser.decode("[{\"_tag\":\"Ping\"}]"), (decoded) => assert.deepStrictEqual(decoded, [{ _tag: "Ping" }]))
       assert.throws(() => parser.decode(`"${"x".repeat(64)}"`), RangeError)
       assert.throws(() => parser.encode({ value: "x".repeat(64) }), RangeError)
     }))
@@ -45,15 +57,15 @@ describe("SyncRpc serialization", () => {
         }
       })
 
-      assert.notInclude(String(protocolDefect), "protocol secret")
-      assert.include(String(protocolDefect), "RemoteDefect")
-      assert.notInclude(String(typedFailure), "database secret")
-      assert.include(String(typedFailure), "Remote internal error")
+      pipe(String(protocolDefect), (serialized) => assert.notInclude(serialized, "protocol secret"))
+      pipe(String(protocolDefect), (serialized) => assert.include(serialized, "RemoteDefect"))
+      pipe(String(typedFailure), (serialized) => assert.notInclude(serialized, "database secret"))
+      pipe(String(typedFailure), (serialized) => assert.include(serialized, "Remote internal error"))
     }))
 
   it.effect("rejects an invalid frame bound while building the Layer", () =>
     Effect.gen(function*() {
-      const error = yield* serialization(0).pipe(Effect.flip)
+      const error = yield* serialization(0).pipe(failureOf)
       assert.strictEqual(error._tag, "InvalidConfiguration")
       if (error._tag === "InvalidConfiguration") assert.strictEqual(error.option, "maximumFrameBytes")
     }))

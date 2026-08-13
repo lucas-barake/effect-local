@@ -1,6 +1,7 @@
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
@@ -43,44 +44,40 @@ export class Authentication extends RpcMiddleware.Service<Authentication, {
 
 const credentialGenerationHeader = "x-effect-local-credential-generation"
 
-const CredentialGenerationHeader = Schema.NumberFromString.check(
-  Schema.isInt(),
-  Schema.isGreaterThanOrEqualTo(0)
+const CredentialGenerationHeader = Schema.isInt().pipe((isInt) =>
+  Schema.isGreaterThanOrEqualTo(0).pipe((isNonNegative) => Schema.NumberFromString.check(isInt, isNonNegative))
 )
 
-export const layerServer: Layer.Layer<Authentication, never, Authenticator> = Layer.effect(
-  Authentication,
-  Effect.gen(function*() {
-    const authenticator = yield* Authenticator
-    return Authentication.of((effect, options) =>
-      Effect.gen(function*() {
-        const authorization = options.headers.authorization
-        const credentialGeneration = yield* Schema.decodeUnknownEffect(
-          Schema.UndefinedOr(CredentialGenerationHeader)
-        )(options.headers[credentialGenerationHeader]).pipe(Effect.orElseSucceed(() => undefined))
-        if (authorization === undefined || !authorization.startsWith("Bearer ")) {
-          if (credentialGeneration === undefined) return yield* new ReplicaError.CredentialRejected()
-          return yield* new ReplicaError.CredentialRejected({ credentialGeneration })
-        }
-        const credential = Redacted.make(authorization.slice("Bearer ".length))
-        const principal = yield* authenticator.authenticate(credential).pipe(
-          Effect.catchTag(
-            "CredentialRejected",
-            () => {
-              if (credentialGeneration === undefined) return Effect.fail(new ReplicaError.CredentialRejected())
-              return Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration }))
-            }
-          )
+export const layerServer: Layer.Layer<Authentication, never, Authenticator> = Effect.gen(function*() {
+  const authenticator = yield* Authenticator
+  return Authentication.of((effect, options) =>
+    Effect.gen(function*() {
+      const authorization = options.headers.authorization
+      const credentialGeneration = yield* CredentialGenerationHeader.pipe(
+        Schema.UndefinedOr,
+        Schema.decodeUnknownEffect
+      )(options.headers[credentialGenerationHeader]).pipe(Effect.orElseSucceed(() => undefined))
+      if (authorization === undefined || !authorization.startsWith("Bearer ")) {
+        if (credentialGeneration === undefined) return yield* new ReplicaError.CredentialRejected()
+        return yield* new ReplicaError.CredentialRejected({ credentialGeneration })
+      }
+      const credential = pipe(authorization.slice("Bearer ".length), Redacted.make)
+      const principal = yield* authenticator.authenticate(credential).pipe(
+        Effect.catchTag(
+          "CredentialRejected",
+          () => {
+            if (credentialGeneration === undefined) return Effect.fail(new ReplicaError.CredentialRejected())
+            return Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration }))
+          }
         )
-        return yield* effect.pipe(Effect.provideService(Principal, principal))
-      })
-    )
-  })
-)
+      )
+      return yield* effect.pipe(Effect.provideService(Principal, principal))
+    })
+  )
+}).pipe(Layer.effect(Authentication))
 
-const layerClientMiddleware = RpcMiddleware.layerClient(
-  Authentication,
-  CredentialProvider.pipe(Effect.map((provider) =>
+const layerClientMiddleware = CredentialProvider.pipe(
+  Effect.map((provider) =>
     (({ next, request }) =>
       Effect.gen(function*() {
         const credential = yield* provider.acquire
@@ -92,23 +89,24 @@ const layerClientMiddleware = RpcMiddleware.layerClient(
             message: "credential generation must be a nonnegative safe integer"
           })
         }
+        const headers = Headers.set(
+          Headers.set(
+            request.headers,
+            "authorization",
+            `Bearer ${Redacted.value(credential.bearer)}`
+          ),
+          credentialGenerationHeader,
+          String(credential.generation)
+        )
         return yield* next({
           ...request,
-          headers: Headers.set(
-            Headers.set(
-              request.headers,
-              "authorization",
-              `Bearer ${Redacted.value(credential.bearer)}`
-            ),
-            credentialGenerationHeader,
-            String(credential.generation)
-          )
+          headers
         })
       })) satisfies RpcMiddleware.RpcMiddlewareClient<AuthenticationError, ReplicaError.InvalidConfiguration, never>
-  ))
+  ),
+  (middleware) => RpcMiddleware.layerClient(Authentication, middleware)
 )
 
-export const layerClient = Layer.merge(
-  layerClientMiddleware,
-  Layer.effect(CredentialProvider, CredentialProvider)
+export const layerClient = Layer.effect(CredentialProvider, CredentialProvider).pipe(
+  Layer.merge(layerClientMiddleware)
 )
