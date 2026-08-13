@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema"
+import * as Attachment from "./Attachment.js"
 
 const optionalDefect = Schema.optionalKey(Schema.Defect())
 const nonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
@@ -161,7 +162,12 @@ export class AuthorizationDenied extends Schema.TaggedErrorClass<AuthorizationDe
   "@lucas-barake/effect-local/AuthorizationDenied"
 )("AuthorizationDenied", { reason: Schema.Json }) {}
 
-export const StorageError = Schema.Union([StorageUnavailable, StorageCorrupt, CanonicalEncodeError])
+export const StorageError = Schema.Union([
+  StorageUnavailable,
+  StorageCorrupt,
+  CanonicalEncodeError,
+  Attachment.AttachmentStorageError
+])
 export type StorageError = typeof StorageError.Type
 
 export const ReplicaError = Schema.Union([
@@ -195,6 +201,14 @@ export const ReplicaError = Schema.Union([
   CredentialRejected,
   AuthenticatorUnavailable,
   OperationTimeout,
-  AuthorizationDenied
+  AuthorizationDenied,
+  Attachment.InvalidAttachmentReference,
+  Attachment.AttachmentTooLarge,
+  Attachment.AttachmentNotFound,
+  Attachment.AttachmentStorageError,
+  Attachment.AttachmentOffsetConflict,
+  Attachment.AttachmentLengthMismatch,
+  Attachment.AttachmentDigestMismatch,
+  Attachment.InvalidAttachmentRange
 ])
 export type ReplicaError = typeof ReplicaError.Type

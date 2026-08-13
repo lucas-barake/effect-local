@@ -229,7 +229,15 @@ export const makeManager = Effect.fnUntraced(function*(options: {
           CredentialRejected: (error) => Effect.die(error),
           AuthenticatorUnavailable: (error) => Effect.die(error),
           OperationTimeout: (error) => Effect.die(error),
-          AuthorizationDenied: (error) => Effect.die(error)
+          AuthorizationDenied: (error) => Effect.die(error),
+          InvalidAttachmentReference: (error) => Effect.die(error),
+          AttachmentTooLarge: (error) => Effect.die(error),
+          AttachmentNotFound: (error) => Effect.die(error),
+          AttachmentStorageError: (error) => Effect.die(error),
+          AttachmentOffsetConflict: (error) => Effect.die(error),
+          AttachmentLengthMismatch: (error) => Effect.die(error),
+          AttachmentDigestMismatch: (error) => Effect.die(error),
+          InvalidAttachmentRange: (error) => Effect.die(error)
         }),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
@@ -286,7 +294,15 @@ export const makeManager = Effect.fnUntraced(function*(options: {
           CredentialRejected: (error) => Effect.die(error),
           AuthenticatorUnavailable: (error) => Effect.die(error),
           OperationTimeout: (error) => Effect.die(error),
-          AuthorizationDenied: (error) => Effect.die(error)
+          AuthorizationDenied: (error) => Effect.die(error),
+          InvalidAttachmentReference: (error) => Effect.die(error),
+          AttachmentTooLarge: (error) => Effect.die(error),
+          AttachmentNotFound: (error) => Effect.die(error),
+          AttachmentStorageError: (error) => Effect.die(error),
+          AttachmentOffsetConflict: (error) => Effect.die(error),
+          AttachmentLengthMismatch: (error) => Effect.die(error),
+          AttachmentDigestMismatch: (error) => Effect.die(error),
+          InvalidAttachmentRange: (error) => Effect.die(error)
         }),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
