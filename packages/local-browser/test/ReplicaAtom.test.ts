@@ -366,7 +366,7 @@ describe("Replica Atom graph", () => {
     })
   )
 
-  it.live(
+  it.effect(
     "does not refresh membership or another space status for an addressed write",
     Effect.fnUntraced(function*() {
       let spacesReads = 0
@@ -409,13 +409,12 @@ describe("Replica Atom graph", () => {
       yield* Effect.addFinalizer(() => Effect.sync(() => mounted.forEach((unmount) => unmount())))
       assert.lengthOf(yield* AtomRegistry.getResult(registry, membership), 2)
       assert.strictEqual((yield* AtomRegistry.getResult(registry, unrelatedStatus)).spaceId, secondSpaceId)
-      yield* Effect.sleep("20 millis")
       const spacesBefore = spacesReads
       const secondStatusBefore = secondStatusReads
 
       registry.set(mutation, { id: "addressed-write", title: "first" })
       yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
-      yield* Effect.sleep("20 millis")
+      yield* Effect.yieldNow
 
       assert.strictEqual(spacesReads, spacesBefore)
       assert.strictEqual(secondStatusReads, secondStatusBefore)

@@ -8,11 +8,11 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
-import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
-import type * as Duration from "effect/Duration"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
@@ -26,10 +26,10 @@ import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
 import * as Codec from "./internal/codec.js"
+import * as Configuration from "./internal/configuration.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
@@ -87,7 +87,7 @@ interface ActiveRuntime {
   readonly queries: QueryExecutor.Service
   readonly reconciler: Reconciler.Service
   readonly reconciliation: Reconciler.ReconciliationService
-  readonly interruptReconciliation: Effect.Effect<void>
+  readonly cancelReconciliation: Effect.Effect<void>
 }
 
 interface RememberedEntry {
@@ -100,11 +100,22 @@ interface RememberedEntry {
   transition: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
   foreground: boolean
   leases: number
-  lastUsed: number
   leaving: boolean
   leaveCompletion: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
   workflowRegistration: ReconciliationWorkflow.RegistrationService | undefined
   summaryStatus: ReplicaStatus.ReplicaStatus
+  retryAttempt: number
+  retryVersion: number
+}
+
+type BackgroundWork =
+  | { readonly _tag: "Sync"; readonly spaceId: Identity.SpaceId }
+  | { readonly _tag: "Deactivate"; readonly entry: RememberedEntry; readonly runtime: ActiveRuntime }
+
+interface RetryWork {
+  readonly entry: RememberedEntry
+  readonly version: number
+  readonly readyAt: number
 }
 
 const RememberedRow = Schema.Struct({
@@ -118,17 +129,6 @@ const addressedStatus = (
   spaceId: Identity.SpaceId,
   status: ReplicaStatus.ReplicaStatus
 ): ReplicaStatus.SpaceStatus => ({ spaceId, ...status })
-
-const defectReplicaError = <A,>(
-  effect: Effect.Effect<A, ReplicaError.ReplicaError>
-): Effect.Effect<A> =>
-  effect.pipe(
-    Effect.exit,
-    Effect.flatMap((exit) => {
-      if (Exit.isSuccess(exit)) return Effect.succeed(exit.value)
-      return Effect.die(Cause.squash(exit.cause))
-    })
-  )
 
 type AggregateCounts = ReplicaStatus.Aggregate["counts"]
 type AggregateCategory = keyof AggregateCounts
@@ -179,6 +179,8 @@ const makeLayer = <D extends Definition.Any, R,>(
       const parentScope = yield* Effect.scope
       const rootContext = yield* Effect.context<BaseRequirements<D> | QueryReactivity.QueryReactivity | R>()
       const entries = new Map<Identity.SpaceId, RememberedEntry>()
+      const joining = new Map<Identity.SpaceId, Deferred.Deferred<void>>()
+      const foregroundResidents = new Map<Identity.SpaceId, RememberedEntry>()
       const aggregate = yield* Ref.make(aggregateStatus(0, 0, {
         offline: 0,
         connecting: 0,
@@ -187,7 +189,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         failed: 0
       }))
       let nextGeneration = 0
-      let accessOrder = 0
       const workflow = yield* workflowEngine
       if (
         !Number.isSafeInteger(options.maximumActiveSpaces) ||
@@ -234,8 +235,24 @@ const makeLayer = <D extends Definition.Any, R,>(
         options.maximumActiveSpaces - options.foregroundActiveSpaces,
         reconciliationConcurrency - foregroundReconciliationConcurrency
       )
-      const backgroundQueue = yield* Queue.unbounded<Identity.SpaceId>()
+      const backgroundActiveSpaces = yield* Semaphore.make(
+        options.maximumActiveSpaces - options.foregroundActiveSpaces
+      )
+      const foregroundWorkflowTurns = yield* Semaphore.make(foregroundReconciliationConcurrency)
+      const backgroundWorkflowTurns = yield* Semaphore.make(
+        reconciliationConcurrency - foregroundReconciliationConcurrency
+      )
+      const retryTiming = yield* Configuration.retryTiming(options)
+      const backgroundQueue = yield* Effect.acquireRelease(
+        Queue.unbounded<BackgroundWork>(),
+        Queue.shutdown
+      )
+      const retryQueue = yield* Effect.acquireRelease(
+        Queue.unbounded<RetryWork>(),
+        Queue.shutdown
+      )
       const backgroundQueued = new Set<Identity.SpaceId>()
+      const retrySchedule: Array<RetryWork> = []
       let capacityChanged = yield* Deferred.make<void>()
 
       yield* Migrations.client({
@@ -251,10 +268,6 @@ const makeLayer = <D extends Definition.Any, R,>(
       const defaultScopeJson = yield* Codec.stringify(normalizedDefaultScope)
       const defaultScopeDigest = yield* Protocol.replicationScopeDigest(normalizedDefaultScope)
 
-      const mapStorageError = (cause: unknown) => {
-        if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
-        return new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })
-      }
       const invalidateAggregate = reactivity.invalidate([ReactivityKey.aggregateStatus])
       const changeAggregate = (
         update: (current: ReplicaStatus.Aggregate) => ReplicaStatus.Aggregate,
@@ -390,6 +403,12 @@ const makeLayer = <D extends Definition.Any, R,>(
         const spaceId = entry.spaceId
         const childScope = yield* Scope.fork(parentScope)
         return yield* Effect.gen(function*() {
+          if (!foreground) {
+            yield* Effect.acquireRelease(
+              backgroundActiveSpaces.take(1),
+              () => backgroundActiveSpaces.release(1)
+            ).pipe(Scope.provide(childScope))
+          }
           const layerMutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
           const layerLocalStore = LocalStore.layer({
             ...options,
@@ -401,7 +420,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           let queries: QueryExecutor.Service
           let reconciler: Reconciler.Service
           let reconciliation: Reconciler.ReconciliationService
-          let interruptReconciliation = Effect.void
+          let cancelReconciliation = Effect.void
           if (workflow !== undefined) {
             const workflowContext = Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow)
             const layerReconciliation = Reconciler.layerOnePass({
@@ -446,7 +465,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                 shutdown: Effect.void
               })
             }
-            interruptReconciliation = reconciler.shutdown
+            cancelReconciliation = reconciler.shutdown
           } else {
             if (manager === undefined) return yield* Effect.die("Reconciler manager was not initialized")
             const runtime = yield* Layer.mergeAll(
@@ -508,7 +527,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             queries,
             reconciler,
             reconciliation,
-            interruptReconciliation
+            cancelReconciliation
           } satisfies ActiveRuntime
         }).pipe(
           Effect.onExit((exit) => {
@@ -518,16 +537,74 @@ const makeLayer = <D extends Definition.Any, R,>(
         )
       })
 
-      const enqueueBackground = (entry: RememberedEntry) =>
+      const enqueueBackground = (entry: RememberedEntry, resetRetry = true) =>
         Effect.suspend(() => {
           if (entry.leaving || backgroundQueued.has(entry.spaceId)) return Effect.void
+          if (resetRetry) {
+            entry.retryAttempt = 0
+            entry.retryVersion += 1
+          }
           backgroundQueued.add(entry.spaceId)
-          return Queue.offer(backgroundQueue, entry.spaceId).pipe(Effect.asVoid)
+          return Queue.offer(backgroundQueue, { _tag: "Sync", spaceId: entry.spaceId }).pipe(Effect.asVoid)
         })
+
+      const scheduleBackgroundRetry = Effect.fnUntraced(function*(entry: RememberedEntry) {
+        if (entries.get(entry.spaceId) !== entry || entry.leaving || entry.foreground) return
+        entry.retryAttempt += 1
+        entry.retryVersion += 1
+        const readyAt = (yield* Clock.currentTimeMillis) + Configuration.retryMillis(retryTiming, entry.retryAttempt)
+        yield* Queue.offer(retryQueue, { entry, version: entry.retryVersion, readyAt })
+      })
+
+      const retrySchedulerTurn = Effect.suspend(() => {
+        const insert = (work: RetryWork) => {
+          retrySchedule.push(work)
+          retrySchedule.sort((left, right) => left.readyAt - right.readyAt)
+        }
+        if (retrySchedule.length === 0) {
+          return Queue.take(retryQueue).pipe(
+            Effect.tap((work) => {
+              insert(work)
+              return Effect.void
+            }),
+            Effect.asVoid
+          )
+        }
+        return Clock.currentTimeMillis.pipe(
+          Effect.flatMap((now) => {
+            const next = retrySchedule[0]
+            if (next.readyAt <= now) {
+              retrySchedule.shift()
+              if (
+                entries.get(next.entry.spaceId) !== next.entry ||
+                next.entry.leaving ||
+                next.entry.foreground ||
+                next.entry.retryVersion !== next.version
+              ) return Effect.void
+              return enqueueBackground(next.entry, false)
+            }
+            return Effect.raceFirst(
+              Queue.take(retryQueue).pipe(Effect.map((work) => Option.some(work))),
+              Effect.sleep(Duration.millis(next.readyAt - now)).pipe(Effect.as(Option.none<RetryWork>()))
+            ).pipe(
+              Effect.tap(Option.match({
+                onNone: () => Effect.void,
+                onSome: (work) => {
+                  insert(work)
+                  return Effect.void
+                }
+              })),
+              Effect.asVoid
+            )
+          })
+        )
+      })
 
       const deactivate = (
         entry: RememberedEntry,
-        explicit: boolean
+        explicit: boolean,
+        expectedRuntime?: ActiveRuntime,
+        enqueuePending = true
       ): Effect.Effect<boolean, ReplicaError.ReplicaError> =>
         Effect.uninterruptibleMask(Effect.fnUntraced(function*(restore) {
           if (entries.get(entry.spaceId) !== entry) {
@@ -537,23 +614,30 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (entry.activation === "Activating" || entry.activation === "Deactivating") {
             const transition = entry.transition
             if (transition !== undefined) yield* restore(Deferred.await(transition))
-            return yield* deactivate(entry, explicit)
+            return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
           }
           const runtime = entry.runtime
           if (runtime === undefined) {
             entry.activation = "Inactive"
             return false
           }
-          if (!explicit && entry.leases > 0) return false
+          if (
+            expectedRuntime !== undefined &&
+            (runtime !== expectedRuntime || runtime.foreground || entry.foreground)
+          ) return false
+          if (entry.leases > 0) {
+            if (!explicit) return false
+            const changed = capacityChanged
+            yield* restore(Deferred.await(changed))
+            return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
+          }
           const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           entry.activation = "Deactivating"
           entry.transition = completion
           entry.foreground = false
+          foregroundResidents.delete(entry.spaceId)
           yield* invalidateActivation(entry.spaceId)
-          const shutdown = Effect.all([
-            runtime.interruptReconciliation,
-            Scope.close(runtime.scope, Exit.void)
-          ], { concurrency: "unbounded", discard: true })
+          const shutdown = Scope.close(runtime.scope, Exit.void)
           const result = yield* restore(
             runtime.local.shutdownSettlements.pipe(
               Effect.andThen(
@@ -571,23 +655,44 @@ const makeLayer = <D extends Definition.Any, R,>(
             yield* result
             return false
           }
-          const count = yield* pendingCount(entry.spaceId).pipe(Effect.mapError(mapStorageError))
+          const count = yield* pendingCount(entry.spaceId).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({
+                    message: "Client membership row is corrupt",
+                    cause
+                  })
+                ),
+              NoSuchElementError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({
+                    message: "Client membership row is missing",
+                    cause
+                  })
+                )
+            }),
+            Effect.tapError(() => {
+              if (enqueuePending) return enqueueBackground(entry)
+              return Effect.void
+            })
+          )
           yield* updateContribution(entry, { _tag: "Offline", pending: count.count })
-          if (count.count > 0 && !entry.leaving) yield* enqueueBackground(entry)
+          if (enqueuePending && count.count > 0 && !entry.leaving) yield* enqueueBackground(entry)
           return true
         }))
 
       const ensureForegroundCapacity = (entry: RememberedEntry): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.suspend(() => {
-          const foreground = Array.from(entries.values()).filter((candidate) =>
-            candidate !== entry &&
-            candidate.foreground &&
-            (candidate.activation === "Active" || candidate.activation === "Activating")
-          )
-          if (foreground.length < options.foregroundActiveSpaces) return Effect.void
-          const victim = foreground
-            .filter((candidate) => candidate.activation === "Active" && candidate.leases === 0)
-            .toSorted((left, right) => left.lastUsed - right.lastUsed)[0]
+          if (foregroundResidents.size <= options.foregroundActiveSpaces) return Effect.void
+          let victim: RememberedEntry | undefined
+          for (const candidate of foregroundResidents.values()) {
+            if (candidate !== entry && candidate.activation === "Active" && candidate.leases === 0) {
+              victim = candidate
+              break
+            }
+          }
           if (victim !== undefined) return deactivate(victim, false).pipe(Effect.asVoid)
           const changed = capacityChanged
           return Deferred.await(changed).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
@@ -602,10 +707,22 @@ const makeLayer = <D extends Definition.Any, R,>(
             return yield* new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId })
           }
           if (foreground && !entry.foreground) {
-            yield* restore(ensureForegroundCapacity(entry))
             entry.foreground = true
+            foregroundResidents.delete(entry.spaceId)
+            foregroundResidents.set(entry.spaceId, entry)
+            yield* restore(ensureForegroundCapacity(entry)).pipe(
+              Effect.onExit((exit) => {
+                if (Exit.isSuccess(exit) || entry.activation === "Active") return Effect.void
+                entry.foreground = false
+                foregroundResidents.delete(entry.spaceId)
+                return signalCapacity
+              })
+            )
           }
-          entry.lastUsed = ++accessOrder
+          if (foreground) {
+            foregroundResidents.delete(entry.spaceId)
+            foregroundResidents.set(entry.spaceId, entry)
+          }
           if (entry.activation === "Active" && entry.runtime !== undefined) {
             if (!foreground || entry.runtime.foreground) return entry.runtime
             if (entry.leases > 0) {
@@ -641,6 +758,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.activation = "Inactive"
           entry.transition = undefined
           entry.foreground = false
+          foregroundResidents.delete(entry.spaceId)
           yield* Deferred.done(completion, result)
           yield* invalidateActivation(entry.spaceId)
           yield* signalCapacity
@@ -652,7 +770,10 @@ const makeLayer = <D extends Definition.Any, R,>(
           Effect.tap(() =>
             Effect.sync(() => {
               entry.leases += 1
-              entry.lastUsed = ++accessOrder
+              if (foreground) {
+                foregroundResidents.delete(entry.spaceId)
+                foregroundResidents.set(entry.spaceId, entry)
+              }
             })
           )
         )
@@ -795,12 +916,12 @@ const makeLayer = <D extends Definition.Any, R,>(
                 yield* continueCancellation(runtime, canceled)
                 return receipt
               })().pipe(
-                Effect.ensuring(
-                  defectReplicaError(
-                    runtime.local.pendingCount.pipe(
-                      Effect.flatMap((pending) => updatePendingContribution(entry, pending)),
-                      Effect.andThen(runtime.reconciler.notify)
-                    )
+                Effect.exit,
+                Effect.flatMap((exit) =>
+                  runtime.local.pendingCount.pipe(
+                    Effect.flatMap((pending) => updatePendingContribution(entry, pending)),
+                    Effect.andThen(runtime.reconciler.notify),
+                    Effect.andThen(exit)
                   )
                 )
               )),
@@ -832,12 +953,12 @@ const makeLayer = <D extends Definition.Any, R,>(
                 }
                 return Quarantine.Resubmitted.make({ pending })
               })().pipe(
-                Effect.ensuring(
-                  defectReplicaError(
-                    runtime.local.pendingCount.pipe(
-                      Effect.flatMap((pending) => updatePendingContribution(entry, pending)),
-                      Effect.andThen(runtime.reconciler.notify)
-                    )
+                Effect.exit,
+                Effect.flatMap((exit) =>
+                  runtime.local.pendingCount.pipe(
+                    Effect.flatMap((pending) => updatePendingContribution(entry, pending)),
+                    Effect.andThen(runtime.reconciler.notify),
+                    Effect.andThen(exit)
                   )
                 )
               )),
@@ -849,7 +970,23 @@ const makeLayer = <D extends Definition.Any, R,>(
               )
             }
             return pendingCount(entry.spaceId).pipe(
-              Effect.mapError(mapStorageError),
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({
+                      message: "Client membership row is corrupt",
+                      cause
+                    })
+                  ),
+                NoSuchElementError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({
+                      message: "Client membership row is missing",
+                      cause
+                    })
+                  )
+              }),
               Effect.map((row) => addressedStatus(entry.spaceId, { _tag: "Offline", pending: row.count }))
             )
           })
@@ -872,31 +1009,36 @@ const makeLayer = <D extends Definition.Any, R,>(
           transition: undefined,
           foreground: false,
           leases: 0,
-          lastUsed: 0,
           leaving: false,
           leaveCompletion: undefined,
           workflowRegistration: undefined,
-          summaryStatus: { _tag: "Offline", pending: row.count }
+          summaryStatus: { _tag: "Offline", pending: row.count },
+          retryAttempt: 0,
+          retryVersion: 0
         }
         if (workflow !== undefined) {
           const lease = ReconciliationWorkflow.RuntimeLease.of({
-            acquire: Effect.acquireRelease(
-              acquire(entry, false).pipe(
-                Effect.map((runtime) => ({
-                  local: runtime.local,
-                  reconciliation: runtime.reconciliation
-                }))
-              ),
-              () =>
-                release(entry).pipe(
-                  Effect.andThen(
-                    Effect.suspend(() => {
-                      if (entry.foreground || entry.activation !== "Active") return Effect.void
-                      return defectReplicaError(deactivate(entry, false)).pipe(Effect.asVoid)
-                    })
+            acquire: Effect.gen(function*() {
+              const foreground = entry.foreground
+              const leaseRuntime = yield* Effect.acquireRelease(
+                acquire(entry, foreground),
+                (runtime) =>
+                  release(entry).pipe(
+                    Effect.andThen(Queue.offer(backgroundQueue, { _tag: "Deactivate", entry, runtime })),
+                    Effect.asVoid
                   )
-                )
-            )
+              )
+              return {
+                local: leaseRuntime.local,
+                reconciliation: leaseRuntime.reconciliation
+              }
+            }),
+            admit: (effect) =>
+              Effect.suspend(() => {
+                let turns = backgroundWorkflowTurns
+                if (entry.foreground) turns = foregroundWorkflowTurns
+                return turns.withPermit(effect)
+              })
           })
           const registrationContext = Context.add(
             Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow),
@@ -942,10 +1084,30 @@ const makeLayer = <D extends Definition.Any, R,>(
               yield* restore(Deferred.await(current.leaveCompletion))
               return yield* join(spaceId)
             }
-            const entry = yield* restore(
+            const activeJoin = joining.get(spaceId)
+            if (activeJoin !== undefined) {
+              yield* restore(Deferred.await(activeJoin))
+              return yield* join(spaceId)
+            }
+            const completion = yield* Deferred.make<void>()
+            joining.set(spaceId, completion)
+            const result = yield* restore(
               sql.withTransaction(insertMembership(spaceId)).pipe(
                 Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
-                Effect.andThen(readMembership(spaceId).pipe(Effect.mapError(mapStorageError))),
+                Effect.andThen(
+                  readMembership(spaceId).pipe(
+                    Effect.catchTags({
+                      SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                      SchemaError: (cause) =>
+                        Effect.fail(
+                          new ReplicaError.StorageCorrupt({
+                            message: "Client membership row is corrupt",
+                            cause
+                          })
+                        )
+                    })
+                  )
+                ),
                 Effect.flatMap(Option.match({
                   onNone: () =>
                     Effect.fail(
@@ -954,21 +1116,31 @@ const makeLayer = <D extends Definition.Any, R,>(
                       })
                     ),
                   onSome: createEntry
-                }))
+                })),
+                Effect.tap((entry) => {
+                  entries.set(spaceId, entry)
+                  return addContribution(entry).pipe(
+                    Effect.andThen(reactivity.invalidate([
+                      ReactivityKey.membership(spaceId),
+                      ReactivityKey.spaces
+                    ]))
+                  )
+                })
               )
-            )
-            entries.set(spaceId, entry)
-            yield* addContribution(entry)
-            yield* reactivity.invalidate([
-              ReactivityKey.membership(spaceId),
-              ReactivityKey.spaces
-            ])
-            return entry.handle
+            ).pipe(Effect.exit)
+            if (joining.get(spaceId) === completion) joining.delete(spaceId)
+            yield* Deferred.succeed(completion, undefined)
+            return yield* result.pipe(Effect.map((entry) => entry.handle))
           })
         )
 
       const leave = (spaceId: Identity.SpaceId): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.uninterruptibleMask(Effect.fnUntraced(function*(restore) {
+          const activeJoin = joining.get(spaceId)
+          if (activeJoin !== undefined) {
+            yield* restore(Deferred.await(activeJoin))
+            return yield* leave(spaceId)
+          }
           const current = entries.get(spaceId)
           if (current?.leaveCompletion !== undefined) {
             return yield* restore(Deferred.await(current.leaveCompletion))
@@ -986,7 +1158,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           current.leaving = true
           current.leaveCompletion = completion
-          const cleanup = deactivate(current, true).pipe(
+          const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
+            Effect.andThen(deactivate(current, true)),
             Effect.andThen(
               sql.withTransaction(
                 sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
@@ -1035,19 +1208,45 @@ const makeLayer = <D extends Definition.Any, R,>(
       const status = Ref.get(aggregate)
 
       const backgroundTurn = Effect.gen(function*() {
-        const spaceId = yield* Queue.take(backgroundQueue)
+        const work = yield* Queue.take(backgroundQueue)
+        if (work._tag === "Deactivate") {
+          const result = yield* deactivate(work.entry, false, work.runtime, false).pipe(Effect.result)
+          if (Result.isFailure(result)) yield* scheduleBackgroundRetry(work.entry)
+          return
+        }
+        const spaceId = work.spaceId
         backgroundQueued.delete(spaceId)
         const entry = entries.get(spaceId)
         if (entry === undefined || entry.leaving) return
+        let activeRuntime: ActiveRuntime | undefined
         const result = yield* Effect.acquireUseRelease(
-          acquire(entry, false),
-          (runtime) => runtime.reconciler.sync,
+          acquire(entry, false).pipe(Effect.tap((runtime) => {
+            activeRuntime = runtime
+            return Effect.void
+          })),
+          (runtime) => {
+            if (workflow === undefined) return runtime.reconciler.sync
+            return backgroundWorkflowTurns.withPermit(runtime.reconciler.sync)
+          },
           () => release(entry)
         ).pipe(Effect.result)
-        yield* deactivate(entry, false)
+        if (activeRuntime !== undefined) {
+          const deactivation = yield* deactivate(
+            entry,
+            false,
+            activeRuntime,
+            Result.isSuccess(result)
+          ).pipe(Effect.result)
+          if (Result.isFailure(deactivation)) {
+            yield* scheduleBackgroundRetry(entry)
+            return
+          }
+        }
         if (Result.isFailure(result)) {
-          yield* Effect.sleep(options.retryDelay ?? "100 millis")
-          if (entries.get(spaceId) === entry && !entry.foreground) yield* enqueueBackground(entry)
+          yield* scheduleBackgroundRetry(entry)
+        } else {
+          entry.retryAttempt = 0
+          entry.retryVersion += 1
         }
       })
 
@@ -1056,8 +1255,20 @@ const makeLayer = <D extends Definition.Any, R,>(
         () => backgroundTurn.pipe(Effect.forever, Effect.forkScoped({ startImmediately: true })),
         { discard: true }
       )
+      yield* retrySchedulerTurn.pipe(Effect.forever, Effect.forkScoped({ startImmediately: true }))
 
-      const restored = yield* readMemberships(undefined).pipe(Effect.mapError(mapStorageError))
+      const restored = yield* readMemberships(undefined).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+          SchemaError: (cause) =>
+            Effect.fail(
+              new ReplicaError.StorageCorrupt({
+                message: "Client membership row is corrupt",
+                cause
+              })
+            )
+        })
+      )
       for (const row of restored) {
         const entry = yield* createEntry(row)
         entries.set(row.space_id, entry)

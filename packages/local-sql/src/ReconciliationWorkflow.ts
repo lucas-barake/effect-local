@@ -148,6 +148,9 @@ export interface RuntimeServices {
 
 export interface RuntimeLeaseService {
   readonly acquire: Effect.Effect<RuntimeServices, ReplicaError.ReplicaError, Scope.Scope>
+  readonly admit: <A, E extends { readonly _tag: string }, R,>(
+    effect: Effect.Effect<A, E, R>
+  ) => Effect.Effect<A, E, R>
 }
 
 export class RuntimeLease extends Context.Service<RuntimeLease, RuntimeLeaseService>()(
@@ -226,7 +229,7 @@ const handler = (
   configuration: RetryConfigurationService,
   registrationState: WorkflowRegistrationState,
   membershipIncarnation: Identity.MembershipIncarnation,
-  acquire: Effect.Effect<RuntimeServices, ReplicaError.ReplicaError, Scope.Scope>
+  lease: RuntimeLeaseService
 ) =>
   Effect.fnUntraced(function*(payload: Payload) {
     if (
@@ -285,17 +288,17 @@ const handler = (
         const result = yield* Activity.make({
           name: `${name}/${attempt}`,
           error: ReplicaError.ReplicaError,
-          execute: Effect.scoped(acquire.pipe(
+          execute: Effect.scoped(lease.acquire.pipe(
             Effect.flatMap((runtime) => {
               if (runtime.local.membershipIncarnation !== membershipIncarnation) {
                 return Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: payload.spaceId }))
               }
-              return execute(runtime)
+              return lease.admit(execute(runtime))
             })
           ))
         }).pipe(Effect.result)
         if (Result.isSuccess(result)) return
-        yield* Effect.scoped(acquire.pipe(
+        yield* Effect.scoped(lease.acquire.pipe(
           Effect.flatMap((runtime) => runtime.reconciliation.failed(result.failure))
         ))
         if (
@@ -327,7 +330,7 @@ const handler = (
       ))
     yield* runActivity("complete", ({ local }) =>
       Effect.andThen(validateScope(local), local.completeReconciliation(payload.generation)))
-    yield* Effect.scoped(acquire.pipe(
+    yield* Effect.scoped(lease.acquire.pipe(
       Effect.flatMap((runtime) =>
         runtime.reconciliation.succeeded
       )
@@ -365,16 +368,19 @@ const layerRegistrationWithConfiguration = (
       clientId: options.clientId,
       membershipIncarnation: local.membershipIncarnation
     })
-    const acquire = Effect.acquireRelease(
-      Effect.succeed({ local, reconciliation }),
-      () => Effect.void
-    )
+    const lease = RuntimeLease.of({
+      acquire: Effect.acquireRelease(
+        Effect.succeed({ local, reconciliation }),
+        () => Effect.void
+      ),
+      admit: (effect) => effect
+    })
     const workflowHandler = handler(
       options,
       configuration,
       registrationState,
       local.membershipIncarnation,
-      acquire
+      lease
     )
     yield* engine.register(workflow, workflowHandler).pipe(Scope.provide(registrationScope))
     const registered = registrationState.schemas.get(replicaKey)
@@ -461,7 +467,7 @@ const layerDetachedRegistrationWithConfiguration = (
         configuration,
         registrationState,
         options.membershipIncarnation,
-        lease.acquire
+        lease
       )
     ).pipe(Scope.provide(registrationScope))
     const registered = registrationState.schemas.get(replicaKey)

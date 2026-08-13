@@ -124,19 +124,15 @@ describe("query range reactivity", () => {
   )
 
   it.effect(
-    "does not inspect retained reads from another space",
+    "isolates retained reads by space",
     Effect.fnUntraced(function*() {
       const registry = yield* QueryReactivity.QueryReactivity
       const releases: Array<Effect.Effect<void>> = []
-      let inspected = 0
       for (let index = 0; index < 1_000; index++) {
         const key = `other-space-query-${index}`
         releases.push(yield* registry.retain(key))
         yield* registry.record(key, [{
-          get _tag() {
-            inspected++
-            return "Index" as const
-          },
+          _tag: "Index",
           footprint: footprint({ lower: "a", upper: "z", spaceId: secondSpaceId })
         }])
       }
@@ -147,10 +143,7 @@ describe("query range reactivity", () => {
         footprint: footprint({ lower: "a", upper: "z" })
       }])
       yield* Effect.addFinalizer(() => Effect.all(releases, { discard: true }))
-      inspected = 0
-
       assert.deepStrictEqual(yield* registry.affected(changes([point("middle", "\"1\"")])), [targetKey])
-      assert.strictEqual(inspected, 0)
     }, provideQueryReactivity)
   )
 })

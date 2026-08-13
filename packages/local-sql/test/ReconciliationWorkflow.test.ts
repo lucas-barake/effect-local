@@ -309,6 +309,62 @@ describe("reconciliation workflow", () => {
   )
 
   it.effect(
+    "lets an active workflow turn finish when its foreground runtime is deactivated",
+    Effect.fnUntraced(function*() {
+      const pullEntered = yield* Deferred.make<void>()
+      const releasePull = yield* Deferred.make<void>()
+      const pullInterrupted = yield* Deferred.make<void>()
+      const activeWatches = yield* Ref.make(0)
+      const layerBlockedSync = pipe(
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
+          discard: () => Effect.die("unexpected discard"),
+          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          pull: () =>
+            Deferred.succeed(pullEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releasePull)),
+              Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable())),
+              Effect.onInterrupt(() => Deferred.succeed(pullInterrupted, undefined))
+            ),
+          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          watch: () =>
+            Effect.acquireRelease(
+              Ref.update(activeWatches, (count) => count + 1).pipe(Effect.as(Stream.never)),
+              () => Ref.update(activeWatches, (count) => count - 1)
+            ).pipe(Stream.unwrap)
+        }),
+        Layer.succeed(SyncEngine.SyncEngine)
+      )
+      const layerReplica = SqlReplica.layerWorkflow({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId,
+        retryDelay: "1 hour",
+        maximumRetryDelay: "1 hour"
+      }).pipe(
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(database()),
+        Layer.provide(layerBlockedSync),
+        Layer.provideMerge(WorkflowEngine.layerMemory)
+      )
+      const context = yield* Layer.build(layerReplica)
+      const replica = Context.get(context, Replica.Replica)
+      const space = yield* replica.space(spaceId)
+      yield* space.activate
+      yield* Deferred.await(pullEntered)
+      assert.strictEqual(yield* Ref.get(activeWatches), 1)
+
+      const deactivation = yield* Effect.forkChild(space.deactivate, { startImmediately: true })
+      yield* Effect.yieldNow
+      assert.isFalse(yield* Deferred.isDone(pullInterrupted))
+      yield* Deferred.succeed(releasePull, undefined)
+      yield* Fiber.join(deactivation)
+      assert.strictEqual(yield* Ref.get(activeWatches), 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "does not resubscribe a transient watch while authentication is paused",
     Effect.fnUntraced(function*() {
       const subscriptions = yield* Ref.make(0)
