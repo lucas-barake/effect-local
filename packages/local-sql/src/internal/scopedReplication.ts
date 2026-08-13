@@ -9,6 +9,7 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as AcceptedLog from "./acceptedLog.js"
 import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
 import * as StorageUnavailable from "./storageUnavailable.js"
@@ -178,9 +179,11 @@ export const make = (options: Options) => {
   })
   const findLogSuffix = SqlSchema.findAll({
     Request: Schema.Struct({ spaceId: Identity.SpaceId, after: Identity.ServerSequence, limit: Schema.Int }),
-    Result: Schema.Struct({ server_sequence: Identity.ServerSequence, entry_json: Schema.String }),
+    Result: Rows.ServerLogRow,
     execute: ({ after, limit, spaceId }) =>
-      sql`SELECT server_sequence, entry_json FROM effect_local_authoritative_log
+      sql`SELECT space_id, server_sequence, client_id, membership_incarnation, local_sequence,
+        mutation_id, digest, entry_bytes, entry_json, source_schema_version, source_schema_hash
+      FROM effect_local_authoritative_log
       WHERE space_id = ${spaceId} AND server_sequence > ${after}
       ORDER BY server_sequence LIMIT ${limit}`
   })
@@ -924,7 +927,7 @@ export const make = (options: Options) => {
     Effect.gen(function*() {
       const head = space.next_server_sequence - 1
       if (view.delivered_sequence > head) return Option.none()
-      let suffix: ReadonlyArray<{ readonly server_sequence: number; readonly entry_json: string }> = []
+      let suffix: ReadonlyArray<typeof Rows.ServerLogRow.Type> = []
       if (view.delivered_sequence < head) {
         suffix = yield* findLogSuffix({
           spaceId: request.spaceId,
@@ -940,9 +943,7 @@ export const make = (options: Options) => {
       }
       const changed = new Map<string, { readonly model: string; readonly key: string }>()
       for (const row of suffix) {
-        const entry = yield* Codec.parse(row.entry_json).pipe(
-          Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
-        )
+        const entry = yield* AcceptedLog.decode(row)
         for (const change of entry.changes) {
           const keyJson = yield* Codec.stringify(change.entity.key)
           changed.set(identityOf(change.entity.model, keyJson), {

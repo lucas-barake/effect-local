@@ -24,6 +24,7 @@ import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as AcceptedLog from "./internal/acceptedLog.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
 import * as ReadAuthorization from "./internal/readAuthorization.js"
@@ -642,9 +643,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             onNone: () => Effect.succeed(undefined),
             onSome: (row) =>
               Effect.gen(function*() {
-                const entry = yield* Codec.parse(row.entry_json).pipe(
-                  Effect.flatMap((value) => Codec.decode(Protocol.AcceptedMutation, value))
-                )
+                const entry = yield* AcceptedLog.decode(row)
                 if (
                   row.space_id !== envelope.spaceId ||
                   row.server_sequence !== receipt.serverSequence ||
@@ -652,21 +651,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   row.membership_incarnation !== envelope.membershipIncarnation ||
                   row.local_sequence !== envelope.localSequence ||
                   row.mutation_id !== envelope.mutationId ||
-                  row.digest !== envelope.digest ||
-                  row.source_schema_version !== entry.sourceSchema.version ||
-                  row.source_schema_hash !== entry.sourceSchema.hash ||
-                  entry.spaceId !== row.space_id ||
-                  entry.sequence !== row.server_sequence ||
-                  entry.clientId !== row.client_id ||
-                  entry.membershipIncarnation !== row.membership_incarnation ||
-                  entry.localSequence !== row.local_sequence ||
-                  entry.mutationId !== row.mutation_id ||
-                  entry.digest !== row.digest ||
-                  row.entry_bytes !== (yield* Protocol.encodedBytesEffect(entry)) ||
-                  row.entry_json !== (yield* Codec.stringify(entry))
+                  row.digest !== envelope.digest
                 ) {
                   return yield* new ReplicaError.StorageCorrupt({
-                    message: `Accepted entry ${row.server_sequence} conflicts with its durable metadata`
+                    message: `Accepted entry ${row.server_sequence} conflicts with its submitted mutation`
                   })
                 }
                 return entry.changes

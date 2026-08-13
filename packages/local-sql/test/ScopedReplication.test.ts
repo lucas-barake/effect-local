@@ -1346,6 +1346,40 @@ describe("scoped replication", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
+  it.effect("rejects authoritative log metadata that conflicts with its entry", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const context = yield* Layer.build(
+          ServerStore.layer({
+            ...history,
+            definition: Domain.definition,
+            readAuthorizationRefreshInterval: "1 second",
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => Effect.void
+          }).pipe(Layer.provide(runtime), Layer.provideMerge(database))
+        )
+        const server = Context.get(context, ServerStore.ServerStore)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const initial = yield* server.pullAuthorized(pullRequest(), "reader")
+        if (!("_tag" in initial)) assert.fail("expected bootstrap")
+        yield* server.bootstrapAuthorized(bootstrapRequest(initial.manifest), "reader")
+
+        yield* server.submit(yield* envelope("corrupt-log", 1))
+        yield* sql`UPDATE effect_local_authoritative_log SET client_id = ${readerId}
+          WHERE space_id = ${spaceId} AND server_sequence = 1`
+
+        const outcome = yield* server.pullAuthorized(pullRequest(initial.manifest.cursor), "reader").pipe(
+          Effect.result
+        )
+        assert.isTrue(Result.isFailure(outcome))
+        if (Result.isFailure(outcome)) assert.strictEqual(outcome.failure._tag, "StorageCorrupt")
+        const pages = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_replication_pages WHERE space_id = ${spaceId} AND client_id = ${readerId}`
+        assert.deepStrictEqual(pages, [{ count: 0 }])
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("rejects corrupt server index catalog object names before cleanup", () =>
     Effect.scoped(
       Effect.gen(function*() {
