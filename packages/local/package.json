@@ -4,7 +4,13 @@
   "description": "Local-first domain primitives for Effect",
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
-  "keywords": ["effect", "local-first", "offline-first", "mutation-log", "typescript"],
+  "keywords": [
+    "effect",
+    "local-first",
+    "offline-first",
+    "mutation-log",
+    "typescript"
+  ],
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
   },
@@ -52,5 +58,8 @@
   },
   "devDependencies": {
     "effect": "4.0.0-beta.103"
+  },
+  "dependencies": {
+    "@noble/hashes": "2.3.0"
   }
 }
