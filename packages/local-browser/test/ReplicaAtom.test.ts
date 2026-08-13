@@ -1,6 +1,9 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as AttachmentClient from "@lucas-barake/effect-local-sql/AttachmentClient"
+import type * as AttachmentStorage from "@lucas-barake/effect-local-sql/AttachmentStorage"
+import * as AttachmentTransfer from "@lucas-barake/effect-local-sql/AttachmentTransfer"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -16,6 +19,7 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
@@ -29,7 +33,10 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { Atom, AtomRegistry } from "effect/unstable/reactivity"
+import * as BrowserAttachmentStorage from "../src/BrowserAttachmentStorage.js"
 import * as BrowserReplica from "../src/BrowserReplica.js"
+import * as AttachmentDirectory from "../src/internal/AttachmentDirectory.js"
+import * as AttachmentWorkerProtocol from "../src/internal/AttachmentWorkerProtocol.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
@@ -195,11 +202,112 @@ describe("Replica Atom graph", () => {
     "exposes attachment placeholder, failure, and lazily resolved bytes",
     Effect.fnUntraced(function*() {
       const bytes = Uint8Array.from([1, 2, 3])
-      const available = Attachment.Reference.make({
-        _tag: "Attachment",
-        digest: Attachment.Digest.make(`sha256:${"1".repeat(64)}`),
-        bytes: bytes.length
+      const availableReady = yield* Deferred.make<Attachment.Reference>()
+      const allowRead = yield* Deferred.make<void>()
+      const files = new Map<AttachmentStorage.ObjectKey, Uint8Array>()
+      const directory = AttachmentDirectory.AttachmentDirectory.of({
+        create: (key) => Effect.sync(() => files.set(key, new Uint8Array(0))),
+        offset: (key) => {
+          const stored = files.get(key)
+          if (stored === undefined) return Effect.fail(new Attachment.AttachmentNotFound({ key }))
+          return Effect.succeed(stored.length)
+        },
+        write: (key, expectedOffset, chunk) => {
+          const stored = files.get(key)
+          if (stored === undefined) return Effect.fail(new Attachment.AttachmentNotFound({ key }))
+          if (stored.length !== expectedOffset) {
+            return Effect.fail(
+              new Attachment.AttachmentOffsetConflict({ expected: expectedOffset, actual: stored.length })
+            )
+          }
+          const next = new Uint8Array(stored.length + chunk.length)
+          next.set(stored)
+          next.set(chunk, stored.length)
+          files.set(key, next)
+          return Effect.succeed(next.length)
+        },
+        read: (key, offset, length) => {
+          const stored = files.get(key)
+          if (stored === undefined) return Effect.fail(new Attachment.AttachmentNotFound({ key }))
+          return Deferred.await(allowRead).pipe(Effect.as(stored.slice(offset, offset + length)))
+        },
+        exists: (key) => Effect.succeed(files.has(key)),
+        remove: (key) => Effect.sync(() => void files.delete(key))
       })
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          channel.port1.close()
+          channel.port2.close()
+        })
+      )
+      yield* AttachmentWorkerProtocol.serve(channel.port1, {
+        maximumBytes: 8,
+        maximumPendingRequests: 2
+      }).pipe(
+        Effect.provideService(AttachmentDirectory.AttachmentDirectory, directory),
+        Effect.forkScoped({ startImmediately: true })
+      )
+      const layerStorage = BrowserAttachmentStorage.layerMessagePort(channel.port2, {
+        maximumBytes: 8,
+        readChunkBytes: 2,
+        maximumPendingRequests: 2,
+        cleanupRequestTimeout: "1 second"
+      }).pipe(Layer.provide(NodeCrypto.layer))
+      const layerTransfer = Layer.succeed(
+        AttachmentTransfer.AttachmentTransfer,
+        AttachmentTransfer.AttachmentTransfer.of({
+          upload: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          download: ({ reference }) => Stream.fail(new Attachment.AttachmentUnavailable({ digest: reference.digest }))
+        })
+      )
+      const layerAttachments = AttachmentClient.layer({
+        maximumLocalBytes: 64,
+        maximumLocalObjects: 8,
+        maximumCacheBytes: 64,
+        maximumCacheObjects: 8,
+        maximumCacheAge: "1 day",
+        evictionBatchSize: 4
+      }).pipe(
+        Layer.provide(layerStorage),
+        Layer.provide(layerTransfer),
+        Layer.provide(layerDatabase)
+      )
+      const layerOfflineSync = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
+          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          discard: () => Effect.die("unexpected discard"),
+          pull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          watch: () => Stream.never
+        })
+      )
+      const layerAttachmentReplica = SqlReplica.layer({
+        ...clientHistory,
+        definition,
+        initialSpaces: [spaceId],
+        clientId,
+        retryDelay: "10 millis"
+      }).pipe(
+        Layer.provide(layerAttachments),
+        Layer.provide(layerOfflineSync),
+        Layer.provide(layerDatabase),
+        Layer.provide(layerHandlers),
+        Layer.tap((context) => {
+          const replica = Context.get(context, Replica.Replica)
+          return replica.space(spaceId).pipe(
+            Effect.flatMap((space) => space.stageAttachment(Stream.make(bytes))),
+            Effect.flatMap((reference) => Deferred.succeed(availableReady, reference))
+          )
+        })
+      )
+      const graph = BrowserReplica.make(layerAttachmentReplica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      yield* AtomRegistry.getResult(registry, graph.spaces)
+      const available = yield* Deferred.await(availableReady)
       const unavailable = Attachment.Reference.make({
         _tag: "Attachment",
         digest: Attachment.Digest.make(`sha256:${"2".repeat(64)}`),
@@ -207,37 +315,9 @@ describe("Replica Atom graph", () => {
       })
       const overflowing = Attachment.Reference.make({
         _tag: "Attachment",
-        digest: Attachment.Digest.make(`sha256:${"3".repeat(64)}`),
-        bytes: 3
+        digest: available.digest,
+        bytes: available.bytes + 1
       })
-      const release = yield* Deferred.make<Uint8Array>()
-      const layerObserved = Effect.gen(function*() {
-        const service = yield* Replica.Replica
-        return Replica.Replica.of({
-          ...service,
-          space: (requestedSpaceId) =>
-            service.space(requestedSpaceId).pipe(Effect.map((space) => ({
-              ...space,
-              readAttachment: (reference) => {
-                if (reference.digest === unavailable.digest) {
-                  return Stream.fail(new Attachment.AttachmentUnavailable({ digest: reference.digest }))
-                }
-                if (reference.digest === overflowing.digest) {
-                  return Stream.make(Uint8Array.of(1, 2), Uint8Array.of(3, 4)).pipe(
-                    Stream.concat(Stream.die("overflow must stop upstream consumption"))
-                  )
-                }
-                return Stream.fromEffect(Deferred.await(release))
-              }
-            })))
-        })
-      }).pipe(
-        Layer.effect(Replica.Replica),
-        Layer.provideMerge(layerReplica)
-      )
-      const graph = BrowserReplica.make(layerObserved)
-      const registry = AtomRegistry.make()
-      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const attachment = graph.attachment(spaceId, available)
       const unmount = registry.mount(attachment)
       yield* Effect.addFinalizer(() => Effect.sync(unmount))
@@ -245,7 +325,7 @@ describe("Replica Atom graph", () => {
       const placeholder = registry.get(attachment)
       assert.strictEqual(placeholder._tag, "Initial")
       assert.isTrue(placeholder.waiting)
-      yield* Deferred.succeed(release, bytes)
+      yield* Deferred.succeed(allowRead, undefined)
       assert.deepStrictEqual(
         yield* AtomRegistry.getResult(registry, attachment, { suspendOnWaiting: true }),
         bytes
@@ -269,7 +349,10 @@ describe("Replica Atom graph", () => {
       if (Exit.isFailure(overflow)) {
         const error = Option.getOrThrow(Cause.findErrorOption(overflow.cause))
         assert.strictEqual(error._tag, "AttachmentLengthMismatch")
-        if (error._tag === "AttachmentLengthMismatch") assert.strictEqual(error.actual, 4)
+        if (error._tag === "AttachmentLengthMismatch") {
+          assert.strictEqual(error.expected, available.bytes)
+          assert.strictEqual(error.actual, overflowing.bytes)
+        }
       }
     }, Effect.scoped)
   )
