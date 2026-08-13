@@ -107,8 +107,13 @@ describe("attachment contract", () => {
     "collects references from deeply nested values within the mutation byte limit",
     Effect.fnUntraced(function*() {
       const depth = 10_000
-      const encodedReference = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(reference)
-      let payload: typeof Schema.Json.Type = reference
+      const referenceJson: typeof Schema.Json.Type = {
+        _tag: "Attachment",
+        digest: reference.digest,
+        bytes: reference.bytes
+      }
+      const encodedReference = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(referenceJson)
+      let payload: typeof Schema.Json.Type = referenceJson
       for (let index = 0; index < depth; index++) payload = { nested: payload }
 
       assert.isBelow(depth * "{\"nested\":}".length + encodedReference.length, maximumMutationBytes)

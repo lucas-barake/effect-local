@@ -305,6 +305,11 @@ describe("replica attachments", () => {
           body: string,
           mutationId: Identity.MutationId
         ) {
+          const attachment: typeof Schema.Json.Type = {
+            _tag: "Attachment",
+            digest: reference.digest,
+            bytes: reference.bytes
+          }
           const identity = {
             spaceId,
             clientId: requestedClientId,
@@ -313,7 +318,7 @@ describe("replica attachments", () => {
             localSequence: Identity.LocalSequence.make(1),
             basis: Identity.ServerSequence.make(0),
             name: PutMessage.name,
-            payload: { id: requestedId, body, attachment: reference },
+            payload: { id: requestedId, body, attachment },
             digestVersion: 3 as const,
             sourceSchema: definition.schemaIdentity,
             mutationVersion: PutMessage.version

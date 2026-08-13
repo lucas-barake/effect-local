@@ -503,6 +503,7 @@ const v1Envelope = Effect.fnUntraced(function*(
   localSequence: number,
   payload: typeof TodoV1.schema.Type
 ) {
+  const encodedPayload = yield* Schema.encodeEffect(TodoV1.schema)(payload)
   const identity = {
     spaceId,
     clientId: envelopeClientId,
@@ -510,7 +511,7 @@ const v1Envelope = Effect.fnUntraced(function*(
     localSequence: Identity.LocalSequence.make(localSequence),
     basis: Identity.ServerSequence.make(0),
     name: PutTodoV1.name,
-    payload,
+    payload: encodedPayload,
     digestVersion: 3 as const,
     membershipIncarnation,
     sourceSchema: definitionV1.schemaIdentity,
