@@ -4,6 +4,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Quarantine from "@lucas-barake/effect-local/Quarantine"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
@@ -460,7 +461,11 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (result._tag === "Success") {
             entries.set(spaceId, result.value)
             yield* Deferred.succeed(decision.completion, result.value.handle)
-            yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
+            yield* reactivity.invalidate([
+              ReactivityKey.membership(spaceId),
+              ReactivityKey.spaces,
+              ReactivityKey.aggregateStatus
+            ])
             return result.value.handle
           }
           const current = entries.get(spaceId)
@@ -521,7 +526,11 @@ const makeLayer = <D extends Definition.Any, R,>(
             if (result._tag === "Success") {
               entries.delete(spaceId)
               yield* Deferred.succeed(decision.completion, undefined)
-              yield* reactivity.invalidate([`effect-local:space:${spaceId}`, "effect-local:status"])
+              yield* reactivity.invalidate([
+                ReactivityKey.membership(spaceId),
+                ReactivityKey.spaces,
+                ReactivityKey.aggregateStatus
+              ])
               return
             }
             if (scopeClosed) {

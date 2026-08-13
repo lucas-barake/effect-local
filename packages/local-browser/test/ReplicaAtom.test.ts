@@ -363,6 +363,62 @@ describe("Replica Atom graph", () => {
     })
   )
 
+  it.live(
+    "does not refresh membership or another space status for an addressed write",
+    Effect.fnUntraced(function*() {
+      let spacesReads = 0
+      let secondStatusReads = 0
+      const layerObserved = Effect.gen(function*() {
+        const service = yield* Replica.Replica
+        return Replica.Replica.of({
+          ...service,
+          spaces: Effect.suspend(() => {
+            spacesReads++
+            return service.spaces
+          }),
+          space: (address) =>
+            service.space(address).pipe(Effect.map((space) => {
+              if (address !== secondSpaceId) return space
+              return {
+                ...space,
+                status: Effect.suspend(() => {
+                  secondStatusReads++
+                  return space.status
+                })
+              }
+            }))
+        })
+      }).pipe(
+        Layer.effect(Replica.Replica),
+        Layer.provideMerge(layerReplica)
+      )
+      const graph = BrowserReplica.make(layerObserved)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const membership = graph.spaces
+      const unrelatedStatus = graph.status(secondSpaceId)
+      const mutation = graph.mutation(spaceId, PutTodo)
+      const mounted = [
+        registry.mount(membership),
+        registry.mount(unrelatedStatus),
+        registry.mount(mutation)
+      ]
+      yield* Effect.addFinalizer(() => Effect.sync(() => mounted.forEach((unmount) => unmount())))
+      assert.lengthOf(yield* AtomRegistry.getResult(registry, membership), 2)
+      assert.strictEqual((yield* AtomRegistry.getResult(registry, unrelatedStatus)).spaceId, secondSpaceId)
+      yield* Effect.sleep("20 millis")
+      const spacesBefore = spacesReads
+      const secondStatusBefore = secondStatusReads
+
+      registry.set(mutation, { id: "addressed-write", title: "first" })
+      yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      yield* Effect.sleep("20 millis")
+
+      assert.strictEqual(spacesReads, spacesBefore)
+      assert.strictEqual(secondStatusReads, secondStatusBefore)
+    })
+  )
+
   it("uses the shared runtime factory by default and preserves an explicit factory", () => {
     const graph = BrowserReplica.make(layerReplica)
     assert.strictEqual(graph.factory, Atom.runtime)
