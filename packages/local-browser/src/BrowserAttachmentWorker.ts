@@ -5,10 +5,14 @@ import * as OpfsAttachmentDirectory from "./internal/OpfsAttachmentDirectory.js"
 export interface Options {
   readonly directory: string
   readonly maximumBytes: number
+  readonly maximumPendingRequests: number
 }
 
 export const serveMessagePort = (port: MessagePort, options: Options) =>
-  AttachmentWorkerProtocol.serve(port, { maximumBytes: options.maximumBytes }).pipe(
+  AttachmentWorkerProtocol.serve(port, {
+    maximumBytes: options.maximumBytes,
+    maximumPendingRequests: options.maximumPendingRequests
+  }).pipe(
     Effect.provide(OpfsAttachmentDirectory.layer({ directory: options.directory })),
     Effect.withSpan("BrowserAttachmentWorker.serveMessagePort")
   )

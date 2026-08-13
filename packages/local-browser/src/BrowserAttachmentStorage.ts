@@ -13,6 +13,7 @@ import * as AttachmentWorkerProtocol from "./internal/AttachmentWorkerProtocol.j
 export interface Options {
   readonly maximumBytes: number
   readonly readChunkBytes: number
+  readonly maximumPendingRequests: number
 }
 
 const writeChunkBytes = 256 * 1_024
@@ -34,9 +35,16 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
           cause: options.readChunkBytes
         })
       }
+      if (!Number.isSafeInteger(options.maximumPendingRequests) || options.maximumPendingRequests <= 0) {
+        return yield* new Attachment.AttachmentStorageError({
+          operation: "configure.maximumPendingRequests",
+          cause: options.maximumPendingRequests
+        })
+      }
       const maximumBytes = options.maximumBytes
       const readChunkBytes = options.readChunkBytes
       const locks = yield* RcMap.make({ lookup: () => Semaphore.make(1) })
+      const requestPermits = yield* Semaphore.make(options.maximumPendingRequests)
       const pending = new Map<number, (value: unknown) => void>()
       let nextRequestId = 0
       const receive = (event: MessageEvent<unknown>) => {
@@ -60,7 +68,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
           })
       )
 
-      const request = Effect.fn("BrowserAttachmentStorage.request")(function*(
+      const requestUnlocked = Effect.fn("BrowserAttachmentStorage.request")(function*(
         message: AttachmentWorkerProtocol.RequestWithoutId,
         transfer?: ReadonlyArray<Transferable>
       ): Effect.fn.Return<AttachmentWorkerProtocol.Response, Attachment.AttachmentStorageError> {
@@ -83,6 +91,10 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
           Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "response.decode", cause }))
         )
       })
+      const request = (
+        message: AttachmentWorkerProtocol.RequestWithoutId,
+        transfer?: ReadonlyArray<Transferable>
+      ) => requestPermits.withPermit(requestUnlocked(message, transfer))
 
       const withLock = <A, E extends { readonly _tag: string }, R,>(
         key: AttachmentStorage.ObjectKey,
@@ -236,10 +248,9 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
                 void,
                 AttachmentStorage.StorageFailure | Attachment.AttachmentOffsetConflict | Attachment.AttachmentTooLarge
               > {
-                const outgoing = Uint8Array.from(chunk)
                 const response = yield* request(
-                  { _tag: "Write", key, expectedOffset: written, bytes: outgoing },
-                  [outgoing.buffer]
+                  { _tag: "Write", key, expectedOffset: written, bytes: chunk },
+                  [chunk.buffer]
                 )
                 if (response._tag === "Written") {
                   written = response.offset
@@ -278,10 +289,9 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
           Effect.fnUntraced(function*(key) {
             let written = 0
             const write = Effect.fnUntraced(function*(chunk: Uint8Array) {
-              const outgoing = Uint8Array.from(chunk)
               const response = yield* request(
-                { _tag: "Write", key, expectedOffset: written, bytes: outgoing },
-                [outgoing.buffer]
+                { _tag: "Write", key, expectedOffset: written, bytes: chunk },
+                [chunk.buffer]
               )
               if (response._tag === "TooLarge") {
                 return yield* new Attachment.AttachmentTooLarge({ limit: response.limit })

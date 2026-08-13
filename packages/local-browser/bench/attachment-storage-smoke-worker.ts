@@ -19,12 +19,14 @@ const program = Effect.gen(function*() {
   )
   yield* BrowserAttachmentWorker.serveMessagePort(channel.port1, {
     directory: "effect-local-attachment-storage-smoke",
-    maximumBytes: 8 * 1_024
+    maximumBytes: 8 * 1_024,
+    maximumPendingRequests: 4
   }).pipe(Effect.forkScoped({ startImmediately: true }))
   const context = yield* Layer.build(
     BrowserAttachmentStorage.layerMessagePort(channel.port2, {
       maximumBytes: 8 * 1_024,
-      readChunkBytes: 257
+      readChunkBytes: 257,
+      maximumPendingRequests: 4
     }).pipe(Layer.provide(BrowserCrypto.layer))
   )
   const storage = Context.get(context, AttachmentStorage.AttachmentStorage)

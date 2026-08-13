@@ -71,28 +71,34 @@ export const make = <E,>(
     runtime.atom(
       Replica.Replica.use((replica) =>
         replica.space(key.spaceId).pipe(
-          Effect.flatMap((space) =>
-            space.readAttachment(key.reference).pipe(
-              Stream.runCollect,
-              Effect.flatMap((chunks) => {
-                const actual = chunks.reduce((total, chunk) => total + chunk.length, 0)
-                if (actual !== key.reference.bytes) {
-                  return Effect.fail(
-                    new Attachment.AttachmentLengthMismatch({
-                      expected: key.reference.bytes,
-                      actual
-                    })
-                  )
-                }
-                const bytes = new Uint8Array(actual)
-                let offset = 0
-                for (const chunk of chunks) {
+          Effect.flatMap(
+            Effect.fnUntraced(function*(space) {
+              const bytes = new Uint8Array(key.reference.bytes)
+              let offset = 0
+              yield* space.readAttachment(key.reference).pipe(
+                Stream.runForEach((chunk) => {
+                  const actual = offset + chunk.length
+                  if (actual > key.reference.bytes) {
+                    return Effect.fail(
+                      new Attachment.AttachmentLengthMismatch({
+                        expected: key.reference.bytes,
+                        actual
+                      })
+                    )
+                  }
                   bytes.set(chunk, offset)
-                  offset += chunk.length
-                }
-                return Effect.succeed(bytes)
-              })
-            )
+                  offset = actual
+                  return Effect.void
+                })
+              )
+              if (offset !== key.reference.bytes) {
+                return yield* new Attachment.AttachmentLengthMismatch({
+                  expected: key.reference.bytes,
+                  actual: offset
+                })
+              }
+              return bytes
+            })
           )
         )
       )

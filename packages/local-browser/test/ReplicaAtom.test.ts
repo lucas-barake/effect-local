@@ -205,6 +205,11 @@ describe("Replica Atom graph", () => {
         digest: Attachment.Digest.make(`sha256:${"2".repeat(64)}`),
         bytes: bytes.length
       })
+      const overflowing = Attachment.Reference.make({
+        _tag: "Attachment",
+        digest: Attachment.Digest.make(`sha256:${"3".repeat(64)}`),
+        bytes: 3
+      })
       const release = yield* Deferred.make<Uint8Array>()
       const layerObserved = Effect.gen(function*() {
         const service = yield* Replica.Replica
@@ -216,6 +221,11 @@ describe("Replica Atom graph", () => {
               readAttachment: (reference) => {
                 if (reference.digest === unavailable.digest) {
                   return Stream.fail(new Attachment.AttachmentUnavailable({ digest: reference.digest }))
+                }
+                if (reference.digest === overflowing.digest) {
+                  return Stream.make(Uint8Array.of(1, 2), Uint8Array.of(3, 4)).pipe(
+                    Stream.concat(Stream.die("overflow must stop upstream consumption"))
+                  )
                 }
                 return Stream.fromEffect(Deferred.await(release))
               }
@@ -252,6 +262,14 @@ describe("Replica Atom graph", () => {
       if (Exit.isFailure(failure)) {
         const error = Option.getOrThrow(Cause.findErrorOption(failure.cause))
         assert.strictEqual(error._tag, "AttachmentUnavailable")
+      }
+      const overflowAtom = graph.attachment(spaceId, overflowing)
+      const overflow = yield* Effect.exit(AtomRegistry.getResult(registry, overflowAtom))
+      assert.isTrue(Exit.isFailure(overflow))
+      if (Exit.isFailure(overflow)) {
+        const error = Option.getOrThrow(Cause.findErrorOption(overflow.cause))
+        assert.strictEqual(error._tag, "AttachmentLengthMismatch")
+        if (error._tag === "AttachmentLengthMismatch") assert.strictEqual(error.actual, 4)
       }
     }, Effect.scoped)
   )

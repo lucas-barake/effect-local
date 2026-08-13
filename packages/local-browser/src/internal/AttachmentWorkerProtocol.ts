@@ -56,12 +56,14 @@ export const Response = Schema.Union([
     actual: Attachment.ByteLength
   }),
   Schema.Struct({ _tag: Schema.tag("TooLarge"), ...BaseResponse, limit: Attachment.ByteLength }),
-  Schema.Struct({ _tag: Schema.tag("StorageError"), ...BaseResponse, operation: Schema.String })
+  Schema.Struct({ _tag: Schema.tag("StorageError"), ...BaseResponse, operation: Schema.String }),
+  Schema.Struct({ _tag: Schema.tag("Overloaded"), ...BaseResponse })
 ])
 export type Response = typeof Response.Type
 
 export interface Options {
   readonly maximumBytes: number
+  readonly maximumPendingRequests: number
 }
 
 const send = (port: MessagePort, response: Response) =>
@@ -80,12 +82,36 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
       cause: options.maximumBytes
     })
   }
+  if (!Number.isSafeInteger(options.maximumPendingRequests) || options.maximumPendingRequests <= 0) {
+    yield* new Attachment.AttachmentStorageError({
+      operation: "worker.configure.maximumPendingRequests",
+      cause: options.maximumPendingRequests
+    })
+  }
   const directory = yield* AttachmentDirectory.AttachmentDirectory
   const queue = yield* Effect.acquireRelease(
-    Queue.unbounded<MessageEvent<unknown>>(),
+    Queue.dropping<MessageEvent<unknown>>(options.maximumPendingRequests),
     Queue.shutdown
   )
-  const receive = (event: MessageEvent<unknown>) => void Queue.offerUnsafe(queue, event)
+  let pendingRequests = 0
+  const sendOverloaded = (id: number) => port.postMessage({ _tag: "Overloaded", id } satisfies Response)
+  const receive = (event: MessageEvent<unknown>) => {
+    const data = event.data
+    let id: number | undefined
+    if (
+      typeof data === "object" && data !== null && "id" in data &&
+      typeof data.id === "number" && Number.isSafeInteger(data.id) && data.id >= 0
+    ) id = data.id
+    if (pendingRequests >= options.maximumPendingRequests) {
+      if (id !== undefined) sendOverloaded(id)
+      return
+    }
+    pendingRequests++
+    if (!Queue.offerUnsafe(queue, event)) {
+      pendingRequests--
+      if (id !== undefined) sendOverloaded(id)
+    }
+  }
   yield* Effect.acquireRelease(
     Effect.sync(() => {
       port.addEventListener("message", receive)
@@ -185,7 +211,7 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
       Effect.withSpan("AttachmentWorkerProtocol.handleRequest")
     )
   yield* Stream.fromQueue(queue).pipe(
-    Stream.mapEffect(handleRequestSafely),
+    Stream.mapEffect((event) => handleRequestSafely(event).pipe(Effect.ensuring(Effect.sync(() => pendingRequests--)))),
     Stream.runDrain
   )
 }, (effect) => Effect.scoped(effect).pipe(Effect.withSpan("AttachmentWorkerProtocol.serve")))

@@ -11,6 +11,7 @@ import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Result from "effect/Result"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
@@ -72,10 +73,68 @@ const makeDirectory = () => {
 const makeLayer = (port: MessagePort, maximumBytes: number) =>
   BrowserAttachmentStorage.layerMessagePort(port, {
     maximumBytes,
-    readChunkBytes: 2
+    readChunkBytes: 2,
+    maximumPendingRequests: 2
   }).pipe(Layer.provide(NodeCrypto.layer))
 
 describe("browser attachment storage", () => {
+  it.effect(
+    "returns a typed overload response when a hostile producer exceeds the worker queue",
+    Effect.fnUntraced(function*() {
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const directory = AttachmentDirectory.AttachmentDirectory.of({
+        create: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        offset: (key) => Effect.fail(new Attachment.AttachmentNotFound({ key })),
+        write: (key) => Effect.fail(new Attachment.AttachmentNotFound({ key })),
+        read: (key) => Effect.fail(new Attachment.AttachmentNotFound({ key })),
+        exists: () => Effect.succeed(false),
+        remove: () => Effect.void
+      })
+      const channel = new MessageChannel()
+      const received = yield* Queue.unbounded<number>()
+      const observeRequest = (event: MessageEvent<{ readonly id: number }>) =>
+        void Queue.offerUnsafe(received, event.data.id)
+      channel.port1.addEventListener("message", observeRequest)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          channel.port1.removeEventListener("message", observeRequest)
+          channel.port1.close()
+          channel.port2.close()
+        })
+      )
+      yield* AttachmentWorkerProtocol.serve(channel.port1, {
+        maximumBytes: 8,
+        maximumPendingRequests: 1
+      }).pipe(
+        Effect.provideService(AttachmentDirectory.AttachmentDirectory, directory),
+        Effect.forkScoped({ startImmediately: true })
+      )
+      const responses = yield* Queue.unbounded<AttachmentWorkerProtocol.Response>()
+      channel.port2.addEventListener("message", (event) => void Queue.offerUnsafe(responses, event.data))
+      channel.port2.start()
+      const key = AttachmentStorage.ObjectKey.make("0123456789abcdef0123456789abcdef")
+      channel.port2.postMessage({ _tag: "Create", id: 0, key })
+      yield* Deferred.await(started)
+      channel.port2.postMessage({ _tag: "Create", id: 1, key })
+      assert.strictEqual(
+        yield* Stream.fromQueue(received).pipe(
+          Stream.filter((id) => id === 1),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow)
+        ),
+        1
+      )
+      yield* Deferred.succeed(release, undefined)
+      const overloaded = yield* Stream.fromQueue(responses).pipe(
+        Stream.filter((response) => response.id === 1),
+        Stream.runHead,
+        Effect.map(Option.getOrThrow)
+      )
+      assert.deepStrictEqual(overloaded, { _tag: "Overloaded", id: 1 })
+    }, Effect.scoped)
+  )
+
   it.effect(
     "streams bounded bytes through an application owned port and reads them after a client restart",
     Effect.fnUntraced(function*() {
@@ -87,7 +146,7 @@ describe("browser attachment storage", () => {
           channel.port2.close()
         })
       )
-      yield* AttachmentWorkerProtocol.serve(channel.port1, { maximumBytes: 5 }).pipe(
+      yield* AttachmentWorkerProtocol.serve(channel.port1, { maximumBytes: 5, maximumPendingRequests: 2 }).pipe(
         Effect.provideService(AttachmentDirectory.AttachmentDirectory, directory.service),
         Effect.forkScoped({ startImmediately: true })
       )
@@ -146,7 +205,10 @@ describe("browser attachment storage", () => {
           channel.port2.close()
         })
       )
-      yield* AttachmentWorkerProtocol.serve(channel.port1, { maximumBytes: 1_024 }).pipe(
+      yield* AttachmentWorkerProtocol.serve(channel.port1, {
+        maximumBytes: 1_024,
+        maximumPendingRequests: 2
+      }).pipe(
         Effect.provideService(AttachmentDirectory.AttachmentDirectory, directory.service),
         Effect.forkScoped({ startImmediately: true })
       )
@@ -205,7 +267,7 @@ describe("browser attachment storage", () => {
           channel.port2.close()
         })
       )
-      yield* AttachmentWorkerProtocol.serve(channel.port1, { maximumBytes: 8 }).pipe(
+      yield* AttachmentWorkerProtocol.serve(channel.port1, { maximumBytes: 8, maximumPendingRequests: 2 }).pipe(
         Effect.provideService(AttachmentDirectory.AttachmentDirectory, directory),
         Effect.forkScoped({ startImmediately: true })
       )
