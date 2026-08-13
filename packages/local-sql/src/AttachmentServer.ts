@@ -6,7 +6,6 @@ import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
-import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as RcMap from "effect/RcMap"
@@ -103,7 +102,6 @@ export class AttachmentServer extends Context.Service<AttachmentServer, Service>
 ) {}
 
 const Lookup = Schema.Struct({ spaceId: Identity.SpaceId, digest: Attachment.Digest })
-const Count = Schema.Struct({ count: Schema.Number })
 const ReadableEntity = Schema.Struct({
   model: Schema.String,
   model_version: Identity.SchemaVersion,
@@ -656,9 +654,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 return yield* new Attachment.AttachmentUnavailable({ digest: reference.digest })
               }
             }
-            const usage = yield* SqlSchema.findOneOption({
+            const usage = yield* SqlSchema.findOne({
               Request: Schema.Void,
-              Result: Count,
+              Result: Rows.CountRow,
               execute: () =>
                 sql`SELECT COUNT(*) AS count
                 FROM effect_local_server_attachment_references
@@ -667,6 +665,12 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   AND NOT (model = ${input.model} AND entity_key = ${input.entityKey})`
             })(undefined).pipe(Effect.catchTags({
               SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+              NoSuchElementError: () =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({
+                    message: "Attachment reference quota query returned no result"
+                  })
+                ),
               SchemaError: (cause) =>
                 Effect.fail(
                   new ReplicaError.StorageCorrupt({
@@ -675,12 +679,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   })
                 )
             }))
-            if (Option.isNone(usage)) {
-              return yield* new ReplicaError.StorageCorrupt({
-                message: "Attachment reference quota query returned no result"
-              })
-            }
-            if (usage.value.count >= maximumReferencesPerObject) {
+            if (usage.count >= maximumReferencesPerObject) {
               return yield* new ReplicaError.CapacityExceeded({
                 resource: "attachment references per object",
                 limit: maximumReferencesPerObject
@@ -817,9 +816,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           ),
           Effect.ignore
         )
+        const renewalInterval = Math.floor(readLeaseLifetime / 2)
         const renew = Effect.forever(
           Effect.gen(function*() {
-            const renewalInterval = Math.floor(readLeaseLifetime / 2)
             yield* Effect.sleep(Math.max(1, renewalInterval))
             const renewedAt = yield* Clock.currentTimeMillis
             yield* sql`UPDATE effect_local_server_attachment_read_leases
@@ -834,12 +833,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             Effect.ignore
           )
         )
-        return Stream.unwrap(Effect.gen(function*() {
-          const renewal = yield* Effect.forkChild(renew)
-          return storage.read(object.object_key, input.reference, input.range).pipe(
-            Stream.ensuring(Fiber.interrupt(renewal).pipe(Effect.andThen(release)))
-          )
-        }))
+        return storage.read(object.object_key, input.reference, input.range).pipe(
+          Stream.drainFork(Stream.fromEffectDrain(renew)),
+          Stream.ensuring(release)
+        )
       }, Effect.withSpan("AttachmentServer.prepareRead"))
 
       const read: Service["read"] = (input) => Stream.unwrap(prepareRead(input))

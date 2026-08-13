@@ -102,14 +102,10 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
       typeof data === "object" && data !== null && "id" in data &&
       typeof data.id === "number" && Number.isSafeInteger(data.id) && data.id >= 0
     ) id = data.id
-    if (pendingRequests >= options.maximumPendingRequests) {
-      if (id !== undefined) sendOverloaded(id)
-      return
-    }
-    pendingRequests++
-    if (!Queue.offerUnsafe(queue, event)) {
-      pendingRequests--
-      if (id !== undefined) sendOverloaded(id)
+    if (pendingRequests < options.maximumPendingRequests && Queue.offerUnsafe(queue, event)) {
+      pendingRequests++
+    } else if (id !== undefined) {
+      sendOverloaded(id)
     }
   }
   yield* Effect.acquireRelease(

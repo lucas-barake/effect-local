@@ -68,7 +68,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
           })
       )
 
-      const requestUnlocked = Effect.fn("BrowserAttachmentStorage.request")(function*(
+      const request = Effect.fn("BrowserAttachmentStorage.request")(function*(
         message: AttachmentWorkerProtocol.RequestWithoutId,
         transfer?: ReadonlyArray<Transferable>
       ): Effect.fn.Return<AttachmentWorkerProtocol.Response, Attachment.AttachmentStorageError> {
@@ -90,11 +90,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
         return yield* Schema.decodeUnknownEffect(AttachmentWorkerProtocol.Response)(response).pipe(
           Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "response.decode", cause }))
         )
-      })
-      const request = (
-        message: AttachmentWorkerProtocol.RequestWithoutId,
-        transfer?: ReadonlyArray<Transferable>
-      ) => requestPermits.withPermit(requestUnlocked(message, transfer))
+      }, (effect) => requestPermits.withPermit(effect))
 
       const withLock = <A, E extends { readonly _tag: string }, R,>(
         key: AttachmentStorage.ObjectKey,

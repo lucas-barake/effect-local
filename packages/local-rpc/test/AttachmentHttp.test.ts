@@ -15,10 +15,10 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
-import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
+import * as Latch from "effect/Latch"
 import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import * as Result from "effect/Result"
@@ -90,14 +90,14 @@ describe("attachment HTTP transport", () => {
         const layerStorage = FileSystemAttachmentStorage.layer({ directory: `${root}/objects`, maximumBytes: 16 })
         const storageContext = yield* layerStorage.pipe(Layer.build)
         const storage = Context.get(storageContext, AttachmentStorage.AttachmentStorage)
-        const readStarted = yield* Deferred.make<void>()
-        const releaseRead = yield* Deferred.make<void>()
+        const readStarted = yield* Latch.make()
+        const releaseRead = yield* Latch.make()
         const gatedStorage = AttachmentStorage.AttachmentStorage.of({
           ...storage,
           read: (objectKey, requestedReference, range) =>
             Stream.unwrap(Effect.gen(function*() {
-              yield* Deferred.succeed(readStarted, undefined)
-              yield* Deferred.await(releaseRead)
+              yield* readStarted.open
+              yield* releaseRead.await
               return storage.read(objectKey, requestedReference, range)
             }))
         })
@@ -255,7 +255,7 @@ describe("attachment HTTP transport", () => {
           Effect.provideService(FetchHttpClient.Fetch, fetch),
           Effect.forkChild
         )
-        yield* Deferred.await(readStarted)
+        yield* readStarted.await
         yield* attachments.replaceEntityReferences({
           spaceId,
           schemaGeneration: 0,
@@ -280,7 +280,7 @@ describe("attachment HTTP transport", () => {
         const secondServer = Context.get(secondContext, AttachmentServer.AttachmentServer)
         yield* TestClock.adjust("2 minutes")
         assert.strictEqual(yield* secondServer.maintain(spaceId), 0)
-        yield* Deferred.succeed(releaseRead, undefined)
+        yield* releaseRead.open
         assert.deepStrictEqual(yield* Fiber.join(download), bytes)
         assert.strictEqual(downloadCacheControl, "private, no-store")
         const leases = yield* sql<{ readonly expires_at: number }>`SELECT expires_at

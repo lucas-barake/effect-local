@@ -74,27 +74,25 @@ export const make = <E,>(
           Effect.flatMap(
             Effect.fnUntraced(function*(space) {
               const bytes = new Uint8Array(key.reference.bytes)
-              let offset = 0
-              yield* space.readAttachment(key.reference).pipe(
-                Stream.runForEach((chunk) => {
-                  const actual = offset + chunk.length
-                  if (actual > key.reference.bytes) {
+              const actual = yield* space.readAttachment(key.reference).pipe(
+                Stream.runFoldEffect(() => 0, (offset, chunk) => {
+                  const nextOffset = offset + chunk.length
+                  if (nextOffset > key.reference.bytes) {
                     return Effect.fail(
                       new Attachment.AttachmentLengthMismatch({
                         expected: key.reference.bytes,
-                        actual
+                        actual: nextOffset
                       })
                     )
                   }
                   bytes.set(chunk, offset)
-                  offset = actual
-                  return Effect.void
+                  return Effect.succeed(nextOffset)
                 })
               )
-              if (offset !== key.reference.bytes) {
+              if (actual !== key.reference.bytes) {
                 return yield* new Attachment.AttachmentLengthMismatch({
                   expected: key.reference.bytes,
-                  actual: offset
+                  actual
                 })
               }
               return bytes
