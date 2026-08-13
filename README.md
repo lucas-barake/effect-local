@@ -320,6 +320,11 @@ Node applications can use `FileSystemAttachmentStorage`. Browser applications us
 files outside SQLite WASM. The Atom graph exposes `graph.attachment(spaceId, reference)` as a lazy `AsyncResult` for
 placeholder, failure, and resolved byte states.
 
+`AttachmentClient.layer` requires hard local byte and object limits plus separate cache byte, object, age, and eviction
+batch limits. Offline staged and pending objects count toward the local limits and are never evicted. Browser storage
+also requires `maximumPendingRequests` on the page and worker sides so transferred buffers cannot form an
+unbounded queue.
+
 `AttachmentHttpServer.layer` contributes authenticated HEAD, PATCH, and GET routes to the application's `HttpRouter`.
 `AttachmentHttpClient.layer` supplies fresh storage backed streams. HEAD reports the durable offset, PATCH resumes and
 verifies the complete digest before promotion, and GET supports one byte range. The application still owns its HTTP
@@ -330,7 +335,9 @@ and reference. A verified upload records possession for that membership. Knowing
 does not authorize a new entity reference. A read also requires a current referencing entity accepted by normal entity
 read authorization. Per object and per space limits bound storage. The last authoritative reference schedules grace
 period collection through an immutable object key. Recipient retractions and history pruning do not define server
-liveness.
+liveness. `AttachmentServer.layer` also requires a reference fanout limit and separate upload, read, grant, staging,
+and collection lifetimes. Active reads renew durable leases, so collection cannot remove an object behind an issued
+response.
 
 Attachment bytes never enter mutation envelopes, accepted history, entity JSON, bootstrap pages, or snapshots. Only
 the compact reference crosses the JSON control plane. Transfer outages and upload leases are retryable. Invalid
