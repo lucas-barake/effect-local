@@ -23,17 +23,14 @@ const errorHeader = "x-effect-local-error"
 const offsetHeader = "upload-offset"
 const completeHeader = "upload-complete"
 
-const protocolInvalid = (message: string, cause?: unknown) => new ReplicaError.ProtocolInvalid({ message, cause })
-
-const decode = <A, I, R,>(schema: Schema.Codec<A, I, R>, value: unknown, name: string) =>
-  Schema.decodeUnknownEffect(schema)(value).pipe(
-    Effect.mapError((cause) => protocolInvalid(`Invalid attachment ${name}`, cause))
-  )
-
 const parseInteger = (value: string | undefined, name: string) => {
-  if (value === undefined || !/^\d+$/.test(value)) return Effect.fail(protocolInvalid(`Missing or invalid ${name}`))
+  if (value === undefined || !/^\d+$/.test(value)) {
+    return Effect.fail(new ReplicaError.ProtocolInvalid({ message: `Missing or invalid ${name}` }))
+  }
   const parsed = Number(value)
-  if (!Number.isSafeInteger(parsed)) return Effect.fail(protocolInvalid(`Missing or invalid ${name}`))
+  if (!Number.isSafeInteger(parsed)) {
+    return Effect.fail(new ReplicaError.ProtocolInvalid({ message: `Missing or invalid ${name}` }))
+  }
   return Effect.succeed(parsed)
 }
 
@@ -43,7 +40,13 @@ const parseRange = (
 ): Effect.Effect<Attachment.Range | undefined, ReplicaError.ProtocolInvalid | Attachment.InvalidAttachmentRange> => {
   if (value === undefined) return Effect.succeed(undefined)
   const match = /^bytes=(\d+)-(\d*)$/.exec(value)
-  if (match === null) return Effect.fail(protocolInvalid("Attachment Range must contain one byte range"))
+  if (match === null) {
+    return Effect.fail(
+      new ReplicaError.ProtocolInvalid({
+        message: "Attachment Range must contain one byte range"
+      })
+    )
+  }
   const offset = Number(match[1])
   let end = bytes - 1
   if (match[2] !== "") end = Number(match[2])
@@ -96,7 +99,8 @@ export const layer = (options?: Options): Layer.Layer<
     const authenticator = yield* Authentication.Authenticator
     const path = options?.path ?? "/effect-local/attachments/:spaceId/:digest"
 
-    const input = Effect.fnUntraced(function*(request: HttpServerRequest.HttpServerRequest) {
+    const input = Effect.fn("AttachmentHttpServer.input")(function*(request: HttpServerRequest.HttpServerRequest) {
+      yield* Effect.annotateCurrentSpan("http.request.method", request.method)
       const params = yield* HttpRouter.params
       const authorization = request.headers.authorization
       if (authorization === undefined || !authorization.startsWith("Bearer ")) {
@@ -104,15 +108,58 @@ export const layer = (options?: Options): Layer.Layer<
       }
       const credential = Redacted.make(authorization.slice("Bearer ".length))
       const principal = yield* authenticator.authenticate(credential)
-      const spaceId = yield* decode(Identity.SpaceId, params.spaceId, "space id")
-      const digest = yield* decode(Attachment.Digest, params.digest, "digest")
+      const spaceId = yield* Schema.decodeUnknownEffect(Identity.SpaceId)(params.spaceId).pipe(
+        Effect.catchTag("SchemaError", (cause) =>
+          Effect.fail(
+            new ReplicaError.ProtocolInvalid({
+              message: "Invalid attachment space id",
+              cause
+            })
+          ))
+      )
+      const digest = yield* Schema.decodeUnknownEffect(Attachment.Digest)(params.digest).pipe(
+        Effect.catchTag("SchemaError", (cause) =>
+          Effect.fail(
+            new ReplicaError.ProtocolInvalid({
+              message: "Invalid attachment digest",
+              cause
+            })
+          ))
+      )
       const bytes = yield* parseInteger(request.headers[bytesHeader], bytesHeader)
-      const reference = yield* decode(Attachment.Reference, { _tag: "Attachment", digest, bytes }, "reference")
-      const clientId = yield* decode(Identity.ClientId, request.headers[clientHeader], "client id")
-      const membershipIncarnation = yield* decode(
-        Identity.MembershipIncarnation,
-        request.headers[incarnationHeader],
-        "membership incarnation"
+      yield* Effect.annotateCurrentSpan("attachment.bytes", bytes)
+      const reference = yield* Schema.decodeUnknownEffect(Attachment.Reference)({
+        _tag: "Attachment",
+        digest,
+        bytes
+      }).pipe(
+        Effect.catchTag("SchemaError", (cause) =>
+          Effect.fail(
+            new ReplicaError.ProtocolInvalid({
+              message: "Invalid attachment reference",
+              cause
+            })
+          ))
+      )
+      const clientId = yield* Schema.decodeUnknownEffect(Identity.ClientId)(request.headers[clientHeader]).pipe(
+        Effect.catchTag("SchemaError", (cause) =>
+          Effect.fail(
+            new ReplicaError.ProtocolInvalid({
+              message: "Invalid attachment client id",
+              cause
+            })
+          ))
+      )
+      const membershipIncarnation = yield* Schema.decodeUnknownEffect(Identity.MembershipIncarnation)(
+        request.headers[incarnationHeader]
+      ).pipe(
+        Effect.catchTag("SchemaError", (cause) =>
+          Effect.fail(
+            new ReplicaError.ProtocolInvalid({
+              message: "Invalid attachment membership incarnation",
+              cause
+            })
+          ))
       )
       return { spaceId, clientId, membershipIncarnation, reference, principal }
     })
@@ -122,69 +169,93 @@ export const layer = (options?: Options): Layer.Layer<
 
     yield* router.addAll([
       HttpRouter.route("HEAD", path, (request) =>
-        handle(Effect.gen(function*() {
-          const prepared = yield* attachments.prepareUpload(yield* input(request))
-          return HttpServerResponse.empty({
-            headers: {
-              [offsetHeader]: String(prepared.offset),
-              [completeHeader]: String(prepared.complete)
-            }
-          })
-        }))),
+        handle(
+          Effect.gen(function*() {
+            const prepared = yield* attachments.prepareUpload(yield* input(request))
+            return HttpServerResponse.empty({
+              headers: {
+                [offsetHeader]: String(prepared.offset),
+                [completeHeader]: String(prepared.complete)
+              }
+            })
+          }).pipe(Effect.withSpan("AttachmentHttpServer.head"))
+        )),
       HttpRouter.route("PATCH", path, (request) =>
-        handle(Effect.gen(function*() {
-          const decoded = yield* input(request)
-          const expectedOffset = yield* parseInteger(request.headers[offsetHeader], offsetHeader)
-          let declaredLength: number | undefined
-          if (request.headers["content-length"] !== undefined) {
-            declaredLength = yield* parseInteger(request.headers["content-length"], "content-length")
-          }
-          if (declaredLength !== undefined && declaredLength > decoded.reference.bytes - expectedOffset) {
-            return yield* new Attachment.AttachmentLengthMismatch({
-              expected: decoded.reference.bytes - expectedOffset,
-              actual: declaredLength
-            })
-          }
-          const prepared = yield* attachments.appendUpload({
-            ...decoded,
-            expectedOffset,
-            bytes: request.stream.pipe(
-              Stream.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "upload.httpBody", cause }))
-            )
-          })
-          if (declaredLength !== undefined && prepared.offset !== expectedOffset + declaredLength) {
-            return yield* new Attachment.AttachmentLengthMismatch({
-              expected: declaredLength,
-              actual: prepared.offset - expectedOffset
-            })
-          }
-          return HttpServerResponse.empty({
-            headers: {
-              [offsetHeader]: String(prepared.offset),
-              [completeHeader]: String(prepared.complete)
+        handle(
+          Effect.gen(function*() {
+            const decoded = yield* input(request)
+            const expectedOffset = yield* parseInteger(request.headers[offsetHeader], offsetHeader)
+            let declaredLength: number | undefined
+            if (request.headers["content-length"] !== undefined) {
+              declaredLength = yield* parseInteger(request.headers["content-length"], "content-length")
             }
-          })
-        }))),
+            if (declaredLength !== undefined && declaredLength > decoded.reference.bytes - expectedOffset) {
+              return yield* new Attachment.AttachmentLengthMismatch({
+                expected: decoded.reference.bytes - expectedOffset,
+                actual: declaredLength
+              })
+            }
+            const prepared = yield* attachments.appendUpload({
+              ...decoded,
+              expectedOffset,
+              bytes: request.stream.pipe(
+                Stream.catchTag(
+                  "HttpServerError",
+                  (cause) => Stream.fail(new Attachment.AttachmentStorageError({ operation: "upload.httpBody", cause }))
+                )
+              )
+            }).pipe(Effect.withSpan("AttachmentHttpServer.upload", {
+              attributes: {
+                "attachment.bytes": decoded.reference.bytes,
+                "attachment.offset": expectedOffset
+              }
+            }))
+            if (declaredLength !== undefined && prepared.offset !== expectedOffset + declaredLength) {
+              return yield* new Attachment.AttachmentLengthMismatch({
+                expected: declaredLength,
+                actual: prepared.offset - expectedOffset
+              })
+            }
+            return HttpServerResponse.empty({
+              headers: {
+                [offsetHeader]: String(prepared.offset),
+                [completeHeader]: String(prepared.complete)
+              }
+            })
+          }).pipe(Effect.withSpan("AttachmentHttpServer.patch"))
+        )),
       HttpRouter.route("GET", path, (request) =>
-        handle(Effect.gen(function*() {
-          const decoded = yield* input(request)
-          const range = yield* parseRange(request.headers.range, decoded.reference.bytes)
-          let readInput: Parameters<AttachmentServer.Service["prepareRead"]>[0] = decoded
-          if (range !== undefined) readInput = { ...decoded, range }
-          const body = yield* attachments.prepareRead(readInput)
-          const offset = range?.offset ?? 0
-          const length = range?.length ?? decoded.reference.bytes
-          let status = 200
-          const headers: Record<string, string> = { "Accept-Ranges": "bytes" }
-          if (range !== undefined) {
-            status = 206
-            headers["Content-Range"] = `bytes ${offset}-${offset + length - 1}/${decoded.reference.bytes}`
-          }
-          return HttpServerResponse.stream(body, {
-            status,
-            contentLength: length,
-            headers
-          })
-        })))
+        handle(
+          Effect.gen(function*() {
+            const decoded = yield* input(request)
+            const range = yield* parseRange(request.headers.range, decoded.reference.bytes)
+            let readInput: Parameters<AttachmentServer.Service["prepareRead"]>[0] = decoded
+            if (range !== undefined) readInput = { ...decoded, range }
+            const body = yield* attachments.prepareRead(readInput).pipe(
+              Effect.withSpan("AttachmentHttpServer.read", {
+                attributes: {
+                  "attachment.bytes": decoded.reference.bytes,
+                  "attachment.range": range !== undefined
+                }
+              })
+            )
+            const offset = range?.offset ?? 0
+            const length = range?.length ?? decoded.reference.bytes
+            let status = 200
+            const headers: Record<string, string> = {
+              "Accept-Ranges": "bytes",
+              "Cache-Control": "private, no-store"
+            }
+            if (range !== undefined) {
+              status = 206
+              headers["Content-Range"] = `bytes ${offset}-${offset + length - 1}/${decoded.reference.bytes}`
+            }
+            return HttpServerResponse.stream(body, {
+              status,
+              contentLength: length,
+              headers
+            })
+          }).pipe(Effect.withSpan("AttachmentHttpServer.get"))
+        ))
     ])
   }))

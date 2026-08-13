@@ -7,7 +7,6 @@ import * as Redacted from "effect/Redacted"
 import * as Stream from "effect/Stream"
 import * as HttpClient from "effect/unstable/http/HttpClient"
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest"
-import type * as HttpClientResponse from "effect/unstable/http/HttpClientResponse"
 import * as Authentication from "./Authentication.js"
 
 export interface Options {
@@ -22,57 +21,6 @@ const errorHeader = "x-effect-local-error"
 const offsetHeader = "upload-offset"
 const completeHeader = "upload-complete"
 
-const parseOffset = (response: HttpClientResponse.HttpClientResponse, reference: Attachment.Reference) => {
-  const value = response.headers[offsetHeader]
-  let offset = Number.NaN
-  if (value !== undefined) offset = Number(value)
-  if (Number.isSafeInteger(offset) && offset >= 0 && offset <= reference.bytes) return Effect.succeed(offset)
-  return Effect.fail(new ReplicaError.ProtocolInvalid({ message: "Attachment response has an invalid upload offset" }))
-}
-
-const remoteFailure = (
-  response: HttpClientResponse.HttpClientResponse,
-  reference: Attachment.Reference
-): ReplicaError.ReplicaError => {
-  switch (response.headers[errorHeader]) {
-    case "CredentialRejected":
-      return new ReplicaError.CredentialRejected()
-    case "AuthorizationDenied":
-      return new ReplicaError.AuthorizationDenied({ reason: { _tag: "AttachmentDenied" } })
-    case "AttachmentUnavailable":
-    case "AttachmentNotFound":
-      return new Attachment.AttachmentUnavailable({ digest: reference.digest })
-    case "AttachmentUploadBusy":
-      return new Attachment.AttachmentUploadBusy({ digest: reference.digest })
-    case "AttachmentOffsetConflict": {
-      const actual = Number(response.headers[offsetHeader])
-      let validActual = 0
-      if (Number.isSafeInteger(actual) && actual >= 0) validActual = actual
-      return new Attachment.AttachmentOffsetConflict({
-        expected: 0,
-        actual: validActual
-      })
-    }
-    case "AttachmentTooLarge":
-      return new Attachment.AttachmentTooLarge({ limit: reference.bytes })
-    case "CapacityExceeded":
-      return new ReplicaError.CapacityExceeded({ resource: "attachment storage", limit: 0 })
-    default:
-      if (response.status >= 500) return new ReplicaError.ServerUnavailable()
-      return new ReplicaError.ProtocolInvalid({
-        message: `Attachment HTTP request failed with status ${response.status}`
-      })
-  }
-}
-
-const accepted = (
-  response: HttpClientResponse.HttpClientResponse,
-  reference: Attachment.Reference
-) => {
-  if (response.status >= 200 && response.status < 300) return Effect.succeed(response)
-  return Effect.fail(remoteFailure(response, reference))
-}
-
 export const layer = (options: Options): Layer.Layer<
   AttachmentTransfer.AttachmentTransfer,
   never,
@@ -86,7 +34,7 @@ export const layer = (options: Options): Layer.Layer<
       const baseUrl = options.baseUrl.replace(/\/$/, "")
       const path = (options.path ?? "/effect-local/attachments").replace(/^\/?/, "/").replace(/\/$/, "")
 
-      const requestFor = Effect.fnUntraced(function*(
+      const requestFor = Effect.fn("AttachmentHttpClient.request")(function*(
         method: "GET" | "HEAD" | "PATCH",
         request: AttachmentTransfer.UploadRequest | AttachmentTransfer.DownloadRequest
       ) {
@@ -114,16 +62,54 @@ export const layer = (options: Options): Layer.Layer<
         })
       })
 
-      const execute = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
-        effect.pipe(
-          Effect.mapError(() => new ReplicaError.ServerUnavailable())
-        )
-
-      const upload: AttachmentTransfer.Service["upload"] = Effect.fnUntraced(function*(request) {
+      const upload: AttachmentTransfer.Service["upload"] = Effect.fn("AttachmentHttpClient.upload")(function*(request) {
+        yield* Effect.annotateCurrentSpan("attachment.bytes", request.reference.bytes)
         const headRequest = yield* requestFor("HEAD", request)
-        const head = yield* execute(client.execute(headRequest))
-        yield* accepted(head, request.reference)
-        const offset = yield* parseOffset(head, request.reference)
+        const head = yield* client.execute(headRequest).pipe(
+          Effect.catchTag("HttpClientError", () => Effect.fail(new ReplicaError.ServerUnavailable())),
+          Effect.withSpan("AttachmentHttpClient.head", {
+            attributes: { "attachment.bytes": request.reference.bytes }
+          })
+        )
+        if (head.status < 200 || head.status >= 300) {
+          switch (head.headers[errorHeader]) {
+            case "CredentialRejected":
+              return yield* new ReplicaError.CredentialRejected()
+            case "AuthorizationDenied":
+              return yield* new ReplicaError.AuthorizationDenied({ reason: { _tag: "AttachmentDenied" } })
+            case "AttachmentUnavailable":
+            case "AttachmentNotFound":
+              return yield* new Attachment.AttachmentUnavailable({ digest: request.reference.digest })
+            case "AttachmentUploadBusy":
+              return yield* new Attachment.AttachmentUploadBusy({ digest: request.reference.digest })
+            case "AttachmentOffsetConflict": {
+              const actual = Number(head.headers[offsetHeader])
+              let validActual = 0
+              if (Number.isSafeInteger(actual) && actual >= 0) validActual = actual
+              return yield* new Attachment.AttachmentOffsetConflict({
+                expected: 0,
+                actual: validActual
+              })
+            }
+            case "AttachmentTooLarge":
+              return yield* new Attachment.AttachmentTooLarge({ limit: request.reference.bytes })
+            case "CapacityExceeded":
+              return yield* new ReplicaError.CapacityExceeded({ resource: "attachment storage", limit: 0 })
+            default:
+              if (head.status >= 500) return yield* new ReplicaError.ServerUnavailable()
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Attachment HTTP request failed with status ${head.status}`
+              })
+          }
+        }
+        const offsetValue = head.headers[offsetHeader]
+        let offset = Number.NaN
+        if (offsetValue !== undefined) offset = Number(offsetValue)
+        if (!Number.isSafeInteger(offset) || offset < 0 || offset > request.reference.bytes) {
+          return yield* new ReplicaError.ProtocolInvalid({
+            message: "Attachment response has an invalid upload offset"
+          })
+        }
         if (head.headers[completeHeader] === "true") return yield* Effect.void
         const patchBase = yield* requestFor("PATCH", request)
         const offsetRequest = HttpClientRequest.setHeader(patchBase, offsetHeader, String(offset))
@@ -132,9 +118,54 @@ export const layer = (options: Options): Layer.Layer<
           request.bytes(offset),
           { contentLength: request.reference.bytes - offset }
         )
-        const patched = yield* execute(client.execute(patchRequest))
-        yield* accepted(patched, request.reference)
-        const uploaded = yield* parseOffset(patched, request.reference)
+        const patched = yield* client.execute(patchRequest).pipe(
+          Effect.catchTag("HttpClientError", () => Effect.fail(new ReplicaError.ServerUnavailable())),
+          Effect.withSpan("AttachmentHttpClient.patch", {
+            attributes: {
+              "attachment.bytes": request.reference.bytes,
+              "attachment.offset": offset
+            }
+          })
+        )
+        if (patched.status < 200 || patched.status >= 300) {
+          switch (patched.headers[errorHeader]) {
+            case "CredentialRejected":
+              return yield* new ReplicaError.CredentialRejected()
+            case "AuthorizationDenied":
+              return yield* new ReplicaError.AuthorizationDenied({ reason: { _tag: "AttachmentDenied" } })
+            case "AttachmentUnavailable":
+            case "AttachmentNotFound":
+              return yield* new Attachment.AttachmentUnavailable({ digest: request.reference.digest })
+            case "AttachmentUploadBusy":
+              return yield* new Attachment.AttachmentUploadBusy({ digest: request.reference.digest })
+            case "AttachmentOffsetConflict": {
+              const actual = Number(patched.headers[offsetHeader])
+              let validActual = 0
+              if (Number.isSafeInteger(actual) && actual >= 0) validActual = actual
+              return yield* new Attachment.AttachmentOffsetConflict({
+                expected: offset,
+                actual: validActual
+              })
+            }
+            case "AttachmentTooLarge":
+              return yield* new Attachment.AttachmentTooLarge({ limit: request.reference.bytes })
+            case "CapacityExceeded":
+              return yield* new ReplicaError.CapacityExceeded({ resource: "attachment storage", limit: 0 })
+            default:
+              if (patched.status >= 500) return yield* new ReplicaError.ServerUnavailable()
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Attachment HTTP request failed with status ${patched.status}`
+              })
+          }
+        }
+        const uploadedValue = patched.headers[offsetHeader]
+        let uploaded = Number.NaN
+        if (uploadedValue !== undefined) uploaded = Number(uploadedValue)
+        if (!Number.isSafeInteger(uploaded) || uploaded < 0 || uploaded > request.reference.bytes) {
+          return yield* new ReplicaError.ProtocolInvalid({
+            message: "Attachment response has an invalid upload offset"
+          })
+        }
         if (uploaded !== request.reference.bytes || patched.headers[completeHeader] !== "true") {
           return yield* new Attachment.AttachmentUnavailable({ digest: request.reference.digest })
         }
@@ -151,9 +182,54 @@ export const layer = (options: Options): Layer.Layer<
             }
             httpRequest = HttpClientRequest.setHeader(httpRequest, "range", `bytes=${request.range.offset}-${end}`)
           }
-          const response = yield* execute(client.execute(httpRequest))
-          yield* accepted(response, request.reference)
-          return response.stream.pipe(Stream.mapError(() => new ReplicaError.ServerUnavailable()))
+          const response = yield* client.execute(httpRequest).pipe(
+            Effect.catchTag("HttpClientError", () => Effect.fail(new ReplicaError.ServerUnavailable())),
+            Effect.withSpan("AttachmentHttpClient.get", {
+              attributes: {
+                "attachment.bytes": request.reference.bytes,
+                "attachment.range": request.range !== undefined
+              }
+            })
+          )
+          if (response.status < 200 || response.status >= 300) {
+            switch (response.headers[errorHeader]) {
+              case "CredentialRejected":
+                return yield* new ReplicaError.CredentialRejected()
+              case "AuthorizationDenied":
+                return yield* new ReplicaError.AuthorizationDenied({ reason: { _tag: "AttachmentDenied" } })
+              case "AttachmentUnavailable":
+              case "AttachmentNotFound":
+                return yield* new Attachment.AttachmentUnavailable({ digest: request.reference.digest })
+              case "AttachmentUploadBusy":
+                return yield* new Attachment.AttachmentUploadBusy({ digest: request.reference.digest })
+              case "AttachmentOffsetConflict": {
+                const actual = Number(response.headers[offsetHeader])
+                let validActual = 0
+                if (Number.isSafeInteger(actual) && actual >= 0) validActual = actual
+                return yield* new Attachment.AttachmentOffsetConflict({
+                  expected: 0,
+                  actual: validActual
+                })
+              }
+              case "AttachmentTooLarge":
+                return yield* new Attachment.AttachmentTooLarge({ limit: request.reference.bytes })
+              case "CapacityExceeded":
+                return yield* new ReplicaError.CapacityExceeded({ resource: "attachment storage", limit: 0 })
+              default:
+                if (response.status >= 500) return yield* new ReplicaError.ServerUnavailable()
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message: `Attachment HTTP request failed with status ${response.status}`
+                })
+            }
+          }
+          return response.stream.pipe(
+            Stream.catchTag("HttpClientError", () => Stream.fail(new ReplicaError.ServerUnavailable()))
+          )
+        })).pipe(Stream.withSpan("AttachmentHttpClient.download", {
+          attributes: {
+            "attachment.bytes": request.reference.bytes,
+            "attachment.range": request.range !== undefined
+          }
         }))
 
       return AttachmentTransfer.AttachmentTransfer.of({ upload, download })

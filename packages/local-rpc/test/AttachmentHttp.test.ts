@@ -135,9 +135,16 @@ describe("attachment HTTP transport", () => {
         )
         const web = HttpRouter.toWebHandler(layerRoute, { disableLogger: true })
         yield* Effect.addFinalizer(() => Effect.promise(web.dispose))
-        const fetch =
-          ((input: URL | RequestInfo, init?: RequestInit) =>
-            web.handler(new Request(input, init))) satisfies typeof globalThis.fetch
+        let downloadCacheControl: string | null | undefined
+        const requests: Array<{ readonly method: string; readonly uploadOffset: string | null }> = []
+        const fetch = ((input: URL | RequestInfo, init?: RequestInit) => {
+          const request = new Request(input, init)
+          requests.push({ method: request.method, uploadOffset: request.headers.get("upload-offset") })
+          return web.handler(request).then((response) => {
+            if (request.method === "GET") downloadCacheControl = response.headers.get("cache-control")
+            return response
+          })
+        }) satisfies typeof globalThis.fetch
         const provider = Authentication.CredentialProvider.of({
           acquire: Effect.succeed({ generation: 0, bearer: Redacted.make("secret") }),
           awaitChange: () => Effect.never
@@ -150,13 +157,41 @@ describe("attachment HTTP transport", () => {
           Effect.provideService(FetchHttpClient.Fetch, fetch)
         )
         const identity = { spaceId, clientId, membershipIncarnation, reference }
-        const prefix = yield* attachments.prepareUpload({ ...identity, principal: { subject: "reader" } })
-        yield* attachments.appendUpload({
-          ...identity,
-          principal: { subject: "reader" },
-          expectedOffset: prefix.offset,
-          bytes: Stream.make(bytes.slice(0, 2))
+        let emittedPrefix = false
+        const interruptedBody = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (!emittedPrefix) {
+              emittedPrefix = true
+              controller.enqueue(bytes.slice(0, 2))
+              return
+            }
+            controller.error("connection interrupted")
+          }
         })
+        const attachmentUrl = `http://effect-local.test/effect-local/attachments/${spaceId}/${reference.digest}`
+        const attachmentHeaders = {
+          authorization: "Bearer secret",
+          "x-effect-local-client-id": clientId,
+          "x-effect-local-membership-incarnation": membershipIncarnation,
+          "x-effect-local-attachment-bytes": String(reference.bytes)
+        }
+        const initial = yield* Effect.promise(() =>
+          fetch(attachmentUrl, { method: "HEAD", headers: attachmentHeaders })
+        )
+        assert.strictEqual(initial.status, 204)
+        assert.strictEqual(initial.headers.get("upload-offset"), "0")
+        const interruptedInit = {
+          method: "PATCH",
+          headers: {
+            ...attachmentHeaders,
+            "upload-offset": "0"
+          },
+          body: interruptedBody,
+          duplex: "half"
+        } satisfies RequestInit & { readonly duplex: "half" }
+        const interrupted = yield* Effect.promise(() => fetch(attachmentUrl, interruptedInit))
+        assert.strictEqual(interrupted.status, 503)
+        requests.length = 0
         let resumedAt = -1
         yield* transfer.upload({
           ...identity,
@@ -168,6 +203,10 @@ describe("attachment HTTP transport", () => {
           Effect.provideService(FetchHttpClient.Fetch, fetch)
         )
         assert.strictEqual(resumedAt, 2)
+        assert.deepStrictEqual(requests.slice(0, 2), [
+          { method: "HEAD", uploadOffset: null },
+          { method: "PATCH", uploadOffset: "2" }
+        ])
 
         const denied = yield* collect(transfer.download(identity)).pipe(
           Effect.provideService(FetchHttpClient.Fetch, fetch),
@@ -184,7 +223,8 @@ describe("attachment HTTP transport", () => {
           model: Message.name,
           modelVersion: Message.version,
           entityKey: "\"message\"",
-          value: entityValue
+          value: entityValue,
+          authority: { _tag: "Mutation", clientId, membershipIncarnation }
         })
         const valueJson = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(entityValue)
         const sql = Context.get(services, SqlClient.SqlClient)
@@ -197,6 +237,7 @@ describe("attachment HTTP transport", () => {
           yield* collect(transfer.download(identity)).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)),
           bytes
         )
+        assert.strictEqual(downloadCacheControl, "private, no-store")
         const storageService = Context.get(services, AttachmentStorage.AttachmentStorage)
         const prepared = yield* attachments.prepareUpload({ ...identity, principal: { subject: "reader" } })
         const object = yield* storageService.exists(prepared.objectKey)
