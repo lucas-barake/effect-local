@@ -723,15 +723,18 @@ export const make = (options: Options) => {
     request: Protocol.PullRequest,
     principal: typeof Schema.Json.Type,
     page: Protocol.PullPage,
-    all: ReadonlyMap<string, MaterializedEntity>
+    all: ReadonlyMap<string, MaterializedEntity>,
+    windowKeys: ReadonlyMap<string, ReadonlySet<string>>
   ) =>
     Effect.gen(function*() {
       for (const change of page.changes) {
         const key = yield* Codec.stringify(change.entity.key)
         const current = all.get(identityOf(change.entity.model, key))
+        const inScope = request.scope.models.includes(change.entity.model) ||
+          (windowKeys.get(change.entity.model)?.has(key) ?? false)
         if (change._tag === "Upsert") {
           if (
-            current === undefined || !Protocol.replicationScopeCoversModel(request.scope, current.entity.model) ||
+            current === undefined || !inScope ||
             change.entity.modelVersion !== current.entity.modelVersion ||
             (yield* Codec.stringify(change.value)) !== current.valueJson ||
             !(yield* options.authorization.entity(request, principal, current.sourceEntity, current.sourceValue))
@@ -741,7 +744,7 @@ export const make = (options: Options) => {
         if (change._tag === "Retract") {
           if (current === undefined) return false
           if (
-            request.scope.models.includes(current.entity.model) &&
+            inScope &&
             (yield* options.authorization.entity(request, principal, current.sourceEntity, current.sourceValue))
           ) return false
         }
@@ -1212,7 +1215,12 @@ export const make = (options: Options) => {
               emptyWindowSelection
             )).all
           }
-          if (!(yield* pageSafe({ ...request, scope: normalized }, principal, page, all))) {
+          const windowKeys = yield* windowSelection(
+            request.spaceId,
+            space.active_schema_generation,
+            normalized
+          )
+          if (!(yield* pageSafe({ ...request, scope: normalized }, principal, page, all, windowKeys))) {
             return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
           }
           return page
@@ -1361,6 +1369,7 @@ export const make = (options: Options) => {
         })))
       }).pipe(Effect.mapError(StorageUnavailable.make))
       const source = yield* decodeAuthoritative(request.spaceId, sourceRows)
+      const windowKeys = yield* windowSelection(request.spaceId, space.active_schema_generation, normalized)
       let valid = true
       for (const storedEntry of selected) {
         const { entry } = storedEntry
@@ -1376,7 +1385,9 @@ export const make = (options: Options) => {
         if (
           entry.change._tag !== "Upsert" || current === undefined ||
           current.valueJson !== storedEntry.sourceValueJson || Option.isNone(projected) ||
-          !Protocol.replicationScopeCoversModel(normalized, projected.value.entity.model) ||
+          !(normalized.models.includes(projected.value.entity.model) ||
+            (projectedKey !== undefined &&
+              (windowKeys.get(projected.value.entity.model)?.has(projectedKey) ?? false))) ||
           entry.change.entity.model !== projected.value.entity.model ||
           entry.change.entity.modelVersion !== projected.value.entity.modelVersion ||
           (yield* Codec.stringify(entry.change.entity.key)) !== projectedKey ||
