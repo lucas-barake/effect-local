@@ -292,19 +292,20 @@ Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect W
 `layerWorkflow` to bound one execution's exponential retry history. A later local mutation or server wake creates a
 new generation after a terminal failure. `SqlReplica.layer` remains the explicit lightweight in memory choice.
 
-The production composition benchmark compares eager runtimes at `e999e1c` with inactive remembered spaces. Each scale
-runs in a fresh process with explicit garbage collection:
+The production composition benchmark compares eager runtimes at `e999e1c` with inactive remembered spaces. It seeds
+the same durable memberships, measures the median of three cold Replica restores, and runs full V8 garbage collection
+before each retained heap sample:
 
-| Spaces | Eager fibers | Lazy fibers | Eager watches | Lazy watches | Eager heap MiB | Lazy heap MiB |
-| -----: | -----------: | ----------: | ------------: | -----------: | -------------: | ------------: |
-|      1 |           11 |           5 |             1 |            0 |           4.24 |          0.25 |
-|     64 |          144 |           5 |            64 |            0 |          50.84 |          7.05 |
-|    256 |          528 |           5 |           256 |            0 |          82.23 |          6.68 |
-|  1,000 |        2,016 |           5 |         1,000 |            0 |         214.34 |         18.14 |
+| Spaces | Eager fibers | Lazy fibers | Eager watches | Lazy watches | Eager heap MiB | Lazy heap MiB | Eager restore ms | Lazy restore ms |
+| -----: | -----------: | ----------: | ------------: | -----------: | -------------: | ------------: | ---------------: | --------------: |
+|      1 |           11 |           6 |             1 |            0 |           0.28 |          0.13 |            24.17 |           14.59 |
+|     64 |          144 |           6 |            64 |            0 |           3.04 |          0.49 |           371.21 |           27.90 |
+|    256 |          528 |           6 |           256 |            0 |           9.63 |          0.49 |         1,031.43 |           32.45 |
+|  1,000 |        2,016 |           6 |         1,000 |            0 |          34.73 |          0.17 |         4,090.48 |           98.84 |
 
 ```sh
 for spaces in 1 64 256 1000; do
-  EFFECT_LOCAL_BENCH_SPACES=$spaces node --expose-gc node_modules/vitest/vitest.mjs bench --run packages/local-sql/bench/ReplicaScale.bench.ts
+  EFFECT_LOCAL_BENCH_SPACES=$spaces pnpm bench packages/local-sql/bench/ReplicaScale.bench.ts
 done
 ```
 

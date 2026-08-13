@@ -1,31 +1,42 @@
+/* oxlint-disable effect/noAsyncFunction, effect/noGlobals, effect/noNodeBuiltinImport, effect/noTryCatch, effect-local/noManualEffectBoundary -- Vitest owns the benchmark boundary and filesystem fixture. */
+
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import * as Clock from "effect/Clock"
+import * as Context from "effect/Context"
+import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Metric from "effect/Metric"
+import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { setFlagsFromString } from "node:v8"
+import { runInNewContext } from "node:vm"
 import { assert, bench, describe } from "vitest"
+import * as Codec from "../src/internal/codec.js"
+import * as Migrations from "../src/Migrations.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "../test/Domain.js"
-
-/* oxlint-disable effect/noAsyncFunction, effect-local/noManualEffectBoundary -- Vitest owns the benchmark boundary. */
 
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const defaultScope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
 const scales = [1, 64, 256, 1_000] as const
 type Scale = typeof scales[number]
 const eagerBaselineAtE999e1c = {
-  1: { fibers: 11, watches: 1, heapBytes: 4_451_056, startupMillis: 16.19 },
-  64: { fibers: 144, watches: 64, heapBytes: 53_314_776, startupMillis: 860.58 },
-  256: { fibers: 528, watches: 256, heapBytes: 86_219_424, startupMillis: 2_792.07 },
-  1_000: { fibers: 2_016, watches: 1_000, heapBytes: 224_750_552, startupMillis: 7_396.56 }
+  1: { fibers: 11, watches: 1, heapBytes: 290_472, startupMillis: 24.17 },
+  64: { fibers: 144, watches: 64, heapBytes: 3_183_800, startupMillis: 371.21 },
+  256: { fibers: 528, watches: 256, heapBytes: 10_100_400, startupMillis: 1_031.43 },
+  1_000: { fibers: 2_016, watches: 1_000, heapBytes: 36_418_480, startupMillis: 4_090.48 }
 } as const
 
 const activeFibers = (snapshots: ReadonlyArray<Metric.Metric.Snapshot>): number => {
@@ -42,12 +53,11 @@ const spaces = (count: number): ReadonlyArray<Identity.SpaceId> =>
     (_, index) => Identity.SpaceId.make(`spc_00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`)
   )
 
-const collectGarbage = () => {
-  globalThis.gc?.()
-  globalThis.gc?.()
-}
+setFlagsFromString("--expose_gc")
+const exposedGc: NonNullable<typeof globalThis.gc> = runInNewContext("gc")
+const collectGarbage = Effect.promise(() => exposedGc({ execution: "async" }))
 
-const layerReplica = (spaceCount: number, onWatchCount: (change: number) => void) => {
+const layerReplica = (onWatchCount: (change: number) => void, layerServices: Layer.Layer<any>) => {
   const remote = SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
     submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -63,10 +73,9 @@ const layerReplica = (spaceCount: number, onWatchCount: (change: number) => void
         () => Effect.sync(() => onWatchCount(-1))
       ).pipe(Stream.unwrap)
   })
-  return SqlReplica.layer({
+  const options: SqlReplica.Options<typeof Domain.definition> = {
     definition: Domain.definition,
     clientId,
-    initialSpaces: spaces(spaceCount),
     defaultScope,
     maximumActiveSpaces: 8,
     foregroundActiveSpaces: 4,
@@ -78,50 +87,116 @@ const layerReplica = (spaceCount: number, onWatchCount: (change: number) => void
     maximumBootstrapBytes: 64 * 1024 * 1024,
     maximumBootstrapPageBytes: 4 * 1024 * 1024,
     migration: { retryDelay: "1 millis", maximumAttempts: 8 }
-  }).pipe(
+  }
+  return SqlReplica.layer(options).pipe(
     Layer.provide(Domain.layerHandlers),
     Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
-    Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
-    Layer.provide(NodeCrypto.layer),
-    Layer.provide(Reactivity.layer)
+    Layer.provide(layerServices)
   )
 }
 
-const open = (spaceCount: number) => {
+const open = (layerServices: Layer.Layer<any>) => {
   let watches = 0
-  const registry = new Map<string, Metric.Metric.Metadata<any, any>>()
-  const layer = layerReplica(spaceCount, (change) => {
+  const layer = layerReplica((change) => {
     watches += change
-  }).pipe(
-    Layer.provideMerge(Metric.enableRuntimeMetricsLayer),
-    Layer.provideMerge(Layer.succeed(Metric.MetricRegistry, registry))
-  )
+  }, layerServices)
   return { layer, watches: () => watches }
 }
 
-const measure = async (spaceCount: Scale) => {
-  const environment = open(0)
-  return Effect.runPromise(
-    Effect.gen(function*() {
-      const replica = yield* Replica.Replica
-      assert.strictEqual((yield* replica.spaces).length, 0)
-      collectGarbage()
-      const beforeHeap = process.memoryUsage().heapUsed
-      const startedAt = yield* Clock.currentTimeMillis
-      yield* Effect.forEach(spaces(spaceCount), replica.join, { discard: true })
-      assert.strictEqual((yield* replica.spaces).length, spaceCount)
-      yield* Effect.yieldNow
-      collectGarbage()
-      const current = {
-        fibers: activeFibers(yield* Metric.snapshot),
-        heapBytes: process.memoryUsage().heapUsed - beforeHeap,
-        startupMillis: (yield* Clock.currentTimeMillis) - startedAt,
-        watches: environment.watches()
-      }
-      assert.strictEqual(current.watches, 0)
-      return current
-    }).pipe(Effect.provide(environment.layer), Effect.scoped)
-  )
+interface Measurement {
+  readonly fibers: number
+  readonly heapBytes: number
+  readonly startupMillis: number
+  readonly watches: number
+}
+
+const median = (values: ReadonlyArray<number>): number => values.toSorted((left, right) => left - right)[1]
+
+const measure = async (spaceCount: Scale): Promise<Measurement> => {
+  const temporaryRoot = tmpdir()
+  const directory = mkdtempSync(join(temporaryRoot, "effect-local-scale-"))
+  const filename = join(directory, "replica.sqlite")
+  try {
+    const samples = await Effect.runPromise(
+      Effect.gen(function*() {
+        const databaseScope = yield* Scope.make()
+        const databaseContext = yield* Layer.mergeAll(
+          SqliteClient.layer({ filename, disableWAL: true }),
+          NodeCrypto.layer,
+          Reactivity.layer
+        ).pipe(Layer.buildWithScope(databaseScope))
+        const sql = Context.get(databaseContext, SqlClient.SqlClient)
+        const crypto = Context.get(databaseContext, Crypto.Crypto)
+        const reactivity = Context.get(databaseContext, Reactivity.Reactivity)
+        const layerServices = Layer.mergeAll(
+          Layer.succeed(SqlClient.SqlClient, sql),
+          Layer.succeed(Crypto.Crypto, crypto),
+          Layer.succeed(Reactivity.Reactivity, reactivity)
+        )
+        yield* Migrations.client({
+          definition: Domain.definition,
+          clientId,
+          migration: { retryDelay: "1 millis", maximumAttempts: 8 }
+        }).pipe(Effect.provideService(SqlClient.SqlClient, sql))
+        const scopeJson = yield* Codec.stringify(defaultScope)
+        const scopeDigest = yield* Protocol.replicationScopeDigest(defaultScope).pipe(
+          Effect.provideService(Crypto.Crypto, crypto)
+        )
+        const seededSpaces = spaces(spaceCount)
+        yield* sql.withTransaction(
+          Effect.forEach(seededSpaces, (spaceId) =>
+            sql`INSERT INTO effect_local_client_spaces
+          (space_id, membership_incarnation, definition_hash, schema_version, schema_hash, schema_generation,
+            active_schema_generation, active_projection_generation, projection_schema_generation,
+            next_local_sequence, server_cursor, visible_revision, requested_generation, completed_generation,
+            installed_snapshot_sequence, installed_snapshot_terminal_sequence, desired_scope_json,
+            desired_scope_digest, scope_generation)
+          VALUES (${spaceId},
+            ('inc_' || lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
+              substr(lower(hex(randomblob(2))), 2) || '-' ||
+              substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))), 2) || '-' ||
+              lower(hex(randomblob(6)))), ${Domain.definition.hash},
+            ${Domain.definition.schemaIdentity.version}, ${Domain.definition.schemaIdentity.hash}, 0, 0, 0, 0,
+            1, 0, 0, 1, 0, 0, 0, ${scopeJson}, ${scopeDigest}, 1)`, { discard: true })
+        )
+
+        const observations: Array<Measurement> = []
+        for (let index = 0; index < 3; index += 1) {
+          yield* collectGarbage
+          const beforeHeap = process.memoryUsage().heapUsed
+          const startedAt = performance.now()
+          const environment = open(layerServices)
+          const replicaScope = yield* Scope.make()
+          const context = yield* Layer.buildWithScope(environment.layer, replicaScope)
+          const replica = Context.get(context, Replica.Replica)
+          assert.lengthOf(yield* replica.spaces, spaceCount)
+          yield* collectGarbage
+          const snapshots = yield* Metric.snapshot
+          observations.push({
+            fibers: activeFibers(snapshots),
+            heapBytes: process.memoryUsage().heapUsed - beforeHeap,
+            startupMillis: performance.now() - startedAt,
+            watches: environment.watches()
+          })
+          yield* Scope.close(replicaScope, Exit.void)
+        }
+        yield* Scope.close(databaseScope, Exit.void)
+        return observations
+      }).pipe(
+        Metric.enableRuntimeMetrics,
+        Effect.provideService(Metric.MetricRegistry, new Map())
+      )
+    )
+    assert.isTrue(samples.every((sample) => sample.watches === 0))
+    return {
+      fibers: median(samples.map((sample) => sample.fibers)),
+      heapBytes: median(samples.map((sample) => sample.heapBytes)),
+      startupMillis: median(samples.map((sample) => sample.startupMillis)),
+      watches: median(samples.map((sample) => sample.watches))
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
 }
 
 // oxlint-disable-next-line effect/noGlobals -- The benchmark runner selects one isolated process per scale.
