@@ -164,7 +164,9 @@ export const make = (
     for (const model of definition.models) {
       byModel.set(model.name, all.filter((descriptor) => descriptor.model === model))
     }
-    const byLabel = new Map(all.map((descriptor) => [`${descriptor.model.name}/${descriptor.indexName}`, descriptor]))
+    const byLabel = new Map(
+      all.map((descriptor) => [Canonical.stringify([descriptor.model.name, descriptor.indexName]), descriptor])
+    )
     for (const descriptor of all) {
       yield* sql.unsafe(descriptor.tableDdl)
       yield* sql.unsafe(descriptor.scanIndexDdl)
@@ -424,7 +426,7 @@ export const make = (
 
     const membership: Runtime["membership"] = (spaceId, schemaGeneration, window) =>
       Effect.gen(function*() {
-        const descriptor = byLabel.get(`${window.model}/${window.index}`)
+        const descriptor = byLabel.get(Canonical.stringify([window.model, window.index]))
         if (descriptor === undefined) {
           return yield* new ReplicaError.ProtocolInvalid({
             message: `Unknown replication window index: ${window.model}/${window.index}`
@@ -459,9 +461,13 @@ export const make = (
           )
         let exclusion = sql`1 = 1`
         if (overrideValues.length > 0) {
-          exclusion = sql`NOT (${
-            sql.or(overrideValues.map((values) => sql`(${partitionMatches(descriptor, values)})`))
-          })`
+          const overrideMatch = sql.and(
+            partitions.map((name, position) => sql`${sql(name)} = json_extract(override.value, ${`$[${position}]`})`)
+          )
+          exclusion = sql`NOT EXISTS (
+            SELECT 1 FROM json_each(${Canonical.stringify(overrideValues)}) AS override
+            WHERE ${overrideMatch}
+          )`
         }
         if (partitions.length === 0) {
           if (overrideValues.length === 0) {
@@ -506,7 +512,7 @@ export const make = (
       }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
     const resolveDescriptor = (window: Protocol.ReplicationWindow) => {
-      const descriptor = byLabel.get(`${window.model}/${window.index}`)
+      const descriptor = byLabel.get(Canonical.stringify([window.model, window.index]))
       if (descriptor === undefined) {
         return Effect.fail(
           new ReplicaError.ProtocolInvalid({

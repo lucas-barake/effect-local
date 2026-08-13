@@ -184,6 +184,151 @@ describe("domain contracts", () => {
       assert.match(failure.message, /Unknown replication model: Missing/)
     }))
 
+  it.effect("rejects duplicate replication window partition keys", () =>
+    Effect.gen(function*() {
+      const IndexedTodo = Model.make("IndexedTodo", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ id: Schema.String, group: Schema.String, rank: Schema.Number }),
+        indexes: {
+          byGroup: {
+            version: 1,
+            partition: [{
+              name: "group",
+              affinity: "text",
+              schema: Schema.String,
+              extract: (value: { readonly group: string }) => value.group
+            }],
+            sort: [{
+              name: "rank",
+              affinity: "real",
+              schema: Schema.Number,
+              extract: (value: { readonly rank: number }) => value.rank
+            }]
+          }
+        }
+      })
+      const definition = Definition.make({ version: 1, models: [IndexedTodo], mutations: [] })
+      const result = yield* Protocol.validateReplicationScope(definition, {
+        models: [],
+        windows: [{
+          model: IndexedTodo.name,
+          index: "byGroup",
+          count: 1,
+          partitions: [{ key: ["same"], count: 3 }, { key: ["same"], count: 1 }]
+        }]
+      }).pipe(Effect.result)
+      assert.strictEqual(result._tag, "Failure")
+      if (result._tag === "Failure") assert.match(result.failure.message, /Duplicate replication window partition/)
+    }))
+
+  it.effect("keeps model and index names distinct without delimiter collisions", () =>
+    Effect.gen(function*() {
+      const component = {
+        version: 1,
+        partition: [],
+        sort: [{
+          name: "rank",
+          affinity: "real" as const,
+          schema: Schema.Number,
+          extract: (value: { readonly rank: number }) => value.rank
+        }]
+      }
+      const A = Model.make("a", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ rank: Schema.Number }),
+        indexes: { "b/c": component }
+      })
+      const AB = Model.make("a/b", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ rank: Schema.Number }),
+        indexes: { c: component }
+      })
+      const definition = Definition.make({ version: 1, models: [A, AB], mutations: [] })
+      const scope = yield* Protocol.validateReplicationScope(definition, {
+        models: [],
+        windows: [
+          { model: A.name, index: "b/c", count: 1 },
+          { model: AB.name, index: "c", count: 1 }
+        ]
+      })
+      assert.strictEqual(scope.windows?.length, 2)
+    }))
+
+  it.effect("validates replication window values with the component codecs", () =>
+    Effect.gen(function*() {
+      const NumericString = Schema.String.check(Schema.isPattern(/^\d+$/)).annotate({
+        identifier: "NumericString"
+      })
+      const Indexed = Model.make("Indexed", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ group: NumericString, rank: Schema.Number }),
+        indexes: {
+          byGroup: {
+            version: 1,
+            partition: [{
+              name: "group",
+              affinity: "text",
+              schema: NumericString,
+              extract: (value: { readonly group: string }) => value.group
+            }],
+            sort: [{
+              name: "rank",
+              affinity: "real",
+              schema: Schema.Number,
+              extract: (value: { readonly rank: number }) => value.rank
+            }]
+          }
+        }
+      })
+      const definition = Definition.make({ version: 1, models: [Indexed], mutations: [] })
+      const valid = yield* Protocol.validateReplicationScope(definition, {
+        models: [],
+        windows: [{ model: Indexed.name, index: "byGroup", count: 1, partitions: [{ key: ["42"] }] }]
+      })
+      assert.deepStrictEqual(valid.windows?.[0].partitions?.[0].key, ["42"])
+
+      const invalid = yield* Protocol.validateReplicationScope(definition, {
+        models: [],
+        windows: [{
+          model: Indexed.name,
+          index: "byGroup",
+          count: 1,
+          partitions: [{ key: ["not-a-number"] }]
+        }]
+      }).pipe(Effect.result)
+      assert.strictEqual(invalid._tag, "Failure")
+      if (invalid._tag === "Failure") assert.match(invalid.failure.message, /component schema/)
+    }))
+
+  it("bounds replication windows and partition overrides", () => {
+    const windows = Array.from({ length: 1_001 }, (_, index) => ({
+      model: `Model${index}`,
+      index: "byRank",
+      count: 1
+    }))
+    assert.throws(
+      () => Schema.decodeUnknownSync(Protocol.ReplicationScope)({ models: [], windows }),
+      /length/i
+    )
+    assert.throws(
+      () =>
+        Schema.decodeUnknownSync(Protocol.ReplicationScope)({
+          models: [],
+          windows: [{
+            model: "Indexed",
+            index: "byGroup",
+            count: 1,
+            partitions: Array.from({ length: 1_001 }, (_, index) => ({ key: [`group-${index}`] }))
+          }]
+        }),
+      /length/i
+    )
+  })
+
   it("round trips scoped replication protocol values", () => {
     const spaceId = "spc_00000000-0000-4000-8000-000000000001"
     const clientId = "cli_00000000-0000-4000-8000-000000000002"

@@ -716,6 +716,30 @@ describe("scoped replication", () => {
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
+  it.effect("accepts the maximum bounded partition override set", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const server = yield* service(ServerStore.ServerStore, makeServer())
+        const windowed = Protocol.ReplicationScope.make({
+          models: [],
+          windows: [
+            Protocol.ReplicationWindow.make({
+              model: Domain.Message.name,
+              index: "byChat",
+              count: 1,
+              partitions: Array.from(
+                { length: Protocol.maximumReplicationWindowPartitions },
+                (_, index) => Protocol.ReplicationWindowPartition.make({ key: [`chat-${index}`] })
+              )
+            })
+          ]
+        })
+        const result = yield* server.pullAuthorized(pullRequest(null, windowed, 1), "reader")
+        assert.isTrue("_tag" in result)
+        if ("_tag" in result) assert.strictEqual(result._tag, "BootstrapRequired")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("emits a periodic revocation hint", () =>
     Effect.scoped(
       Effect.gen(function*() {
