@@ -317,7 +317,7 @@ yield* space.releaseAttachment(attachment)
 Client SQLite stores ownership, availability, and cleanup metadata. Bytes stay in a separate `AttachmentStorage`.
 Node applications can use `FileSystemAttachmentStorage`. Browser applications use
 `BrowserAttachmentStorage.layerMessagePort` with the application owned `BrowserAttachmentWorker` to store direct OPFS
-files outside SQLite WASM. The Atom graph exposes `graph.attachment(spaceId)(reference)` as a lazy `AsyncResult` for
+files outside SQLite WASM. The Atom graph exposes `graph.attachment(spaceId, reference)` as a lazy `AsyncResult` for
 placeholder, failure, and resolved byte states.
 
 `AttachmentHttpServer.layer` contributes authenticated HEAD, PATCH, and GET routes to the application's `HttpRouter`.
