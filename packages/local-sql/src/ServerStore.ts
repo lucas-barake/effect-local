@@ -1217,7 +1217,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               const mutationPayload = mutation.payload
               let transactionOptions: Parameters<typeof SqlTransaction.server>[0] = {
                 sql,
-                definition: options.definition,
                 spaceId: envelope.spaceId,
                 generation: storedSpace.active_schema_generation,
                 clientId: envelope.clientId,

@@ -42,23 +42,13 @@ export const layer = (options: Options): Layer.Layer<
         const url = `${baseUrl}${path}/${encodeURIComponent(request.spaceId)}/${
           encodeURIComponent(request.reference.digest)
         }`
-        let initial: HttpClientRequest.HttpClientRequest
-        switch (method) {
-          case "GET":
-            initial = HttpClientRequest.get(url)
-            break
-          case "HEAD":
-            initial = HttpClientRequest.head(url)
-            break
-          case "PATCH":
-            initial = HttpClientRequest.patch(url)
-            break
-        }
-        return HttpClientRequest.setHeaders(initial, {
-          authorization: `Bearer ${Redacted.value(credential.bearer)}`,
-          [clientHeader]: request.clientId,
-          [incarnationHeader]: request.membershipIncarnation,
-          [bytesHeader]: String(request.reference.bytes)
+        return HttpClientRequest.make(method)(url, {
+          headers: {
+            authorization: `Bearer ${Redacted.value(credential.bearer)}`,
+            [clientHeader]: request.clientId,
+            [incarnationHeader]: request.membershipIncarnation,
+            [bytesHeader]: String(request.reference.bytes)
+          }
         })
       })
 

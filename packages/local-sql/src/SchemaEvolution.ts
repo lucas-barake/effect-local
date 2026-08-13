@@ -10,6 +10,7 @@ import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import type * as AttachmentServer from "./AttachmentServer.js"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as Codec from "./internal/codec.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
@@ -1455,25 +1456,8 @@ export interface ServerOptions {
   readonly batchSize?: number | undefined
   readonly batchBytes?: number | undefined
   readonly afterBatch?: Effect.Effect<void> | undefined
-  readonly replaceAttachmentReferences?: (input: {
-    readonly spaceId: Identity.SpaceId
-    readonly schemaGeneration: number
-    readonly model: string
-    readonly modelVersion: Identity.SchemaVersion
-    readonly entityKey: string
-    readonly value?: Schema.Json
-    readonly authority:
-      | {
-        readonly _tag: "Mutation"
-        readonly clientId: Identity.ClientId
-        readonly membershipIncarnation: Identity.MembershipIncarnation
-      }
-      | { readonly _tag: "SchemaEvolution" }
-  }) => Effect.Effect<void, ReplicaError.StorageError>
-  readonly activateAttachmentGeneration?: (
-    spaceId: Identity.SpaceId,
-    schemaGeneration: number
-  ) => Effect.Effect<void, ReplicaError.StorageError>
+  readonly replaceAttachmentReferences?: AttachmentServer.Service["replaceEntityReferences"]
+  readonly activateAttachmentGeneration?: AttachmentServer.Service["activateGeneration"]
 }
 
 export const server = Effect.fn("SchemaEvolution.server")(function*(options: ServerOptions) {

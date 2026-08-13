@@ -9,7 +9,6 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as RcMap from "effect/RcMap"
-import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
@@ -377,13 +376,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               const leased = object.lease_token !== null &&
                 object.lease_expires_at !== null && object.lease_expires_at > now
               if (offset === input.reference.bytes && !leased) {
-                yield* storage.verify(object.object_key, input.reference).pipe(Effect.catchTags({
-                  AttachmentNotFound: (error) => Effect.fail(error),
-                  AttachmentStorageError: (error) => Effect.fail(error),
-                  AttachmentLengthMismatch: (error) => Effect.fail(error),
-                  AttachmentDigestMismatch: (error) => Effect.fail(error),
-                  AttachmentTooLarge: (error) => Effect.fail(error)
-                }))
+                yield* storage.verify(object.object_key, input.reference)
                 yield* sql.withTransaction(Effect.gen(function*() {
                   yield* sql`UPDATE effect_local_server_attachment_objects SET state = 'Complete',
                     storage_offset = ${offset}, garbage_collect_after = ${now + garbageCollectionGracePeriod},
@@ -524,13 +517,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               )
               const completedAt = yield* Clock.currentTimeMillis
               if (appended === input.reference.bytes) {
-                yield* storage.verify(lease.value.object_key, input.reference).pipe(Effect.catchTags({
-                  AttachmentNotFound: (error) => Effect.fail(error),
-                  AttachmentStorageError: (error) => Effect.fail(error),
-                  AttachmentLengthMismatch: (error) => Effect.fail(error),
-                  AttachmentDigestMismatch: (error) => Effect.fail(error),
-                  AttachmentTooLarge: (error) => Effect.fail(error)
-                }))
+                yield* storage.verify(lease.value.object_key, input.reference)
                 const completed = yield* sql.withTransaction(Effect.gen(function*() {
                   const updated = yield* SqlSchema.findOneOption({
                     Request: Schema.Void,
@@ -715,8 +702,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               ...input,
               entity: { model: row.model, modelVersion: row.model_version, key },
               value
-            }).pipe(Effect.provide(context), Effect.result)
-            if (Result.isSuccess(result)) {
+            }).pipe(Effect.provide(context), Effect.option)
+            if (Option.isSome(result)) {
               authorized = true
               break
             }
@@ -806,31 +793,36 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         )
         for (const object of [...completeDue, ...stagingDue]) {
           yield* sql.withTransaction(Effect.gen(function*() {
+            let execute
+            if (object.state === "Complete") {
+              execute = () =>
+                sql`DELETE FROM effect_local_server_attachment_objects AS o
+                WHERE o.space_id = ${object.space_id} AND o.digest = ${object.digest}
+                  AND o.object_key = ${object.object_key} AND o.state = 'Complete'
+                  AND o.garbage_collect_after IS NOT NULL AND o.garbage_collect_after <= ${now}
+                  AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= ${now})
+                  AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_references AS r
+                    WHERE r.space_id = o.space_id AND r.digest = o.digest)
+                  AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
+                    WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${now})
+                RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
+                  lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
+            } else {
+              execute = () =>
+                sql`DELETE FROM effect_local_server_attachment_objects AS o
+                WHERE o.space_id = ${object.space_id} AND o.digest = ${object.digest}
+                  AND o.object_key = ${object.object_key} AND o.state = 'Staging'
+                  AND o.last_accessed_at <= ${now - stagingLifetime}
+                  AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= ${now})
+                  AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
+                    WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${now})
+                RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
+                  lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
+            }
             const removed = yield* SqlSchema.findOneOption({
               Request: Schema.Void,
               Result: Rows.ServerAttachmentObjectRow,
-              execute: () =>
-                object.state === "Complete"
-                  ? sql`DELETE FROM effect_local_server_attachment_objects AS o
-                  WHERE o.space_id = ${object.space_id} AND o.digest = ${object.digest}
-                    AND o.object_key = ${object.object_key} AND o.state = 'Complete'
-                    AND o.garbage_collect_after IS NOT NULL AND o.garbage_collect_after <= ${now}
-                    AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= ${now})
-                    AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_references AS r
-                      WHERE r.space_id = o.space_id AND r.digest = o.digest)
-                    AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
-                      WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${now})
-                  RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
-                    lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
-                  : sql`DELETE FROM effect_local_server_attachment_objects AS o
-                  WHERE o.space_id = ${object.space_id} AND o.digest = ${object.digest}
-                    AND o.object_key = ${object.object_key} AND o.state = 'Staging'
-                    AND o.last_accessed_at <= ${now - stagingLifetime}
-                    AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= ${now})
-                    AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
-                      WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${now})
-                  RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
-                    lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
+              execute
             })(undefined).pipe(Effect.catchTags({
               SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
               SchemaError: (cause) =>

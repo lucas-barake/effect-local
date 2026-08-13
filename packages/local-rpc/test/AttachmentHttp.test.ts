@@ -73,12 +73,6 @@ const history = {
 const layerNodeServices = Layer.mergeAll(NodeCrypto.layer, NodeFileSystem.layer, NodePath.layer)
 const provideNodeServices = Effect.provide(layerNodeServices)
 
-const collect = <E extends { readonly _tag: string }, R,>(stream: Stream.Stream<Uint8Array, E, R>) =>
-  stream.pipe(
-    Stream.runCollect,
-    Effect.map((chunks) => Uint8Array.from(chunks.flatMap((chunk) => Array.from(chunk))))
-  )
-
 describe("attachment HTTP transport", () => {
   it.effect(
     "uploads and lazily downloads through the production byte plane",
@@ -208,7 +202,7 @@ describe("attachment HTTP transport", () => {
           { method: "PATCH", uploadOffset: "2" }
         ])
 
-        const denied = yield* collect(transfer.download(identity)).pipe(
+        const denied = yield* Stream.mkUint8Array(transfer.download(identity)).pipe(
           Effect.provideService(FetchHttpClient.Fetch, fetch),
           Effect.result
         )
@@ -234,7 +228,9 @@ describe("attachment HTTP transport", () => {
         ${valueJson}, 1)`
 
         assert.deepStrictEqual(
-          yield* collect(transfer.download(identity)).pipe(Effect.provideService(FetchHttpClient.Fetch, fetch)),
+          yield* Stream.mkUint8Array(transfer.download(identity)).pipe(
+            Effect.provideService(FetchHttpClient.Fetch, fetch)
+          ),
           bytes
         )
         assert.strictEqual(downloadCacheControl, "private, no-store")

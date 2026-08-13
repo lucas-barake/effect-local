@@ -1,5 +1,4 @@
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
-import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
@@ -10,6 +9,7 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import type * as AttachmentServer from "../AttachmentServer.js"
 import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
 import * as StorageUnavailable from "./storageUnavailable.js"
@@ -144,27 +144,12 @@ export const local = (options: {
 
 export const server = (options: {
   readonly sql: SqlClient.SqlClient
-  readonly definition: Definition.Any
   readonly spaceId: Identity.SpaceId
   readonly generation: number
   readonly clientId: Identity.ClientId
   readonly membershipIncarnation: Identity.MembershipIncarnation
   readonly changes: Array<Protocol.EntityChange>
-  readonly replaceAttachmentReferences?: (input: {
-    readonly spaceId: Identity.SpaceId
-    readonly schemaGeneration: number
-    readonly model: string
-    readonly modelVersion: Identity.SchemaVersion
-    readonly entityKey: string
-    readonly value?: Schema.Json
-    readonly authority:
-      | {
-        readonly _tag: "Mutation"
-        readonly clientId: Identity.ClientId
-        readonly membershipIncarnation: Identity.MembershipIncarnation
-      }
-      | { readonly _tag: "SchemaEvolution" }
-  }) => Effect.Effect<void, ReplicaError.StorageError>
+  readonly replaceAttachmentReferences?: AttachmentServer.Service["replaceEntityReferences"]
 }): Transaction.Transaction => {
   const find = SqlSchema.findOneOption({
     Request: Schema.Struct({ spaceId: Schema.String, model: Schema.String, key: Schema.String }),
