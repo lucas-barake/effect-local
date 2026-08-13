@@ -132,7 +132,7 @@ const makeLayer = <D extends Definition.Any, R,>(
   ReplicaError.ReplicaError,
   BaseRequirements<D> | R
 > => {
-  const QueryReactivityLayer = QueryReactivity.makeLayer()
+  const layerQueryReactivity = QueryReactivity.makeLayer()
   return Layer.effect(
     Replica.Replica,
     Effect.gen(function*() {
@@ -166,9 +166,9 @@ const makeLayer = <D extends Definition.Any, R,>(
       const initialize = Effect.fnUntraced(function*(spaceId: Identity.SpaceId, generation: number) {
         const childScope = yield* Scope.fork(parentScope)
         return yield* Effect.gen(function*() {
-          const MutationRuntimeLayer = MutationRuntime.layer(options.definition, options.evolution)
-          const LocalStoreLayer = LocalStore.layer({ ...options, spaceId }).pipe(Layer.provide(MutationRuntimeLayer))
-          const QueryExecutorLayer = QueryExecutor.layer(options.definition, spaceId)
+          const layerMutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
+          const layerLocalStore = LocalStore.layer({ ...options, spaceId }).pipe(Layer.provide(layerMutationRuntime))
+          const layerQueryExecutor = QueryExecutor.layer(options.definition, spaceId)
           let local: LocalStore.Service
           let queries: QueryExecutor.Service
           let reconciler: Reconciler.Service
@@ -176,10 +176,10 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (workflow !== undefined) {
             const workflowContext = Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow)
             const runtime = yield* Layer.mergeAll(
-              LocalStoreLayer,
-              QueryExecutorLayer,
+              layerLocalStore,
+              layerQueryExecutor,
               ReconciliationWorkflow.layer({ ...options, spaceId }).pipe(
-                Layer.provide(LocalStoreLayer),
+                Layer.provide(layerLocalStore),
                 Layer.provide(Layer.succeed(ReconciliationWorkflow.RegistrationScope, parentScope))
               )
             ).pipe(
@@ -194,9 +194,9 @@ const makeLayer = <D extends Definition.Any, R,>(
           } else {
             if (manager === undefined) return yield* Effect.die("Reconciler manager was not initialized")
             const runtime = yield* Layer.mergeAll(
-              LocalStoreLayer,
-              QueryExecutorLayer,
-              Reconciler.layerOnePass({ ...options, spaceId }).pipe(Layer.provide(LocalStoreLayer))
+              layerLocalStore,
+              layerQueryExecutor,
+              Reconciler.layerOnePass({ ...options, spaceId }).pipe(Layer.provide(layerLocalStore))
             ).pipe(
               Layer.buildWithScope(childScope),
               Effect.provide(rootContext),
@@ -602,7 +602,7 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       return Replica.Replica.of({ join, leave, spaces, space, status })
     })
-  ).pipe(Layer.provideMerge(QueryReactivityLayer))
+  ).pipe(Layer.provideMerge(layerQueryReactivity))
 }
 
 export const layer = <D extends Definition.Any,>(options: Options<D>) =>

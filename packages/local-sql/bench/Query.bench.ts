@@ -73,7 +73,7 @@ const definition = Definition.make({
   mutations: [],
   queries: [Indexed, MultiColumn]
 })
-const Handlers = Indexed.toLayer(({ payload, query }) =>
+const layerHandlers = Indexed.toLayer(({ payload, query }) =>
   query.from(Item, "byScore").where({ score: { gte: payload.minimum } }).limit(25).page().pipe(
     Effect.map((page) => page.items)
   )
@@ -88,14 +88,14 @@ const Handlers = Indexed.toLayer(({ payload, query }) =>
       })
     ).pipe((multiColumn) => Layer.mergeAll(indexed, multiColumn))
 )
-const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
+const layerDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
   Layer.merge(Reactivity.layer)
 )
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
-const Dependencies = Layer.mergeAll(Database, Handlers, QueryReactivity.Layer)
-const Executor = QueryExecutor.layer(definition, spaceId).pipe(Layer.provide(Dependencies))
-const runtime = ManagedRuntime.make(Layer.merge(Executor, Dependencies))
+const layerDependencies = Layer.mergeAll(layerDatabase, layerHandlers, QueryReactivity.layer)
+const layerExecutor = QueryExecutor.layer(definition, spaceId).pipe(Layer.provide(layerDependencies))
+const runtime = ManagedRuntime.make(Layer.merge(layerExecutor, layerDependencies))
 
 beforeAll(async () => {
   // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this asynchronous benchmark fixture setup boundary.

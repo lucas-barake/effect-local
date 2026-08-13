@@ -1,6 +1,9 @@
 import {
   isArrayLiteralExpression,
+  isBindingElement,
   isCallExpression,
+  isComputedPropertyName,
+  isConstructorDeclaration,
   isElementAccessExpression,
   isExpression,
   isIdentifier,
@@ -8,12 +11,17 @@ import {
   isObjectBindingPattern,
   isObjectLiteralExpression,
   isOuterExpression,
+  isParameterDeclaration,
+  isPrivateIdentifier,
   isPropertyAccessExpression,
+  isPropertyAssignment,
+  isPropertyDeclaration,
+  isShorthandPropertyAssignment,
   isStringLiteral,
   isTypeNode,
   isVariableDeclaration
 } from "@typescript/native-preview/unstable/ast/is"
-import { API, SignatureKind, SymbolFlags, TypeFlags } from "@typescript/native-preview/unstable/sync"
+import { API, ModifierFlags, SignatureKind, SymbolFlags, TypeFlags } from "@typescript/native-preview/unstable/sync"
 import { realpathSync } from "node:fs"
 import { resolve } from "node:path"
 
@@ -95,11 +103,49 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
       if (sourceFile === undefined) throw new Error(`TypeScript did not load ${absoluteFilename}`)
       const checker = project.checker
       const expressions = []
-      const variableNames = []
+      const layerValueCandidates = []
       const calls = []
       const objectBindingPatterns = []
+      const addLayerPropertyName = (name) => {
+        if (isIdentifier(name) || isStringLiteral(name) || isNoSubstitutionTemplateLiteral(name)) {
+          layerValueCandidates.push({ name: name.text, node: name, typeNode: name })
+          return
+        }
+        if (isPrivateIdentifier(name)) {
+          layerValueCandidates.push({ name: name.text.replace(/^#/, ""), node: name, typeNode: name })
+          return
+        }
+        if (!isComputedPropertyName(name)) return
+        const expression = name.expression
+        if (!isStringLiteral(expression) && !isNoSubstitutionTemplateLiteral(expression)) return
+        layerValueCandidates.push({ name: expression.text, node: expression, typeNode: name })
+      }
       const visit = (node) => {
-        if (isVariableDeclaration(node) && isIdentifier(node.name)) variableNames.push(node.name)
+        const parameterProperty = isParameterDeclaration(node) &&
+          isConstructorDeclaration(node.parent) &&
+          (node.modifierFlags & ModifierFlags.ParameterPropertyModifier) !== 0
+        if (
+          (isVariableDeclaration(node) || isBindingElement(node) || parameterProperty) &&
+          node.name !== undefined &&
+          isIdentifier(node.name)
+        ) {
+          addLayerPropertyName(node.name)
+        }
+        if (
+          isPropertyDeclaration(node) &&
+          (node.initializer === undefined || !isArrayLiteralExpression(node.initializer))
+        ) {
+          addLayerPropertyName(node.name)
+        }
+        if (
+          isPropertyAssignment(node) &&
+          !isArrayLiteralExpression(node.initializer)
+        ) {
+          addLayerPropertyName(node.name)
+        }
+        if (isShorthandPropertyAssignment(node) && isIdentifier(node.name)) {
+          addLayerPropertyName(node.name)
+        }
         if (isCallExpression(node)) calls.push(node)
         if (isObjectBindingPattern(node)) objectBindingPatterns.push(node)
         const typeNode = isTypeNode(node)
@@ -259,7 +305,12 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
           errorTypes: [...new Set(names)].toSorted((left, right) => left.localeCompare(right))
         })
       }
-      const layerNameTypes = checker.getTypeAtLocation(variableNames)
+      const invalidLayerValueCandidates = layerValueCandidates.filter(
+        (candidate) => !/^layer(?:[A-Z][A-Za-z0-9]*)?$/.test(candidate.name)
+      )
+      const layerNameTypes = checker.getTypeAtLocation(
+        invalidLayerValueCandidates.map((candidate) => candidate.typeNode)
+      )
       const layerByType = new Map()
       const hasOfficialLayerMarker = (type, seen = new Set()) => {
         if (layerByType.has(type.id)) return layerByType.get(type.id)
@@ -289,13 +340,17 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
         layerByType.set(type.id, result)
         return result
       }
-      const layerNames = []
-      for (let index = 0; index < variableNames.length; index++) {
-        const name = variableNames[index]
+      const layerNameViolations = []
+      for (let index = 0; index < invalidLayerValueCandidates.length; index++) {
+        const candidate = invalidLayerValueCandidates[index]
         const type = layerNameTypes[index]
-        if (type === undefined || /^[A-Z][A-Za-z0-9]*$/.test(name.text)) continue
+        if (type === undefined) continue
         if (!hasOfficialLayerMarker(type)) continue
-        layerNames.push({ start: name.getStart(sourceFile), end: name.getEnd(), name: name.text })
+        layerNameViolations.push({
+          start: candidate.node.getStart(sourceFile),
+          end: candidate.node.getEnd(),
+          name: candidate.name
+        })
       }
 
       const unwrapNative = (node) => {
@@ -443,7 +498,7 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
         }
       }
 
-      const result = { layerNames, manualRuntimeBoundaries, serviceTagMaps, taggedEffectErrors }
+      const result = { layerNameViolations, manualRuntimeBoundaries, serviceTagMaps, taggedEffectErrors }
       cachedAnalysis = { filename, sourceText, result }
       return result
     } finally {

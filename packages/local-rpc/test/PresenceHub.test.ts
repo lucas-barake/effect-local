@@ -42,7 +42,7 @@ describe("PresenceHub", () => {
     "authorizes tagged operations and includes the publishing client identity",
     Effect.fnUntraced(function*() {
       const inputs: Array<PresenceHub.AuthorizationInput> = []
-      const Live = PresenceHub.layer({
+      const layerLive = PresenceHub.layer({
         maximumWatchersPerSpace: 16,
         authorize: (input) =>
           Effect.sync(() => {
@@ -73,18 +73,18 @@ describe("PresenceHub", () => {
             principal: { subject: "writer" }
           }
         ])
-      }).pipe(Effect.provide(Live))
+      }).pipe(Effect.provide(layerLive))
     })
   )
 
   it.effect(
     "uses an explicit trusted layer for applications without authorization",
     Effect.fnUntraced(function*() {
-      const Live = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 16 })
+      const layerLive = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 16 })
       yield* Effect.gen(function*() {
         const hub = yield* PresenceHub.PresenceHub
         yield* hub.publish(update(spaceA), null)
-      }).pipe(Effect.provide(Live))
+      }).pipe(Effect.provide(layerLive))
     })
   )
 
@@ -116,7 +116,7 @@ describe("PresenceHub", () => {
   it.effect(
     "lets policy reject a spoofed publishing client identity",
     Effect.fnUntraced(function*() {
-      const Live = PresenceHub.layer({
+      const layerLive = PresenceHub.layer({
         maximumWatchersPerSpace: 16,
         authorize: (input) => {
           if (input._tag === "Publish" && input.clientId !== clientId) {
@@ -137,14 +137,14 @@ describe("PresenceHub", () => {
         if (failure._tag === "AuthorizationDenied") {
           assert.strictEqual(failure.reason, "client identity mismatch")
         }
-      }).pipe(Effect.provide(Live))
+      }).pipe(Effect.provide(layerLive))
     })
   )
 
   it.effect(
     "routes a publish only through the matching space channel",
     Effect.fnUntraced(function*() {
-      const Live = PresenceHub.layer({
+      const layerLive = PresenceHub.layer({
         maximumWatchersPerSpace: 16,
         authorize: () => Effect.void
       })
@@ -174,14 +174,14 @@ describe("PresenceHub", () => {
           isolated.map((entry) => Option.getOrUndefined(entry)?.value),
           [{ cursor: 3 }, { cursor: 4 }, { cursor: 5 }]
         )
-      }).pipe(Effect.provide(Live))
+      }).pipe(Effect.provide(layerLive))
     })
   )
 
   it.effect(
     "rejects a presence payload beyond the protocol limit",
     Effect.fnUntraced(function*() {
-      const Live = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 16 })
+      const layerLive = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 16 })
       yield* Effect.gen(function*() {
         const hub = yield* PresenceHub.PresenceHub
         const failure = yield* hub.publish({
@@ -194,14 +194,14 @@ describe("PresenceHub", () => {
           assert.strictEqual(failure.resource, "presence bytes")
           assert.strictEqual(failure.limit, Protocol.maximumPresenceBytes)
         }
-      }).pipe(Effect.provide(Live))
+      }).pipe(Effect.provide(layerLive))
     })
   )
 
   it.effect(
     "caps active presence watchers and releases slots on interruption",
     Effect.fnUntraced(function*() {
-      const Live = PresenceHub.layerTrusted({
+      const layerLive = PresenceHub.layerTrusted({
         capacity: 1,
         maximumWatchersPerSpace: 2
       })
@@ -239,7 +239,7 @@ describe("PresenceHub", () => {
         yield* Fiber.interrupt(first)
         const replacement = yield* startActive(spaceA, 4)
         yield* Fiber.interruptAll([second, otherSpace, replacement])
-      }).pipe(Effect.provide(Live))
+      }).pipe(Effect.provide(layerLive))
     })
   )
 
@@ -247,7 +247,7 @@ describe("PresenceHub", () => {
     "releases an acquired watcher permit when metric registration defects",
     Effect.fnUntraced(function*() {
       const registry = new Map<string, Metric.Metric.Metadata<any, any>>()
-      const Live = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 2 })
+      const layerLive = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 2 })
 
       yield* Effect.gen(function*() {
         const hub = yield* PresenceHub.PresenceHub
@@ -293,7 +293,7 @@ describe("PresenceHub", () => {
         assert.deepStrictEqual(Option.getOrUndefined(received), update(spaceA))
         yield* Fiber.interrupt(first)
       }).pipe(
-        Effect.provide(Live),
+        Effect.provide(layerLive),
         Effect.provideService(Metric.MetricRegistry, registry)
       )
     })
@@ -302,7 +302,7 @@ describe("PresenceHub", () => {
   it.effect(
     "releases presence watcher capacity after establishment authorization denial",
     Effect.fnUntraced(function*() {
-      const Live = PresenceHub.layer({
+      const layerLive = PresenceHub.layer({
         maximumWatchersPerSpace: 1,
         authorize: (input) => {
           if (input._tag !== "Watch") return Effect.void
@@ -327,14 +327,14 @@ describe("PresenceHub", () => {
           Option.getOrUndefined(yield* Fiber.join(replacement)),
           (actual) => assert.deepStrictEqual(actual, update(spaceA))
         )
-      }).pipe(Effect.provide(Live))
+      }).pipe(Effect.provide(layerLive))
     })
   )
 
   it.effect(
     "does not reveal presence watcher occupancy to unauthorized principals",
     Effect.fnUntraced(function*() {
-      const Live = PresenceHub.layer({
+      const layerLive = PresenceHub.layer({
         maximumWatchersPerSpace: 1,
         authorize: (input) => {
           if (input._tag !== "Watch") return Effect.void
@@ -366,14 +366,14 @@ describe("PresenceHub", () => {
         const denied = yield* hub.watch(spaceA, "denied").pipe(Stream.runHead, Effect.flip)
         assert.strictEqual(denied._tag, "AuthorizationDenied")
         yield* Fiber.interrupt(first)
-      }).pipe(Effect.provide(Live))
+      }).pipe(Effect.provide(layerLive))
     })
   )
 
   it.effect(
     "releases presence watcher capacity after stream completion",
     Effect.fnUntraced(function*() {
-      const Live = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1 })
+      const layerLive = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1 })
 
       yield* Effect.gen(function*() {
         const hub = yield* PresenceHub.PresenceHub
@@ -394,13 +394,13 @@ describe("PresenceHub", () => {
         const next = { ...update(spaceA), value: { cursor: 2 } }
         yield* hub.publish(next, null)
         pipe(Option.getOrUndefined(yield* Fiber.join(replacement)), (actual) => assert.deepStrictEqual(actual, next))
-      }).pipe(Effect.provide(Live))
+      }).pipe(Effect.provide(layerLive))
     })
   )
 
   it.effect("records live presence watchers in each layer's metric registry", () => {
     const exercise = Effect.fnUntraced(function*(registry: Map<string, Metric.Metric.Metadata<any, any>>) {
-      const Live = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1 })
+      const layerLive = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1 })
 
       yield* Effect.gen(function*() {
         const hub = yield* PresenceHub.PresenceHub
@@ -427,7 +427,7 @@ describe("PresenceHub", () => {
         assert.isDefined(released)
         assert.strictEqual(released.type, "Gauge")
         if (released.type === "Gauge") assert.strictEqual(released.state.value, 0)
-      }).pipe(Effect.provide(Live))
+      }).pipe(Effect.provide(layerLive))
     }, (effect, registry) => effect.pipe(Effect.provideService(Metric.MetricRegistry, registry)))
 
     return exercise(new Map()).pipe(Effect.andThen(exercise(new Map())))

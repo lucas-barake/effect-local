@@ -123,7 +123,7 @@ export const definition = Definition.make({
   queries: [ListTasks]
 })
 
-export const DomainLive = Layer.mergeAll(
+export const layerDomain = Layer.mergeAll(
   PutTask.toLayer(({ payload, transaction }) => transaction.set(Task, payload.id, payload).pipe(Effect.as(payload))),
   ToggleTask.toLayer(({ payload, transaction }) =>
     transaction.get(Task, payload.id).pipe(
@@ -202,13 +202,13 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import { definition, DomainLive, ListTasks, PutTask, Task } from "./domain.js"
+import { definition, layerDomain, ListTasks, PutTask, Task } from "./domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const scope = Protocol.ReplicationScope.make({ models: [Task.name] })
 
-const DatabaseLive = Layer.mergeAll(
+const layerDatabase = Layer.mergeAll(
   SqliteClient.layer({ filename: "tasks.sqlite" }),
   NodeCrypto.layer
 )
@@ -224,7 +224,7 @@ const history = {
   migration: { retryDelay: "25 millis", maximumAttempts: 8 }
 } as const
 
-export const ReplicaLive = SqlReplica.layer({
+export const layerReplica = SqlReplica.layer({
   definition,
   clientId,
   scope,
@@ -232,9 +232,9 @@ export const ReplicaLive = SqlReplica.layer({
   reconciliationConcurrency: 8,
   ...history
 }).pipe(
-  Layer.provide(DomainLive),
-  Layer.provide(DatabaseLive),
-  Layer.provide(SyncLive)
+  Layer.provide(layerDomain),
+  Layer.provide(layerDatabase),
+  Layer.provide(layerSync)
 )
 
 const program = Replica.Replica.use((replica) =>
@@ -250,7 +250,7 @@ const program = Replica.Replica.use((replica) =>
     const tasks = yield* space.query(ListTasks, { completed: false })
     return { pending, inFlight, task, tasks }
   })
-).pipe(Effect.provide(ReplicaLive), Effect.scoped)
+).pipe(Effect.provide(layerReplica), Effect.scoped)
 ```
 
 Call `replica.join(spaceId)` to add membership, `replica.leave(spaceId)` to evict that space, and `replica.spaces` to
@@ -259,7 +259,7 @@ state to its space.
 Leaving cascades through every client table without changing the durable client identity or any other space. A stale
 handle returns `SpaceUnavailable`, including after the same space is joined again with a fresh membership incarnation.
 
-`SyncLive` can be the RPC client Layer from the next section or any implementation of `SyncEngine`. Local commits do
+`layerSync` can be the RPC client Layer from the next section or any implementation of `SyncEngine`. Local commits do
 not wait for it. One dispatcher owns keyed watches and reconciliation turns for every joined space. A failed or busy
 space does not block another space, while all requests still share the one `SyncEngine` and its one RPC WebSocket.
 Per space status is available on each handle. `replica.status` returns the sorted aggregate with total pending work.
@@ -342,7 +342,7 @@ class ReadPolicy extends Context.Service<ReadPolicy, {
   ) => Effect.Effect<void, typeof Schema.Json.Type>
 }>()("app/ReadPolicy") {}
 
-const StoreLive = ServerStore.layer({
+const layerStore = ServerStore.layer({
   ...serverHistory,
   definition,
   readAuthorizationRefreshInterval: "30 seconds",
@@ -352,7 +352,7 @@ const StoreLive = ServerStore.layer({
   authorizeAccess: ({ clientId, principal, spaceId }) => authorizeClient({ clientId, principal, spaceId }),
   authorizeMutation: ({ mutation, principal }) => authorizeMutation({ mutation, principal }),
   authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
-}).pipe(Layer.provide(ReadPolicyLive))
+}).pipe(Layer.provide(layerReadPolicy))
 ```
 
 `Delete` means the authoritative entity no longer exists. `Retract` means it still exists but no longer belongs to the
@@ -387,7 +387,7 @@ retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted
 tests and already trusted processes.
 
 `SyncRpc.Rpcs` multiplexes submit, pull, bootstrap, watch, and presence on one Effect RPC WebSocket. The server uses
-`Authentication.LayerServer`. The client uses `Authentication.LayerClient` with an application supplied
+`Authentication.layerServer`. The client uses `Authentication.layerClient` with an application supplied
 `CredentialProvider`. Its `acquire` Effect runs for every RPC and returns a redacted bearer credential plus its
 nonnegative generation. `awaitChange(rejectedGeneration)` signals when `acquire` can return a different generation.
 A rejected credential changes the space to `NeedsAuthentication` and pauses that generation. Publishing a new
@@ -433,7 +433,7 @@ benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1
 ```ts
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 
-export const graph = BrowserReplica.make(ReplicaLive)
+export const graph = BrowserReplica.make(layerReplica)
 
 export const taskAtom = graph.entity(spaceId, Task)("task-1")
 export const tasksAtom = graph.query(spaceId, ListTasks)({ completed: false })
@@ -471,7 +471,7 @@ the enclosing model through the same transaction. These semantics are domain too
 
 ## Testing
 
-`TestServer.TestServerLayer` adapts the real authoritative store to a production shaped `SyncEngine`. `FaultInjection` can
+`TestServer.layer` adapts the real authoritative store to a production shaped `SyncEngine`. `FaultInjection` can
 partition and heal the link, drop the next receipt after the server commits it, and duplicate the next catch up page.
 `TestReplica.layer` is the same `SqlReplica` composition used in production.
 
@@ -545,7 +545,7 @@ window is missing a required downgrade transform.
 ```ts
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 
-export const ServerLive = ServerStore.layer({
+export const layerServer = ServerStore.layer({
   ...serverHistory,
   definition: definitionV2,
   evolution,
@@ -572,22 +572,22 @@ import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as SyncServer from "@lucas-barake/effect-local-rpc/SyncServer"
 import * as Layer from "effect/Layer"
 
-export const ServerRpcLive = SyncServer.layerWithOptions({
+export const layerServerRpc = SyncServer.layerWithOptions({
   supportedProtocolVersions: [1, 2]
 })
 
-const session = ProtocolSession.layerWithOptions({
+const layerSession = ProtocolSession.layerWithOptions({
   supportedProtocolVersions: [1, 2],
   sessionAcquisitionTimeout: "10 seconds"
 })
 
-export const ClientRpcLive = Layer.merge(
+export const layerClientRpc = Layer.merge(
   SyncClient.layerFromSession({ rpcTimeout: "10 seconds" }),
   PresenceClient.layerFromSession({ rpcTimeout: "10 seconds" })
 ).pipe(
-  Layer.provide(session),
-  Layer.provide(RpcProtocolLive),
-  Layer.provide(AuthenticationLive)
+  Layer.provide(layerSession),
+  Layer.provide(layerRpcProtocol),
+  Layer.provide(layerAuthentication)
 )
 ```
 

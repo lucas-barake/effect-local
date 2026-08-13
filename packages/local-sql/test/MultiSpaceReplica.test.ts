@@ -51,16 +51,16 @@ const remoteService = SyncEngine.SyncEngine.of({
   bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
   watch: () => Stream.never
 })
-const Remote = Layer.succeed(SyncEngine.SyncEngine, remoteService)
+const layerRemote = Layer.succeed(SyncEngine.SyncEngine, remoteService)
 
-const Live = SqlReplica.layer({
+const layerLive = SqlReplica.layer({
   ...clientHistory,
   definition: Domain.definition,
   clientId,
   initialSpaces: [spaceB, spaceA]
 }).pipe(
-  Layer.provide(Domain.Handlers),
-  Layer.provide(Remote),
+  Layer.provide(Domain.layerHandlers),
+  Layer.provide(layerRemote),
   Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
   Layer.provide(NodeCrypto.layer),
   Layer.provide(Reactivity.layer)
@@ -70,7 +70,7 @@ describe("multi space Replica", () => {
   it.effect(
     "isolates overlapping entity keys for two spaces in one database",
     Effect.fnUntraced(function*() {
-      const context = yield* Layer.build(Live)
+      const context = yield* Layer.build(layerLive)
       const replica = Context.get(context, Replica.Replica)
       const spaces = yield* replica.spaces
       assert.deepStrictEqual(spaces.map((space) => space.spaceId), [spaceA, spaceB])
@@ -91,7 +91,7 @@ describe("multi space Replica", () => {
   it.effect(
     "evicts one space and leaves retained handles stale across rejoin",
     Effect.fnUntraced(function*() {
-      const context = yield* Layer.build(Live)
+      const context = yield* Layer.build(layerLive)
       const replica = Context.get(context, Replica.Replica)
       const stale = yield* replica.space(spaceA)
       const b = yield* replica.space(spaceB)
@@ -118,22 +118,22 @@ describe("multi space Replica", () => {
   it.effect(
     "restores durable memberships when the Replica runtime restarts",
     Effect.fnUntraced(function*() {
-      const Database = Layer.mergeAll(
+      const layerDatabase = Layer.mergeAll(
         SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
         NodeCrypto.layer,
         Reactivity.layer
       )
-      const databaseContext = yield* Layer.build(Database)
-      const SqlLayer = Layer.succeed(SqlClient.SqlClient, Context.get(databaseContext, SqlClient.SqlClient))
-      const CryptoLayer = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
-      const ReactivityLayer = Layer.succeed(
+      const databaseContext = yield* Layer.build(layerDatabase)
+      const layerSql = Layer.succeed(SqlClient.SqlClient, Context.get(databaseContext, SqlClient.SqlClient))
+      const layerCrypto = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
+      const layerReactivity = Layer.succeed(
         Reactivity.Reactivity,
         Context.get(databaseContext, Reactivity.Reactivity)
       )
-      const Services = Layer.mergeAll(
-        SqlLayer,
-        CryptoLayer,
-        ReactivityLayer
+      const layerServices = Layer.mergeAll(
+        layerSql,
+        layerCrypto,
+        layerReactivity
       )
       const replicaLayer = (initialSpaces?: Iterable<Identity.SpaceId>) => {
         const options = {
@@ -141,12 +141,12 @@ describe("multi space Replica", () => {
           definition: Domain.definition,
           clientId
         } satisfies SqlReplica.Options<typeof Domain.definition>
-        let ReplicaLayer = SqlReplica.layer(options)
-        if (initialSpaces !== undefined) ReplicaLayer = SqlReplica.layer({ ...options, initialSpaces })
-        return ReplicaLayer.pipe(
-          Layer.provide(Domain.Handlers),
-          Layer.provide(Remote),
-          Layer.provide(Services)
+        let layerReplica = SqlReplica.layer(options)
+        if (initialSpaces !== undefined) layerReplica = SqlReplica.layer({ ...options, initialSpaces })
+        return layerReplica.pipe(
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(layerRemote),
+          Layer.provide(layerServices)
         )
       }
 
@@ -187,19 +187,19 @@ describe("multi space Replica", () => {
           return Reflect.get(target, property, receiver)
         }
       })
-      const ReplicaLayer = SqlReplica.layerWorkflow({
+      const layerReplica = SqlReplica.layerWorkflow({
         ...clientHistory,
         definition: Domain.definition,
         clientId
       }).pipe(
-        Layer.provide(Domain.Handlers),
-        Layer.provide(Remote),
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(layerRemote),
         Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
         Layer.provide(NodeCrypto.layer),
         Layer.provide(Reactivity.layer),
         Layer.provide(Layer.succeed(WorkflowEngine.WorkflowEngine, interruptedEngine))
       )
-      const context = yield* Layer.build(ReplicaLayer)
+      const context = yield* Layer.build(layerReplica)
       const replica = Context.get(context, Replica.Replica)
       const first = yield* Effect.forkChild(replica.join(spaceA), { startImmediately: true })
       yield* Deferred.await(firstRegistration)
@@ -232,8 +232,8 @@ describe("multi space Replica", () => {
           ).pipe(Stream.unwrap)
         }
       })
-      const CountedRemote = Layer.succeed(SyncEngine.SyncEngine, countedRemoteService)
-      const manager = yield* Reconciler.makeManager().pipe(Effect.provide(CountedRemote))
+      const layerCountedRemote = Layer.succeed(SyncEngine.SyncEngine, countedRemoteService)
+      const manager = yield* Reconciler.makeManager().pipe(Effect.provide(layerCountedRemote))
       const local = {
         requestReconciliation: Deferred.succeed(requestBlocked, undefined).pipe(Effect.andThen(Effect.never)),
         reconciliationGenerations: Effect.succeed({ requested: 0, completed: 0 }),
@@ -283,26 +283,26 @@ describe("multi space Replica", () => {
         models: [Domain.Todo],
         mutations: [Domain.PutTodo]
       })
-      const Handlers = Domain.PutTodo.toLayer(({ payload, transaction }) =>
+      const layerHandlers = Domain.PutTodo.toLayer(({ payload, transaction }) =>
         Deferred.succeed(entered, undefined).pipe(
           Effect.andThen(Deferred.await(release)),
           Effect.andThen(transaction.set(Domain.Todo, payload.id, payload)),
           Effect.as(payload)
         )
       )
-      const ReplicaLayer = SqlReplica.layer({
+      const layerReplica = SqlReplica.layer({
         ...clientHistory,
         definition,
         clientId,
         initialSpaces: [spaceA]
       }).pipe(
-        Layer.provide(Handlers),
-        Layer.provide(Remote),
+        Layer.provide(layerHandlers),
+        Layer.provide(layerRemote),
         Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
         Layer.provide(NodeCrypto.layer),
         Layer.provide(Reactivity.layer)
       )
-      const context = yield* Layer.build(ReplicaLayer)
+      const context = yield* Layer.build(layerReplica)
       const replica = Context.get(context, Replica.Replica)
       const space = yield* replica.space(spaceA)
       const mutate = space.mutate(Domain.PutTodo, Domain.todo("drain"))
@@ -333,26 +333,26 @@ describe("multi space Replica", () => {
         models: [Domain.Todo],
         mutations: [Domain.PutTodo]
       })
-      const Handlers = Domain.PutTodo.toLayer(({ payload, transaction }) =>
+      const layerHandlers = Domain.PutTodo.toLayer(({ payload, transaction }) =>
         Deferred.succeed(entered, undefined).pipe(
           Effect.andThen(Deferred.await(release)),
           Effect.andThen(transaction.set(Domain.Todo, payload.id, payload)),
           Effect.as(payload)
         )
       )
-      const ReplicaLayer = SqlReplica.layer({
+      const layerReplica = SqlReplica.layer({
         ...clientHistory,
         definition,
         clientId,
         initialSpaces: [spaceA]
       }).pipe(
-        Layer.provide(Handlers),
-        Layer.provide(Remote),
+        Layer.provide(layerHandlers),
+        Layer.provide(layerRemote),
         Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
         Layer.provide(NodeCrypto.layer),
         Layer.provide(Reactivity.layer)
       )
-      const context = yield* Layer.build(ReplicaLayer)
+      const context = yield* Layer.build(layerReplica)
       const replica = Context.get(context, Replica.Replica)
       const space = yield* replica.space(spaceA)
       const mutate = space.mutate(Domain.PutTodo, Domain.todo("interrupt-leave"))
@@ -377,12 +377,12 @@ describe("multi space Replica", () => {
   it.effect(
     "retries durable eviction after a SQL failure",
     Effect.fnUntraced(function*() {
-      const Database = Layer.mergeAll(
+      const layerDatabase = Layer.mergeAll(
         SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
         NodeCrypto.layer,
         Reactivity.layer
       )
-      const databaseContext = yield* Layer.build(Database)
+      const databaseContext = yield* Layer.build(layerDatabase)
       const sql = Context.get(databaseContext, SqlClient.SqlClient)
       let failDelete = true
       const failingSql = new Proxy(sql, {
@@ -403,16 +403,16 @@ describe("multi space Replica", () => {
         }
       })
       const services = (client: SqlClient.SqlClient) => {
-        const SqlLayer = Layer.succeed(SqlClient.SqlClient, client)
-        const CryptoLayer = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
-        const ReactivityLayer = Layer.succeed(
+        const layerSql = Layer.succeed(SqlClient.SqlClient, client)
+        const layerCrypto = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
+        const layerReactivity = Layer.succeed(
           Reactivity.Reactivity,
           Context.get(databaseContext, Reactivity.Reactivity)
         )
         return Layer.mergeAll(
-          SqlLayer,
-          CryptoLayer,
-          ReactivityLayer
+          layerSql,
+          layerCrypto,
+          layerReactivity
         )
       }
       const replicaLayer = (client: SqlClient.SqlClient, initialSpaces?: Iterable<Identity.SpaceId>) =>
@@ -422,8 +422,8 @@ describe("multi space Replica", () => {
           clientId,
           initialSpaces: initialSpaces ?? []
         }).pipe(
-          Layer.provide(Domain.Handlers),
-          Layer.provide(Remote),
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(layerRemote),
           Layer.provide(services(client))
         )
 
@@ -477,21 +477,21 @@ describe("multi space Replica", () => {
         bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         watch: () => Stream.never
       })
-      const BlockedRemote = Layer.succeed(SyncEngine.SyncEngine, blockedRemoteService)
-      const ReplicaLayer = SqlReplica.layer({
+      const layerBlockedRemote = Layer.succeed(SyncEngine.SyncEngine, blockedRemoteService)
+      const layerReplica = SqlReplica.layer({
         ...clientHistory,
         definition: Domain.definition,
         clientId,
         initialSpaces: spaces,
         reconciliationConcurrency: 2
       }).pipe(
-        Layer.provide(Domain.Handlers),
-        Layer.provide(BlockedRemote),
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(layerBlockedRemote),
         Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
         Layer.provide(NodeCrypto.layer),
         Layer.provide(Reactivity.layer)
       )
-      const context = yield* Layer.build(ReplicaLayer)
+      const context = yield* Layer.build(layerReplica)
       yield* Deferred.await(twoStarted)
       yield* Context.get(context, Replica.Replica).status
 

@@ -37,14 +37,14 @@ describe("SyncClient", () => {
           ),
         writer: Effect.succeed(() => Effect.void)
       })
-      const LiveLayer = SyncClient.layerProtocolSocket({
+      const layerLive = SyncClient.layerProtocolSocket({
         retryPolicy: Schedule.spaced("5 seconds")
       }).pipe(
         Layer.provide(Layer.succeed(Socket.Socket, socket)),
         Layer.provide(RpcSerialization.layerJson)
       )
 
-      yield* Layer.build(LiveLayer)
+      yield* Layer.build(layerLive)
       yield* Deferred.await(firstAttempt)
       assert.strictEqual(yield* Ref.get(attempts), 1)
 
@@ -78,11 +78,11 @@ describe("SyncClient", () => {
         }),
         writer: Effect.succeed(() => Effect.void)
       })
-      const LiveLayer = SyncClient.layerProtocolSocket().pipe(
+      const layerLive = SyncClient.layerProtocolSocket().pipe(
         Layer.provide(Layer.succeed(Socket.Socket, socket)),
         Layer.provide(RpcSerialization.layerJson)
       )
-      const context = yield* Layer.build(LiveLayer)
+      const context = yield* Layer.build(layerLive)
       const protocol = Context.get(context, RpcClient.Protocol)
       const firstClientResponses = yield* Ref.make<Array<string>>([])
       const secondClientResponses = yield* Ref.make<Array<string>>([])
@@ -154,13 +154,13 @@ describe("SyncClient", () => {
           ),
         writer: Effect.succeed(() => Effect.void)
       })
-      const LiveLayer = SyncClient.layerProtocolSocket({
+      const layerLive = SyncClient.layerProtocolSocket({
         retryPolicy: Schedule.spaced("1 second")
       }).pipe(
         Layer.provide(Layer.succeed(Socket.Socket, socket)),
         Layer.provide(RpcSerialization.layerJson)
       )
-      const context = yield* Layer.build(LiveLayer)
+      const context = yield* Layer.build(layerLive)
       const protocol = Context.get(context, RpcClient.Protocol)
       const firstClientResponses = yield* Ref.make<Array<string>>([])
       const secondClientResponses = yield* Ref.make<Array<string>>([])
@@ -242,14 +242,14 @@ describe("SyncClient", () => {
           ),
         writer: Effect.succeed(() => Effect.void)
       })
-      const LiveLayer = SyncClient.layerProtocolSocket({
+      const layerLive = SyncClient.layerProtocolSocket({
         retryTransientErrors: true,
         retryPolicy: Schedule.spaced("1 second")
       }).pipe(
         Layer.provide(Layer.succeed(Socket.Socket, socket)),
         Layer.provide(RpcSerialization.layerJson)
       )
-      const context = yield* Layer.build(LiveLayer)
+      const context = yield* Layer.build(layerLive)
       const protocol = Context.get(context, RpcClient.Protocol)
       const firstClientResponses = yield* Ref.make<Array<string>>([])
       const secondClientResponses = yield* Ref.make<Array<string>>([])

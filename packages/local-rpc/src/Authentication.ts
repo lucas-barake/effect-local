@@ -48,7 +48,7 @@ const CredentialGenerationHeader = Schema.NumberFromString.check(
   Schema.isGreaterThanOrEqualTo(0)
 )
 
-export const LayerServer: Layer.Layer<Authentication, never, Authenticator> = Layer.effect(
+export const layerServer: Layer.Layer<Authentication, never, Authenticator> = Layer.effect(
   Authentication,
   Effect.gen(function*() {
     const authenticator = yield* Authenticator
@@ -78,7 +78,7 @@ export const LayerServer: Layer.Layer<Authentication, never, Authenticator> = La
   })
 )
 
-const LayerClientMiddleware = RpcMiddleware.layerClient(
+const layerClientMiddleware = RpcMiddleware.layerClient(
   Authentication,
   Effect.gen(function*() {
     const provider = yield* CredentialProvider
@@ -108,7 +108,7 @@ const LayerClientMiddleware = RpcMiddleware.layerClient(
   })
 )
 
-export const LayerClient = Layer.merge(
-  LayerClientMiddleware,
+export const layerClient = Layer.merge(
+  layerClientMiddleware,
   Layer.effect(CredentialProvider, CredentialProvider)
 )

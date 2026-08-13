@@ -37,21 +37,21 @@ const options = {
   maximumBootstrapPageBytes: Protocol.maximumBatchBytes,
   migration
 }
-const Runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.Handlers))
+const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
 
 const database = () => {
-  const Sqlite = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+  const layerSqlite = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
   return Layer.mergeAll(
-    Sqlite,
+    layerSqlite,
     NodeCrypto.layer,
     Reactivity.layer,
-    QueryReactivity.Layer
+    QueryReactivity.layer
   )
 }
 
 const localLayer = (clientId: Identity.ClientId) => {
   return LocalStore.layer({ ...options, definition: Domain.definition, spaceId, clientId }).pipe(
-    Layer.provide(Runtime),
+    Layer.provide(layerRuntime),
     Layer.provide(database())
   )
 }
@@ -170,11 +170,11 @@ describe("LocalStore metrics", () => {
             return statement
           }
         })
-        const Infrastructure = Layer.mergeAll(
+        const layerInfrastructure = Layer.mergeAll(
           Layer.succeed(SqlClient.SqlClient, observedSql),
           NodeCrypto.layer,
           Reactivity.layer,
-          QueryReactivity.Layer
+          QueryReactivity.layer
         )
         const context = yield* LocalStore.layer({
           ...options,
@@ -182,8 +182,8 @@ describe("LocalStore metrics", () => {
           spaceId,
           clientId: firstClientId
         }).pipe(
-          Layer.provide(Runtime),
-          Layer.provide(Infrastructure),
+          Layer.provide(layerRuntime),
+          Layer.provide(layerInfrastructure),
           Layer.build
         )
         const store = Context.get(context, LocalStore.Store)
@@ -226,17 +226,17 @@ describe("LocalStore metrics", () => {
     const registry = new Map<string, Metric.Metric.Metadata<any, any>>()
     return Effect.fnUntraced(function*() {
       const scope = yield* Scope.make()
-      const ClientDatabase = database()
-      const Local = LocalStore.layer({
+      const layerClientDatabase = database()
+      const layerLocal = LocalStore.layer({
         ...options,
         definition: Domain.definition,
         spaceId,
         clientId: firstClientId
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(ClientDatabase)
+        Layer.provide(layerRuntime),
+        Layer.provide(layerClientDatabase)
       )
-      const context = yield* Layer.buildWithScope(Layer.merge(Local, ClientDatabase), scope)
+      const context = yield* Layer.buildWithScope(Layer.merge(layerLocal, layerClientDatabase), scope)
       const store = Context.get(context, LocalStore.Store)
       const entries = Array.from(registry.values())
       const metadata = entries.find((entry) => entry.id === "effect_local_client_pending_mutation_count")
@@ -289,17 +289,17 @@ describe("LocalStore metrics", () => {
         0
       )
       const scope = yield* Scope.make()
-      const ClientDatabase = database()
-      const Local = LocalStore.layer({
+      const layerClientDatabase = database()
+      const layerLocal = LocalStore.layer({
         ...options,
         definition: Domain.definition,
         spaceId,
         clientId: firstClientId
       }).pipe(
-        Layer.provide(Runtime),
-        Layer.provide(ClientDatabase)
+        Layer.provide(layerRuntime),
+        Layer.provide(layerClientDatabase)
       )
-      const context = yield* Layer.buildWithScope(Layer.merge(Local, ClientDatabase), scope)
+      const context = yield* Layer.buildWithScope(Layer.merge(layerLocal, layerClientDatabase), scope)
       const store = Context.get(context, LocalStore.Store)
       const sql = Context.get(context, SqlClient.SqlClient)
       yield* store.mutate(Domain.PutTodo, Domain.todo("pending"))

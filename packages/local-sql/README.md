@@ -34,13 +34,13 @@ import * as ClusterWorkflowEngine from "effect/unstable/cluster/ClusterWorkflowE
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import { definition, Todo } from "./domain.js"
 
-const WorkflowEngineLive = ClusterWorkflowEngine.layer.pipe(
+const layerWorkflowEngine = ClusterWorkflowEngine.layer.pipe(
   Layer.provideMerge(SingleRunner.layer({ runnerStorage: "sql" }))
 )
 
 const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
 
-const ReplicaLive = SqlReplica.layerWorkflow({
+const layerReplica = SqlReplica.layerWorkflow({
   definition,
   clientId,
   scope,
@@ -53,7 +53,7 @@ const ReplicaLive = SqlReplica.layerWorkflow({
   maximumBootstrapPageBytes: 4 * 1024 * 1024,
   migration: { retryDelay: "25 millis", maximumAttempts: 8 }
 }).pipe(
-  Layer.provide(WorkflowEngineLive)
+  Layer.provide(layerWorkflowEngine)
 )
 ```
 
@@ -123,7 +123,7 @@ class ReadPolicy extends Context.Service<ReadPolicy, {
   ) => Effect.Effect<void, typeof Schema.Json.Type>
 }>()("app/ReadPolicy") {}
 
-const StoreLive = ServerStore.layer({
+const layerStore = ServerStore.layer({
   ...serverHistory,
   definition,
   readAuthorizationRefreshInterval: "30 seconds",
@@ -133,7 +133,7 @@ const StoreLive = ServerStore.layer({
   authorizeAccess,
   authorizeMutation,
   authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
-}).pipe(Layer.provide(ReadPolicyLive))
+}).pipe(Layer.provide(layerReadPolicy))
 ```
 
 Provide `ServerStore.layerMaintenance({ interval, runOnStart })` beside the store, or schedule `maintainAll` through an
@@ -145,7 +145,7 @@ chained. Client staging survives interruption and installs with one atomic canon
 ```ts
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 
-const StoreLive = ServerStore.layer({
+const layerStore = ServerStore.layer({
   definition,
   authorizeAccess,
   authorizeMutation,
@@ -169,10 +169,10 @@ const StoreLive = ServerStore.layer({
   migration: { retryDelay: "25 millis", maximumAttempts: 8 }
 })
 
-const ServerLive = ServerStore.layerMaintenance({
+const layerServer = ServerStore.layerMaintenance({
   interval: "30 seconds",
   runOnStart: true
-}).pipe(Layer.provideMerge(StoreLive))
+}).pipe(Layer.provideMerge(layerStore))
 ```
 
 Exact retries return retained receipts. Once receipt evidence has crossed the published terminal fence, an old exact

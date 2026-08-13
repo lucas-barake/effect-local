@@ -130,4 +130,4 @@ const make = (): Service => {
 
 export const makeLayer = (): EffectLayer.Layer<QueryReactivity> => EffectLayer.sync(QueryReactivity, make)
 
-export const Layer: EffectLayer.Layer<QueryReactivity> = makeLayer()
+export const layer: EffectLayer.Layer<QueryReactivity> = makeLayer()

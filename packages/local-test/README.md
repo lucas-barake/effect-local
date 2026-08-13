@@ -2,8 +2,8 @@
 
 Production shaped test Layers for Effect Local.
 
-`TestServer.TestServerLayer` adapts the real `ServerStore` to `SyncEngine`. `TestReplica.layer` uses the real `SqlReplica`
-composition. `FaultInjection.FaultInjectionLayer` addresses every fault by `SpaceId`. It can partition and heal one link, drop that
+`TestServer.layer` adapts the real `ServerStore` to `SyncEngine`. `TestReplica.layer` uses the real `SqlReplica`
+composition. `FaultInjection.layer` addresses every fault by `SpaceId`. It can partition and heal one link, drop that
 space's next receipt after authoritative commit, and duplicate that space's next pull page. Tests can prove that one
 partitioned space does not delay another while retaining the real persistence and reconciliation composition.
 

@@ -75,7 +75,7 @@ const definition = Definition.make({
   mutations: [PutTodo, PutNumbered],
   queries: [ListTodos, RangeTodos]
 })
-const Handlers = Layer.mergeAll(
+const layerHandlers = Layer.mergeAll(
   PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
   PutNumbered.toLayer(({ payload, transaction }) =>
     transaction.set(Numbered, payload.id, payload).pipe(Effect.as(payload))
@@ -93,11 +93,11 @@ const Handlers = Layer.mergeAll(
       .pipe(Effect.map((page) => page.items))
   })
 )
-const Database = Layer.mergeAll(
+const layerDatabase = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   NodeCrypto.layer
 )
-const MutationRuntimeLayer = MutationRuntime.layer(definition).pipe(Layer.provide(Handlers))
+const layerMutationRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(layerHandlers))
 const migration = {
   retryDelay: "1 millis",
   maximumAttempts: 8
@@ -113,7 +113,7 @@ const clientHistory = {
   maximumBootstrapPageBytes: 4 * 1024 * 1024,
   migration
 }
-const Server = ServerStore.layerTrusted({
+const layerServer = ServerStore.layerTrusted({
   definition,
   readAuthorizationRefreshInterval: "30 seconds" as const,
   maximumWatchersPerSpace: 1_024,
@@ -133,10 +133,10 @@ const Server = ServerStore.layerTrusted({
   maintenanceSpaceBatchSize: 128,
   migration
 }).pipe(
-  Layer.provide(MutationRuntimeLayer),
-  Layer.provide(Database)
+  Layer.provide(layerMutationRuntime),
+  Layer.provide(layerDatabase)
 )
-const Sync = Effect.gen(function*() {
+const layerSync = Effect.gen(function*() {
   const store = yield* ServerStore.ServerStore
   return SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
@@ -148,27 +148,27 @@ const Sync = Effect.gen(function*() {
   })
 }).pipe(
   Layer.effect(SyncEngine.SyncEngine),
-  Layer.provide(Server)
+  Layer.provide(layerServer)
 )
-const ReplicaLayer = SqlReplica.layer({
+const layerReplica = SqlReplica.layer({
   ...clientHistory,
   definition,
   initialSpaces: [spaceId, secondSpaceId],
   clientId,
   retryDelay: "10 millis"
 }).pipe(
-  Layer.provide(Sync),
-  Layer.provide(Database),
-  Layer.provide(Handlers)
+  Layer.provide(layerSync),
+  Layer.provide(layerDatabase),
+  Layer.provide(layerHandlers)
 )
 
 const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) => {
-  const Faults = FaultInjection.FaultInjectionLayer.pipe(
+  const layerFaults = FaultInjection.layer.pipe(
     Layer.tap((context) => Deferred.succeed(faultsReady, Context.get(context, FaultInjection.FaultInjection)))
   )
-  const FaultedSync = TestServer.TestServerLayer.pipe(
-    Layer.provide(Server),
-    Layer.provide(Faults),
+  const layerFaultedSync = TestServer.layer.pipe(
+    Layer.provide(layerServer),
+    Layer.provide(layerFaults),
     Layer.provide(NodeCrypto.layer)
   )
   return TestReplica.layer({
@@ -178,9 +178,9 @@ const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) 
     clientId,
     retryDelay: "10 millis"
   }).pipe(
-    Layer.provide(FaultedSync),
-    Layer.provide(Database),
-    Layer.provide(Handlers)
+    Layer.provide(layerFaultedSync),
+    Layer.provide(layerDatabase),
+    Layer.provide(layerHandlers)
   )
 }
 
@@ -239,7 +239,7 @@ describe("Replica Atom graph", () => {
     "reruns only an indexed query whose result range can change",
     Effect.fnUntraced(function*() {
       rangeReads.clear()
-      const graph = BrowserReplica.make(ReplicaLayer)
+      const graph = BrowserReplica.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const related = graph.query(spaceId, RangeTodos)({ lower: "a", upper: "m" })
@@ -273,7 +273,7 @@ describe("Replica Atom graph", () => {
   it.live(
     "refreshes an entity atom when its key has a different encoded representation",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(ReplicaLayer)
+      const graph = BrowserReplica.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const entity = graph.entity(spaceId, Numbered)(1)
@@ -305,7 +305,7 @@ describe("Replica Atom graph", () => {
     "does not rerun an unrelated mounted entity atom",
     Effect.fnUntraced(function*() {
       let unrelatedReads = 0
-      const Observed = Effect.gen(function*() {
+      const layerObserved = Effect.gen(function*() {
         const service = yield* Replica.Replica
         return Replica.Replica.of({
           ...service,
@@ -320,9 +320,9 @@ describe("Replica Atom graph", () => {
         })
       }).pipe(
         Layer.effect(Replica.Replica),
-        Layer.provideMerge(ReplicaLayer)
+        Layer.provideMerge(layerReplica)
       )
-      const graph = BrowserReplica.make(Observed)
+      const graph = BrowserReplica.make(layerObserved)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const changed = graph.entity(spaceId, Todo)("changed")
@@ -359,11 +359,11 @@ describe("Replica Atom graph", () => {
   )
 
   it("uses the shared runtime factory by default and preserves an explicit factory", () => {
-    const graph = BrowserReplica.make(ReplicaLayer)
+    const graph = BrowserReplica.make(layerReplica)
     assert.strictEqual(graph.factory, Atom.runtime)
 
     const factory = Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
-    const customGraph = BrowserReplica.make(ReplicaLayer, { factory })
+    const customGraph = BrowserReplica.make(layerReplica, { factory })
     assert.strictEqual(customGraph.factory, factory)
   })
 
@@ -375,7 +375,7 @@ describe("Replica Atom graph", () => {
         return 17
       }
     } satisfies Duration.Input
-    const graph = BrowserReplica.make(ReplicaLayer, { idleTTL })
+    const graph = BrowserReplica.make(layerReplica, { idleTTL })
     const readsAfterConstruction = reads
 
     assert.isAbove(readsAfterConstruction, 0)
@@ -393,7 +393,7 @@ describe("Replica Atom graph", () => {
   it.live(
     "runs mutation, entity, query, receipt, and status state through one reactive runtime",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(ReplicaLayer, {
+      const graph = BrowserReplica.make(layerReplica, {
         factory: Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
       })
       const registry = AtomRegistry.make()
@@ -448,7 +448,7 @@ describe("Replica Atom graph", () => {
   it.effect(
     "keeps addressed atoms isolated and shares membership through one runtime",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(ReplicaLayer)
+      const graph = BrowserReplica.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const firstEntity = graph.entity(spaceId, Todo)("shared")

@@ -45,16 +45,16 @@ const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, suc
 const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo] })
 const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
 const scopeGeneration = Identity.ReplicationScopeGeneration.make(1)
-const Handlers = PutTodo.toLayer(({ payload, transaction }) =>
+const layerHandlers = PutTodo.toLayer(({ payload, transaction }) =>
   transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
 )
-const Runtime = MutationRuntime.layer(definition).pipe(Layer.provide(Handlers))
-const Database = Layer.mergeAll(
+const layerRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(layerHandlers))
+const layerDatabase = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   NodeCrypto.layer,
   Reactivity.layer
 )
-const Store = ServerStore.layerTrusted({
+const layerStore = ServerStore.layerTrusted({
   definition,
   readAuthorizationRefreshInterval: "1 second" as const,
   maximumWatchersPerSpace: 1_024,
@@ -74,28 +74,28 @@ const Store = ServerStore.layerTrusted({
   maintenanceSpaceBatchSize: 128,
   migration: { retryDelay: "1 millis", maximumAttempts: 8 }
 }).pipe(
-  Layer.provide(Runtime),
-  Layer.provide(Database)
+  Layer.provide(layerRuntime),
+  Layer.provide(layerDatabase)
 )
 const assertionCodec = Schema.fromJsonString(Schema.Json)
 const assertionOf = (principal: typeof Schema.Json.Type) =>
   Schema.encodeUnknownEffect(assertionCodec)(principal).pipe(
     Effect.map((encoded) => PrincipalAssertion.PrincipalAssertion.make(encoded))
   )
-const AssertionVerifier = PrincipalAssertion.layerVerifier((assertion) =>
+const layerAssertionVerifier = PrincipalAssertion.layerVerifier((assertion) =>
   Schema.decodeUnknownEffect(assertionCodec)(assertion).pipe(
     Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" }))
   )
 )
 
-const ShardingConfigLayer = ShardingConfig.layer({
+const layerShardingConfig = ShardingConfig.layer({
   shardsPerGroup: 32,
   entityMailboxCapacity: 32,
   entityTerminationTimeout: 0,
   entityMessagePollInterval: 5_000,
   sendRetryInterval: 100
 })
-const provideShardingConfig = Effect.provide(ShardingConfigLayer)
+const provideShardingConfig = Effect.provide(layerShardingConfig)
 const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
 const handlerOptions = {
   admissionMailboxCapacity: 32,
@@ -128,30 +128,30 @@ describe("SpaceEntity", () => {
   it.effect("routes synchronization and presence through the split space boundaries", () =>
     Effect.scoped(Effect.gen(function*() {
       const presenceReady = yield* Deferred.make<void>()
-      const Presence = PresenceHub.layer({
+      const layerPresence = PresenceHub.layer({
         maximumWatchersPerSpace: 1_024,
         authorize: (input) => {
           if (input._tag === "Watch") return Deferred.succeed(presenceReady, undefined).pipe(Effect.asVoid)
           return Effect.void
         }
       })
-      const actualStore = yield* Layer.build(Store).pipe(
+      const actualStore = yield* Layer.build(layerStore).pipe(
         Effect.map(Context.get(ServerStore.ServerStore))
       )
-      const actualPresence = yield* Layer.build(Presence).pipe(
+      const actualPresence = yield* Layer.build(layerPresence).pipe(
         Effect.map(Context.get(PresenceHub.PresenceHub))
       )
-      const EntityHandlers = SpaceEntity.layerHandlers(handlerOptions).pipe(
-        Layer.provide(AssertionVerifier),
+      const layerEntityHandlers = SpaceEntity.layerHandlers(handlerOptions).pipe(
+        Layer.provide(layerAssertionVerifier),
         Layer.provide(Layer.succeed(ServerStore.ServerStore, actualStore)),
         Layer.provide(Layer.succeed(PresenceHub.PresenceHub, actualPresence))
       )
-      const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, EntityHandlers)
-      const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, EntityHandlers)
-      const makeWatchClient = yield* Entity.makeTestClient(SpaceEntity.SpaceWatchEntity, EntityHandlers)
+      const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, layerEntityHandlers)
+      const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerEntityHandlers)
+      const makeWatchClient = yield* Entity.makeTestClient(SpaceEntity.SpaceWatchEntity, layerEntityHandlers)
       const makePresencePublishClient = yield* Entity.makeTestClient(
         SpaceEntity.SpacePresencePublishEntity,
-        EntityHandlers
+        layerEntityHandlers
       )
       const admissionClient = yield* makeAdmissionClient(spaceA)
       const readClient = yield* makeReadClient(spaceA)
@@ -238,7 +238,7 @@ describe("SpaceEntity", () => {
       assert.deepStrictEqual(Option.getOrUndefined(received), update)
       yield* Fiber.interrupt(watch)
     })).pipe(
-      Effect.provide(ShardingConfigLayer),
+      Effect.provide(layerShardingConfig),
       Effect.provide(NodeCrypto.layer)
     ))
 
@@ -246,16 +246,16 @@ describe("SpaceEntity", () => {
     "rejects payloads addressed through a different space owner",
     Effect.fnUntraced(
       function*() {
-        const EntityHandlers = SpaceEntity.layerHandlers(handlerOptions).pipe(
-          Layer.provide(AssertionVerifier),
-          Layer.provide(Store),
+        const layerEntityHandlers = SpaceEntity.layerHandlers(handlerOptions).pipe(
+          Layer.provide(layerAssertionVerifier),
+          Layer.provide(layerStore),
           Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }))
         )
-        const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, EntityHandlers)
-        const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, EntityHandlers)
+        const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, layerEntityHandlers)
+        const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerEntityHandlers)
         const makePresencePublishClient = yield* Entity.makeTestClient(
           SpaceEntity.SpacePresencePublishEntity,
-          EntityHandlers
+          layerEntityHandlers
         )
         const admissionClient = yield* makeAdmissionClient(spaceA)
         const readClient = yield* makeReadClient(spaceA)
@@ -326,7 +326,7 @@ describe("SpaceEntity", () => {
 
   it.effect("completes Submit while a Bootstrap page is paused", () =>
     Effect.scoped(Effect.gen(function*() {
-      const actual = yield* Layer.build(Store).pipe(
+      const actual = yield* Layer.build(layerStore).pipe(
         Effect.map(Context.get(ServerStore.ServerStore))
       )
       const firstEntered = yield* Deferred.make<void>()
@@ -373,8 +373,8 @@ describe("SpaceEntity", () => {
           return Effect.succeed(prepare)
         }
       })
-      const Cluster = SpaceEntity.layer(handlerOptions).pipe(
-        Layer.provide(AssertionVerifier),
+      const layerCluster = SpaceEntity.layer(handlerOptions).pipe(
+        Layer.provide(layerAssertionVerifier),
         Layer.provide(Layer.succeed(ServerStore.ServerStore, wrapped)),
         Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
         Layer.provide(
@@ -385,7 +385,7 @@ describe("SpaceEntity", () => {
               entityMessagePollInterval: 5_000,
               sendRetryInterval: 100
             }
-          }).pipe(Layer.provide(Database))
+          }).pipe(Layer.provide(layerDatabase))
         )
       )
       const request: Protocol.BootstrapRequest = {
@@ -424,16 +424,16 @@ describe("SpaceEntity", () => {
         yield* Deferred.succeed(releaseFirst, undefined)
         yield* Fiber.join(first)
         yield* Fiber.join(submit)
-      }).pipe(Effect.provide(Cluster))
+      }).pipe(Effect.provide(layerCluster))
     })).pipe(
       TestClock.withLive,
-      Effect.provide(ShardingConfigLayer),
+      Effect.provide(layerShardingConfig),
       Effect.provide(NodeCrypto.layer)
     ))
 
   it.effect("does not reveal Bootstrap page occupancy to a denied principal", () =>
     Effect.scoped(Effect.gen(function*() {
-      const actual = yield* Layer.build(Store).pipe(
+      const actual = yield* Layer.build(layerStore).pipe(
         Effect.map(Context.get(ServerStore.ServerStore))
       )
       const firstEntered = yield* Deferred.make<void>()
@@ -475,8 +475,8 @@ describe("SpaceEntity", () => {
           return Effect.succeed(prepare)
         }
       })
-      const Cluster = SpaceEntity.layer(handlerOptions).pipe(
-        Layer.provide(AssertionVerifier),
+      const layerCluster = SpaceEntity.layer(handlerOptions).pipe(
+        Layer.provide(layerAssertionVerifier),
         Layer.provide(Layer.succeed(ServerStore.ServerStore, wrapped)),
         Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
         Layer.provide(
@@ -487,7 +487,7 @@ describe("SpaceEntity", () => {
               entityMessagePollInterval: 5_000,
               sendRetryInterval: 100
             }
-          }).pipe(Layer.provide(Database))
+          }).pipe(Layer.provide(layerDatabase))
         )
       )
       const request: Protocol.BootstrapRequest = {
@@ -517,16 +517,16 @@ describe("SpaceEntity", () => {
 
         yield* Deferred.succeed(releaseFirst, undefined)
         yield* Fiber.join(first)
-      }).pipe(Effect.provide(Cluster))
+      }).pipe(Effect.provide(layerCluster))
     })).pipe(
       TestClock.withLive,
-      Effect.provide(ShardingConfigLayer),
+      Effect.provide(layerShardingConfig),
       Effect.provide(NodeCrypto.layer)
     ))
 
   it.effect("bounds Bootstrap assertion and preparation work across spaces", () =>
     Effect.scoped(Effect.gen(function*() {
-      const actual = yield* Layer.build(Store).pipe(
+      const actual = yield* Layer.build(layerStore).pipe(
         Effect.map(Context.get(ServerStore.ServerStore))
       )
       const activePreflights = yield* Ref.make(0)
@@ -567,7 +567,7 @@ describe("SpaceEntity", () => {
           () => effect,
           () => Ref.update(activePreflights, (active) => active - 1)
         )
-      const Verifier = PrincipalAssertion.layerVerifier((assertion) =>
+      const layerVerifier = PrincipalAssertion.layerVerifier((assertion) =>
         Schema.decodeUnknownEffect(assertionCodec)(assertion).pipe(
           Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" })),
           Effect.flatMap((principal) => {
@@ -593,11 +593,11 @@ describe("SpaceEntity", () => {
           )
         }
       })
-      const Cluster = SpaceEntity.layer({
+      const layerCluster = SpaceEntity.layer({
         ...handlerOptions,
         maximumConcurrentBootstrapAuthorizations: 1
       }).pipe(
-        Layer.provide(Verifier),
+        Layer.provide(layerVerifier),
         Layer.provide(Layer.succeed(ServerStore.ServerStore, wrapped)),
         Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
         Layer.provide(
@@ -608,7 +608,7 @@ describe("SpaceEntity", () => {
               entityMessagePollInterval: 5_000,
               sendRetryInterval: 100
             }
-          }).pipe(Layer.provide(Database))
+          }).pipe(Layer.provide(layerDatabase))
         )
       )
       const request: Protocol.BootstrapRequest = {
@@ -669,10 +669,10 @@ describe("SpaceEntity", () => {
         yield* Deferred.succeed(releasePreparation, undefined)
         yield* Fiber.join(first)
         assert.strictEqual(yield* Ref.get(activePreflights), 0)
-      }).pipe(Effect.provide(Cluster))
+      }).pipe(Effect.provide(layerCluster))
     })).pipe(
       TestClock.withLive,
-      Effect.provide(ShardingConfigLayer),
+      Effect.provide(layerShardingConfig),
       Effect.provide(NodeCrypto.layer)
     ))
 })

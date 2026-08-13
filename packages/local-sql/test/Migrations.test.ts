@@ -19,8 +19,8 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Migrations from "../src/Migrations.js"
 import * as Domain from "./Domain.js"
 
-const Database = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
-const provideDatabase = Effect.provide(Database)
+const layerDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+const provideDatabase = Effect.provide(layerDatabase)
 const provideNodeFileSystemAndReactivity = Effect.provide([NodeFileSystem.layer, Reactivity.layer])
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")

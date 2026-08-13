@@ -28,8 +28,8 @@ const Todo = Model.make("Todo", {
 })
 const definition = Definition.make({ version: 1, models: [Todo], mutations: [] })
 const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
-const Runtime = MutationRuntime.layer(definition)
-const Database = Layer.mergeAll(
+const layerRuntime = MutationRuntime.layer(definition)
+const layerDatabase = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
   NodeCrypto.layer,
   Reactivity.layer
@@ -37,7 +37,7 @@ const Database = Layer.mergeAll(
 class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationError, Schema.JsonObject>(
   "@lucas-barake/effect-local-rpc/test/PrincipalAssertion/TestAuthorizationError"
 )("TestAuthorizationError", { reason: Schema.String }) {}
-const Store = ServerStore.layer({
+const layerStore = ServerStore.layer({
   definition,
   readAuthorizationRefreshInterval: "1 second",
   maximumWatchersPerSpace: 1_024,
@@ -62,15 +62,15 @@ const Store = ServerStore.layer({
     if (principal !== null && typeof principal === "object" && "subject" in principal) return Effect.void
     return Effect.fail(new TestAuthorizationError({ reason: "missing principal" }))
   }
-}).pipe(Layer.provide(Runtime), Layer.provide(Database))
-const TestShardingConfig = ShardingConfig.layer({
+}).pipe(Layer.provide(layerRuntime), Layer.provide(layerDatabase))
+const layerTestShardingConfig = ShardingConfig.layer({
   shardsPerGroup: 32,
   entityMailboxCapacity: 32,
   entityTerminationTimeout: 0,
   entityMessagePollInterval: 5_000,
   sendRetryInterval: 100
 })
-const provideTestShardingConfig = Effect.provide(TestShardingConfig)
+const provideTestShardingConfig = Effect.provide(layerTestShardingConfig)
 const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
 
 describe("principal assertions", () => {
@@ -78,13 +78,13 @@ describe("principal assertions", () => {
     "rejects a forged internal assertion before reaching entity authorization",
     Effect.fnUntraced(
       function*() {
-        const Verifier = PrincipalAssertion.layerVerifier((assertion) => {
+        const layerVerifier = PrincipalAssertion.layerVerifier((assertion) => {
           if (assertion === PrincipalAssertion.PrincipalAssertion.make("trusted")) {
             return Effect.succeed({ subject: "reader" })
           }
           return Effect.fail(new ReplicaError.AuthorizationDenied({ reason: "forged assertion" }))
         })
-        const Handlers = SpaceEntity.layerHandlers({
+        const layerHandlers = SpaceEntity.layerHandlers({
           admissionMailboxCapacity: 32,
           readMailboxCapacity: 32,
           watchMailboxCapacity: 32,
@@ -93,12 +93,12 @@ describe("principal assertions", () => {
           maximumConcurrentBootstrapPagesPerSpace: 4,
           maximumConcurrentPresencePublicationsPerSpace: 16
         })
-        const LiveHandlers = Handlers.pipe(
-          Layer.provide(Store),
+        const layerLiveHandlers = layerHandlers.pipe(
+          Layer.provide(layerStore),
           Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
-          Layer.provide(Verifier)
+          Layer.provide(layerVerifier)
         )
-        const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, LiveHandlers)
+        const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerLiveHandlers)
         const client = yield* makeClient(spaceId)
         const request = Protocol.PullRequest.make({
           spaceId,

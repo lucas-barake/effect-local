@@ -132,4 +132,4 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
     })
   )
 
-export const Default = layerWithOptions()
+export const layer = layerWithOptions()

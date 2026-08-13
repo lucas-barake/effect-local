@@ -91,11 +91,11 @@ const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
 
 const makeLayerHandlers = (options?: Options) => SyncRpc.Rpcs.toLayer(makeHandlers(options))
 
-export const LayerHandlers = makeLayerHandlers()
+export const layerHandlers = makeLayerHandlers()
 export const layerHandlersWithOptions = (options: Options) => makeLayerHandlers(options)
 
-export const Default = RpcServer.layer(SyncRpc.Rpcs, { disableFatalDefects: true }).pipe(
-  Layer.provide(LayerHandlers)
+export const layer = RpcServer.layer(SyncRpc.Rpcs, { disableFatalDefects: true }).pipe(
+  Layer.provide(layerHandlers)
 )
 
 export const layerWithOptions = (options: Options) =>

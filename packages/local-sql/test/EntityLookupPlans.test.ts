@@ -151,14 +151,14 @@ const windowedScope = Protocol.ReplicationScope.make({
 })
 
 const layers = () => {
-  const Database = Layer.mergeAll(
+  const layerDatabase = Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
     Reactivity.layer,
-    QueryReactivity.Layer
+    QueryReactivity.layer
   )
-  const Runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.Handlers))
-  const Server = ServerStore.layer({
+  const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
+  const layerServer = ServerStore.layer({
     definition: Domain.definition,
     wakeCapacity: 16,
     maximumWatchersPerSpace: 1_024,
@@ -181,7 +181,7 @@ const layers = () => {
     authorizeAccess: () => Effect.void,
     authorizeMutation: () => Effect.void,
     authorizeRead: () => Effect.void
-  }).pipe(Layer.provide(Runtime), Layer.provide(Database))
+  }).pipe(Layer.provide(layerRuntime), Layer.provide(layerDatabase))
   const remoteEffect = Effect.gen(function*() {
     const store = yield* ServerStore.ServerStore
     return SyncEngine.SyncEngine.of({
@@ -193,8 +193,8 @@ const layers = () => {
       watch: (request) => store.watchAuthorized(request, "reader").pipe(Stream.unwrap)
     })
   })
-  const Remote = Layer.effect(SyncEngine.SyncEngine, remoteEffect).pipe(Layer.provide(Server))
-  const Local = LocalStore.layer({
+  const layerRemote = Layer.effect(SyncEngine.SyncEngine, remoteEffect).pipe(Layer.provide(layerServer))
+  const layerLocal = LocalStore.layer({
     settlementCapacity: 64,
     retainedReceipts: 256,
     maximumReceipts: 100_000,
@@ -207,12 +207,12 @@ const layers = () => {
     spaceId,
     clientId: readerId,
     scope: windowedScope
-  }).pipe(Layer.provide(Runtime), Layer.provide(Database))
-  const ReconcilerLayer = Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
-    Layer.provide(Local),
-    Layer.provide(Remote)
+  }).pipe(Layer.provide(layerRuntime), Layer.provide(layerDatabase))
+  const layerReconciler = Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+    Layer.provide(layerLocal),
+    Layer.provide(layerRemote)
   )
-  return Layer.mergeAll(Local, ReconcilerLayer, Server, Database)
+  return Layer.mergeAll(layerLocal, layerReconciler, layerServer, layerDatabase)
 }
 
 describe("entity lookup query plans", () => {
