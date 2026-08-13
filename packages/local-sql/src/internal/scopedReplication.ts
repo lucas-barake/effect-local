@@ -150,8 +150,8 @@ export const make = (options: Options) => {
     Result: Rows.ReplicationViewRow,
     execute: ({ spaceId, clientId }) =>
       sql`SELECT space_id, client_id, principal_digest, view_id, view_revision, scope_generation,
-        scope_json, scope_digest, definition_hash, schema_version, schema_hash, server_sequence,
-        delivered_sequence, read_auth_epoch
+        scope_json, scope_digest, definition_hash, index_layout_hash, schema_version, schema_hash,
+        server_sequence, delivered_sequence, read_auth_epoch
       FROM effect_local_server_replication_views
       WHERE space_id = ${spaceId} AND client_id = ${clientId}`
   })
@@ -193,7 +193,7 @@ export const make = (options: Options) => {
     Result: Rows.ScopedSnapshotManifestRow,
     execute: (snapshotId) =>
       sql`SELECT snapshot_id, space_id, client_id, principal_digest, definition_hash,
-        schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id,
+        index_layout_hash, schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id,
         view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest
       FROM effect_local_server_scoped_snapshots WHERE snapshot_id = ${snapshotId}`
   })
@@ -202,7 +202,7 @@ export const make = (options: Options) => {
     Result: Rows.ScopedSnapshotManifestRow,
     execute: ({ spaceId, clientId }) =>
       sql`SELECT snapshot_id, space_id, client_id, principal_digest, definition_hash,
-        schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id,
+        index_layout_hash, schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id,
         view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest
       FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId} AND client_id = ${clientId}`
   })
@@ -614,29 +614,31 @@ export const make = (options: Options) => {
         WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}`
       yield* sql`INSERT INTO effect_local_server_replication_views
         (space_id, client_id, principal_digest, view_id, view_revision, scope_generation,
-          scope_json, scope_digest, definition_hash, schema_version, schema_hash, server_sequence,
-          delivered_sequence, read_auth_epoch)
+          scope_json, scope_digest, definition_hash, index_layout_hash, schema_version, schema_hash,
+          server_sequence, delivered_sequence, read_auth_epoch)
         VALUES (${request.spaceId}, ${request.clientId}, ${principalHash}, ${viewId}, 0,
           ${request.scopeGeneration}, ${yield* Codec.stringify(normalized)}, ${normalizedDigest},
-          ${targetDefinition.hash}, ${targetDefinition.schemaIdentity.version}, ${targetDefinition.schemaIdentity.hash},
-          ${space.next_server_sequence - 1}, ${space.next_server_sequence - 1}, ${space.read_auth_epoch})
+          ${targetDefinition.hash}, ${targetDefinition.indexLayoutHash}, ${targetDefinition.schemaIdentity.version},
+          ${targetDefinition.schemaIdentity.hash}, ${space.next_server_sequence - 1},
+          ${space.next_server_sequence - 1}, ${space.read_auth_epoch})
         ON CONFLICT (space_id, client_id) DO UPDATE SET principal_digest = excluded.principal_digest,
           view_id = excluded.view_id, view_revision = excluded.view_revision,
           scope_generation = excluded.scope_generation, scope_json = excluded.scope_json,
           scope_digest = excluded.scope_digest, definition_hash = excluded.definition_hash,
+          index_layout_hash = excluded.index_layout_hash,
           schema_version = excluded.schema_version, schema_hash = excluded.schema_hash,
           server_sequence = excluded.server_sequence, delivered_sequence = excluded.delivered_sequence,
           read_auth_epoch = excluded.read_auth_epoch`
       yield* replaceViewEntities(request, principalHash, cursor, visibleEntities)
       yield* sql`INSERT INTO effect_local_server_scoped_snapshots
-        (snapshot_id, space_id, client_id, principal_digest, definition_hash, schema_version,
-          schema_hash, scope_json, scope_digest, scope_generation, view_id, view_revision,
+        (snapshot_id, space_id, client_id, principal_digest, definition_hash, index_layout_hash,
+          schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id, view_revision,
           server_sequence, terminal_sequence, entry_count, content_bytes, digest)
         VALUES (${snapshotId}, ${request.spaceId}, ${request.clientId}, ${principalHash},
-          ${targetDefinition.hash}, ${targetDefinition.schemaIdentity.version}, ${targetDefinition.schemaIdentity.hash},
-          ${yield* Codec.stringify(normalized)}, ${normalizedDigest}, ${request.scopeGeneration},
-          ${viewId}, 0, ${space.next_server_sequence - 1}, ${space.next_terminal_sequence - 1},
-          ${entries.length}, ${bytes}, ${rolling})`
+          ${targetDefinition.hash}, ${targetDefinition.indexLayoutHash}, ${targetDefinition.schemaIdentity.version},
+          ${targetDefinition.schemaIdentity.hash}, ${yield* Codec.stringify(normalized)}, ${normalizedDigest},
+          ${request.scopeGeneration}, ${viewId}, 0, ${space.next_server_sequence - 1},
+          ${space.next_terminal_sequence - 1}, ${entries.length}, ${bytes}, ${rolling})`
       const entryRows = yield* Effect.forEach(entries, (entry) =>
         Codec.stringify(entry).pipe(Effect.map((changeJson) => ({
           snapshot_id: snapshotId,
@@ -1132,6 +1134,7 @@ export const make = (options: Options) => {
       if (
         request.cursor === null && Option.isSome(stored) && stored.value.principal_digest === principalHash &&
         stored.value.definition_hash === targetDefinition.hash &&
+        stored.value.index_layout_hash === targetDefinition.indexLayoutHash &&
         stored.value.schema_version === request.schema.version && stored.value.schema_hash === request.schema.hash &&
         stored.value.scope_generation === request.scopeGeneration && stored.value.scope_digest === normalizedDigest
       ) {
@@ -1142,6 +1145,7 @@ export const make = (options: Options) => {
         if (
           Option.isSome(snapshot) && snapshot.value.principal_digest === principalHash &&
           snapshot.value.definition_hash === targetDefinition.hash &&
+          snapshot.value.index_layout_hash === targetDefinition.indexLayoutHash &&
           snapshot.value.schema_version === request.schema.version &&
           snapshot.value.schema_hash === request.schema.hash &&
           snapshot.value.scope_generation === request.scopeGeneration &&
@@ -1154,6 +1158,7 @@ export const make = (options: Options) => {
       if (
         request.cursor === null || Option.isNone(stored) || stored.value.principal_digest !== principalHash ||
         stored.value.definition_hash !== targetDefinition.hash ||
+        stored.value.index_layout_hash !== targetDefinition.indexLayoutHash ||
         stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
         request.cursor.viewId !== stored.value.view_id || request.scopeGeneration < stored.value.scope_generation
       ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
@@ -1287,6 +1292,7 @@ export const make = (options: Options) => {
         Option.isNone(stored) || stored.value.space_id !== request.spaceId ||
         stored.value.client_id !== request.clientId || stored.value.principal_digest !== principalHash ||
         stored.value.definition_hash !== targetDefinition.hash ||
+        stored.value.index_layout_hash !== targetDefinition.indexLayoutHash ||
         stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
         stored.value.scope_digest !== normalizedDigest || stored.value.scope_generation !== request.scopeGeneration ||
         stored.value.view_id !== request.cursor.viewId || stored.value.view_revision !== request.cursor.revision

@@ -1,17 +1,21 @@
-import { NodeCrypto } from "@effect/platform-node"
+import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Model from "@lucas-barake/effect-local/Model"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
+import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -740,6 +744,108 @@ describe("scoped replication", () => {
         if ("_tag" in result) assert.strictEqual(result._tag, "BootstrapRequired")
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
+
+  it.effect("replaces a windowed view when the index layout changes", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const fs = yield* FileSystem.FileSystem
+        const directory = yield* fs.makeTempDirectoryScoped()
+        const filename = `${directory}/index-layout.sqlite`
+        const reorderedMessage = Model.make(Domain.Message.name, {
+          version: Domain.Message.version,
+          key: Domain.Message.key,
+          schema: Domain.Message.schema,
+          indexes: {
+            byChat: {
+              version: 2,
+              partition: Domain.Message.indexes.byChat.partition,
+              sort: [{
+                name: "body",
+                affinity: "text",
+                schema: Schema.String,
+                extract: (message: typeof Domain.Message.schema.Type) => message.body
+              }]
+            }
+          }
+        })
+        const reorderedDefinition = Definition.make({
+          version: Domain.definition.version,
+          models: [Domain.Todo, reorderedMessage],
+          mutations: Domain.definition.mutations,
+          queries: Domain.definition.queries
+        })
+        assert.deepStrictEqual(reorderedDefinition.schemaIdentity, Domain.definition.schemaIdentity)
+        assert.strictEqual(reorderedDefinition.hash, Domain.definition.hash)
+        assert.notStrictEqual(reorderedDefinition.indexLayoutHash, Domain.definition.indexLayoutHash)
+        const persistentDatabase = () =>
+          Layer.mergeAll(
+            SqliteClient.layer({ filename, disableWAL: true }),
+            NodeCrypto.layer,
+            Reactivity.layer,
+            QueryReactivity.layer
+          )
+        const build = (definition: Definition.Any) =>
+          Layer.build(
+            ServerStore.layer({
+              ...history,
+              definition,
+              readAuthorizationRefreshInterval: "1 second",
+              authorizeAccess: () => Effect.void,
+              authorizeMutation: () => Effect.void,
+              authorizeRead: () => Effect.void
+            }).pipe(
+              Layer.provide(MutationRuntime.layer(definition).pipe(Layer.provide(Domain.handlers))),
+              Layer.provideMerge(persistentDatabase())
+            )
+          ).pipe(Effect.map((context) => Context.get(context, ServerStore.ServerStore)))
+        const message = (id: string, sentAt: number, body: string) =>
+          Effect.gen(function*() {
+            const identity = {
+              spaceId,
+              clientId: writerId,
+              mutationId: Identity.MutationId.make(
+                `mut_00000000-0000-4000-8000-${String(sentAt).padStart(12, "0")}`
+              ),
+              localSequence: Identity.LocalSequence.make(sentAt),
+              basis: Identity.ServerSequence.make(0),
+              name: Domain.PutMessage.name,
+              payload: { id, chatId: "chat-a", sentAt, body },
+              digestVersion: 3 as const,
+              membershipIncarnation,
+              sourceSchema: Domain.definition.schemaIdentity,
+              mutationVersion: Domain.PutMessage.version
+            }
+            return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
+          })
+        const windowed = Protocol.ReplicationScope.make({
+          models: [],
+          windows: [Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "byChat", count: 2 })]
+        })
+
+        const first = yield* build(Domain.definition)
+        yield* first.submit(yield* message("m-1", 1, "z"))
+        yield* first.submit(yield* message("m-2", 2, "a"))
+        yield* first.submit(yield* message("m-3", 3, "b"))
+        const required = yield* first.pullAuthorized(pullRequest(null, windowed), "reader")
+        if (!("_tag" in required)) assert.fail("expected bootstrap")
+        const page = yield* first.bootstrapAuthorized(
+          Protocol.BootstrapRequest.make({ ...bootstrapRequest(required.manifest), scope: windowed }),
+          "reader"
+        )
+        assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["m-2", "m-3"])
+
+        const second = yield* build(reorderedDefinition)
+        const replacement = yield* second.pullAuthorized(
+          pullRequest(required.manifest.cursor, windowed),
+          "reader"
+        )
+        assert.isTrue("_tag" in replacement)
+        if ("_tag" in replacement) {
+          assert.strictEqual(replacement._tag, "BootstrapRequired")
+          assert.notStrictEqual(replacement.manifest.cursor.viewId, required.manifest.cursor.viewId)
+        }
+      })
+    ).pipe(Effect.provide(Layer.merge(NodeFileSystem.layer, NodeCrypto.layer))))
 
   it.effect("emits a periodic revocation hint", () =>
     Effect.scoped(
