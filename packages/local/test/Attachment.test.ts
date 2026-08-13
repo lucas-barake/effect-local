@@ -6,6 +6,7 @@ import * as Stream from "effect/Stream"
 import * as Attachment from "../src/Attachment.js"
 import * as Definition from "../src/Definition.js"
 import * as Model from "../src/Model.js"
+import { maximumMutationBytes } from "../src/Protocol.js"
 
 const digest = Attachment.Digest.make(
   "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
@@ -99,6 +100,19 @@ describe("attachment contract", () => {
         assert.strictEqual(conflict.failure.reason, "ConflictingLength")
         assert.deepStrictEqual(conflict.failure.path, ["second"])
       }
+    })
+  )
+
+  it.effect(
+    "collects references from deeply nested values within the mutation byte limit",
+    Effect.fnUntraced(function*() {
+      const depth = 10_000
+      const encodedReference = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(reference)
+      let payload: typeof Schema.Json.Type = reference
+      for (let index = 0; index < depth; index++) payload = { nested: payload }
+
+      assert.isBelow(depth * "{\"nested\":}".length + encodedReference.length, maximumMutationBytes)
+      assert.deepStrictEqual(yield* Attachment.collect(payload), [reference])
     })
   )
 })

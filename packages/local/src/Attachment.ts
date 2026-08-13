@@ -97,6 +97,22 @@ const isJsonArray = (
   value: Schema.JsonArray | Schema.JsonObject
 ): value is Schema.JsonArray => Array.isArray(value)
 
+interface PathNode {
+  readonly parent: PathNode | undefined
+  readonly segment: string | number
+}
+
+const materializePath = (node: PathNode | undefined): ReadonlyArray<string | number> => {
+  const path: Array<string | number> = []
+  let current = node
+  while (current !== undefined) {
+    path.push(current.segment)
+    current = current.parent
+  }
+  path.reverse()
+  return path
+}
+
 export const hash = Effect.fnUntraced(function*<E extends { readonly _tag: string }, R,>(
   bytes: Stream.Stream<Uint8Array, E, R>,
   options?: { readonly maximumBytes?: number }
@@ -126,34 +142,45 @@ export const collect = Effect.fnUntraced(function*(
   value: typeof Schema.Json.Type
 ): Effect.fn.Return<ReadonlyArray<Reference>, InvalidAttachmentReference> {
   const references = new Map<Digest, Reference>()
-  const visit: (
-    current: typeof Schema.Json.Type,
-    path: ReadonlyArray<string | number>
-  ) => Effect.Effect<void, InvalidAttachmentReference> = Effect.fnUntraced(
-    function*(current, path) {
-      if (current === null || typeof current !== "object") return
-      if (isJsonArray(current)) {
-        for (let index = 0; index < current.length; index++) yield* visit(current[index], [...path, index])
-        return
+  const pending: Array<{
+    readonly current: typeof Schema.Json.Type
+    readonly path: PathNode | undefined
+  }> = [{ current: value, path: undefined }]
+
+  while (pending.length > 0) {
+    const { current, path } = pending.pop()!
+    if (current === null || typeof current !== "object") continue
+    if (isJsonArray(current)) {
+      for (let index = current.length - 1; index >= 0; index--) {
+        pending.push({ current: current[index], path: { parent: path, segment: index } })
       }
-      if (current._tag === "Attachment") {
-        const reference = yield* Schema.decodeUnknownEffect(Reference)(current).pipe(
-          Effect.mapError((cause) => new InvalidAttachmentReference({ path, reason: "InvalidShape", cause }))
-        )
-        const existing = references.get(reference.digest)
-        if (existing !== undefined && existing.bytes !== reference.bytes) {
-          yield* new InvalidAttachmentReference({
-            path,
-            reason: "ConflictingLength"
-          })
-          return
-        }
-        references.set(reference.digest, reference)
-        return
-      }
-      for (const [key, nested] of Object.entries(current)) yield* visit(nested, [...path, key])
+      continue
     }
-  )
-  yield* visit(value, [])
+    if (current._tag === "Attachment") {
+      const reference = yield* Schema.decodeUnknownEffect(Reference)(current).pipe(
+        Effect.mapError((cause) =>
+          new InvalidAttachmentReference({
+            path: materializePath(path),
+            reason: "InvalidShape",
+            cause
+          })
+        )
+      )
+      const existing = references.get(reference.digest)
+      if (existing !== undefined && existing.bytes !== reference.bytes) {
+        yield* new InvalidAttachmentReference({
+          path: materializePath(path),
+          reason: "ConflictingLength"
+        })
+      }
+      references.set(reference.digest, reference)
+      continue
+    }
+    const entries = Object.entries(current)
+    for (let index = entries.length - 1; index >= 0; index--) {
+      const [key, nested] = entries[index]
+      pending.push({ current: nested, path: { parent: path, segment: key } })
+    }
+  }
   return [...references.values()]
 })
