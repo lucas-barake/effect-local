@@ -248,13 +248,16 @@ export const layer = (options: Options): Layer.Layer<
         includeAdmissionInCache = true,
         cacheAlreadyCounted = localAlreadyCounted
       ) {
-        if (admission !== undefined && admission.bytes > maximumLocalBytes) {
+        if (admission !== undefined && !localAlreadyCounted && admission.bytes > maximumLocalBytes) {
           return yield* new ReplicaError.CapacityExceeded({
             resource: "client attachment storage",
             limit: maximumLocalBytes
           })
         }
-        if (admission !== undefined && includeAdmissionInCache && admission.bytes > maximumCacheBytes) {
+        if (
+          admission !== undefined && includeAdmissionInCache && !cacheAlreadyCounted &&
+          admission.bytes > maximumCacheBytes
+        ) {
           return yield* new ReplicaError.CapacityExceeded({
             resource: "client attachment cache",
             limit: maximumCacheBytes
@@ -406,8 +409,24 @@ export const layer = (options: Options): Layer.Layer<
         reference: Attachment.Reference,
         localAlreadyCounted: boolean,
         cacheAlreadyCounted: boolean
-      ): Effect.Effect<number, ReplicaError.ReplicaError> =>
-        evictCache(reference, localAlreadyCounted, true, cacheAlreadyCounted).pipe(
+      ): Effect.Effect<number, ReplicaError.ReplicaError> => {
+        if (!localAlreadyCounted && reference.bytes > maximumLocalBytes) {
+          return Effect.fail(
+            new ReplicaError.CapacityExceeded({
+              resource: "client attachment storage",
+              limit: maximumLocalBytes
+            })
+          )
+        }
+        if (!cacheAlreadyCounted && reference.bytes > maximumCacheBytes) {
+          return Effect.fail(
+            new ReplicaError.CapacityExceeded({
+              resource: "client attachment cache",
+              limit: maximumCacheBytes
+            })
+          )
+        }
+        return evictCache(reference, localAlreadyCounted, true, cacheAlreadyCounted).pipe(
           Effect.catchTag("CapacityExceeded", (error) => {
             if (activeReads.size === 0) return Effect.fail(error)
             const changed = activeReadsChanged
@@ -416,6 +435,7 @@ export const layer = (options: Options): Layer.Layer<
             )
           })
         )
+      }
 
       const maintain: Service["maintain"] = cacheGate.withPermit(Effect.gen(function*() {
         yield* drainAllDeletions()

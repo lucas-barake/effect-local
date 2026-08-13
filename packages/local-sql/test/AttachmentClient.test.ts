@@ -234,7 +234,7 @@ describe("attachment client", () => {
   )
 
   it.effect(
-    "rejects an impossible known-size remote object before consuming its bytes",
+    "rejects an impossible remote object while an unrelated read remains active",
     Effect.fnUntraced(
       function*() {
         const fs = yield* FileSystem.FileSystem
@@ -273,11 +273,35 @@ describe("attachment client", () => {
         yield* Migrations.client({ definition: Domain.definition, spaceId, clientId }).pipe(
           Effect.provideService(SqlClient.SqlClient, sql)
         )
+        const activeBytes = Uint8Array.of(1)
+        const activeReference = yield* client.stage(spaceId, Stream.make(activeBytes))
+        const activeReadStarted = yield* Deferred.make<void>()
+        const releaseActiveRead = yield* Deferred.make<void>()
+        const activeRead = yield* client.read(spaceId, clientId, membershipIncarnation, activeReference).pipe(
+          Stream.runForEach(() =>
+            Deferred.succeed(activeReadStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseActiveRead))
+            )
+          ),
+          Effect.forkChild
+        )
+        yield* Deferred.await(activeReadStarted)
 
-        const result = yield* collectBytes(
+        const rejectedRead = yield* collectBytes(
           client.read(spaceId, clientId, membershipIncarnation, reference)
-        ).pipe(Effect.result)
+        ).pipe(
+          Effect.result,
+          Effect.timeoutOption("1 second"),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* TestClock.adjust("1 second")
+        const completed = yield* Fiber.join(rejectedRead)
+        yield* Deferred.succeed(releaseActiveRead, undefined)
+        yield* Fiber.join(activeRead)
 
+        assert.isTrue(Option.isSome(completed))
+        if (Option.isNone(completed)) return
+        const result = completed.value
         assert.isTrue(Result.isFailure(result))
         if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, "CapacityExceeded")
         assert.strictEqual(yield* Ref.get(consumed), 0)
