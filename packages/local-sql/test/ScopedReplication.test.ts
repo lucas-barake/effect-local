@@ -363,9 +363,12 @@ describe("scoped replication", () => {
         yield* server.submit(yield* putManyEnvelope(250, 2))
         let cursor = acknowledged.cursor
         const delivered = new Map<string, string>()
+        const pageSizes: Array<number> = []
         for (let round = 0; round < 10; round++) {
           const page = yield* server.pullAuthorized(pullRequest(cursor), "reader")
           if ("_tag" in page) assert.fail("expected incremental page")
+          pageSizes.push(page.changes.length)
+          assert.isAtMost(page.changes.length, 100)
           for (const change of page.changes) {
             assert.strictEqual(change._tag, "Upsert")
             delivered.set(yield* Codec.stringify(change.entity.key), change._tag)
@@ -374,6 +377,7 @@ describe("scoped replication", () => {
           if (!page.hasMore && page.changes.length === 0) break
         }
         assert.strictEqual(delivered.size, 250)
+        assert.deepStrictEqual(pageSizes, [100, 100, 50, 0])
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
@@ -397,9 +401,12 @@ describe("scoped replication", () => {
 
         let cursor = acknowledged.cursor
         const delivered = new Set<string>()
+        const pageSizes: Array<number> = []
         for (let round = 0; round < 10; round++) {
           const page = yield* server.pullAuthorized(pullRequest(cursor, scope, 2), "reader")
           if ("_tag" in page) assert.fail("expected incremental page")
+          pageSizes.push(page.changes.length)
+          assert.isAtMost(page.changes.length, 100)
           for (const change of page.changes) {
             assert.strictEqual(change._tag, "Upsert")
             delivered.add(yield* Codec.stringify(change.entity.key))
@@ -408,6 +415,7 @@ describe("scoped replication", () => {
           if (!page.hasMore && page.changes.length === 0) break
         }
         assert.strictEqual(delivered.size, 250)
+        assert.deepStrictEqual(pageSizes, [100, 100, 50, 0])
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 

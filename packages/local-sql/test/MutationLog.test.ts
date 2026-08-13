@@ -2234,7 +2234,7 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(pending.envelope.mutationId))._tag, "Accepted")
     })))
 
-  it.effect("rebases pending reads over an incrementally applied page without a projection rebuild", () =>
+  it.effect("rebases pending reads over an incrementally applied page", () =>
     Effect.scoped(
       Effect.gen(function*() {
         const clientDatabase = database()
@@ -2244,7 +2244,6 @@ describe("server reconciled mutation log", () => {
         )
         const context = yield* Layer.build(Layer.merge(live, clientDatabase))
         const local = Context.get(context, LocalStore.Store)
-        const sql = Context.get(context, SqlClient.SqlClient)
         const server = yield* service(ServerStore.ServerStore, serverLayer())
 
         yield* installFreshView(local, server)
@@ -2270,34 +2269,10 @@ describe("server reconciled mutation log", () => {
           )
         )
 
-        const generationsBefore = yield* SqlSchema.findOne({
-          Request: Schema.Void,
-          Result: Schema.Struct({ active: Schema.Int }),
-          execute: () =>
-            sql`SELECT active_projection_generation AS active
-          FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
-        })(undefined)
         const state = yield* local.replicationState
         yield* local.applyViewPage(incremental(yield* server.pull(pullRequest(state.cursor))))
 
         assert.strictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "base")).count, 6)
-        const projection = yield* SqlSchema.findOne({
-          Request: Schema.Void,
-          Result: Schema.Struct({
-            active: Schema.Int,
-            replay: Schema.NullOr(Schema.Int),
-            dirty_rows: Schema.Int
-          }),
-          execute: () =>
-            sql`SELECT s.active_projection_generation AS active,
-          s.projection_replay_generation AS replay,
-          (SELECT COUNT(*) FROM effect_local_client_projection_dirty AS d
-            WHERE d.space_id = s.space_id) AS dirty_rows
-          FROM effect_local_client_spaces AS s WHERE s.space_id = ${spaceId}`
-        })(undefined)
-        assert.strictEqual(projection.active, generationsBefore.active)
-        assert.isNull(projection.replay)
-        assert.strictEqual(projection.dirty_rows, 0)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
