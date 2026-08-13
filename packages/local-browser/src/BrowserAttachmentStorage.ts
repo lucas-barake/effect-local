@@ -1,9 +1,11 @@
 import * as AttachmentStorage from "@lucas-barake/effect-local-sql/AttachmentStorage"
 import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import * as Crypto from "effect/Crypto"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as RcMap from "effect/RcMap"
 import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
@@ -14,6 +16,7 @@ export interface Options {
   readonly maximumBytes: number
   readonly readChunkBytes: number
   readonly maximumPendingRequests: number
+  readonly cleanupRequestTimeout: Duration.Input
 }
 
 const writeChunkBytes = 256 * 1_024
@@ -35,16 +38,38 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
           cause: options.readChunkBytes
         })
       }
-      if (!Number.isSafeInteger(options.maximumPendingRequests) || options.maximumPendingRequests <= 0) {
+      if (
+        !Number.isSafeInteger(options.maximumPendingRequests) || options.maximumPendingRequests <= 0 ||
+        options.maximumPendingRequests === Number.MAX_SAFE_INTEGER
+      ) {
         return yield* new Attachment.AttachmentStorageError({
           operation: "configure.maximumPendingRequests",
           cause: options.maximumPendingRequests
         })
       }
+      const cleanupRequestTimeout = yield* Option.match(Duration.fromInput(options.cleanupRequestTimeout), {
+        onNone: () =>
+          Effect.fail(
+            new Attachment.AttachmentStorageError({
+              operation: "configure.cleanupRequestTimeout",
+              cause: options.cleanupRequestTimeout
+            })
+          ),
+        onSome: (duration) => {
+          if (Duration.isPositive(duration) && Duration.isFinite(duration)) return Effect.succeed(duration)
+          return Effect.fail(
+            new Attachment.AttachmentStorageError({
+              operation: "configure.cleanupRequestTimeout",
+              cause: options.cleanupRequestTimeout
+            })
+          )
+        }
+      })
       const maximumBytes = options.maximumBytes
       const readChunkBytes = options.readChunkBytes
       const locks = yield* RcMap.make({ lookup: () => Semaphore.make(1) })
       const requestPermits = yield* Semaphore.make(options.maximumPendingRequests)
+      const cleanupPermit = yield* Semaphore.make(1)
       const pending = new Map<number, (value: unknown) => void>()
       let nextRequestId = 0
       const receive = (event: MessageEvent<unknown>) => {
@@ -68,7 +93,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
           })
       )
 
-      const request = Effect.fn("BrowserAttachmentStorage.request")(function*(
+      const requestRaw = Effect.fn("BrowserAttachmentStorage.request")(function*(
         message: AttachmentWorkerProtocol.RequestWithoutId,
         transfer?: ReadonlyArray<Transferable>
       ): Effect.fn.Return<AttachmentWorkerProtocol.Response, Attachment.AttachmentStorageError> {
@@ -90,7 +115,29 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
         return yield* Schema.decodeUnknownEffect(AttachmentWorkerProtocol.Response)(response).pipe(
           Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "response.decode", cause }))
         )
-      }, (effect) => requestPermits.withPermit(effect))
+      })
+      const request = (
+        message: AttachmentWorkerProtocol.RequestWithoutId,
+        transfer?: ReadonlyArray<Transferable>
+      ) => requestPermits.withPermit(requestRaw(message, transfer))
+
+      const cleanupRemove = Effect.fn("BrowserAttachmentStorage.cleanupRemove")(function*(key) {
+        const response = yield* requestRaw({ _tag: "CleanupRemove", key }).pipe(
+          Effect.timeoutOption(cleanupRequestTimeout)
+        )
+        if (Option.isNone(response)) {
+          yield* Effect.logWarning("Timed out removing an interrupted staged attachment")
+          return
+        }
+        if (response.value._tag !== "Removed") {
+          let operation: string = response.value._tag
+          if (response.value._tag === "StorageError") operation = response.value.operation
+          yield* new Attachment.AttachmentStorageError({
+            operation: `worker.${operation}`,
+            cause: operation
+          })
+        }
+      }, (effect) => cleanupPermit.withPermit(effect))
 
       const withLock = <A, E extends { readonly _tag: string }, R,>(
         key: AttachmentStorage.ObjectKey,
@@ -311,7 +358,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
           }),
           Effect.fnUntraced(function*(key, exit) {
             if (Exit.isFailure(exit)) {
-              yield* remove(key).pipe(
+              yield* cleanupRemove(key).pipe(
                 Effect.catchTag("AttachmentStorageError", (error) =>
                   Effect.logWarning("Failed to remove an interrupted staged attachment").pipe(
                     Effect.annotateLogs("operation", error.operation)

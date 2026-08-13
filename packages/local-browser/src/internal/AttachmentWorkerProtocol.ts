@@ -29,7 +29,8 @@ export const Request = Schema.Union([
     length: Attachment.ByteLength
   }),
   Schema.Struct({ _tag: Schema.tag("Exists"), ...BaseRequest }),
-  Schema.Struct({ _tag: Schema.tag("Remove"), ...BaseRequest })
+  Schema.Struct({ _tag: Schema.tag("Remove"), ...BaseRequest }),
+  Schema.Struct({ _tag: Schema.tag("CleanupRemove"), ...BaseRequest })
 ])
 export type Request = typeof Request.Type
 export type RequestWithoutId = Request extends infer R ? R extends { readonly id: number } ? Omit<R, "id"> : never
@@ -82,7 +83,10 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
       cause: options.maximumBytes
     })
   }
-  if (!Number.isSafeInteger(options.maximumPendingRequests) || options.maximumPendingRequests <= 0) {
+  if (
+    !Number.isSafeInteger(options.maximumPendingRequests) || options.maximumPendingRequests <= 0 ||
+    options.maximumPendingRequests === Number.MAX_SAFE_INTEGER
+  ) {
     yield* new Attachment.AttachmentStorageError({
       operation: "worker.configure.maximumPendingRequests",
       cause: options.maximumPendingRequests
@@ -90,10 +94,13 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
   }
   const directory = yield* AttachmentDirectory.AttachmentDirectory
   const queue = yield* Effect.acquireRelease(
-    Queue.dropping<MessageEvent<unknown>>(options.maximumPendingRequests),
+    Queue.dropping<{ readonly event: MessageEvent<unknown>; readonly lane: "cleanup" | "ordinary" }>(
+      options.maximumPendingRequests + 1
+    ),
     Queue.shutdown
   )
-  let pendingRequests = 0
+  let pendingOrdinaryRequests = 0
+  let pendingCleanupRequests = 0
   const sendOverloaded = (id: number) => port.postMessage({ _tag: "Overloaded", id } satisfies Response)
   const receive = (event: MessageEvent<unknown>) => {
     const data = event.data
@@ -102,8 +109,14 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
       typeof data === "object" && data !== null && "id" in data &&
       typeof data.id === "number" && Number.isSafeInteger(data.id) && data.id >= 0
     ) id = data.id
-    if (pendingRequests < options.maximumPendingRequests && Queue.offerUnsafe(queue, event)) {
-      pendingRequests++
+    const cleanup = typeof data === "object" && data !== null && "_tag" in data && data._tag === "CleanupRemove"
+    if (cleanup && pendingCleanupRequests < 1 && Queue.offerUnsafe(queue, { event, lane: "cleanup" })) {
+      pendingCleanupRequests++
+    } else if (
+      !cleanup && pendingOrdinaryRequests < options.maximumPendingRequests &&
+      Queue.offerUnsafe(queue, { event, lane: "ordinary" })
+    ) {
+      pendingOrdinaryRequests++
     } else if (id !== undefined) {
       sendOverloaded(id)
     }
@@ -184,6 +197,7 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
         )
         break
       case "Remove":
+      case "CleanupRemove":
         response = yield* directory.remove(decoded.key).pipe(
           Effect.as<Response>({ _tag: "Removed", id: decoded.id }),
           Effect.catchTag(
@@ -207,7 +221,12 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
       Effect.withSpan("AttachmentWorkerProtocol.handleRequest")
     )
   yield* Stream.fromQueue(queue).pipe(
-    Stream.mapEffect((event) => handleRequestSafely(event).pipe(Effect.ensuring(Effect.sync(() => pendingRequests--)))),
+    Stream.mapEffect(({ event, lane }) =>
+      handleRequestSafely(event).pipe(Effect.ensuring(Effect.sync(() => {
+        if (lane === "cleanup") pendingCleanupRequests--
+        else pendingOrdinaryRequests--
+      })))
+    ),
     Stream.runDrain
   )
 }, (effect) => Effect.scoped(effect).pipe(Effect.withSpan("AttachmentWorkerProtocol.serve")))

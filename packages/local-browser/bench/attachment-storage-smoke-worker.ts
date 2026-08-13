@@ -26,7 +26,8 @@ const program = Effect.gen(function*() {
     BrowserAttachmentStorage.layerMessagePort(channel.port2, {
       maximumBytes: 8 * 1_024,
       readChunkBytes: 257,
-      maximumPendingRequests: 4
+      maximumPendingRequests: 4,
+      cleanupRequestTimeout: "1 second"
     }).pipe(Layer.provide(BrowserCrypto.layer))
   )
   const storage = Context.get(context, AttachmentStorage.AttachmentStorage)

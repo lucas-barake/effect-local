@@ -15,6 +15,7 @@ import * as Queue from "effect/Queue"
 import * as Result from "effect/Result"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
+import { TestClock } from "effect/testing"
 import * as BrowserAttachmentStorage from "../src/BrowserAttachmentStorage.js"
 import * as AttachmentDirectory from "../src/internal/AttachmentDirectory.js"
 import * as AttachmentWorkerProtocol from "../src/internal/AttachmentWorkerProtocol.js"
@@ -28,7 +29,6 @@ const collectBytes = <E extends { readonly _tag: string }, R,>(stream: Stream.St
 
 const makeDirectory = () => {
   const files = new Map<AttachmentStorage.ObjectKey, Uint8Array>()
-  let writes = 0
   const service = AttachmentDirectory.AttachmentDirectory.of({
     create: (key) => Effect.sync(() => files.set(key, new Uint8Array(0))),
     offset: (key) => {
@@ -37,7 +37,6 @@ const makeDirectory = () => {
       return Effect.succeed(bytes.length)
     },
     write: (key, expectedOffset, bytes) => {
-      writes++
       const current = files.get(key)
       if (current === undefined) return Effect.fail(new Attachment.AttachmentNotFound({ key }))
       if (current.length !== expectedOffset) {
@@ -63,9 +62,6 @@ const makeDirectory = () => {
   })
   return {
     files,
-    get writes() {
-      return writes
-    },
     service
   }
 }
@@ -74,7 +70,8 @@ const makeLayer = (port: MessagePort, maximumBytes: number) =>
   BrowserAttachmentStorage.layerMessagePort(port, {
     maximumBytes,
     readChunkBytes: 2,
-    maximumPendingRequests: 2
+    maximumPendingRequests: 2,
+    cleanupRequestTimeout: "1 second"
   }).pipe(Layer.provide(NodeCrypto.layer))
 
 describe("browser attachment storage", () => {
@@ -217,7 +214,10 @@ describe("browser attachment storage", () => {
       const bytes = Array.from({ length: 1_024 }, (_, index) => Uint8Array.of(index % 251))
       const staged = yield* storage.stage(Stream.fromIterable(bytes))
       assert.strictEqual(staged.reference.bytes, 1_024)
-      assert.strictEqual(directory.writes, 1)
+      assert.deepStrictEqual(
+        yield* collectBytes(storage.read(staged.key, staged.reference)),
+        Uint8Array.from(bytes.flatMap((chunk) => Array.from(chunk)))
+      )
 
       const key = yield* storage.create()
       const interrupted = Stream.concat(
@@ -232,7 +232,13 @@ describe("browser attachment storage", () => {
       ).pipe(Effect.result)
       assert.isTrue(Result.isFailure(append))
       assert.strictEqual(yield* storage.offset(key), 3)
-      assert.strictEqual(directory.writes, 2)
+      assert.deepStrictEqual(
+        yield* collectBytes(storage.read(
+          key,
+          Attachment.Reference.make({ _tag: "Attachment", digest: staged.reference.digest, bytes: 3 })
+        )),
+        Uint8Array.of(1, 2, 3)
+      )
     }, Effect.scoped)
   )
 
@@ -287,6 +293,82 @@ describe("browser attachment storage", () => {
   )
 
   it.effect(
+    "reserves worker capacity to remove a staged object interrupted during Write",
+    Effect.fnUntraced(function*() {
+      const writeStarted = yield* Deferred.make<void>()
+      const releaseWrite = yield* Deferred.make<void>()
+      const cleanupOutcome = yield* Deferred.make<"Overloaded" | "Removed">()
+      const cleanupReceived = yield* Deferred.make<void>()
+      const files = new Set<AttachmentStorage.ObjectKey>()
+      const directory = AttachmentDirectory.AttachmentDirectory.of({
+        create: (key) => Effect.sync(() => files.add(key)),
+        offset: (key) => files.has(key) ? Effect.succeed(0) : Effect.fail(new Attachment.AttachmentNotFound({ key })),
+        write: (key, expectedOffset, bytes) =>
+          Effect.gen(function*() {
+            if (!files.has(key)) return yield* new Attachment.AttachmentNotFound({ key })
+            yield* Deferred.succeed(writeStarted, undefined)
+            yield* Deferred.await(releaseWrite)
+            return expectedOffset + bytes.length
+          }),
+        read: (key) =>
+          files.has(key)
+            ? Effect.succeed(new Uint8Array(0))
+            : Effect.fail(new Attachment.AttachmentNotFound({ key })),
+        exists: (key) => Effect.succeed(files.has(key)),
+        remove: (key) =>
+          Effect.sync(() => {
+            files.delete(key)
+            Deferred.doneUnsafe(cleanupOutcome, Effect.succeed("Removed"))
+          })
+      })
+      const channel = new MessageChannel()
+      const observeCleanup = (event: MessageEvent<{ readonly _tag?: string }>) => {
+        if (event.data._tag === "CleanupRemove") Deferred.doneUnsafe(cleanupReceived, Effect.void)
+      }
+      const observeOverloaded = (event: MessageEvent<{ readonly _tag?: string }>) => {
+        if (event.data._tag === "Overloaded") Deferred.doneUnsafe(cleanupOutcome, Effect.succeed("Overloaded"))
+      }
+      channel.port1.addEventListener("message", observeCleanup)
+      channel.port2.addEventListener("message", observeOverloaded)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          channel.port1.removeEventListener("message", observeCleanup)
+          channel.port2.removeEventListener("message", observeOverloaded)
+          channel.port1.close()
+          channel.port2.close()
+        })
+      )
+      yield* AttachmentWorkerProtocol.serve(channel.port1, {
+        maximumBytes: 8,
+        maximumPendingRequests: 1
+      }).pipe(
+        Effect.provideService(AttachmentDirectory.AttachmentDirectory, directory),
+        Effect.forkScoped({ startImmediately: true })
+      )
+      const context = yield* Layer.build(
+        BrowserAttachmentStorage.layerMessagePort(channel.port2, {
+          maximumBytes: 8,
+          readChunkBytes: 2,
+          maximumPendingRequests: 1,
+          cleanupRequestTimeout: "1 second"
+        }).pipe(Layer.provide(NodeCrypto.layer))
+      )
+      const storage = Context.get(context, AttachmentStorage.AttachmentStorage)
+      const stage = yield* storage.stage(Stream.make(new Uint8Array(8))).pipe(
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Deferred.await(writeStarted)
+      const interruption = yield* Fiber.interrupt(stage).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Effect.yieldNow
+      yield* Deferred.await(cleanupReceived)
+      yield* Deferred.succeed(releaseWrite, undefined)
+      assert.strictEqual(yield* Deferred.await(cleanupOutcome), "Removed")
+      yield* Fiber.join(interruption)
+      assert.strictEqual(files.size, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "forgets a request callback when postMessage throws",
     Effect.fnUntraced(function*() {
       let messageError: ((event: MessageEvent<unknown>) => void) | undefined
@@ -314,6 +396,50 @@ describe("browser attachment storage", () => {
         }
       } as MessageEvent<unknown>)
       assert.strictEqual(dataReads, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "bounds interrupted stage cleanup when its worker stops responding",
+    Effect.fnUntraced(function*() {
+      let receive: ((event: MessageEvent<unknown>) => void) | undefined
+      const cleanupSent = yield* Deferred.make<void>()
+      const port = {
+        addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => {
+          if (type === "message") receive = listener as (event: MessageEvent<unknown>) => void
+        },
+        removeEventListener: () => undefined,
+        start: () => undefined,
+        postMessage: (message: { readonly _tag: string; readonly id: number }) => {
+          if (message._tag === "Create") {
+            receive?.({ data: { _tag: "Created", id: message.id } } as MessageEvent<unknown>)
+          } else if (message._tag === "CleanupRemove") {
+            Deferred.doneUnsafe(cleanupSent, Effect.void)
+          }
+        }
+      } as unknown as MessagePort
+      const context = yield* Layer.build(
+        BrowserAttachmentStorage.layerMessagePort(port, {
+          maximumBytes: 8,
+          readChunkBytes: 2,
+          maximumPendingRequests: 1,
+          cleanupRequestTimeout: "1 second"
+        }).pipe(Layer.provide(NodeCrypto.layer))
+      )
+      const storage = Context.get(context, AttachmentStorage.AttachmentStorage)
+      const interrupted = new Attachment.AttachmentStorageError({
+        operation: "test.interrupted",
+        cause: "interrupted"
+      })
+      const stage = yield* storage.stage(Stream.fail(interrupted)).pipe(
+        Effect.result,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Deferred.await(cleanupSent)
+      yield* TestClock.adjust("1 second")
+      const result = yield* Fiber.join(stage)
+      assert.isTrue(Result.isFailure(result))
+      if (Result.isFailure(result)) assert.strictEqual(result.failure, interrupted)
     }, Effect.scoped)
   )
 
