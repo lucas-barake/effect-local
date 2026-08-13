@@ -683,11 +683,21 @@ export const make = Effect.fnUntraced(function*<R,>(
             EXCEPT SELECT watcher_id FROM local_presence)) AS count`
   })
 
+  const deferRuntimeWakes = (heartbeatAt: number) =>
+    sql`UPDATE effect_local_server_offline_wakes SET
+      next_attempt_at = MAX(next_attempt_at, ${heartbeatAt + presenceLeaseMillis})
+      WHERE rowid IN (
+        SELECT wake.rowid FROM effect_local_server_watch_presence AS presence
+        INNER JOIN effect_local_server_offline_wakes AS wake
+          ON wake.space_id = presence.space_id AND wake.client_id = presence.client_id
+        WHERE presence.runtime_id = ${runtimeId})`
+
   const heartbeat = Effect.fnUntraced(function*(heartbeatAt: number) {
     const updated = yield* heartbeatRuntime({
       databaseRuntimeId: runtimeId,
       expiresAt: heartbeatAt + presenceLeaseMillis
     })
+    yield* deferRuntimeWakes(heartbeatAt)
     if (Option.isSome(updated) && !presenceDirty) return
     presenceDirty = true
     yield* presenceGate.withPermit(Effect.gen(function*() {
@@ -711,12 +721,7 @@ export const make = Effect.fnUntraced(function*<R,>(
                 AND wake.claim_token IS NOT NULL AND wake.claimed_until > ${heartbeatAt})
             ON CONFLICT (space_id, client_id, watcher_id) DO UPDATE SET
               runtime_id = excluded.runtime_id`
-        yield* sql`UPDATE effect_local_server_offline_wakes SET
-          next_attempt_at = MAX(next_attempt_at, ${heartbeatAt + presenceLeaseMillis})
-          WHERE EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS durable
-            WHERE durable.runtime_id = ${runtimeId}
-              AND durable.space_id = effect_local_server_offline_wakes.space_id
-              AND durable.client_id = effect_local_server_offline_wakes.client_id)`
+        yield* deferRuntimeWakes(heartbeatAt)
         yield* sql`UPDATE effect_local_server_offline_wakes SET next_attempt_at = 0
           WHERE EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS durable
             WHERE durable.runtime_id = ${runtimeId}

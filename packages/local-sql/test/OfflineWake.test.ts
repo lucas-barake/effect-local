@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -430,6 +431,15 @@ describe("offline wake delivery", () => {
         yield* TestClock.adjust("10 seconds")
         yield* Deferred.await(cycleCompleted)
         assert.strictEqual(yield* Queue.size(deliveries), 0)
+
+        yield* TestClock.adjust("30 seconds")
+        const now = yield* Clock.currentTimeMillis
+        const inspectionSql = yield* makeInspectionSql(filename)
+        const pending = yield* inspectionSql<{ readonly next_attempt_at: number }>`
+          SELECT next_attempt_at FROM effect_local_server_offline_wakes
+          WHERE space_id = ${spaceId} AND client_id = ${readerId}`
+        assert.strictEqual(pending.length, 1)
+        assert.isAbove(pending[0].next_attempt_at, now)
 
         yield* Fiber.interrupt(watcher)
         yield* TestClock.adjust("1 second")
