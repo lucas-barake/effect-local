@@ -37,10 +37,10 @@ const scope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
 
 const database = (filename: string) =>
   SqliteClient.layer({ filename, disableWAL: true }).pipe((sqlite) =>
-    Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.Layer)
+    Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
   )
-const Database = database(":memory:")
-const Runtime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.Handlers))
+const layerDatabase = database(":memory:")
+const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
 const provideNodeFileSystem = Effect.provide(NodeFileSystem.layer)
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const serverOptions = {
@@ -94,25 +94,25 @@ const service = <I, S, E extends { readonly _tag: string }, R,>(
 
 const makeServer = (
   offlineWake: OfflineWake.Options,
-  databaseLayer: typeof Database = Database
+  databaseLayer: typeof layerDatabase = layerDatabase
 ) => {
-  const StoreLayer = ServerStore.layer({ ...serverOptions, offlineWake }).pipe(
-    Layer.provide(Runtime),
+  const layerStore = ServerStore.layer({ ...serverOptions, offlineWake }).pipe(
+    Layer.provide(layerRuntime),
     Layer.provide(databaseLayer)
   )
-  return service(ServerStore.ServerStore, StoreLayer)
+  return service(ServerStore.ServerStore, layerStore)
 }
 
 const makeServerInScope = (
   offlineWake: OfflineWake.Options,
-  databaseLayer: typeof Database,
+  databaseLayer: typeof layerDatabase,
   owner: Scope.Scope
 ) => {
-  const StoreLayer = ServerStore.layer({ ...serverOptions, offlineWake }).pipe(
-    Layer.provide(Runtime),
+  const layerStore = ServerStore.layer({ ...serverOptions, offlineWake }).pipe(
+    Layer.provide(layerRuntime),
     Layer.provide(databaseLayer)
   )
-  return Layer.buildWithScope(StoreLayer, owner).pipe(Effect.map(Context.get(ServerStore.ServerStore)))
+  return Layer.buildWithScope(layerStore, owner).pipe(Effect.map(Context.get(ServerStore.ServerStore)))
 }
 
 const envelope = Effect.fnUntraced(function*(sequence: number) {
@@ -226,15 +226,15 @@ describe("offline wake delivery", () => {
           coalescingWindow: "5 seconds"
         } satisfies OfflineWake.Options
         const acceptingScope = yield* Scope.make()
-        const AcceptingDatabase = database(filename)
-        const acceptingServer = yield* makeServerInScope(offlineWake, AcceptingDatabase, acceptingScope)
+        const layerAcceptingDatabase = database(filename)
+        const acceptingServer = yield* makeServerInScope(offlineWake, layerAcceptingDatabase, acceptingScope)
         const receipt = yield* submit(acceptingServer, 1)
         assert.strictEqual(receipt._tag, "Accepted")
         yield* Scope.close(acceptingScope, Exit.void)
 
         const recoveringScope = yield* Scope.make()
-        const RecoveringDatabase = database(filename)
-        yield* makeServerInScope(offlineWake, RecoveringDatabase, recoveringScope)
+        const layerRecoveringDatabase = database(filename)
+        yield* makeServerInScope(offlineWake, layerRecoveringDatabase, recoveringScope)
         yield* TestClock.adjust("5 seconds")
         const recovered = yield* Deferred.await(delivery)
         assert.strictEqual(recovered.clientId, readerId)
