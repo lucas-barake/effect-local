@@ -8,6 +8,7 @@ import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
 import * as FaultInjection from "@lucas-barake/effect-local-test/FaultInjection"
 import * as TestReplica from "@lucas-barake/effect-local-test/TestReplica"
 import * as TestServer from "@lucas-barake/effect-local-test/TestServer"
+import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
@@ -15,10 +16,12 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
@@ -188,6 +191,71 @@ const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) 
 }
 
 describe("Replica Atom graph", () => {
+  it.effect(
+    "exposes attachment placeholder, failure, and lazily resolved bytes",
+    Effect.fnUntraced(function*() {
+      const bytes = Uint8Array.from([1, 2, 3])
+      const available = Attachment.Reference.make({
+        _tag: "Attachment",
+        digest: Attachment.Digest.make(`sha256:${"1".repeat(64)}`),
+        bytes: bytes.length
+      })
+      const unavailable = Attachment.Reference.make({
+        _tag: "Attachment",
+        digest: Attachment.Digest.make(`sha256:${"2".repeat(64)}`),
+        bytes: bytes.length
+      })
+      const release = yield* Deferred.make<Uint8Array>()
+      const layerObserved = Effect.gen(function*() {
+        const service = yield* Replica.Replica
+        return Replica.Replica.of({
+          ...service,
+          space: (requestedSpaceId) =>
+            service.space(requestedSpaceId).pipe(Effect.map((space) => ({
+              ...space,
+              readAttachment: (reference) => {
+                if (reference.digest === unavailable.digest) {
+                  return Stream.fail(new Attachment.AttachmentUnavailable({ digest: reference.digest }))
+                }
+                return Stream.fromEffect(Deferred.await(release))
+              }
+            })))
+        })
+      }).pipe(
+        Layer.effect(Replica.Replica),
+        Layer.provideMerge(layerReplica)
+      )
+      const graph = BrowserReplica.make(layerObserved)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const attachment = graph.attachment(spaceId, available)
+      const unmount = registry.mount(attachment)
+      yield* Effect.addFinalizer(() => Effect.sync(unmount))
+
+      const placeholder = registry.get(attachment)
+      assert.strictEqual(placeholder._tag, "Initial")
+      assert.isTrue(placeholder.waiting)
+      yield* Deferred.succeed(release, bytes)
+      assert.deepStrictEqual(
+        yield* AtomRegistry.getResult(registry, attachment, { suspendOnWaiting: true }),
+        bytes
+      )
+      const equivalent = Attachment.Reference.make({
+        _tag: "Attachment",
+        digest: available.digest,
+        bytes: available.bytes
+      })
+      assert.strictEqual(graph.attachment(spaceId, equivalent), attachment)
+      const unavailableAtom = graph.attachment(spaceId, unavailable)
+      const failure = yield* Effect.exit(AtomRegistry.getResult(registry, unavailableAtom))
+      assert.isTrue(Exit.isFailure(failure))
+      if (Exit.isFailure(failure)) {
+        const error = Option.getOrThrow(Cause.findErrorOption(failure.cause))
+        assert.strictEqual(error._tag, "AttachmentUnavailable")
+      }
+    }, Effect.scoped)
+  )
+
   it.effect(
     "reacts to pending mutation submission and settlement",
     Effect.fnUntraced(function*() {
