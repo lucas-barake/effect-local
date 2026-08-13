@@ -486,7 +486,8 @@ describe("multi space Replica", () => {
         definition: Domain.definition,
         clientId,
         initialSpaces: spaces,
-        reconciliationConcurrency: 2
+        reconciliationConcurrency: 3,
+        foregroundReconciliationConcurrency: 2
       }).pipe(
         Layer.provide(Domain.layerHandlers),
         Layer.provide(layerBlockedRemote),
@@ -506,6 +507,139 @@ describe("multi space Replica", () => {
       assert.isAtMost(yield* Ref.get(maximum), 2)
       yield* Deferred.succeed(release, undefined)
       yield* Fiber.join(activations)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "settles a foreground mutation while the background lane is saturated",
+    Effect.fnUntraced(function*() {
+      const backgroundSpaces = Array.from({ length: 3 }, (_, index) => {
+        const suffix = String(index + 10).padStart(12, "0")
+        return Identity.SpaceId.make(`spc_00000000-0000-4000-8000-${suffix}`)
+      })
+      const foregroundSpace = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000099")
+      const allSpaces = [...backgroundSpaces, foregroundSpace]
+      const databaseContext = yield* Layer.mergeAll(
+        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        NodeCrypto.layer,
+        Reactivity.layer
+      ).pipe(Layer.build)
+      const sqlService = Context.get(databaseContext, SqlClient.SqlClient)
+      const cryptoService = Context.get(databaseContext, Crypto.Crypto)
+      const reactivityService = Context.get(databaseContext, Reactivity.Reactivity)
+      const layerServices = Layer.mergeAll(
+        Layer.succeed(SqlClient.SqlClient, sqlService),
+        Layer.succeed(Crypto.Crypto, cryptoService),
+        Layer.succeed(Reactivity.Reactivity, reactivityService)
+      )
+      let blockBackground = false
+      const backgroundEntered = yield* Deferred.make<void>()
+      const releaseBackground = yield* Deferred.make<void>()
+      const activeBackground = yield* Ref.make(0)
+      const viewId = Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000001")
+      const scheduledRemote = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
+        submit: (request) => {
+          if (request.envelope.spaceId !== foregroundSpace) {
+            if (!blockBackground) return Effect.fail(new ReplicaError.ServerUnavailable())
+            return Ref.updateAndGet(activeBackground, (count) => count + 1).pipe(
+              Effect.tap(() => Deferred.succeed(backgroundEntered, undefined)),
+              Effect.andThen(Deferred.await(releaseBackground)),
+              Effect.as(Protocol.AcceptedReceipt.make({
+                ...request.envelope,
+                serverSequence: Identity.ServerSequence.make(1),
+                result: Domain.todo(request.envelope.spaceId, "background settled")
+              })),
+              Effect.ensuring(Ref.update(activeBackground, (count) => count - 1))
+            )
+          }
+          return Effect.succeed(Protocol.AcceptedReceipt.make({
+            ...request.envelope,
+            serverSequence: Identity.ServerSequence.make(1),
+            result: Domain.todo("foreground", "settled")
+          }))
+        },
+        discard: () => Effect.die("unexpected discard"),
+        pull: (request) => {
+          return Protocol.viewChangesDigest([]).pipe(
+            Effect.map((digest) =>
+              Protocol.PullPage.make({
+                scopeGeneration: request.scopeGeneration,
+                cursor: Protocol.ReplicationCursor.make({
+                  viewId,
+                  revision: Identity.ReplicationViewRevision.make((request.cursor?.revision ?? 0) + 1)
+                }),
+                serverSequence: Identity.ServerSequence.make(1),
+                changes: [],
+                contentBytes: Protocol.encodedBytes([]),
+                digest,
+                hasMore: false,
+                serverSchema: Domain.definition.schemaIdentity
+              })
+            ),
+            Effect.provideService(Crypto.Crypto, cryptoService)
+          )
+        },
+        bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        watch: () => Stream.never
+      })
+      const layerReplica = () =>
+        SqlReplica.layer({
+          ...clientHistory,
+          definition: Domain.definition,
+          clientId,
+          initialSpaces: allSpaces,
+          maximumActiveSpaces: 4,
+          foregroundActiveSpaces: 1,
+          reconciliationConcurrency: 2,
+          foregroundReconciliationConcurrency: 1,
+          retryDelay: "1 hour",
+          maximumRetryDelay: "1 hour"
+        }).pipe(
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, scheduledRemote)),
+          Layer.provide(layerServices)
+        )
+
+      const seedScope = yield* Scope.make()
+      const seedContext = yield* Layer.buildWithScope(layerReplica(), seedScope)
+      const seedReplica = Context.get(seedContext, Replica.Replica)
+      for (const spaceId of backgroundSpaces) {
+        const space = yield* seedReplica.space(spaceId)
+        yield* space.mutate(Domain.PutTodo, Domain.todo(spaceId))
+        yield* space.deactivate
+      }
+      yield* Scope.close(seedScope, Exit.void)
+      yield* sqlService`UPDATE effect_local_client_spaces
+        SET replication_view_id = ${viewId}, replication_view_revision = 0`
+
+      blockBackground = true
+      const runtimeScope = yield* Scope.make()
+      const runtimeContext = yield* Layer.buildWithScope(layerReplica(), runtimeScope)
+      const replica = Context.get(runtimeContext, Replica.Replica)
+      yield* Deferred.await(backgroundEntered)
+      for (let index = 0; index < 10; index += 1) yield* Effect.yieldNow
+      assert.strictEqual(yield* Ref.get(activeBackground), 1)
+
+      const foreground = yield* replica.space(foregroundSpace)
+      const pending = yield* foreground.mutate(Domain.PutTodo, Domain.todo("foreground", "settled"))
+      let receipt = yield* foreground.receipt(Domain.PutTodo, pending.envelope.mutationId)
+      while (Option.isNone(receipt)) {
+        yield* Effect.yieldNow
+        receipt = yield* foreground.receipt(Domain.PutTodo, pending.envelope.mutationId)
+      }
+      assert.strictEqual(receipt.value._tag, "Accepted")
+
+      yield* Deferred.succeed(releaseBackground, undefined)
+      for (const spaceId of backgroundSpaces) {
+        const space = yield* replica.space(spaceId)
+        let status = yield* space.status
+        while (status.pending > 0 || (yield* space.activation) !== "Inactive") {
+          yield* Effect.yieldNow
+          status = yield* space.status
+        }
+      }
+      yield* Scope.close(runtimeScope, Exit.void)
     }, Effect.scoped)
   )
 

@@ -63,6 +63,7 @@ export interface Options<D extends Definition.Any,> {
   readonly migration: Migrations.Options
   readonly pageSize?: number
   readonly reconciliationConcurrency?: number
+  readonly foregroundReconciliationConcurrency?: number
   readonly retryDelay?: Duration.Input
   readonly maximumRetryDelay?: Duration.Input
   readonly maximumAttempts?: number
@@ -190,12 +191,32 @@ const makeLayer = <D extends Definition.Any, R,>(
           message: "foregroundActiveSpaces must be positive and less than maximumActiveSpaces"
         })
       }
+      const reconciliationConcurrency = options.reconciliationConcurrency ?? 8
+      if (!Number.isSafeInteger(reconciliationConcurrency) || reconciliationConcurrency < 2) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "reconciliationConcurrency",
+          message: "reconciliationConcurrency must be a safe integer of at least 2"
+        })
+      }
+      const foregroundReconciliationConcurrency = options.foregroundReconciliationConcurrency ?? 1
+      if (
+        !Number.isSafeInteger(foregroundReconciliationConcurrency) ||
+        foregroundReconciliationConcurrency <= 0 ||
+        foregroundReconciliationConcurrency >= reconciliationConcurrency
+      ) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "foregroundReconciliationConcurrency",
+          message: "foregroundReconciliationConcurrency must be positive and less than reconciliationConcurrency"
+        })
+      }
       let manager: Reconciler.ManagerService | undefined
       if (workflow === undefined) {
-        if (options.reconciliationConcurrency === undefined) manager = yield* Reconciler.makeManager()
-        else manager = yield* Reconciler.makeManager({ concurrency: options.reconciliationConcurrency })
+        manager = yield* Reconciler.makeManager({ concurrency: foregroundReconciliationConcurrency })
       }
-      const backgroundConcurrency = options.maximumActiveSpaces - options.foregroundActiveSpaces
+      const backgroundConcurrency = Math.min(
+        options.maximumActiveSpaces - options.foregroundActiveSpaces,
+        reconciliationConcurrency - foregroundReconciliationConcurrency
+      )
       const backgroundQueue = yield* Queue.unbounded<Identity.SpaceId>()
       const backgroundQueued = new Set<Identity.SpaceId>()
       let capacityChanged = yield* Deferred.make<void>()
@@ -351,29 +372,38 @@ const makeLayer = <D extends Definition.Any, R,>(
             local = Context.get(runtime, LocalStore.Store)
             queries = Context.get(runtime, QueryExecutor.QueryExecutor)
             reconciliation = Context.get(runtime, Reconciler.Reconciliation)
-            let managedSpace: Reconciler.ManagedSpace = {
-              spaceId,
-              generation,
-              definition: options.definition,
-              local,
-              reconciliation
+            if (foreground) {
+              let managedSpace: Reconciler.ManagedSpace = {
+                spaceId,
+                generation,
+                definition: options.definition,
+                local,
+                reconciliation
+              }
+              if (options.retryDelay !== undefined) {
+                managedSpace = { ...managedSpace, retryDelay: options.retryDelay }
+              }
+              if (options.maximumRetryDelay !== undefined) {
+                managedSpace = { ...managedSpace, maximumRetryDelay: options.maximumRetryDelay }
+              }
+              yield* Effect.acquireRelease(
+                manager.register(managedSpace),
+                () => manager.unregister(spaceId, generation)
+              ).pipe(Scope.provide(childScope))
+              reconciler = Reconciler.Reconciler.of({
+                sync: manager.sync(spaceId),
+                notify: manager.notify(spaceId),
+                status: manager.status(spaceId),
+                shutdown: Effect.void
+              })
+            } else {
+              reconciler = Reconciler.Reconciler.of({
+                sync: reconciliation.sync,
+                notify: local.requestReconciliation.pipe(Effect.asVoid),
+                status: reconciliation.status,
+                shutdown: Effect.void
+              })
             }
-            if (options.retryDelay !== undefined) {
-              managedSpace = { ...managedSpace, retryDelay: options.retryDelay }
-            }
-            if (options.maximumRetryDelay !== undefined) {
-              managedSpace = { ...managedSpace, maximumRetryDelay: options.maximumRetryDelay }
-            }
-            yield* Effect.acquireRelease(
-              manager.register(managedSpace),
-              () => manager.unregister(spaceId, generation)
-            ).pipe(Scope.provide(childScope))
-            reconciler = Reconciler.Reconciler.of({
-              sync: manager.sync(spaceId),
-              notify: manager.notify(spaceId),
-              status: manager.status(spaceId),
-              shutdown: Effect.void
-            })
           }
           const operationGate = yield* Semaphore.make(1)
           return {
