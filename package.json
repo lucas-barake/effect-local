@@ -8,6 +8,7 @@
   "scripts": {
     "clean": "node scripts/clean.mjs",
     "bench": "vitest bench --run",
+    "bench:attachments": "vite packages/local-browser/bench --config packages/local-browser/bench/vite.config.ts",
     "build": "tsgo -b tsconfig.packages.json",
     "build:tsc": "tsc -b tsconfig.packages.json",
     "circular": "madge --extensions ts --circular --no-color --no-spinner packages/*/src",
@@ -57,6 +58,7 @@
     "oxlint-plugin-effect": "0.6.0",
     "oxlint-tsgolint": "7.0.2001",
     "typescript": "^6.0.3",
+    "vite": "7.3.6",
     "vitest": "4.1.10"
   }
 }
