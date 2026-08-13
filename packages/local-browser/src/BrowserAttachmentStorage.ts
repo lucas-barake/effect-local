@@ -70,6 +70,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
       const locks = yield* RcMap.make({ lookup: () => Semaphore.make(1) })
       const requestPermits = yield* Semaphore.make(options.maximumPendingRequests)
       const cleanupPermit = yield* Semaphore.make(options.maximumPendingRequests)
+      const stagePermits = yield* Semaphore.make(options.maximumPendingRequests)
       const pending = new Map<number, (value: unknown) => void>()
       let nextRequestId = 0
       const receive = (event: MessageEvent<unknown>) => {
@@ -327,7 +328,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
         E extends { readonly _tag: string },
         R,
       >(bytes: Stream.Stream<Uint8Array, E, R>) {
-        return yield* Effect.acquireUseRelease(
+        const workflow = Effect.acquireUseRelease(
           create(),
           Effect.fnUntraced(function*(key) {
             let written = 0
@@ -366,7 +367,8 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
               )
             }
           })
-        ).pipe(Effect.withSpan("BrowserAttachmentStorage.stage"))
+        )
+        return yield* stagePermits.withPermit(workflow).pipe(Effect.withSpan("BrowserAttachmentStorage.stage"))
       })
 
       const read: AttachmentStorage.Service["read"] = (key, reference, range) => {

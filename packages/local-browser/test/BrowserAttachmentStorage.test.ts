@@ -369,15 +369,19 @@ describe("browser attachment storage", () => {
   )
 
   it.effect(
-    "admits every bounded cleanup after an earlier cleanup times out behind blocked writes",
+    "bounds live staged files to the cleanup lane while a failed stage removal is blocked",
     Effect.fnUntraced(function*() {
-      const allowWriteRequests = yield* Deferred.make<void>()
-      const releaseWrites = yield* Deferred.make<void>()
+      const firstInputStarted = yield* Deferred.make<void>()
+      const failInputs = yield* Deferred.make<void>()
+      const firstRemoveStarted = yield* Deferred.make<void>()
+      const releaseFirstRemove = yield* Deferred.make<void>()
+      const firstRemoveCompleted = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(releaseFirstRemove, undefined).pipe(Effect.ignore))
       const createdKeys = yield* Queue.unbounded<AttachmentStorage.ObjectKey>()
-      const receivedWrites = yield* Queue.unbounded<void>()
       const receivedCleanups = yield* Queue.unbounded<void>()
-      const removedKeys = yield* Queue.unbounded<AttachmentStorage.ObjectKey>()
       const files = new Set<AttachmentStorage.ObjectKey>()
+      let removals = 0
+      let blockFirstRemove = false
       const directory = AttachmentDirectory.AttachmentDirectory.of({
         create: (key) =>
           Effect.sync(() => {
@@ -385,24 +389,25 @@ describe("browser attachment storage", () => {
             Queue.offerUnsafe(createdKeys, key)
           }),
         offset: (key) => files.has(key) ? Effect.succeed(0) : Effect.fail(new Attachment.AttachmentNotFound({ key })),
-        write: (key, expectedOffset, bytes) =>
-          files.has(key)
-            ? Deferred.await(releaseWrites).pipe(Effect.as(expectedOffset + bytes.length))
-            : Effect.fail(new Attachment.AttachmentNotFound({ key })),
+        write: (key) => files.has(key) ? Effect.succeed(0) : Effect.fail(new Attachment.AttachmentNotFound({ key })),
         read: (key) =>
           files.has(key)
             ? Effect.succeed(new Uint8Array(0))
             : Effect.fail(new Attachment.AttachmentNotFound({ key })),
         exists: (key) => Effect.succeed(files.has(key)),
         remove: (key) =>
-          Effect.sync(() => {
+          Effect.gen(function*() {
+            removals++
+            if (removals === 1 && blockFirstRemove) {
+              yield* Deferred.succeed(firstRemoveStarted, undefined)
+              yield* Deferred.await(releaseFirstRemove)
+            }
             files.delete(key)
-            Queue.offerUnsafe(removedKeys, key)
+            if (removals === 1) yield* Deferred.succeed(firstRemoveCompleted, undefined)
           })
       })
       const channel = new MessageChannel()
       const observeRequests = (event: MessageEvent<{ readonly _tag?: string }>) => {
-        if (event.data._tag === "Write") Queue.offerUnsafe(receivedWrites, undefined)
         if (event.data._tag === "CleanupRemove") Queue.offerUnsafe(receivedCleanups, undefined)
       }
       channel.port1.addEventListener("message", observeRequests)
@@ -415,7 +420,7 @@ describe("browser attachment storage", () => {
       )
       yield* AttachmentWorkerProtocol.serve(channel.port1, {
         maximumBytes: 8,
-        maximumPendingRequests: 2
+        maximumPendingRequests: 1
       }).pipe(
         Effect.provideService(AttachmentDirectory.AttachmentDirectory, directory),
         Effect.forkScoped({ startImmediately: true })
@@ -424,34 +429,50 @@ describe("browser attachment storage", () => {
         BrowserAttachmentStorage.layerMessagePort(channel.port2, {
           maximumBytes: 8,
           readChunkBytes: 2,
-          maximumPendingRequests: 2,
+          maximumPendingRequests: 1,
           cleanupRequestTimeout: "1 second"
         }).pipe(Layer.provide(NodeCrypto.layer))
       )
       const storage = Context.get(context, AttachmentStorage.AttachmentStorage)
-      const bytes = Stream.unwrap(Deferred.await(allowWriteRequests).pipe(Effect.as(Stream.make(new Uint8Array(8)))))
-      const firstStage = yield* storage.stage(bytes).pipe(Effect.forkScoped({ startImmediately: true }))
-      const secondStage = yield* storage.stage(bytes).pipe(Effect.forkScoped({ startImmediately: true }))
+      const failed = new Attachment.AttachmentStorageError({ operation: "test.failed", cause: "failed" })
+      const firstBytes = Stream.fromEffect(
+        Deferred.succeed(firstInputStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(failInputs)),
+          Effect.andThen(Effect.fail(failed)),
+          Effect.as(new Uint8Array(0))
+        )
+      )
+      const secondBytes = Stream.fromEffect(
+        Deferred.await(failInputs).pipe(
+          Effect.andThen(Effect.fail(failed)),
+          Effect.as(new Uint8Array(0))
+        )
+      )
+      const firstStage = yield* storage.stage(firstBytes).pipe(
+        Effect.result,
+        Effect.forkScoped({ startImmediately: true })
+      )
       const firstKey = yield* Queue.take(createdKeys)
+      yield* Deferred.await(firstInputStarted)
+      const secondStage = yield* storage.stage(secondBytes).pipe(
+        Effect.result,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Effect.yieldNow
+      blockFirstRemove = true
+      yield* Deferred.succeed(failInputs, undefined)
+      yield* Queue.take(receivedCleanups)
+      yield* Deferred.await(firstRemoveStarted)
+      assert.isTrue(Option.isNone(yield* Queue.poll(createdKeys)))
+      yield* Effect.yieldNow
+      yield* TestClock.adjust("1 second")
+      yield* Fiber.join(firstStage)
+      yield* Deferred.succeed(releaseFirstRemove, undefined)
+      yield* Deferred.await(firstRemoveCompleted)
       const secondKey = yield* Queue.take(createdKeys)
       assert.notStrictEqual(firstKey, secondKey)
-      yield* Deferred.succeed(allowWriteRequests, undefined)
-      yield* Queue.take(receivedWrites)
-      yield* Queue.take(receivedWrites)
-
-      const firstInterruption = yield* Fiber.interrupt(firstStage).pipe(
-        Effect.forkChild({ startImmediately: true })
-      )
       yield* Queue.take(receivedCleanups)
-      yield* TestClock.adjust("1 second")
-      yield* Fiber.join(firstInterruption)
-      const secondInterruption = yield* Fiber.interrupt(secondStage).pipe(
-        Effect.forkChild({ startImmediately: true })
-      )
-      yield* Queue.take(receivedCleanups)
-      yield* Deferred.succeed(releaseWrites, undefined)
-      yield* Queue.take(removedKeys)
-      yield* Fiber.join(secondInterruption)
+      yield* Fiber.join(secondStage)
       assert.strictEqual(files.size, 0)
     }, Effect.scoped)
   )
