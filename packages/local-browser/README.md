@@ -18,8 +18,9 @@ or lifecycle policy. A SharedWorker must build one replica runtime per database 
 
 `BrowserAttachmentStorage.layerMessagePort` streams bounded chunks to an application owned worker port.
 Run `BrowserAttachmentWorker.serveMessagePort` in that dedicated worker to keep attachment bytes as direct OPFS files.
-The application chooses the worker URL, port lifetime, OPFS directory, byte limit, read chunk size, and maximum pending
-requests on both sides of the port.
+The application chooses the worker URL, port lifetime, OPFS directory, byte limit, read chunk size, maximum pending
+requests on both sides of the port, and cleanup request timeout. The worker reserves one bounded request slot so an
+interrupted write can remove its partial file even when ordinary request capacity is full.
 
 `pnpm bench:attachments --host 127.0.0.1 --port 4173 --force` serves the real Chromium OPFS smoke at
 `/attachment-storage-smoke.html`. It reports deterministic completion or failure through

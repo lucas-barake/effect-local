@@ -322,8 +322,8 @@ placeholder, failure, and resolved byte states.
 
 `AttachmentClient.layer` requires hard local byte and object limits plus separate cache byte, object, age, and eviction
 batch limits. Offline staged and pending objects count toward the local limits and are never evicted. Browser storage
-also requires `maximumPendingRequests` on the page and worker sides so transferred buffers cannot form an
-unbounded queue.
+also requires `maximumPendingRequests` on the page and worker sides plus a cleanup timeout. Transferred buffers cannot
+form an unbounded queue, and one reserved worker request lets interruption remove a partial OPFS file.
 
 `AttachmentHttpServer.layer` contributes authenticated HEAD, PATCH, and GET routes to the application's `HttpRouter`.
 `AttachmentHttpClient.layer` supplies fresh storage backed streams. HEAD reports the durable offset, PATCH resumes and
