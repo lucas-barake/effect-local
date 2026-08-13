@@ -235,7 +235,7 @@ describe("Replica Atom graph", () => {
     }, Effect.scoped)
   )
 
-  it.live(
+  it.effect(
     "reruns only an indexed query whose result range can change",
     Effect.fnUntraced(function*() {
       rangeReads.clear()
@@ -264,13 +264,16 @@ describe("Replica Atom graph", () => {
       yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
       yield* Effect.yieldNow
       assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, related), [{ id: "range", title: "beta" }])
-      yield* Effect.sleep("20 millis")
+      assert.deepStrictEqual(
+        yield* AtomRegistry.getResult(registry, unrelated, { suspendOnWaiting: true }),
+        []
+      )
       assert.isAtLeast(rangeReads.get("a:m") ?? 0, 2)
       assert.strictEqual(rangeReads.get("n:z"), 1)
     })
   )
 
-  it.live(
+  it.effect(
     "refreshes an entity atom when its key has a different encoded representation",
     Effect.fnUntraced(function*() {
       const graph = BrowserReplica.make(layerReplica)
@@ -301,7 +304,7 @@ describe("Replica Atom graph", () => {
     })
   )
 
-  it.live(
+  it.effect(
     "does not rerun an unrelated mounted entity atom",
     Effect.fnUntraced(function*() {
       let unrelatedReads = 0
@@ -353,7 +356,9 @@ describe("Replica Atom graph", () => {
             title: "new"
           })
       )
-      yield* Effect.sleep("20 millis")
+      assert.isTrue(Option.isNone(
+        yield* AtomRegistry.getResult(registry, unrelated, { suspendOnWaiting: true })
+      ))
       assert.strictEqual(unrelatedReads, 1)
     })
   )

@@ -83,19 +83,20 @@ const make = (): Service => {
   const retained = new Map<string, number>()
   const readsByKey = new Map<string, ReadonlyArray<Read>>()
   return {
-    retain: (key) =>
-      Effect.sync(() => {
+    retain: (key) => {
+      const cleanup = Effect.sync(() => {
+        const remaining = (retained.get(key) ?? 1) - 1
+        if (remaining > 0) {
+          retained.set(key, remaining)
+          return
+        }
+        retained.delete(key)
+        readsByKey.delete(key)
+      })
+      return Effect.sync(() => {
         retained.set(key, (retained.get(key) ?? 0) + 1)
-        return Effect.sync(() => {
-          const remaining = (retained.get(key) ?? 1) - 1
-          if (remaining > 0) {
-            retained.set(key, remaining)
-            return
-          }
-          retained.delete(key)
-          readsByKey.delete(key)
-        })
-      }),
+      }).pipe(Effect.as(cleanup))
+    },
     record: (key, reads) =>
       Effect.sync(() => {
         if (retained.has(key)) readsByKey.set(key, reads)
