@@ -18,6 +18,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
 import * as Codec from "../src/internal/codec.js"
+import * as ServerIndex from "../src/internal/serverIndex.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -1342,6 +1343,35 @@ describe("scoped replication", () => {
         const outcome = yield* server.pullAuthorized(pullRequest(initial.manifest.cursor), "reader").pipe(Effect.result)
         assert.isTrue(Result.isFailure(outcome))
         if (Result.isFailure(outcome)) assert.strictEqual(outcome.failure._tag, "StorageCorrupt")
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("rejects corrupt server index catalog object names before cleanup", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const context = yield* Layer.build(
+          ServerStore.layer({
+            ...history,
+            definition: Domain.definition,
+            readAuthorizationRefreshInterval: "1 second",
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => Effect.void
+          }).pipe(Layer.provide(runtime), Layer.provideMerge(database))
+        )
+        const sql = Context.get(context, SqlClient.SqlClient)
+        yield* sql`CREATE TABLE unrelated_user_data (value INTEGER NOT NULL)`
+        yield* sql`INSERT INTO unrelated_user_data VALUES (1)`
+        yield* sql`INSERT INTO effect_local_server_index_catalog
+          (model, index_name, descriptor_hash, table_name, scan_index_name)
+          VALUES (${"obsolete"}, ${"obsolete"}, ${"0".repeat(16)},
+            ${"unrelated_user_data"}, ${"unrelated_user_data_scan"})`
+
+        const outcome = yield* ServerIndex.make(sql, Domain.definition).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(outcome))
+        if (Result.isFailure(outcome)) assert.strictEqual(outcome.failure._tag, "StorageCorrupt")
+        const rows = yield* sql<{ readonly value: number }>`SELECT value FROM unrelated_user_data`
+        assert.deepStrictEqual(rows, [{ value: 1 }])
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 

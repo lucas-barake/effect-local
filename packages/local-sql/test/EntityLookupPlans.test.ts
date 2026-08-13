@@ -61,20 +61,30 @@ const keyedNames = (sql: string) => {
   return names
 }
 
+const queryPlans = (predicate: (sql: string) => boolean) => {
+  const plans: Array<{ readonly execution: Execution; readonly steps: ReadonlyArray<Record<string, unknown>> }> = []
+  const errors: Array<string> = []
+  for (const execution of executions) {
+    if (!predicate(execution.sql)) continue
+    try {
+      plans.push({
+        execution,
+        steps: originalPrepare.call(execution.database, `EXPLAIN QUERY PLAN ${execution.sql}`)
+          .all(...execution.params as Array<never>)
+      })
+    } catch (cause) {
+      errors.push(`${String(cause)} :: ${execution.sql.replace(/\s+/g, " ").slice(0, 160)}`)
+    }
+  }
+  return { errors, plans }
+}
+
 const unindexedKeyLookups = () => {
   const offenders: Array<string> = []
-  for (const execution of executions) {
-    if (!keyedTables.test(execution.sql)) continue
-    if (!/entity_key\s*(=|IN)/.test(execution.sql)) continue
+  const inspected = queryPlans((sql) => keyedTables.test(sql) && /entity_key\s*(=|IN)/.test(sql))
+  for (const { execution, steps } of inspected.plans) {
     const names = keyedNames(execution.sql)
-    let plan: ReadonlyArray<Record<string, unknown>>
-    try {
-      plan = originalPrepare.call(execution.database, `EXPLAIN QUERY PLAN ${execution.sql}`)
-        .all(...execution.params as Array<never>)
-    } catch {
-      continue
-    }
-    for (const step of plan) {
+    for (const step of steps) {
       if (typeof step.detail !== "string") continue
       const matched = rangeScan.exec(step.detail)
       if (matched?.groups === undefined) continue
@@ -84,8 +94,24 @@ const unindexedKeyLookups = () => {
       offenders.push(`${step.detail} :: ${execution.sql.replace(/\s+/g, " ").slice(0, 160)}`)
     }
   }
-  return offenders
+  return { errors: inspected.errors, inspected: inspected.plans.length, offenders }
 }
+
+const windowSortPlans = () => {
+  const inspected = queryPlans((sql) => sql.includes("ROW_NUMBER() OVER"))
+  const temporarySorts = inspected.plans.flatMap(({ execution, steps }) =>
+    steps.flatMap((step) => {
+      if (typeof step.detail !== "string" || !step.detail.includes("USE TEMP B-TREE")) return []
+      return [`${step.detail} :: ${execution.sql.replace(/\s+/g, " ").slice(0, 160)}`]
+    })
+  )
+  return { errors: inspected.errors, inspected: inspected.plans.length, temporarySorts }
+}
+
+const serverIndexExecutions = () =>
+  executions.filter((execution) =>
+    /effect_local_srvidx_[0-9a-f]+|effect_local_server_index_partition_log/.test(execution.sql)
+  )
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const writerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
@@ -190,8 +216,51 @@ const layers = () => {
 }
 
 describe("entity lookup query plans", () => {
+  it.effect("defers server index maintenance until the index is built", () =>
+    Effect.gen(function*() {
+      nextSequence = 1
+      const server = yield* ServerStore.ServerStore
+      executions.length = 0
+      recording = true
+      yield* server.submit(yield* envelope(Domain.PutManyMessages.name, { count: 200, chats: 10 }))
+      recording = false
+      assert.strictEqual(serverIndexExecutions().length, 0)
+    }).pipe(Effect.provide(layers())), 120_000)
+
+  it.effect("batches maintenance for a built server index", () =>
+    Effect.gen(function*() {
+      nextSequence = 1
+      const server = yield* ServerStore.ServerStore
+      const reconciler = yield* Reconciler.Reconciliation
+      yield* server.submit(yield* envelope(Domain.PutManyMessages.name, { count: 200, chats: 10 }))
+      yield* reconciler.sync
+
+      executions.length = 0
+      recording = true
+      yield* server.submit(yield* envelope(Domain.PutManyMessages.name, { count: 210, chats: 10 }))
+      recording = false
+      assert.isAtMost(serverIndexExecutions().length, 10)
+    }).pipe(Effect.provide(layers())), 120_000)
+
+  it.effect("uses the server scan index for window ordering", () =>
+    Effect.gen(function*() {
+      nextSequence = 1
+      const server = yield* ServerStore.ServerStore
+      const reconciler = yield* Reconciler.Reconciliation
+      yield* server.submit(yield* envelope(Domain.PutManyMessages.name, { count: 200, chats: 10 }))
+      executions.length = 0
+      recording = true
+      yield* reconciler.sync
+      recording = false
+      const plans = windowSortPlans()
+      assert.deepStrictEqual(plans.errors, [])
+      assert.isAbove(plans.inspected, 0)
+      assert.deepStrictEqual(plans.temporarySorts, [])
+    }).pipe(Effect.provide(layers())), 120_000)
+
   it.effect("resolves multi-entity lookups through the entity key index", () =>
     Effect.gen(function*() {
+      nextSequence = 1
       const server = yield* ServerStore.ServerStore
       const reconciler = yield* Reconciler.Reconciliation
       yield* server.submit(yield* envelope(Domain.PutManyMessages.name, { count: 200, chats: 10 }))
@@ -201,7 +270,9 @@ describe("entity lookup query plans", () => {
       recording = true
       yield* reconciler.sync
       recording = false
-      const offenders = unindexedKeyLookups()
-      assert.deepStrictEqual(offenders, [])
+      const lookups = unindexedKeyLookups()
+      assert.deepStrictEqual(lookups.errors, [])
+      assert.isAbove(lookups.inspected, 0)
+      assert.deepStrictEqual(lookups.offenders, [])
     }).pipe(Effect.provide(layers())), 120_000)
 })
