@@ -14,6 +14,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as AttachmentStorage from "./AttachmentStorage.js"
+import * as AttachmentTransfer from "./AttachmentTransfer.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
@@ -59,6 +60,10 @@ export interface Service {
     spaceId: Identity.SpaceId,
     reference: Attachment.Reference
   ) => Effect.Effect<void, ClientFailure>
+  readonly ensureUploaded: (
+    spaceId: Identity.SpaceId,
+    references: ReadonlyArray<Attachment.Reference>
+  ) => Effect.Effect<void, ClientFailure>
   readonly drainDeletions: (
     maximum: number
   ) => Effect.Effect<number, Attachment.AttachmentStorageError | ReplicaError.ReplicaError>
@@ -82,12 +87,13 @@ const write = <A, R,>(
 export const layer: Layer.Layer<
   AttachmentClient,
   never,
-  SqlClient.SqlClient | AttachmentStorage.AttachmentStorage
+  SqlClient.SqlClient | AttachmentStorage.AttachmentStorage | AttachmentTransfer.AttachmentTransfer
 > = Layer.effect(
   AttachmentClient,
   Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
     const storage = yield* AttachmentStorage.AttachmentStorage
+    const transfer = yield* AttachmentTransfer.AttachmentTransfer
     const locks = yield* RcMap.make({ lookup: () => Semaphore.make(1) })
     const findAttachment = SqlSchema.findOneOption({
       Request: Lookup,
@@ -287,6 +293,37 @@ export const layer: Layer.Layer<
         WHERE space_id = ${spaceId} AND digest = ${reference.digest}`)
     })
 
+    const ensureUploaded: Service["ensureUploaded"] = Effect.fnUntraced(function*(spaceId, references) {
+      for (const reference of references) {
+        yield* withLock(
+          spaceId,
+          reference.digest,
+          Effect.gen(function*() {
+            const found = yield* find(spaceId, reference.digest)
+            if (Option.isNone(found)) return yield* notFound(reference)
+            if (found.value.bytes !== reference.bytes) {
+              return yield* new Attachment.AttachmentLengthMismatch({
+                expected: found.value.bytes,
+                actual: reference.bytes
+              })
+            }
+            if (found.value.remote_available === 1) return yield* Effect.void
+            if (!(yield* storage.exists(found.value.object_key))) return yield* notFound(reference)
+            yield* transfer.upload({
+              spaceId,
+              reference,
+              bytes: storage.read(found.value.object_key, reference)
+            })
+            const now = yield* Clock.currentTimeMillis
+            yield* write(sql`UPDATE effect_local_client_attachments
+              SET remote_available = 1, last_accessed_at = ${now}
+              WHERE space_id = ${spaceId} AND digest = ${reference.digest}`)
+            return yield* Effect.void
+          })
+        )
+      }
+    })
+
     return AttachmentClient.of({
       stage,
       associatePending,
@@ -294,6 +331,7 @@ export const layer: Layer.Layer<
       objectKey,
       read,
       markRemoteAvailable,
+      ensureUploaded,
       drainDeletions
     })
   })

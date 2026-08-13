@@ -1,5 +1,6 @@
 export * as AttachmentClient from "./AttachmentClient.js"
 export * as AttachmentStorage from "./AttachmentStorage.js"
+export * as AttachmentTransfer from "./AttachmentTransfer.js"
 export * as FileSystemAttachmentStorage from "./FileSystemAttachmentStorage.js"
 export * as IndexStore from "./IndexStore.js"
 export * as LocalStore from "./LocalStore.js"

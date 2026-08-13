@@ -2,6 +2,7 @@ import { NodeCrypto, NodeFileSystem, NodePath } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -13,6 +14,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as AttachmentClient from "../src/AttachmentClient.js"
 import * as AttachmentStorage from "../src/AttachmentStorage.js"
+import * as AttachmentTransfer from "../src/AttachmentTransfer.js"
 import * as FileSystemAttachmentStorage from "../src/FileSystemAttachmentStorage.js"
 import * as Migrations from "../src/Migrations.js"
 import * as Domain from "./Domain.js"
@@ -47,7 +49,17 @@ describe("attachment client", () => {
         )
         const layerStorage = FileSystemAttachmentStorage.layer({ directory: objects, maximumBytes: 8 })
         const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
-        const layerClient = AttachmentClient.layer.pipe(Layer.provide(layerInfrastructure))
+        const layerTransfer = Layer.succeed(
+          AttachmentTransfer.AttachmentTransfer,
+          AttachmentTransfer.AttachmentTransfer.of({
+            upload: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+            download: () => Stream.fail(new ReplicaError.ServerUnavailable())
+          })
+        )
+        const layerClient = AttachmentClient.layer.pipe(
+          Layer.provide(layerInfrastructure),
+          Layer.provide(layerTransfer)
+        )
         const layerRuntime = Layer.merge(layerInfrastructure, layerClient)
 
         const firstScope = yield* Scope.make()

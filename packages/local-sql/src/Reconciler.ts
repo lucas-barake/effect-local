@@ -1,3 +1,4 @@
+import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
@@ -17,6 +18,7 @@ import * as Ref from "effect/Ref"
 import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
+import * as AttachmentClient from "./AttachmentClient.js"
 import * as Configuration from "./internal/configuration.js"
 import * as LocalStore from "./LocalStore.js"
 import * as SyncEngine from "./SyncEngine.js"
@@ -493,6 +495,7 @@ export const layerOnePass = (
       }
       const local = yield* LocalStore.Store
       const remote = yield* SyncEngine.SyncEngine
+      const attachments = yield* Effect.serviceOption(AttachmentClient.AttachmentClient)
       const gate = yield* Semaphore.make(1)
       const status = yield* Ref.make<ReplicaStatus.ReplicaStatus>({ _tag: "Offline", pending: 0 })
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
@@ -669,6 +672,16 @@ export const layerOnePass = (
           let installedExpiredSnapshot = false
           for (const mutation of pending) {
             const receipt = yield* Effect.gen(function*() {
+              const references = yield* Attachment.collect(mutation.envelope.payload)
+              if (references.length > 0) {
+                if (Option.isNone(attachments)) {
+                  return yield* new ReplicaError.InvalidConfiguration({
+                    option: "attachments",
+                    message: "Attachment transfer is not configured"
+                  })
+                }
+                yield* attachments.value.ensureUploaded(options.spaceId, references)
+              }
               yield* local.markSubmitting(mutation.envelope.mutationId)
               const remoteReceipt = yield* remote.submit({
                 envelope: mutation.envelope,
