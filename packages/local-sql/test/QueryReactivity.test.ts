@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
+import { pipe } from "effect/Function"
 import type * as IndexStore from "../src/IndexStore.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
 
@@ -55,9 +56,15 @@ describe("query range reactivity", () => {
       yield* registry.record("related", [{ _tag: "Index", footprint: footprint({ lower: "a", upper: "m" }) }])
       yield* registry.record("unrelated", [{ _tag: "Index", footprint: footprint({ lower: "n", upper: "z" }) }])
 
-      assert.deepStrictEqual(yield* registry.affected(changes([point("beta", "\"1\"")])), ["related"])
       assert.deepStrictEqual(
-        yield* registry.affected(changes([point("beta", "\"1\""), point("omega", "\"1\"")])),
+        yield* pipe(changes([point("beta", "\"1\"")]), (changeSet) => registry.affected(changeSet)),
+        ["related"]
+      )
+      assert.deepStrictEqual(
+        yield* pipe(
+          changes([point("beta", "\"1\""), point("omega", "\"1\"")]),
+          (changeSet) => registry.affected(changeSet)
+        ),
         ["related", "unrelated"]
       )
     }).pipe(Effect.provide(QueryReactivity.layer)))
@@ -72,8 +79,14 @@ describe("query range reactivity", () => {
         footprint: footprint({ lower: "a", upper: "z", boundary: ["middle", "\"2\""], full: true })
       }])
 
-      assert.deepStrictEqual(yield* registry.affected(changes([point("omega", "\"3\"")])), [])
-      assert.deepStrictEqual(yield* registry.affected(changes([point("beta", "\"1\"")])), ["page"])
+      assert.deepStrictEqual(
+        yield* pipe(changes([point("omega", "\"3\"")]), (changeSet) => registry.affected(changeSet)),
+        []
+      )
+      assert.deepStrictEqual(
+        yield* pipe(changes([point("beta", "\"1\"")]), (changeSet) => registry.affected(changeSet)),
+        ["page"]
+      )
     }).pipe(Effect.provide(QueryReactivity.layer)))
 
   it.effect("indexes changed points by descriptor before range intersection", () =>
@@ -100,7 +113,7 @@ describe("query range reactivity", () => {
         entityKey: `"${index}"`
       }))
 
-      assert.deepStrictEqual(yield* registry.affected(changes(unrelated)), [])
+      assert.deepStrictEqual(yield* pipe(changes(unrelated), (changeSet) => registry.affected(changeSet)), [])
       assert.isAtMost(comparisons, 2_000)
     }).pipe(Effect.provide(QueryReactivity.layer)))
 })

@@ -18,6 +18,7 @@ import * as Context from "effect/Context"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
@@ -75,44 +76,39 @@ const serverHistory = {
   migration
 }
 const database = () =>
-  Layer.mergeAll(
-    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
-    NodeCrypto.layer,
-    Reactivity.layer,
-    QueryReactivity.layer
+  SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
+    (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
   )
 
-const service = <I, S, E, R,>(tag: Context.Service<I, S>, layer: Layer.Layer<I, E, R>) =>
-  Layer.build(layer).pipe(Effect.map((context) => Context.get(context, tag)))
+const service = <I, S, E extends { readonly _tag: string }, R,>(
+  tag: Context.Service<I, S>,
+  layer: Layer.Layer<I, E, R>
+) => Layer.build(layer).pipe(Effect.map(Context.get(tag)))
 
 const makeSyncServices = Effect.gen(function*() {
-  const server = yield* service(
-    ServerStore.ServerStore,
-    ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
-      Layer.provide(runtime),
-      Layer.provide(database())
-    )
+  const serverLayer = ServerStore.layerTrusted({ ...serverHistory, definition })
+  const server = yield* serverLayer.pipe(
+    Layer.provide(runtime),
+    Layer.provide(database()),
+    (layer) => service(ServerStore.ServerStore, layer)
   )
   const faults = yield* service(FaultInjection.FaultInjection, FaultInjection.layer)
-  const sync = yield* service(
-    SyncEngine.SyncEngine,
-    TestServer.layer.pipe(
-      Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
-      Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults)),
-      Layer.provide(NodeCrypto.layer)
-    )
+  const sync = yield* TestServer.layer.pipe(
+    Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
+    Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults)),
+    Layer.provide(NodeCrypto.layer),
+    (layer) => service(SyncEngine.SyncEngine, layer)
   )
   return { faults, sync }
 })
 
 const makeServices = Effect.gen(function*() {
   const { faults, sync } = yield* makeSyncServices
-  const local = yield* service(
-    LocalStore.Store,
-    LocalStore.layer({ ...clientHistory, definition, spaceId, clientId }).pipe(
-      Layer.provide(runtime),
-      Layer.provide(database())
-    )
+  const localLayer = LocalStore.layer({ ...clientHistory, definition, spaceId, clientId })
+  const local = yield* localLayer.pipe(
+    Layer.provide(runtime),
+    Layer.provide(database()),
+    (layer) => service(LocalStore.Store, layer)
   )
   return { faults, local, sync }
 })
@@ -129,13 +125,16 @@ const pullRequest = (state: LocalStore.ReplicationState) =>
   })
 
 const synchronize = (local: LocalStore.Service, sync: SyncEngine.Service) =>
-  service(
-    Reconciler.Reconciliation,
-    Reconciler.layerOnePass({ definition, spaceId, pageSize: 10 }).pipe(
-      Layer.provide(Layer.succeed(LocalStore.Store, local)),
-      Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
-    )
-  ).pipe(Effect.flatMap((reconciliation) => reconciliation.sync))
+  Reconciler.layerOnePass({ definition, spaceId, pageSize: 10 }).pipe(
+    (reconciliationLayer) => {
+      return reconciliationLayer.pipe(
+        Layer.provide(Layer.succeed(LocalStore.Store, local)),
+        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
+      )
+    },
+    (layer) => service(Reconciler.Reconciliation, layer),
+    Effect.flatMap((reconciliation) => reconciliation.sync)
+  )
 
 describe("test synchronization faults", () => {
   it.effect("routes synchronization events without stealing another space's event", () =>
@@ -178,19 +177,18 @@ describe("test synchronization faults", () => {
     Effect.gen(function*() {
       const { faults, sync } = yield* makeSyncServices
       yield* faults.partition(spaceId)
-      const root = yield* service(
-        Replica.Replica,
-        SqlReplica.layer({
-          ...clientHistory,
-          definition,
-          clientId,
-          initialSpaces: [spaceId, secondSpaceId],
-          retryDelay: "1 millis"
-        }).pipe(
-          Layer.provide(handlers),
-          Layer.provide(database()),
-          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
-        )
+      const replicaLayer = SqlReplica.layer({
+        ...clientHistory,
+        definition,
+        clientId,
+        initialSpaces: [spaceId, secondSpaceId],
+        retryDelay: "1 millis"
+      })
+      const root = yield* replicaLayer.pipe(
+        Layer.provide(handlers),
+        Layer.provide(database()),
+        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync)),
+        (layer) => service(Replica.Replica, layer)
       )
       const first = yield* root.space(spaceId)
       const second = yield* root.space(secondSpaceId)
@@ -215,7 +213,11 @@ describe("test synchronization faults", () => {
 
       const secondReceipt = yield* awaitReceipt(second, secondPending.envelope.mutationId)
       assert.strictEqual(secondReceipt._tag, "Accepted")
-      assert.isTrue(Option.isNone(yield* first.receipt(PutTodo, firstPending.envelope.mutationId)))
+      pipe(
+        yield* first.receipt(PutTodo, firstPending.envelope.mutationId),
+        Option.isNone,
+        (isNone) => assert.isTrue(isNone)
+      )
       yield* awaitStatus(first, "Offline")
       yield* awaitStatus(second, "Online")
 
@@ -235,13 +237,17 @@ describe("test synchronization faults", () => {
       yield* faults.partition(spaceId)
       const error = yield* sync.submit(request).pipe(Effect.flip)
       assert.strictEqual(error._tag, "ServerUnavailable")
-      assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Todo, "1")), { id: "1", title: "offline" })
+      pipe(
+        yield* local.get(Todo, "1"),
+        Option.getOrThrow,
+        (todo) => assert.deepStrictEqual(todo, { id: "1", title: "offline" })
+      )
       assert.strictEqual(yield* local.pendingCount, 1)
 
       yield* faults.heal(spaceId)
       const receipt = yield* sync.submit(request)
       yield* local.applyReceipt(receipt)
-      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
+      const page = yield* pipe(yield* local.replicationState, pullRequest, (pullInput) => sync.pull(pullInput))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
       yield* local.applyViewPage(page)
       yield* local.settleReceipts
@@ -261,7 +267,7 @@ describe("test synchronization faults", () => {
       const receipt = yield* sync.submit(request)
       assert.strictEqual(receipt._tag, "Accepted")
       if (receipt._tag === "Accepted") assert.strictEqual(receipt.serverSequence, 1)
-      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
+      const page = yield* pipe(yield* local.replicationState, pullRequest, (pullInput) => sync.pull(pullInput))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
       assert.strictEqual(page.changes.length, 1)
     }))
@@ -274,9 +280,12 @@ describe("test synchronization faults", () => {
       const receipt = yield* sync.submit({ envelope: pending.envelope, schema: definition.schemaIdentity })
       yield* local.applyReceipt(receipt)
       yield* faults.duplicateNextPage(spaceId)
-      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
+      const page = yield* pipe(yield* local.replicationState, pullRequest, (pullInput) => sync.pull(pullInput))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
-      assert.deepStrictEqual(page.changes.map((change) => change._tag), ["Upsert", "Upsert"])
+      pipe(
+        page.changes.map((change) => change._tag),
+        (tags) => assert.deepStrictEqual(tags, ["Upsert", "Upsert"])
+      )
       yield* local.applyViewPage(page)
       yield* local.settleReceipts
       assert.strictEqual(yield* local.cursor, 1)

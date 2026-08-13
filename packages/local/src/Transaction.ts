@@ -17,7 +17,7 @@ export interface Transaction {
     value: Model.Value<M>
   ) => Effect.Effect<void, ReplicaError.StorageError>
   readonly delete: <M extends Model.Any,>(model: M, key: Model.Key<M>) => Effect.Effect<void, ReplicaError.StorageError>
-  readonly applyField: <Value extends Schema.Top, Operation extends Schema.Top, E,>(
+  readonly applyField: <Value extends Schema.Top, Operation extends Schema.Top, E extends Field.TaggedError,>(
     semantics: Field.Semantics<Value, Operation, E>,
     current: Value["Type"],
     operation: Operation["Type"]

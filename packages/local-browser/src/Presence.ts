@@ -119,7 +119,10 @@ export const make = <A,>(schema: Schema.Decoder<A>, options: { readonly timeToLi
     return {
       receive: (clientId, value) => set(clientId, value).pipe(Effect.asVoid),
       publish: (clientId, value) =>
-        Effect.acquireRelease(set(clientId, value), (token) => removeToken(clientId, token)).pipe(Effect.asVoid),
+        set(clientId, value).pipe(
+          (acquire) => Effect.acquireRelease(acquire, (token) => removeToken(clientId, token)),
+          Effect.asVoid
+        ),
       remove: (clientId) =>
         Ref.update(state, (current) => {
           const token = current.nextToken + 1

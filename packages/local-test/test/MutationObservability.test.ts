@@ -15,6 +15,7 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
@@ -41,22 +42,36 @@ const PutTodo = Mutation.make("PutTodo", {
   success: Todo.schema
 })
 
+class RejectTodoError extends Schema.TaggedErrorClass<RejectTodoError>(
+  "@lucas-barake/effect-local-test/RejectTodoError"
+)("RejectTodoError", { code: Schema.NumberFromString }) {}
+
 const RejectTodo = Mutation.make("RejectTodo", {
   version: 1,
   payload: Todo.schema,
-  rejection: Schema.NumberFromString
+  rejection: RejectTodoError
 })
 
 const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo, RejectTodo] })
-const clientHandlers = Layer.mergeAll(
-  PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
-  RejectTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload))
+const clientHandlers = PutTodo.toLayer(({ payload, transaction }) =>
+  transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
+).pipe(
+  (putTodo) =>
+    RejectTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload)).pipe(
+      (rejectTodo) => Layer.mergeAll(putTodo, rejectTodo)
+    )
 )
-const serverHandlers = Layer.mergeAll(
-  PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
-  RejectTodo.toLayer(({ payload, transaction }) =>
-    transaction.set(Todo, payload.id, payload).pipe(Effect.andThen(Effect.fail(409)))
-  )
+const serverHandlers = PutTodo.toLayer(({ payload, transaction }) =>
+  transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
+).pipe(
+  (putTodo) =>
+    RejectTodo.toLayer(({ payload, transaction }) =>
+      transaction.set(Todo, payload.id, payload).pipe(
+        Effect.andThen(Effect.fail(new RejectTodoError({ code: 409 })))
+      )
+    ).pipe(
+      (rejectTodo) => Layer.mergeAll(putTodo, rejectTodo)
+    )
 )
 const runtime = MutationRuntime.layer(definition).pipe(Layer.provide(serverHandlers))
 
@@ -93,46 +108,41 @@ const serverHistory = {
 }
 
 const database = () =>
-  Layer.mergeAll(
-    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
-    NodeCrypto.layer,
-    Reactivity.layer,
-    QueryReactivity.layer
+  SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
+    (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
   )
 
-const service = <I, S, E, R,>(tag: Context.Service<I, S>, layer: Layer.Layer<I, E, R>) =>
-  Layer.build(layer).pipe(Effect.map((context) => Context.get(context, tag)))
+const service = <I, S, E extends { readonly _tag: string }, R,>(
+  tag: Context.Service<I, S>,
+  layer: Layer.Layer<I, E, R>
+) => Layer.build(layer).pipe(Effect.map(Context.get(tag)))
 
 const makeServices = Effect.gen(function*() {
-  const server = yield* service(
-    ServerStore.ServerStore,
-    ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
-      Layer.provide(runtime),
-      Layer.provide(database())
-    )
+  const serverLayer = ServerStore.layerTrusted({ ...serverHistory, definition })
+  const server = yield* serverLayer.pipe(
+    Layer.provide(runtime),
+    Layer.provide(database()),
+    (layer) => service(ServerStore.ServerStore, layer)
   )
   const faults = yield* service(FaultInjection.FaultInjection, FaultInjection.layer)
-  const sync = yield* service(
-    SyncEngine.SyncEngine,
-    TestServer.layer.pipe(
-      Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
-      Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults)),
-      Layer.provide(NodeCrypto.layer)
-    )
+  const sync = yield* TestServer.layer.pipe(
+    Layer.provide(Layer.succeed(ServerStore.ServerStore, server)),
+    Layer.provide(Layer.succeed(FaultInjection.FaultInjection, faults)),
+    Layer.provide(NodeCrypto.layer),
+    (layer) => service(SyncEngine.SyncEngine, layer)
   )
-  const replica = yield* service(
-    Replica.Replica,
-    TestReplica.layer({
-      ...clientHistory,
-      definition,
-      clientId,
-      initialSpaces: [spaceId],
-      retryDelay: "1 millis"
-    }).pipe(
-      Layer.provide(clientHandlers),
-      Layer.provide(database()),
-      Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
-    )
+  const replicaLayer = TestReplica.layer({
+    ...clientHistory,
+    definition,
+    clientId,
+    initialSpaces: [spaceId],
+    retryDelay: "1 millis"
+  })
+  const replica = yield* replicaLayer.pipe(
+    Layer.provide(clientHandlers),
+    Layer.provide(database()),
+    Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync)),
+    (layer) => service(Replica.Replica, layer)
   )
   return { faults, replica }
 })
@@ -148,7 +158,7 @@ describe("mutation observability", () => {
     Effect.gen(function*() {
       const { replica } = yield* makeServices
       const space = yield* replica.space(spaceId)
-      const settlementFiber = yield* subscribe(space.settlementsFor(RejectTodo))
+      const settlementFiber = yield* space.settlementsFor(RejectTodo).pipe(subscribe)
 
       const pending = yield* space.mutate(RejectTodo, { id: "typed", title: "optimistic" })
       const settlement = Option.getOrThrow(yield* Fiber.join(settlementFiber))
@@ -158,18 +168,22 @@ describe("mutation observability", () => {
       assert.strictEqual(settlement.receipt.origin, "Mutation")
       if (settlement.receipt.origin !== "Mutation") return
       const typed: Mutation.Rejection<typeof RejectTodo> = settlement.receipt.rejection
-      assert.strictEqual(typed, 409)
+      assert.strictEqual(typed._tag, "RejectTodoError")
+      assert.strictEqual(typed.code, 409)
       const durable = Option.getOrThrow(yield* space.receipt(RejectTodo, pending.envelope.mutationId))
       assert.strictEqual(durable._tag, "Rejected")
-      if (durable._tag === "Rejected" && durable.origin === "Mutation") assert.strictEqual(durable.rejection, 409)
+      if (durable._tag === "Rejected" && durable.origin === "Mutation") {
+        assert.strictEqual(durable.rejection._tag, "RejectTodoError")
+        assert.strictEqual(durable.rejection.code, 409)
+      }
     }))
 
   it.effect("emits one settlement when the same receipt is persisted twice across reconnect", () =>
     Effect.gen(function*() {
       const { faults, replica } = yield* makeServices
       const space = yield* replica.space(spaceId)
-      const firstCollector = yield* Stream.toQueue(space.settlementsFor(PutTodo), { capacity: "unbounded" })
-      const secondCollector = yield* Stream.toQueue(space.settlementsFor(PutTodo), { capacity: "unbounded" })
+      const firstCollector = yield* space.settlementsFor(PutTodo).pipe(Stream.toQueue({ capacity: "unbounded" }))
+      const secondCollector = yield* space.settlementsFor(PutTodo).pipe(Stream.toQueue({ capacity: "unbounded" }))
       yield* faults.withholdPullEvidence(spaceId)
       yield* faults.dropNextReceipt(spaceId)
 
@@ -210,11 +224,11 @@ describe("mutation observability", () => {
         collectThroughBarrier(secondCollector)
       ], { concurrency: "unbounded" })
       for (const settlements of received) {
-        assert.lengthOf(
+        pipe(
           settlements.filter(
             (settlement) => settlement.pending.envelope.mutationId === pending.envelope.mutationId
           ),
-          1
+          (matching) => assert.lengthOf(matching, 1)
         )
       }
     }))
@@ -244,7 +258,7 @@ describe("mutation observability", () => {
       yield* faults.releaseHeldReceipt(spaceId)
 
       const state = yield* Deferred.await(observed)
-      assert.isTrue(Option.isNone(state.rejected))
-      assert.deepStrictEqual(Option.getOrThrow(state.later), { id: "later", title: "replayed" })
+      pipe(Option.isNone(state.rejected), (isNone) => assert.isTrue(isNone))
+      pipe(Option.getOrThrow(state.later), (later) => assert.deepStrictEqual(later, { id: "later", title: "replayed" }))
     }))
 })

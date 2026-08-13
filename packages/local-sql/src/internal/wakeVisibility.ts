@@ -3,6 +3,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import type * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import { pipe } from "effect/Function"
 import * as MutableHashMap from "effect/MutableHashMap"
 import * as Option from "effect/Option"
 import type * as Scope from "effect/Scope"
@@ -13,7 +14,11 @@ export interface Snapshot {
   readonly running: number
 }
 
-export interface Options<E,> {
+interface TaggedError {
+  readonly _tag: string
+}
+
+export interface Options<E extends TaggedError,> {
   readonly lookupTimeoutNanos: bigint
   readonly onLookupTimeout: () => E
   readonly maximumConcurrentLookups: number
@@ -21,7 +26,7 @@ export interface Options<E,> {
   readonly onPendingCapacityExceeded: () => E
 }
 
-export interface Limiter<E,> {
+export interface Limiter<E extends TaggedError,> {
   readonly ownerScope: Scope.Scope
   readonly tryReserveUnsafe: () => boolean
   readonly releaseUnsafe: () => void
@@ -30,23 +35,25 @@ export interface Limiter<E,> {
   readonly snapshot: Effect.Effect<Snapshot>
 }
 
-export interface Coordinator<K, A, E,> {
+export interface Coordinator<K, A, E extends TaggedError,> {
   readonly evaluate: (key: K, lookup: () => Effect.Effect<A, E>) => Effect.Effect<A, E>
 }
 
-interface Entry<A, E,> {
+interface Entry<A, E extends TaggedError,> {
   readonly deferred: Deferred.Deferred<A, E>
   waiters: number
   state: "Pending" | "Canceling" | "Completed"
   owner: Fiber.Fiber<void> | undefined
 }
 
-type Registration<A, E,> =
+type Registration<A, E extends TaggedError,> =
   | { readonly _tag: "AtCapacity" }
   | { readonly _tag: "Leader"; readonly entry: Entry<A, E> }
   | { readonly _tag: "Follower"; readonly entry: Entry<A, E> }
 
-export const makeLimiter = <E,>(options: Options<E>): Effect.Effect<Limiter<E>, never, Scope.Scope> =>
+export const makeLimiter = <E extends TaggedError,>(
+  options: Options<E>
+): Effect.Effect<Limiter<E>, never, Scope.Scope> =>
   Effect.gen(function*() {
     const ownerScope = yield* Effect.scope
     const clock = yield* Clock.Clock
@@ -57,22 +64,20 @@ export const makeLimiter = <E,>(options: Options<E>): Effect.Effect<Limiter<E>, 
     const execute = <A,>(lookup: () => Effect.Effect<A, E>): Effect.Effect<A, E> =>
       Effect.suspend(() => {
         const expiresAtNanos = clock.monotonicTimeNanosUnsafe() + options.lookupTimeoutNanos
-        return Semaphore.withPermit(
-          semaphore,
-          Effect.suspend(() => {
-            if (clock.monotonicTimeNanosUnsafe() >= expiresAtNanos) {
-              return Effect.fail(options.onLookupTimeout())
-            }
-            return Effect.sync(() => {
-              running++
-            }).pipe(
-              Effect.andThen(Effect.suspend(lookup)),
-              Effect.ensuring(Effect.sync(() => {
-                running--
-              }))
-            )
-          })
-        ).pipe(
+        return Effect.suspend(() => {
+          if (clock.monotonicTimeNanosUnsafe() >= expiresAtNanos) {
+            return pipe(options.onLookupTimeout(), Effect.fail)
+          }
+          return Effect.sync(() => {
+            running++
+          }).pipe(
+            Effect.andThen(Effect.suspend(lookup)),
+            Effect.ensuring(Effect.sync(() => {
+              running--
+            }))
+          )
+        }).pipe(
+          Semaphore.withPermit(semaphore),
           Effect.timeoutOption(options.lookupTimeoutNanos),
           Effect.flatMap(Option.match({
             onNone: () => Effect.fail(options.onLookupTimeout()),
@@ -97,7 +102,7 @@ export const makeLimiter = <E,>(options: Options<E>): Effect.Effect<Limiter<E>, 
     }
   })
 
-export const make = <K, A, E,>(limiter: Limiter<E>): Coordinator<K, A, E> => {
+export const make = <K, A, E extends TaggedError,>(limiter: Limiter<E>): Coordinator<K, A, E> => {
   const entries = MutableHashMap.empty<K, Entry<A, E>>()
 
   const register = (key: K): Effect.Effect<Registration<A, E>> =>
@@ -128,7 +133,8 @@ export const make = <K, A, E,>(limiter: Limiter<E>): Coordinator<K, A, E> => {
 
   const run = (entry: Entry<A, E>, lookup: () => Effect.Effect<A, E>): Effect.Effect<void> =>
     Effect.uninterruptibleMask((restore) =>
-      restore(limiter.execute(lookup)).pipe(
+      limiter.execute(lookup).pipe(
+        restore,
         Effect.exit,
         Effect.flatMap((exit) => complete(entry, exit))
       )

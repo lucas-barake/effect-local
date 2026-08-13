@@ -18,11 +18,13 @@ import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as MutableRef from "effect/MutableRef"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Redacted from "effect/Redacted"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
@@ -32,6 +34,19 @@ import * as HttpRouter from "effect/unstable/http/HttpRouter"
 import * as HttpServer from "effect/unstable/http/HttpServer"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as Socket from "effect/unstable/socket/Socket"
+
+const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(
+    Effect.result,
+    Effect.map((result) => {
+      if (Result.isFailure(result)) return result.failure
+      return assert.fail("expected Effect failure")
+    })
+  )
+
+class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationError, Schema.JsonObject>(
+  "@lucas-barake/effect-local-rpc/test/WebSocketSync/TestAuthorizationError"
+)("TestAuthorizationError", { reason: Schema.String }) {}
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "../src/Authentication.js"
 import * as PresenceClient from "../src/PresenceClient.js"
@@ -102,18 +117,18 @@ const evolution = Evolution.make({
     })]
   })]
 })
-const handlers = Layer.mergeAll(
-  PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
-  ReturnHugeResult.toLayer(() => Effect.succeed("x".repeat(SyncRpc.maximumFrameBytes))),
-  AssignRoleV2.toLayer(({ payload }) => Effect.succeed(payload.role))
+const putTodoHandler = PutTodo.toLayer(({ payload, transaction }) =>
+  transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
 )
+const returnHugeResultHandler = ReturnHugeResult.toLayer(() =>
+  pipe("x".repeat(SyncRpc.maximumFrameBytes), Effect.succeed)
+)
+const assignRoleHandler = AssignRoleV2.toLayer(({ payload }) => Effect.succeed(payload.role))
+const handlers = Layer.mergeAll(putTodoHandler, returnHugeResultHandler, assignRoleHandler)
 const runtime = MutationRuntime.layer(definition, evolution).pipe(Layer.provide(handlers))
 const readAuthorized = MutableRef.make(true)
-const database = Layer.mergeAll(
-  SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
-  NodeCrypto.layer,
-  Reactivity.layer
-)
+const sqlite = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+const database = Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer)
 
 const migration = {
   retryDelay: "1 millis",
@@ -171,11 +186,11 @@ const store = ServerStore.layer({
     ) {
       return Effect.void
     }
-    return Effect.fail({ reason: "forbidden" })
+    return Effect.fail(new TestAuthorizationError({ reason: "forbidden" }))
   },
   authorizeMutation: ({ mutation }) => {
     if (Schema.is(AssignRoleV2.payloadSchema)(mutation.payload) && mutation.payload.role === "admin") {
-      return Effect.fail({ reason: "admin role requires elevated access" })
+      return Effect.fail(new TestAuthorizationError({ reason: "admin role requires elevated access" }))
     }
     return Effect.void
   },
@@ -188,20 +203,18 @@ const store = ServerStore.layer({
     ) {
       return Effect.void
     }
-    return Effect.fail({ reason: "forbidden" })
+    return Effect.fail(new TestAuthorizationError({ reason: "forbidden" }))
   }
 }).pipe(Layer.provide(runtime), Layer.provide(database))
 
-const authenticator = Layer.succeed(
-  Authentication.Authenticator,
-  Authentication.Authenticator.of({
-    authenticate: (credential) => {
-      if (Redacted.value(credential) === "secret") return Effect.succeed({ subject: "test" })
-      if (Redacted.value(credential) === "revoked") return Effect.succeed({ subject: "revoked" })
-      return Effect.fail(new ReplicaError.CredentialRejected())
-    }
-  })
-)
+const authenticatorService = Authentication.Authenticator.of({
+  authenticate: (credential) => {
+    if (Redacted.value(credential) === "secret") return Effect.succeed({ subject: "test" })
+    if (Redacted.value(credential) === "revoked") return Effect.succeed({ subject: "revoked" })
+    return Effect.fail(new ReplicaError.CredentialRejected())
+  }
+})
+const authenticator = Layer.succeed(Authentication.Authenticator, authenticatorService)
 const authenticationServer = Authentication.layerServer.pipe(Layer.provide(authenticator))
 const assertionCodec = Schema.fromJsonString(Schema.Json)
 const assertionIssuer = PrincipalAssertion.layerIssuer((principal) =>
@@ -233,11 +246,10 @@ const revokedAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe
     })
   )
 ))
-const presenceHub = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })
 const cluster = SpaceEntity.layer(entityOptions).pipe(
   Layer.provide(assertionVerifier),
   Layer.provide(store),
-  Layer.provide(presenceHub),
+  Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
   Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(database)))
 )
 
@@ -253,9 +265,8 @@ const websocketServer = SyncServer.layer.pipe(
 )
 const webSocketConstructions = MutableRef.make(0)
 const liveWebSockets = MutableRef.make(0)
-const countedConstructor = Layer.effect(
-  Socket.WebSocketConstructor,
-  Socket.WebSocketConstructor.pipe(Effect.map((makeWebSocket) => (url: string, protocols?: string | Array<string>) => {
+const countedWebSocketConstructor = Socket.WebSocketConstructor.pipe(
+  Effect.map((makeWebSocket) => (url: string, protocols?: string | Array<string>) => {
     MutableRef.update(webSocketConstructions, (count) => count + 1)
     MutableRef.update(liveWebSockets, (count) => count + 1)
     const webSocket = makeWebSocket(url, protocols)
@@ -263,8 +274,11 @@ const countedConstructor = Layer.effect(
       MutableRef.update(liveWebSockets, (count) => count - 1)
     }, { once: true })
     return webSocket
-  }))
-).pipe(Layer.provide(NodeSocket.layerWebSocketConstructor))
+  })
+)
+const countedConstructor = Layer.effect(Socket.WebSocketConstructor, countedWebSocketConstructor).pipe(
+  Layer.provide(NodeSocket.layerWebSocketConstructor)
+)
 const socket = Effect.gen(function*() {
   const server = yield* HttpServer.HttpServer
   const address = server.address
@@ -323,36 +337,36 @@ type ProtocolObservation =
   | { readonly _tag: "PublishPresence"; readonly version: Protocol.ProtocolVersion }
 
 const protocolObservations = MutableRef.make<Array<ProtocolObservation>>([])
-const observingAuthenticationServer = Layer.effect(
-  Authentication.Authentication,
-  Authentication.Authentication.pipe(
-    Effect.map((authenticate) =>
-      Authentication.Authentication.of((effect, options) =>
-        Effect.sync(() => {
-          const payload = options.payload
-          if (options.rpc._tag === "Negotiate") {
-            MutableRef.update(protocolObservations, (observations) => [
-              ...observations,
-              { _tag: "Negotiate" as const }
-            ])
-          } else if (options.rpc._tag === "Pull" && Schema.is(Protocol.VersionedPullRequest)(payload)) {
-            MutableRef.update(protocolObservations, (observations) => [
-              ...observations,
-              { _tag: "Pull" as const, version: payload.protocolVersion }
-            ])
-          } else if (
-            options.rpc._tag === "PublishPresence" && Schema.is(Protocol.VersionedPresenceUpdate)(payload)
-          ) {
-            MutableRef.update(protocolObservations, (observations) => [
-              ...observations,
-              { _tag: "PublishPresence" as const, version: payload.protocolVersion }
-            ])
-          }
-        }).pipe(Effect.andThen(authenticate(effect, options)))
-      )
+const observingAuthentication = Authentication.Authentication.pipe(
+  Effect.map((authenticate) =>
+    Authentication.Authentication.of((effect, options) =>
+      Effect.sync(() => {
+        const payload = options.payload
+        if (options.rpc._tag === "Negotiate") {
+          MutableRef.update(protocolObservations, (observations) => [
+            ...observations,
+            { _tag: "Negotiate" as const }
+          ])
+        } else if (options.rpc._tag === "Pull" && Schema.is(Protocol.VersionedPullRequest)(payload)) {
+          MutableRef.update(protocolObservations, (observations) => [
+            ...observations,
+            { _tag: "Pull" as const, version: payload.protocolVersion }
+          ])
+        } else if (
+          options.rpc._tag === "PublishPresence" && Schema.is(Protocol.VersionedPresenceUpdate)(payload)
+        ) {
+          MutableRef.update(protocolObservations, (observations) => [
+            ...observations,
+            { _tag: "PublishPresence" as const, version: payload.protocolVersion }
+          ])
+        }
+      }).pipe(Effect.andThen(authenticate(effect, options)))
     )
   )
-).pipe(Layer.provide(authenticationServer))
+)
+const observingAuthenticationServer = Layer.effect(Authentication.Authentication, observingAuthentication).pipe(
+  Layer.provide(authenticationServer)
+)
 const protocol2Server = SyncServer.layerWithOptions({ supportedProtocolVersions: [1, 2] }).pipe(
   Layer.provideMerge(websocketProtocol),
   Layer.provide(cluster),
@@ -361,7 +375,9 @@ const protocol2Server = SyncServer.layerWithOptions({ supportedProtocolVersions:
   Layer.provide(HttpRouter.serve(websocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const configurableProtocolSession = ProtocolSession.layerWithOptions({ supportedProtocolVersions: [1, 2] })
-const configurableClient = Layer.merge(SyncClient.layerFromSession(), PresenceClient.layerFromSession()).pipe(
+const configurableSyncClient = SyncClient.layerFromSession()
+const configurablePresenceClient = PresenceClient.layerFromSession()
+const configurableClient = Layer.merge(configurableSyncClient, configurablePresenceClient).pipe(
   Layer.provide(configurableProtocolSession),
   Layer.provide(clientProtocol),
   Layer.provide(authenticationClient)
@@ -423,49 +439,52 @@ const makeLifecycleHarness = (options?: {
     const clientAuthentication = Authentication.layerClient.pipe(
       Layer.provide(Layer.succeed(Authentication.CredentialProvider, provider))
     )
-    const dynamicAuthenticator = Layer.succeed(
-      Authentication.Authenticator,
-      Authentication.Authenticator.of({
-        authenticate: (credential) => {
-          const current = MutableRef.get(mode)
-          if (current === "Unavailable") return Effect.fail(new ReplicaError.AuthenticatorUnavailable())
-          if (current === "Rejected") return Effect.fail(new ReplicaError.CredentialRejected())
-          const bearer = Redacted.value(credential)
-          if (bearer === "secret" || bearer === "refreshed") return Effect.succeed({ subject: "test" })
-          return Effect.fail(new ReplicaError.CredentialRejected())
-        }
-      })
-    )
+    const dynamicAuthenticatorService = Authentication.Authenticator.of({
+      authenticate: (credential) => {
+        const current = MutableRef.get(mode)
+        if (current === "Unavailable") return Effect.fail(new ReplicaError.AuthenticatorUnavailable())
+        if (current === "Rejected") return Effect.fail(new ReplicaError.CredentialRejected())
+        const bearer = Redacted.value(credential)
+        if (bearer === "secret" || bearer === "refreshed") return Effect.succeed({ subject: "test" })
+        return Effect.fail(new ReplicaError.CredentialRejected())
+      }
+    })
+    const dynamicAuthenticator = Layer.succeed(Authentication.Authenticator, dynamicAuthenticatorService)
     const baseAuthenticationServer = Authentication.layerServer.pipe(Layer.provide(dynamicAuthenticator))
-    const observedAuthenticationServer = Layer.effect(
-      Authentication.Authentication,
-      Authentication.Authentication.pipe(
-        Effect.map((authenticate) =>
-          Authentication.Authentication.of((effect, request) =>
-            Queue.offer(attempts, {
-              mode: MutableRef.get(mode),
-              rpc: request.rpc._tag
-            }).pipe(
-              Effect.andThen(Effect.suspend(() => {
-                if (request.rpc._tag === "Watch") return Deferred.succeed(watchStarted, undefined)
-                return Effect.void
-              })),
-              Effect.andThen(authenticate(effect, request))
-            )
+    const observedAuthentication = Authentication.Authentication.pipe(
+      Effect.map((authenticate) =>
+        Authentication.Authentication.of((effect, request) =>
+          Queue.offer(attempts, {
+            mode: MutableRef.get(mode),
+            rpc: request.rpc._tag
+          }).pipe(
+            Effect.andThen(Effect.suspend(() => {
+              if (request.rpc._tag === "Watch") return Deferred.succeed(watchStarted, undefined)
+              return Effect.void
+            })),
+            Effect.andThen(authenticate(effect, request))
           )
         )
       )
-    ).pipe(Layer.provide(baseAuthenticationServer))
+    )
+    const observedAuthenticationServer = Layer.effect(Authentication.Authentication, observedAuthentication).pipe(
+      Layer.provide(baseAuthenticationServer)
+    )
 
+    const lifecyclePutTodoHandler = PutTodo.toLayer(({ payload, transaction }) =>
+      transaction.set(Todo, payload.id, payload).pipe(
+        Effect.tap(() => Queue.offer(applications, payload.id)),
+        Effect.as(payload)
+      )
+    )
+    const lifecycleReturnHugeResultHandler = ReturnHugeResult.toLayer(() =>
+      pipe("x".repeat(SyncRpc.maximumFrameBytes), Effect.succeed)
+    )
+    const lifecycleAssignRoleHandler = AssignRoleV2.toLayer(({ payload }) => Effect.succeed(payload.role))
     const lifecycleHandlers = Layer.mergeAll(
-      PutTodo.toLayer(({ payload, transaction }) =>
-        transaction.set(Todo, payload.id, payload).pipe(
-          Effect.tap(() => Queue.offer(applications, payload.id)),
-          Effect.as(payload)
-        )
-      ),
-      ReturnHugeResult.toLayer(() => Effect.succeed("x".repeat(SyncRpc.maximumFrameBytes))),
-      AssignRoleV2.toLayer(({ payload }) => Effect.succeed(payload.role))
+      lifecyclePutTodoHandler,
+      lifecycleReturnHugeResultHandler,
+      lifecycleAssignRoleHandler
     )
     const lifecycleRuntime = MutationRuntime.layer(definition, evolution).pipe(Layer.provide(lifecycleHandlers))
     const lifecycleStore = ServerStore.layer({
@@ -477,7 +496,7 @@ const makeLifecycleHarness = (options?: {
           principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
           "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
         ) return Effect.void
-        return Effect.fail({ reason: "forbidden" })
+        return Effect.fail(new TestAuthorizationError({ reason: "forbidden" }))
       },
       authorizeMutation: () => Effect.void,
       authorizeRead: () => {
@@ -507,17 +526,19 @@ const makeLifecycleHarness = (options?: {
         disableLogger: true
       }))
     )
-    const lifecycleConstructor = Layer.effect(
-      Socket.WebSocketConstructor,
-      Socket.WebSocketConstructor.pipe(Effect.map((makeWebSocket) =>
+    const lifecycleWebSocketConstructor = Socket.WebSocketConstructor.pipe(
+      Effect.map((makeWebSocket) =>
       (
         url: string,
         protocols?: string | Array<string>
       ) => {
         MutableRef.update(lifecycleWebSocketConstructions, (count) => count + 1)
         return makeWebSocket(url, protocols)
-      }))
-    ).pipe(Layer.provide(NodeSocket.layerWebSocketConstructor))
+      })
+    )
+    const lifecycleConstructor = Layer.effect(Socket.WebSocketConstructor, lifecycleWebSocketConstructor).pipe(
+      Layer.provide(NodeSocket.layerWebSocketConstructor)
+    )
     const lifecycleSocket = Effect.gen(function*() {
       const server = yield* HttpServer.HttpServer
       const address = server.address
@@ -569,7 +590,7 @@ describe("WebSocket synchronization", () => {
   it.effect("pauses a rejected credential generation at NeedsAuthentication", () =>
     Effect.gen(function*() {
       const harness = yield* makeLifecycleHarness()
-      const replicaContext = yield* Layer.build(harness.replicaLayer("4 seconds"))
+      const replicaContext = yield* harness.replicaLayer("4 seconds").pipe(Layer.build)
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
@@ -590,13 +611,13 @@ describe("WebSocket synchronization", () => {
 
       yield* TestClock.adjust("1 minute")
       yield* space.mutate(PutTodo, { id: "still-expired", title: "must stay local" })
-      assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
+      pipe(Option.isNone(yield* Queue.poll(harness.attempts)), (isNone) => assert.isTrue(isNone))
     }))
 
   it.effect("resumes synchronization after a credential refresh without rebuilding the replica", () =>
     Effect.gen(function*() {
       const harness = yield* makeLifecycleHarness()
-      const replicaContext = yield* Layer.build(harness.replicaLayer("4 seconds"))
+      const replicaContext = yield* harness.replicaLayer("4 seconds").pipe(Layer.build)
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
@@ -624,14 +645,17 @@ describe("WebSocket synchronization", () => {
 
       assert.strictEqual(yield* Queue.take(harness.applications), "refresh")
       assert.strictEqual((yield* Fiber.join(online))._tag, "Online")
-      assert.strictEqual(Context.get(replicaContext, Replica.Replica), replica)
-      assert.strictEqual(MutableRef.get(harness.webSocketConstructions), 1)
+      pipe(
+        Context.get(replicaContext, Replica.Replica),
+        (currentReplica) => assert.strictEqual(currentReplica, replica)
+      )
+      pipe(MutableRef.get(harness.webSocketConstructions), (constructions) => assert.strictEqual(constructions, 1))
     }))
 
   it.effect("backs off an unavailable authenticator and recovers", () =>
     Effect.gen(function*() {
       const harness = yield* makeLifecycleHarness()
-      const replicaContext = yield* Layer.build(harness.replicaLayer("2 seconds"))
+      const replicaContext = yield* harness.replicaLayer("2 seconds").pipe(Layer.build)
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
@@ -650,12 +674,12 @@ describe("WebSocket synchronization", () => {
       assert.strictEqual((yield* Fiber.join(offline))._tag, "Offline")
 
       yield* TestClock.adjust("999 millis")
-      assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
+      pipe(Option.isNone(yield* Queue.poll(harness.attempts)), (isNone) => assert.isTrue(isNone))
       yield* TestClock.adjust("1 millis")
       assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
 
       yield* TestClock.adjust("1999 millis")
-      assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
+      pipe(Option.isNone(yield* Queue.poll(harness.attempts)), (isNone) => assert.isTrue(isNone))
       yield* TestClock.adjust("1 millis")
       assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
 
@@ -681,7 +705,7 @@ describe("WebSocket synchronization", () => {
       yield* Deferred.await(harness.pullEntered)
 
       yield* TestClock.adjust("1 second")
-      const error = yield* Fiber.join(pulling).pipe(Effect.flip)
+      const error = yield* Fiber.join(pulling).pipe(failureOf)
       assert.strictEqual(error._tag, "OperationTimeout")
       if (error._tag === "OperationTimeout") {
         assert.strictEqual(error.operation, "Pull")
@@ -693,7 +717,7 @@ describe("WebSocket synchronization", () => {
   it.effect("keeps a healthy idle watch open past rpcTimeout", () =>
     Effect.gen(function*() {
       const harness = yield* makeLifecycleHarness({ rpcTimeout: "500 millis" })
-      const replicaContext = yield* Layer.build(harness.replicaLayer("8 seconds"))
+      const replicaContext = yield* harness.replicaLayer("8 seconds").pipe(Layer.build)
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
@@ -711,27 +735,26 @@ describe("WebSocket synchronization", () => {
 
       yield* TestClock.adjust("3 seconds")
 
-      assert.isTrue(Option.isNone(yield* Fiber.join(restarted)))
+      pipe(Option.isNone(yield* Fiber.join(restarted)), (isNone) => assert.isTrue(isNone))
     }))
 
   it.effect("multiplexes two Replica spaces through exactly one WebSocket", () =>
     Effect.gen(function*() {
       MutableRef.set(webSocketConstructions, 0)
       MutableRef.set(liveWebSockets, 0)
-      const replicaContext = yield* Layer.build(
-        SqlReplica.layer({
-          ...clientHistory,
-          definition,
-          evolution,
-          clientId,
-          scope,
-          initialSpaces: [spaceId, secondSpaceId],
-          retryDelay: "1 millis"
-        }).pipe(
-          Layer.provide(handlers),
-          Layer.provide(database),
-          Layer.provide(singleClientLive)
-        )
+      const replicaContext = yield* SqlReplica.layer({
+        ...clientHistory,
+        definition,
+        evolution,
+        clientId,
+        scope,
+        initialSpaces: [spaceId, secondSpaceId],
+        retryDelay: "1 millis"
+      }).pipe(
+        Layer.provide(handlers),
+        Layer.provide(database),
+        Layer.provide(singleClientLive),
+        Layer.build
       )
       const replica = Context.get(replicaContext, Replica.Replica)
       const first = yield* replica.space(spaceId)
@@ -755,20 +778,20 @@ describe("WebSocket synchronization", () => {
 
       assert.strictEqual(firstReceipt.spaceId, spaceId)
       assert.strictEqual(secondReceipt.spaceId, secondSpaceId)
-      assert.strictEqual(MutableRef.get(webSocketConstructions), 1)
-      assert.strictEqual(MutableRef.get(liveWebSockets), 1)
+      pipe(MutableRef.get(webSocketConstructions), (constructions) => assert.strictEqual(constructions, 1))
+      pipe(MutableRef.get(liveWebSockets), (liveSockets) => assert.strictEqual(liveSockets, 1))
     }).pipe(Effect.provide(NodeCrypto.layer)))
 
   it.effect("rejects an empty protocol version configuration at layer construction", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const error = yield* Layer.build(invalidProtocolLive).pipe(Effect.flip)
+    Effect.gen(function*() {
+      const error = yield* Layer.build(invalidProtocolLive).pipe(failureOf)
       assert.strictEqual(error._tag, "InvalidConfiguration")
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("returns UpgradeRequired when protocol versions do not intersect", () =>
     Effect.gen(function*() {
       const remote = yield* SyncEngine.SyncEngine
-      const error = yield* remote.pull(pullRequest()).pipe(Effect.flip)
+      const error = yield* pipe(pullRequest(), (request) => remote.pull(request), failureOf)
       assert.strictEqual(error._tag, "UpgradeRequired")
     }).pipe(Effect.provide(incompatibleLive)))
 
@@ -778,7 +801,7 @@ describe("WebSocket synchronization", () => {
       const remote = yield* SyncEngine.SyncEngine
       const presence = yield* PresenceClient.PresenceClient
 
-      yield* remote.pull(pullRequest())
+      yield* pipe(pullRequest(), (request) => remote.pull(request))
       yield* presence.publish({
         spaceId,
         clientId,
@@ -786,11 +809,12 @@ describe("WebSocket synchronization", () => {
         ttlMillis: 5_000
       })
 
-      assert.deepStrictEqual(MutableRef.get(protocolObservations), [
-        { _tag: "Negotiate" },
-        { _tag: "Pull", version: Protocol.ProtocolVersion.make(2) },
-        { _tag: "PublishPresence", version: Protocol.ProtocolVersion.make(2) }
-      ])
+      pipe(MutableRef.get(protocolObservations), (observations) =>
+        assert.deepStrictEqual(observations, [
+          { _tag: "Negotiate" },
+          { _tag: "Pull", version: Protocol.ProtocolVersion.make(2) },
+          { _tag: "PublishPresence", version: Protocol.ProtocolVersion.make(2) }
+        ]))
     }).pipe(Effect.provide(configurableLive)))
 
   it.effect("delivers an authorized bounded bootstrap through both RPC hops", () =>
@@ -820,7 +844,7 @@ describe("WebSocket synchronization", () => {
       }
       yield* (yield* ServerStore.ServerStore).maintain(spaceId)
 
-      const pulled = yield* remote.pull(pullRequest())
+      const pulled = yield* pipe(pullRequest(), (request) => remote.pull(request))
       assert.isTrue("_tag" in pulled)
       if (!("_tag" in pulled)) assert.fail("expected bootstrap")
       const request = {
@@ -839,7 +863,7 @@ describe("WebSocket synchronization", () => {
       let pages = 0
       while (true) {
         assert.isAbove(page.entries.length, 0)
-        assert.isAtMost(Protocol.encodedBytes(page), serverHistory.maximumBootstrapPageBytes)
+        pipe(Protocol.encodedBytes(page), (bytes) => assert.isAtMost(bytes, serverHistory.maximumBootstrapPageBytes))
         entities += page.entries.length
         pages += 1
         if (!page.hasMore) break
@@ -853,7 +877,7 @@ describe("WebSocket synchronization", () => {
       assert.strictEqual(entities, 3)
       assert.isAbove(pages, 1)
 
-      const denied = yield* (yield* RevokedSyncEngine).bootstrap(request).pipe(Effect.flip)
+      const denied = yield* (yield* RevokedSyncEngine).bootstrap(request).pipe(failureOf)
       assert.strictEqual(denied._tag, "AuthorizationDenied")
     }).pipe(
       Effect.provide(Layer.mergeAll(live, store, database)),
@@ -893,7 +917,7 @@ describe("WebSocket synchronization", () => {
       const replyRows = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM cluster_replies`
       assert.deepStrictEqual([messageRows[0]?.count, replyRows[0]?.count], [0, 0])
 
-      const page = yield* remote.pull(pullRequest())
+      const page = yield* pipe(pullRequest(), (pullRequestValue) => remote.pull(pullRequestValue))
       if (!("_tag" in page)) assert.fail("expected bootstrap")
       const bootstrap = yield* remote.bootstrap({
         spaceId,
@@ -906,9 +930,13 @@ describe("WebSocket synchronization", () => {
         afterOrdinal: -1,
         limit: 10
       })
-      assert.deepStrictEqual(bootstrap.entries.map((entry) => entry.change._tag), ["Upsert"])
+      pipe(bootstrap.entries.map((entry) => entry.change._tag), (tags) => assert.deepStrictEqual(tags, ["Upsert"]))
 
-      const denied = yield* remote.pull(pullRequest(forbiddenSpaceId)).pipe(Effect.flip)
+      const denied = yield* pipe(
+        pullRequest(forbiddenSpaceId),
+        (pullRequestValue) => remote.pull(pullRequestValue),
+        failureOf
+      )
       assert.strictEqual(denied._tag, "AuthorizationDenied")
 
       const forbiddenIdentity = { ...identity, spaceId: forbiddenSpaceId }
@@ -948,7 +976,7 @@ describe("WebSocket synchronization", () => {
       MutableRef.set(readAuthorized, false)
       yield* TestClock.adjust("500 millis")
 
-      const denied = yield* Fiber.join(watching).pipe(Effect.flip)
+      const denied = yield* Fiber.join(watching).pipe(failureOf)
       assert.strictEqual(denied._tag, "AuthorizationDenied")
     }).pipe(
       Effect.ensuring(Effect.sync(() => MutableRef.set(readAuthorized, true))),
@@ -981,7 +1009,10 @@ describe("WebSocket synchronization", () => {
       assert.strictEqual(receipt._tag, "Rejected")
       if (receipt._tag === "Rejected") {
         assert.strictEqual(receipt.origin, "Authorization")
-        assert.deepStrictEqual(receipt.rejection, { reason: "admin role requires elevated access" })
+        assert.deepStrictEqual(receipt.rejection, {
+          _tag: "TestAuthorizationError",
+          reason: "admin role requires elevated access"
+        })
       }
     }).pipe(
       Effect.provide(live),
@@ -1003,7 +1034,7 @@ describe("WebSocket synchronization", () => {
       }
       yield* presence.publish(update)
       const value = yield* Fiber.join(received)
-      assert.deepStrictEqual(Option.getOrUndefined(value), update)
+      pipe(Option.getOrUndefined(value), (presenceUpdate) => assert.deepStrictEqual(presenceUpdate, update))
     }).pipe(TestClock.withLive, Effect.provide(live)))
 
   it.effect("returns and replays a bounded terminal rejection for an oversized private result", () =>
@@ -1040,7 +1071,7 @@ describe("WebSocket synchronization", () => {
           limit: Protocol.maximumReceiptBytes
         })
       }
-      const page = yield* remote.pull(pullRequest())
+      const page = yield* pipe(pullRequest(), (pullRequestValue) => remote.pull(pullRequestValue))
       if (!("_tag" in page)) assert.fail("expected bootstrap")
       assert.strictEqual(page.manifest.entityCount, 0)
     }).pipe(

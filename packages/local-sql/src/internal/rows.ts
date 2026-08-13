@@ -1,9 +1,10 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import { pipe } from "effect/Function"
 import * as Schema from "effect/Schema"
 
-const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
-const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
+const NonNegativeInt = pipe(Schema.isGreaterThanOrEqualTo(0), (check) => Schema.Int.check(check))
+const PositiveInt = pipe(Schema.isGreaterThan(0), (check) => Schema.Int.check(check))
 
 export const ClientMetaRow = Schema.Struct({
   space_id: Identity.SpaceId,

@@ -6,6 +6,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -31,19 +32,14 @@ export type Handlers<D extends Definition.Any,> = D["queries"][number] extends i
   ? Q extends Query.Query<infer Name, infer P, infer A, infer E> ? Query.HandlerService<Name, P, A, E> : never
   : never
 
-type Handler<Q extends Query.Any,> = Query.HandlerService<
-  Q["name"],
-  Q["payloadSchema"],
-  Q["successSchema"],
-  Q["errorSchema"]
->
+const NonNegativeInt = pipe(Schema.isGreaterThanOrEqualTo(0), (check) => Schema.Int.check(check))
 
 const SchemaFenceRow = Schema.Struct({
   definition_hash: Schema.String,
   schema_version: Identity.SchemaVersion,
   schema_hash: Identity.SchemaHash,
-  active_schema_generation: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  active_projection_generation: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  active_schema_generation: NonNegativeInt,
+  active_projection_generation: NonNegativeInt,
   target_schema_version: Schema.NullOr(Identity.SchemaVersion),
   target_schema_hash: Schema.NullOr(Identity.SchemaHash),
   migration_hash: Schema.NullOr(Identity.SchemaHash)
@@ -53,8 +49,7 @@ export const layer = <D extends Definition.Any,>(
   definition: D,
   spaceId: Identity.SpaceId
 ): Layer.Layer<QueryExecutor, never, SqlClient.SqlClient | Handlers<D> | QueryReactivity.QueryReactivity> =>
-  Layer.effect(
-    QueryExecutor,
+  pipe(
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
       const queryReactivity = yield* QueryReactivity.QueryReactivity
@@ -112,9 +107,12 @@ export const layer = <D extends Definition.Any,>(
       const execute = <Q extends Query.Any,>(
         query: Q,
         payload: Q["payloadSchema"]["Type"]
-      ): Effect.Effect<Q["successSchema"]["Type"], ReplicaError.ReplicaError | Q["errorSchema"]["Type"]> => {
+      ): Effect.Effect<
+        Q["successSchema"]["Type"],
+        ReplicaError.ReplicaError | Q["errorSchema"]["Type"]
+      > => {
         const key = ReactivityKey.query(spaceId, query.name, payload)
-        return sql.withTransaction(Effect.gen(function*() {
+        return Effect.gen(function*() {
           const fence = yield* findFence(undefined).pipe(Effect.mapError(StorageUnavailable.make))
           if (
             fence.schema_version !== definition.schemaIdentity.version ||
@@ -139,7 +137,15 @@ export const layer = <D extends Definition.Any,>(
           if (registered === undefined || registered !== query) {
             return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown query: ${query.name}` })
           }
-          const handler = Context.getUnsafe<Handler<Q>, any>(registered.handler)(context)
+          const handler = Context.getUnsafe<
+            Query.HandlerService<
+              Q["name"],
+              Q["payloadSchema"],
+              Q["successSchema"],
+              Q["errorSchema"]
+            >,
+            any
+          >(query.handler)(context)
           const payloadSchema = Schema.make<
             Schema.Codec<
               Q["payloadSchema"]["Type"],
@@ -172,7 +178,8 @@ export const layer = <D extends Definition.Any,>(
           const value = yield* Codec.decode(successSchema, encoded)
           yield* queryReactivity.record(key, reads)
           return value
-        })).pipe(
+        }).pipe(
+          sql.withTransaction,
           Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
           Effect.withSpan("QueryExecutor.execute", {
             attributes: { "query.name": query.name }
@@ -180,5 +187,6 @@ export const layer = <D extends Definition.Any,>(
         )
       }
       return QueryExecutor.of({ execute })
-    })
+    }),
+    Layer.effect(QueryExecutor)
   )

@@ -9,6 +9,7 @@ import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
@@ -26,9 +27,13 @@ import * as LocalStore from "./LocalStore.js"
 import * as Reconciler from "./Reconciler.js"
 import * as SyncEngine from "./SyncEngine.js"
 
-export const ReconciliationGeneration = Schema.Int.check(
+export const ReconciliationGeneration = pipe(
   Schema.isGreaterThan(0),
-  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)
+  (greaterThanZero) =>
+    pipe(
+      Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
+      (maximumSafeInteger) => Schema.Int.check(greaterThanZero, maximumSafeInteger)
+    )
 )
 
 const PayloadFields = {
@@ -62,7 +67,8 @@ const workflowRegistrationStateSymbol = Symbol.for(
   "@lucas-barake/effect-local-sql/ReconciliationWorkflow/WorkflowRegistrationState"
 )
 
-const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
+const Json = Schema.fromJsonString(Schema.Unknown)
+const encodeJson = Schema.encodeEffect(Json)
 
 type EngineWithRegistrationState = WorkflowEngine.WorkflowEngine["Service"] & {
   [workflowRegistrationStateSymbol]?: WorkflowRegistrationState
@@ -72,7 +78,7 @@ const replicaIdentityKey = (options: {
   readonly spaceId: Identity.SpaceId
   readonly clientId: Identity.ClientId
   readonly membershipIncarnation: Identity.MembershipIncarnation
-}) => encodeJson([options.spaceId, options.clientId, options.membershipIncarnation])
+}) => encodeJson([options.spaceId, options.clientId, options.membershipIncarnation]).pipe(Effect.orDie)
 
 const workflowRegistrationState = (
   engine: WorkflowEngine.WorkflowEngine["Service"]
@@ -89,17 +95,19 @@ export const make = ({
   membershipIncarnation,
   schemaIdentity: workflowSchemaIdentity,
   spaceId
-}: ReplicaIdentity) =>
-  Workflow.make(
-    `effect-local/ReconcileReplica/v4/${
-      encodeJson([workflowSchemaIdentity, spaceId, clientId, membershipIncarnation])
-    }`,
+}: ReplicaIdentity) => {
+  const workflowIdentityValues = [workflowSchemaIdentity, spaceId, clientId, membershipIncarnation]
+  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Workflow.make requires its durable tag as a synchronous string.
+  const encodeWorkflowIdentity = Schema.encodeSync(Json)
+  const workflowIdentity = encodeWorkflowIdentity(workflowIdentityValues)
+  return Workflow.make(
+    `effect-local/ReconcileReplica/v4/${workflowIdentity}`,
     {
       payload: PayloadFields,
       success: Schema.Void,
       error: ReplicaError.ReplicaError,
-      idempotencyKey: (payload) =>
-        encodeJson([
+      idempotencyKey: (payload) => {
+        const key = [
           payload.schemaIdentity,
           payload.spaceId,
           payload.clientId,
@@ -107,9 +115,14 @@ export const make = ({
           payload.scope,
           payload.scopeGeneration,
           payload.generation
-        ])
+        ]
+        // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Workflow.idempotencyKey must synchronously return a string.
+        const encodeKey = Schema.encodeSync(Json)
+        return encodeKey(key)
+      }
     }
   )
+}
 
 export const Execution = Schema.Struct({
   ...PayloadFields,
@@ -150,19 +163,13 @@ export const validateExecution = (execution: Execution): Effect.Effect<Payload, 
   )
 
 export const poll = (execution: Execution) =>
-  validateExecution(execution).pipe(
-    Effect.andThen(make(execution).poll(execution.executionId))
-  )
+  validateExecution(execution).pipe(Effect.andThen(make(execution).poll(execution.executionId)))
 
 export const interrupt = (execution: Execution) =>
-  validateExecution(execution).pipe(
-    Effect.andThen(make(execution).interrupt(execution.executionId))
-  )
+  validateExecution(execution).pipe(Effect.andThen(make(execution).interrupt(execution.executionId)))
 
 export const resume = (execution: Execution) =>
-  validateExecution(execution).pipe(
-    Effect.andThen(make(execution).resume(execution.executionId))
-  )
+  validateExecution(execution).pipe(Effect.andThen(make(execution).resume(execution.executionId)))
 
 export interface Options {
   readonly definition: Definition.Any
@@ -185,23 +192,20 @@ class RetryConfiguration extends Context.Service<RetryConfiguration, RetryConfig
 ) {}
 
 const layerRetryConfiguration = (options: Options) =>
-  Layer.effect(
-    RetryConfiguration,
-    Effect.gen(function*() {
-      const maximumAttempts = options.maximumAttempts ?? 8
-      if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts <= 0) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "maximumAttempts",
-          message: "maximumAttempts must be a positive safe integer"
-        })
-      }
-      const retryTiming = yield* Configuration.retryTiming(options)
-      return RetryConfiguration.of({
-        ...retryTiming,
-        maximumAttempts
+  Effect.gen(function*() {
+    const maximumAttempts = options.maximumAttempts ?? 8
+    if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts <= 0) {
+      return yield* new ReplicaError.InvalidConfiguration({
+        option: "maximumAttempts",
+        message: "maximumAttempts must be a positive safe integer"
       })
+    }
+    const retryTiming = yield* Configuration.retryTiming(options)
+    return RetryConfiguration.of({
+      ...retryTiming,
+      maximumAttempts
     })
-  )
+  }).pipe(Layer.effect(RetryConfiguration))
 
 const handler = (
   options: Options,
@@ -223,10 +227,11 @@ const handler = (
     if (payload.membershipIncarnation !== local.membershipIncarnation) {
       return yield* new ReplicaError.SpaceUnavailable({ spaceId: payload.spaceId })
     }
-    const registered = registrationState.schemas.get(replicaIdentityKey({
+    const registeredKey = yield* replicaIdentityKey({
       ...options,
       membershipIncarnation: local.membershipIncarnation
-    }))
+    })
+    const registered = registrationState.schemas.get(registeredKey)
     if (
       registered !== undefined &&
       (registered.version !== options.definition.schemaIdentity.version ||
@@ -291,10 +296,14 @@ const handler = (
         }
       })
 
-    yield* runActivity("sync", validateScope.pipe(Effect.andThen(reconciliation.sync), Effect.andThen(validateScope)))
-    yield* runActivity(
-      "complete",
-      validateScope.pipe(Effect.andThen(local.completeReconciliation(payload.generation)))
+    yield* validateScope.pipe(
+      Effect.andThen(reconciliation.sync),
+      Effect.andThen(validateScope),
+      (execute) => runActivity("sync", execute)
+    )
+    yield* validateScope.pipe(
+      Effect.andThen(local.completeReconciliation(payload.generation)),
+      (execute) => runActivity("complete", execute)
     )
     yield* reconciliation.succeeded
     return undefined
@@ -307,81 +316,83 @@ const layerRegistrationWithConfiguration = (
   ReplicaError.InvalidConfiguration,
   LocalStore.Store | Reconciler.Reconciliation | RetryConfiguration | WorkflowEngine.WorkflowEngine
 > =>
-  Layer.unwrap(
-    Effect.gen(function*() {
-      const configuration = yield* RetryConfiguration
-      const engine = yield* WorkflowEngine.WorkflowEngine
-      const local = yield* LocalStore.Store
-      const currentScope = yield* Effect.scope
-      const registrationScope = Option.getOrElse(
-        yield* Effect.serviceOption(RegistrationScope),
-        () => currentScope
-      )
-      const evolution = options.evolution ?? Evolution.make({ current: options.definition })
-      const registrationState = workflowRegistrationState(engine)
-      const identity = {
-        ...options,
-        membershipIncarnation: local.membershipIncarnation
-      }
-      const replicaKey = replicaIdentityKey(identity)
-      yield* engine.register(
-        make({
-          schemaIdentity: schemaIdentityKey(options.definition),
-          spaceId: options.spaceId,
-          clientId: options.clientId,
-          membershipIncarnation: local.membershipIncarnation
-        }),
-        handler(options, configuration, registrationState)
-      ).pipe(Scope.provide(registrationScope))
-      const registered = registrationState.schemas.get(replicaKey)
-      if (
-        registered !== undefined &&
-        registered.version === options.definition.schemaIdentity.version &&
-        registered.hash !== options.definition.schemaIdentity.hash
-      ) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "definition",
-          message:
-            `Reconciliation workflow schema version ${registered.version} is already registered with another hash`
-        })
-      }
-      if (registered === undefined || registered.version < options.definition.schemaIdentity.version) {
-        registrationState.schemas.set(replicaKey, options.definition.schemaIdentity)
-      }
-      const legacySchemas = new Map<string, Definition.Any>()
-      for (const step of evolution.steps) {
-        legacySchemas.set(schemaIdentityKey(step.from), step.from)
-      }
-      for (const baseline of evolution.legacyBaselines) {
-        legacySchemas.set(schemaIdentityKey(baseline.definition), baseline.definition)
-      }
-      legacySchemas.delete(schemaIdentityKey(options.definition))
-      for (const [legacyIdentity, definition] of legacySchemas) {
-        yield* engine.register(
-          make({
-            schemaIdentity: legacyIdentity,
-            spaceId: options.spaceId,
-            clientId: options.clientId,
-            membershipIncarnation: local.membershipIncarnation
-          }),
-          () =>
-            Effect.gen(function*() {
-              const current = registrationState.schemas.get(replicaKey) ?? options.definition.schemaIdentity
-              return yield* new ReplicaError.StaleSchema({
-                expectedVersion: current.version,
-                expectedHash: current.hash,
-                actualVersion: definition.schemaIdentity.version,
-                actualHash: definition.schemaIdentity.hash
-              })
-            })
-        ).pipe(Scope.provide(registrationScope))
-      }
-      return Layer.succeed(Registration, Registration.of({ registered: true }))
+  Effect.gen(function*() {
+    const configuration = yield* RetryConfiguration
+    const engine = yield* WorkflowEngine.WorkflowEngine
+    const local = yield* LocalStore.Store
+    const currentScope = yield* Effect.scope
+    const registrationScope = Option.getOrElse(
+      yield* Effect.serviceOption(RegistrationScope),
+      () => currentScope
+    )
+    const evolution = options.evolution ?? Evolution.make({ current: options.definition })
+    const registrationState = workflowRegistrationState(engine)
+    const identity = {
+      ...options,
+      membershipIncarnation: local.membershipIncarnation
+    }
+    const replicaKey = yield* replicaIdentityKey(identity)
+    const workflow = make({
+      schemaIdentity: schemaIdentityKey(options.definition),
+      spaceId: options.spaceId,
+      clientId: options.clientId,
+      membershipIncarnation: local.membershipIncarnation
     })
-  )
+    const workflowHandler = handler(options, configuration, registrationState)
+    yield* engine.register(workflow, workflowHandler).pipe(Scope.provide(registrationScope))
+    const registered = registrationState.schemas.get(replicaKey)
+    if (
+      registered !== undefined &&
+      registered.version === options.definition.schemaIdentity.version &&
+      registered.hash !== options.definition.schemaIdentity.hash
+    ) {
+      return yield* new ReplicaError.InvalidConfiguration({
+        option: "definition",
+        message: `Reconciliation workflow schema version ${registered.version} is already registered with another hash`
+      })
+    }
+    if (registered === undefined || registered.version < options.definition.schemaIdentity.version) {
+      registrationState.schemas.set(replicaKey, options.definition.schemaIdentity)
+    }
+    const legacySchemas = new Map<string, Definition.Any>()
+    for (const step of evolution.steps) {
+      const legacySchemaIdentity = schemaIdentityKey(step.from)
+      legacySchemas.set(legacySchemaIdentity, step.from)
+    }
+    for (const baseline of evolution.legacyBaselines) {
+      const legacySchemaIdentity = schemaIdentityKey(baseline.definition)
+      legacySchemas.set(legacySchemaIdentity, baseline.definition)
+    }
+    const currentIdentity = schemaIdentityKey(options.definition)
+    legacySchemas.delete(currentIdentity)
+    for (const [legacyIdentity, definition] of legacySchemas) {
+      const legacyWorkflow = make({
+        schemaIdentity: legacyIdentity,
+        spaceId: options.spaceId,
+        clientId: options.clientId,
+        membershipIncarnation: local.membershipIncarnation
+      })
+      yield* engine.register(
+        legacyWorkflow,
+        () =>
+          Effect.gen(function*() {
+            const current = registrationState.schemas.get(replicaKey) ?? options.definition.schemaIdentity
+            return yield* new ReplicaError.StaleSchema({
+              expectedVersion: current.version,
+              expectedHash: current.hash,
+              actualVersion: definition.schemaIdentity.version,
+              actualHash: definition.schemaIdentity.hash
+            })
+          })
+      ).pipe(Scope.provide(registrationScope))
+    }
+    return pipe(Registration.of({ registered: true }), Layer.succeed(Registration))
+  }).pipe(Layer.unwrap)
 
-export const layerRegistration = (options: Options) =>
-  layerRegistrationWithConfiguration(options).pipe(Layer.provide(layerRetryConfiguration(options)))
+export const layerRegistration = (options: Options) => {
+  const registration = layerRegistrationWithConfiguration(options)
+  return registration.pipe(Layer.provide(layerRetryConfiguration(options)))
+}
 
 const layerSchedulerWithConfiguration = (
   options: Options
@@ -395,233 +406,236 @@ const layerSchedulerWithConfiguration = (
   | SyncEngine.SyncEngine
   | WorkflowEngine.WorkflowEngine
 > =>
-  Layer.effect(
-    Reconciler.Reconciler,
-    Effect.gen(function*() {
-      const configuration = yield* RetryConfiguration
-      const local = yield* LocalStore.Store
-      const reconciliation = yield* Reconciler.Reconciliation
-      yield* Registration
-      const remote = yield* SyncEngine.SyncEngine
-      const engine = yield* WorkflowEngine.WorkflowEngine
-      const wake = yield* Queue.sliding<void>(1)
-      const activeExecution = yield* Ref.make<
-        Option.Option<{
-          readonly workflow: ReturnType<typeof make>
-          readonly executionId: string
-        }>
-      >(Option.none())
-      const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
-      const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
-      const authenticationPause = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(Option.none())
-      let authenticationEpoch = 0
-      const awaitAuthenticationChange = Ref.get(authenticationPause).pipe(
-        Effect.flatMap(Option.match({
-          onNone: () => Effect.void,
-          onSome: Deferred.await
+  Effect.gen(function*() {
+    const configuration = yield* RetryConfiguration
+    const local = yield* LocalStore.Store
+    const reconciliation = yield* Reconciler.Reconciliation
+    yield* Registration
+    const remote = yield* SyncEngine.SyncEngine
+    const engine = yield* WorkflowEngine.WorkflowEngine
+    const wake = yield* Queue.sliding<void>(1)
+    const inactiveExecution = Option.none()
+    const activeExecution = yield* Ref.make<
+      Option.Option<{
+        readonly workflow: ReturnType<typeof make>
+        readonly executionId: string
+      }>
+    >(inactiveExecution)
+    const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
+    const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
+    const authenticationPause = yield* pipe(
+      Option.none(),
+      Ref.make<Option.Option<Deferred.Deferred<void>>>
+    )
+    let authenticationEpoch = 0
+    const awaitAuthenticationChange = Ref.get(authenticationPause).pipe(
+      Effect.flatMap(Option.match({
+        onNone: () => Effect.void,
+        onSome: Deferred.await
+      }))
+    )
+    const admitCredentialPause = Effect.gen(function*() {
+      const candidate = yield* Deferred.make<void>()
+      const admission = yield* authenticationPause.pipe(
+        Ref.modify(Option.match({
+          onNone: () => [{ gate: candidate, owner: true }, Option.some(candidate)],
+          onSome: (gate) => [{ gate, owner: false }, Option.some(gate)]
         }))
       )
-      const admitCredentialPause = Effect.uninterruptible(Effect.gen(function*() {
-        const candidate = yield* Deferred.make<void>()
-        const admission = yield* Ref.modify(authenticationPause, (
-          current
-        ): readonly [
-          { readonly gate: Deferred.Deferred<void>; readonly owner: boolean },
-          Option.Option<Deferred.Deferred<void>>
-        ] =>
-          Option.match(current, {
-            onNone: () => [{ gate: candidate, owner: true }, Option.some(candidate)],
-            onSome: (gate) => [{ gate, owner: false }, Option.some(gate)]
-          }))
-        if (admission.owner) authenticationEpoch += 1
-        return admission
-      }))
-      const startCredentialWait = (
-        generation: number,
-        admission: { readonly gate: Deferred.Deferred<void>; readonly owner: boolean }
-      ) => {
-        if (!admission.owner) return Effect.void
-        return remote.waitForCredentialChange(generation).pipe(
-          Effect.andThen(Effect.uninterruptible(Effect.gen(function*() {
-            const owned = yield* Ref.modify(authenticationPause, (current) => {
-              if (Option.isSome(current) && current.value === admission.gate) {
-                return [true, Option.none()] as const
-              }
-              return [false, current] as const
-            })
-            if (owned) yield* Deferred.succeed(admission.gate, undefined)
-          }))),
-          Effect.catchCause((cause) => {
-            if (Cause.hasInterruptsOnly(cause)) return Effect.void
-            return Effect.failCause(cause)
-          }),
-          Effect.forkScoped,
-          Effect.asVoid
-        )
-      }
+      if (admission.owner) authenticationEpoch += 1
+      return admission
+    }).pipe(Effect.uninterruptible)
+    const startCredentialWait = (
+      generation: number,
+      admission: { readonly gate: Deferred.Deferred<void>; readonly owner: boolean }
+    ) => {
+      if (!admission.owner) return Effect.void
+      const credentialChange = remote.waitForCredentialChange(generation)
+      return credentialChange.pipe(
+        Effect.andThen(Effect.uninterruptible(Effect.gen(function*() {
+          const owned = yield* Ref.modify(authenticationPause, (current) => {
+            if (Option.isSome(current) && current.value === admission.gate) {
+              return [true, Option.none()] as const
+            }
+            return [false, current] as const
+          })
+          if (owned) yield* Deferred.succeed(admission.gate, undefined)
+        }))),
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) return Effect.void
+          return Effect.failCause(cause)
+        }),
+        Effect.forkScoped,
+        Effect.asVoid
+      )
+    }
 
-      const supervise = Effect.gen(function*() {
-        let retryAttempt = 0
-        while (true) {
-          yield* Queue.take(wake)
-          yield* awaitAuthenticationChange
-          const result = yield* Effect.gen(function*() {
-            while (true) {
-              yield* awaitAuthenticationChange
-              const generations = yield* local.reconciliationGenerations
-              if (generations.completed >= generations.requested) return
-              const state = yield* local.replicationState
-              const payload = Payload.make({
-                schemaIdentity: schemaIdentityKey(options.definition),
-                spaceId: options.spaceId,
-                clientId: options.clientId,
-                membershipIncarnation: local.membershipIncarnation,
-                scope: state.scope,
-                scopeGeneration: state.scopeGeneration,
-                generation: generations.requested
-              })
-              const workflow = make(payload)
-              const activeExecutionId = yield* workflow.executionId(payload)
-              yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
-              yield* workflow.execute(payload).pipe(
-                Effect.ensuring(Ref.set(activeExecution, Option.none()))
-              )
-              retryAttempt = 0
-            }
-          }).pipe(Effect.result)
-          if (Result.isSuccess(result)) continue
-          const error = result.failure
-          if (error._tag === "CredentialRejected") {
-            if (error.credentialGeneration === undefined) {
-              yield* reconciliation.failed(error)
-              yield* Effect.logWarning("Rejected credential did not include its generation")
-              return
-            }
-            const admission = yield* admitCredentialPause
-            yield* reconciliation.failed(error)
-            yield* startCredentialWait(error.credentialGeneration, admission)
-            yield* Deferred.await(admission.gate)
+    const supervise = Effect.gen(function*() {
+      let retryAttempt = 0
+      while (true) {
+        yield* Queue.take(wake)
+        yield* awaitAuthenticationChange
+        const result = yield* Effect.gen(function*() {
+          while (true) {
+            yield* awaitAuthenticationChange
+            const generations = yield* local.reconciliationGenerations
+            if (generations.completed >= generations.requested) return
+            const state = yield* local.replicationState
+            const payload = Payload.make({
+              schemaIdentity: schemaIdentityKey(options.definition),
+              spaceId: options.spaceId,
+              clientId: options.clientId,
+              membershipIncarnation: local.membershipIncarnation,
+              scope: state.scope,
+              scopeGeneration: state.scopeGeneration,
+              generation: generations.requested
+            })
+            const workflow = make(payload)
+            const activeExecutionId = yield* workflow.executionId(payload)
+            const active = Option.some({ workflow, executionId: activeExecutionId })
+            yield* Ref.set(activeExecution, active)
+            const execution = workflow.execute(payload)
+            yield* execution.pipe(
+              Effect.ensuring(Ref.set(activeExecution, Option.none()))
+            )
             retryAttempt = 0
-            yield* requestAndNotify
-            continue
           }
-          const pause = yield* Ref.get(authenticationPause)
-          if (Option.isSome(pause)) {
-            yield* Deferred.await(pause.value)
-            yield* requestAndNotify
-            continue
+        }).pipe(Effect.result)
+        if (Result.isSuccess(result)) continue
+        const error = result.failure
+        if (error._tag === "CredentialRejected") {
+          if (error.credentialGeneration === undefined) {
+            yield* reconciliation.failed(error)
+            yield* Effect.logWarning("Rejected credential did not include its generation")
+            return
           }
+          const admission = yield* admitCredentialPause
           yield* reconciliation.failed(error)
-          if (
-            error._tag === "AuthenticatorUnavailable" ||
-            error._tag === "ServerUnavailable" ||
-            error._tag === "OperationTimeout"
-          ) {
-            retryAttempt += 1
-            yield* Effect.logWarning("Reconciliation supervisor will retry", error)
-            yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
-            yield* requestAndNotify
-            continue
-          }
-          yield* Effect.logWarning("Reconciliation supervisor stopped", error)
+          yield* startCredentialWait(error.credentialGeneration, admission)
+          yield* Deferred.await(admission.gate)
+          retryAttempt = 0
+          yield* requestAndNotify
           continue
         }
-      })
-
-      const supervisorFiber = yield* Effect.forkScoped(supervise)
-      const watch = Effect.gen(function*() {
-        let retryAttempt = 0
-        while (true) {
-          yield* awaitAuthenticationChange
-          const watchEpoch = authenticationEpoch
-          const result = yield* Stream.unwrap(local.replicationState.pipe(
-            Effect.map((state) =>
-              remote.watch({
-                spaceId: options.spaceId,
-                clientId: options.clientId,
-                schema: options.definition.schemaIdentity,
-                scope: state.scope,
-                scopeGeneration: state.scopeGeneration,
-                cursor: state.cursor
-              })
-            )
-          )).pipe(
-            Stream.runForEach(() => {
-              retryAttempt = 0
-              return requestAndNotify
-            }),
-            Effect.result
-          )
-          if (Result.isSuccess(result)) {
-            retryAttempt += 1
-            yield* requestAndNotify
-            yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
-            continue
-          }
-          const error = result.failure
-          if (watchEpoch !== authenticationEpoch) continue
-          const pause = yield* Ref.get(authenticationPause)
-          if (Option.isSome(pause) && error._tag !== "CredentialRejected") {
-            yield* Deferred.await(pause.value)
-            continue
-          }
-          if (error._tag === "CredentialRejected") {
-            if (error.credentialGeneration === undefined) {
-              yield* reconciliation.watchFailed(error)
-              yield* Effect.logWarning("Rejected watch credential did not include its generation")
-              return
-            }
-            const admission = yield* admitCredentialPause
-            yield* reconciliation.watchFailed(error)
-            yield* startCredentialWait(error.credentialGeneration, admission)
-            yield* Deferred.await(admission.gate)
-            retryAttempt = 0
-            continue
-          }
-          yield* reconciliation.watchFailed(error)
-          if (
-            error._tag === "AuthenticatorUnavailable" ||
-            error._tag === "ServerUnavailable" ||
-            error._tag === "OperationTimeout"
-          ) {
-            retryAttempt += 1
-            yield* Effect.logWarning("Sync watch will retry", error)
-            yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
-            yield* notify
-            continue
-          }
-          yield* Effect.logWarning("Sync watch stopped", error)
-          return
+        const pause = yield* Ref.get(authenticationPause)
+        if (Option.isSome(pause)) {
+          yield* Deferred.await(pause.value)
+          yield* requestAndNotify
+          continue
         }
-      })
-      const watchFiber = yield* Effect.forkScoped(watch)
-      yield* requestAndNotify
-      yield* Effect.addFinalizer(() =>
-        Fiber.interruptAll([supervisorFiber, watchFiber]).pipe(
-          Effect.andThen(Queue.shutdown(wake)),
-          Effect.asVoid
-        )
-      )
-
-      const shutdown = Effect.gen(function*() {
-        const active = yield* Ref.get(activeExecution)
-        const supervisorInterruption = yield* Effect.forkChild(Fiber.interrupt(supervisorFiber), {
-          startImmediately: true
-        })
-        if (Option.isSome(active)) {
-          const result = yield* engine.poll(active.value.workflow, active.value.executionId)
-          if (Option.isNone(result)) {
-            yield* engine.interruptUnsafe(active.value.workflow, active.value.executionId)
-          }
+        yield* reconciliation.failed(error)
+        if (
+          error._tag === "AuthenticatorUnavailable" ||
+          error._tag === "ServerUnavailable" ||
+          error._tag === "OperationTimeout"
+        ) {
+          retryAttempt += 1
+          yield* Effect.logWarning("Reconciliation supervisor will retry", error)
+          yield* pipe(Configuration.retryMillis(configuration, retryAttempt), Effect.sleep)
+          yield* requestAndNotify
+          continue
         }
-        yield* Fiber.join(supervisorInterruption)
-      })
-      return Reconciler.Reconciler.of({ sync: reconciliation.sync, notify, status: reconciliation.status, shutdown })
+        yield* Effect.logWarning("Reconciliation supervisor stopped", error)
+        continue
+      }
     })
-  )
 
-export const layerScheduler = (options: Options) =>
-  layerSchedulerWithConfiguration(options).pipe(Layer.provide(layerRetryConfiguration(options)))
+    const supervisorFiber = yield* Effect.forkScoped(supervise)
+    const watch = Effect.gen(function*() {
+      let retryAttempt = 0
+      while (true) {
+        yield* awaitAuthenticationChange
+        const watchEpoch = authenticationEpoch
+        const result = yield* local.replicationState.pipe(
+          Effect.map((state) =>
+            remote.watch({
+              spaceId: options.spaceId,
+              clientId: options.clientId,
+              schema: options.definition.schemaIdentity,
+              scope: state.scope,
+              scopeGeneration: state.scopeGeneration,
+              cursor: state.cursor
+            })
+          ),
+          Stream.unwrap,
+          Stream.runForEach(() => {
+            retryAttempt = 0
+            return requestAndNotify
+          }),
+          Effect.result
+        )
+        if (Result.isSuccess(result)) {
+          retryAttempt += 1
+          yield* requestAndNotify
+          yield* pipe(Configuration.retryMillis(configuration, retryAttempt), Effect.sleep)
+          continue
+        }
+        const error = result.failure
+        if (watchEpoch !== authenticationEpoch) continue
+        const pause = yield* Ref.get(authenticationPause)
+        if (Option.isSome(pause) && error._tag !== "CredentialRejected") {
+          yield* Deferred.await(pause.value)
+          continue
+        }
+        if (error._tag === "CredentialRejected") {
+          if (error.credentialGeneration === undefined) {
+            yield* reconciliation.watchFailed(error)
+            yield* Effect.logWarning("Rejected watch credential did not include its generation")
+            return
+          }
+          const admission = yield* admitCredentialPause
+          yield* reconciliation.watchFailed(error)
+          yield* startCredentialWait(error.credentialGeneration, admission)
+          yield* Deferred.await(admission.gate)
+          retryAttempt = 0
+          continue
+        }
+        yield* reconciliation.watchFailed(error)
+        if (
+          error._tag === "AuthenticatorUnavailable" ||
+          error._tag === "ServerUnavailable" ||
+          error._tag === "OperationTimeout"
+        ) {
+          retryAttempt += 1
+          yield* Effect.logWarning("Sync watch will retry", error)
+          yield* pipe(Configuration.retryMillis(configuration, retryAttempt), Effect.sleep)
+          yield* notify
+          continue
+        }
+        yield* Effect.logWarning("Sync watch stopped", error)
+        return
+      }
+    })
+    const watchFiber = yield* Effect.forkScoped(watch)
+    yield* requestAndNotify
+    yield* Effect.addFinalizer(() => {
+      const interruption = Fiber.interruptAll([supervisorFiber, watchFiber])
+      return interruption.pipe(
+        Effect.andThen(Queue.shutdown(wake)),
+        Effect.asVoid
+      )
+    })
+
+    const shutdown = Effect.gen(function*() {
+      const active = yield* Ref.get(activeExecution)
+      const supervisorInterruption = yield* Fiber.interrupt(supervisorFiber).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      if (Option.isSome(active)) {
+        const result = yield* engine.poll(active.value.workflow, active.value.executionId)
+        if (Option.isNone(result)) {
+          yield* engine.interruptUnsafe(active.value.workflow, active.value.executionId)
+        }
+      }
+      yield* Fiber.join(supervisorInterruption)
+    })
+    return Reconciler.Reconciler.of({ sync: reconciliation.sync, notify, status: reconciliation.status, shutdown })
+  }).pipe(Layer.effect(Reconciler.Reconciler))
+
+export const layerScheduler = (options: Options) => {
+  const scheduler = layerSchedulerWithConfiguration(options)
+  return scheduler.pipe(Layer.provide(layerRetryConfiguration(options)))
+}
 
 export const layer = (
   options: Options

@@ -3,6 +3,7 @@ import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
@@ -54,7 +55,7 @@ describe("SyncClient", () => {
     }))
 
   it.effect("forgets routing for an interrupted socket request", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const incoming = yield* Queue.unbounded<{
         readonly message: string | Uint8Array
         readonly processed: Deferred.Deferred<void>
@@ -115,10 +116,10 @@ describe("SyncClient", () => {
 
       assert.deepStrictEqual(yield* Ref.get(firstClientResponses), ["Exit"])
       assert.deepStrictEqual(yield* Ref.get(secondClientResponses), ["Exit"])
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("forgets routing after a socket failure", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const incoming = yield* Queue.unbounded<{
         readonly message: string | Uint8Array
         readonly processed: Deferred.Deferred<void>
@@ -205,10 +206,10 @@ describe("SyncClient", () => {
 
       assert.deepStrictEqual(yield* Ref.get(firstClientResponses), ["ClientProtocolError", "Exit"])
       assert.deepStrictEqual(yield* Ref.get(secondClientResponses), ["ClientProtocolError", "Exit"])
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("fails active routes before retrying a socket open error", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const incoming = yield* Queue.unbounded<{
         readonly message: string | Uint8Array
         readonly processed: Deferred.Deferred<void>
@@ -296,10 +297,10 @@ describe("SyncClient", () => {
 
       assert.deepStrictEqual(yield* Ref.get(firstClientResponses), ["ClientProtocolError", "Exit"])
       assert.deepStrictEqual(yield* Ref.get(secondClientResponses), ["ClientProtocolError", "Exit"])
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("accepts a valid interrupted exit", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const incoming = yield* Queue.unbounded<string | Uint8Array>()
       const socketReady = yield* Deferred.make<void>()
       const responseReceived = yield* Deferred.make<void>()
@@ -319,11 +320,10 @@ describe("SyncClient", () => {
           }),
         writer: Effect.succeed(() => Effect.void)
       })
-      const context = yield* Layer.build(
-        SyncClient.layerProtocolSocket().pipe(
-          Layer.provide(Layer.succeed(Socket.Socket, socket)),
-          Layer.provide(RpcSerialization.layerJson)
-        )
+      const context = yield* SyncClient.layerProtocolSocket().pipe(
+        Layer.provide(Layer.succeed(Socket.Socket, socket)),
+        Layer.provide(RpcSerialization.layerJson),
+        Layer.build
       )
       const protocol = Context.get(context, RpcClient.Protocol)
       const responses = yield* Ref.make<Array<string>>([])
@@ -339,21 +339,21 @@ describe("SyncClient", () => {
         payload: undefined,
         headers: []
       })
-      yield* Queue.offer(
-        incoming,
+      yield* pipe(
         RpcSerialization.json.makeUnsafe().encode({
           _tag: "Exit",
           requestId: 1,
           exit: { _tag: "Failure", cause: [{ _tag: "Interrupt", fiberId: null }] }
-        })!
+        })!,
+        (message) => Queue.offer(incoming, message)
       )
       yield* Deferred.await(responseReceived)
 
       assert.deepStrictEqual(yield* Ref.get(responses), ["Exit"])
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("preserves an unknown socket failure cause", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const socketReady = yield* Deferred.make<void>()
       const failSocket = yield* Deferred.make<void>()
       const responseReceived = yield* Deferred.make<void>()
@@ -367,11 +367,10 @@ describe("SyncClient", () => {
           }),
         writer: Effect.succeed(() => Effect.void)
       })
-      const context = yield* Layer.build(
-        SyncClient.layerProtocolSocket({ retryPolicy: Schedule.recurs(0) }).pipe(
-          Layer.provide(Layer.succeed(Socket.Socket, socket)),
-          Layer.provide(RpcSerialization.layerJson)
-        )
+      const context = yield* SyncClient.layerProtocolSocket({ retryPolicy: Schedule.recurs(0) }).pipe(
+        Layer.provide(Layer.succeed(Socket.Socket, socket)),
+        Layer.provide(RpcSerialization.layerJson),
+        Layer.build
       )
       const protocol = Context.get(context, RpcClient.Protocol)
       const causes = yield* Ref.make<Array<unknown>>([])
@@ -394,10 +393,10 @@ describe("SyncClient", () => {
       yield* Deferred.await(responseReceived)
 
       const [cause] = yield* Ref.get(causes)
-      assert.isTrue(Cause.isCause(cause))
+      pipe(Cause.isCause(cause), (isCause) => assert.isTrue(isCause))
       if (!Cause.isCause(cause)) return
       const defect = Cause.findDefect(cause)
       assert.isTrue(defect._tag === "Success")
       if (defect._tag === "Success") assert.strictEqual(defect.success, "socket defect")
-    })))
+    }).pipe(Effect.scoped))
 })

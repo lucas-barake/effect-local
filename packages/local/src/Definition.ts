@@ -72,9 +72,10 @@ export function make(options: {
     success: SchemaDescriptor.make(mutation.successSchema),
     rejection: SchemaDescriptor.make(mutation.rejectionSchema)
   })).toSorted(byName)
+  const schemaHash = Canonical.hash({ format: 1, models, mutations })
   const schemaIdentity = Identity.SchemaIdentity.make({
     version,
-    hash: Identity.SchemaHash.make(Canonical.hash({ format: 1, models, mutations }))
+    hash: Identity.SchemaHash.make(schemaHash)
   })
   const hash = Canonical.hash({
     format: 2,

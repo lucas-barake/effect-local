@@ -2,6 +2,7 @@ import * as Clock from "effect/Clock"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import { pipe } from "effect/Function"
 import * as MutableHashMap from "effect/MutableHashMap"
 import * as Option from "effect/Option"
 import * as Scope from "effect/Scope"
@@ -19,7 +20,11 @@ export interface Snapshot {
   readonly completed: number
 }
 
-export interface Coordinator<K, A, E,> {
+interface TaggedError {
+  readonly _tag: string
+}
+
+export interface Coordinator<K, A, E extends TaggedError,> {
   readonly authorize: (
     key: K,
     lookup: (key: K) => Effect.Effect<A, E>
@@ -33,7 +38,7 @@ export interface Coordinator<K, A, E,> {
   readonly snapshot: Effect.Effect<Snapshot>
 }
 
-export interface Options<E,> {
+export interface Options<E extends TaggedError,> {
   readonly refreshIntervalNanos: bigint
   readonly lookupTimeoutNanos: bigint
   readonly onLookupTimeout: () => E
@@ -43,11 +48,11 @@ export interface Options<E,> {
   readonly completedCacheCapacity: number
 }
 
-interface Pending<A, E,> {
+interface Pending<A, E extends TaggedError,> {
   readonly deferred: Deferred.Deferred<Success<A>, E>
 }
 
-type Registration<A, E,> =
+type Registration<A, E extends TaggedError,> =
   | { readonly _tag: "Cached"; readonly success: Success<A> }
   | { readonly _tag: "Follower"; readonly pending: Pending<A, E> }
   | { readonly _tag: "Leader"; readonly pending: Pending<A, E> }
@@ -69,7 +74,9 @@ const pruneCompleted = <K, A,>(
   }
 }
 
-export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K, A, E>, never, Scope.Scope> =>
+export const make = <K, A, E extends TaggedError,>(
+  options: Options<E>
+): Effect.Effect<Coordinator<K, A, E>, never, Scope.Scope> =>
   Effect.gen(function*() {
     const ownerScope = yield* Effect.scope
     const clock = yield* Clock.Clock
@@ -79,9 +86,8 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
     let nextGeneration = 0n
     let requesting = 0
 
-    yield* Scope.addFinalizer(
-      ownerScope,
-      Effect.sync(() => MutableHashMap.clear(completed))
+    yield* Effect.sync(() => MutableHashMap.clear(completed)).pipe(
+      (finalizer) => Scope.addFinalizer(ownerScope, finalizer)
     )
 
     const register = (
@@ -149,26 +155,23 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
       registered: Pending<A, E>
     ): Effect.Effect<void> =>
       Effect.uninterruptibleMask((restore) =>
-        restore(
-          Effect.suspend(() => {
-            const expiresAtNanos = clock.monotonicTimeNanosUnsafe() + options.lookupTimeoutNanos
-            return Semaphore.withPermit(
-              semaphore,
-              Effect.suspend(() => {
-                if (clock.monotonicTimeNanosUnsafe() >= expiresAtNanos) {
-                  return Effect.fail(options.onLookupTimeout())
-                }
-                return lookup(key)
-              })
-            ).pipe(
-              Effect.timeoutOption(options.lookupTimeoutNanos),
-              Effect.flatMap(Option.match({
-                onNone: () => Effect.fail(options.onLookupTimeout()),
-                onSome: Effect.succeed
-              }))
-            )
-          })
-        ).pipe(
+        Effect.suspend(() => {
+          const expiresAtNanos = clock.monotonicTimeNanosUnsafe() + options.lookupTimeoutNanos
+          return Effect.suspend(() => {
+            if (clock.monotonicTimeNanosUnsafe() >= expiresAtNanos) {
+              return pipe(options.onLookupTimeout(), Effect.fail)
+            }
+            return lookup(key)
+          }).pipe(
+            Semaphore.withPermit(semaphore),
+            Effect.timeoutOption(options.lookupTimeoutNanos),
+            Effect.flatMap(Option.match({
+              onNone: () => Effect.fail(options.onLookupTimeout()),
+              onSome: Effect.succeed
+            }))
+          )
+        }).pipe(
+          (effect) => restore(effect),
           Effect.exit,
           Effect.flatMap((exit) => complete(key, registered, afterGeneration, exit))
         )
@@ -190,7 +193,9 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
             return register(key, afterGeneration).pipe(
               Effect.flatMap((registration) => {
                 if (registration._tag === "Cached") return Effect.succeed(registration.success)
-                if (registration._tag === "AtCapacity") return Effect.fail(options.onPendingCapacityExceeded())
+                if (registration._tag === "AtCapacity") {
+                  return Effect.fail(options.onPendingCapacityExceeded())
+                }
                 if (registration._tag === "Leader") {
                   return run(key, afterGeneration, lookup, registration.pending).pipe(
                     Effect.forkIn(ownerScope, { startImmediately: true }),
@@ -212,11 +217,13 @@ export const make = <K, A, E,>(options: Options<E>): Effect.Effect<Coordinator<K
       refresh: (key, generation, lookup) => request(key, generation, lookup),
       current: (key) =>
         Effect.sync(() => {
-          pruneCompleted(completed, clock.monotonicTimeNanosUnsafe(), options.completedCacheCapacity)
+          const nowNanos = clock.monotonicTimeNanosUnsafe()
+          pruneCompleted(completed, nowNanos, options.completedCacheCapacity)
           return MutableHashMap.get(completed, key)
         }),
       snapshot: Effect.sync(() => {
-        pruneCompleted(completed, clock.monotonicTimeNanosUnsafe(), options.completedCacheCapacity)
+        const nowNanos = clock.monotonicTimeNanosUnsafe()
+        pruneCompleted(completed, nowNanos, options.completedCacheCapacity)
         return {
           pending: MutableHashMap.size(pending),
           requesting,

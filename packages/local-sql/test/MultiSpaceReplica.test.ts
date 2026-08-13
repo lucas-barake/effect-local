@@ -43,17 +43,15 @@ const clientHistory = {
   migration: { retryDelay: "1 millis", maximumAttempts: 8 }
 } satisfies Omit<SqlReplica.Options<typeof Domain.definition>, "definition" | "clientId">
 
-const remote = Layer.succeed(
-  SyncEngine.SyncEngine,
-  SyncEngine.SyncEngine.of({
-    waitForCredentialChange: () => Effect.never,
-    submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-    discard: () => Effect.die("unexpected discard"),
-    pull: () => Effect.never,
-    bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-    watch: () => Stream.never
-  })
-)
+const remoteService = SyncEngine.SyncEngine.of({
+  waitForCredentialChange: () => Effect.never,
+  submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+  discard: () => Effect.die("unexpected discard"),
+  pull: () => Effect.never,
+  bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+  watch: () => Stream.never
+})
+const remote = Layer.succeed(SyncEngine.SyncEngine, remoteService)
 
 const live = SqlReplica.layer({
   ...clientHistory,
@@ -70,57 +68,77 @@ const live = SqlReplica.layer({
 
 describe("multi space Replica", () => {
   it.effect("isolates overlapping entity keys for two spaces in one database", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const context = yield* Layer.build(live)
       const replica = Context.get(context, Replica.Replica)
       const spaces = yield* replica.spaces
-      assert.deepStrictEqual(spaces.map((space) => space.spaceId), [spaceA, spaceB])
+      const spaceIds = spaces.map((space) => space.spaceId)
+      assert.deepStrictEqual(spaceIds, [spaceA, spaceB])
       const a = yield* replica.space(spaceA)
       const b = yield* replica.space(spaceB)
 
-      yield* a.mutate(Domain.PutTodo, Domain.todo("same", "A"))
-      yield* b.mutate(Domain.PutTodo, Domain.todo("same", "B"))
+      const todoA = Domain.todo("same", "A")
+      const todoB = Domain.todo("same", "B")
+      yield* a.mutate(Domain.PutTodo, todoA)
+      yield* b.mutate(Domain.PutTodo, todoB)
 
       assert.strictEqual(Option.getOrThrow(yield* a.get(Domain.Todo, "same")).title, "A")
       assert.strictEqual(Option.getOrThrow(yield* b.get(Domain.Todo, "same")).title, "B")
       const aggregate = yield* replica.status
-      assert.deepStrictEqual(aggregate.spaces.map((status) => status.spaceId), [spaceA, spaceB])
+      const aggregateSpaceIds = aggregate.spaces.map((status) => status.spaceId)
+      assert.deepStrictEqual(aggregateSpaceIds, [spaceA, spaceB])
       assert.strictEqual(aggregate.totalPending, 2)
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("evicts one space and leaves retained handles stale across rejoin", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const context = yield* Layer.build(live)
       const replica = Context.get(context, Replica.Replica)
       const stale = yield* replica.space(spaceA)
       const b = yield* replica.space(spaceB)
-      yield* stale.mutate(Domain.PutTodo, Domain.todo("same", "A"))
-      yield* b.mutate(Domain.PutTodo, Domain.todo("same", "B"))
+      const todoA = Domain.todo("same", "A")
+      const todoB = Domain.todo("same", "B")
+      yield* stale.mutate(Domain.PutTodo, todoA)
+      yield* b.mutate(Domain.PutTodo, todoB)
 
       yield* replica.leave(spaceA)
-      assert.strictEqual((yield* replica.space(spaceA).pipe(Effect.flip))._tag, "SpaceNotJoined")
-      assert.strictEqual((yield* stale.get(Domain.Todo, "same").pipe(Effect.flip))._tag, "SpaceUnavailable")
+      const missingSpace = yield* replica.space(spaceA).pipe(Effect.result)
+      assert.strictEqual(missingSpace._tag, "Failure")
+      if (missingSpace._tag === "Failure") assert.strictEqual(missingSpace.failure._tag, "SpaceNotJoined")
+      const staleRead = yield* stale.get(Domain.Todo, "same").pipe(Effect.result)
+      assert.strictEqual(staleRead._tag, "Failure")
+      if (staleRead._tag === "Failure") assert.strictEqual(staleRead.failure._tag, "SpaceUnavailable")
       assert.strictEqual(Option.getOrThrow(yield* b.get(Domain.Todo, "same")).title, "B")
 
       const rejoined = yield* replica.join(spaceA)
-      assert.isTrue(Option.isNone(yield* rejoined.get(Domain.Todo, "same")))
-      assert.strictEqual(
-        (yield* stale.mutate(Domain.PutTodo, Domain.todo("stale")).pipe(Effect.flip))._tag,
-        "SpaceUnavailable"
-      )
-    })))
+      const rejoinedTodo = yield* rejoined.get(Domain.Todo, "same")
+      const rejoinedTodoIsNone = Option.isNone(rejoinedTodo)
+      assert.isTrue(rejoinedTodoIsNone)
+      const staleTodo = Domain.todo("stale")
+      const staleMutation = yield* stale.mutate(Domain.PutTodo, staleTodo).pipe(Effect.result)
+      assert.strictEqual(staleMutation._tag, "Failure")
+      if (staleMutation._tag === "Failure") assert.strictEqual(staleMutation.failure._tag, "SpaceUnavailable")
+    }).pipe(Effect.scoped))
 
   it.effect("restores durable memberships when the Replica runtime restarts", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const databaseContext = yield* Layer.build(Layer.mergeAll(
-        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    Effect.gen(function*() {
+      const sqlite = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+      const database = Layer.mergeAll(
+        sqlite,
         NodeCrypto.layer,
         Reactivity.layer
-      ))
+      )
+      const databaseContext = yield* Layer.build(database)
+      const sqlClient = Context.get(databaseContext, SqlClient.SqlClient)
+      const crypto = Context.get(databaseContext, Crypto.Crypto)
+      const reactivity = Context.get(databaseContext, Reactivity.Reactivity)
+      const sqlLayer = Layer.succeed(SqlClient.SqlClient, sqlClient)
+      const cryptoLayer = Layer.succeed(Crypto.Crypto, crypto)
+      const reactivityLayer = Layer.succeed(Reactivity.Reactivity, reactivity)
       const services = Layer.mergeAll(
-        Layer.succeed(SqlClient.SqlClient, Context.get(databaseContext, SqlClient.SqlClient)),
-        Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto)),
-        Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity))
+        sqlLayer,
+        cryptoLayer,
+        reactivityLayer
       )
       const replicaLayer = (initialSpaces?: Iterable<Identity.SpaceId>) => {
         const options = {
@@ -138,24 +156,28 @@ describe("multi space Replica", () => {
       }
 
       const firstScope = yield* Scope.make()
-      const firstContext = yield* Layer.buildWithScope(replicaLayer([spaceA, spaceB]), firstScope)
+      const firstReplicaLayer = replicaLayer([spaceA, spaceB])
+      const firstContext = yield* Layer.buildWithScope(firstReplicaLayer, firstScope)
       const first = Context.get(firstContext, Replica.Replica)
-      yield* (yield* first.space(spaceA)).mutate(Domain.PutTodo, Domain.todo("restart", "retained"))
+      const restartTodo = Domain.todo("restart", "retained")
+      yield* (yield* first.space(spaceA)).mutate(Domain.PutTodo, restartTodo)
       yield* Scope.close(firstScope, Exit.void)
 
       const secondScope = yield* Scope.make()
-      const secondContext = yield* Layer.buildWithScope(replicaLayer(), secondScope)
+      const secondReplicaLayer = replicaLayer()
+      const secondContext = yield* Layer.buildWithScope(secondReplicaLayer, secondScope)
       const second = Context.get(secondContext, Replica.Replica)
-      assert.deepStrictEqual((yield* second.spaces).map((space) => space.spaceId), [spaceA, spaceB])
+      const secondSpaceIds = (yield* second.spaces).map((space) => space.spaceId)
+      assert.deepStrictEqual(secondSpaceIds, [spaceA, spaceB])
       assert.strictEqual(
         Option.getOrThrow(yield* (yield* second.space(spaceA)).get(Domain.Todo, "restart")).title,
         "retained"
       )
       yield* Scope.close(secondScope, Exit.void)
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("releases a joining reservation when its owner is interrupted", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const engineContext = yield* Layer.build(WorkflowEngine.layerMemory)
       const engine = Context.get(engineContext, WorkflowEngine.WorkflowEngine)
       const firstRegistration = yield* Deferred.make<void>()
@@ -186,36 +208,37 @@ describe("multi space Replica", () => {
       )
       const context = yield* Layer.build(replicaLayer)
       const replica = Context.get(context, Replica.Replica)
-      const first = yield* Effect.forkChild(replica.join(spaceA), { startImmediately: true })
+      const join = replica.join(spaceA)
+      const first = yield* Effect.forkChild(join, { startImmediately: true })
       yield* Deferred.await(firstRegistration)
       yield* Fiber.interrupt(first)
 
       assert.strictEqual((yield* replica.join(spaceA)).spaceId, spaceA)
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("releases manager registration when join is interrupted", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const requestBlocked = yield* Deferred.make<void>()
       const activeWatches = yield* Ref.make(0)
       const watchStarted = yield* Deferred.make<void>()
-      const countedRemote = Layer.succeed(
-        SyncEngine.SyncEngine,
-        SyncEngine.SyncEngine.of({
-          waitForCredentialChange: () => Effect.never,
-          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-          discard: () => Effect.die("unexpected discard"),
-          pull: () => Effect.never,
-          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-          watch: () =>
-            Stream.unwrap(Effect.acquireRelease(
-              Ref.update(activeWatches, (count) => count + 1).pipe(
-                Effect.andThen(Deferred.succeed(watchStarted, undefined)),
-                Effect.as(Stream.never)
-              ),
-              () => Ref.update(activeWatches, (count) => count - 1)
-            ))
-        })
-      )
+      const countedRemoteService = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
+        submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        discard: () => Effect.die("unexpected discard"),
+        pull: () => Effect.never,
+        bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        watch: () => {
+          const acquire = Ref.update(activeWatches, (count) => count + 1).pipe(
+            Effect.andThen(Deferred.succeed(watchStarted, undefined)),
+            Effect.as(Stream.never)
+          )
+          return Effect.acquireRelease(
+            acquire,
+            () => Ref.update(activeWatches, (count) => count - 1)
+          ).pipe(Stream.unwrap)
+        }
+      })
+      const countedRemote = Layer.succeed(SyncEngine.SyncEngine, countedRemoteService)
       const manager = yield* Reconciler.makeManager().pipe(Effect.provide(countedRemote))
       const local = {
         requestReconciliation: Deferred.succeed(requestBlocked, undefined).pipe(Effect.andThen(Effect.never)),
@@ -238,14 +261,15 @@ describe("multi space Replica", () => {
         succeeded: Effect.void,
         status: Effect.succeed({ _tag: "Offline", pending: 0 })
       })
+      const registrationEffect = manager.register({
+        spaceId: spaceA,
+        generation: 1,
+        definition: Domain.definition,
+        local,
+        reconciliation
+      })
       const registration = yield* Effect.forkChild(
-        manager.register({
-          spaceId: spaceA,
-          generation: 1,
-          definition: Domain.definition,
-          local,
-          reconciliation
-        }),
+        registrationEffect,
         { startImmediately: true }
       )
       yield* Deferred.await(watchStarted)
@@ -253,10 +277,10 @@ describe("multi space Replica", () => {
       yield* Fiber.interrupt(registration)
 
       assert.strictEqual(yield* Ref.get(activeWatches), 0)
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("drains an admitted mutation before reconciliation teardown", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const entered = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       const definition = Definition.make({
@@ -286,22 +310,27 @@ describe("multi space Replica", () => {
       const context = yield* Layer.build(replicaLayer)
       const replica = Context.get(context, Replica.Replica)
       const space = yield* replica.space(spaceA)
+      const drainTodo = Domain.todo("drain")
+      const mutate = space.mutate(Domain.PutTodo, drainTodo)
       const mutation = yield* Effect.forkChild(
-        space.mutate(Domain.PutTodo, Domain.todo("drain")),
+        mutate,
         { startImmediately: true }
       )
       yield* Deferred.await(entered)
-      const leaving = yield* Effect.forkChild(replica.leave(spaceA), { startImmediately: true })
+      const leave = replica.leave(spaceA)
+      const leaving = yield* Effect.forkChild(leave, { startImmediately: true })
       yield* Effect.yieldNow
-      assert.strictEqual((yield* replica.space(spaceA).pipe(Effect.flip))._tag, "SpaceNotJoined")
+      const missingSpace = yield* replica.space(spaceA).pipe(Effect.result)
+      assert.strictEqual(missingSpace._tag, "Failure")
+      if (missingSpace._tag === "Failure") assert.strictEqual(missingSpace.failure._tag, "SpaceNotJoined")
       yield* Deferred.succeed(release, undefined)
 
       assert.strictEqual((yield* Fiber.join(mutation)).envelope.spaceId, spaceA)
       yield* Fiber.join(leaving)
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("releases a leaving reservation when its owner is interrupted", () =>
-    Effect.scoped(Effect.gen(function*() {
+    Effect.gen(function*() {
       const entered = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       const definition = Definition.make({
@@ -331,28 +360,35 @@ describe("multi space Replica", () => {
       const context = yield* Layer.build(replicaLayer)
       const replica = Context.get(context, Replica.Replica)
       const space = yield* replica.space(spaceA)
+      const interruptTodo = Domain.todo("interrupt-leave")
+      const mutate = space.mutate(Domain.PutTodo, interruptTodo)
       const mutation = yield* Effect.forkChild(
-        space.mutate(Domain.PutTodo, Domain.todo("interrupt-leave")),
+        mutate,
         { startImmediately: true }
       )
       yield* Deferred.await(entered)
-      const leaving = yield* Effect.forkChild(replica.leave(spaceA), { startImmediately: true })
+      const leave = replica.leave(spaceA)
+      const leaving = yield* Effect.forkChild(leave, { startImmediately: true })
       yield* Effect.yieldNow
-      assert.strictEqual((yield* replica.space(spaceA).pipe(Effect.flip))._tag, "SpaceNotJoined")
+      const missingSpace = yield* replica.space(spaceA).pipe(Effect.result)
+      assert.strictEqual(missingSpace._tag, "Failure")
+      if (missingSpace._tag === "Failure") assert.strictEqual(missingSpace.failure._tag, "SpaceNotJoined")
       yield* Fiber.interrupt(leaving)
       yield* Deferred.succeed(release, undefined)
       yield* Fiber.join(mutation)
 
       assert.strictEqual((yield* replica.join(spaceA)).spaceId, spaceA)
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("retries durable eviction after a SQL failure", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const databaseContext = yield* Layer.build(Layer.mergeAll(
-        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    Effect.gen(function*() {
+      const sqlite = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+      const database = Layer.mergeAll(
+        sqlite,
         NodeCrypto.layer,
         Reactivity.layer
-      ))
+      )
+      const databaseContext = yield* Layer.build(database)
       const sql = Context.get(databaseContext, SqlClient.SqlClient)
       let failDelete = true
       const failingSql = new Proxy(sql, {
@@ -372,12 +408,18 @@ describe("multi space Replica", () => {
           return Reflect.apply(target, thisArg, args)
         }
       })
-      const services = (client: SqlClient.SqlClient) =>
-        Layer.mergeAll(
-          Layer.succeed(SqlClient.SqlClient, client),
-          Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto)),
-          Layer.succeed(Reactivity.Reactivity, Context.get(databaseContext, Reactivity.Reactivity))
+      const crypto = Context.get(databaseContext, Crypto.Crypto)
+      const reactivity = Context.get(databaseContext, Reactivity.Reactivity)
+      const services = (client: SqlClient.SqlClient) => {
+        const sqlLayer = Layer.succeed(SqlClient.SqlClient, client)
+        const cryptoLayer = Layer.succeed(Crypto.Crypto, crypto)
+        const reactivityLayer = Layer.succeed(Reactivity.Reactivity, reactivity)
+        return Layer.mergeAll(
+          sqlLayer,
+          cryptoLayer,
+          reactivityLayer
         )
+      }
       const replicaLayer = (client: SqlClient.SqlClient, initialSpaces?: Iterable<Identity.SpaceId>) =>
         SqlReplica.layer({
           ...clientHistory,
@@ -391,52 +433,56 @@ describe("multi space Replica", () => {
         )
 
       const firstScope = yield* Scope.make()
-      const firstContext = yield* Layer.buildWithScope(replicaLayer(failingSql, [spaceA]), firstScope)
+      const firstReplicaLayer = replicaLayer(failingSql, [spaceA])
+      const firstContext = yield* Layer.buildWithScope(firstReplicaLayer, firstScope)
       const first = Context.get(firstContext, Replica.Replica)
-      assert.strictEqual((yield* first.leave(spaceA).pipe(Effect.flip))._tag, "StorageUnavailable")
+      const failedLeave = yield* first.leave(spaceA).pipe(Effect.result)
+      assert.strictEqual(failedLeave._tag, "Failure")
+      if (failedLeave._tag === "Failure") assert.strictEqual(failedLeave.failure._tag, "StorageUnavailable")
       yield* first.leave(spaceA)
       yield* Scope.close(firstScope, Exit.void)
 
       const secondScope = yield* Scope.make()
-      const secondContext = yield* Layer.buildWithScope(replicaLayer(sql), secondScope)
+      const secondReplicaLayer = replicaLayer(sql)
+      const secondContext = yield* Layer.buildWithScope(secondReplicaLayer, secondScope)
       assert.deepStrictEqual(yield* Context.get(secondContext, Replica.Replica).spaces, [])
       yield* Scope.close(secondScope, Exit.void)
-    })))
+    }).pipe(Effect.scoped))
 
   it.effect("bounds reconciliation turns across many joined spaces", () =>
-    Effect.scoped(Effect.gen(function*() {
-      const spaces = Array.from({ length: 6 }, (_, index) =>
-        Identity.SpaceId.make(`spc_00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`))
+    Effect.gen(function*() {
+      const spaces = Array.from({ length: 6 }, (_, index) => {
+        const suffix = String(index + 1).padStart(12, "0")
+        return Identity.SpaceId.make(`spc_00000000-0000-4000-8000-${suffix}`)
+      })
       const current = yield* Ref.make(0)
       const maximum = yield* Ref.make(0)
       const twoStarted = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
-      const blockedRemote = Layer.succeed(
-        SyncEngine.SyncEngine,
-        SyncEngine.SyncEngine.of({
-          waitForCredentialChange: () =>
-            Effect.never,
-          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-          discard: () => Effect.die("unexpected discard"),
-          pull: () =>
-            Effect.acquireUseRelease(
-              Ref.updateAndGet(current, (count) => count + 1).pipe(
-                Effect.tap((count) => Ref.update(maximum, (seen) => Math.max(seen, count))),
-                Effect.tap((count) => {
-                  if (count === 2) return Deferred.succeed(twoStarted, undefined)
-                  return Effect.void
-                })
-              ),
-              () =>
-                Deferred.await(release).pipe(
-                  Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
-                ),
-              () => Ref.update(current, (count) => count - 1)
-            ),
-          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-          watch: () => Stream.never
-        })
-      )
+      const blockedRemoteService = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
+        submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        discard: () => Effect.die("unexpected discard"),
+        pull: () => {
+          const acquire = Ref.updateAndGet(current, (count) => count + 1).pipe(
+            Effect.tap((count) => Ref.update(maximum, (seen) => Math.max(seen, count))),
+            Effect.tap((count) => {
+              if (count === 2) return Deferred.succeed(twoStarted, undefined)
+              return Effect.void
+            })
+          )
+          const use = () =>
+            Deferred.await(release).pipe(Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable())))
+          return Effect.acquireUseRelease(
+            acquire,
+            use,
+            () => Ref.update(current, (count) => count - 1)
+          )
+        },
+        bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        watch: () => Stream.never
+      })
+      const blockedRemote = Layer.succeed(SyncEngine.SyncEngine, blockedRemoteService)
       const replicaLayer = SqlReplica.layer({
         ...clientHistory,
         definition: Domain.definition,
@@ -456,5 +502,5 @@ describe("multi space Replica", () => {
 
       assert.isAtMost(yield* Ref.get(maximum), 2)
       yield* Deferred.succeed(release, undefined)
-    })))
+    }).pipe(Effect.scoped))
 })

@@ -1,9 +1,13 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import { pipe } from "effect/Function"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as SchemaGetter from "effect/SchemaGetter"
 import * as TestClock from "effect/testing/TestClock"
@@ -31,7 +35,15 @@ const gatedPayload = Effect.gen(function*() {
 describe("Presence", () => {
   it.effect("validates time to live", () =>
     Effect.gen(function*() {
-      const error = yield* Effect.flip(Presence.make(Payload, { timeToLive: Number.POSITIVE_INFINITY }))
+      const result = yield* Presence.make(Payload, { timeToLive: Number.POSITIVE_INFINITY }).pipe(Effect.exit)
+      const error = pipe(
+        result,
+        Exit.match({
+          onFailure: Cause.findErrorOption,
+          onSuccess: () => Option.none()
+        }),
+        Option.getOrThrow
+      )
       assert.strictEqual(error._tag, "ProtocolInvalid")
     }))
 
@@ -53,19 +65,22 @@ describe("Presence", () => {
     Effect.gen(function*() {
       const gate = yield* gatedPayload
       const presence = yield* Presence.make(gate.schema, { timeToLive: "1 second" })
-      const older = yield* Effect.forkChild(presence.receive(clientId, { cursor: 1, status: "active" }))
+      const older = yield* presence.receive(clientId, { cursor: 1, status: "active" }).pipe(Effect.forkChild)
       yield* Deferred.await(gate.started)
       yield* presence.receive(clientId, { cursor: 2, status: "idle" })
       yield* Deferred.succeed(gate.release, undefined)
       yield* Fiber.join(older)
-      assert.deepStrictEqual((yield* presence.values).map((entry) => entry.value), [{ cursor: 2, status: "idle" }])
+      pipe(
+        (yield* presence.values).map((entry) => entry.value),
+        (values) => assert.deepStrictEqual(values, [{ cursor: 2, status: "idle" }])
+      )
     }))
 
   it.effect("does not let an in-flight value survive explicit removal", () =>
     Effect.gen(function*() {
       const gate = yield* gatedPayload
       const presence = yield* Presence.make(gate.schema, { timeToLive: "1 second" })
-      const receive = yield* Effect.forkChild(presence.receive(clientId, { cursor: 1, status: "active" }))
+      const receive = yield* presence.receive(clientId, { cursor: 1, status: "active" }).pipe(Effect.forkChild)
       yield* Deferred.await(gate.started)
       yield* presence.remove(clientId)
       yield* Deferred.succeed(gate.release, undefined)
@@ -77,26 +92,40 @@ describe("Presence", () => {
     Effect.gen(function*() {
       const gate = yield* gatedPayload
       const presence = yield* Presence.make(gate.schema, { timeToLive: "1 second" })
-      yield* Effect.scoped(Effect.gen(function*() {
+      yield* Effect.gen(function*() {
         yield* presence.publish(clientId, { cursor: 0, status: "active" })
-        const receive = yield* Effect.forkChild(presence.receive(clientId, { cursor: 1, status: "idle" }))
+        const receive = yield* presence.receive(clientId, { cursor: 1, status: "idle" }).pipe(Effect.forkChild)
         yield* Deferred.await(gate.started)
         yield* Effect.addFinalizer(() => Fiber.join(receive).pipe(Effect.orDie, Effect.asVoid))
         yield* Effect.addFinalizer(() => Deferred.succeed(gate.release, undefined).pipe(Effect.asVoid))
-      }))
-      assert.deepStrictEqual((yield* presence.values).map((entry) => entry.value), [{ cursor: 1, status: "idle" }])
+      }).pipe(Effect.scoped)
+      pipe(
+        (yield* presence.values).map((entry) => entry.value),
+        (values) => assert.deepStrictEqual(values, [{ cursor: 1, status: "idle" }])
+      )
     }))
 
   it.effect("does not let an invalid later payload suppress an earlier valid one", () =>
     Effect.gen(function*() {
       const gate = yield* gatedPayload
       const presence = yield* Presence.make(gate.schema, { timeToLive: "1 second" })
-      const valid = yield* Effect.forkChild(presence.receive(clientId, { cursor: 1, status: "active" }))
+      const valid = yield* presence.receive(clientId, { cursor: 1, status: "active" }).pipe(Effect.forkChild)
       yield* Deferred.await(gate.started)
-      const error = yield* Effect.flip(presence.receive(clientId, { cursor: "invalid", status: "idle" }))
+      const result = yield* presence.receive(clientId, { cursor: "invalid", status: "idle" }).pipe(Effect.exit)
+      const error = pipe(
+        result,
+        Exit.match({
+          onFailure: Cause.findErrorOption,
+          onSuccess: () => Option.none()
+        }),
+        Option.getOrThrow
+      )
       assert.strictEqual(error._tag, "ProtocolInvalid")
       yield* Deferred.succeed(gate.release, undefined)
       yield* Fiber.join(valid)
-      assert.deepStrictEqual((yield* presence.values).map((entry) => entry.value), [{ cursor: 1, status: "active" }])
+      pipe(
+        (yield* presence.values).map((entry) => entry.value),
+        (values) => assert.deepStrictEqual(values, [{ cursor: 1, status: "active" }])
+      )
     }))
 })

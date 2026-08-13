@@ -10,6 +10,7 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Entity from "effect/unstable/cluster/Entity"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
@@ -28,11 +29,20 @@ const Todo = Model.make("Todo", {
 const definition = Definition.make({ version: 1, models: [Todo], mutations: [] })
 const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
 const runtime = MutationRuntime.layer(definition)
-const database = Layer.mergeAll(
-  SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
-  NodeCrypto.layer,
-  Reactivity.layer
+const database = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
+  (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer)
 )
+const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(
+    Effect.result,
+    Effect.map((result) => {
+      if (Result.isFailure(result)) return result.failure
+      return assert.fail("expected Effect failure")
+    })
+  )
+class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationError, Schema.JsonObject>(
+  "@lucas-barake/effect-local-rpc/test/PrincipalAssertion/TestAuthorizationError"
+)("TestAuthorizationError", { reason: Schema.String }) {}
 const store = ServerStore.layer({
   definition,
   readAuthorizationRefreshInterval: "1 second",
@@ -56,13 +66,13 @@ const store = ServerStore.layer({
   authorizeMutation: () => Effect.void,
   authorizeRead: ({ principal }) => {
     if (principal !== null && typeof principal === "object" && "subject" in principal) return Effect.void
-    return Effect.fail("missing principal")
+    return Effect.fail(new TestAuthorizationError({ reason: "missing principal" }))
   }
 }).pipe(Layer.provide(runtime), Layer.provide(database))
 
 describe("principal assertions", () => {
-  it.effect("rejects a forged internal assertion before reaching entity authorization", () =>
-    Effect.gen(function*() {
+  it.effect("rejects a forged internal assertion before reaching entity authorization", () => {
+    return Effect.gen(function*() {
       const verifier = PrincipalAssertion.layerVerifier((assertion) => {
         if (assertion === PrincipalAssertion.PrincipalAssertion.make("trusted")) {
           return Effect.succeed({ subject: "reader" })
@@ -77,12 +87,13 @@ describe("principal assertions", () => {
         maximumConcurrentBootstrapAuthorizations: 16,
         maximumConcurrentBootstrapPagesPerSpace: 4,
         maximumConcurrentPresencePublicationsPerSpace: 16
-      }).pipe(
+      })
+      const liveHandlers = handlers.pipe(
         Layer.provide(store),
         Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
         Layer.provide(verifier)
       )
-      const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, handlers)
+      const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, liveHandlers)
       const client = yield* makeClient(spaceId)
       const request = Protocol.PullRequest.make({
         spaceId,
@@ -97,7 +108,7 @@ describe("principal assertions", () => {
       const forged = yield* client.Pull({
         request,
         assertion: PrincipalAssertion.PrincipalAssertion.make("forged")
-      }).pipe(Effect.flip)
+      }).pipe(failureOf)
       if (forged._tag !== "AuthorizationDenied") assert.fail("expected forged assertion denial")
       assert.strictEqual(forged.reason, "forged assertion")
 
@@ -115,5 +126,6 @@ describe("principal assertions", () => {
         sendRetryInterval: 100
       })),
       Effect.provide(NodeCrypto.layer)
-    ))
+    )
+  })
 })

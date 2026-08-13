@@ -1,6 +1,7 @@
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Predicate from "effect/Predicate"
 import * as Schema from "effect/Schema"
@@ -30,7 +31,9 @@ const RemoteDefect = Schema.Struct({
 const opaqueDefect = { _tag: "RemoteDefect" } as const
 const opaqueCause = { name: "Error", message: "Remote internal error" } as const
 const JsonString = Schema.fromJsonString(Schema.Unknown)
+// oxlint-disable-next-line effect-local/noManualEffectBoundary -- RpcSerialization.Parser decode is synchronous and must signal invalid input by throwing.
 const decodeJsonString = Schema.decodeUnknownSync(JsonString)
+// oxlint-disable-next-line effect-local/noManualEffectBoundary -- RpcSerialization.Parser encode is synchronous and must signal invalid output by throwing.
 const encodeJsonString = Schema.encodeSync(JsonString)
 
 const sanitizeReason = (reason: unknown): unknown => {
@@ -63,54 +66,51 @@ const sanitizeResponse = (response: unknown): unknown => {
 export const layerJson = (options?: {
   readonly maximumFrameBytes?: number
 }): Layer.Layer<RpcSerialization.RpcSerialization, ReplicaError.InvalidConfiguration> =>
-  Layer.effect(
-    RpcSerialization.RpcSerialization,
-    Effect.gen(function*() {
-      const limit = options?.maximumFrameBytes ?? maximumFrameBytes
-      if (!Number.isSafeInteger(limit) || limit <= 0) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "maximumFrameBytes",
-          message: "maximumFrameBytes must be a positive safe integer"
-        })
-      }
-      return RpcSerialization.RpcSerialization.of({
-        contentType: "application/json",
-        includesFraming: false,
-        makeUnsafe: () => {
-          const decoder = new TextDecoder()
-          const encoder = new TextEncoder()
-          return {
-            decode: (data) => {
-              let encoded: string
-              let bytes: number
-              if (typeof data === "string") {
-                encoded = data
-                bytes = encoder.encode(data).byteLength
-              } else {
-                encoded = decoder.decode(data)
-                bytes = data.byteLength
-              }
-              if (bytes > limit) {
-                // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- RpcSerialization.Parser is synchronous and signals parsing failures by throwing.
-                throw new RangeError(`RPC frame exceeds ${limit} bytes`)
-              }
-              const decoded = decodeJsonString(encoded)
-              if (Array.isArray(decoded)) return decoded
-              return [decoded]
-            },
-            encode: (response) => {
-              const encoded = encodeJsonString(sanitizeResponse(response))
-              if (encoder.encode(encoded).byteLength > limit) {
-                // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- RpcSerialization.Parser is synchronous and signals encoding failures by throwing.
-                throw new RangeError(`RPC frame exceeds ${limit} bytes`)
-              }
-              return encoded
+  Effect.gen(function*() {
+    const limit = options?.maximumFrameBytes ?? maximumFrameBytes
+    if (!Number.isSafeInteger(limit) || limit <= 0) {
+      return yield* new ReplicaError.InvalidConfiguration({
+        option: "maximumFrameBytes",
+        message: "maximumFrameBytes must be a positive safe integer"
+      })
+    }
+    return RpcSerialization.RpcSerialization.of({
+      contentType: "application/json",
+      includesFraming: false,
+      makeUnsafe: () => {
+        const decoder = new TextDecoder()
+        const encoder = new TextEncoder()
+        return {
+          decode: (data) => {
+            let encoded: string
+            let bytes: number
+            if (typeof data === "string") {
+              encoded = data
+              bytes = encoder.encode(data).byteLength
+            } else {
+              encoded = decoder.decode(data)
+              bytes = data.byteLength
             }
+            if (bytes > limit) {
+              // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- RpcSerialization.Parser is synchronous and signals parsing failures by throwing.
+              throw new RangeError(`RPC frame exceeds ${limit} bytes`)
+            }
+            const decoded = decodeJsonString(encoded)
+            if (Array.isArray(decoded)) return decoded
+            return [decoded]
+          },
+          encode: (response) => {
+            const encoded = pipe(sanitizeResponse(response), encodeJsonString)
+            if (encoder.encode(encoded).byteLength > limit) {
+              // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- RpcSerialization.Parser is synchronous and signals encoding failures by throwing.
+              throw new RangeError(`RPC frame exceeds ${limit} bytes`)
+            }
+            return encoded
           }
         }
-      })
+      }
     })
-  )
+  }).pipe(Layer.effect(RpcSerialization.RpcSerialization))
 
 export class Submit extends Rpc.make("Submit", {
   payload: Protocol.VersionedSubmitRequest.fields,

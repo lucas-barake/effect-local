@@ -13,6 +13,7 @@ import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
@@ -132,8 +133,7 @@ const makeLayer = <D extends Definition.Any, R,>(
   BaseRequirements<D> | R
 > => {
   const queryReactivity = QueryReactivity.makeLayer()
-  return Layer.effect(
-    Replica.Replica,
+  return pipe(
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
       const reactivity = yield* Reactivity.Reactivity
@@ -175,17 +175,16 @@ const makeLayer = <D extends Definition.Any, R,>(
             let interruptReconciliation = Effect.void
             if (workflow !== undefined) {
               const workflowContext = Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow)
-              const runtime = yield* Layer.buildWithScope(
-                Layer.mergeAll(
-                  localLayer,
-                  queryLayer,
-                  ReconciliationWorkflow.layer({ ...options, spaceId }).pipe(
-                    Layer.provide(localLayer),
-                    Layer.provide(Layer.succeed(ReconciliationWorkflow.RegistrationScope, parentScope))
-                  )
-                ),
-                childScope
+              const reconciliationWorkflowLayer = ReconciliationWorkflow.layer({ ...options, spaceId }).pipe(
+                Layer.provide(localLayer),
+                Layer.provide(Layer.succeed(ReconciliationWorkflow.RegistrationScope, parentScope))
+              )
+              const runtime = yield* Layer.mergeAll(
+                localLayer,
+                queryLayer,
+                reconciliationWorkflowLayer
               ).pipe(
+                Layer.buildWithScope(childScope),
                 Effect.provide(workflowContext),
                 Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
               )
@@ -195,14 +194,13 @@ const makeLayer = <D extends Definition.Any, R,>(
               interruptReconciliation = reconciler.shutdown
             } else {
               if (manager === undefined) return yield* Effect.die("Reconciler manager was not initialized")
-              const runtime = yield* Layer.buildWithScope(
-                Layer.mergeAll(
-                  localLayer,
-                  queryLayer,
-                  Reconciler.layerOnePass({ ...options, spaceId }).pipe(Layer.provide(localLayer))
-                ),
-                childScope
+              const onePassLayer = Reconciler.layerOnePass({ ...options, spaceId }).pipe(Layer.provide(localLayer))
+              const runtime = yield* Layer.mergeAll(
+                localLayer,
+                queryLayer,
+                onePassLayer
               ).pipe(
+                Layer.buildWithScope(childScope),
                 Effect.provide(rootContext),
                 Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
               )
@@ -222,10 +220,10 @@ const makeLayer = <D extends Definition.Any, R,>(
               if (options.maximumRetryDelay !== undefined) {
                 managedSpace = { ...managedSpace, maximumRetryDelay: options.maximumRetryDelay }
               }
-              yield* Effect.acquireRelease(
-                manager.register(managedSpace),
-                () => manager.unregister(spaceId, generation)
-              ).pipe(Scope.provide(childScope))
+              yield* manager.register(managedSpace).pipe(
+                (acquire) => Effect.acquireRelease(acquire, () => manager.unregister(spaceId, generation)),
+                Scope.provide(childScope)
+              )
               reconciler = Reconciler.Reconciler.of({
                 sync: manager.sync(spaceId),
                 notify: manager.notify(spaceId).pipe(Effect.orDie),
@@ -234,8 +232,11 @@ const makeLayer = <D extends Definition.Any, R,>(
               })
             }
             const operationGate = yield* Semaphore.make(1)
-            const admit = <A, E,>(effect: Effect.Effect<A, E>) =>
-              operationGate.withPermit(checkActive(spaceId, generation).pipe(Effect.andThen(effect)))
+            const admit = <A, E extends Mutation.TaggedError,>(effect: Effect.Effect<A, E>) =>
+              checkActive(spaceId, generation).pipe(
+                Effect.andThen(effect),
+                (guarded) => operationGate.withPermit(guarded)
+              )
             const findReceipt = (mutationId: Identity.MutationId) =>
               local.receipt(mutationId).pipe(
                 Effect.flatMap((found) => {
@@ -282,24 +283,27 @@ const makeLayer = <D extends Definition.Any, R,>(
             const handle: Replica.Space = {
               spaceId,
               mutate: (mutation, payload) =>
-                admit(local.mutate(mutation, payload).pipe(Effect.tap(() => reconciler.notify))),
-              get: (model, key) => admit(local.get(model, key)),
-              query: (query, payload) => admit(queries.execute(query, payload)),
-              receipt: (mutation, mutationId) => admit(local.receiptFor(mutation, mutationId)),
+                local.mutate(mutation, payload).pipe(Effect.tap(() => reconciler.notify), admit),
+              get: (model, key) => local.get(model, key).pipe(admit),
+              query: (query, payload) => queries.execute(query, payload).pipe(admit),
+              receipt: (mutation, mutationId) => local.receiptFor(mutation, mutationId).pipe(admit),
               pending: admit(local.pending),
               pendingFor: (mutation) =>
-                admit(MutationDescriptor.validate(options.definition, mutation).pipe(Effect.andThen(local.pending)))
-                  .pipe(
-                    Effect.map((pending) =>
-                      pending.flatMap((item) => {
-                        if (item.envelope.name !== mutation.name) return []
-                        return [{ ...item } satisfies Replica.PendingMutation<typeof mutation>]
-                      })
-                    )
-                  ),
+                MutationDescriptor.validate(options.definition, mutation).pipe(
+                  Effect.andThen(local.pending),
+                  admit,
+                  Effect.map((pending) =>
+                    pending.flatMap((item) => {
+                      if (item.envelope.name !== mutation.name) return []
+                      return [{ ...item } satisfies Replica.PendingMutation<typeof mutation>]
+                    })
+                  )
+                ),
               settlements: local.settlements,
               settlementsFor: (mutation) =>
-                Stream.fromEffect(admit(MutationDescriptor.validate(options.definition, mutation))).pipe(
+                MutationDescriptor.validate(options.definition, mutation).pipe(
+                  admit,
+                  Stream.fromEffect,
                   Stream.flatMap(() =>
                     Stream.filter(
                       local.settlements,
@@ -308,13 +312,13 @@ const makeLayer = <D extends Definition.Any, R,>(
                   )
                 ),
               quarantine: admit(local.quarantine),
-              discardQuarantined: (mutationId) => admit(discardQuarantined(mutationId)),
+              discardQuarantined: (mutationId) => discardQuarantined(mutationId).pipe(admit),
               resubmitQuarantined: <M extends Mutation.Any,>(
                 mutationId: Identity.MutationId,
                 mutation: M,
                 payload: Mutation.Payload<M>
               ) =>
-                admit(
+                pipe(
                   Effect.gen(function*() {
                     const found = yield* local.quarantineByMutation(mutationId)
                     if (Option.isNone(found)) {
@@ -336,12 +340,13 @@ const makeLayer = <D extends Definition.Any, R,>(
                     }
                     yield* resolveDisposition(receipt, "Resubmit")
                     return Quarantine.Resubmitted.make({ pending })
-                  }).pipe(Effect.ensuring(reconciler.notify))
+                  }),
+                  Effect.ensuring(reconciler.notify),
+                  admit
                 ),
-              status: admit(
-                Effect.all([reconciler.status, local.pendingCount]).pipe(
-                  Effect.map(([status, pending]) => addressedStatus(spaceId, { ...status, pending }))
-                )
+              status: Effect.all([reconciler.status, local.pendingCount]).pipe(
+                Effect.map(([status, pending]) => addressedStatus(spaceId, { ...status, pending })),
+                admit
               )
             }
             return {
@@ -382,12 +387,12 @@ const makeLayer = <D extends Definition.Any, R,>(
             const completion = yield* Deferred.make<Replica.Space, ReplicaError.ReplicaError>()
             const decision = reserveJoin(spaceId, completion)
             if (decision._tag === "Active") return decision.entry.handle
-            if (decision._tag === "WaitJoin") return yield* restore(Deferred.await(decision.completion))
+            if (decision._tag === "WaitJoin") return yield* Deferred.await(decision.completion).pipe(restore)
             if (decision._tag === "WaitLeave") {
-              yield* restore(Deferred.await(decision.completion))
+              yield* Deferred.await(decision.completion).pipe(restore)
               return yield* join(spaceId)
             }
-            const result = yield* restore(initialize(spaceId, decision.generation)).pipe(Effect.exit)
+            const result = yield* initialize(spaceId, decision.generation).pipe(restore, Effect.exit)
             if (result._tag === "Success") {
               entries.set(spaceId, result.value)
               yield* Deferred.succeed(decision.completion, result.value.handle)
@@ -403,7 +408,8 @@ const makeLayer = <D extends Definition.Any, R,>(
         )
 
       const evictMembership = (spaceId: Identity.SpaceId) =>
-        sql.withTransaction(sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`).pipe(
+        sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`.pipe(
+          (effect) => sql.withTransaction(effect),
           Effect.asVoid,
           Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
         )
@@ -429,30 +435,30 @@ const makeLayer = <D extends Definition.Any, R,>(
           Effect.gen(function*() {
             const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
             const decision = reserveLeave(spaceId, completion)
-            if (decision._tag === "Missing") return yield* restore(evictMembership(spaceId))
+            if (decision._tag === "Missing") return yield* evictMembership(spaceId).pipe(restore)
             if (decision._tag === "WaitJoin") {
-              yield* restore(Deferred.await(decision.completion))
+              yield* Deferred.await(decision.completion).pipe(restore)
               return yield* leave(spaceId)
             }
             if (decision._tag === "WaitLeave") {
-              yield* restore(Deferred.await(decision.completion))
+              yield* Deferred.await(decision.completion).pipe(restore)
               return yield* Effect.void
             }
             yield* decision.entry.local.shutdownSettlements
             yield* Effect.gen(function*() {
               let scopeClosed = false
-              const result = yield* decision.entry.operationGate.withPermit(
-                decision.entry.interruptReconciliation.pipe(
-                  Effect.andThen(Effect.uninterruptible(
-                    Scope.close(decision.entry.scope, Exit.void).pipe(
-                      Effect.andThen(Effect.sync(() => {
-                        scopeClosed = true
-                      }))
-                    )
-                  )),
-                  Effect.andThen(evictMembership(spaceId))
-                )
-              ).pipe(Effect.exit)
+              const result = yield* decision.entry.interruptReconciliation.pipe(
+                Effect.andThen(Effect.uninterruptible(
+                  Scope.close(decision.entry.scope, Exit.void).pipe(
+                    Effect.andThen(Effect.sync(() => {
+                      scopeClosed = true
+                    }))
+                  )
+                )),
+                Effect.andThen(evictMembership(spaceId)),
+                (effect) => decision.entry.operationGate.withPermit(effect),
+                Effect.exit
+              )
               if (result._tag === "Success") {
                 entries.delete(spaceId)
                 yield* Deferred.succeed(decision.completion, undefined)
@@ -463,7 +469,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               else entries.set(spaceId, decision.entry)
               yield* Deferred.done(decision.completion, result)
             }).pipe(Effect.forkIn(parentScope, { startImmediately: true }))
-            return yield* restore(Deferred.await(decision.completion))
+            return yield* Deferred.await(decision.completion).pipe(restore)
           })
         )
 
@@ -474,15 +480,17 @@ const makeLayer = <D extends Definition.Any, R,>(
           return Effect.fail(new ReplicaError.SpaceNotJoined({ spaceId }))
         })
 
-      const spaces = Effect.sync(() =>
-        Array.from(entries.entries())
+      const spaces = Effect.sync(() => {
+        const allEntries = entries.entries()
+        return Array.from(allEntries)
           .filter((entry): entry is [Identity.SpaceId, ActiveEntry] => entry[1]._tag === "Active")
           .toSorted(([left], [right]) => left.localeCompare(right))
           .map(([, entry]) => entry.handle)
-      )
+      })
 
       const status = Effect.gen(function*() {
-        const active = Array.from(entries.values())
+        const entryValues = entries.values()
+        const active = Array.from(entryValues)
           .filter((entry): entry is ActiveEntry => entry._tag === "Active")
           .toSorted((left, right) => left.handle.spaceId.localeCompare(right.handle.spaceId))
         if (active.length === 0) return aggregateStatus([])
@@ -497,7 +505,8 @@ const makeLayer = <D extends Definition.Any, R,>(
             WHERE s.space_id IN ${sql.in(spaceIds)}
             GROUP BY s.space_id`
         })
-        const counts = yield* readPendingCounts(active.map((entry) => entry.handle.spaceId)).pipe(
+        const activeSpaceIds = active.map((entry) => entry.handle.spaceId)
+        const counts = yield* readPendingCounts(activeSpaceIds).pipe(
           Effect.mapError((cause) => {
             if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
             return new ReplicaError.StorageCorrupt({ message: "Client pending count row is corrupt", cause })
@@ -536,12 +545,14 @@ const makeLayer = <D extends Definition.Any, R,>(
       yield* Effect.forEach(initial, join, { discard: true })
 
       return Replica.Replica.of({ join, leave, spaces, space, status })
-    })
-  ).pipe(Layer.provideMerge(queryReactivity))
+    }),
+    Layer.effect(Replica.Replica),
+    Layer.provideMerge(queryReactivity)
+  )
 }
 
 export const layer = <D extends Definition.Any,>(options: Options<D>) =>
-  makeLayer<D, never>(options, Effect.succeed(undefined))
+  Effect.succeed(undefined).pipe((workflowEngine) => makeLayer<D, never>(options, workflowEngine))
 
 export const layerWorkflow = <D extends Definition.Any,>(options: Options<D>) =>
   makeLayer<D, WorkflowEngine.WorkflowEngine>(options, WorkflowEngine.WorkflowEngine)

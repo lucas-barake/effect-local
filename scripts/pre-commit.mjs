@@ -1,5 +1,6 @@
+import { pipe } from "effect/Function"
 import { spawn } from "node:child_process"
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from "node:fs"
 import { dirname, join, relative, resolve, sep } from "node:path"
 
 const run = (command, args, options = {}) =>
@@ -24,7 +25,7 @@ const run = (command, args, options = {}) =>
     })
   })
 
-const checked = async(command, args, options = {}) => {
+const checked = async (command, args, options = {}) => {
   const result = await run(command, args, options)
   if (result.code !== 0) {
     throw new Error(`${command} ${args.join(" ")} failed\n${result.stderr || result.stdout}`)
@@ -33,18 +34,25 @@ const checked = async(command, args, options = {}) => {
 }
 
 const linkDependencies = (repository, snapshot) => {
-  symlinkSync(join(repository, "node_modules"), join(snapshot, "node_modules"), "dir")
+  pipe(
+    join(repository, "node_modules"),
+    (source) =>
+      pipe(
+        join(snapshot, "node_modules"),
+        (target) => symlinkSync(source, target, "dir")
+      )
+  )
   const packages = join(repository, "packages")
   for (const name of readdirSync(packages)) {
     const source = join(packages, name, "node_modules")
     const target = join(snapshot, "packages", name, "node_modules")
-    if (!existsSync(source) || !existsSync(dirname(target))) continue
+    if (!existsSync(source) || !pipe(dirname(target), existsSync)) continue
     symlinkSync(source, target, "dir")
   }
 }
 
-const createSnapshots = async(repository) => {
-  const temporary = mkdtempSync(join(repository, ".precommit-"))
+const createSnapshots = async (repository) => {
+  const temporary = pipe(join(repository, ".precommit-"), mkdtempSync)
   const baseline = join(temporary, "baseline")
   const staged = join(temporary, "staged")
   const archive = join(temporary, "baseline.tar")
@@ -67,10 +75,15 @@ const parseOxlint = (result, snapshot) => {
   }
   return output.diagnostics.map((diagnostic) => {
     const label = diagnostic.labels[0]
-    const filename = relative(snapshot, resolve(snapshot, diagnostic.filename)).split(sep).join("/")
+    const filename = pipe(
+      resolve(snapshot, diagnostic.filename),
+      (absolute) => relative(snapshot, absolute)
+    ).split(sep).join("/")
     return {
       key: `${filename}\0${diagnostic.code}\0${diagnostic.severity}\0${diagnostic.message}`,
-      display: `${filename}:${label?.span.line ?? 1}:${label?.span.column ?? 1} ${diagnostic.code} ${diagnostic.message}`
+      display: `${filename}:${label?.span.line ?? 1}:${
+        label?.span.column ?? 1
+      } ${diagnostic.code} ${diagnostic.message}`
     }
   })
 }
@@ -82,7 +95,10 @@ const parseTypecheck = (result, snapshot) => {
   for (const line of `${result.stdout}\n${result.stderr}`.split(/\r?\n/u)) {
     const match = typeDiagnostic.exec(line)
     if (match === null) continue
-    const filename = relative(snapshot, resolve(snapshot, match[1])).split(sep).join("/")
+    const filename = pipe(
+      resolve(snapshot, match[1]),
+      (absolute) => relative(snapshot, absolute)
+    ).split(sep).join("/")
     diagnostics.push({
       key: `${filename}\0${match[4]}`,
       display: `${filename}(${match[2]},${match[3]}): ${match[4]}`
@@ -99,7 +115,10 @@ const parseFormatting = (result, snapshot) => {
     throw new Error(`dprint failed\n${result.stderr || result.stdout}`)
   }
   return result.stdout.split(/\r?\n/u).filter((line) => line.length > 0).map((filename) => {
-    const normalized = relative(snapshot, resolve(snapshot, filename)).split(sep).join("/")
+    const normalized = pipe(
+      resolve(snapshot, filename),
+      (absolute) => relative(snapshot, absolute)
+    ).split(sep).join("/")
     return { key: normalized, display: `${normalized} is not formatted` }
   })
 }
@@ -116,25 +135,55 @@ const introduced = (baseline, staged) => {
   return result
 }
 
-const main = async() => {
+const main = async () => {
   const repository = (await checked("git", ["rev-parse", "--show-toplevel"])).trim()
   const { baseline, staged, temporary } = await createSnapshots(repository)
   try {
     const executable = (name) => join(repository, "node_modules", ".bin", name)
+    await checked(process.execPath, ["scripts/test-oxlint-rules.mjs"], { cwd: staged })
     const commands = [
-      [executable("oxlint"), ["--format=json", "."]],
+      [executable("oxlint"), ["--format=json", "--threads=1", "."]],
       [executable("tsgo"), ["-b", "tsconfig.json", "--pretty", "false"]],
       [executable("dprint"), ["check", "--list-different", "--allow-no-files"]]
     ]
     const [baselineResults, stagedResults] = await Promise.all([
-      Promise.all(commands.map(([command, args]) => run(command, args, { cwd: baseline }))),
-      Promise.all(commands.map(([command, args]) => run(command, args, { cwd: staged })))
+      pipe(
+        commands.map(([command, args]) => run(command, args, { cwd: baseline })),
+        (runs) => Promise.all(runs)
+      ),
+      pipe(
+        commands.map(([command, args]) => run(command, args, { cwd: staged })),
+        (runs) => Promise.all(runs)
+      )
     ])
-    const failures = [...new Set([
-      ...introduced(parseOxlint(baselineResults[0], baseline), parseOxlint(stagedResults[0], staged)),
-      ...introduced(parseTypecheck(baselineResults[1], baseline), parseTypecheck(stagedResults[1], staged)),
-      ...introduced(parseFormatting(baselineResults[2], baseline), parseFormatting(stagedResults[2], staged))
-    ])]
+    const failures = [
+      ...new Set([
+        ...pipe(
+          parseOxlint(baselineResults[0], baseline),
+          (baselineDiagnostics) =>
+            pipe(
+              parseOxlint(stagedResults[0], staged),
+              (stagedDiagnostics) => introduced(baselineDiagnostics, stagedDiagnostics)
+            )
+        ),
+        ...pipe(
+          parseTypecheck(baselineResults[1], baseline),
+          (baselineDiagnostics) =>
+            pipe(
+              parseTypecheck(stagedResults[1], staged),
+              (stagedDiagnostics) => introduced(baselineDiagnostics, stagedDiagnostics)
+            )
+        ),
+        ...pipe(
+          parseFormatting(baselineResults[2], baseline),
+          (baselineDiagnostics) =>
+            pipe(
+              parseFormatting(stagedResults[2], staged),
+              (stagedDiagnostics) => introduced(baselineDiagnostics, stagedDiagnostics)
+            )
+        )
+      ])
+    ]
     if (failures.length > 0) {
       process.stderr.write(`Pre commit checks found ${failures.length} new diagnostic(s):\n${failures.join("\n")}\n`)
       process.exitCode = 1

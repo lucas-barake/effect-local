@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Definition from "../src/Definition.js"
 import * as Evolution from "../src/Evolution.js"
@@ -14,11 +15,17 @@ const TodoV1 = Model.make("Todo", {
   key: Schema.String,
   schema: Schema.Struct({ id: Schema.String, title: Schema.String })
 })
+class Missing extends Schema.TaggedErrorClass<Missing>(
+  "@lucas-barake/effect-local/test/Evolution/Missing"
+)("Missing", {}) {}
+class Forbidden extends Schema.TaggedErrorClass<Forbidden>(
+  "@lucas-barake/effect-local/test/Evolution/Forbidden"
+)("Forbidden", {}) {}
 const PutTodoV1 = Mutation.make("PutTodo", {
   version: 1,
   payload: TodoV1.schema,
   success: TodoV1.schema,
-  rejection: Schema.Literal("Missing")
+  rejection: Missing
 })
 const definitionV1 = Definition.make({ version: 1, models: [TodoV1], mutations: [PutTodoV1] })
 
@@ -31,7 +38,7 @@ const PutTodoV2 = Mutation.make("PutTodo", {
   version: 2,
   payload: TodoV2.schema,
   success: TodoV2.schema,
-  rejection: Schema.Literals(["Missing", "Forbidden"])
+  rejection: Schema.Union([Missing, Forbidden])
 })
 const definitionV2 = Definition.make({ version: 2, models: [TodoV2], mutations: [PutTodoV2] })
 
@@ -54,7 +61,7 @@ const putTodoMigration = Evolution.mutation({
   downgradePayload: ({ id, title }) => ({ id, title }),
   downgradeSuccess: ({ id, title }) => ({ id, title }),
   downgradeRejection: (rejection) => {
-    if (rejection === "Forbidden") return "Missing"
+    if (rejection._tag === "Forbidden") return new Missing()
     return rejection
   }
 })
@@ -89,7 +96,8 @@ describe("schema evolution", () => {
       mutations: [First, Second],
       queries: [
         Query.make("ListTodos", {
-          success: Schema.Array(TodoV1.schema)
+          success: Schema.Array(TodoV1.schema),
+          error: Missing
         })
       ]
     })
@@ -126,7 +134,8 @@ describe("schema evolution", () => {
       })
       assert.strictEqual(model.key, 42)
       assert.deepStrictEqual(model.value, { id: "42", title: "old", done: false })
-      assert.deepStrictEqual(model.aliases.map((alias) => alias.key), ["42", 42])
+      const aliases = model.aliases.map((alias) => alias.key)
+      assert.deepStrictEqual(aliases, ["42", 42])
 
       const payload = yield* Evolution.migrateMutationPayload({
         evolution,
@@ -151,9 +160,9 @@ describe("schema evolution", () => {
         source: definitionV1.schemaIdentity,
         mutation: "PutTodo",
         mutationVersion: Identity.SchemaVersion.make(1),
-        value: "Missing"
+        value: { _tag: "Missing" }
       })
-      assert.strictEqual(rejection.value, "Missing")
+      assert.deepStrictEqual(rejection.value, { _tag: "Missing" })
     }))
 
   it.effect("projects models and mutation outcomes to an explicit older definition", () =>
@@ -170,7 +179,8 @@ describe("schema evolution", () => {
       assert.deepStrictEqual(model.schemaIdentity, definitionV1.schemaIdentity)
       assert.strictEqual(model.key, "42")
       assert.deepStrictEqual(model.value, { id: "42", title: "new" })
-      assert.deepStrictEqual(model.aliases.map((alias) => alias.key), [42, "42"])
+      const aliases = model.aliases.map((alias) => alias.key)
+      assert.deepStrictEqual(aliases, [42, "42"])
 
       const payload = yield* Evolution.migrateMutationPayloadTo({
         evolution,
@@ -200,10 +210,10 @@ describe("schema evolution", () => {
         target: definitionV1.schemaIdentity,
         mutation: "PutTodo",
         mutationVersion: Identity.SchemaVersion.make(2),
-        value: "Forbidden"
+        value: { _tag: "Forbidden" }
       })
       assert.deepStrictEqual(rejection.schemaIdentity, definitionV1.schemaIdentity)
-      assert.strictEqual(rejection.value, "Missing")
+      assert.deepStrictEqual(rejection.value, { _tag: "Missing" })
     }))
 
   it.effect("reports invalid transform output as a typed failure with exact context", () => {
@@ -222,17 +232,20 @@ describe("schema evolution", () => {
     })
     const configured = Evolution.make({ current: definitionV2, steps: [invalid] })
     return Effect.gen(function*() {
-      const error = yield* Evolution.migrateModel({
+      const result = yield* Evolution.migrateModel({
         evolution: configured,
         source: definitionV1.schemaIdentity,
         model: "Todo",
         modelVersion: Identity.SchemaVersion.make(1),
         key: "42"
-      }).pipe(Effect.flip)
-      assert.strictEqual(error._tag, "SchemaEvolutionFailed")
-      if (error._tag === "SchemaEvolutionFailed") {
-        assert.strictEqual(error.stepId, "definition/invalid-output")
-        assert.strictEqual(error.part, "Key")
+      }).pipe(Effect.result)
+      assert.strictEqual(result._tag, "Failure")
+      if (Result.isFailure(result)) {
+        assert.strictEqual(result.failure._tag, "SchemaEvolutionFailed")
+        if (result.failure._tag === "SchemaEvolutionFailed") {
+          assert.strictEqual(result.failure.stepId, "definition/invalid-output")
+          assert.strictEqual(result.failure.part, "Key")
+        }
       }
     })
   })
@@ -248,7 +261,9 @@ describe("schema evolution", () => {
         from: TodoV1,
         to: TodoV2,
         key: () => {
-          return Effect.runSync(Effect.die(defect))
+          // This migration hook is synchronous, and the test must exercise its thrown defect boundary.
+          // oxlint-disable-next-line effect-local/noManualEffectBoundary
+          return Effect.die(defect).pipe(Effect.runSync)
         },
         value: ({ value }) => ({ ...value, done: false })
       })],
@@ -265,7 +280,8 @@ describe("schema evolution", () => {
       }).pipe(Effect.exit)
       assert.strictEqual(exit._tag, "Failure")
       if (exit._tag === "Failure") {
-        assert.strictEqual(Cause.squash(exit.cause), defect)
+        const squashed = Cause.squash(exit.cause)
+        assert.strictEqual(squashed, defect)
       }
     })
   })

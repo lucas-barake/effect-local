@@ -7,6 +7,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as SchemaDescriptor from "@lucas-barake/effect-local/SchemaDescriptor"
 import type * as SecondaryIndex from "@lucas-barake/effect-local/SecondaryIndex"
 import * as Effect from "effect/Effect"
+import { pipe } from "effect/Function"
 import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
@@ -62,7 +63,8 @@ const EntityKeyRow = Schema.Struct({ entity_key: Schema.String })
 
 const StateRow = Schema.Struct({ built: Schema.Literals([0, 1]) })
 
-const DescriptorHash = Schema.String.check(Schema.isPattern(/^[0-9a-f]{16}$/))
+const descriptorHashPattern = Schema.isPattern(/^[0-9a-f]{16}$/)
+const DescriptorHash = Schema.String.check(descriptorHashPattern)
 
 const BuiltDescriptorRow = Schema.Struct({ descriptor_hash: DescriptorHash })
 
@@ -79,7 +81,8 @@ const BackfillRow = Schema.Struct({
   value_json: Schema.String
 })
 
-const PartitionValues = Schema.Array(Schema.Union([Schema.String, Schema.Number]))
+const PartitionValue = Schema.Union([Schema.String, Schema.Number])
+const PartitionValues = Schema.Array(PartitionValue)
 
 const backfillPageSize = 500
 
@@ -166,7 +169,8 @@ export const make = (
     )
     const byModel = new Map<string, ReadonlyArray<Descriptor>>()
     for (const model of definition.models) {
-      byModel.set(model.name, all.filter((descriptor) => descriptor.model === model))
+      const descriptors = all.filter((descriptor) => descriptor.model === model)
+      byModel.set(model.name, descriptors)
     }
     const byLabel = new Map(
       all.map((descriptor) => [Canonical.stringify([descriptor.model.name, descriptor.indexName]), descriptor])
@@ -242,21 +246,25 @@ export const make = (
       }
       const table = sql(descriptor.tableName)
       const columns = [...partitionColumns(descriptor), ...sortColumns(descriptor)]
-      const assignments = sql.join(", ", false)(
-        columns.map((name) =>
-          sql`${sql(name)} = excluded.${sql(name)}`
-        )
+      const assignmentClauses = columns.map((name) => {
+        const column = sql(name)
+        return sql`${column} = excluded.${column}`
+      })
+      const assignments = sql.join(", ", false)(assignmentClauses)
+      const batchSize = pipe(Math.floor(900 / (columns.length + 3)), (size) =>
+        Math.max(1, size))
+      const batches = Array.from(
+        { length: Math.ceil(rows.length / batchSize) },
+        (_, position) => rows.slice(position * batchSize, (position + 1) * batchSize)
       )
-      const batchSize = Math.max(1, Math.floor(900 / (columns.length + 3)))
       return Effect.forEach(
-        Array.from(
-          { length: Math.ceil(rows.length / batchSize) },
-          (_, position) => rows.slice(position * batchSize, (position + 1) * batchSize)
-        ),
-        (batch) =>
-          sql`INSERT INTO ${table} ${sql.insert(batch)}
+        batches,
+        (batch) => {
+          const insert = sql.insert(batch)
+          return sql`INSERT INTO ${table} ${insert}
           ON CONFLICT (space_id, schema_generation, entity_key)
-          DO UPDATE SET ${assignments}`,
+          DO UPDATE SET ${assignments}`
+        },
         { discard: true }
       )
     }
@@ -295,7 +303,8 @@ export const make = (
           for (const row of rows) {
             const value = yield* decodeValue(descriptor.model, row.value_json)
             const values = yield* encodedComponents(descriptor.index, value)
-            encoded.push(indexRow(descriptor, spaceId, schemaGeneration, row.entity_key, values))
+            const encodedRow = indexRow(descriptor, spaceId, schemaGeneration, row.entity_key, values)
+            encoded.push(encodedRow)
           }
           yield* writeRows(descriptor, encoded)
           after = rows[rows.length - 1].entity_key
@@ -355,11 +364,13 @@ export const make = (
             for (const row of rows) found.set(row.entity_key, [])
             continue
           }
+          const partitionIdentifiers = partitions.map((name) => sql.literal(name))
+          const valuesJson = sql.csv(partitionIdentifiers)
           const rows = yield* SqlSchema.findAll({
             Request: Schema.Void,
             Result: Schema.Struct({ entity_key: Schema.String, values_json: Schema.String }),
             execute: () =>
-              sql`SELECT entity_key, json_array(${sql.csv(partitions.map(sql.literal))}) AS values_json
+              sql`SELECT entity_key, json_array(${valuesJson}) AS values_json
               FROM ${sql(descriptor.tableName)}
               WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
                 AND entity_key IN ${sql.in(batch)}`
@@ -383,14 +394,17 @@ export const make = (
 
     const writePartitionLogs = (rows: ReadonlyArray<Record<string, unknown>>) => {
       if (rows.length === 0) return Effect.void
+      const batches = Array.from(
+        { length: Math.ceil(rows.length / 180) },
+        (_, position) => rows.slice(position * 180, (position + 1) * 180)
+      )
       return Effect.forEach(
-        Array.from(
-          { length: Math.ceil(rows.length / 180) },
-          (_, position) => rows.slice(position * 180, (position + 1) * 180)
-        ),
-        (batch) =>
-          sql`INSERT INTO effect_local_server_index_partition_log ${sql.insert(batch)}
-          ON CONFLICT (space_id, server_sequence, descriptor_hash, partition_json) DO NOTHING`,
+        batches,
+        (batch) => {
+          const insert = sql.insert(batch)
+          return sql`INSERT INTO effect_local_server_index_partition_log ${insert}
+          ON CONFLICT (space_id, server_sequence, descriptor_hash, partition_json) DO NOTHING`
+        },
         { discard: true }
       )
     }
@@ -428,11 +442,12 @@ export const make = (
             })
           }
           for (const descriptor of active) {
+            const entityKeys = prepared.map((item) => item.entityKey)
             const previousByKey = yield* readPartitions(
               descriptor,
               spaceId,
               schemaGeneration,
-              prepared.map((item) => item.entityKey)
+              entityKeys
             )
             const logs: Array<Record<string, unknown>> = []
             const rows: Array<Record<string, unknown>> = []
@@ -457,12 +472,14 @@ export const make = (
               const next = values.slice(0, descriptor.index.partition.length)
               if (previous !== undefined && Canonical.stringify(previous) !== Canonical.stringify(next)) log(previous)
               log(next)
-              rows.push(indexRow(descriptor, spaceId, schemaGeneration, item.entityKey, values))
+              const row = indexRow(descriptor, spaceId, schemaGeneration, item.entityKey, values)
+              rows.push(row)
             }
             for (let offset = 0; offset < deleted.length; offset += 100) {
+              const batch = deleted.slice(offset, offset + 100)
               yield* sql`DELETE FROM ${sql(descriptor.tableName)}
                 WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
-                  AND entity_key IN ${sql.in(deleted.slice(offset, offset + 100))}`
+                  AND entity_key IN ${sql.in(batch)}`
             }
             yield* writePartitionLogs(logs)
             yield* writeRows(descriptor, rows)
@@ -485,7 +502,11 @@ export const make = (
     ): Statement.Fragment => {
       const columns = partitionColumns(descriptor)
       if (columns.length === 0) return sql`1 = 1`
-      return sql.and(columns.map((name, position) => sql`${sql(name)} = ${values[position]}`))
+      const clauses = columns.map((name, position) => {
+        const column = sql(name)
+        return sql`${column} = ${values[position]}`
+      })
+      return sql.and(clauses)
     }
 
     const boundsClauses = (
@@ -505,7 +526,8 @@ export const make = (
 
     const membership: Runtime["membership"] = (spaceId, schemaGeneration, window) =>
       Effect.gen(function*() {
-        const descriptor = byLabel.get(Canonical.stringify([window.model, window.index]))
+        const label = Canonical.stringify([window.model, window.index])
+        const descriptor = byLabel.get(label)
         if (descriptor === undefined) {
           return yield* new ReplicaError.ProtocolInvalid({
             message: `Unknown replication window index: ${window.model}/${window.index}`
@@ -515,8 +537,12 @@ export const make = (
         const table = sql(descriptor.tableName)
         const partitions = partitionColumns(descriptor)
         const sorts = sortColumns(descriptor)
+        const orderColumns = [...sorts, "entity_key"].map((name) => {
+          const column = sql(name)
+          return sql`${column} DESC`
+        })
         const orderTuple = sql.join(", ", false)(
-          [...sorts, "entity_key"].map((name) => sql`${sql(name)} DESC`)
+          orderColumns
         )
         const selected = new Set<string>()
         const overrides = window.partitions ?? []
@@ -540,9 +566,11 @@ export const make = (
           )
         let exclusion = sql`1 = 1`
         if (overrideValues.length > 0) {
-          const overrideMatch = sql.and(
-            partitions.map((name, position) => sql`${sql(name)} = json_extract(override.value, ${`$[${position}]`})`)
-          )
+          const overrideClauses = partitions.map((name, position) => {
+            const column = sql(name)
+            return sql`${column} = json_extract(override.value, ${`$[${position}]`})`
+          })
+          const overrideMatch = sql.and(overrideClauses)
           exclusion = sql`NOT EXISTS (
             SELECT 1 FROM json_each(${Canonical.stringify(overrideValues)}) AS override
             WHERE ${overrideMatch}
@@ -557,10 +585,14 @@ export const make = (
             )
           }
         } else {
-          const partitionTuple = sql.join(", ", false)(partitions.map((name) => sql`${sql(name)}`))
+          const partitionIdentifiers = partitions.map((name) => {
+            const column = sql(name)
+            return sql`${column}`
+          })
+          const partitionTuple = sql.join(", ", false)(partitionIdentifiers)
           yield* collect(
             sql`SELECT entity_key FROM (
-              SELECT entity_key, ${sql.join(", ", false)(partitions.map((name) => sql`${sql(name)}`))},
+              SELECT entity_key, ${partitionTuple},
                 ROW_NUMBER() OVER (PARTITION BY ${partitionTuple} ORDER BY ${orderTuple}) AS window_rank
               FROM ${table}
               WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration} AND ${exclusion}
@@ -579,10 +611,11 @@ export const make = (
           if (override.bounds !== undefined) {
             const clauses = yield* boundsClauses(descriptor, override.bounds)
             if (clauses.length > 0) {
+              const bounds = sql.and(clauses)
               yield* collect(
                 sql`SELECT entity_key FROM ${table}
                 WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration} AND ${matches}
-                  AND ${sql.and(clauses)}`
+                  AND ${bounds}`
               )
             }
           }
@@ -591,7 +624,8 @@ export const make = (
       }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
     const resolveDescriptor = (window: Protocol.ReplicationWindow) => {
-      const descriptor = byLabel.get(Canonical.stringify([window.model, window.index]))
+      const label = Canonical.stringify([window.model, window.index])
+      const descriptor = byLabel.get(label)
       if (descriptor === undefined) {
         return Effect.fail(
           new ReplicaError.ProtocolInvalid({
@@ -610,7 +644,8 @@ export const make = (
         const overrides = new Map<string, Protocol.ReplicationWindowPartition>()
         for (const override of window.partitions ?? []) {
           const values = yield* encodedPartitionKey(descriptor, override.key)
-          overrides.set(Canonical.stringify(values), override)
+          const label = Canonical.stringify(values)
+          overrides.set(label, override)
         }
         return overrides
       })
@@ -626,9 +661,11 @@ export const make = (
         yield* ensureBuilt(spaceId, schemaGeneration, descriptor)
         const table = sql(descriptor.tableName)
         const sorts = sortColumns(descriptor)
-        const orderTuple = sql.join(", ", false)(
-          [...sorts, "entity_key"].map((name) => sql`${sql(name)} DESC`)
-        )
+        const orderColumns = [...sorts, "entity_key"].map((name) => {
+          const column = sql(name)
+          return sql`${column} DESC`
+        })
+        const orderTuple = sql.join(", ", false)(orderColumns)
         const overrides = yield* overrideByPartition(descriptor, window)
         const selected = new Set<string>()
         const visited = new Set<string>()
@@ -661,10 +698,11 @@ export const make = (
           if (override?.bounds !== undefined) {
             const clauses = yield* boundsClauses(descriptor, override.bounds)
             if (clauses.length > 0) {
+              const bounds = sql.and(clauses)
               yield* collect(
                 sql`SELECT entity_key FROM ${table}
                 WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration} AND ${matches}
-                  AND ${sql.and(clauses)}`
+                  AND ${bounds}`
               )
             }
           }
@@ -689,11 +727,13 @@ export const make = (
         })
         for (let offset = 0; offset < entityKeys.length; offset += 100) {
           const batch = entityKeys.slice(offset, offset + 100)
+          const partitionIdentifiers = partitions.map((name) => sql.literal(name))
+          const valuesJson = sql.csv(partitionIdentifiers)
           const rows = yield* SqlSchema.findAll({
             Request: Schema.Void,
             Result: RowSchema,
             execute: () =>
-              sql`SELECT entity_key, json_array(${sql.csv(partitions.map(sql.literal))}) AS values_json FROM ${table}
+              sql`SELECT entity_key, json_array(${valuesJson}) AS values_json FROM ${table}
               WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
                 AND entity_key IN ${sql.in(batch)}`
           })(undefined).pipe(
@@ -720,9 +760,10 @@ export const make = (
     ) =>
       Effect.gen(function*() {
         const descriptor = yield* resolveDescriptor(window)
+        const PartitionLogRow = Schema.Struct({ partition_json: Schema.String })
         const rows = yield* SqlSchema.findAll({
           Request: Schema.Void,
-          Result: Schema.Struct({ partition_json: Schema.String }),
+          Result: PartitionLogRow,
           execute: () =>
             sql`SELECT DISTINCT partition_json FROM effect_local_server_index_partition_log
             WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}

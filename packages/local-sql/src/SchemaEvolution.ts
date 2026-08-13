@@ -18,7 +18,8 @@ import * as TerminalRejection from "./internal/TerminalRejection.js"
 import * as SqlTransaction from "./internal/transaction.js"
 import { MutationRuntime } from "./MutationRuntime.js"
 
-const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+const nonNegativeIntFilter = Schema.isGreaterThanOrEqualTo(0)
+const NonNegativeInt = Schema.Int.check(nonNegativeIntFilter)
 const NullableSchemaVersion = Schema.NullOr(Identity.SchemaVersion)
 const NullableSchemaHash = Schema.NullOr(Identity.SchemaHash)
 const EvolutionPhase = Schema.Literals([
@@ -289,7 +290,8 @@ const resolveInitialSource = (
     if (meta.schema_version === null || meta.schema_hash === null) {
       return Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client schema identity is partially stored" }))
     }
-    return sourceDefinition(evolution, identityFrom(meta.schema_version, meta.schema_hash)).pipe(
+    const identity = identityFrom(meta.schema_version, meta.schema_hash)
+    return sourceDefinition(evolution, identity).pipe(
       Effect.map((definition) => ({ identity: definition.schemaIdentity, legacy: false }))
     )
   }
@@ -298,9 +300,10 @@ const resolveInitialSource = (
   }
   const baseline = evolution.legacyBaselineByHash.get(meta.definition_hash)
   if (baseline === undefined) {
+    const legacyBaselineHashes = evolution.legacyBaselineByHash.keys()
     return Effect.fail(
       new ReplicaError.DefinitionMismatch({
-        expected: Array.from(evolution.legacyBaselineByHash.keys()).concat(evolution.current.hash).join(","),
+        expected: Array.from(legacyBaselineHashes).concat(evolution.current.hash).join(","),
         actual: meta.definition_hash
       })
     )
@@ -539,6 +542,8 @@ export interface ClientOptions {
 export const client = (options: ClientOptions) =>
   Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
+    const withTransaction = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
+      sql.withTransaction(effect)
     const runtime = yield* MutationRuntime
     if (!sameIdentity(options.definition.schemaIdentity, options.evolution.current.schemaIdentity)) {
       return yield* new ReplicaError.InvalidConfiguration({
@@ -833,7 +838,7 @@ export const client = (options: ClientOptions) =>
       const source = yield* resolveInitialSource(meta, options.evolution)
       if (!source.legacy && sameIdentity(source.identity, options.definition.schemaIdentity)) {
         if (meta.definition_hash === options.definition.hash) return meta.schema_generation
-        return yield* sql.withTransaction(Effect.gen(function*() {
+        return yield* Effect.gen(function*() {
           yield* sql`UPDATE effect_local_client_spaces SET definition_hash = ${options.definition.hash}
             WHERE space_id = ${options.spaceId} AND schema_generation = ${meta.schema_generation}
               AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL`
@@ -851,7 +856,7 @@ export const client = (options: ClientOptions) =>
             })
           }
           return currentMeta.schema_generation
-        }))
+        }).pipe(withTransaction)
       }
       if (meta.schema_generation >= Number.MAX_SAFE_INTEGER) {
         return yield* new ReplicaError.CapacityExceeded({
@@ -860,7 +865,7 @@ export const client = (options: ClientOptions) =>
         })
       }
       const generation = Identity.SchemaVersion.make(meta.schema_generation + 1)
-      yield* sql.withTransaction(Effect.gen(function*() {
+      yield* Effect.gen(function*() {
         const promoted = yield* beginPromotion({
           expectedGeneration: meta.schema_generation,
           generation,
@@ -886,16 +891,17 @@ export const client = (options: ClientOptions) =>
             ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash},
             ${options.evolution.migrationHash}, ${generation}, ${meta.active_schema_generation},
             ${meta.active_projection_generation}, 0, 'Log', NULL, NULL, 0)`
-      }))
+      }).pipe(withTransaction)
       progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
     }
     if (Option.isNone(progress)) {
       return yield* new ReplicaError.StorageCorrupt({ message: "Client schema evolution progress was not created" })
     }
     const expected = progress.value
+    const targetIdentity = identityFrom(expected.target_schema_version, expected.target_schema_hash)
     if (
       !sameIdentity(
-        identityFrom(expected.target_schema_version, expected.target_schema_hash),
+        targetIdentity,
         options.definition.schemaIdentity
       ) ||
       expected.migration_hash !== options.evolution.migrationHash
@@ -939,7 +945,7 @@ export const client = (options: ClientOptions) =>
         )
         const limit = yield* boundedCount(metadata, batchBytes)
         const rows = yield* logBatch({ after, limit }).pipe(Effect.mapError(StorageUnavailable.make))
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           for (const row of rows) {
             const entry = yield* currentOrLegacyEntry(row, source, definition)
@@ -964,7 +970,7 @@ export const client = (options: ClientOptions) =>
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
           return undefined
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "Entities") {
         let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
         if (state.cursor_model === null) {
@@ -994,7 +1000,7 @@ export const client = (options: ClientOptions) =>
             limit
           }).pipe(Effect.mapError(StorageUnavailable.make))
         }
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           for (const row of rows) {
             const model = definition.modelByName.get(row.model)
@@ -1034,7 +1040,7 @@ export const client = (options: ClientOptions) =>
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
           return undefined
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "Receipts") {
         const request = {
           generation: state.source_generation,
@@ -1046,7 +1052,7 @@ export const client = (options: ClientOptions) =>
         )
         const limit = yield* boundedCount(metadata, batchBytes)
         const rows = yield* receiptBatch({ ...request, limit }).pipe(Effect.mapError(StorageUnavailable.make))
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           for (const row of rows) {
             const decoded = yield* currentOrLegacyReceipt(row, source)
@@ -1071,7 +1077,7 @@ export const client = (options: ClientOptions) =>
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
           return undefined
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "Pending") {
         const request = {
           generation: state.source_generation,
@@ -1083,45 +1089,45 @@ export const client = (options: ClientOptions) =>
         )
         const limit = yield* boundedCount(metadata, batchBytes)
         const rows = yield* pendingBatch({ ...request, limit }).pipe(Effect.mapError(StorageUnavailable.make))
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           for (const row of rows) {
             const envelope = yield* pendingEnvelope(row, options, source, definition)
+            const entityChanges = Schema.Array(Protocol.EntityChange)
             const decodedChanges = yield* decodeJson(
-              Schema.Array(Protocol.EntityChange),
+              entityChanges,
               row.changes_json
             ).pipe(Effect.result)
             let historicalChanges: ReadonlyArray<Protocol.EntityChange>
             if (Result.isSuccess(decodedChanges)) {
               historicalChanges = decodedChanges.success
             } else {
-              historicalChanges = yield* decodeJson(Schema.Array(LegacyEntityChange), row.changes_json).pipe(
-                Effect.flatMap((changes) =>
-                  Effect.forEach(changes, (change): Effect.Effect<
-                    Protocol.EntityChange,
-                    ReplicaError.StorageCorrupt
-                  > => {
-                    const model = definition.modelByName.get(change.entity.model)
-                    if (model === undefined) {
-                      return Effect.fail(
-                        new ReplicaError.StorageCorrupt({
-                          message: `Pending mutation references unknown model ${change.entity.model}`
-                        })
-                      )
-                    }
-                    if (change._tag === "Delete") {
-                      return Effect.succeed({
-                        _tag: "Delete" as const,
-                        entity: { ...change.entity, modelVersion: model.version }
+              const legacyEntityChanges = Schema.Array(LegacyEntityChange)
+              historicalChanges = yield* decodeJson(legacyEntityChanges, row.changes_json).pipe(
+                Effect.flatMap(Effect.forEach((change: typeof LegacyEntityChange.Type): Effect.Effect<
+                  Protocol.EntityChange,
+                  ReplicaError.StorageCorrupt
+                > => {
+                  const model = definition.modelByName.get(change.entity.model)
+                  if (model === undefined) {
+                    return Effect.fail(
+                      new ReplicaError.StorageCorrupt({
+                        message: `Pending mutation references unknown model ${change.entity.model}`
                       })
-                    }
+                    )
+                  }
+                  if (change._tag === "Delete") {
                     return Effect.succeed({
-                      _tag: "Upsert" as const,
-                      entity: { ...change.entity, modelVersion: model.version },
-                      value: change.value
+                      _tag: "Delete" as const,
+                      entity: { ...change.entity, modelVersion: model.version }
                     })
+                  }
+                  return Effect.succeed({
+                    _tag: "Upsert" as const,
+                    entity: { ...change.entity, modelVersion: model.version },
+                    value: change.value
                   })
-                )
+                }))
               )
             }
             const migratedHistoricalChanges: Array<Protocol.EntityChange> = []
@@ -1134,14 +1140,16 @@ export const client = (options: ClientOptions) =>
                 key: migrated.key
               }
               if (change._tag === "Delete") {
-                migratedHistoricalChanges.push(Protocol.Delete.make({ entity }))
+                const migratedDelete = Protocol.Delete.make({ entity })
+                migratedHistoricalChanges.push(migratedDelete)
               } else {
                 if (migrated.value === undefined) {
                   return yield* new ReplicaError.StorageCorrupt({
                     message: `Migrated pending upsert for ${change.entity.model} has no value`
                   })
                 }
-                migratedHistoricalChanges.push(Protocol.Upsert.make({ entity, value: migrated.value }))
+                const migratedUpsert = Protocol.Upsert.make({ entity, value: migrated.value })
+                migratedHistoricalChanges.push(migratedUpsert)
               }
             }
             if (row.submission_state === "AwaitingReceipt" || row.receipt_count > 0) {
@@ -1171,30 +1179,25 @@ export const client = (options: ClientOptions) =>
               continue
             }
             const changes: Array<Protocol.EntityChange> = []
-            const executed = yield* sql.withTransaction(
-              runtime.executeEnvelope(
-                envelope,
-                SqlTransaction.local({
-                  sql,
-                  table: "visible",
-                  spaceId: options.spaceId,
-                  schemaGeneration: state.generation,
-                  projectionGeneration: state.target_projection_generation,
-                  changes
-                }),
-                changes
-              ).pipe(
-                Effect.flatMap((result) => {
-                  if (Result.isSuccess(result)) return Effect.succeed(result.success)
-                  return Effect.fail(
-                    new TerminalRejection.TerminalRejection({
-                      origin: "Mutation",
-                      rejection: result.failure
-                    })
-                  )
-                })
-              )
-            ).pipe(
+            const transaction = SqlTransaction.local({
+              sql,
+              table: "visible",
+              spaceId: options.spaceId,
+              schemaGeneration: state.generation,
+              projectionGeneration: state.target_projection_generation,
+              changes
+            })
+            const executed = yield* runtime.executeEnvelope(envelope, transaction, changes).pipe(
+              Effect.flatMap((result) => {
+                if (Result.isSuccess(result)) return Effect.succeed(result.success)
+                return Effect.fail(
+                  new TerminalRejection.TerminalRejection({
+                    origin: "Mutation",
+                    rejection: result.failure
+                  })
+                )
+              }),
+              withTransaction,
               Effect.map(Result.succeed),
               Effect.catchTag("TerminalRejection", ({ rejection }) => Effect.succeed(Result.fail(rejection)))
             )
@@ -1234,7 +1237,7 @@ export const client = (options: ClientOptions) =>
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
           return undefined
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "Retractions") {
         const request = {
           generation: state.source_generation,
@@ -1270,7 +1273,7 @@ export const client = (options: ClientOptions) =>
             limit
           }).pipe(Effect.mapError(StorageUnavailable.make))
         }
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           for (const row of rows) {
             const migrated = yield* Evolution.migrateModel({
@@ -1300,9 +1303,9 @@ export const client = (options: ClientOptions) =>
               cursor_key = ${last.entity_key}
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "Flip") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_client_scoped_bootstrap_entries
             WHERE space_id = ${options.spaceId}`
@@ -1318,9 +1321,9 @@ export const client = (options: ClientOptions) =>
               AND active_schema_generation = ${state.source_generation}`
           yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupCanonical'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "CleanupCanonical") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_client_canonical_entities_data WHERE rowid IN (
             SELECT rowid FROM effect_local_client_canonical_entities_data
@@ -1333,9 +1336,9 @@ export const client = (options: ClientOptions) =>
             yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupVisible'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "CleanupVisible") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_client_visible_entities_data WHERE rowid IN (
             SELECT rowid FROM effect_local_client_visible_entities_data
@@ -1348,9 +1351,9 @@ export const client = (options: ClientOptions) =>
             yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupRetractions'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "CleanupRetractions") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_client_retractions WHERE rowid IN (
             SELECT rowid FROM effect_local_client_retractions
@@ -1363,9 +1366,9 @@ export const client = (options: ClientOptions) =>
             yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupReceipts'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "CleanupReceipts") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_client_receipts_data WHERE rowid IN (
             SELECT rowid FROM effect_local_client_receipts_data
@@ -1378,9 +1381,9 @@ export const client = (options: ClientOptions) =>
             yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupPending'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "CleanupPending") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_client_pending_data WHERE rowid IN (
             SELECT rowid FROM effect_local_client_pending_data
@@ -1393,9 +1396,9 @@ export const client = (options: ClientOptions) =>
             yield* sql`UPDATE effect_local_client_evolution SET phase = 'Finalize'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`UPDATE effect_local_client_spaces SET definition_hash = ${options.definition.hash},
             schema_version = ${options.definition.schemaIdentity.version},
@@ -1405,7 +1408,7 @@ export const client = (options: ClientOptions) =>
               AND active_schema_generation = ${state.generation}`
           yield* sql`DELETE FROM effect_local_client_evolution
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
-        }))
+        }).pipe(withTransaction)
       }
       if (options.afterBatch !== undefined) yield* options.afterBatch
     }
@@ -1478,6 +1481,8 @@ export interface ServerOptions {
 export const server = (options: ServerOptions) =>
   Effect.gen(function*() {
     const sql = yield* SqlClient.SqlClient
+    const withTransaction = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
+      sql.withTransaction(effect)
     if (!sameIdentity(options.definition.schemaIdentity, options.evolution.current.schemaIdentity)) {
       return yield* new ReplicaError.InvalidConfiguration({
         option: "evolution",
@@ -1805,7 +1810,7 @@ export const server = (options: ServerOptions) =>
       const source = yield* resolveInitialSource(meta, options.evolution)
       if (!source.legacy && sameIdentity(source.identity, options.definition.schemaIdentity)) {
         if (meta.definition_hash === options.definition.hash) return meta.schema_generation
-        return yield* sql.withTransaction(Effect.gen(function*() {
+        return yield* Effect.gen(function*() {
           yield* sql`UPDATE effect_local_server_spaces SET definition_hash = ${options.definition.hash}
             WHERE space_id = ${options.spaceId} AND schema_generation = ${meta.schema_generation}
               AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL`
@@ -1823,7 +1828,7 @@ export const server = (options: ServerOptions) =>
             })
           }
           return currentMeta.schema_generation
-        }))
+        }).pipe(withTransaction)
       }
       if (meta.schema_generation >= Number.MAX_SAFE_INTEGER) {
         return yield* new ReplicaError.CapacityExceeded({
@@ -1832,7 +1837,7 @@ export const server = (options: ServerOptions) =>
         })
       }
       const generation = Identity.SchemaVersion.make(meta.schema_generation + 1)
-      yield* sql.withTransaction(Effect.gen(function*() {
+      yield* Effect.gen(function*() {
         const promoted = yield* beginPromotion({
           expectedGeneration: meta.schema_generation,
           generation,
@@ -1850,16 +1855,17 @@ export const server = (options: ServerOptions) =>
             ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash},
             ${options.evolution.migrationHash}, ${generation}, ${meta.active_schema_generation},
             0, 0, 'Log', NULL, NULL, 0)`
-      }))
+      }).pipe(withTransaction)
       progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
     }
     if (Option.isNone(progress)) {
       return yield* new ReplicaError.StorageCorrupt({ message: "Server schema evolution progress was not created" })
     }
     const expected = progress.value
+    const targetIdentity = identityFrom(expected.target_schema_version, expected.target_schema_hash)
     if (
       !sameIdentity(
-        identityFrom(expected.target_schema_version, expected.target_schema_hash),
+        targetIdentity,
         options.definition.schemaIdentity
       ) ||
       expected.migration_hash !== options.evolution.migrationHash
@@ -1902,7 +1908,7 @@ export const server = (options: ServerOptions) =>
         )
         const limit = yield* boundedCount(metadata, batchBytes)
         const rows = yield* logBatch({ after, limit }).pipe(Effect.mapError(StorageUnavailable.make))
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           for (const row of rows) {
             const entry = yield* currentOrLegacyEntry(row, source, definition)
@@ -1928,7 +1934,7 @@ export const server = (options: ServerOptions) =>
             }
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "Entities") {
         let targetEntityCount = 0
         let targetEntityBytes = 0
@@ -1960,7 +1966,7 @@ export const server = (options: ServerOptions) =>
             limit
           }).pipe(Effect.mapError(StorageUnavailable.make))
         }
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           for (const row of rows) {
             const model = definition.modelByName.get(row.model)
@@ -2012,7 +2018,7 @@ export const server = (options: ServerOptions) =>
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
           return undefined
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "Receipts") {
         let metadataQuery = initialReceiptMetadata(batchSize)
         if (state.cursor_key !== null) {
@@ -2025,7 +2031,7 @@ export const server = (options: ServerOptions) =>
         let receiptQuery = initialReceiptBatch(limit)
         if (state.cursor_key !== null) receiptQuery = continuingReceiptBatch({ after: state.cursor_key, limit })
         const rows = yield* receiptQuery.pipe(Effect.mapError(StorageUnavailable.make))
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           for (const row of rows) {
             const receipt = yield* currentOrLegacyReceipt(row, source)
@@ -2045,9 +2051,9 @@ export const server = (options: ServerOptions) =>
             yield* sql`UPDATE effect_local_server_evolution SET cursor_key = ${rows[rows.length - 1].mutation_id}
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "Flip") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`UPDATE effect_local_server_spaces SET
             active_schema_generation = ${state.generation},
@@ -2056,9 +2062,9 @@ export const server = (options: ServerOptions) =>
               AND active_schema_generation = ${state.source_generation}`
           yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupScopedSnapshotEntries'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "CleanupScopedSnapshotEntries") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_server_scoped_snapshot_entries WHERE rowid IN (
             SELECT entry.rowid FROM effect_local_server_scoped_snapshot_entries AS entry
@@ -2071,9 +2077,9 @@ export const server = (options: ServerOptions) =>
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupScopedSnapshots'
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "CleanupScopedSnapshots") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_server_scoped_snapshots WHERE rowid IN (
             SELECT rowid FROM effect_local_server_scoped_snapshots
@@ -2084,9 +2090,9 @@ export const server = (options: ServerOptions) =>
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupReplicationPages'
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "CleanupReplicationPages") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_server_replication_pages WHERE rowid IN (
             SELECT page.rowid FROM effect_local_server_replication_pages AS page
@@ -2099,9 +2105,9 @@ export const server = (options: ServerOptions) =>
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupReplicationViewEntities'
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "CleanupReplicationViewEntities") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_server_replication_view_entities WHERE rowid IN (
             SELECT entity.rowid FROM effect_local_server_replication_view_entities AS entity
@@ -2116,9 +2122,9 @@ export const server = (options: ServerOptions) =>
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupReplicationViews'
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "CleanupReplicationViews") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_server_replication_views WHERE rowid IN (
             SELECT rowid FROM effect_local_server_replication_views
@@ -2129,9 +2135,9 @@ export const server = (options: ServerOptions) =>
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupEntities'
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else if (state.phase === "CleanupEntities") {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`DELETE FROM effect_local_server_entities_data WHERE rowid IN (
             SELECT rowid FROM effect_local_server_entities_data
@@ -2144,9 +2150,9 @@ export const server = (options: ServerOptions) =>
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'Finalize'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
           }
-        }))
+        }).pipe(withTransaction)
       } else {
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* Effect.gen(function*() {
           yield* validateBatch(state)
           yield* sql`UPDATE effect_local_server_spaces SET definition_hash = ${options.definition.hash},
             schema_version = ${options.definition.schemaIdentity.version},
@@ -2156,7 +2162,7 @@ export const server = (options: ServerOptions) =>
               AND active_schema_generation = ${state.generation}`
           yield* sql`DELETE FROM effect_local_server_evolution
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
-        }))
+        }).pipe(withTransaction)
       }
       if (options.afterBatch !== undefined) yield* options.afterBatch
     }

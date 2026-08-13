@@ -44,7 +44,10 @@ export const encodedComponents = (
 ): Effect.Effect<ReadonlyArray<SqlValue>, ReplicaError.StorageCorrupt> =>
   Effect.forEach(
     [...index.partition, ...index.sort],
-    (component) => encodeComponent(component, component.extract(value))
+    (component) => {
+      const extracted = component.extract(value)
+      return encodeComponent(component, extracted)
+    }
   )
 
 export const encodedPrimitive = (

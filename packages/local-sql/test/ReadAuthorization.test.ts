@@ -4,6 +4,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import { pipe } from "effect/Function"
 import * as Option from "effect/Option"
 import * as Scope from "effect/Scope"
 import * as TestClock from "effect/testing/TestClock"
@@ -14,16 +15,29 @@ interface Key {
   readonly path: ReadonlyArray<string>
 }
 
+type TestErrorReason = "timeout" | "pending-capacity" | "revoked" | "denied"
+
+class TestError {
+  readonly _tag = "TestError"
+
+  constructor(readonly reason: TestErrorReason) {}
+}
+
+const timeoutError = new TestError("timeout")
+const pendingCapacityError = new TestError("pending-capacity")
+const revokedError = new TestError("revoked")
+const deniedError = new TestError("denied")
+
 const key = (tenant: string): Key => ({ tenant, path: ["spaces", "read"] })
 
-const make = (options?: Partial<ReadAuthorization.Options<string>>) =>
-  ReadAuthorization.make<Key, string, string>({
+const make = (options?: Partial<ReadAuthorization.Options<TestError>>) =>
+  ReadAuthorization.make<Key, string, TestError>({
     refreshIntervalNanos: 1_000_000_000n,
     lookupTimeoutNanos: 1_000_000_000n,
-    onLookupTimeout: () => "timeout",
+    onLookupTimeout: () => timeoutError,
     maximumConcurrentLookups: 2,
     maximumPendingLookups: 16,
-    onPendingCapacityExceeded: () => "pending-capacity",
+    onPendingCapacityExceeded: () => pendingCapacityError,
     completedCacheCapacity: 16,
     ...options
   })
@@ -43,16 +57,20 @@ describe("read authorization coordinator", () => {
           return "initial"
         })
 
-      const first = yield* coordinator.authorize(key("one"), initial).pipe(
+      const first = yield* pipe(
+        key("one"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, initial),
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(initialEntered)
-      const second = yield* coordinator.authorize(key("one"), initial).pipe(
+      const second = yield* pipe(
+        key("one"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, initial),
         Effect.forkChild({ startImmediately: true })
       )
       assert.strictEqual(initialLookups, 1)
       yield* Deferred.succeed(releaseInitial, undefined)
-      const [firstSuccess, secondSuccess] = yield* Effect.all([Fiber.join(first), Fiber.join(second)])
+      const [firstSuccess, secondSuccess] = yield* pipe([Fiber.join(first), Fiber.join(second)], Effect.all)
       assert.strictEqual(firstSuccess.generation, secondSuccess.generation)
 
       const refreshEntered = yield* Deferred.make<void>()
@@ -65,38 +83,51 @@ describe("read authorization coordinator", () => {
           yield* Deferred.await(releaseRefresh)
           return "refreshed"
         })
-      const refreshing = yield* coordinator.refresh(key("one"), firstSuccess.generation, refresh).pipe(
+      const refreshing = yield* pipe(
+        key("one"),
+        (authorizationKey) => coordinator.refresh(authorizationKey, firstSuccess.generation, refresh),
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(refreshEntered)
-      const following = yield* coordinator.refresh(key("one"), firstSuccess.generation, refresh).pipe(
+      const following = yield* pipe(
+        key("one"),
+        (authorizationKey) => coordinator.refresh(authorizationKey, firstSuccess.generation, refresh),
         Effect.forkChild({ startImmediately: true })
       )
       assert.strictEqual(refreshLookups, 1)
       yield* Deferred.succeed(releaseRefresh, undefined)
-      const [refreshed, followed] = yield* Effect.all([Fiber.join(refreshing), Fiber.join(following)])
+      const [refreshed, followed] = yield* pipe([Fiber.join(refreshing), Fiber.join(following)], Effect.all)
       assert.strictEqual(refreshed.value, "refreshed")
       assert.strictEqual(refreshed.generation, followed.generation)
       assert.isTrue(refreshed.generation > firstSuccess.generation)
-      assert.deepStrictEqual(yield* coordinator.current(key("one")), Option.some(refreshed))
+      const current = yield* pipe(key("one"), coordinator.current)
+      pipe(refreshed, Option.some, (expected) => assert.deepStrictEqual(current, expected))
     }).pipe(Effect.scoped))
 
   it.effect("invalidates the matching cached authorization when its refresh is denied", () =>
     Effect.gen(function*() {
       const coordinator = yield* make()
-      const initial = yield* coordinator.authorize(key("revoked"), () => Effect.succeed("allowed"))
-
-      const denied = yield* Effect.exit(
-        coordinator.refresh(key("revoked"), initial.generation, () => Effect.fail("revoked"))
+      const initial = yield* pipe(
+        key("revoked"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, () => Effect.succeed("allowed"))
       )
-      assert.isTrue(Exit.isFailure(denied))
-      assert.isTrue(Option.isNone(yield* coordinator.current(key("revoked"))))
+
+      const denied = yield* pipe(
+        key("revoked"),
+        (authorizationKey) =>
+          coordinator.refresh(authorizationKey, initial.generation, () => Effect.fail(revokedError)),
+        Effect.exit
+      )
+      pipe(denied, Exit.isFailure, (isFailure) => assert.isTrue(isFailure))
+      const current = yield* pipe(key("revoked"), coordinator.current)
+      pipe(current, Option.isNone, (isNone) => assert.isTrue(isNone))
 
       let replacementLookups = 0
-      const replacement = yield* coordinator.authorize(key("revoked"), () => {
-        replacementLookups++
-        return Effect.succeed("allowed-again")
-      })
+      const replacement = yield* pipe(key("revoked"), (authorizationKey) =>
+        coordinator.authorize(authorizationKey, () => {
+          replacementLookups++
+          return Effect.succeed("allowed-again")
+        }))
       assert.strictEqual(replacementLookups, 1)
       assert.strictEqual(replacement.value, "allowed-again")
       assert.isTrue(replacement.generation > initial.generation)
@@ -123,7 +154,12 @@ describe("read authorization coordinator", () => {
 
       const fibers = yield* Effect.forEach(
         ["a", "b", "c", "d", "e"],
-        (tenant) => coordinator.authorize(key(tenant), lookup).pipe(Effect.forkChild({ startImmediately: true }))
+        (tenant) =>
+          pipe(
+            key(tenant),
+            (authorizationKey) => coordinator.authorize(authorizationKey, lookup),
+            Effect.forkChild({ startImmediately: true })
+          )
       )
       yield* Deferred.await(twoEntered)
       assert.strictEqual(maximumRunning, 2)
@@ -140,7 +176,7 @@ describe("read authorization coordinator", () => {
       const coordinator = yield* make({
         maximumConcurrentLookups: 2,
         maximumPendingLookups: 2,
-        onPendingCapacityExceeded: () => "pending-capacity"
+        onPendingCapacityExceeded: () => pendingCapacityError
       })
       const entered = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
@@ -153,24 +189,31 @@ describe("read authorization coordinator", () => {
           return "allowed"
         })
 
-      const leader = yield* coordinator.authorize(key("shared"), blocked).pipe(
+      const leader = yield* pipe(
+        key("shared"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, blocked),
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(entered)
-      const follower = yield* coordinator.authorize(key("shared"), blocked).pipe(
+      const follower = yield* pipe(
+        key("shared"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, blocked),
         Effect.forkChild({ startImmediately: true })
       )
-      const overflow = yield* coordinator.authorize(key("shared"), blocked).pipe(
+      const overflow = yield* pipe(
+        key("shared"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, blocked),
         Effect.forkChild({ startImmediately: true })
       )
       yield* Effect.yieldNow
 
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 1, requesting: 2, completed: 0 })
-      assert.deepStrictEqual(yield* Fiber.await(overflow), Exit.fail("pending-capacity"))
+      const overflowExit = yield* Fiber.await(overflow)
+      pipe(pendingCapacityError, Exit.fail, (expected) => assert.deepStrictEqual(overflowExit, expected))
       assert.strictEqual(lookups, 1)
 
       yield* Deferred.succeed(release, undefined)
-      const [leaderSuccess, followerSuccess] = yield* Effect.all([Fiber.join(leader), Fiber.join(follower)])
+      const [leaderSuccess, followerSuccess] = yield* pipe([Fiber.join(leader), Fiber.join(follower)], Effect.all)
       assert.strictEqual(leaderSuccess.generation, followerSuccess.generation)
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 0, requesting: 0, completed: 1 })
     }).pipe(Effect.scoped))
@@ -180,15 +223,22 @@ describe("read authorization coordinator", () => {
       const coordinator = yield* make({
         maximumConcurrentLookups: 1,
         maximumPendingLookups: 2,
-        onPendingCapacityExceeded: () => "pending-capacity"
+        onPendingCapacityExceeded: () => pendingCapacityError
       })
       const firstEntered = yield* Deferred.make<void>()
-      const first = yield* coordinator.authorize(
+      const first = yield* pipe(
         key("first"),
-        () => Deferred.succeed(firstEntered, undefined).pipe(Effect.andThen(Effect.never))
-      ).pipe(Effect.forkChild({ startImmediately: true }))
+        (authorizationKey) =>
+          coordinator.authorize(
+            authorizationKey,
+            () => Deferred.succeed(firstEntered, undefined).pipe(Effect.andThen(Effect.never))
+          ),
+        Effect.forkChild({ startImmediately: true })
+      )
       yield* Deferred.await(firstEntered)
-      const second = yield* coordinator.authorize(key("second"), () => Effect.never).pipe(
+      const second = yield* pipe(
+        key("second"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, () => Effect.never),
         Effect.forkChild({ startImmediately: true })
       )
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 2, requesting: 2, completed: 0 })
@@ -197,11 +247,14 @@ describe("read authorization coordinator", () => {
       yield* Fiber.interrupt(second)
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 2, requesting: 0, completed: 0 })
 
-      const overflow = yield* coordinator.authorize(key("overflow"), () => Effect.succeed("overflow")).pipe(
+      const overflow = yield* pipe(
+        key("overflow"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, () => Effect.succeed("overflow")),
         Effect.forkChild({ startImmediately: true })
       )
       yield* Effect.yieldNow
-      assert.deepStrictEqual(overflow.pollUnsafe(), Exit.fail("pending-capacity"))
+      pipe(overflow.pollUnsafe(), (actual) =>
+        pipe(pendingCapacityError, Exit.fail, (expected) => assert.deepStrictEqual(actual, expected)))
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 2, requesting: 0, completed: 0 })
     }).pipe(Effect.scoped))
 
@@ -210,32 +263,43 @@ describe("read authorization coordinator", () => {
       const coordinator = yield* make({ maximumConcurrentLookups: 1 })
       const firstEntered = yield* Deferred.make<void>()
       let queuedEntered = false
-      const first = yield* coordinator.authorize(
+      const first = yield* pipe(
         key("first"),
-        () => Deferred.succeed(firstEntered, undefined).pipe(Effect.andThen(Effect.never))
-      ).pipe(Effect.forkChild({ startImmediately: true }))
+        (authorizationKey) =>
+          coordinator.authorize(
+            authorizationKey,
+            () => Deferred.succeed(firstEntered, undefined).pipe(Effect.andThen(Effect.never))
+          ),
+        Effect.forkChild({ startImmediately: true })
+      )
       yield* Deferred.await(firstEntered)
-      const queued = yield* coordinator.authorize(
+      const queued = yield* pipe(
         key("queued"),
-        () =>
-          Effect.sync(() => {
-            queuedEntered = true
-            return "queued"
-          })
-      ).pipe(Effect.forkChild({ startImmediately: true }))
+        (authorizationKey) =>
+          coordinator.authorize(
+            authorizationKey,
+            () =>
+              Effect.sync(() => {
+                queuedEntered = true
+                return "queued"
+              })
+          ),
+        Effect.forkChild({ startImmediately: true })
+      )
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 2, requesting: 2, completed: 0 })
       yield* Effect.yieldNow
 
       yield* TestClock.adjust("2 seconds")
       yield* Effect.yieldNow
-      assert.isTrue(Exit.isFailure(yield* Fiber.await(first)))
-      assert.isTrue(Exit.isFailure(yield* Fiber.await(queued)))
+      pipe(yield* Fiber.await(first), Exit.isFailure, (isFailure) => assert.isTrue(isFailure))
+      pipe(yield* Fiber.await(queued), Exit.isFailure, (isFailure) => assert.isTrue(isFailure))
       assert.isFalse(queuedEntered)
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 0, requesting: 0, completed: 0 })
-      assert.strictEqual(
-        (yield* coordinator.authorize(key("replacement"), () => Effect.succeed("replacement"))).value,
-        "replacement"
+      const replacement = yield* pipe(
+        key("replacement"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, () => Effect.succeed("replacement"))
       )
+      assert.strictEqual(replacement.value, "replacement")
     }).pipe(Effect.scoped))
 
   it.effect("detaches interrupted leader and follower callers without canceling shared work", () =>
@@ -253,23 +317,30 @@ describe("read authorization coordinator", () => {
           return "allowed"
         }).pipe(Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)))
 
-      const leader = yield* coordinator.authorize(key("shared"), lookup).pipe(
+      const leader = yield* pipe(
+        key("shared"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, lookup),
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(entered)
-      const follower = yield* coordinator.authorize(key("shared"), lookup).pipe(
+      const follower = yield* pipe(
+        key("shared"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, lookup),
         Effect.forkChild({ startImmediately: true })
       )
-      const observer = yield* coordinator.authorize(key("shared"), lookup).pipe(
+      const observer = yield* pipe(
+        key("shared"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, lookup),
         Effect.forkChild({ startImmediately: true })
       )
       yield* Fiber.interrupt(leader)
       yield* Fiber.interrupt(follower)
-      assert.isFalse(yield* Deferred.isDone(interrupted))
+      pipe(yield* Deferred.isDone(interrupted), (isDone) => assert.isFalse(isDone))
       assert.strictEqual(lookups, 1)
       yield* Deferred.succeed(release, undefined)
-      assert.strictEqual((yield* Fiber.join(observer)).value, "allowed")
-      assert.isFalse(yield* Deferred.isDone(interrupted))
+      const observed = yield* Fiber.join(observer)
+      assert.strictEqual(observed.value, "allowed")
+      pipe(yield* Deferred.isDone(interrupted), (isDone) => assert.isFalse(isDone))
     }).pipe(Effect.scoped))
 
   it.effect("releases pending work and permits after every lookup exit", () =>
@@ -278,22 +349,55 @@ describe("read authorization coordinator", () => {
       let typedFailures = 0
       const denied = () => {
         typedFailures++
-        return Effect.fail("denied")
+        return Effect.fail(deniedError)
       }
 
-      assert.isTrue(Exit.isFailure(yield* Effect.exit(coordinator.authorize(key("denied"), denied))))
-      assert.isTrue(Exit.isFailure(yield* Effect.exit(coordinator.authorize(key("denied"), denied))))
+      const firstDenied = yield* pipe(key("denied"), (authorizationKey) =>
+        coordinator.authorize(authorizationKey, denied), Effect.exit)
+      pipe(firstDenied, Exit.isFailure, (isFailure) =>
+        assert.isTrue(isFailure))
+      const secondDenied = yield* pipe(key("denied"), (authorizationKey) =>
+        coordinator.authorize(authorizationKey, denied), Effect.exit)
+      pipe(secondDenied, Exit.isFailure, (isFailure) =>
+        assert.isTrue(isFailure))
       assert.strictEqual(typedFailures, 2)
-      assert.strictEqual((yield* coordinator.authorize(key("after-denial"), () => Effect.succeed("ok"))).value, "ok")
+      const afterDenial = yield* pipe(
+        key("after-denial"),
+        (authorizationKey) =>
+          coordinator.authorize(authorizationKey, () =>
+            Effect.succeed("ok"))
+      )
+      assert.strictEqual(afterDenial.value, "ok")
 
-      const defect = yield* Effect.exit(coordinator.authorize(key("defect"), () => Effect.die("broken")))
-      assert.isTrue(Exit.isFailure(defect))
-      assert.strictEqual((yield* coordinator.authorize(key("after-defect"), () => Effect.succeed("ok"))).value, "ok")
+      const defect = yield* pipe(
+        key("defect"),
+        (authorizationKey) =>
+          coordinator.authorize(authorizationKey, () => Effect.die("broken")),
+        Effect.exit
+      )
+      pipe(defect, Exit.isFailure, (isFailure) => assert.isTrue(isFailure))
+      const afterDefect = yield* pipe(
+        key("after-defect"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, () => Effect.succeed("ok"))
+      )
+      assert.strictEqual(afterDefect.value, "ok")
 
-      const interruption = yield* Effect.exit(coordinator.authorize(key("interrupt"), () => Effect.interrupt))
-      assert.isTrue(Exit.isFailure(interruption))
-      assert.strictEqual((yield* coordinator.authorize(key("after-interrupt"), () => Effect.succeed("ok"))).value, "ok")
-      assert.strictEqual((yield* coordinator.authorize(key("success"), () => Effect.succeed("ok"))).value, "ok")
+      const interruption = yield* pipe(
+        key("interrupt"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, () => Effect.interrupt),
+        Effect.exit
+      )
+      pipe(interruption, Exit.isFailure, (isFailure) => assert.isTrue(isFailure))
+      const afterInterrupt = yield* pipe(
+        key("after-interrupt"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, () => Effect.succeed("ok"))
+      )
+      assert.strictEqual(afterInterrupt.value, "ok")
+      const success = yield* pipe(
+        key("success"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, () => Effect.succeed("ok"))
+      )
+      assert.strictEqual(success.value, "ok")
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 0, requesting: 0, completed: 4 })
     }).pipe(Effect.scoped))
 
@@ -305,14 +409,14 @@ describe("read authorization coordinator", () => {
         lookups++
         return Effect.succeed(input.tenant)
       }
-      yield* coordinator.authorize(key("a"), lookup)
-      yield* coordinator.authorize(key("b"), lookup)
-      yield* coordinator.authorize(key("c"), lookup)
+      yield* pipe(key("a"), (authorizationKey) => coordinator.authorize(authorizationKey, lookup))
+      yield* pipe(key("b"), (authorizationKey) => coordinator.authorize(authorizationKey, lookup))
+      yield* pipe(key("c"), (authorizationKey) => coordinator.authorize(authorizationKey, lookup))
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 0, requesting: 0, completed: 2 })
-      assert.isTrue(Option.isNone(yield* coordinator.current(key("a"))))
-      assert.isTrue(Option.isSome(yield* coordinator.current(key("b"))))
-      assert.isTrue(Option.isSome(yield* coordinator.current(key("c"))))
-      yield* coordinator.authorize(key("a"), lookup)
+      pipe(yield* pipe(key("a"), coordinator.current), Option.isNone, (isNone) => assert.isTrue(isNone))
+      pipe(yield* pipe(key("b"), coordinator.current), Option.isSome, (isSome) => assert.isTrue(isSome))
+      pipe(yield* pipe(key("c"), coordinator.current), Option.isSome, (isSome) => assert.isTrue(isSome))
+      yield* pipe(key("a"), (authorizationKey) => coordinator.authorize(authorizationKey, lookup))
       assert.strictEqual(lookups, 4)
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 0, requesting: 0, completed: 2 })
     }).pipe(Effect.scoped))
@@ -320,13 +424,15 @@ describe("read authorization coordinator", () => {
   it.effect("eagerly removes successes at the exact monotonic expiry", () =>
     Effect.gen(function*() {
       const coordinator = yield* make({ refreshIntervalNanos: 1_000_000_000n })
-      const first = yield* coordinator.authorize(key("a"), () => Effect.succeed("a"))
-      yield* coordinator.authorize(key("b"), () => Effect.succeed("b"))
+      const first = yield* pipe(key("a"), (authorizationKey) =>
+        coordinator.authorize(authorizationKey, () => Effect.succeed("a")))
+      yield* pipe(key("b"), (authorizationKey) =>
+        coordinator.authorize(authorizationKey, () => Effect.succeed("b")))
       assert.strictEqual(first.expiresAtNanos, 1_000_000_000n)
       yield* TestClock.adjust("999 millis")
-      assert.isTrue(Option.isSome(yield* coordinator.current(key("a"))))
+      pipe(yield* pipe(key("a"), coordinator.current), Option.isSome, (isSome) => assert.isTrue(isSome))
       yield* TestClock.adjust("1 milli")
-      assert.isTrue(Option.isNone(yield* coordinator.current(key("a"))))
+      pipe(yield* pipe(key("a"), coordinator.current), Option.isNone, (isNone) => assert.isTrue(isNone))
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 0, requesting: 0, completed: 0 })
     }).pipe(Effect.scoped))
 
@@ -336,26 +442,33 @@ describe("read authorization coordinator", () => {
       const coordinator = yield* make({ maximumConcurrentLookups: 1 }).pipe(Scope.provide(owner))
       const entered = yield* Deferred.make<void>()
       const interrupted = yield* Deferred.make<void>()
-      const caller = yield* coordinator.authorize(
+      const caller = yield* pipe(
         key("owner"),
-        () =>
-          Deferred.succeed(entered, undefined).pipe(
-            Effect.andThen(Effect.never),
-            Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined))
-          )
-      ).pipe(Effect.forkChild({ startImmediately: true }))
+        (authorizationKey) =>
+          coordinator.authorize(
+            authorizationKey,
+            () =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined))
+              )
+          ),
+        Effect.forkChild({ startImmediately: true })
+      )
       yield* Deferred.await(entered)
-      const queued = yield* coordinator.authorize(key("queued"), () => Effect.never).pipe(
+      const queued = yield* pipe(
+        key("queued"),
+        (authorizationKey) => coordinator.authorize(authorizationKey, () => Effect.never),
         Effect.forkChild({ startImmediately: true })
       )
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 2, requesting: 2, completed: 0 })
       yield* Scope.close(owner, Exit.void)
       yield* Deferred.await(interrupted)
-      const [callerExit, queuedExit] = yield* Effect.all([Fiber.await(caller), Fiber.await(queued)])
-      assert.isTrue(Exit.isFailure(callerExit))
-      if (Exit.isFailure(callerExit)) assert.isAbove(Cause.interruptors(callerExit.cause).size, 0)
-      assert.isTrue(Exit.isFailure(queuedExit))
-      if (Exit.isFailure(queuedExit)) assert.isAbove(Cause.interruptors(queuedExit.cause).size, 0)
+      const [callerExit, queuedExit] = yield* pipe([Fiber.await(caller), Fiber.await(queued)], Effect.all)
+      pipe(callerExit, Exit.isFailure, (isFailure) => assert.isTrue(isFailure))
+      if (Exit.isFailure(callerExit)) pipe(callerExit.cause, Cause.interruptors, (ids) => assert.isAbove(ids.size, 0))
+      pipe(queuedExit, Exit.isFailure, (isFailure) => assert.isTrue(isFailure))
+      if (Exit.isFailure(queuedExit)) pipe(queuedExit.cause, Cause.interruptors, (ids) => assert.isAbove(ids.size, 0))
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 0, requesting: 0, completed: 0 })
     }).pipe(Effect.scoped))
 })
