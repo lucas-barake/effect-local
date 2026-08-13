@@ -1,5 +1,7 @@
 import * as Effect from "effect/Effect"
 import { pipe } from "effect/Function"
+import { readFileSync } from "node:fs"
+import { dirname, relative, resolve, sep } from "node:path"
 import { Diagnostic, Plugin, Rule, RuleContext } from "oxlint-plugin-effect/rule-bindings"
 import { makeEffectTypePolicyChecker } from "./tagged-effect-errors.mjs"
 
@@ -59,6 +61,572 @@ const importedVariable = (context, node, localName) =>
 
 const reportDiagnostic = (context, node, message) => context.report(Diagnostic.make({ node, message }))
 
+const rootEffectModuleNames = new Map([
+  ["Data", "effect/Data"],
+  ["Effect", "effect/Effect"],
+  ["Function", "effect/Function"],
+  ["ManagedRuntime", "effect/ManagedRuntime"],
+  ["Runtime", "effect/Runtime"],
+  ["Schedule", "effect/Schedule"],
+  ["Schema", "effect/Schema"],
+  ["SchemaParser", "effect/SchemaParser"]
+])
+
+const makeOfficialBindingResolver = (context, configuredModules) => {
+  let modules = configuredModules
+  if (configuredModules instanceof Set) {
+    modules = new Map([
+      ["effect/Effect", configuredModules],
+      ["effect/Function", new Set(["pipe"])]
+    ])
+  }
+  const moduleBindings = new Map()
+  const exportBindings = new Map()
+  const fallbackModuleBindings = new Map()
+  const fallbackExportBindings = new Map()
+  const rootNamespaces = new Set()
+  const importBindingNodes = new WeakSet()
+  const aliasBindingNodes = new WeakSet()
+
+  const resolveModule = (node) => {
+    const expression = unwrapExpression(node)
+    if (expression.type === "Identifier") {
+      const variable = findVariable(context, expression)
+      if (variable === undefined) return fallbackModuleBindings.get(expression.name)
+      return moduleBindings.get(variable)
+    }
+    const member = getStaticMember(expression)
+    if (member === undefined) return undefined
+    const root = unwrapExpression(member.expression.object)
+    if (root.type !== "Identifier" || !rootNamespaces.has(findVariable(context, root))) return undefined
+    const moduleName = rootEffectModuleNames.get(member.name)
+    if (moduleName !== undefined && modules.has(moduleName)) return moduleName
+    return undefined
+  }
+
+  const resolveExport = (node) => {
+    const expression = unwrapExpression(node)
+    if (expression.type === "Identifier") {
+      const variable = findVariable(context, expression)
+      if (variable === undefined) return fallbackExportBindings.get(expression.name)
+      return exportBindings.get(variable)
+    }
+    const member = getStaticMember(expression)
+    if (member === undefined) return undefined
+    const moduleName = resolveModule(member.expression.object)
+    if (moduleName !== undefined && modules.get(moduleName)?.has(member.name) === true) {
+      return { moduleName, name: member.name }
+    }
+    return undefined
+  }
+
+  const registerImport = (node) => {
+    if (node.importKind === "type") return
+    const source = node.source.value
+    for (const specifier of node.specifiers) importBindingNodes.add(specifier.local)
+    if (modules.has(source)) {
+      for (const specifier of node.specifiers) {
+        const variable = importedVariable(context, node, specifier.local.name)
+        if (specifier.type === "ImportNamespaceSpecifier") {
+          if (variable === undefined) fallbackModuleBindings.set(specifier.local.name, source)
+          else moduleBindings.set(variable, source)
+        } else if (
+          specifier.type === "ImportSpecifier" && specifier.importKind !== "type" &&
+          specifier.imported.type === "Identifier" && modules.get(source).has(specifier.imported.name)
+        ) {
+          if (variable === undefined) {
+            fallbackExportBindings.set(specifier.local.name, {
+              moduleName: source,
+              name: specifier.imported.name
+            })
+          } else exportBindings.set(variable, { moduleName: source, name: specifier.imported.name })
+        }
+      }
+      return
+    }
+    if (source !== "effect") return
+    for (const specifier of node.specifiers) {
+      const variable = importedVariable(context, node, specifier.local.name)
+      if (specifier.type === "ImportNamespaceSpecifier") {
+        if (variable !== undefined) rootNamespaces.add(variable)
+      } else if (
+        specifier.type === "ImportSpecifier" && specifier.importKind !== "type" &&
+        specifier.imported.type === "Identifier"
+      ) {
+        const moduleName = rootEffectModuleNames.get(specifier.imported.name)
+        if (moduleName !== undefined && modules.has(moduleName)) {
+          if (variable === undefined) fallbackModuleBindings.set(specifier.local.name, moduleName)
+          else moduleBindings.set(variable, moduleName)
+        }
+      }
+    }
+  }
+
+  const registerConstAlias = (node) => {
+    const declaration = context.sourceCode.getAncestors(node).findLast(
+      (ancestor) => ancestor.type === "VariableDeclaration"
+    )
+    if (declaration?.kind !== "const" || node.init === null || node.init === undefined) return
+    if (node.id.type === "Identifier") {
+      const variable = context.sourceCode.getDeclaredVariables(node).find(
+        (candidate) => candidate.name === node.id.name
+      )
+      if (variable === undefined) return
+      const moduleName = resolveModule(node.init)
+      if (moduleName !== undefined) moduleBindings.set(variable, moduleName)
+      const resolvedExport = resolveExport(node.init)
+      if (resolvedExport !== undefined) exportBindings.set(variable, resolvedExport)
+      aliasBindingNodes.add(node.id)
+      return
+    }
+    if (node.id.type !== "ObjectPattern") return
+    const moduleName = resolveModule(node.init)
+    if (moduleName === undefined) return
+    const moduleExports = modules.get(moduleName)
+    for (const property of node.id.properties) {
+      if (property.type !== "Property" || property.computed) continue
+      let key = property.key.value
+      if (property.key.type === "Identifier") key = property.key.name
+      if (typeof key !== "string" || moduleExports.has(key) !== true) continue
+      let value = property.value
+      if (value.type === "AssignmentPattern") value = value.left
+      if (value.type !== "Identifier") continue
+      const variable = context.sourceCode.getDeclaredVariables(node).find(
+        (candidate) => candidate.name === value.name
+      )
+      if (variable !== undefined) exportBindings.set(variable, { moduleName, name: key })
+      aliasBindingNodes.add(value)
+    }
+  }
+
+  return {
+    aliasBindingNodes,
+    importBindingNodes,
+    registerConstAlias,
+    registerImport,
+    resolveExport,
+    resolveModule
+  }
+}
+
+const packageMetadataCache = new Map()
+const getPackageSource = (filename) => {
+  const normalized = resolve(filename).split(sep).join("/")
+  const match = /^(.*\/packages\/[^/]+)\/src\/(.+)$/.exec(normalized)
+  if (match === null) return undefined
+  return { packageRoot: match[1], sourcePath: match[2] }
+}
+
+const collectExportTargets = (value, targets = []) => {
+  if (typeof value === "string") targets.push(value)
+  else if (value !== null && typeof value === "object") {
+    for (const nested of Object.values(value)) collectExportTargets(nested, targets)
+  }
+  return targets
+}
+
+const getPackageExports = (packageRoot) => {
+  if (packageMetadataCache.has(packageRoot)) return packageMetadataCache.get(packageRoot)
+  let exports
+  try {
+    const packagePath = resolve(packageRoot, "package.json")
+    exports = JSON.parse(readFileSync(packagePath, "utf8")).exports
+  } catch {
+    exports = undefined
+  }
+  packageMetadataCache.set(packageRoot, exports)
+  return exports
+}
+
+const isPublicPackageEntrypoint = (filename) => {
+  const source = getPackageSource(filename)
+  if (source === undefined) return false
+  const exports = getPackageExports(source.packageRoot)
+  if (exports === undefined) return false
+  const relativeSource = `./src/${source.sourcePath}`
+  for (const [specifier, value] of Object.entries(exports)) {
+    if (specifier === "./internal/*" || specifier === "./package.json") continue
+    for (const target of collectExportTargets(value)) {
+      if (target === relativeSource) return true
+      const star = target.indexOf("*")
+      if (star < 0 || specifier.indexOf("*") < 0) continue
+      const prefix = target.slice(0, star)
+      const suffix = target.slice(star + 1)
+      if (relativeSource.startsWith(prefix) && relativeSource.endsWith(suffix)) return true
+    }
+  }
+  return false
+}
+
+const effectCodecExports = new Set(["decodeEffect", "encodeEffect"])
+export const exportedSchemaCodecAliasMessage =
+  "Do not export an alias of an Effect Schema codec. Call Schema.decodeEffect or Schema.encodeEffect directly at each use site so the schema and operation remain visible at the boundary."
+
+export const noExportedSchemaCodecAlias = Rule.define({
+  name: "no-exported-schema-codec-alias",
+  meta: Rule.meta({
+    type: "problem",
+    description: "Keep Effect Schema codec operations visible at each use site."
+  }),
+  create: function*() {
+    const context = yield* RuleContext
+    const bindings = makeOfficialBindingResolver(
+      context,
+      new Map([
+        ["effect/Schema", effectCodecExports],
+        ["effect/SchemaParser", effectCodecExports]
+      ])
+    )
+    const codecVariables = new Set()
+
+    const resolveCodecValue = (node) => {
+      const expression = unwrapExpression(node)
+      if (expression.type === "CallExpression") return bindings.resolveExport(expression.callee)
+      const direct = bindings.resolveExport(expression)
+      if (direct !== undefined) return direct
+      if (expression.type === "Identifier" && codecVariables.has(findVariable(context, expression))) {
+        return { moduleName: "alias", name: "codec" }
+      }
+      return undefined
+    }
+
+    return {
+      ImportDeclaration: (node) => Effect.sync(() => bindings.registerImport(node)),
+      VariableDeclarator: (node) =>
+        Effect.flatMap(
+          Effect.sync(() => {
+            bindings.registerConstAlias(node)
+            if (node.id.type === "ObjectPattern") {
+              if (node.init === null) return undefined
+              const moduleName = bindings.resolveModule(node.init)
+              if (moduleName === "effect/Schema" || moduleName === "effect/SchemaParser") {
+                const exported = context.sourceCode.getAncestors(node).some(
+                  (ancestor) => ancestor.type === "ExportNamedDeclaration"
+                )
+                if (exported) {
+                  return node.id.properties.filter((property) => {
+                    if (property.type !== "Property" || property.computed) return false
+                    let name = property.key.value
+                    if (property.key.type === "Identifier") name = property.key.name
+                    return typeof name === "string" && effectCodecExports.has(name)
+                  })
+                }
+              }
+              return undefined
+            }
+            if (node.id.type !== "Identifier" || node.init === null || resolveCodecValue(node.init) === undefined) {
+              return undefined
+            }
+            const variable = context.sourceCode.getDeclaredVariables(node).find(
+              (candidate) => candidate.name === node.id.name
+            )
+            if (variable !== undefined) codecVariables.add(variable)
+            const exported = context.sourceCode.getAncestors(node).some(
+              (ancestor) => ancestor.type === "ExportNamedDeclaration" || ancestor.type === "ExportDefaultDeclaration"
+            )
+            if (exported) return node.id
+            return undefined
+          }),
+          (reportNode) => {
+            if (reportNode === undefined) return Effect.void
+            if (Array.isArray(reportNode)) {
+              return Effect.forEach(
+                reportNode,
+                (property) => reportDiagnostic(context, property.value, exportedSchemaCodecAliasMessage),
+                { discard: true }
+              )
+            }
+            return reportDiagnostic(context, reportNode, exportedSchemaCodecAliasMessage)
+          }
+        ),
+      ExportNamedDeclaration: (node) => {
+        if (node.exportKind === "type") return Effect.void
+        if (node.source !== null && node.source !== undefined) {
+          if (node.source.value !== "effect/Schema" && node.source.value !== "effect/SchemaParser") {
+            return Effect.void
+          }
+          return Effect.forEach(
+            node.specifiers.filter((specifier) =>
+              specifier.type === "ExportSpecifier" && specifier.local.type === "Identifier" &&
+              effectCodecExports.has(specifier.local.name)
+            ),
+            (specifier) => reportDiagnostic(context, specifier.exported, exportedSchemaCodecAliasMessage),
+            { discard: true }
+          )
+        }
+        return Effect.forEach(
+          node.specifiers.filter((specifier) =>
+            specifier.type === "ExportSpecifier" && specifier.local.type === "Identifier" &&
+            (codecVariables.has(findVariable(context, specifier.local)) ||
+              bindings.resolveExport(specifier.local) !== undefined)
+          ),
+          (specifier) => reportDiagnostic(context, specifier.exported, exportedSchemaCodecAliasMessage),
+          { discard: true }
+        )
+      },
+      ExportDefaultDeclaration: (node) => {
+        if (resolveCodecValue(node.declaration) === undefined) return Effect.void
+        return reportDiagnostic(context, node.declaration, exportedSchemaCodecAliasMessage)
+      }
+    }
+  }
+})
+
+export const detachedForkMessage =
+  "Do not use Effect.forkDetach. Use forkChild, forkScoped, or forkIn so lifetime, shutdown, and failure observation have an explicit owner."
+
+export const noDetachedFork = Rule.define({
+  name: "no-detached-fork",
+  meta: Rule.meta({
+    type: "problem",
+    description: "Require an explicit owner for forked Effect fibers."
+  }),
+  create: function*() {
+    const context = yield* RuleContext
+    const bindings = makeOfficialBindingResolver(context, new Set(["forkDetach"]))
+    return {
+      ImportDeclaration: (node) => Effect.sync(() => bindings.registerImport(node)),
+      VariableDeclarator: (node) => Effect.sync(() => bindings.registerConstAlias(node)),
+      ExportNamedDeclaration: (node) => {
+        if (node.source?.value !== "effect/Effect" || node.exportKind === "type") return Effect.void
+        return Effect.forEach(
+          node.specifiers.filter((specifier) =>
+            specifier.type === "ExportSpecifier" && specifier.local.type === "Identifier" &&
+            specifier.local.name === "forkDetach"
+          ),
+          (specifier) => reportDiagnostic(context, specifier.local, detachedForkMessage),
+          { discard: true }
+        )
+      },
+      Identifier: (node) => {
+        if (bindings.importBindingNodes.has(node) || bindings.aliasBindingNodes.has(node)) return Effect.void
+        if (bindings.resolveExport(node)?.name !== "forkDetach") return Effect.void
+        return reportDiagnostic(context, node, detachedForkMessage)
+      },
+      MemberExpression: (node) => {
+        if (bindings.resolveExport(node)?.name !== "forkDetach") return Effect.void
+        return reportDiagnostic(context, node, detachedForkMessage)
+      }
+    }
+  }
+})
+
+export const internalEntrypointExportMessage =
+  "Do not export an internal module from a package entrypoint. Keep src/internal implementation details unreachable from public package exports."
+
+export const noInternalEntrypointExport = Rule.define({
+  name: "no-internal-entrypoint-export",
+  meta: Rule.meta({
+    type: "problem",
+    description: "Keep package internal modules out of every public entrypoint."
+  }),
+  create: function*() {
+    const context = yield* RuleContext
+    const inspect = (node) => {
+      if (!isPublicPackageEntrypoint(context.filename)) return Effect.void
+      if (node.source === null || node.source === undefined || typeof node.source.value !== "string") {
+        return Effect.void
+      }
+      const target = resolve(dirname(context.filename), node.source.value)
+      const source = getPackageSource(context.filename)
+      if (source === undefined) return Effect.void
+      const internalRoot = resolve(source.packageRoot, "src/internal")
+      const targetRelative = relative(internalRoot, target)
+      if (targetRelative.startsWith("..")) return Effect.void
+      return reportDiagnostic(context, node.source, internalEntrypointExportMessage)
+    }
+    return {
+      ExportAllDeclaration: inspect,
+      ExportNamedDeclaration: inspect
+    }
+  }
+})
+
+export const testWallClockWaitMessage =
+  "Do not synchronize a test on wall clock time. Use TestClock for Effect time, or rendezvous on observable state with a Deferred, Latch, Queue, callback probe, or fiber join."
+
+export const noTestWallClockWait = Rule.define({
+  name: "no-test-wall-clock-wait",
+  meta: Rule.meta({
+    type: "problem",
+    description: "Require deterministic test synchronization."
+  }),
+  create: function*() {
+    const context = yield* RuleContext
+    const waits = makeOfficialBindingResolver(
+      context,
+      new Map([
+        ["effect/Effect", new Set(["sleep"])],
+        ["effect/Schedule", new Set(["spaced", "fixed", "exponential"])]
+      ])
+    )
+    const testNamespaces = new Map()
+    const testBindings = new Map()
+    const timerBindings = new Set()
+    const timerNamespaces = new Set()
+    const testModifiers = new Set(["each", "fails", "only", "runIf", "skip", "skipIf", "todo"])
+
+    const resolveTest = (node) => {
+      const expression = unwrapExpression(node)
+      if (expression.type === "CallExpression") return resolveTest(expression.callee)
+      if (expression.type === "Identifier") return testBindings.get(findVariable(context, expression))
+      const member = getStaticMember(expression)
+      if (member === undefined) return undefined
+      const object = unwrapExpression(member.expression.object)
+      if (testModifiers.has(member.name)) return resolveTest(object)
+      if (object.type === "Identifier") {
+        const variable = findVariable(context, object)
+        const source = testNamespaces.get(variable)
+        if (source !== undefined && (member.name === "it" || member.name === "test")) return "plain"
+        if (source === "@effect/vitest" && (member.name === "effect" || member.name === "live")) {
+          return member.name
+        }
+      }
+      const direct = resolveTest(object)
+      if (direct === "plain" && (member.name === "effect" || member.name === "live")) return member.name
+      return undefined
+    }
+
+    const registerTestImport = (node) => {
+      const source = node.source.value
+      if (source === "node:timers/promises") {
+        for (const specifier of node.specifiers) {
+          const variable = importedVariable(context, node, specifier.local.name)
+          if (specifier.type === "ImportNamespaceSpecifier") {
+            if (variable !== undefined) timerNamespaces.add(variable)
+            continue
+          }
+          if (
+            specifier.type !== "ImportSpecifier" || specifier.importKind === "type" ||
+            specifier.imported.type !== "Identifier" ||
+            (specifier.imported.name !== "setTimeout" && specifier.imported.name !== "setInterval")
+          ) continue
+          if (variable !== undefined) timerBindings.add(variable)
+        }
+        return
+      }
+      if (source !== "vitest" && source !== "@effect/vitest") return
+      for (const specifier of node.specifiers) {
+        const variable = importedVariable(context, node, specifier.local.name)
+        if (variable === undefined) continue
+        if (specifier.type === "ImportNamespaceSpecifier") {
+          testNamespaces.set(variable, source)
+          continue
+        }
+        if (
+          specifier.type !== "ImportSpecifier" || specifier.importKind === "type" ||
+          specifier.imported.type !== "Identifier"
+        ) continue
+        const name = specifier.imported.name
+        if (name === "it" || name === "test") testBindings.set(variable, "plain")
+        else if (source === "@effect/vitest" && (name === "effect" || name === "live")) {
+          testBindings.set(variable, name)
+        }
+      }
+    }
+
+    const registerTestAlias = (node) => {
+      const declaration = context.sourceCode.getAncestors(node).findLast(
+        (ancestor) => ancestor.type === "VariableDeclaration"
+      )
+      if (declaration?.kind !== "const" || node.id.type !== "Identifier" || node.init == null) return
+      const kind = resolveTest(node.init)
+      if (kind === undefined) return
+      const variable = context.sourceCode.getDeclaredVariables(node).find(
+        (candidate) => candidate.name === node.id.name
+      )
+      if (variable !== undefined) testBindings.set(variable, kind)
+    }
+
+    const collectWaits = (root, testKind) => {
+      const found = []
+      const seen = new Set()
+      const visit = (value) => {
+        if (value === null || typeof value !== "object" || seen.has(value)) return
+        seen.add(value)
+        if (value.type === "CallExpression") {
+          const callee = unwrapExpression(value.callee)
+          let wallClock = false
+          if (callee.type === "Identifier") {
+            const variable = findVariable(context, callee)
+            wallClock = timerBindings.has(variable) ||
+              (variable === undefined && (callee.name === "setTimeout" || callee.name === "setInterval"))
+          }
+          const member = getStaticMember(callee)
+          if (member !== undefined && (member.name === "setTimeout" || member.name === "setInterval")) {
+            const object = unwrapExpression(member.expression.object)
+            if (object.type === "Identifier") {
+              const variable = findVariable(context, object)
+              wallClock = timerNamespaces.has(variable) ||
+                object.name === "globalThis"
+            }
+          }
+          const official = waits.resolveExport(callee)
+          if (official?.moduleName === "effect/Effect" && official.name === "sleep") {
+            wallClock = testKind !== "effect"
+          }
+          if (official?.moduleName === "effect/Schedule") wallClock = testKind !== "effect"
+          if (wallClock) found.push(value)
+        }
+        for (const [key, child] of Object.entries(value)) {
+          if (key === "parent" || key === "loc" || key === "range") continue
+          if (Array.isArray(child)) child.forEach(visit)
+          else visit(child)
+        }
+      }
+      visit(root)
+      return found
+    }
+    const resolveCallbackBody = (node, seen = new Set()) => {
+      const callback = unwrapExpression(node)
+      if (callback.type === "ArrowFunctionExpression" || callback.type === "FunctionExpression") {
+        return callback.body
+      }
+      if (callback.type !== "Identifier") return undefined
+      const variable = findVariable(context, callback)
+      if (variable === undefined || seen.has(variable)) return undefined
+      seen.add(variable)
+      for (const definition of variable.defs) {
+        if (definition.type === "FunctionName" && definition.node?.body !== undefined) {
+          return definition.node.body
+        }
+        if (definition.type !== "Variable") continue
+        const initializer = definition.node?.init
+        if (initializer === null || initializer === undefined) continue
+        const body = resolveCallbackBody(initializer, seen)
+        if (body !== undefined) return body
+      }
+      return undefined
+    }
+
+    return {
+      ImportDeclaration: (node) =>
+        Effect.sync(() => {
+          waits.registerImport(node)
+          registerTestImport(node)
+        }),
+      VariableDeclarator: (node) =>
+        Effect.sync(() => {
+          waits.registerConstAlias(node)
+          registerTestAlias(node)
+        }),
+      CallExpression: (node) => {
+        const kind = resolveTest(node.callee)
+        if (kind === undefined) return Effect.void
+        const callbackBody = node.arguments.map((argument) => resolveCallbackBody(argument)).find(
+          (body) => body !== undefined
+        )
+        if (callbackBody === undefined) return Effect.void
+        return Effect.forEach(
+          collectWaits(callbackBody, kind),
+          (wait) => reportDiagnostic(context, wait, testWallClockWaitMessage),
+          { discard: true }
+        )
+      }
+    }
+  }
+})
+
 export const noYieldEffectSync = Rule.define({
   name: "no-yield-effect-sync",
   meta: Rule.meta({
@@ -67,22 +635,13 @@ export const noYieldEffectSync = Rule.define({
   }),
   create: function*() {
     const context = yield* RuleContext
-    const effectNamespaces = new Set()
+    const bindings = makeOfficialBindingResolver(context, new Set(["sync"]))
     return {
-      ImportDeclaration: (node) => {
-        if (node.source.value !== "effect/Effect") return Effect.void
-        return Effect.sync(() => {
-          for (const specifier of node.specifiers) {
-            if (specifier.type === "ImportNamespaceSpecifier") effectNamespaces.add(specifier.local.name)
-          }
-        })
-      },
+      ImportDeclaration: (node) => Effect.sync(() => bindings.registerImport(node)),
+      VariableDeclarator: (node) => Effect.sync(() => bindings.registerConstAlias(node)),
       YieldExpression: (node) => {
         if (!node.delegate || node.argument?.type !== "CallExpression") return Effect.void
-        const callee = node.argument.callee
-        if (callee.type !== "MemberExpression" || callee.computed) return Effect.void
-        if (callee.object.type !== "Identifier" || !effectNamespaces.has(callee.object.name)) return Effect.void
-        if (callee.property.type !== "Identifier" || callee.property.name !== "sync") return Effect.void
+        if (bindings.resolveExport(node.argument.callee)?.name !== "sync") return Effect.void
         return context.report(Diagnostic.make({
           node,
           message: "Do not yield Effect.sync inside Effect.gen. Execute the synchronous code directly."
@@ -100,28 +659,17 @@ export const noSemaphoreEffectSync = Rule.define({
   }),
   create: function*() {
     const context = yield* RuleContext
-    const effectNamespaces = new Set()
+    const bindings = makeOfficialBindingResolver(context, new Set(["sync"]))
     return {
-      ImportDeclaration: (node) => {
-        if (node.source.value !== "effect/Effect") return Effect.void
-        return Effect.sync(() => {
-          for (const specifier of node.specifiers) {
-            if (specifier.type === "ImportNamespaceSpecifier") effectNamespaces.add(specifier.local.name)
-          }
-        })
-      },
+      ImportDeclaration: (node) => Effect.sync(() => bindings.registerImport(node)),
+      VariableDeclarator: (node) => Effect.sync(() => bindings.registerConstAlias(node)),
       CallExpression: (node) => {
         const callee = node.callee
         if (callee.type !== "MemberExpression" || callee.computed) return Effect.void
         if (callee.property.type !== "Identifier" || callee.property.name !== "withPermit") return Effect.void
         const argument = node.arguments[0]
         if (argument?.type !== "CallExpression") return Effect.void
-        const innerCallee = argument.callee
-        if (innerCallee.type !== "MemberExpression" || innerCallee.computed) return Effect.void
-        if (innerCallee.object.type !== "Identifier" || !effectNamespaces.has(innerCallee.object.name)) {
-          return Effect.void
-        }
-        if (innerCallee.property.type !== "Identifier" || innerCallee.property.name !== "sync") return Effect.void
+        if (bindings.resolveExport(argument.callee)?.name !== "sync") return Effect.void
         return context.report(Diagnostic.make({
           node,
           message: "Do not acquire a semaphore around Effect.sync. Synchronous JavaScript cannot interleave."
@@ -495,125 +1043,6 @@ export const noUnnecessaryEffectForwarding = Rule.define({
   }
 })
 
-const makeOfficialBindingResolver = (context, effectExports) => {
-  const moduleBindings = new Map()
-  const exportBindings = new Map()
-  const rootNamespaces = new Set()
-  const importBindingNodes = new WeakSet()
-  const aliasBindingNodes = new WeakSet()
-
-  const resolveModule = (node) => {
-    const expression = unwrapExpression(node)
-    if (expression.type === "Identifier") return moduleBindings.get(findVariable(context, expression))
-    const member = getStaticMember(expression)
-    if (member?.name !== "Effect") return undefined
-    const root = unwrapExpression(member.expression.object)
-    if (root.type !== "Identifier" || !rootNamespaces.has(findVariable(context, root))) return undefined
-    return "effect/Effect"
-  }
-
-  const resolveExport = (node) => {
-    const expression = unwrapExpression(node)
-    if (expression.type === "Identifier") return exportBindings.get(findVariable(context, expression))
-    const member = getStaticMember(expression)
-    if (member === undefined) return undefined
-    const moduleName = resolveModule(member.expression.object)
-    if (moduleName === "effect/Effect" && effectExports.has(member.name)) {
-      return { moduleName, name: member.name }
-    }
-    if (moduleName === "effect/Function" && member.name === "pipe") {
-      return { moduleName, name: "pipe" }
-    }
-    return undefined
-  }
-
-  const registerImport = (node) => {
-    if (node.importKind === "type") return
-    const source = node.source.value
-    for (const specifier of node.specifiers) importBindingNodes.add(specifier.local)
-    if (source === "effect/Effect" || source === "effect/Function") {
-      for (const specifier of node.specifiers) {
-        const variable = importedVariable(context, node, specifier.local.name)
-        if (variable === undefined) continue
-        if (specifier.type === "ImportNamespaceSpecifier") {
-          moduleBindings.set(variable, source)
-        } else if (
-          specifier.type === "ImportSpecifier" && specifier.importKind !== "type" &&
-          specifier.imported.type === "Identifier"
-        ) {
-          const name = specifier.imported.name
-          if (
-            (source === "effect/Effect" && effectExports.has(name)) ||
-            (source === "effect/Function" && name === "pipe")
-          ) {
-            exportBindings.set(variable, { moduleName: source, name })
-          }
-        }
-      }
-      return
-    }
-    if (source !== "effect") return
-    for (const specifier of node.specifiers) {
-      const variable = importedVariable(context, node, specifier.local.name)
-      if (variable === undefined) continue
-      if (specifier.type === "ImportNamespaceSpecifier") {
-        rootNamespaces.add(variable)
-      } else if (
-        specifier.type === "ImportSpecifier" && specifier.importKind !== "type" &&
-        specifier.imported.type === "Identifier" && specifier.imported.name === "Effect"
-      ) {
-        moduleBindings.set(variable, "effect/Effect")
-      }
-    }
-  }
-
-  const registerConstAlias = (node) => {
-    const declaration = context.sourceCode.getAncestors(node).findLast(
-      (ancestor) => ancestor.type === "VariableDeclaration"
-    )
-    if (declaration?.kind !== "const") return
-    if (node.init === null || node.init === undefined) return
-    if (node.id.type === "Identifier") {
-      const variable = context.sourceCode.getDeclaredVariables(node).find(
-        (candidate) => candidate.name === node.id.name
-      )
-      if (variable === undefined) return
-      const moduleName = resolveModule(node.init)
-      if (moduleName !== undefined) moduleBindings.set(variable, moduleName)
-      const resolvedExport = resolveExport(node.init)
-      if (resolvedExport !== undefined) exportBindings.set(variable, resolvedExport)
-      aliasBindingNodes.add(node.id)
-      return
-    }
-    if (node.id.type !== "ObjectPattern") return
-    const moduleName = resolveModule(node.init)
-    if (moduleName !== "effect/Effect") return
-    for (const property of node.id.properties) {
-      if (property.type !== "Property" || property.computed) continue
-      let key = property.key.value
-      if (property.key.type === "Identifier") key = property.key.name
-      if (typeof key !== "string" || !effectExports.has(key)) continue
-      let value = property.value
-      if (value.type === "AssignmentPattern") value = value.left
-      if (value.type !== "Identifier") continue
-      const variable = context.sourceCode.getDeclaredVariables(node).find(
-        (candidate) => candidate.name === value.name
-      )
-      if (variable !== undefined) exportBindings.set(variable, { moduleName, name: key })
-      aliasBindingNodes.add(value)
-    }
-  }
-
-  return {
-    aliasBindingNodes,
-    importBindingNodes,
-    registerConstAlias,
-    registerImport,
-    resolveExport,
-    resolveModule
-  }
-}
-
 export const functionEffectGenMessage =
   "Do not return Effect.gen from a function. Move the generator body into Effect.fnUntraced(function* () { ... }). If this function intentionally defines a telemetry boundary, use Effect.fn(\"spanName\")(function* () { ... }). In Effect 4.0.0-beta.103, the first argument is the generator body and arguments after it act as sequential pipe operators, so migrate a returned pipeline as Effect.fnUntraced(function* () {}, x, y, z) or Effect.fn(\"spanName\")(function* () {}, x, y, z). Each operator receives the previous result and the original function arguments."
 
@@ -792,14 +1221,6 @@ const boundaryModules = new Map([
   ["effect/Runtime", new Set(["makeRunMain"])]
 ])
 
-const effectRootModules = new Map([
-  ["Effect", "effect/Effect"],
-  ["ManagedRuntime", "effect/ManagedRuntime"],
-  ["Runtime", "effect/Runtime"],
-  ["Schema", "effect/Schema"],
-  ["SchemaParser", "effect/SchemaParser"]
-])
-
 const managedRuntimeBoundaries = new Set([
   "runFork",
   "runCallback",
@@ -857,7 +1278,7 @@ export const noManualEffectBoundary = Rule.define({
       if (object.type !== "Identifier") return undefined
       const variable = findVariable(context, object)
       if (moduleBindings.get(variable) !== "effect") return undefined
-      return effectRootModules.get(member.name)
+      return rootEffectModuleNames.get(member.name)
     }
 
     const getMemberName = (node) => {
@@ -995,27 +1416,27 @@ export const noManualEffectBoundary = Rule.define({
     }
 
     return {
-      Program: (node) =>
-        Effect.sync(() => {
-          const isTypeScript = context.filename.endsWith(".ts") || context.filename.endsWith(".tsx")
-          if (!isTypeScript) return
-          try {
-            typedRuntimeViolations = getTypePolicyChecker(context.cwd).analyze({
-              filename: context.filename,
-              sourceText: context.sourceCode.text
-            }).manualRuntimeBoundaries
-            for (const violation of typedRuntimeViolations) {
-              typedRuntimeRanges.add(`${violation.start}:${violation.end}`)
-            }
-          } catch (cause) {
-            context.report({
-              node,
-              message: `Could not verify ManagedRuntime boundaries. The type aware rule must run successfully: ${
-                String(cause)
-              }`
-            })
+      Program: (node) => {
+        const isTypeScript = context.filename.endsWith(".ts") || context.filename.endsWith(".tsx")
+        if (!isTypeScript) return Effect.void
+        try {
+          typedRuntimeViolations = getTypePolicyChecker(context.cwd).analyze({
+            filename: context.filename,
+            sourceText: context.sourceCode.text
+          }).manualRuntimeBoundaries
+          for (const violation of typedRuntimeViolations) {
+            typedRuntimeRanges.add(`${violation.start}:${violation.end}`)
           }
-        }),
+          return Effect.void
+        } catch (cause) {
+          return context.report({
+            node,
+            message: `Could not verify ManagedRuntime boundaries. The type aware rule must run successfully: ${
+              String(cause)
+            }`
+          })
+        }
+      },
       ImportDeclaration: (node) => {
         if (node.importKind === "type") return Effect.void
         const source = node.source.value
@@ -1037,7 +1458,7 @@ export const noManualEffectBoundary = Rule.define({
             if (specifier.type !== "ImportSpecifier" || specifier.imported.type !== "Identifier") continue
             const importedName = specifier.imported.name
             if (source === "effect") {
-              const moduleName = effectRootModules.get(importedName)
+              const moduleName = rootEffectModuleNames.get(importedName)
               if (moduleName !== undefined) moduleBindings.set(variable, moduleName)
               continue
             }
@@ -1083,9 +1504,9 @@ export const noManualEffectBoundary = Rule.define({
       "Program:exit": (node) => {
         const isTypeScript = context.filename.endsWith(".ts") || context.filename.endsWith(".tsx")
         if (!isTypeScript) return Effect.void
-        return Effect.sync(() => {
-          for (const violation of typedRuntimeViolations) {
-            if (reportedRanges.has(`${violation.start}:${violation.end}`)) continue
+        return Effect.forEach(
+          typedRuntimeViolations.filter((violation) => !reportedRanges.has(`${violation.start}:${violation.end}`)),
+          (violation) => {
             const deepestNode = context.sourceCode.getNodeByRangeIndex(violation.start)
             let reportNode = deepestNode ?? node
             if (deepestNode !== null) {
@@ -1101,9 +1522,10 @@ export const noManualEffectBoundary = Rule.define({
                 if (call !== undefined) reportNode = call
               }
             }
-            report(reportNode)
-          }
-        })
+            return report(reportNode)
+          },
+          { discard: true }
+        )
       }
     }
   }
@@ -1180,6 +1602,81 @@ export const noServiceTagMap = makeTypePolicyRule({
   message: () => serviceTagMapMessage
 })
 
+export const bareSqlRowTypeMessage =
+  "Do not assert SQL row shapes with a bare sql<T> type argument in library code. Decode request and result rows with SqlSchema at the database boundary."
+export const noBareSqlRowType = makeTypePolicyRule({
+  description: "Require SqlSchema decoding for library SQL reads.",
+  failure: "Could not verify SQL row type arguments",
+  select: (analysis) => analysis.bareSqlRowTypes,
+  message: () => bareSqlRowTypeMessage
+})
+
+export const effectSyncReturningEffectMessage =
+  "Do not return an Effect from an Effect.sync thunk. Use Effect.suspend when the thunk itself produces an Effect, or compose the synchronous mutation and return the Effect with Effect.as."
+export const noEffectSyncReturningEffect = makeTypePolicyRule({
+  description: "Keep Effect.sync thunks synchronous and non Effect valued.",
+  failure: "Could not verify Effect.sync return types",
+  select: (analysis) => analysis.effectSyncReturnsEffect,
+  message: () => effectSyncReturningEffectMessage
+})
+
+export const effectTestsUseEffectMessage =
+  "This test callback returns an Effect. Use @effect/vitest it.effect, it.live, or effect so the Effect runtime, scope, failures, and TestClock are managed by the test harness."
+export const effectTestsUseEffect = makeTypePolicyRule({
+  description: "Run Effect valued tests through @effect/vitest.",
+  failure: "Could not verify Effect valued test callbacks",
+  select: (analysis) => analysis.effectValuedPlainTests,
+  message: () => effectTestsUseEffectMessage
+})
+
+export const requireSchemaTaggedErrorMessage =
+  "Define every library owned typed error with Schema.TaggedErrorClass<Self>(identifier)(\"Tag\", fields). Do not use Data.TaggedError or a custom tagged Error class."
+export const requireSchemaTaggedError = makeTypePolicyRule({
+  description: "Require Schema.TaggedErrorClass for library owned typed errors.",
+  failure: "Could not verify tagged error declarations",
+  select: (analysis) => analysis.schemaTaggedErrorViolations,
+  message: () => requireSchemaTaggedErrorMessage
+})
+
+export const taggedErrorInstanceofMessage =
+  "Do not use instanceof to discriminate a tagged error. Match its stable _tag with Effect.catchTag, catchTags, catchReason, catchReasons, or an explicit _tag branch."
+export const noInstanceofTaggedError = makeTypePolicyRule({
+  description: "Discriminate tagged errors by _tag.",
+  failure: "Could not verify tagged error instanceof checks",
+  select: (analysis) => analysis.taggedErrorInstanceof,
+  message: () => taggedErrorInstanceofMessage
+})
+
+export const noClassInstanceFactoryMessage =
+  "Instantiate this class directly where the value is needed. Do not hide construction in a mapper or factory function. Prefer local verbosity so every construction site stays explicit."
+export const noClassInstanceFactory = makeTypePolicyRule({
+  description: "Instantiate classes directly instead of defining single purpose factories.",
+  failure: "Could not verify class instance factories",
+  select: (analysis) => analysis.classInstanceFactories,
+  message: () => noClassInstanceFactoryMessage
+})
+
+export const durationInputAtConfigBoundaryMessage =
+  "Express configurable durations as Duration.Input. Do not expose a bare number with a unit suffix. Convert the input once when the Layer or service is constructed."
+export const durationInputAtConfigBoundary = makeTypePolicyRule({
+  description: "Require Duration.Input at consumer configuration boundaries.",
+  failure: "Could not verify configurable duration inputs",
+  select: (analysis) => analysis.durationInputViolations,
+  message: (violation) => {
+    if (violation.property === undefined) return durationInputAtConfigBoundaryMessage
+    return `${durationInputAtConfigBoundaryMessage} Imported property: ${violation.property}.`
+  }
+})
+
+export const noModuleErrorHelperMessage =
+  "Do not hide tagged error construction or translation in a module helper. Construct the error inline at each raising call site, even when that is more verbose. When multiple modules raise the same error, use exactly one shared constructor under src/internal."
+export const noModuleErrorHelper = makeTypePolicyRule({
+  description: "Keep tagged error construction and translation at the raising call site.",
+  failure: "Could not verify module error helpers",
+  select: (analysis) => analysis.moduleErrorHelpers,
+  message: () => noModuleErrorHelperMessage
+})
+
 export default Plugin.define({
   name: "effect-local",
   rules: {
@@ -1189,7 +1686,19 @@ export default Plugin.define({
     noUnnecessaryEffectForwarding,
     noFunctionEffectGen,
     noImplicitDefectConversion,
+    noExportedSchemaCodecAlias,
+    noDetachedFork,
+    noInternalEntrypointExport,
+    noTestWallClockWait,
     noManualEffectBoundary,
+    noBareSqlRowType,
+    noEffectSyncReturningEffect,
+    effectTestsUseEffect,
+    requireSchemaTaggedError,
+    noInstanceofTaggedError,
+    noClassInstanceFactory,
+    durationInputAtConfigBoundary,
+    noModuleErrorHelper,
     requireTaggedEffectError,
     requireLayerName,
     noServiceTagMap
