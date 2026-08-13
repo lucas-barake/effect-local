@@ -2321,9 +2321,11 @@ describe("server reconciled mutation log", () => {
 
       yield* installFreshView(local, server)
 
-      const first = yield* local.mutate(Domain.PutTodo, Domain.todo("projection-1"))
-      yield* local.mutate(Domain.PutTodo, Domain.todo("projection-2"))
-      const receipt = yield* server.submit(first.envelope)
+      const pending = yield* Effect.forEach(
+        Array.from({ length: 12 }, (_, index) => `projection-${index + 1}`),
+        (id) => local.mutate(Domain.PutTodo, Domain.todo(id))
+      )
+      const receipt = yield* server.submit(pending[0].envelope)
       const state = yield* local.replicationState
       const page = incremental(yield* server.pull(pullRequest(state.cursor)))
 
@@ -2349,11 +2351,11 @@ describe("server reconciled mutation log", () => {
           WHERE s.space_id = ${spaceId}`
       })(undefined)
       assert.isNull(projection.replay)
-      assert.strictEqual(projection.active_rows, 2)
+      assert.strictEqual(projection.active_rows, 12)
       assert.strictEqual(projection.inactive_rows, 0)
       assert.deepStrictEqual(
-        Option.getOrThrow(yield* local.get(Domain.Todo, "projection-2")),
-        Domain.todo("projection-2")
+        Option.getOrThrow(yield* local.get(Domain.Todo, "projection-12")),
+        Domain.todo("projection-12")
       )
     })))
 

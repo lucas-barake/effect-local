@@ -1550,22 +1550,20 @@ export const layer = (
             row.entity_key
           )
         }
-        const pendingRows: Array<typeof Rows.PendingRow.Type & { readonly receipt_json: string | null }> = []
         let after = 0
         while (true) {
           const batch = yield* findReplayPendingBatch({ after, limit: projectionReplayBatchSize }).pipe(
             Effect.mapError(StorageUnavailable.make)
           )
           if (batch.length === 0) break
-          pendingRows.push(...batch)
+          for (const row of batch) {
+            const item = yield* decodePendingRow(row)
+            for (const change of item.changes) {
+              record(change.entity, yield* Codec.stringify(change.entity.key))
+            }
+          }
           after = batch[batch.length - 1].local_sequence
           if (batch.length < projectionReplayBatchSize) break
-        }
-        for (const row of pendingRows) {
-          const item = yield* decodePendingRow(row)
-          for (const change of item.changes) {
-            record(change.entity, yield* Codec.stringify(change.entity.key))
-          }
         }
         const resetIdentities = [...touched.values()]
         for (let offset = 0; offset < resetIdentities.length; offset += 100) {
@@ -1596,11 +1594,20 @@ export const layer = (
                   AND r.model = c.model AND r.entity_key = c.entity_key
               )`
         }
-        for (const row of pendingRows) {
-          const written = yield* replayPendingRow(row, replaySchemaGeneration, projectionGeneration, current)
-          for (const change of written) {
-            record(change.entity, yield* Codec.stringify(change.entity.key))
+        after = 0
+        while (true) {
+          const batch = yield* findReplayPendingBatch({ after, limit: projectionReplayBatchSize }).pipe(
+            Effect.mapError(StorageUnavailable.make)
+          )
+          if (batch.length === 0) break
+          for (const row of batch) {
+            const written = yield* replayPendingRow(row, replaySchemaGeneration, projectionGeneration, current)
+            for (const change of written) {
+              record(change.entity, yield* Codec.stringify(change.entity.key))
+            }
           }
+          after = batch[batch.length - 1].local_sequence
+          if (batch.length < projectionReplayBatchSize) break
         }
         const allIdentities = [...touched.values()]
         for (let offset = 0; offset < allIdentities.length; offset += 100) {
