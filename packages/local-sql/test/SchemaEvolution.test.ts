@@ -1,4 +1,4 @@
-import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
+import { NodeCrypto, NodeFileSystem, NodePath } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Attachment from "@lucas-barake/effect-local/Attachment"
@@ -30,6 +30,8 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as AttachmentClient from "../src/AttachmentClient.js"
 import * as AttachmentServer from "../src/AttachmentServer.js"
 import * as AttachmentStorage from "../src/AttachmentStorage.js"
+import * as AttachmentTransfer from "../src/AttachmentTransfer.js"
+import * as FileSystemAttachmentStorage from "../src/FileSystemAttachmentStorage.js"
 import * as Codec from "../src/internal/codec.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
@@ -403,6 +405,7 @@ const layerDatabase = Layer.mergeAll(
 )
 const provideDatabase = Effect.provide(layerDatabase)
 const provideNodeFileSystem = Effect.provide(NodeFileSystem.layer)
+const provideNodeFileSystemAndPath = Effect.provide(Layer.merge(NodeFileSystem.layer, NodePath.layer))
 
 const buildStore = <D extends Definition.Any,>(
   definition: D,
@@ -1547,6 +1550,71 @@ describe("client schema evolution", () => {
         assert.isNotNull(rows[0].garbage_collect_after)
       },
       Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect(
+    "keeps quarantined attachment bytes available after client schema evolution",
+    Effect.fnUntraced(
+      function*() {
+        const fs = yield* FileSystem.FileSystem
+        const sql = yield* SqlClient.SqlClient
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-quarantine-attachment-" })
+        const layerStorage = FileSystemAttachmentStorage.layer({
+          directory: `${root}/objects`,
+          maximumBytes: 8
+        })
+        const layerTransfer = Layer.succeed(
+          AttachmentTransfer.AttachmentTransfer,
+          AttachmentTransfer.AttachmentTransfer.of({
+            upload: () => Effect.die("unexpected attachment upload"),
+            download: () => Stream.die("unexpected attachment download")
+          })
+        )
+        const layerAttachmentDependencies = Layer.mergeAll(
+          Layer.succeed(SqlClient.SqlClient, sql),
+          layerStorage,
+          layerTransfer
+        )
+        const attachmentContext = yield* AttachmentClient.layer.pipe(
+          Layer.provide(layerAttachmentDependencies),
+          Layer.build
+        )
+        const attachments = Context.get(attachmentContext, AttachmentClient.AttachmentClient)
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1, undefined, clientId, attachments)
+        const content = Uint8Array.from([1, 2, 3])
+        const reference = yield* attachments.stage(spaceId, Stream.make(content))
+        const original = yield* v1.mutate(PutTodoV1, {
+          id: "43",
+          title: "quarantined-attachment",
+          attachment: reference
+        })
+        yield* attachments.release(spaceId, reference)
+
+        const v2 = yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution, clientId, attachments)
+        const quarantined = yield* v2.quarantine
+        assert.deepStrictEqual(quarantined.map(({ envelope }) => envelope.mutationId), [
+          original.envelope.mutationId
+        ])
+        assert.strictEqual(yield* attachments.objectKey(spaceId, reference).pipe(Effect.as(true)), true)
+        const owners = yield* sql<{ readonly owner_kind: string }>`
+          SELECT owner_kind FROM effect_local_client_attachment_owners
+          WHERE space_id = ${spaceId} AND digest = ${reference.digest}`
+        assert.deepStrictEqual(owners.map(({ owner_kind }) => owner_kind), ["Quarantine"])
+
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution)
+        const discarded = yield* server.discard({
+          envelope: quarantined[0].envelope,
+          schema: definitionV2.schemaIdentity
+        }, null)
+        yield* v2.resolveQuarantine(discarded)
+        const released = yield* attachments.objectKey(spaceId, reference).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(released))
+        if (Result.isFailure(released)) assert.strictEqual(released.failure._tag, "AttachmentNotFound")
+      },
+      Effect.scoped,
+      provideNodeFileSystemAndPath,
       provideDatabase
     )
   )

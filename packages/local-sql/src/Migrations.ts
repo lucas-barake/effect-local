@@ -1346,7 +1346,7 @@ const clientV14 = makeMigration({
     `CREATE TABLE effect_local_client_attachment_owners (
       space_id TEXT NOT NULL,
       digest TEXT NOT NULL,
-      owner_kind TEXT NOT NULL CHECK (owner_kind IN ('Staged', 'Pending')),
+      owner_kind TEXT NOT NULL CHECK (owner_kind IN ('Staged', 'Pending', 'Quarantine')),
       owner_id TEXT NOT NULL,
       created_at INTEGER NOT NULL CHECK (created_at >= 0),
       PRIMARY KEY (space_id, digest, owner_kind, owner_id),
@@ -1367,6 +1367,28 @@ const clientV14 = makeMigration({
     )`,
     `CREATE INDEX effect_local_client_attachment_deletions_due
       ON effect_local_client_attachment_deletions (next_attempt_at, object_key)`,
+    `CREATE TRIGGER effect_local_client_attachment_space_delete BEFORE DELETE
+      ON effect_local_client_spaces BEGIN
+        INSERT OR IGNORE INTO effect_local_client_attachment_deletions
+          (object_key, next_attempt_at, created_at)
+          SELECT object_key, 0, 0 FROM effect_local_client_attachments WHERE space_id = OLD.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_client_quarantine_attachment_acquire
+      AFTER INSERT ON effect_local_client_quarantine BEGIN
+        INSERT OR IGNORE INTO effect_local_client_attachment_owners
+          (space_id, digest, owner_kind, owner_id, created_at)
+          SELECT space_id, digest, 'Quarantine', NEW.mutation_id, created_at
+          FROM effect_local_client_attachment_owners
+          WHERE space_id = NEW.space_id AND owner_kind = 'Pending' AND owner_id = NEW.mutation_id;
+      END`,
+    `CREATE TRIGGER effect_local_client_pending_attachment_reacquire
+      AFTER INSERT ON effect_local_client_pending_data BEGIN
+        INSERT OR IGNORE INTO effect_local_client_attachment_owners
+          (space_id, digest, owner_kind, owner_id, created_at)
+          SELECT space_id, digest, 'Pending', NEW.mutation_id, created_at
+          FROM effect_local_client_attachment_owners
+          WHERE space_id = NEW.space_id AND owner_kind = 'Quarantine' AND owner_id = NEW.mutation_id;
+      END`,
     `CREATE TRIGGER effect_local_client_pending_attachment_release
       AFTER DELETE ON effect_local_client_pending_data BEGIN
         DELETE FROM effect_local_client_attachment_owners
@@ -1375,6 +1397,24 @@ const clientV14 = makeMigration({
               SELECT 1 FROM effect_local_client_pending_data AS p
               WHERE p.space_id = OLD.space_id AND p.mutation_id = OLD.mutation_id
             );
+        INSERT OR IGNORE INTO effect_local_client_attachment_deletions
+          (object_key, next_attempt_at, created_at)
+          SELECT a.object_key, 0, 0 FROM effect_local_client_attachments AS a
+          WHERE a.space_id = OLD.space_id AND a.remote_available = 0 AND NOT EXISTS (
+            SELECT 1 FROM effect_local_client_attachment_owners AS o
+            WHERE o.space_id = a.space_id AND o.digest = a.digest
+          );
+        DELETE FROM effect_local_client_attachments
+          WHERE space_id = OLD.space_id AND remote_available = 0 AND NOT EXISTS (
+            SELECT 1 FROM effect_local_client_attachment_owners AS o
+            WHERE o.space_id = effect_local_client_attachments.space_id
+              AND o.digest = effect_local_client_attachments.digest
+          );
+      END`,
+    `CREATE TRIGGER effect_local_client_quarantine_attachment_release
+      AFTER DELETE ON effect_local_client_quarantine BEGIN
+        DELETE FROM effect_local_client_attachment_owners
+          WHERE space_id = OLD.space_id AND owner_kind = 'Quarantine' AND owner_id = OLD.mutation_id;
         INSERT OR IGNORE INTO effect_local_client_attachment_deletions
           (object_key, next_attempt_at, created_at)
           SELECT a.object_key, 0, 0 FROM effect_local_client_attachments AS a

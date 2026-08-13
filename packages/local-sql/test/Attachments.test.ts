@@ -154,6 +154,9 @@ describe("replica attachments", () => {
         const serialized = Canonical.stringify(pending)
         assert.notInclude(serialized, "aGVsbG8=")
         assert.notInclude(serialized, "104,101,108,108,111")
+        assert.lengthOf(yield* fs.readDirectory(`${root}/objects`), 1)
+        yield* replica.leave(spaceId)
+        assert.deepStrictEqual(yield* fs.readDirectory(`${root}/objects`), [])
       },
       provideNodeServices,
       Effect.scoped

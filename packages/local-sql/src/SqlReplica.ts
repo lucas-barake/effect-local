@@ -686,6 +686,15 @@ const makeLayer = <D extends Definition.Any, R,>(
           return true
         }))
 
+      const evictMembership = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
+        yield* Effect.asVoid(
+          sql.withTransaction(sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`)
+        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        if (Option.isNone(attachments)) return
+        let deleted = 128
+        while (deleted === 128) deleted = yield* attachments.value.drainDeletions(128)
+      })
+
       const ensureForegroundCapacity = (entry: RememberedEntry): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.suspend(() => {
           if (foregroundResidents.size <= options.foregroundActiveSpaces) return Effect.void
@@ -1194,25 +1203,14 @@ const makeLayer = <D extends Definition.Any, R,>(
             return yield* restore(Deferred.await(current.leaveCompletion))
           }
           if (current === undefined) {
-            return yield* restore(
-              sql.withTransaction(
-                sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
-              ).pipe(
-                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
-                Effect.asVoid
-              )
-            )
+            return yield* restore(evictMembership(spaceId))
           }
           const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           current.leaving = true
           current.leaveCompletion = completion
           const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
             Effect.andThen(deactivate(current, true)),
-            Effect.andThen(
-              sql.withTransaction(
-                sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
-              ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-            ),
+            Effect.andThen(evictMembership(spaceId)),
             Effect.tap(() =>
               removeContribution(current).pipe(
                 Effect.andThen(Effect.sync(() => entries.delete(spaceId)))

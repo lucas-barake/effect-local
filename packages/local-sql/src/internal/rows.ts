@@ -20,7 +20,7 @@ export const ClientAttachmentRow = Schema.Struct({
 export const ClientAttachmentOwnerRow = Schema.Struct({
   space_id: Identity.SpaceId,
   digest: Attachment.Digest,
-  owner_kind: Schema.Literals(["Staged", "Pending"]),
+  owner_kind: Schema.Literals(["Staged", "Pending", "Quarantine"]),
   owner_id: Schema.String,
   created_at: NonNegativeInt
 })
