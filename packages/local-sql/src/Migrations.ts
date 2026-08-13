@@ -1358,6 +1358,50 @@ const clientV14 = makeMigration({
       ON effect_local_client_attachment_owners (space_id, owner_kind, owner_id, digest)`,
     `CREATE INDEX effect_local_client_attachments_eviction
       ON effect_local_client_attachments (cache_managed, remote_available, last_accessed_at, space_id, digest)`,
+    `CREATE TABLE effect_local_client_attachment_usage (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      local_object_count INTEGER NOT NULL CHECK (local_object_count >= 0),
+      local_byte_count INTEGER NOT NULL CHECK (local_byte_count >= 0),
+      cache_object_count INTEGER NOT NULL CHECK (cache_object_count >= 0),
+      cache_byte_count INTEGER NOT NULL CHECK (cache_byte_count >= 0)
+    )`,
+    `INSERT INTO effect_local_client_attachment_usage
+      (id, local_object_count, local_byte_count, cache_object_count, cache_byte_count)
+      VALUES (1, 0, 0, 0, 0)`,
+    `CREATE TRIGGER effect_local_client_attachment_usage_insert
+      AFTER INSERT ON effect_local_client_attachments BEGIN
+        UPDATE effect_local_client_attachment_usage SET
+          local_object_count = local_object_count + 1,
+          local_byte_count = local_byte_count + NEW.bytes,
+          cache_object_count = cache_object_count +
+            CASE WHEN NEW.cache_managed = 1 AND NEW.remote_available = 1 THEN 1 ELSE 0 END,
+          cache_byte_count = cache_byte_count +
+            CASE WHEN NEW.cache_managed = 1 AND NEW.remote_available = 1 THEN NEW.bytes ELSE 0 END
+        WHERE id = 1;
+      END`,
+    `CREATE TRIGGER effect_local_client_attachment_usage_delete
+      AFTER DELETE ON effect_local_client_attachments BEGIN
+        UPDATE effect_local_client_attachment_usage SET
+          local_object_count = local_object_count - 1,
+          local_byte_count = local_byte_count - OLD.bytes,
+          cache_object_count = cache_object_count -
+            CASE WHEN OLD.cache_managed = 1 AND OLD.remote_available = 1 THEN 1 ELSE 0 END,
+          cache_byte_count = cache_byte_count -
+            CASE WHEN OLD.cache_managed = 1 AND OLD.remote_available = 1 THEN OLD.bytes ELSE 0 END
+        WHERE id = 1;
+      END`,
+    `CREATE TRIGGER effect_local_client_attachment_usage_update
+      AFTER UPDATE OF bytes, cache_managed, remote_available ON effect_local_client_attachments BEGIN
+        UPDATE effect_local_client_attachment_usage SET
+          local_byte_count = local_byte_count + NEW.bytes - OLD.bytes,
+          cache_object_count = cache_object_count +
+            CASE WHEN NEW.cache_managed = 1 AND NEW.remote_available = 1 THEN 1 ELSE 0 END -
+            CASE WHEN OLD.cache_managed = 1 AND OLD.remote_available = 1 THEN 1 ELSE 0 END,
+          cache_byte_count = cache_byte_count +
+            CASE WHEN NEW.cache_managed = 1 AND NEW.remote_available = 1 THEN NEW.bytes ELSE 0 END -
+            CASE WHEN OLD.cache_managed = 1 AND OLD.remote_available = 1 THEN OLD.bytes ELSE 0 END
+        WHERE id = 1;
+      END`,
     `CREATE TABLE effect_local_client_attachment_deletions (
       object_key TEXT PRIMARY KEY CHECK (
         length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'

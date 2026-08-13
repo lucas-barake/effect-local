@@ -26,6 +26,13 @@ export const ClientAttachmentOwnerRow = Schema.Struct({
   created_at: NonNegativeInt
 })
 
+export const ClientAttachmentUsageRow = Schema.Struct({
+  local_object_count: NonNegativeInt,
+  local_byte_count: NonNegativeInt,
+  cache_object_count: NonNegativeInt,
+  cache_byte_count: NonNegativeInt
+})
+
 export const ClientAttachmentDeletionRow = Schema.Struct({
   object_key: AttachmentStorage.ObjectKey,
   attempt_count: NonNegativeInt,

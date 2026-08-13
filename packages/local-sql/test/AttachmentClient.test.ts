@@ -234,6 +234,60 @@ describe("attachment client", () => {
   )
 
   it.effect(
+    "rejects an impossible known-size remote object before consuming its bytes",
+    Effect.fnUntraced(
+      function*() {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-read-capacity-" })
+        const remoteBytes = Uint8Array.from({ length: 8 }, (_, index) => index)
+        const reference = Attachment.Reference.make(yield* Attachment.hash(Stream.make(remoteBytes)))
+        const consumed = yield* Ref.make(0)
+        const layerDatabase = SqliteClient.layer({ filename: `${root}/client.sqlite`, disableWAL: true })
+        const layerStorage = FileSystemAttachmentStorage.layer({ directory: `${root}/objects`, maximumBytes: 16 })
+        const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
+        const layerTransfer = Layer.succeed(
+          AttachmentTransfer.AttachmentTransfer,
+          AttachmentTransfer.AttachmentTransfer.of({
+            upload: () => Effect.die("unexpected upload"),
+            download: () =>
+              Stream.fromEffect(Ref.update(consumed, (count) => count + remoteBytes.length)).pipe(
+                Stream.flatMap(() => Stream.make(remoteBytes))
+              )
+          })
+        )
+        const context = yield* AttachmentClient.layer({
+          maximumLocalBytes: 1,
+          maximumLocalObjects: 1,
+          maximumCacheBytes: 1,
+          maximumCacheObjects: 1,
+          maximumCacheAge: "1 day",
+          evictionBatchSize: 1
+        }).pipe(
+          Layer.provide(layerInfrastructure),
+          Layer.provide(layerTransfer),
+          Layer.provideMerge(layerInfrastructure),
+          Layer.build
+        )
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const client = Context.get(context, AttachmentClient.AttachmentClient)
+        yield* Migrations.client({ definition: Domain.definition, spaceId, clientId }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql)
+        )
+
+        const result = yield* collectBytes(
+          client.read(spaceId, clientId, membershipIncarnation, reference)
+        ).pipe(Effect.result)
+
+        assert.isTrue(Result.isFailure(result))
+        if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, "CapacityExceeded")
+        assert.strictEqual(yield* Ref.get(consumed), 0)
+      },
+      provideNodeServices,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
     "bounds offline staging by bytes and objects while preserving deduplication",
     Effect.fnUntraced(
       function*() {
@@ -288,6 +342,12 @@ describe("attachment client", () => {
           SELECT COUNT(*) AS object_count, COALESCE(SUM(bytes), 0) AS byte_count
           FROM effect_local_client_attachments`
         assert.deepStrictEqual(usage, [{ object_count: 2, byte_count: 1 }])
+        const counterUsage = yield* sql<{
+          readonly local_object_count: number
+          readonly local_byte_count: number
+        }>`SELECT local_object_count, local_byte_count
+          FROM effect_local_client_attachment_usage WHERE id = 1`
+        assert.deepStrictEqual(counterUsage, [{ local_object_count: 2, local_byte_count: 1 }])
         assert.deepStrictEqual(
           yield* collectBytes(client.read(spaceId, clientId, membershipIncarnation, empty)),
           new Uint8Array()

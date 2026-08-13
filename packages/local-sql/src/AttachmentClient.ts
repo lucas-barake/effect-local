@@ -3,6 +3,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
@@ -17,6 +18,7 @@ import * as AttachmentStorage from "./AttachmentStorage.js"
 import * as AttachmentTransfer from "./AttachmentTransfer.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Rows from "./internal/rows.js"
+import * as StorageUnavailable from "./internal/storageUnavailable.js"
 
 export type ClientFailure =
   | AttachmentStorage.StorageFailure
@@ -87,7 +89,6 @@ export interface Options {
 }
 
 const Lookup = Schema.Struct({ spaceId: Identity.SpaceId, digest: Attachment.Digest })
-const CacheUsage = Schema.Struct({ object_count: Schema.Number, byte_count: Schema.Number })
 const CacheCandidate = Schema.Struct({
   space_id: Identity.SpaceId,
   digest: Attachment.Digest,
@@ -139,19 +140,14 @@ export const layer = (options: Options): Layer.Layer<
       const cacheGate = yield* Semaphore.make(1)
       const reservations = new Map<string, Attachment.Reference>()
       const activeReads = new Map<string, number>()
-      const cacheUsage = SqlSchema.findOne({
+      const protectedKeys = new Set<string>()
+      let activeReadsChanged = yield* Deferred.make<void>()
+      const usage = SqlSchema.findOne({
         Request: Schema.Void,
-        Result: CacheUsage,
+        Result: Rows.ClientAttachmentUsageRow,
         execute: () =>
-          sql`SELECT COUNT(*) AS object_count, COALESCE(SUM(bytes), 0) AS byte_count
-          FROM effect_local_client_attachments WHERE cache_managed = 1 AND remote_available = 1`
-      })
-      const localUsage = SqlSchema.findOne({
-        Request: Schema.Void,
-        Result: CacheUsage,
-        execute: () =>
-          sql`SELECT COUNT(*) AS object_count, COALESCE(SUM(bytes), 0) AS byte_count
-          FROM effect_local_client_attachments`
+          sql`SELECT local_object_count, local_byte_count, cache_object_count, cache_byte_count
+          FROM effect_local_client_attachment_usage WHERE id = 1`
       })
       const cacheCandidates = SqlSchema.findAll({
         Request: CacheCandidateRequest,
@@ -184,7 +180,7 @@ export const layer = (options: Options): Layer.Layer<
       const find = (spaceId: Identity.SpaceId, digest: Attachment.Digest) =>
         findAttachment({ spaceId, digest }).pipe(
           Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
             SchemaError: (cause) =>
               Effect.fail(
                 new ReplicaError.StorageCorrupt({
@@ -210,7 +206,7 @@ export const layer = (options: Options): Layer.Layer<
         const now = yield* Clock.currentTimeMillis
         const pending = yield* findDeletions({ now, maximum: batchSize }).pipe(
           Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
             SchemaError: (cause) =>
               Effect.fail(
                 new ReplicaError.StorageCorrupt({
@@ -224,7 +220,7 @@ export const layer = (options: Options): Layer.Layer<
           yield* storage.remove(deletion.object_key).pipe(Effect.withSpan("AttachmentClient.removeObject"))
           yield* sql`DELETE FROM effect_local_client_attachment_deletions
           WHERE object_key = ${deletion.object_key}`.pipe(
-            Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+            Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
           )
         }
         return pending.length
@@ -265,39 +261,20 @@ export const layer = (options: Options): Layer.Layer<
           })
         }
         const now = yield* Clock.currentTimeMillis
-        const cache = yield* cacheUsage(undefined).pipe(
+        const current = yield* usage(undefined).pipe(
           Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
             NoSuchElementError: (cause) =>
               Effect.fail(
                 new ReplicaError.StorageCorrupt({
-                  message: "Client attachment cache usage is missing",
+                  message: "Client attachment usage is missing",
                   cause
                 })
               ),
             SchemaError: (cause) =>
               Effect.fail(
                 new ReplicaError.StorageCorrupt({
-                  message: "Client attachment cache usage is corrupt",
-                  cause
-                })
-              )
-          })
-        )
-        const local = yield* localUsage(undefined).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            NoSuchElementError: (cause) =>
-              Effect.fail(
-                new ReplicaError.StorageCorrupt({
-                  message: "Client attachment local usage is missing",
-                  cause
-                })
-              ),
-            SchemaError: (cause) =>
-              Effect.fail(
-                new ReplicaError.StorageCorrupt({
-                  message: "Client attachment local usage is corrupt",
+                  message: "Client attachment usage is corrupt",
                   cause
                 })
               )
@@ -322,10 +299,10 @@ export const layer = (options: Options): Layer.Layer<
           (total, reference) => total + reference.bytes,
           0
         )
-        let cacheObjectCount = cache.object_count + reservations.size + cacheAdmissionCount
-        let cacheByteCount = cache.byte_count + reservationBytes + cacheAdmissionBytes
-        let localObjectCount = local.object_count + reservations.size + localAdmissionCount
-        let localByteCount = local.byte_count + reservationBytes + localAdmissionBytes
+        let cacheObjectCount = current.cache_object_count + reservations.size + cacheAdmissionCount
+        let cacheByteCount = current.cache_byte_count + reservationBytes + cacheAdmissionBytes
+        let localObjectCount = current.local_object_count + reservations.size + localAdmissionCount
+        let localByteCount = current.local_byte_count + reservationBytes + localAdmissionBytes
         let evicted = 0
         while (true) {
           const cacheCapacityExceeded = cacheObjectCount > maximumCacheObjects || cacheByteCount > maximumCacheBytes
@@ -339,7 +316,7 @@ export const layer = (options: Options): Layer.Layer<
             maximum: evictionBatchSize + reservations.size + activeReads.size + 1
           }).pipe(
             Effect.catchTags({
-              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
               SchemaError: (cause) =>
                 Effect.fail(
                   new ReplicaError.StorageCorrupt({
@@ -353,7 +330,9 @@ export const layer = (options: Options): Layer.Layer<
           let removedAny = false
           for (const candidate of candidates) {
             const candidateKey = cacheKey(candidate.space_id, candidate.digest)
-            if (reservations.has(candidateKey) || activeReads.has(candidateKey)) continue
+            if (
+              reservations.has(candidateKey) || activeReads.has(candidateKey) || protectedKeys.has(candidateKey)
+            ) continue
             const deleted = yield* sql.withTransaction(Effect.gen(function*() {
               const removed = yield* SqlSchema.findOneOption({
                 Request: Schema.Void,
@@ -379,7 +358,7 @@ export const layer = (options: Options): Layer.Layer<
               }
               return removed
             })).pipe(
-              Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+              Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
             )
             if (Option.isSome(deleted)) {
               cacheObjectCount -= 1
@@ -422,6 +401,21 @@ export const layer = (options: Options): Layer.Layer<
         }
         return evicted
       }, Effect.withSpan("AttachmentClient.evictCache"))
+
+      const admitRemote = (
+        reference: Attachment.Reference,
+        localAlreadyCounted: boolean,
+        cacheAlreadyCounted: boolean
+      ): Effect.Effect<number, ReplicaError.ReplicaError> =>
+        evictCache(reference, localAlreadyCounted, true, cacheAlreadyCounted).pipe(
+          Effect.catchTag("CapacityExceeded", (error) => {
+            if (activeReads.size === 0) return Effect.fail(error)
+            const changed = activeReadsChanged
+            return Deferred.await(changed).pipe(
+              Effect.andThen(Effect.suspend(() => admitRemote(reference, localAlreadyCounted, cacheAlreadyCounted)))
+            )
+          })
+        )
 
       const maintain: Service["maintain"] = cacheGate.withPermit(Effect.gen(function*() {
         yield* drainAllDeletions()
@@ -491,7 +485,7 @@ export const layer = (options: Options): Layer.Layer<
             (space_id, digest, owner_kind, owner_id, created_at)
             VALUES (${spaceId}, ${staged.reference.digest}, 'Staged', 'staged', ${now})`
                 })).pipe(
-                  Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+                  Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
                 )
                 return staged.reference
               })
@@ -564,7 +558,7 @@ export const layer = (options: Options): Layer.Layer<
               sql`INSERT OR IGNORE INTO effect_local_client_attachment_owners
             (space_id, digest, owner_kind, owner_id, created_at)
             VALUES (${spaceId}, ${reference.digest}, 'Pending', ${mutationId}, ${now})`.pipe(
-                Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
+                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
                 Effect.withSpan("AttachmentClient.associatePendingReference", {
                   attributes: {
                     "space.id": spaceId,
@@ -611,7 +605,7 @@ export const layer = (options: Options): Layer.Layer<
                     AND o.digest = effect_local_client_attachments.digest
                 )`
               })).pipe(
-                Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
               )
             })
           )
@@ -645,20 +639,35 @@ export const layer = (options: Options): Layer.Layer<
               const now = yield* Clock.currentTimeMillis
               yield* sql`UPDATE effect_local_client_attachments SET last_accessed_at = ${now}
               WHERE space_id = ${spaceId} AND digest = ${reference.digest}`.pipe(
-                Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
               )
               return existing.value.object_key
             }
           }
           const reservationKey = cacheKey(spaceId, reference.digest)
-          if (Option.isNone(existing)) reservations.set(reservationKey, reference)
           yield* drainAllDeletions()
+          protectedKeys.add(reservationKey)
+          let cacheAlreadyCounted = false
+          if (
+            Option.isSome(existing) && existing.value.cache_managed === 1 && existing.value.remote_available === 1
+          ) cacheAlreadyCounted = true
+          const clearProtection = Effect.sync(() => protectedKeys.delete(reservationKey))
+          yield* admitRemote(reference, Option.isSome(existing), cacheAlreadyCounted).pipe(
+            Effect.onError(() => clearProtection)
+          )
+          yield* drainAllDeletions().pipe(Effect.onError(() => clearProtection))
+          if (Option.isNone(existing)) reservations.set(reservationKey, reference)
           const staged = yield* storage.stage(transfer.download({
             spaceId,
             clientId,
             membershipIncarnation,
             reference
-          })).pipe(Effect.onError(() => Effect.sync(() => reservations.delete(reservationKey))))
+          })).pipe(Effect.onError(() =>
+            Effect.sync(() => {
+              reservations.delete(reservationKey)
+              protectedKeys.delete(reservationKey)
+            })
+          ))
           const persist = Effect.gen(function*() {
             if (staged.reference.bytes !== reference.bytes) {
               return yield* new Attachment.AttachmentLengthMismatch({
@@ -672,18 +681,73 @@ export const layer = (options: Options): Layer.Layer<
                 actual: staged.reference.digest
               })
             }
-            let cacheAlreadyCounted = Option.isNone(existing)
-            if (
-              Option.isSome(existing) && existing.value.cache_managed === 1 && existing.value.remote_available === 1
-            ) cacheAlreadyCounted = true
-            yield* evictCache(reference, true, true, cacheAlreadyCounted)
-            yield* drainAllDeletions()
             const now = yield* Clock.currentTimeMillis
             yield* sql.withTransaction(Effect.gen(function*() {
-              if (Option.isSome(existing)) {
+              const currentAttachment = yield* find(spaceId, reference.digest)
+              if (Option.isSome(currentAttachment) && currentAttachment.value.bytes !== reference.bytes) {
+                return yield* new Attachment.AttachmentLengthMismatch({
+                  expected: currentAttachment.value.bytes,
+                  actual: reference.bytes
+                })
+              }
+              const current = yield* usage(undefined).pipe(
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                  NoSuchElementError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({
+                        message: "Client attachment usage is missing",
+                        cause
+                      })
+                    ),
+                  SchemaError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({
+                        message: "Client attachment usage is corrupt",
+                        cause
+                      })
+                    )
+                })
+              )
+              let localObjectAdmission = 1
+              let localByteAdmission = reference.bytes
+              if (Option.isSome(currentAttachment)) {
+                localObjectAdmission = 0
+                localByteAdmission = 0
+              }
+              let cacheObjectAdmission = 1
+              let cacheByteAdmission = reference.bytes
+              if (
+                Option.isSome(currentAttachment) && currentAttachment.value.cache_managed === 1 &&
+                currentAttachment.value.remote_available === 1
+              ) {
+                cacheObjectAdmission = 0
+                cacheByteAdmission = 0
+              }
+              const projectedLocalObjects = current.local_object_count + localObjectAdmission
+              const projectedLocalBytes = current.local_byte_count + localByteAdmission
+              const projectedCacheObjects = current.cache_object_count + cacheObjectAdmission
+              const projectedCacheBytes = current.cache_byte_count + cacheByteAdmission
+              if (projectedLocalObjects > maximumLocalObjects || projectedLocalBytes > maximumLocalBytes) {
+                let limit = maximumLocalObjects
+                if (projectedLocalBytes > maximumLocalBytes) limit = maximumLocalBytes
+                return yield* new ReplicaError.CapacityExceeded({
+                  resource: "client attachment storage",
+                  limit
+                })
+              }
+              if (projectedCacheObjects > maximumCacheObjects || projectedCacheBytes > maximumCacheBytes) {
+                let limit = maximumCacheObjects
+                if (projectedCacheBytes > maximumCacheBytes) limit = maximumCacheBytes
+                return yield* new ReplicaError.CapacityExceeded({
+                  resource: "client attachment cache",
+                  limit
+                })
+              }
+              if (Option.isSome(currentAttachment)) {
                 yield* sql`INSERT OR IGNORE INTO effect_local_client_attachment_deletions
                 (object_key, next_attempt_at, created_at)
-                VALUES (${existing.value.object_key}, ${now}, ${now})`
+                VALUES (${currentAttachment.value.object_key}, ${now}, ${now})`
                 yield* sql`UPDATE effect_local_client_attachments SET object_key = ${staged.key},
                 remote_available = 1, cache_managed = 1, last_accessed_at = ${now}
                 WHERE space_id = ${spaceId} AND digest = ${reference.digest}`
@@ -692,8 +756,9 @@ export const layer = (options: Options): Layer.Layer<
                 (space_id, digest, bytes, object_key, remote_available, cache_managed, created_at, last_accessed_at)
                 VALUES (${spaceId}, ${reference.digest}, ${reference.bytes}, ${staged.key}, 1, 1, ${now}, ${now})`
               }
+              return yield* Effect.void
             })).pipe(
-              Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+              Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
             )
             return staged.key
           })
@@ -708,7 +773,10 @@ export const layer = (options: Options): Layer.Layer<
                 Effect.ignore
               )
             ),
-            Effect.ensuring(Effect.sync(() => reservations.delete(reservationKey)))
+            Effect.ensuring(Effect.sync(() => {
+              reservations.delete(reservationKey)
+              protectedKeys.delete(reservationKey)
+            }))
           )
         },
         Effect.withSpan("AttachmentClient.cacheRemote", (spaceId, _clientId, _membershipIncarnation, reference) => ({
@@ -732,17 +800,22 @@ export const layer = (options: Options): Layer.Layer<
         return cacheGate.withPermit(withLock(spaceId, reference.digest, downloaded))
       }
 
+      const releaseActiveRead = Effect.fnUntraced(function*(activeKey: string) {
+        const count = activeReads.get(activeKey)
+        if (count === undefined || count === 1) activeReads.delete(activeKey)
+        else activeReads.set(activeKey, count - 1)
+        const changed = activeReadsChanged
+        activeReadsChanged = yield* Deferred.make<void>()
+        yield* Deferred.succeed(changed, undefined)
+      })
+
       const read: Service["read"] = (spaceId, clientId, membershipIncarnation, reference, range) =>
         Stream.unwrap(
           Effect.acquireRelease(
             cacheRemote(spaceId, clientId, membershipIncarnation, reference),
             () => {
               const activeKey = cacheKey(spaceId, reference.digest)
-              return Effect.sync(() => {
-                const count = activeReads.get(activeKey)
-                if (count === undefined || count === 1) activeReads.delete(activeKey)
-                else activeReads.set(activeKey, count - 1)
-              })
+              return releaseActiveRead(activeKey)
             }
           ).pipe(
             Effect.map((key) => storage.read(key, reference, range)),
@@ -770,7 +843,7 @@ export const layer = (options: Options): Layer.Layer<
           yield* sql`UPDATE effect_local_client_attachments
         SET remote_available = 1, cache_managed = 1, last_accessed_at = ${now}
         WHERE space_id = ${spaceId} AND digest = ${reference.digest}`.pipe(
-            Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+            Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
           )
         },
         Effect.withSpan("AttachmentClient.markRemoteAvailable", (spaceId, reference) => ({
@@ -825,7 +898,7 @@ export const layer = (options: Options): Layer.Layer<
                 yield* sql`UPDATE effect_local_client_attachments
               SET remote_available = 1, cache_managed = 1, last_accessed_at = ${now}
               WHERE space_id = ${spaceId} AND digest = ${reference.digest}`.pipe(
-                  Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+                  Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
                 )
                 return yield* Effect.void
               })

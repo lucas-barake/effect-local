@@ -295,6 +295,9 @@ describe("storage migration catalogs", () => {
         execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_client_attachment_owners`
       })(undefined)
       assert.strictEqual(quarantinedOwners.count, 1)
+      const retainedUsage = yield* sql<{ readonly local_object_count: number }>`
+        SELECT local_object_count FROM effect_local_client_attachment_usage WHERE id = 1`
+      assert.deepStrictEqual(retainedUsage, [{ local_object_count: 1 }])
       yield* sql`DELETE FROM effect_local_client_quarantine WHERE mutation_id = ${mutationId}`
       const releasedOwners = yield* SqlSchema.findOne({
         Request: Schema.Void,
@@ -310,6 +313,9 @@ describe("storage migration catalogs", () => {
           WHERE object_key = ${objectKey}`
       })(undefined)
       assert.strictEqual(clientDeletions.count, 1)
+      const releasedUsage = yield* sql<{ readonly local_object_count: number }>`
+        SELECT local_object_count FROM effect_local_client_attachment_usage WHERE id = 1`
+      assert.deepStrictEqual(releasedUsage, [{ local_object_count: 0 }])
 
       const releasePlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
         SELECT a.object_key FROM effect_local_client_attachment_owners AS target
@@ -604,5 +610,85 @@ describe("storage migration catalogs", () => {
       provideDatabase,
       Effect.scoped
     )
+  )
+
+  it.effect(
+    "maintains constant-time client attachment usage across lifecycle transitions",
+    Effect.fnUntraced(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrations.client({ definition: Domain.definition, spaceId, clientId })
+      const usage = () =>
+        sql<{
+          readonly local_object_count: number
+          readonly local_byte_count: number
+          readonly cache_object_count: number
+          readonly cache_byte_count: number
+        }>`SELECT local_object_count, local_byte_count, cache_object_count, cache_byte_count
+          FROM effect_local_client_attachment_usage WHERE id = 1`
+      const secondDigest = `sha256:${"1".repeat(64)}`
+      const firstKey = "00000000000000000000000000000001"
+      const secondKey = "00000000000000000000000000000002"
+
+      assert.deepStrictEqual(yield* usage(), [{
+        local_object_count: 0,
+        local_byte_count: 0,
+        cache_object_count: 0,
+        cache_byte_count: 0
+      }])
+      yield* sql`INSERT INTO effect_local_client_attachments
+        (space_id, digest, bytes, object_key, created_at, last_accessed_at)
+        VALUES (${spaceId}, ${attachmentDigest}, 0, ${firstKey}, 1, 1)`
+      yield* sql`INSERT INTO effect_local_client_attachments
+        (space_id, digest, bytes, object_key, remote_available, cache_managed, created_at, last_accessed_at)
+        VALUES (${spaceId}, ${secondDigest}, 5, ${secondKey}, 1, 1, 1, 1)`
+      assert.deepStrictEqual(yield* usage(), [{
+        local_object_count: 2,
+        local_byte_count: 5,
+        cache_object_count: 1,
+        cache_byte_count: 5
+      }])
+
+      yield* sql`UPDATE effect_local_client_attachments SET cache_managed = 0
+        WHERE space_id = ${spaceId} AND digest = ${secondDigest}`
+      assert.deepStrictEqual(yield* usage(), [{
+        local_object_count: 2,
+        local_byte_count: 5,
+        cache_object_count: 0,
+        cache_byte_count: 0
+      }])
+      yield* sql`UPDATE effect_local_client_attachments SET cache_managed = 1, remote_available = 1
+        WHERE space_id = ${spaceId} AND digest = ${secondDigest}`
+      yield* sql`UPDATE effect_local_client_attachments SET remote_available = 0
+        WHERE space_id = ${spaceId} AND digest = ${secondDigest}`
+      assert.deepStrictEqual(yield* usage(), [{
+        local_object_count: 2,
+        local_byte_count: 5,
+        cache_object_count: 0,
+        cache_byte_count: 0
+      }])
+      yield* sql`UPDATE effect_local_client_attachments SET remote_available = 1
+        WHERE space_id = ${spaceId} AND digest = ${secondDigest}`
+      yield* sql`DELETE FROM effect_local_client_attachments
+        WHERE space_id = ${spaceId} AND digest = ${attachmentDigest}`
+      assert.deepStrictEqual(yield* usage(), [{
+        local_object_count: 1,
+        local_byte_count: 5,
+        cache_object_count: 1,
+        cache_byte_count: 5
+      }])
+
+      const plan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
+        SELECT local_object_count, local_byte_count, cache_object_count, cache_byte_count
+        FROM effect_local_client_attachment_usage WHERE id = 1`
+      assert.isTrue(plan.some((row) => row.detail.includes("INTEGER PRIMARY KEY")))
+
+      yield* sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
+      assert.deepStrictEqual(yield* usage(), [{
+        local_object_count: 0,
+        local_byte_count: 0,
+        cache_object_count: 0,
+        cache_byte_count: 0
+      }])
+    }, provideDatabase)
   )
 })
