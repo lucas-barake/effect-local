@@ -10,7 +10,7 @@ export interface UploadRequest {
   readonly clientId: Identity.ClientId
   readonly membershipIncarnation: Identity.MembershipIncarnation
   readonly reference: Attachment.Reference
-  readonly bytes: Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
+  readonly bytes: (offset: number) => Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
 }
 
 export interface DownloadRequest {

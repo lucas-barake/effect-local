@@ -224,7 +224,7 @@ describe("replica attachments", () => {
               yield* serverAttachments.appendUpload({
                 ...identity,
                 expectedOffset: prepared.offset,
-                bytes
+                bytes: bytes(prepared.offset)
               })
               yield* Ref.update(events, (current) => [...current, "upload"])
             }),

@@ -1435,6 +1435,7 @@ describe("client schema evolution", () => {
           prepareUpload: () => Effect.die("unexpected upload preparation"),
           appendUpload: () => Effect.die("unexpected upload append"),
           replaceEntityReferences: (input) => Ref.update(references, (current) => [...current, input]),
+          prepareRead: () => Effect.die("unexpected attachment read preparation"),
           read: () => Stream.fromEffect(Effect.die("unexpected attachment read")),
           maintain: () => Effect.die("unexpected attachment maintenance")
         })

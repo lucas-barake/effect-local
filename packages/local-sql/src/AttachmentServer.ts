@@ -80,6 +80,9 @@ export interface Service {
   readonly read: (
     input: AuthorizationInput & { readonly range?: Attachment.Range }
   ) => Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
+  readonly prepareRead: (
+    input: AuthorizationInput & { readonly range?: Attachment.Range }
+  ) => Effect.Effect<Stream.Stream<Uint8Array, ReplicaError.ReplicaError>, ReplicaError.ReplicaError>
   readonly maintain: (spaceId: Identity.SpaceId) => Effect.Effect<number, ReplicaError.ReplicaError>
 }
 
@@ -460,46 +463,47 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         return yield* Effect.void
       })
 
-      const read: Service["read"] = (input) =>
-        Stream.unwrap(Effect.gen(function*() {
-          yield* validateReference(input.reference)
-          yield* authorize(input, false)
-          const entities = yield* readableEntities({ spaceId: input.spaceId, digest: input.reference.digest }).pipe(
-            Effect.mapError(readError("Attachment reference authorization state is corrupt"))
+      const prepareRead: Service["prepareRead"] = Effect.fnUntraced(function*(input) {
+        yield* validateReference(input.reference)
+        yield* authorize(input, false)
+        const entities = yield* readableEntities({ spaceId: input.spaceId, digest: input.reference.digest }).pipe(
+          Effect.mapError(readError("Attachment reference authorization state is corrupt"))
+        )
+        let authorized = false
+        for (const row of entities) {
+          const key = yield* Codec.parse(row.entity_key).pipe(
+            Effect.flatMap((value) => Codec.decode(Schema.Json, value))
           )
-          let authorized = false
-          for (const row of entities) {
-            const key = yield* Codec.parse(row.entity_key).pipe(
-              Effect.flatMap((value) => Codec.decode(Schema.Json, value))
-            )
-            const value = yield* Codec.parse(row.value_json).pipe(
-              Effect.flatMap((parsed) => Codec.decode(Schema.Json, parsed))
-            )
-            const result = yield* options.authorizeRead({
-              ...input,
-              entity: { model: row.model, modelVersion: row.model_version, key },
-              value
-            }).pipe(Effect.provide(context), Effect.result)
-            if (Result.isSuccess(result)) {
-              authorized = true
-              break
-            }
+          const value = yield* Codec.parse(row.value_json).pipe(
+            Effect.flatMap((parsed) => Codec.decode(Schema.Json, parsed))
+          )
+          const result = yield* options.authorizeRead({
+            ...input,
+            entity: { model: row.model, modelVersion: row.model_version, key },
+            value
+          }).pipe(Effect.provide(context), Effect.result)
+          if (Result.isSuccess(result)) {
+            authorized = true
+            break
           }
-          if (!authorized) {
-            return yield* new ReplicaError.AuthorizationDenied({
-              reason: { _tag: "AttachmentReadDenied" }
-            })
-          }
-          const found = yield* find(input.spaceId, input.reference.digest)
-          if (Option.isNone(found) || found.value.state !== "Complete") return yield* notFound(input.reference)
-          if (found.value.bytes !== input.reference.bytes) {
-            return yield* new Attachment.AttachmentLengthMismatch({
-              expected: found.value.bytes,
-              actual: input.reference.bytes
-            })
-          }
-          return storage.read(found.value.object_key, input.reference, input.range)
-        }))
+        }
+        if (!authorized) {
+          return yield* new ReplicaError.AuthorizationDenied({
+            reason: { _tag: "AttachmentReadDenied" }
+          })
+        }
+        const found = yield* find(input.spaceId, input.reference.digest)
+        if (Option.isNone(found) || found.value.state !== "Complete") return yield* notFound(input.reference)
+        if (found.value.bytes !== input.reference.bytes) {
+          return yield* new Attachment.AttachmentLengthMismatch({
+            expected: found.value.bytes,
+            actual: input.reference.bytes
+          })
+        }
+        return storage.read(found.value.object_key, input.reference, input.range)
+      })
+
+      const read: Service["read"] = (input) => Stream.unwrap(prepareRead(input))
 
       const maintain: Service["maintain"] = Effect.fnUntraced(function*(spaceId) {
         const now = yield* Clock.currentTimeMillis
@@ -557,6 +561,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         return deletions.length
       })
 
-      return AttachmentServer.of({ prepareUpload, appendUpload, replaceEntityReferences, read, maintain })
+      return AttachmentServer.of({ prepareUpload, appendUpload, replaceEntityReferences, prepareRead, read, maintain })
     })
   )

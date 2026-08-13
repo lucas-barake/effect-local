@@ -393,7 +393,13 @@ export const layer: Layer.Layer<
               clientId,
               membershipIncarnation,
               reference,
-              bytes: storage.read(found.value.object_key, reference)
+              bytes: (offset) => {
+                if (offset === 0) return storage.read(found.value.object_key, reference)
+                return storage.read(found.value.object_key, reference, {
+                  offset,
+                  length: reference.bytes - offset
+                })
+              }
             })
             const now = yield* Clock.currentTimeMillis
             yield* write(sql`UPDATE effect_local_client_attachments
