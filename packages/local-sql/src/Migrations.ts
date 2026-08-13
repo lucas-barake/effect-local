@@ -1861,6 +1861,15 @@ const serverV13 = makeMigration({
       FOREIGN KEY (space_id, digest)
         REFERENCES effect_local_server_attachment_objects(space_id, digest) ON DELETE CASCADE
     )`,
+    `CREATE TABLE effect_local_server_attachment_possessions (
+      space_id TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      membership_incarnation TEXT NOT NULL,
+      PRIMARY KEY (space_id, digest, client_id, membership_incarnation),
+      FOREIGN KEY (space_id, digest)
+        REFERENCES effect_local_server_attachment_objects(space_id, digest) ON DELETE CASCADE
+    )`,
     `CREATE TABLE effect_local_server_attachment_references (
       space_id TEXT NOT NULL,
       schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
@@ -1887,13 +1896,20 @@ const serverV13 = makeMigration({
       CHECK ((claim_token IS NULL AND claimed_until IS NULL) OR
         (claim_token IS NOT NULL AND claimed_until IS NOT NULL AND claimed_until >= 0))
     )`,
-    `CREATE INDEX effect_local_server_attachment_objects_gc
-      ON effect_local_server_attachment_objects (garbage_collect_after, space_id, digest)
+    `CREATE INDEX effect_local_server_attachment_objects_complete_gc
+      ON effect_local_server_attachment_objects (space_id, garbage_collect_after, digest)
       WHERE state = 'Complete' AND garbage_collect_after IS NOT NULL`,
+    `CREATE INDEX effect_local_server_attachment_objects_staging_gc
+      ON effect_local_server_attachment_objects (space_id, last_accessed_at, digest)
+      WHERE state = 'Staging'`,
     `CREATE INDEX effect_local_server_attachment_upload_grants_expiry
       ON effect_local_server_attachment_upload_grants (expires_at, space_id, digest)`,
+    `CREATE INDEX effect_local_server_attachment_upload_grants_object
+      ON effect_local_server_attachment_upload_grants (space_id, digest, expires_at)`,
     `CREATE INDEX effect_local_server_attachment_references_digest
       ON effect_local_server_attachment_references (space_id, schema_generation, digest, model, entity_key)`,
+    `CREATE INDEX effect_local_server_attachment_references_object
+      ON effect_local_server_attachment_references (space_id, digest, schema_generation)`,
     `CREATE INDEX effect_local_server_attachment_deletions_due
       ON effect_local_server_attachment_deletions (next_attempt_at, object_key)`,
     `CREATE TRIGGER effect_local_server_attachment_space_delete BEFORE DELETE

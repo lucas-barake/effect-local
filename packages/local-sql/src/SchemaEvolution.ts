@@ -1462,7 +1462,18 @@ export interface ServerOptions {
     readonly modelVersion: Identity.SchemaVersion
     readonly entityKey: string
     readonly value?: Schema.Json
+    readonly authority:
+      | {
+        readonly _tag: "Mutation"
+        readonly clientId: Identity.ClientId
+        readonly membershipIncarnation: Identity.MembershipIncarnation
+      }
+      | { readonly _tag: "SchemaEvolution" }
   }) => Effect.Effect<void, ReplicaError.StorageError>
+  readonly activateAttachmentGeneration?: (
+    spaceId: Identity.SpaceId,
+    schemaGeneration: number
+  ) => Effect.Effect<void, ReplicaError.StorageError>
 }
 
 export const server = Effect.fn("SchemaEvolution.server")(function*(options: ServerOptions) {
@@ -1992,7 +2003,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
             model: row.model,
             modelVersion: migrated.modelVersion,
             entityKey: keyJson,
-            value
+            value,
+            authority: { _tag: "SchemaEvolution" }
           }) ?? Effect.void)
           targetEntityCount += 1
           targetEntityBytes += entityBytes
@@ -2055,6 +2067,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
             entity_count = ${state.target_entity_count}, entity_bytes = ${state.target_entity_bytes}
             WHERE space_id = ${options.spaceId} AND schema_generation = ${state.generation}
               AND active_schema_generation = ${state.source_generation}`
+        yield* (options.activateAttachmentGeneration?.(options.spaceId, state.generation) ?? Effect.void)
         yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupScopedSnapshotEntries'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
       }))

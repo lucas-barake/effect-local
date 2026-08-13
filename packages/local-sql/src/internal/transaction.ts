@@ -147,6 +147,8 @@ export const server = (options: {
   readonly definition: Definition.Any
   readonly spaceId: Identity.SpaceId
   readonly generation: number
+  readonly clientId: Identity.ClientId
+  readonly membershipIncarnation: Identity.MembershipIncarnation
   readonly changes: Array<Protocol.EntityChange>
   readonly replaceAttachmentReferences?: (input: {
     readonly spaceId: Identity.SpaceId
@@ -155,6 +157,13 @@ export const server = (options: {
     readonly modelVersion: Identity.SchemaVersion
     readonly entityKey: string
     readonly value?: Schema.Json
+    readonly authority:
+      | {
+        readonly _tag: "Mutation"
+        readonly clientId: Identity.ClientId
+        readonly membershipIncarnation: Identity.MembershipIncarnation
+      }
+      | { readonly _tag: "SchemaEvolution" }
   }) => Effect.Effect<void, ReplicaError.StorageError>
 }): Transaction.Transaction => {
   const find = SqlSchema.findOneOption({
@@ -198,7 +207,12 @@ export const server = (options: {
         model: model.name,
         modelVersion: model.version,
         entityKey: encoded.keyJson,
-        value: encoded.encodedValue
+        value: encoded.encodedValue,
+        authority: {
+          _tag: "Mutation",
+          clientId: options.clientId,
+          membershipIncarnation: options.membershipIncarnation
+        }
       }) ?? Effect.void)
       options.changes.push({
         _tag: "Upsert",
@@ -216,7 +230,12 @@ export const server = (options: {
         schemaGeneration: options.generation,
         model: model.name,
         modelVersion: model.version,
-        entityKey: encoded.keyJson
+        entityKey: encoded.keyJson,
+        authority: {
+          _tag: "Mutation",
+          clientId: options.clientId,
+          membershipIncarnation: options.membershipIncarnation
+        }
       }) ?? Effect.void)
       options.changes.push({
         _tag: "Delete",

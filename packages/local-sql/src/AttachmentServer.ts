@@ -14,7 +14,6 @@ import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as AttachmentStorage from "./AttachmentStorage.js"
 import * as Codec from "./internal/codec.js"
@@ -76,7 +75,18 @@ export interface Service {
     readonly modelVersion: Identity.SchemaVersion
     readonly entityKey: string
     readonly value?: Schema.Json
+    readonly authority:
+      | {
+        readonly _tag: "Mutation"
+        readonly clientId: Identity.ClientId
+        readonly membershipIncarnation: Identity.MembershipIncarnation
+      }
+      | { readonly _tag: "SchemaEvolution" }
   }) => Effect.Effect<void, ReplicaError.StorageError>
+  readonly activateGeneration: (
+    spaceId: Identity.SpaceId,
+    schemaGeneration: number
+  ) => Effect.Effect<void, ReplicaError.StorageError>
   readonly read: (
     input: AuthorizationInput & { readonly range?: Attachment.Range }
   ) => Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
@@ -98,14 +108,7 @@ const ReadableEntity = Schema.Struct({
   entity_key: Schema.String,
   value_json: Schema.String
 })
-
-const readError = (message: string) => (cause: unknown): ReplicaError.StorageError => {
-  if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
-  return new ReplicaError.StorageCorrupt({ message, cause })
-}
-
-const authorizationDenied = (reason: AuthorizationRejection) =>
-  new ReplicaError.AuthorizationDenied({ reason: { ...reason } })
+const DigestRow = Schema.Struct({ digest: Attachment.Digest })
 
 export const layer = <R = never,>(options: Options<R>): Layer.Layer<
   AttachmentServer,
@@ -176,10 +179,16 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           sql`SELECT COUNT(*) AS objects, COALESCE(SUM(bytes), 0) AS bytes
         FROM effect_local_server_attachment_objects WHERE space_id = ${spaceId}`
       })
-      const readableEntities = SqlSchema.findAll({
-        Request: Lookup,
+      const readableEntityPage = SqlSchema.findAll({
+        Request: Schema.Struct({
+          spaceId: Identity.SpaceId,
+          digest: Attachment.Digest,
+          afterModel: Schema.NullOr(Schema.String),
+          afterKey: Schema.NullOr(Schema.String),
+          limit: Schema.Number
+        }),
         Result: ReadableEntity,
-        execute: ({ digest, spaceId }) =>
+        execute: ({ afterKey, afterModel, digest, limit, spaceId }) =>
           sql`SELECT e.model, e.model_version, e.entity_key, e.value_json
         FROM effect_local_server_attachment_references AS r
         JOIN effect_local_server_spaces AS s ON s.space_id = r.space_id
@@ -187,43 +196,102 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         JOIN effect_local_server_entities_data AS e ON e.space_id = r.space_id
           AND e.generation = r.schema_generation AND e.model = r.model AND e.entity_key = r.entity_key
         WHERE r.space_id = ${spaceId} AND r.digest = ${digest}
-        ORDER BY e.model, e.entity_key`
+          AND (${afterModel} IS NULL OR e.model > ${afterModel}
+            OR (e.model = ${afterModel} AND e.entity_key > ${afterKey}))
+        ORDER BY e.model, e.entity_key LIMIT ${limit}`
       })
       const acquireUploadLease = SqlSchema.findOneOption({
         Request: Schema.Struct({
           spaceId: Identity.SpaceId,
           digest: Attachment.Digest,
+          objectKey: AttachmentStorage.ObjectKey,
           token: Schema.String,
           now: Schema.Number,
           expiresAt: Schema.Number
         }),
         Result: Rows.ServerAttachmentObjectRow,
-        execute: ({ digest, expiresAt, now, spaceId, token }) =>
+        execute: ({ digest, expiresAt, now, objectKey, spaceId, token }) =>
           sql`UPDATE effect_local_server_attachment_objects SET lease_token = ${token},
           lease_expires_at = ${expiresAt}
           WHERE space_id = ${spaceId} AND digest = ${digest} AND state = 'Staging'
+            AND object_key = ${objectKey}
             AND (lease_token IS NULL OR lease_expires_at <= ${now})
           RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
             lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
       })
       const find = (spaceId: Identity.SpaceId, digest: Attachment.Digest) =>
-        findObject({ spaceId, digest }).pipe(Effect.mapError(readError("Server attachment metadata is corrupt")))
+        findObject({ spaceId, digest }).pipe(Effect.catchTags({
+          SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+          SchemaError: (cause) =>
+            Effect.fail(
+              new ReplicaError.StorageCorrupt({
+                message: "Server attachment metadata is corrupt",
+                cause
+              })
+            )
+        }))
+      const rotateExpiredStaging = Effect.fnUntraced(function*(
+        object: typeof Rows.ServerAttachmentObjectRow.Type,
+        now: number
+      ) {
+        if (
+          object.state !== "Staging" || object.lease_token === null || object.lease_expires_at === null ||
+          object.lease_expires_at > now
+        ) return object
+        const replacementKey = yield* storage.create()
+        const rotated = yield* sql.withTransaction(Effect.gen(function*() {
+          const replacement = yield* SqlSchema.findOneOption({
+            Request: Schema.Void,
+            Result: Rows.ServerAttachmentObjectRow,
+            execute: () =>
+              sql`UPDATE effect_local_server_attachment_objects
+              SET object_key = ${replacementKey}, storage_offset = 0, lease_token = NULL,
+                lease_expires_at = NULL, last_accessed_at = ${now}
+              WHERE space_id = ${object.space_id} AND digest = ${object.digest}
+                AND object_key = ${object.object_key} AND state = 'Staging'
+                AND lease_token = ${object.lease_token} AND lease_expires_at <= ${now}
+              RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
+                lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
+          })(undefined).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Attachment upload incarnation state is corrupt",
+                  cause
+                })
+              )
+          }))
+          if (Option.isNone(replacement)) return Option.none()
+          yield* sql`INSERT OR IGNORE INTO effect_local_server_attachment_deletions
+            (object_key, space_id, digest, bytes, next_attempt_at, created_at)
+            VALUES (${object.object_key}, ${object.space_id}, ${object.digest}, ${object.bytes}, ${now}, ${now})`
+          return replacement
+        })).pipe(
+          Effect.onError(() => storage.remove(replacementKey).pipe(Effect.ignore)),
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+        )
+        if (Option.isNone(rotated)) {
+          yield* storage.remove(replacementKey)
+          const current = yield* find(object.space_id, object.digest)
+          if (Option.isNone(current)) return yield* new Attachment.AttachmentUnavailable({ digest: object.digest })
+          return current.value
+        }
+        return rotated.value
+      }, Effect.withSpan("AttachmentServer.rotateExpiredStaging"))
       const authorize = (input: AuthorizationInput, upload: boolean) => {
         let uploadAuthorization: Effect.Effect<void, AuthorizationRejection> = Effect.void
         if (upload) uploadAuthorization = options.authorizeUpload(input).pipe(Effect.provide(context))
         return options.authorizeAccess(input).pipe(
           Effect.provide(context),
           Effect.andThen(uploadAuthorization),
-          Effect.mapError(authorizationDenied)
+          Effect.mapError((reason) => new ReplicaError.AuthorizationDenied({ reason: { ...reason } }))
         )
       }
       const validateReference = (reference: Attachment.Reference) => {
         if (reference.bytes <= maximumObjectBytes) return Effect.void
         return Effect.fail(new Attachment.AttachmentTooLarge({ limit: maximumObjectBytes }))
       }
-      const notFound = (reference: Attachment.Reference) =>
-        new Attachment.AttachmentUnavailable({ digest: reference.digest })
-
       const prepareUpload: Service["prepareUpload"] = Effect.fnUntraced(function*(input) {
         yield* validateReference(input.reference)
         yield* authorize(input, true)
@@ -241,7 +309,16 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 const concurrent = yield* find(input.spaceId, input.reference.digest)
                 if (Option.isSome(concurrent)) return false
                 const usage = yield* spaceUsage(input.spaceId).pipe(
-                  Effect.mapError(readError("Server attachment quota state is corrupt"))
+                  Effect.catchTags({
+                    SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                    SchemaError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.StorageCorrupt({
+                          message: "Server attachment quota state is corrupt",
+                          cause
+                        })
+                      )
+                  })
                 )
                 if (usage.objects >= maximumObjectsPerSpace) {
                   return yield* new ReplicaError.CapacityExceeded({
@@ -276,30 +353,49 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               if (!inserted) yield* storage.remove(objectKey)
               found = yield* find(input.spaceId, input.reference.digest)
             }
-            if (Option.isNone(found)) return yield* notFound(input.reference)
-            if (found.value.bytes !== input.reference.bytes) {
+            if (Option.isNone(found)) {
+              return yield* new Attachment.AttachmentUnavailable({ digest: input.reference.digest })
+            }
+            let object = found.value
+            if (object.bytes !== input.reference.bytes) {
               return yield* new Attachment.AttachmentLengthMismatch({
-                expected: found.value.bytes,
+                expected: object.bytes,
                 actual: input.reference.bytes
               })
             }
-            let offset = found.value.storage_offset
-            if (found.value.state === "Staging") {
-              offset = yield* storage.offset(found.value.object_key)
+            object = yield* rotateExpiredStaging(object, now)
+            let offset = object.storage_offset
+            let complete = object.state === "Complete"
+            if (object.state === "Staging") {
+              offset = yield* storage.offset(object.object_key)
               if (offset > input.reference.bytes) {
                 return yield* new Attachment.AttachmentLengthMismatch({
                   expected: input.reference.bytes,
                   actual: offset
                 })
               }
-              const leased = found.value.lease_token !== null &&
-                found.value.lease_expires_at !== null && found.value.lease_expires_at > now
+              const leased = object.lease_token !== null &&
+                object.lease_expires_at !== null && object.lease_expires_at > now
               if (offset === input.reference.bytes && !leased) {
-                yield* storage.verify(found.value.object_key, input.reference)
-                yield* sql`UPDATE effect_local_server_attachment_objects SET state = 'Complete',
-              storage_offset = ${offset}, garbage_collect_after = ${now + garbageCollectionGracePeriod},
-              last_accessed_at = ${now}
-              WHERE space_id = ${input.spaceId} AND digest = ${input.reference.digest}`
+                yield* storage.verify(object.object_key, input.reference).pipe(Effect.catchTags({
+                  AttachmentNotFound: (error) => Effect.fail(error),
+                  AttachmentStorageError: (error) => Effect.fail(error),
+                  AttachmentLengthMismatch: (error) => Effect.fail(error),
+                  AttachmentDigestMismatch: (error) => Effect.fail(error),
+                  AttachmentTooLarge: (error) => Effect.fail(error)
+                }))
+                yield* sql.withTransaction(Effect.gen(function*() {
+                  yield* sql`UPDATE effect_local_server_attachment_objects SET state = 'Complete',
+                    storage_offset = ${offset}, garbage_collect_after = ${now + garbageCollectionGracePeriod},
+                    last_accessed_at = ${now}
+                    WHERE space_id = ${input.spaceId} AND digest = ${input.reference.digest}
+                      AND object_key = ${object.object_key} AND state = 'Staging'`
+                  yield* sql`INSERT OR IGNORE INTO effect_local_server_attachment_possessions
+                    (space_id, digest, client_id, membership_incarnation)
+                    VALUES (${input.spaceId}, ${input.reference.digest}, ${input.clientId},
+                      ${input.membershipIncarnation})`
+                }))
+                complete = true
               } else {
                 yield* sql`UPDATE effect_local_server_attachment_objects SET storage_offset = ${offset},
               last_accessed_at = ${now}
@@ -313,17 +409,23 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           ON CONFLICT (space_id, digest, client_id, membership_incarnation) DO UPDATE SET
             expires_at = excluded.expires_at`
             return {
-              objectKey: found.value.object_key,
+              objectKey: object.object_key,
               offset,
-              complete: found.value.state === "Complete" || (
-                offset === input.reference.bytes &&
-                (found.value.lease_token === null || found.value.lease_expires_at === null ||
-                  found.value.lease_expires_at <= now)
-              )
+              complete
             }
           }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         )
-      })
+      }, (effect) =>
+        effect.pipe(
+          Effect.catchTag("NoSuchElementError", (cause) =>
+            Effect.fail(
+              new ReplicaError.StorageCorrupt({
+                message: "Attachment upload state is missing",
+                cause
+              })
+            )),
+          Effect.withSpan("AttachmentServer.prepareUpload")
+        ))
 
       const appendUpload: Service["appendUpload"] = Effect.fnUntraced(function*<
         E extends { readonly _tag: string },
@@ -340,24 +442,28 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           input.spaceId,
           input.reference.digest,
           Effect.gen(function*() {
-            const found = yield* find(input.spaceId, input.reference.digest)
-            if (Option.isNone(found)) return yield* notFound(input.reference)
-            if (found.value.bytes !== input.reference.bytes) {
+            let found = yield* find(input.spaceId, input.reference.digest)
+            if (Option.isNone(found)) {
+              return yield* new Attachment.AttachmentUnavailable({ digest: input.reference.digest })
+            }
+            let object = found.value
+            if (object.bytes !== input.reference.bytes) {
               return yield* new Attachment.AttachmentLengthMismatch({
-                expected: found.value.bytes,
+                expected: object.bytes,
                 actual: input.reference.bytes
               })
             }
-            if (found.value.state === "Complete") {
+            if (object.state === "Complete") {
               if (input.expectedOffset !== input.reference.bytes) {
                 return yield* new Attachment.AttachmentOffsetConflict({
                   expected: input.expectedOffset,
                   actual: input.reference.bytes
                 })
               }
-              return { objectKey: found.value.object_key, offset: input.reference.bytes, complete: true }
+              return { objectKey: object.object_key, offset: input.reference.bytes, complete: true }
             }
             const now = yield* Clock.currentTimeMillis
+            object = yield* rotateExpiredStaging(object, now)
             const leaseToken = yield* crypto.randomUUIDv4.pipe(
               Effect.mapError((cause) =>
                 new Attachment.AttachmentStorageError({
@@ -369,17 +475,27 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             const lease = yield* acquireUploadLease({
               spaceId: input.spaceId,
               digest: input.reference.digest,
+              objectKey: object.object_key,
               token: leaseToken,
               now,
               expiresAt: now + uploadLeaseLifetime
-            }).pipe(Effect.mapError(readError("Attachment upload lease state is corrupt")))
+            }).pipe(Effect.catchTags({
+              SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({
+                    message: "Attachment upload lease state is corrupt",
+                    cause
+                  })
+                )
+            }))
             if (Option.isNone(lease)) {
               return yield* new Attachment.AttachmentUploadBusy({ digest: input.reference.digest })
             }
             const releaseLease = sql`UPDATE effect_local_server_attachment_objects
           SET lease_token = NULL, lease_expires_at = NULL
           WHERE space_id = ${input.spaceId} AND digest = ${input.reference.digest}
-            AND lease_token = ${leaseToken}`.pipe(
+            AND object_key = ${lease.value.object_key} AND lease_token = ${leaseToken}`.pipe(
               Effect.tapError((error) =>
                 Effect.logWarning("Attachment upload lease will expire").pipe(
                   Effect.annotateLogs("error", error._tag)
@@ -389,17 +505,18 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             )
             return yield* Effect.gen(function*() {
               const appended = yield* storage.append(
-                found.value.object_key,
+                lease.value.object_key,
                 input.reference,
                 input.expectedOffset,
                 input.bytes
               ).pipe(
                 Effect.tapError(() =>
-                  storage.offset(found.value.object_key).pipe(
+                  storage.offset(lease.value.object_key).pipe(
                     Effect.flatMap((offset) =>
                       sql`UPDATE effect_local_server_attachment_objects
                 SET storage_offset = ${offset} WHERE space_id = ${input.spaceId}
-                  AND digest = ${input.reference.digest}`
+                  AND digest = ${input.reference.digest} AND object_key = ${lease.value.object_key}
+                  AND lease_token = ${leaseToken}`
                     ),
                     Effect.catch(() => Effect.void)
                   )
@@ -407,36 +524,115 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               )
               const completedAt = yield* Clock.currentTimeMillis
               if (appended === input.reference.bytes) {
-                yield* storage.verify(found.value.object_key, input.reference)
-                yield* sql`UPDATE effect_local_server_attachment_objects SET state = 'Complete',
-              storage_offset = ${appended}, garbage_collect_after = ${completedAt + garbageCollectionGracePeriod},
-              last_accessed_at = ${completedAt}
-              WHERE space_id = ${input.spaceId} AND digest = ${input.reference.digest}
-                AND lease_token = ${leaseToken}`
-                return { objectKey: found.value.object_key, offset: appended, complete: true }
+                yield* storage.verify(lease.value.object_key, input.reference).pipe(Effect.catchTags({
+                  AttachmentNotFound: (error) => Effect.fail(error),
+                  AttachmentStorageError: (error) => Effect.fail(error),
+                  AttachmentLengthMismatch: (error) => Effect.fail(error),
+                  AttachmentDigestMismatch: (error) => Effect.fail(error),
+                  AttachmentTooLarge: (error) => Effect.fail(error)
+                }))
+                const completed = yield* sql.withTransaction(Effect.gen(function*() {
+                  const updated = yield* SqlSchema.findOneOption({
+                    Request: Schema.Void,
+                    Result: DigestRow,
+                    execute: () =>
+                      sql`UPDATE effect_local_server_attachment_objects SET state = 'Complete',
+                      storage_offset = ${appended}, garbage_collect_after = ${
+                        completedAt + garbageCollectionGracePeriod
+                      },
+                      last_accessed_at = ${completedAt}
+                      WHERE space_id = ${input.spaceId} AND digest = ${input.reference.digest}
+                        AND object_key = ${lease.value.object_key} AND lease_token = ${leaseToken}
+                      RETURNING digest`
+                  })(undefined).pipe(Effect.catchTags({
+                    SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                    SchemaError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.StorageCorrupt({
+                          message: "Attachment upload completion state is corrupt",
+                          cause
+                        })
+                      )
+                  }))
+                  if (Option.isNone(updated)) return false
+                  yield* sql`INSERT OR IGNORE INTO effect_local_server_attachment_possessions
+                    (space_id, digest, client_id, membership_incarnation)
+                    VALUES (${input.spaceId}, ${input.reference.digest}, ${input.clientId},
+                      ${input.membershipIncarnation})`
+                  return true
+                }))
+                if (!completed) {
+                  return yield* new Attachment.AttachmentUploadBusy({ digest: input.reference.digest })
+                }
+                return { objectKey: lease.value.object_key, offset: appended, complete: true }
               }
               yield* sql`UPDATE effect_local_server_attachment_objects SET storage_offset = ${appended},
             last_accessed_at = ${completedAt} WHERE space_id = ${input.spaceId}
-              AND digest = ${input.reference.digest} AND lease_token = ${leaseToken}`
-              return { objectKey: found.value.object_key, offset: appended, complete: false }
+              AND digest = ${input.reference.digest} AND object_key = ${lease.value.object_key}
+              AND lease_token = ${leaseToken}`
+              return { objectKey: lease.value.object_key, offset: appended, complete: false }
             }).pipe(Effect.ensuring(releaseLease))
           }).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         )
-      })
+      }, Effect.withSpan("AttachmentServer.appendUpload"))
 
       const replaceEntityReferences: Service["replaceEntityReferences"] = Effect.fnUntraced(function*(input) {
         let references: ReadonlyArray<Attachment.Reference> = []
         if (input.value !== undefined) references = yield* Attachment.collect(input.value)
         const now = yield* Clock.currentTimeMillis
         yield* sql.withTransaction(Effect.gen(function*() {
+          const previous = yield* SqlSchema.findAll({
+            Request: Schema.Void,
+            Result: DigestRow,
+            execute: () =>
+              sql`SELECT digest FROM effect_local_server_attachment_references
+              WHERE space_id = ${input.spaceId} AND schema_generation = ${input.schemaGeneration}
+                AND model = ${input.model} AND entity_key = ${input.entityKey}`
+          })(undefined).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Attachment reference state is corrupt",
+                  cause
+                })
+              )
+          }))
+          const previousDigests = new Set(previous.map(({ digest }) => digest))
           for (const reference of references) {
             const found = yield* find(input.spaceId, reference.digest)
-            if (Option.isNone(found) || found.value.state !== "Complete") return yield* notFound(reference)
+            if (Option.isNone(found) || found.value.state !== "Complete") {
+              return yield* new Attachment.AttachmentUnavailable({ digest: reference.digest })
+            }
             if (found.value.bytes !== reference.bytes) {
               return yield* new Attachment.AttachmentLengthMismatch({
                 expected: found.value.bytes,
                 actual: reference.bytes
               })
+            }
+            if (input.authority._tag === "Mutation" && !previousDigests.has(reference.digest)) {
+              const authority = input.authority
+              const possession = yield* SqlSchema.findOneOption({
+                Request: Schema.Void,
+                Result: DigestRow,
+                execute: () =>
+                  sql`SELECT digest FROM effect_local_server_attachment_possessions
+                  WHERE space_id = ${input.spaceId} AND digest = ${reference.digest}
+                    AND client_id = ${authority.clientId}
+                    AND membership_incarnation = ${authority.membershipIncarnation}`
+              })(undefined).pipe(Effect.catchTags({
+                SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({
+                      message: "Attachment possession state is corrupt",
+                      cause
+                    })
+                  )
+              }))
+              if (Option.isNone(possession)) {
+                return yield* new Attachment.AttachmentUnavailable({ digest: reference.digest })
+              }
             }
           }
           yield* sql`DELETE FROM effect_local_server_attachment_references
@@ -450,42 +646,84 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             yield* sql`UPDATE effect_local_server_attachment_objects SET garbage_collect_after = NULL
             WHERE space_id = ${input.spaceId} AND digest = ${reference.digest}`
           }
-          yield* sql`UPDATE effect_local_server_attachment_objects SET
-          garbage_collect_after = ${now + garbageCollectionGracePeriod}
-          WHERE space_id = ${input.spaceId} AND state = 'Complete' AND garbage_collect_after IS NULL
-            AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_references AS r
-              JOIN effect_local_server_spaces AS s ON s.space_id = r.space_id
-                AND s.active_schema_generation = r.schema_generation
-              WHERE r.space_id = effect_local_server_attachment_objects.space_id
-                AND r.digest = effect_local_server_attachment_objects.digest)`
+          for (const { digest } of previous) {
+            yield* sql`UPDATE effect_local_server_attachment_objects SET
+              garbage_collect_after = ${now + garbageCollectionGracePeriod}
+              WHERE space_id = ${input.spaceId} AND digest = ${digest} AND state = 'Complete'
+                AND garbage_collect_after IS NULL
+                AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_references AS r
+                  JOIN effect_local_server_spaces AS s ON s.space_id = r.space_id
+                    AND s.active_schema_generation = r.schema_generation
+                  WHERE r.space_id = effect_local_server_attachment_objects.space_id
+                    AND r.digest = effect_local_server_attachment_objects.digest)`
+          }
           return yield* Effect.void
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         return yield* Effect.void
-      })
+      }, Effect.withSpan("AttachmentServer.replaceEntityReferences"))
+
+      const activateGeneration: Service["activateGeneration"] = Effect.fnUntraced(function*(
+        spaceId,
+        schemaGeneration
+      ) {
+        const now = yield* Clock.currentTimeMillis
+        yield* sql`UPDATE effect_local_server_attachment_objects AS o SET
+          garbage_collect_after = CASE
+            WHEN EXISTS (SELECT 1 FROM effect_local_server_attachment_references AS r
+              WHERE r.space_id = o.space_id AND r.schema_generation = ${schemaGeneration}
+                AND r.digest = o.digest) THEN NULL
+            WHEN o.garbage_collect_after IS NULL THEN ${now + garbageCollectionGracePeriod}
+            ELSE o.garbage_collect_after
+          END
+          WHERE o.space_id = ${spaceId} AND o.state = 'Complete'`.pipe(
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+        )
+      }, Effect.withSpan("AttachmentServer.activateGeneration"))
 
       const prepareRead: Service["prepareRead"] = Effect.fnUntraced(function*(input) {
         yield* validateReference(input.reference)
         yield* authorize(input, false)
-        const entities = yield* readableEntities({ spaceId: input.spaceId, digest: input.reference.digest }).pipe(
-          Effect.mapError(readError("Attachment reference authorization state is corrupt"))
-        )
         let authorized = false
-        for (const row of entities) {
-          const key = yield* Codec.parse(row.entity_key).pipe(
-            Effect.flatMap((value) => Codec.decode(Schema.Json, value))
-          )
-          const value = yield* Codec.parse(row.value_json).pipe(
-            Effect.flatMap((parsed) => Codec.decode(Schema.Json, parsed))
-          )
-          const result = yield* options.authorizeRead({
-            ...input,
-            entity: { model: row.model, modelVersion: row.model_version, key },
-            value
-          }).pipe(Effect.provide(context), Effect.result)
-          if (Result.isSuccess(result)) {
-            authorized = true
-            break
+        let afterModel: string | null = null
+        let afterKey: string | null = null
+        while (!authorized) {
+          const entities: ReadonlyArray<typeof ReadableEntity.Type> = yield* readableEntityPage({
+            spaceId: input.spaceId,
+            digest: input.reference.digest,
+            afterModel,
+            afterKey,
+            limit: 64
+          }).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Attachment reference authorization state is corrupt",
+                  cause
+                })
+              )
+          }))
+          if (entities.length === 0) break
+          for (const row of entities) {
+            const key = yield* Codec.parse(row.entity_key).pipe(
+              Effect.flatMap((value) => Codec.decode(Schema.Json, value))
+            )
+            const value = yield* Codec.parse(row.value_json).pipe(
+              Effect.flatMap((parsed) => Codec.decode(Schema.Json, parsed))
+            )
+            const result = yield* options.authorizeRead({
+              ...input,
+              entity: { model: row.model, modelVersion: row.model_version, key },
+              value
+            }).pipe(Effect.provide(context), Effect.result)
+            if (Result.isSuccess(result)) {
+              authorized = true
+              break
+            }
           }
+          const last: typeof ReadableEntity.Type = entities[entities.length - 1]
+          afterModel = last.model
+          afterKey = last.entity_key
         }
         if (!authorized) {
           return yield* new ReplicaError.AuthorizationDenied({
@@ -493,7 +731,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           })
         }
         const found = yield* find(input.spaceId, input.reference.digest)
-        if (Option.isNone(found) || found.value.state !== "Complete") return yield* notFound(input.reference)
+        if (Option.isNone(found) || found.value.state !== "Complete") {
+          return yield* new Attachment.AttachmentUnavailable({ digest: input.reference.digest })
+        }
         if (found.value.bytes !== input.reference.bytes) {
           return yield* new Attachment.AttachmentLengthMismatch({
             expected: found.value.bytes,
@@ -501,45 +741,111 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           })
         }
         return storage.read(found.value.object_key, input.reference, input.range)
-      })
+      }, Effect.withSpan("AttachmentServer.prepareRead"))
 
       const read: Service["read"] = (input) => Stream.unwrap(prepareRead(input))
 
       const maintain: Service["maintain"] = Effect.fnUntraced(function*(spaceId) {
         const now = yield* Clock.currentTimeMillis
-        yield* sql`DELETE FROM effect_local_server_attachment_upload_grants WHERE expires_at <= ${now}`.pipe(
+        yield* sql`DELETE FROM effect_local_server_attachment_upload_grants
+          WHERE space_id = ${spaceId} AND expires_at <= ${now}`.pipe(
           Effect.mapError(StorageUnavailable.make)
         )
-        const due = yield* SqlSchema.findAll({
+        const completeDue = yield* SqlSchema.findAll({
           Request: Schema.Struct({ spaceId: Identity.SpaceId, now: Schema.Number, maximum: Schema.Number }),
           Result: Rows.ServerAttachmentObjectRow,
           execute: ({ maximum, now: requestedNow, spaceId: requestedSpaceId }) =>
             sql`SELECT space_id, digest, bytes, object_key, state,
-          storage_offset, lease_token, lease_expires_at, garbage_collect_after, created_at, last_accessed_at
-          FROM effect_local_server_attachment_objects AS o
-          WHERE o.space_id = ${requestedSpaceId} AND (
-            (o.state = 'Complete' AND o.garbage_collect_after IS NOT NULL
+              storage_offset, lease_token, lease_expires_at, garbage_collect_after, created_at, last_accessed_at
+            FROM effect_local_server_attachment_objects AS o
+            WHERE o.space_id = ${requestedSpaceId} AND o.state = 'Complete'
+              AND o.garbage_collect_after IS NOT NULL
               AND o.garbage_collect_after <= ${requestedNow}
               AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_references AS r
-                JOIN effect_local_server_spaces AS s ON s.space_id = r.space_id
-                  AND s.active_schema_generation = r.schema_generation
                 WHERE r.space_id = o.space_id AND r.digest = o.digest)
               AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
-                WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${requestedNow}))
-            OR (o.state = 'Staging' AND o.last_accessed_at + ${stagingLifetime} <= ${requestedNow}
-              AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= ${requestedNow})))
-          ORDER BY COALESCE(o.garbage_collect_after, o.last_accessed_at), o.digest LIMIT ${maximum}`
+                WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${requestedNow})
+              AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= ${requestedNow})
+            ORDER BY o.garbage_collect_after, o.digest LIMIT ${maximum}`
         })({ spaceId, now, maximum: deletionBatchSize }).pipe(
-          Effect.mapError(readError("Attachment garbage collection state is corrupt"))
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Attachment garbage collection state is corrupt",
+                  cause
+                })
+              )
+          })
         )
-        for (const object of due) {
+        const stagingDue = yield* SqlSchema.findAll({
+          Request: Schema.Struct({ spaceId: Identity.SpaceId, now: Schema.Number, maximum: Schema.Number }),
+          Result: Rows.ServerAttachmentObjectRow,
+          execute: ({ maximum, now: requestedNow, spaceId: requestedSpaceId }) =>
+            sql`SELECT space_id, digest, bytes, object_key, state,
+              storage_offset, lease_token, lease_expires_at, garbage_collect_after, created_at, last_accessed_at
+            FROM effect_local_server_attachment_objects AS o
+            WHERE o.space_id = ${requestedSpaceId} AND o.state = 'Staging'
+              AND o.last_accessed_at <= ${requestedNow - stagingLifetime}
+              AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= ${requestedNow})
+              AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
+                WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${requestedNow})
+            ORDER BY o.last_accessed_at, o.digest LIMIT ${maximum}`
+        })({ spaceId, now, maximum: deletionBatchSize - completeDue.length }).pipe(
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Attachment garbage collection state is corrupt",
+                  cause
+                })
+              )
+          })
+        )
+        for (const object of [...completeDue, ...stagingDue]) {
           yield* sql.withTransaction(Effect.gen(function*() {
+            const removed = yield* SqlSchema.findOneOption({
+              Request: Schema.Void,
+              Result: Rows.ServerAttachmentObjectRow,
+              execute: () =>
+                object.state === "Complete"
+                  ? sql`DELETE FROM effect_local_server_attachment_objects AS o
+                  WHERE o.space_id = ${object.space_id} AND o.digest = ${object.digest}
+                    AND o.object_key = ${object.object_key} AND o.state = 'Complete'
+                    AND o.garbage_collect_after IS NOT NULL AND o.garbage_collect_after <= ${now}
+                    AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= ${now})
+                    AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_references AS r
+                      WHERE r.space_id = o.space_id AND r.digest = o.digest)
+                    AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
+                      WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${now})
+                  RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
+                    lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
+                  : sql`DELETE FROM effect_local_server_attachment_objects AS o
+                  WHERE o.space_id = ${object.space_id} AND o.digest = ${object.digest}
+                    AND o.object_key = ${object.object_key} AND o.state = 'Staging'
+                    AND o.last_accessed_at <= ${now - stagingLifetime}
+                    AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= ${now})
+                    AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
+                      WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${now})
+                  RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
+                    lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
+            })(undefined).pipe(Effect.catchTags({
+              SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({
+                    message: "Attachment garbage collection state is corrupt",
+                    cause
+                  })
+                )
+            }))
+            if (Option.isNone(removed)) return
             yield* sql`INSERT OR IGNORE INTO effect_local_server_attachment_deletions
             (object_key, space_id, digest, bytes, next_attempt_at, created_at)
-            VALUES (${object.object_key}, ${object.space_id}, ${object.digest}, ${object.bytes}, ${now}, ${now})`
-            yield* sql`DELETE FROM effect_local_server_attachment_objects
-            WHERE space_id = ${object.space_id} AND digest = ${object.digest}
-              AND object_key = ${object.object_key}`
+            VALUES (${removed.value.object_key}, ${removed.value.space_id}, ${removed.value.digest},
+              ${removed.value.bytes}, ${now}, ${now})`
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         }
         const deletions = yield* SqlSchema.findAll({
@@ -551,7 +857,16 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           FROM effect_local_server_attachment_deletions WHERE next_attempt_at <= ${requestedNow}
           ORDER BY next_attempt_at, object_key LIMIT ${maximum}`
         })({ now, maximum: deletionBatchSize }).pipe(
-          Effect.mapError(readError("Attachment deletion state is corrupt"))
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Attachment deletion state is corrupt",
+                  cause
+                })
+              )
+          })
         )
         for (const deletion of deletions) {
           yield* storage.remove(deletion.object_key)
@@ -559,8 +874,16 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           WHERE object_key = ${deletion.object_key}`.pipe(Effect.mapError(StorageUnavailable.make))
         }
         return deletions.length
-      })
+      }, Effect.withSpan("AttachmentServer.maintain"))
 
-      return AttachmentServer.of({ prepareUpload, appendUpload, replaceEntityReferences, prepareRead, read, maintain })
+      return AttachmentServer.of({
+        prepareUpload,
+        appendUpload,
+        replaceEntityReferences,
+        activateGeneration,
+        prepareRead,
+        read,
+        maintain
+      })
     })
   )

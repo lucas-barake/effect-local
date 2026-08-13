@@ -6,7 +6,9 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Result from "effect/Result"
@@ -83,9 +85,9 @@ describe("attachment server", () => {
           maximumObjectBytes: 8,
           maximumObjectsPerSpace: 1,
           maximumBytesPerSpace: 32,
-          uploadGrantLifetime: "1 minute",
+          uploadGrantLifetime: "1 day",
           uploadLeaseLifetime: "1 minute",
-          stagingLifetime: "1 day",
+          stagingLifetime: "1 minute",
           garbageCollectionGracePeriod: "1 minute",
           deletionBatchSize: 8,
           authorizeAccess: () => Effect.void,
@@ -152,6 +154,9 @@ describe("attachment server", () => {
         const failure = yield* interruptedUpload.pipe(Effect.result)
         assert.isTrue(Result.isFailure(failure))
         if (Result.isFailure(failure)) assert.strictEqual(failure.failure._tag, "ServerUnavailable")
+        yield* TestClock.adjust("2 minutes")
+        assert.strictEqual(yield* attachments.maintain(spaceId), 0)
+        assert.isTrue(yield* storage.exists(first.objectKey))
         const resumed = yield* attachments.prepareUpload(identity)
         assert.strictEqual(resumed.offset, 2)
         const complete = yield* attachments.appendUpload({
@@ -188,7 +193,8 @@ describe("attachment server", () => {
           model: Domain.Todo.name,
           modelVersion: Domain.Todo.version,
           entityKey: "\"message\"",
-          value: entityValue
+          value: entityValue,
+          authority: { _tag: "Mutation", clientId, membershipIncarnation }
         })
         const sql = Context.get(context, SqlClient.SqlClient)
         const valueJson = yield* Codec.stringify(entityValue)
@@ -210,11 +216,116 @@ describe("attachment server", () => {
           schemaGeneration: 0,
           model: Domain.Todo.name,
           modelVersion: Domain.Todo.version,
-          entityKey: "\"message\""
+          entityKey: "\"message\"",
+          authority: { _tag: "Mutation", clientId, membershipIncarnation }
         })
-        yield* TestClock.adjust("2 minutes")
+        yield* TestClock.adjust("2 days")
         assert.strictEqual(yield* attachments.maintain(spaceId), 1)
         assert.strictEqual(yield* storage.exists(first.objectKey), false)
+      },
+      provideNodeServices,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "fences a stale writer by rotating the staging object after lease expiry",
+    Effect.fnUntraced(
+      function*() {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-lease-" })
+        const layerDatabase = SqliteClient.layer({ filename: `${root}/server.sqlite`, disableWAL: true }).pipe(
+          Layer.provide(Reactivity.layer)
+        )
+        const layerStorage = FileSystemAttachmentStorage.layer({
+          directory: `${root}/objects`,
+          maximumBytes: 8
+        })
+        const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
+        const attachmentOptions = {
+          maximumObjectBytes: 8,
+          maximumObjectsPerSpace: 2,
+          maximumBytesPerSpace: 32,
+          uploadGrantLifetime: "1 day",
+          uploadLeaseLifetime: "1 minute",
+          stagingLifetime: "1 day",
+          garbageCollectionGracePeriod: "1 minute",
+          deletionBatchSize: 8,
+          authorizeAccess: () => Effect.void,
+          authorizeUpload: () => Effect.void,
+          authorizeRead: () => Effect.void
+        } as const
+        const layerAttachments = AttachmentServer.layer(attachmentOptions).pipe(Layer.provide(layerInfrastructure))
+        const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
+        const layerServer = ServerStore.layerTrusted(history).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerDatabase),
+          Layer.provide(NodeCrypto.layer)
+        )
+        const context = yield* Layer.mergeAll(layerInfrastructure, layerAttachments, layerServer).pipe(Layer.build)
+        const firstServer = Context.get(context, AttachmentServer.AttachmentServer)
+        const storage = Context.get(context, AttachmentStorage.AttachmentStorage)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const server = Context.get(context, ServerStore.ServerStore)
+        yield* server.pull({
+          spaceId,
+          clientId,
+          schema: Domain.definition.schemaIdentity,
+          scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
+          scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+          cursor: null,
+          limit: 10
+        })
+        const secondStorage = FileSystemAttachmentStorage.layer({
+          directory: `${root}/objects`,
+          maximumBytes: 8
+        })
+        const secondContext = yield* AttachmentServer.layer(attachmentOptions).pipe(
+          Layer.provide(Layer.mergeAll(Layer.succeed(SqlClient.SqlClient, sql), secondStorage, NodeCrypto.layer)),
+          Layer.build
+        )
+        const secondServer = Context.get(secondContext, AttachmentServer.AttachmentServer)
+        const reference = Attachment.Reference.make({
+          _tag: "Attachment",
+          digest: Attachment.Digest.make(
+            "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+          ),
+          bytes: hello.length
+        })
+        const identity = { spaceId, clientId, membershipIncarnation, reference, principal }
+        const initial = yield* firstServer.prepareUpload(identity)
+        const prefixWritten = yield* Deferred.make<void>()
+        const resumeStaleWriter = yield* Deferred.make<void>()
+        const staleBytes = Stream.concat(
+          Stream.make(hello.slice(0, 2)),
+          Stream.fromEffect(Effect.gen(function*() {
+            yield* Deferred.succeed(prefixWritten, undefined)
+            yield* Deferred.await(resumeStaleWriter)
+            return hello.slice(2)
+          }))
+        )
+        const staleWriter = yield* firstServer.appendUpload({
+          ...identity,
+          expectedOffset: initial.offset,
+          bytes: staleBytes
+        }).pipe(Effect.forkChild)
+        yield* Deferred.await(prefixWritten)
+        yield* TestClock.adjust("2 minutes")
+
+        const replacement = yield* secondServer.prepareUpload(identity)
+        assert.strictEqual(replacement.offset, 0)
+        assert.notStrictEqual(replacement.objectKey, initial.objectKey)
+        const completed = yield* secondServer.appendUpload({
+          ...identity,
+          expectedOffset: replacement.offset,
+          bytes: Stream.make(hello)
+        })
+        assert.isTrue(completed.complete)
+        yield* Deferred.succeed(resumeStaleWriter, undefined)
+        const staleResult = yield* Fiber.join(staleWriter).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(staleResult))
+        if (Result.isFailure(staleResult)) assert.strictEqual(staleResult.failure._tag, "AttachmentUploadBusy")
+        assert.deepStrictEqual(yield* collectBytes(storage.read(completed.objectKey, reference)), hello)
       },
       provideNodeServices,
       Effect.scoped

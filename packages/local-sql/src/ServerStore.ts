@@ -871,7 +871,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         if (Option.isSome(attachments)) {
           evolutionOptions = {
             ...evolutionOptions,
-            replaceAttachmentReferences: attachments.value.replaceEntityReferences
+            replaceAttachmentReferences: attachments.value.replaceEntityReferences,
+            activateAttachmentGeneration: attachments.value.activateGeneration
           }
         }
         if (options.schemaEvolutionBatchSize !== undefined) {
@@ -1219,6 +1220,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 definition: options.definition,
                 spaceId: envelope.spaceId,
                 generation: storedSpace.active_schema_generation,
+                clientId: envelope.clientId,
+                membershipIncarnation: envelope.membershipIncarnation,
                 changes
               }
               if (Option.isSome(attachments)) {

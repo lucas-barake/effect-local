@@ -17,6 +17,7 @@ import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -297,6 +298,59 @@ describe("replica attachments", () => {
         yield* Deferred.await(submitted)
 
         assert.deepStrictEqual(yield* Ref.get(events), ["upload", "submit"])
+        const submitWithoutGrant = Effect.fnUntraced(function*(
+          requestedClientId: Identity.ClientId,
+          requestedIncarnation: Identity.MembershipIncarnation,
+          requestedId: string,
+          body: string,
+          mutationId: Identity.MutationId
+        ) {
+          const identity = {
+            spaceId,
+            clientId: requestedClientId,
+            membershipIncarnation: requestedIncarnation,
+            mutationId,
+            localSequence: Identity.LocalSequence.make(1),
+            basis: Identity.ServerSequence.make(0),
+            name: PutMessage.name,
+            payload: { id: requestedId, body, attachment: reference },
+            digestVersion: 3 as const,
+            sourceSchema: definition.schemaIdentity,
+            mutationVersion: PutMessage.version
+          }
+          return yield* server.submit(
+            Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
+          )
+        })
+        const retaining = yield* submitWithoutGrant(
+          Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+          Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000002"),
+          "message-upload",
+          "retained by another writer",
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000002")
+        )
+        assert.strictEqual(retaining._tag, "Accepted")
+        const unprovenClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000003")
+        const unprovenIncarnation = Identity.MembershipIncarnation.make(
+          "inc_00000000-0000-4000-8000-000000000003"
+        )
+        const alreadyComplete = yield* serverAttachments.prepareUpload({
+          spaceId,
+          clientId: unprovenClientId,
+          membershipIncarnation: unprovenIncarnation,
+          reference,
+          principal: null
+        })
+        assert.isTrue(alreadyComplete.complete)
+        const stolen = yield* submitWithoutGrant(
+          unprovenClientId,
+          unprovenIncarnation,
+          "message-stolen",
+          "new binding without upload possession",
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000003")
+        ).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(stolen))
+        if (Result.isFailure(stolen)) assert.strictEqual(stolen.failure._tag, "AttachmentUnavailable")
         assert.deepStrictEqual(
           yield* collectBytes(serverAttachments.read({
             spaceId,
