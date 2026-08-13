@@ -34,6 +34,9 @@ export type SnapshotId = typeof SnapshotId.Type
 export const ReplicationViewId = identifier("ReplicationViewId", "viw")
 export type ReplicationViewId = typeof ReplicationViewId.Type
 
+export const WakeId = identifier("WakeId", "wak")
+export type WakeId = typeof WakeId.Type
+
 export const LocalSequence = sequence("LocalSequence", 1)
 export type LocalSequence = typeof LocalSequence.Type
 
@@ -75,3 +78,4 @@ export const makeMembershipIncarnation = makeIdentifier(MembershipIncarnation, "
 export const makeMutationId = makeIdentifier(MutationId, "mut")
 export const makeSnapshotId = makeIdentifier(SnapshotId, "snp")
 export const makeReplicationViewId = makeIdentifier(ReplicationViewId, "viw")
+export const makeWakeId = makeIdentifier(WakeId, "wak")

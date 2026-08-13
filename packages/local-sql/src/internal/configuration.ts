@@ -36,19 +36,19 @@ export interface RetryTiming {
 export const retryTiming = Effect.fnUntraced(function*(options: {
   readonly retryDelay?: Duration.Input
   readonly maximumRetryDelay?: Duration.Input
-}): Effect.fn.Return<RetryTiming, ReplicaError.InvalidConfiguration> {
+}, optionPrefix = ""): Effect.fn.Return<RetryTiming, ReplicaError.InvalidConfiguration> {
   const retryDelayMillis = yield* positiveFiniteDurationMillis(
-    "retryDelay",
+    `${optionPrefix}retryDelay`,
     options.retryDelay ?? Duration.seconds(1)
   )
   const maximumRetryDelayMillis = yield* positiveFiniteDurationMillis(
-    "maximumRetryDelay",
+    `${optionPrefix}maximumRetryDelay`,
     options.maximumRetryDelay ?? Duration.minutes(1)
   )
   if (maximumRetryDelayMillis < retryDelayMillis) {
     return yield* new ReplicaError.InvalidConfiguration({
-      option: "maximumRetryDelay",
-      message: "maximumRetryDelay must be greater than or equal to retryDelay"
+      option: `${optionPrefix}maximumRetryDelay`,
+      message: `${optionPrefix}maximumRetryDelay must be greater than or equal to ${optionPrefix}retryDelay`
     })
   }
   return { retryDelayMillis, maximumRetryDelayMillis }

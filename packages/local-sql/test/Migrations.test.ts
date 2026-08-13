@@ -34,6 +34,7 @@ const NameRow = Schema.Struct({ name: Schema.String })
 const CountRow = Schema.Struct({ count: Schema.Number })
 const UpgradedScopedRow = Schema.Struct({
   delivered_sequence: Schema.Number,
+  wake_ack_sequence: Schema.Number,
   read_auth_epoch: Schema.Number,
   view_layout: Schema.String,
   snapshot_layout: Schema.String
@@ -164,7 +165,7 @@ describe("storage migration catalogs", () => {
       )
       pipe(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
       )
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
@@ -194,6 +195,9 @@ describe("storage migration catalogs", () => {
         "effect_local_server_replication_views",
         "effect_local_server_replication_view_entities",
         "effect_local_server_replication_pages",
+        "effect_local_server_offline_wake_spaces",
+        "effect_local_server_offline_wakes",
+        "effect_local_server_watch_presence",
         "effect_local_server_scoped_snapshots",
         "effect_local_server_scoped_snapshot_entries",
         "effect_local_server_snapshot_projections",
@@ -229,7 +233,8 @@ describe("storage migration catalogs", () => {
         Request: Schema.Void,
         Result: UpgradedScopedRow,
         execute: () =>
-          sql`SELECT v.delivered_sequence, v.read_auth_epoch, v.index_layout_hash AS view_layout,
+          sql`SELECT v.delivered_sequence, v.wake_ack_sequence, v.read_auth_epoch,
+            v.index_layout_hash AS view_layout,
             s.index_layout_hash AS snapshot_layout
           FROM effect_local_server_replication_views AS v
           INNER JOIN effect_local_server_scoped_snapshots AS s
@@ -237,13 +242,14 @@ describe("storage migration catalogs", () => {
       })(undefined)
       assert.deepStrictEqual(upgraded, {
         delivered_sequence: 7,
+        wake_ack_sequence: 0,
         read_auth_epoch: 0,
         view_layout: "",
         snapshot_layout: ""
       })
       pipe(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
       )
     }, provideDatabase)
   )

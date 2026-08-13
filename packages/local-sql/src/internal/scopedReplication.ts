@@ -127,7 +127,7 @@ export const make = (options: Options) => {
     execute: ({ spaceId, clientId }) =>
       sql`SELECT space_id, client_id, principal_digest, view_id, view_revision, scope_generation,
         scope_json, scope_digest, definition_hash, index_layout_hash, schema_version, schema_hash,
-        server_sequence, delivered_sequence, read_auth_epoch
+        server_sequence, delivered_sequence, wake_ack_sequence, read_auth_epoch
       FROM effect_local_server_replication_views
       WHERE space_id = ${spaceId} AND client_id = ${clientId}`
   })
@@ -588,12 +588,12 @@ export const make = (options: Options) => {
       yield* sql`INSERT INTO effect_local_server_replication_views
         (space_id, client_id, principal_digest, view_id, view_revision, scope_generation,
           scope_json, scope_digest, definition_hash, index_layout_hash, schema_version, schema_hash,
-          server_sequence, delivered_sequence, read_auth_epoch)
+          server_sequence, delivered_sequence, wake_ack_sequence, read_auth_epoch)
         VALUES (${request.spaceId}, ${request.clientId}, ${principalHash}, ${viewId}, 0,
           ${request.scopeGeneration}, ${yield* Codec.stringify(normalized)}, ${normalizedDigest},
           ${targetDefinition.hash}, ${targetDefinition.indexLayoutHash}, ${targetDefinition.schemaIdentity.version},
           ${targetDefinition.schemaIdentity.hash}, ${space.next_server_sequence - 1},
-          ${space.next_server_sequence - 1}, ${space.read_auth_epoch})
+          ${space.next_server_sequence - 1}, 0, ${space.read_auth_epoch})
         ON CONFLICT (space_id, client_id) DO UPDATE SET principal_digest = excluded.principal_digest,
           view_id = excluded.view_id, view_revision = excluded.view_revision,
           scope_generation = excluded.scope_generation, scope_json = excluded.scope_json,
@@ -601,6 +601,7 @@ export const make = (options: Options) => {
           index_layout_hash = excluded.index_layout_hash,
           schema_version = excluded.schema_version, schema_hash = excluded.schema_hash,
           server_sequence = excluded.server_sequence, delivered_sequence = excluded.delivered_sequence,
+          wake_ack_sequence = effect_local_server_replication_views.wake_ack_sequence,
           read_auth_epoch = excluded.read_auth_epoch`
       yield* replaceViewEntities(request, principalHash, cursor, visibleEntities)
       yield* sql`INSERT INTO effect_local_server_scoped_snapshots
@@ -1221,6 +1222,12 @@ export const make = (options: Options) => {
           onSome: Effect.succeed
         }))
       )
+      yield* sql`UPDATE effect_local_server_replication_views SET
+        wake_ack_sequence = MAX(wake_ack_sequence, ${currentView.delivered_sequence})
+        WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}`
+      yield* sql`DELETE FROM effect_local_server_offline_wakes
+        WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}
+          AND high_water_sequence <= ${currentView.delivered_sequence}`
       let changes: ReadonlyArray<Protocol.ViewChange> | undefined
       if (
         schemaIsCurrent && currentView.scope_digest === normalizedDigest &&

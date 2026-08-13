@@ -290,6 +290,7 @@ export const ReplicationViewRow = Schema.Struct({
   schema_hash: Identity.SchemaHash,
   server_sequence: Identity.ServerSequence,
   delivered_sequence: Identity.ServerSequence,
+  wake_ack_sequence: Identity.ServerSequence,
   read_auth_epoch: NonNegativeInt
 })
 
