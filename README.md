@@ -297,7 +297,7 @@ client pages older history in and evicts it again. Scroll-back and eviction are 
 same generation fencing, pages, and retractions as any other scope transition. The client needs no window logic: slid
 or evicted entities arrive as retractions. A windowed scope requires the caller to be on the current server schema;
 clients mid rolling upgrade keep full model scopes until they upgrade.
-One scope can contain at most 1,000 windows and 1,000 partition overrides in total.
+One scope can contain at most 1,000 windows, 1,000 partition overrides in total, and 4 MiB of encoded data.
 
 ```ts
 const scope = Protocol.ReplicationScope.make({

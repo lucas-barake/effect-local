@@ -304,6 +304,45 @@ describe("domain contracts", () => {
       if (invalid._tag === "Failure") assert.match(invalid.failure.message, /component schema/)
     }))
 
+  it.effect("rejects noncanonical replication window component encodings", () =>
+    Effect.gen(function*() {
+      const Indexed = Model.make("CanonicalIndexed", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ group: Schema.Number, rank: Schema.Number }),
+        indexes: {
+          byGroup: {
+            version: 1,
+            partition: [{
+              name: "group",
+              affinity: "text",
+              schema: Schema.NumberFromString,
+              extract: (value: { readonly group: number }) => value.group
+            }],
+            sort: [{
+              name: "rank",
+              affinity: "real",
+              schema: Schema.Number,
+              extract: (value: { readonly rank: number }) => value.rank
+            }]
+          }
+        }
+      })
+      const definition = Definition.make({ version: 1, models: [Indexed], mutations: [] })
+      const valid = yield* Protocol.validateReplicationScope(definition, {
+        models: [],
+        windows: [{ model: Indexed.name, index: "byGroup", count: 1, partitions: [{ key: ["1"] }] }]
+      })
+      assert.deepStrictEqual(valid.windows?.[0].partitions?.[0].key, ["1"])
+
+      const invalid = yield* Protocol.validateReplicationScope(definition, {
+        models: [],
+        windows: [{ model: Indexed.name, index: "byGroup", count: 1, partitions: [{ key: ["01"] }] }]
+      }).pipe(Effect.result)
+      assert.strictEqual(invalid._tag, "Failure")
+      if (invalid._tag === "Failure") assert.match(invalid.failure.message, /canonical encoding/)
+    }))
+
   it("bounds replication windows and partition overrides", () => {
     const windows = Array.from({ length: 1_001 }, (_, index) => ({
       model: `Model${index}`,
@@ -328,6 +367,44 @@ describe("domain contracts", () => {
       /length/i
     )
   })
+
+  it.effect("rejects replication scopes larger than the encoded byte limit", () =>
+    Effect.gen(function*() {
+      const Indexed = Model.make("BoundedScope", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ group: Schema.String, rank: Schema.Number }),
+        indexes: {
+          byGroup: {
+            version: 1,
+            partition: [{
+              name: "group",
+              affinity: "text",
+              schema: Schema.String,
+              extract: (value: { readonly group: string }) => value.group
+            }],
+            sort: [{
+              name: "rank",
+              affinity: "real",
+              schema: Schema.Number,
+              extract: (value: { readonly rank: number }) => value.rank
+            }]
+          }
+        }
+      })
+      const definition = Definition.make({ version: 1, models: [Indexed], mutations: [] })
+      const result = yield* Protocol.validateReplicationScope(definition, {
+        models: [],
+        windows: [{
+          model: Indexed.name,
+          index: "byGroup",
+          count: 1,
+          partitions: [{ key: ["x".repeat(Protocol.maximumReplicationScopeBytes)] }]
+        }]
+      }).pipe(Effect.result)
+      assert.strictEqual(result._tag, "Failure")
+      if (result._tag === "Failure") assert.match(result.failure.message, /encoded bytes/)
+    }))
 
   it("round trips scoped replication protocol values", () => {
     const spaceId = "spc_00000000-0000-4000-8000-000000000001"

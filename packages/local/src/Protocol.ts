@@ -11,6 +11,7 @@ export const maximumBatchEntries = 1_000
 export const maximumBatchBytes = 4 * 1024 * 1024
 export const maximumReceiptBytes = 4 * 1024 * 1024
 export const maximumPresenceBytes = 16 * 1024
+export const maximumReplicationScopeBytes = maximumBatchBytes
 export const maximumReplicationWindows = 1_000
 export const maximumReplicationWindowPartitions = 1_000
 export const maximumPresenceTtlMillis = 60_000
@@ -198,6 +199,16 @@ export const validateReplicationScope = (
   scope: ReplicationScope
 ): Effect.Effect<ReplicationScope, ReplicaError.ProtocolInvalid> =>
   Effect.gen(function*() {
+    const scopeBytes = yield* encodedBytesEffect(scope).pipe(
+      Effect.mapError((cause) =>
+        new ReplicaError.ProtocolInvalid({ message: "Replication scope cannot be canonically encoded", cause })
+      )
+    )
+    if (scopeBytes > maximumReplicationScopeBytes) {
+      return yield* new ReplicaError.ProtocolInvalid({
+        message: `Replication scope exceeds ${maximumReplicationScopeBytes} encoded bytes`
+      })
+    }
     const normalized = normalizeReplicationScope(scope)
     for (const model of normalized.models) {
       if (!definition.modelByName.has(model)) {
@@ -254,7 +265,7 @@ export const validateReplicationScope = (
               message: `Replication window partition key for ${label} does not match the index component types`
             })
           }
-          yield* Schema.decodeUnknownEffect(descriptor.schema)(input).pipe(
+          const decoded = yield* Schema.decodeUnknownEffect(descriptor.schema)(input).pipe(
             Effect.mapError((cause) =>
               new ReplicaError.ProtocolInvalid({
                 message: `Replication window partition key for ${label} does not match the component schema`,
@@ -262,6 +273,19 @@ export const validateReplicationScope = (
               })
             )
           )
+          const encoded = yield* Schema.encodeEffect(descriptor.schema)(decoded).pipe(
+            Effect.mapError((cause) =>
+              new ReplicaError.ProtocolInvalid({
+                message: `Replication window partition key for ${label} cannot be canonically encoded`,
+                cause
+              })
+            )
+          )
+          if (!Object.is(encoded, input)) {
+            return yield* new ReplicaError.ProtocolInvalid({
+              message: `Replication window partition key for ${label} is not the canonical encoding`
+            })
+          }
         }
         const partitionIdentity = Canonical.stringify(partition.key.map(canonicalPartitionValue))
         if (seenPartitions.has(partitionIdentity)) {
@@ -286,7 +310,7 @@ export const validateReplicationScope = (
                 message: `Replication window bounds for ${label} do not match the leading sort component type`
               })
             }
-            yield* Schema.decodeUnknownEffect(leading.schema)(bound).pipe(
+            const decoded = yield* Schema.decodeUnknownEffect(leading.schema)(bound).pipe(
               Effect.mapError((cause) =>
                 new ReplicaError.ProtocolInvalid({
                   message: `Replication window bounds for ${label} do not match the component schema`,
@@ -294,6 +318,19 @@ export const validateReplicationScope = (
                 })
               )
             )
+            const encoded = yield* Schema.encodeEffect(leading.schema)(decoded).pipe(
+              Effect.mapError((cause) =>
+                new ReplicaError.ProtocolInvalid({
+                  message: `Replication window bound for ${label} cannot be canonically encoded`,
+                  cause
+                })
+              )
+            )
+            if (!Object.is(encoded, bound)) {
+              return yield* new ReplicaError.ProtocolInvalid({
+                message: `Replication window bound for ${label} is not the canonical encoding`
+              })
+            }
           }
         }
       }
