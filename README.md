@@ -326,9 +326,11 @@ verifies the complete digest before promotion, and GET supports one byte range. 
 server, TLS, Origin policy, bearer verification, and reverse proxy.
 
 Server objects are isolated by space. Upload and read authorization receive the principal, space, client membership,
-and reference. A read also requires a current referencing entity accepted by normal entity read authorization. Per
-object and per space limits bound storage. The last authoritative reference schedules grace period collection through
-an immutable object key. Recipient retractions and history pruning do not define server liveness.
+and reference. A verified upload records possession for that membership. Knowing a digest or probing a complete object
+does not authorize a new entity reference. A read also requires a current referencing entity accepted by normal entity
+read authorization. Per object and per space limits bound storage. The last authoritative reference schedules grace
+period collection through an immutable object key. Recipient retractions and history pruning do not define server
+liveness.
 
 Attachment bytes never enter mutation envelopes, accepted history, entity JSON, bootstrap pages, or snapshots. Only
 the compact reference crosses the JSON control plane. Transfer outages and upload leases are retryable. Invalid
