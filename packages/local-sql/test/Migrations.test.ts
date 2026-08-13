@@ -1,6 +1,7 @@
 import { NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
@@ -24,6 +25,9 @@ const provideDatabase = Effect.provide(layerDatabase)
 const provideNodeFileSystemAndReactivity = Effect.provide([NodeFileSystem.layer, Reactivity.layer])
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const attachmentDigest = Attachment.Digest.make(
+  "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+)
 const expectedFailure = <A, E extends { readonly _tag: string },>(exit: Exit.Exit<A, E>) => {
   assert.isTrue(Exit.isFailure(exit))
   if (Exit.isFailure(exit)) return Cause.findErrorOption(exit.cause)
@@ -167,11 +171,11 @@ describe("storage migration catalogs", () => {
 
       pipe(
         (yield* clientLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
+        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
       )
       pipe(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
       )
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
@@ -192,6 +196,9 @@ describe("storage migration catalogs", () => {
         "effect_local_client_visible_entities_data",
         "effect_local_client_index_catalog",
         "effect_local_client_index_state",
+        "effect_local_client_attachments",
+        "effect_local_client_attachment_owners",
+        "effect_local_client_attachment_deletions",
         "effect_local_server_evolution",
         "effect_local_server_key_lineage",
         "effect_local_server_key_lineage_groups",
@@ -209,7 +216,11 @@ describe("storage migration catalogs", () => {
         "effect_local_server_scoped_snapshots",
         "effect_local_server_scoped_snapshot_entries",
         "effect_local_server_snapshot_projections",
-        "effect_local_server_snapshot_projection_entities"
+        "effect_local_server_snapshot_projection_entities",
+        "effect_local_server_attachment_objects",
+        "effect_local_server_attachment_upload_grants",
+        "effect_local_server_attachment_references",
+        "effect_local_server_attachment_deletions"
       ])
       assert.notInclude(names, "effect_local_bootstrap")
       assert.notInclude(names, "effect_local_bootstrap_entities")
@@ -223,6 +234,75 @@ describe("storage migration catalogs", () => {
         Effect.exit
       )
       assert.isTrue(SqlError.isSqlError(expectedFailure(duplicatePresence).pipe(Option.getOrThrow)))
+    }, provideDatabase)
+  )
+
+  it.effect(
+    "enforces pending ownership release and incarnation fenced server deletion",
+    Effect.fnUntraced(function*() {
+      const sql = yield* SqlClient.SqlClient
+      yield* Migrations.client({ definition: Domain.definition, spaceId, clientId })
+      yield* Migrations.server()
+
+      const objectKey = "00000000000000000000000000000001"
+      const mutationId = "mut_00000000-0000-4000-8000-000000000001"
+      const membershipIncarnation = "inc_00000000-0000-4000-8000-000000000001"
+      yield* sql`INSERT INTO effect_local_client_attachments
+        (space_id, digest, bytes, object_key, created_at, last_accessed_at)
+        VALUES (${spaceId}, ${attachmentDigest}, 5, ${objectKey}, 1, 1)`
+      yield* sql`INSERT INTO effect_local_client_attachment_owners
+        (space_id, digest, owner_kind, owner_id, created_at)
+        VALUES (${spaceId}, ${attachmentDigest}, 'Pending', ${mutationId}, 1)`
+      yield* sql`INSERT INTO effect_local_client_pending_data
+        (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, basis,
+          name, payload_json, digest, digest_version, source_schema_version, source_schema_hash,
+          mutation_version, optimistic_result_json, changes_json)
+        VALUES (${spaceId}, 0, ${membershipIncarnation}, ${mutationId}, 1, 0,
+          'PutTodo', '{}', ${"0".repeat(64)}, 3, ${Domain.definition.schemaIdentity.version},
+          ${Domain.definition.schemaIdentity.hash}, 1, 'null', '[]')`
+      yield* sql`DELETE FROM effect_local_client_pending_data WHERE mutation_id = ${mutationId}`
+      const owners = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_client_attachment_owners`
+      })(undefined)
+      assert.strictEqual(owners.count, 0)
+      const clientDeletions = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_client_attachment_deletions
+          WHERE object_key = ${objectKey}`
+      })(undefined)
+      assert.strictEqual(clientDeletions.count, 1)
+
+      yield* sql`INSERT INTO effect_local_server_spaces
+        (space_id, definition_hash, next_server_sequence, schema_version, schema_hash, schema_generation,
+          next_terminal_sequence, history_floor, receipt_floor, retained_history_count,
+          retained_receipt_count, entity_count, entity_bytes, snapshot_sequence,
+          snapshot_terminal_sequence, metadata_verified)
+        VALUES (${spaceId}, ${Domain.definition.hash}, 1, ${Domain.definition.schemaIdentity.version},
+          ${Domain.definition.schemaIdentity.hash}, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1)`
+      yield* sql`INSERT INTO effect_local_server_attachment_objects
+        (space_id, digest, bytes, object_key, state, storage_offset, created_at, last_accessed_at)
+        VALUES (${spaceId}, ${attachmentDigest}, 5, ${objectKey}, 'Complete', 5, 1, 1)`
+      yield* sql`INSERT INTO effect_local_server_attachment_references
+        (space_id, schema_generation, digest, model, model_version, entity_key)
+        VALUES (${spaceId}, 0, ${attachmentDigest}, 'Todo', 1, 'todo-1')`
+      const liveDelete = yield* sql`DELETE FROM effect_local_server_attachment_objects
+        WHERE space_id = ${spaceId} AND digest = ${attachmentDigest}`.pipe(Effect.exit)
+      assert.isTrue(SqlError.isSqlError(expectedFailure(liveDelete).pipe(Option.getOrThrow)))
+
+      yield* sql`DELETE FROM effect_local_server_attachment_references WHERE space_id = ${spaceId}`
+      yield* sql`DELETE FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
+      const deletions = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_server_attachment_deletions
+          WHERE object_key = ${objectKey}`
+      })(undefined)
+      assert.strictEqual(deletions.count, 1)
     }, provideDatabase)
   )
 
@@ -266,7 +346,7 @@ describe("storage migration catalogs", () => {
       })
       pipe(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13])
       )
     }, provideDatabase)
   )

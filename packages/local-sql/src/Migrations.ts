@@ -1323,6 +1323,71 @@ const clientV13 = makeMigration({
   ]
 })
 
+const clientV14 = makeMigration({
+  id: 14,
+  name: "attachment-ownership",
+  statements: [
+    `CREATE TABLE effect_local_client_attachments (
+      space_id TEXT NOT NULL,
+      digest TEXT NOT NULL CHECK (
+        length(digest) = 71 AND substr(digest, 1, 7) = 'sha256:' AND
+        substr(digest, 8) NOT GLOB '*[^0-9a-f]*'
+      ),
+      bytes INTEGER NOT NULL CHECK (bytes >= 0),
+      object_key TEXT NOT NULL UNIQUE CHECK (
+        length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
+      ),
+      remote_available INTEGER NOT NULL DEFAULT 0 CHECK (remote_available IN (0, 1)),
+      created_at INTEGER NOT NULL CHECK (created_at >= 0),
+      last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= created_at),
+      PRIMARY KEY (space_id, digest),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE effect_local_client_attachment_owners (
+      space_id TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      owner_kind TEXT NOT NULL CHECK (owner_kind IN ('Staged', 'Pending')),
+      owner_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL CHECK (created_at >= 0),
+      PRIMARY KEY (space_id, digest, owner_kind, owner_id),
+      FOREIGN KEY (space_id, digest)
+        REFERENCES effect_local_client_attachments(space_id, digest) ON DELETE CASCADE
+    )`,
+    `CREATE INDEX effect_local_client_attachment_owners_identity
+      ON effect_local_client_attachment_owners (space_id, owner_kind, owner_id, digest)`,
+    `CREATE INDEX effect_local_client_attachments_eviction
+      ON effect_local_client_attachments (space_id, remote_available, last_accessed_at, digest)`,
+    `CREATE TABLE effect_local_client_attachment_deletions (
+      object_key TEXT PRIMARY KEY CHECK (
+        length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
+      ),
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+      next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
+      created_at INTEGER NOT NULL CHECK (created_at >= 0)
+    )`,
+    `CREATE INDEX effect_local_client_attachment_deletions_due
+      ON effect_local_client_attachment_deletions (next_attempt_at, object_key)`,
+    `CREATE TRIGGER effect_local_client_pending_attachment_release
+      AFTER DELETE ON effect_local_client_pending_data BEGIN
+        DELETE FROM effect_local_client_attachment_owners
+          WHERE space_id = OLD.space_id AND owner_kind = 'Pending' AND owner_id = OLD.mutation_id;
+        INSERT OR IGNORE INTO effect_local_client_attachment_deletions
+          (object_key, next_attempt_at, created_at)
+          SELECT a.object_key, 0, 0 FROM effect_local_client_attachments AS a
+          WHERE a.space_id = OLD.space_id AND a.remote_available = 0 AND NOT EXISTS (
+            SELECT 1 FROM effect_local_client_attachment_owners AS o
+            WHERE o.space_id = a.space_id AND o.digest = a.digest
+          );
+        DELETE FROM effect_local_client_attachments
+          WHERE space_id = OLD.space_id AND remote_available = 0 AND NOT EXISTS (
+            SELECT 1 FROM effect_local_client_attachment_owners AS o
+            WHERE o.space_id = effect_local_client_attachments.space_id
+              AND o.digest = effect_local_client_attachments.digest
+          );
+      END`
+  ]
+})
+
 export const clientCatalog = Object.freeze([
   clientV1,
   clientV2,
@@ -1336,7 +1401,8 @@ export const clientCatalog = Object.freeze([
   clientV10,
   clientV11,
   clientV12,
-  clientV13
+  clientV13,
+  clientV14
 ])
 
 const serverV6 = makeMigration({
@@ -1754,6 +1820,90 @@ const serverV12 = makeMigration({
   ]
 })
 
+const serverV13 = makeMigration({
+  id: 13,
+  name: "attachment-lifecycle",
+  statements: [
+    `CREATE TABLE effect_local_server_attachment_objects (
+      space_id TEXT NOT NULL,
+      digest TEXT NOT NULL CHECK (
+        length(digest) = 71 AND substr(digest, 1, 7) = 'sha256:' AND
+        substr(digest, 8) NOT GLOB '*[^0-9a-f]*'
+      ),
+      bytes INTEGER NOT NULL CHECK (bytes >= 0),
+      object_key TEXT NOT NULL UNIQUE CHECK (
+        length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
+      ),
+      state TEXT NOT NULL CHECK (state IN ('Staging', 'Complete')),
+      storage_offset INTEGER NOT NULL DEFAULT 0 CHECK (storage_offset >= 0 AND storage_offset <= bytes),
+      lease_token TEXT,
+      lease_expires_at INTEGER,
+      garbage_collect_after INTEGER,
+      created_at INTEGER NOT NULL CHECK (created_at >= 0),
+      last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= created_at),
+      PRIMARY KEY (space_id, digest),
+      CHECK ((state = 'Complete' AND storage_offset = bytes) OR state = 'Staging'),
+      CHECK ((lease_token IS NULL AND lease_expires_at IS NULL) OR
+        (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_expires_at >= 0)),
+      CHECK (garbage_collect_after IS NULL OR garbage_collect_after >= 0)
+    )`,
+    `CREATE TABLE effect_local_server_attachment_upload_grants (
+      space_id TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      membership_incarnation TEXT NOT NULL,
+      expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+      PRIMARY KEY (space_id, digest, client_id, membership_incarnation),
+      FOREIGN KEY (space_id, digest)
+        REFERENCES effect_local_server_attachment_objects(space_id, digest) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE effect_local_server_attachment_references (
+      space_id TEXT NOT NULL,
+      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
+      digest TEXT NOT NULL,
+      model TEXT NOT NULL,
+      model_version INTEGER NOT NULL CHECK (model_version > 0),
+      entity_key TEXT NOT NULL,
+      PRIMARY KEY (space_id, schema_generation, model, entity_key, digest),
+      FOREIGN KEY (space_id, digest)
+        REFERENCES effect_local_server_attachment_objects(space_id, digest) ON DELETE RESTRICT
+    )`,
+    `CREATE TABLE effect_local_server_attachment_deletions (
+      object_key TEXT PRIMARY KEY CHECK (
+        length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
+      ),
+      space_id TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      bytes INTEGER NOT NULL CHECK (bytes >= 0),
+      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+      next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
+      claim_token TEXT,
+      claimed_until INTEGER,
+      created_at INTEGER NOT NULL CHECK (created_at >= 0),
+      CHECK ((claim_token IS NULL AND claimed_until IS NULL) OR
+        (claim_token IS NOT NULL AND claimed_until IS NOT NULL AND claimed_until >= 0))
+    )`,
+    `CREATE INDEX effect_local_server_attachment_objects_gc
+      ON effect_local_server_attachment_objects (garbage_collect_after, space_id, digest)
+      WHERE state = 'Complete' AND garbage_collect_after IS NOT NULL`,
+    `CREATE INDEX effect_local_server_attachment_upload_grants_expiry
+      ON effect_local_server_attachment_upload_grants (expires_at, space_id, digest)`,
+    `CREATE INDEX effect_local_server_attachment_references_digest
+      ON effect_local_server_attachment_references (space_id, schema_generation, digest, model, entity_key)`,
+    `CREATE INDEX effect_local_server_attachment_deletions_due
+      ON effect_local_server_attachment_deletions (next_attempt_at, object_key)`,
+    `CREATE TRIGGER effect_local_server_attachment_space_delete BEFORE DELETE
+      ON effect_local_server_spaces BEGIN
+        DELETE FROM effect_local_server_attachment_references WHERE space_id = OLD.space_id;
+        INSERT OR IGNORE INTO effect_local_server_attachment_deletions
+          (object_key, space_id, digest, bytes, next_attempt_at, created_at)
+          SELECT object_key, space_id, digest, bytes, 0, 0
+          FROM effect_local_server_attachment_objects WHERE space_id = OLD.space_id;
+        DELETE FROM effect_local_server_attachment_objects WHERE space_id = OLD.space_id;
+      END`
+  ]
+})
+
 export const serverCatalog = Object.freeze([
   serverV1,
   serverV2,
@@ -1766,7 +1916,8 @@ export const serverCatalog = Object.freeze([
   serverV9,
   serverV10,
   serverV11,
-  serverV12
+  serverV12,
+  serverV13
 ])
 
 export const client = Effect.fnUntraced(function*(options: {

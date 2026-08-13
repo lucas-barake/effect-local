@@ -1,9 +1,71 @@
+import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Schema from "effect/Schema"
+import * as AttachmentStorage from "../AttachmentStorage.js"
 
 const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
+
+export const ClientAttachmentRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  digest: Attachment.Digest,
+  bytes: Attachment.ByteLength,
+  object_key: AttachmentStorage.ObjectKey,
+  remote_available: Schema.Literals([0, 1]),
+  created_at: NonNegativeInt,
+  last_accessed_at: NonNegativeInt
+})
+
+export const ClientAttachmentOwnerRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  digest: Attachment.Digest,
+  owner_kind: Schema.Literals(["Staged", "Pending"]),
+  owner_id: Schema.String,
+  created_at: NonNegativeInt
+})
+
+export const ClientAttachmentDeletionRow = Schema.Struct({
+  object_key: AttachmentStorage.ObjectKey,
+  attempt_count: NonNegativeInt,
+  next_attempt_at: NonNegativeInt,
+  created_at: NonNegativeInt
+})
+
+export const ServerAttachmentObjectRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  digest: Attachment.Digest,
+  bytes: Attachment.ByteLength,
+  object_key: AttachmentStorage.ObjectKey,
+  state: Schema.Literals(["Staging", "Complete"]),
+  storage_offset: Attachment.ByteLength,
+  lease_token: Schema.NullOr(Schema.String),
+  lease_expires_at: Schema.NullOr(NonNegativeInt),
+  garbage_collect_after: Schema.NullOr(NonNegativeInt),
+  created_at: NonNegativeInt,
+  last_accessed_at: NonNegativeInt
+})
+
+export const ServerAttachmentReferenceRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  schema_generation: NonNegativeInt,
+  digest: Attachment.Digest,
+  model: Schema.String,
+  model_version: Identity.SchemaVersion,
+  entity_key: Schema.String
+})
+
+export const ServerAttachmentDeletionRow = Schema.Struct({
+  object_key: AttachmentStorage.ObjectKey,
+  space_id: Identity.SpaceId,
+  digest: Attachment.Digest,
+  bytes: Attachment.ByteLength,
+  attempt_count: NonNegativeInt,
+  next_attempt_at: NonNegativeInt,
+  claim_token: Schema.NullOr(Schema.String),
+  claimed_until: Schema.NullOr(NonNegativeInt),
+  created_at: NonNegativeInt
+})
 
 export const ClientMetaRow = Schema.Struct({
   space_id: Identity.SpaceId,
