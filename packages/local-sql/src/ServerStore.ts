@@ -868,6 +868,12 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           evolution,
           spaceId
         }
+        if (Option.isSome(attachments)) {
+          evolutionOptions = {
+            ...evolutionOptions,
+            replaceAttachmentReferences: attachments.value.replaceEntityReferences
+          }
+        }
         if (options.schemaEvolutionBatchSize !== undefined) {
           evolutionOptions = { ...evolutionOptions, batchSize: options.schemaEvolutionBatchSize }
         }

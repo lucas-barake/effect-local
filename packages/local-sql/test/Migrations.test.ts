@@ -260,13 +260,30 @@ describe("storage migration catalogs", () => {
         VALUES (${spaceId}, 0, ${membershipIncarnation}, ${mutationId}, 1, 0,
           'PutTodo', '{}', ${"0".repeat(64)}, 3, ${Domain.definition.schemaIdentity.version},
           ${Domain.definition.schemaIdentity.hash}, 1, 'null', '[]')`
-      yield* sql`DELETE FROM effect_local_client_pending_data WHERE mutation_id = ${mutationId}`
+      yield* sql`INSERT INTO effect_local_client_pending_data
+        (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, basis,
+          name, payload_json, digest, digest_version, source_schema_version, source_schema_hash,
+          mutation_version, optimistic_result_json, changes_json)
+        SELECT space_id, 1, membership_incarnation, mutation_id, local_sequence, basis, name, payload_json,
+          digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
+          optimistic_result_json, changes_json
+        FROM effect_local_client_pending_data WHERE schema_generation = 0`
+      yield* sql`DELETE FROM effect_local_client_pending_data
+        WHERE mutation_id = ${mutationId} AND schema_generation = 0`
       const owners = yield* SqlSchema.findOne({
         Request: Schema.Void,
         Result: CountRow,
         execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_client_attachment_owners`
       })(undefined)
-      assert.strictEqual(owners.count, 0)
+      assert.strictEqual(owners.count, 1)
+      yield* sql`DELETE FROM effect_local_client_pending_data
+        WHERE mutation_id = ${mutationId} AND schema_generation = 1`
+      const releasedOwners = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_client_attachment_owners`
+      })(undefined)
+      assert.strictEqual(releasedOwners.count, 0)
       const clientDeletions = yield* SqlSchema.findOne({
         Request: Schema.Void,
         Result: CountRow,

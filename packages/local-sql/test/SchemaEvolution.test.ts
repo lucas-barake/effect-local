@@ -26,6 +26,7 @@ import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as AttachmentServer from "../src/AttachmentServer.js"
 import * as Codec from "../src/internal/codec.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
@@ -422,7 +423,8 @@ const buildServer = <D extends Definition.Any,>(
   definition: D,
   handlers: Layer.Layer<MutationRuntime.Handlers<D>>,
   configuredEvolution?: Evolution.Evolution,
-  serverOptions?: Partial<Pick<ServerStore.Options, "acceptedSchemaVersions" | "retainedHistoryEntries">>
+  serverOptions?: Partial<Pick<ServerStore.Options, "acceptedSchemaVersions" | "retainedHistoryEntries">>,
+  attachmentService?: AttachmentServer.Service
 ) => {
   const layerRuntime = MutationRuntime.layer(definition, configuredEvolution).pipe(Layer.provide(handlers))
   let options: ServerStore.TrustedOptions = {
@@ -434,11 +436,15 @@ const buildServer = <D extends Definition.Any,>(
   if (serverOptions !== undefined) {
     options = { ...options, ...serverOptions }
   }
-  return ServerStore.layerTrusted(options).pipe(
-    Layer.provide(layerRuntime),
-    Layer.build,
-    Effect.map(Context.get(ServerStore.ServerStore))
+  let layerServer = ServerStore.layerTrusted(options).pipe(
+    Layer.provide(layerRuntime)
   )
+  if (attachmentService !== undefined) {
+    layerServer = layerServer.pipe(
+      Layer.provide(Layer.succeed(AttachmentServer.AttachmentServer, attachmentService))
+    )
+  }
+  return layerServer.pipe(Layer.build, Effect.map(Context.get(ServerStore.ServerStore)))
 }
 
 const buildReplica = <D extends Definition.Any,>(
@@ -1406,6 +1412,46 @@ describe("client schema evolution", () => {
         })(undefined)
         const historical = yield* Codec.decode(Protocol.AcceptedMutation, yield* Codec.parse(logRows[0].entry_json))
         assert.deepStrictEqual(historical.sourceSchema, definitionV1.schemaIdentity)
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect(
+    "builds target attachment references before the server generation flip",
+    Effect.fnUntraced(
+      function*() {
+        const localV1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1)
+        const pending = yield* localV1.mutate(PutTodoV1, { id: "8", title: "attachment-generation" })
+        assert.strictEqual((yield* serverV1.submit(pending.envelope))._tag, "Accepted")
+        const references = yield* Ref.make<
+          ReadonlyArray<
+            Parameters<AttachmentServer.Service["replaceEntityReferences"]>[0]
+          >
+        >([])
+        const attachments = AttachmentServer.AttachmentServer.of({
+          prepareUpload: () => Effect.die("unexpected upload preparation"),
+          appendUpload: () => Effect.die("unexpected upload append"),
+          replaceEntityReferences: (input) => Ref.update(references, (current) => [...current, input]),
+          read: () => Stream.fromEffect(Effect.die("unexpected attachment read")),
+          maintain: () => Effect.die("unexpected attachment maintenance")
+        })
+
+        const serverV2 = yield* buildServer(definitionV2, layerHandlersV2, evolution, undefined, attachments)
+        yield* serverV2.pull(pullRequest(definitionV2))
+
+        const rebuilt = yield* Ref.get(references)
+        assert.lengthOf(rebuilt, 1)
+        assert.strictEqual(rebuilt[0].schemaGeneration, 1)
+        assert.strictEqual(rebuilt[0].model, TodoV2.name)
+        assert.strictEqual(rebuilt[0].modelVersion, TodoV2.version)
+        assert.deepStrictEqual(rebuilt[0].value, {
+          id: 8,
+          title: "attachment-generation",
+          done: false
+        })
       },
       Effect.scoped,
       provideDatabase

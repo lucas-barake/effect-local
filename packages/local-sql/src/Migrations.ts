@@ -1370,7 +1370,11 @@ const clientV14 = makeMigration({
     `CREATE TRIGGER effect_local_client_pending_attachment_release
       AFTER DELETE ON effect_local_client_pending_data BEGIN
         DELETE FROM effect_local_client_attachment_owners
-          WHERE space_id = OLD.space_id AND owner_kind = 'Pending' AND owner_id = OLD.mutation_id;
+          WHERE space_id = OLD.space_id AND owner_kind = 'Pending' AND owner_id = OLD.mutation_id
+            AND NOT EXISTS (
+              SELECT 1 FROM effect_local_client_pending_data AS p
+              WHERE p.space_id = OLD.space_id AND p.mutation_id = OLD.mutation_id
+            );
         INSERT OR IGNORE INTO effect_local_client_attachment_deletions
           (object_key, next_attempt_at, created_at)
           SELECT a.object_key, 0, 0 FROM effect_local_client_attachments AS a
