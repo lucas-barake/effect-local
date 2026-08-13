@@ -96,25 +96,26 @@ export function make(name: string, options: {
     HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema>,
     EX,
     Exclude<R | RX, Scope.Scope>
-  > => {
-    const service = Effect.gen(function*() {
-      const context = (yield* Effect.context<R | Scope.Scope>()).pipe(Context.omit(Scope.Scope))
-      let implementation: Handler<
-        SchemaInput.WireSchema["Type"],
-        SchemaInput.WireSchema["Type"],
-        TaggedError,
-        R
-      >
-      if (Effect.isEffect(build)) implementation = yield* build
-      else implementation = build
-      return {
-        query,
-        execute: (input: Parameters<typeof implementation>[0]) =>
-          implementation(input).pipe(Effect.scoped, Effect.provide(context))
-      }
-    })
-    return Layer.effect(handler, service)
-  }
+  > =>
+    Layer.effect(
+      handler,
+      Effect.gen(function*() {
+        const context = (yield* Effect.context<R | Scope.Scope>()).pipe(Context.omit(Scope.Scope))
+        let implementation: Handler<
+          SchemaInput.WireSchema["Type"],
+          SchemaInput.WireSchema["Type"],
+          TaggedError,
+          R
+        >
+        if (Effect.isEffect(build)) implementation = yield* build
+        else implementation = build
+        return {
+          query,
+          execute: (input: Parameters<typeof implementation>[0]) =>
+            implementation(input).pipe(Effect.scoped, Effect.provide(context))
+        }
+      })
+    )
   const query: Query<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema> = {
     name,
     payloadSchema,

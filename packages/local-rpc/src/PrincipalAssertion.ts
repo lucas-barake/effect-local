@@ -1,7 +1,6 @@
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import type * as Effect from "effect/Effect"
-import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 
@@ -32,8 +31,8 @@ export class Verifier extends Context.Service<Verifier, VerifierService>()(
 
 export const layerIssuer = (
   issue: IssuerService["issue"]
-): Layer.Layer<Issuer> => pipe(Issuer.of({ issue }), Layer.succeed(Issuer))
+): Layer.Layer<Issuer> => Layer.succeed(Issuer, Issuer.of({ issue }))
 
 export const layerVerifier = (
   verify: VerifierService["verify"]
-): Layer.Layer<Verifier> => pipe(Verifier.of({ verify }), Layer.succeed(Verifier))
+): Layer.Layer<Verifier> => Layer.succeed(Verifier, Verifier.of({ verify }))

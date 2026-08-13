@@ -31,20 +31,20 @@ const makeLimiter = (options?: Partial<WakeVisibility.Options<TestError>>) =>
   })
 
 describe("wake visibility coordinator", () => {
-  it.effect("runs one visibility lookup for concurrent callers with the same canonical key", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "runs one visibility lookup for concurrent callers with the same canonical key",
+    Effect.fnUntraced(function*() {
       const limiter = yield* makeLimiter()
       const coordinator = WakeVisibility.make<string, boolean, TestError>(limiter)
       const entered = yield* Deferred.make<void>()
       const release = yield* Deferred.make<void>()
       let lookups = 0
-      const lookup = () =>
-        Effect.gen(function*() {
-          lookups++
-          yield* Deferred.succeed(entered, undefined)
-          yield* Deferred.await(release)
-          return true
-        })
+      const lookup = Effect.fnUntraced(function*() {
+        lookups++
+        yield* Deferred.succeed(entered, undefined)
+        yield* Deferred.await(release)
+        return true
+      })
 
       const leader = yield* coordinator.evaluate("canonical-reader", lookup).pipe(
         Effect.forkChild({ startImmediately: true })
@@ -60,11 +60,13 @@ describe("wake visibility coordinator", () => {
       assert.strictEqual(lookups, 1)
       yield* Deferred.succeed(release, undefined)
       const results = yield* Effect.forEach([leader, ...followers], Fiber.join)
-      pipe(Array.from({ length: 16 }, () => true), (expected) => assert.deepStrictEqual(results, expected))
-    }).pipe(Effect.scoped))
+      assert.deepStrictEqual(results, Array.from({ length: 16 }, () => true))
+    }, Effect.scoped)
+  )
 
-  it.effect("isolates visibility by the complete canonical key", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "isolates visibility by the complete canonical key",
+    Effect.fnUntraced(function*() {
       const limiter = yield* makeLimiter()
       const coordinator = WakeVisibility.make<string, string, TestError>(limiter)
       let lookups = 0
@@ -98,28 +100,29 @@ describe("wake visibility coordinator", () => {
         ]
       )
       assert.strictEqual(lookups, 4)
-    }).pipe(Effect.scoped))
+    }, Effect.scoped)
+  )
 
-  it.effect("cancels owner work when its last evaluator detaches and allows a restart", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "cancels owner work when its last evaluator detaches and allows a restart",
+    Effect.fnUntraced(function*() {
       const limiter = yield* makeLimiter()
       const coordinator = WakeVisibility.make<string, boolean, TestError>(limiter)
       const entered = yield* Deferred.make<void>()
       const lookupInterrupted = yield* Deferred.make<void>()
       let lookups = 0
-      const lookup = () =>
-        Effect.gen(function*() {
-          lookups++
-          yield* Deferred.succeed(entered, undefined)
-          return yield* Effect.never
-        }).pipe(Effect.onInterrupt(() => Deferred.succeed(lookupInterrupted, undefined)))
+      const lookup = Effect.fnUntraced(function*() {
+        lookups++
+        yield* Deferred.succeed(entered, undefined)
+        return yield* Effect.never
+      }, Effect.onInterrupt(() => Deferred.succeed(lookupInterrupted, undefined)))
 
       const evaluator = yield* coordinator.evaluate("canonical-reader", lookup).pipe(
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(entered)
       yield* Fiber.interrupt(evaluator)
-      pipe(yield* Deferred.isDone(lookupInterrupted), (isDone) => assert.isTrue(isDone))
+      assert.isTrue(yield* Deferred.isDone(lookupInterrupted))
 
       assert.isTrue(
         yield* coordinator.evaluate("canonical-reader", () => {
@@ -128,10 +131,12 @@ describe("wake visibility coordinator", () => {
         })
       )
       assert.strictEqual(lookups, 2)
-    }).pipe(Effect.scoped))
+    }, Effect.scoped)
+  )
 
-  it.effect("shares typed failures and defects", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "shares typed failures and defects",
+    Effect.fnUntraced(function*() {
       const limiter = yield* makeLimiter()
       const coordinator = WakeVisibility.make<string, boolean, TestError>(limiter)
       let failedLookups = 0
@@ -152,8 +157,8 @@ describe("wake visibility coordinator", () => {
       }).pipe(Effect.exit)
       const secondDefect = yield* coordinator.evaluate("defect", () => Effect.die(defect)).pipe(Effect.exit)
       assert.strictEqual(defectLookups, 1)
-      pipe(firstDefect, Exit.isFailure, (isFailure) => assert.isTrue(isFailure))
-      pipe(secondDefect, Exit.isFailure, (isFailure) => assert.isTrue(isFailure))
+      assert.isTrue(Exit.isFailure(firstDefect))
+      assert.isTrue(Exit.isFailure(secondDefect))
       if (Exit.isFailure(firstDefect)) {
         pipe(
           firstDefect.cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect),
@@ -166,10 +171,12 @@ describe("wake visibility coordinator", () => {
           (defects) => assert.deepStrictEqual(defects, [defect])
         )
       }
-    }).pipe(Effect.scoped))
+    }, Effect.scoped)
+  )
 
-  it.effect("shares lookup interruption without stranding followers", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "shares lookup interruption without stranding followers",
+    Effect.fnUntraced(function*() {
       const limiter = yield* makeLimiter()
       const coordinator = WakeVisibility.make<string, boolean, TestError>(limiter)
       let lookups = 0
@@ -180,18 +187,20 @@ describe("wake visibility coordinator", () => {
       const leaderExit = yield* coordinator.evaluate("interrupted", lookup).pipe(Effect.exit)
       const followerExit = yield* coordinator.evaluate("interrupted", lookup).pipe(Effect.exit)
       assert.strictEqual(lookups, 1)
-      pipe(leaderExit, Exit.isFailure, (isFailure) => assert.isTrue(isFailure))
-      pipe(followerExit, Exit.isFailure, (isFailure) => assert.isTrue(isFailure))
+      assert.isTrue(Exit.isFailure(leaderExit))
+      assert.isTrue(Exit.isFailure(followerExit))
       if (Exit.isFailure(leaderExit)) {
-        pipe(leaderExit.cause, Cause.hasInterrupts, (hasInterrupts) => assert.isTrue(hasInterrupts))
+        assert.isTrue(Cause.hasInterrupts(leaderExit.cause))
       }
       if (Exit.isFailure(followerExit)) {
-        pipe(followerExit.cause, Cause.hasInterrupts, (hasInterrupts) => assert.isTrue(hasInterrupts))
+        assert.isTrue(Cause.hasInterrupts(followerExit.cause))
       }
-    }).pipe(Effect.scoped))
+    }, Effect.scoped)
+  )
 
-  it.effect("shares pending and execution bounds across wakes", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "shares pending and execution bounds across wakes",
+    Effect.fnUntraced(function*() {
       const limiter = yield* makeLimiter({
         maximumConcurrentLookups: 1,
         maximumPendingLookups: 2
@@ -219,21 +228,23 @@ describe("wake visibility coordinator", () => {
       yield* Effect.yieldNow
 
       assert.deepStrictEqual(yield* limiter.snapshot, { pending: 2, running: 1 })
-      pipe(yield* Deferred.isDone(secondEntered), (isDone) => assert.isFalse(isDone))
+      assert.isFalse(yield* Deferred.isDone(secondEntered))
       const overflowExit = yield* Fiber.await(overflow)
-      pipe(pendingCapacityError, Exit.fail, (expected) => assert.deepStrictEqual(overflowExit, expected))
+      assert.deepStrictEqual(overflowExit, Exit.fail(pendingCapacityError))
 
       yield* Deferred.succeed(releaseFirst, undefined)
-      pipe(yield* Fiber.join(first), (visible) => assert.isTrue(visible))
+      assert.isTrue(yield* Fiber.join(first))
       yield* Deferred.await(secondEntered)
       assert.deepStrictEqual(yield* limiter.snapshot, { pending: 1, running: 1 })
       yield* Deferred.succeed(releaseSecond, undefined)
-      pipe(yield* Fiber.join(second), (visible) => assert.isTrue(visible))
+      assert.isTrue(yield* Fiber.join(second))
       assert.deepStrictEqual(yield* limiter.snapshot, { pending: 0, running: 0 })
-    }).pipe(Effect.scoped))
+    }, Effect.scoped)
+  )
 
-  it.effect("times out executing and queued lookups from their admission time", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "times out executing and queued lookups from their admission time",
+    Effect.fnUntraced(function*() {
       const limiter = yield* makeLimiter({
         maximumConcurrentLookups: 1,
         maximumPendingLookups: 2
@@ -242,10 +253,12 @@ describe("wake visibility coordinator", () => {
       const secondWake = WakeVisibility.make<string, boolean, TestError>(limiter)
       const firstEntered = yield* Deferred.make<void>()
       let secondEntered = false
-      const first = yield* firstWake.evaluate("reader-a", () =>
-        Deferred.succeed(firstEntered, undefined).pipe(Effect.andThen(Effect.never))).pipe(
-          Effect.forkChild({ startImmediately: true })
-        )
+      const first = yield* firstWake.evaluate(
+        "reader-a",
+        () => Deferred.succeed(firstEntered, undefined).pipe(Effect.andThen(Effect.never))
+      ).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
       yield* Deferred.await(firstEntered)
       const second = yield* secondWake.evaluate("reader-b", () =>
         Effect.sync(() => {
@@ -255,11 +268,11 @@ describe("wake visibility coordinator", () => {
 
       yield* TestClock.adjust("1 second")
       const firstExit = yield* Fiber.await(first)
-      pipe(timeoutError, Exit.fail, (expected) =>
-        assert.deepStrictEqual(firstExit, expected))
+      assert.deepStrictEqual(firstExit, Exit.fail(timeoutError))
       const secondExit = yield* Fiber.await(second)
-      pipe(timeoutError, Exit.fail, (expected) => assert.deepStrictEqual(secondExit, expected))
+      assert.deepStrictEqual(secondExit, Exit.fail(timeoutError))
       assert.isFalse(secondEntered)
       assert.deepStrictEqual(yield* limiter.snapshot, { pending: 0, running: 0 })
-    }).pipe(Effect.scoped))
+    }, Effect.scoped)
+  )
 })

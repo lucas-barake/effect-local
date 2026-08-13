@@ -3,7 +3,6 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import type * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
-import { pipe } from "effect/Function"
 import * as MutableHashMap from "effect/MutableHashMap"
 import * as Option from "effect/Option"
 import type * as Scope from "effect/Scope"
@@ -51,22 +50,23 @@ type Registration<A, E extends TaggedError,> =
   | { readonly _tag: "Leader"; readonly entry: Entry<A, E> }
   | { readonly _tag: "Follower"; readonly entry: Entry<A, E> }
 
-export const makeLimiter = <E extends TaggedError,>(
+export const makeLimiter = Effect.fnUntraced(function*<E extends TaggedError,>(
   options: Options<E>
-): Effect.Effect<Limiter<E>, never, Scope.Scope> =>
-  Effect.gen(function*() {
-    const ownerScope = yield* Effect.scope
-    const clock = yield* Clock.Clock
-    const semaphore = yield* Semaphore.make(options.maximumConcurrentLookups)
-    let pending = 0
-    let running = 0
+): Effect.fn.Return<Limiter<E>, never, Scope.Scope> {
+  const ownerScope = yield* Effect.scope
+  const clock = yield* Clock.Clock
+  const semaphore = yield* Semaphore.make(options.maximumConcurrentLookups)
+  let pending = 0
+  let running = 0
 
-    const execute = <A,>(lookup: () => Effect.Effect<A, E>): Effect.Effect<A, E> =>
-      Effect.suspend(() => {
-        const expiresAtNanos = clock.monotonicTimeNanosUnsafe() + options.lookupTimeoutNanos
-        return Effect.suspend(() => {
+  const execute = <A,>(lookup: () => Effect.Effect<A, E>): Effect.Effect<A, E> =>
+    Effect.suspend(() => {
+      const expiresAtNanos = clock.monotonicTimeNanosUnsafe() + options.lookupTimeoutNanos
+      return Semaphore.withPermit(
+        semaphore,
+        Effect.suspend(() => {
           if (clock.monotonicTimeNanosUnsafe() >= expiresAtNanos) {
-            return pipe(options.onLookupTimeout(), Effect.fail)
+            return Effect.fail(options.onLookupTimeout())
           }
           return Effect.sync(() => {
             running++
@@ -76,31 +76,31 @@ export const makeLimiter = <E extends TaggedError,>(
               running--
             }))
           )
-        }).pipe(
-          Semaphore.withPermit(semaphore),
-          Effect.timeoutOption(options.lookupTimeoutNanos),
-          Effect.flatMap(Option.match({
-            onNone: () => Effect.fail(options.onLookupTimeout()),
-            onSome: Effect.succeed
-          }))
-        )
-      })
+        })
+      ).pipe(
+        Effect.timeoutOption(options.lookupTimeoutNanos),
+        Effect.flatMap(Option.match({
+          onNone: () => Effect.fail(options.onLookupTimeout()),
+          onSome: Effect.succeed
+        }))
+      )
+    })
 
-    return {
-      ownerScope,
-      tryReserveUnsafe: () => {
-        if (pending >= options.maximumPendingLookups) return false
-        pending++
-        return true
-      },
-      releaseUnsafe: () => {
-        pending--
-      },
-      execute,
-      pendingCapacityExceeded: options.onPendingCapacityExceeded,
-      snapshot: Effect.sync(() => ({ pending, running }))
-    }
-  })
+  return {
+    ownerScope,
+    tryReserveUnsafe: () => {
+      if (pending >= options.maximumPendingLookups) return false
+      pending++
+      return true
+    },
+    releaseUnsafe: () => {
+      pending--
+    },
+    execute,
+    pendingCapacityExceeded: options.onPendingCapacityExceeded,
+    snapshot: Effect.sync(() => ({ pending, running }))
+  }
+})
 
 export const make = <K, A, E extends TaggedError,>(limiter: Limiter<E>): Coordinator<K, A, E> => {
   const entries = MutableHashMap.empty<K, Entry<A, E>>()
@@ -133,11 +133,7 @@ export const make = <K, A, E extends TaggedError,>(limiter: Limiter<E>): Coordin
 
   const run = (entry: Entry<A, E>, lookup: () => Effect.Effect<A, E>): Effect.Effect<void> =>
     Effect.uninterruptibleMask((restore) =>
-      limiter.execute(lookup).pipe(
-        restore,
-        Effect.exit,
-        Effect.flatMap((exit) => complete(entry, exit))
-      )
+      restore(limiter.execute(lookup)).pipe(Effect.exit, Effect.flatMap((exit) => complete(entry, exit)))
     )
 
   const detach = (key: K, entry: Entry<A, E>): Effect.Effect<void> =>

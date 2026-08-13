@@ -17,43 +17,25 @@ export const maximumReplicationWindowPartitions = 1_000
 export const maximumPresenceTtlMillis = 60_000
 export const maximumBootstrapEntries = 1_000
 
-const greaterThanZero = Schema.isGreaterThan(0)
-const greaterThanOrEqualToZero = Schema.isGreaterThanOrEqualTo(0)
-const greaterThanOrEqualToNegativeOne = Schema.isGreaterThanOrEqualTo(-1)
-const minimumLengthOne = Schema.isMinLength(1)
-const maximumLength256 = Schema.isMaxLength(256)
-const unique = Schema.isUnique()
-const digestPattern = Schema.isPattern(/^[0-9a-f]{64}$/)
-const maximumBatchLength = Schema.isMaxLength(maximumBatchEntries)
-const maximumBootstrapLength = Schema.isMaxLength(maximumBootstrapEntries)
-const maximumReplicationWindowsLength = Schema.isMaxLength(maximumReplicationWindows)
-const maximumReplicationWindowPartitionsLength = Schema.isMaxLength(maximumReplicationWindowPartitions)
-const maximumBatchLimit = Schema.isLessThanOrEqualTo(maximumBatchEntries)
-const maximumBootstrapLimit = Schema.isLessThanOrEqualTo(maximumBootstrapEntries)
-const maximumPresenceTtl = Schema.isLessThanOrEqualTo(maximumPresenceTtlMillis)
-
-export const ProtocolVersion = Schema.Int.check(greaterThanZero)
+export const ProtocolVersion = Schema.Int.check(Schema.isGreaterThan(0))
 export type ProtocolVersion = typeof ProtocolVersion.Type
 export const currentProtocolVersion = ProtocolVersion.make(1)
 const withProtocolVersion = Schema.fieldsAssign({ protocolVersion: ProtocolVersion })
 export const NegotiateRequest = Schema.Struct({
-  supportedVersions: Schema.Array(ProtocolVersion).check(minimumLengthOne)
+  supportedVersions: Schema.Array(ProtocolVersion).check(Schema.isMinLength(1))
 })
 export type NegotiateRequest = typeof NegotiateRequest.Type
 export const NegotiatedProtocol = Schema.Struct({ version: ProtocolVersion })
 export type NegotiatedProtocol = typeof NegotiatedProtocol.Type
 
-export const encodedBytes = (value: unknown): number => {
-  const encoded = Canonical.stringify(value)
-  return new TextEncoder().encode(encoded).byteLength
-}
+export const encodedBytes = (value: unknown): number => new TextEncoder().encode(Canonical.stringify(value)).byteLength
 
 export const encodedBytesEffect = (
   value: unknown
 ): Effect.Effect<number, ReplicaError.CanonicalEncodeError> =>
   Canonical.stringifyEffect(value).pipe(Effect.map((encoded) => new TextEncoder().encode(encoded).byteLength))
 
-export const MutationDigest = Schema.String.check(digestPattern)
+export const MutationDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
 export type MutationDigest = typeof MutationDigest.Type
 
 export const MutationDigestVersion = Schema.Literal(3)
@@ -65,7 +47,7 @@ const MutationIdentity = {
   mutationId: Identity.MutationId,
   localSequence: Identity.LocalSequence,
   basis: Identity.ServerSequence,
-  name: Schema.NonEmptyString.check(maximumLength256),
+  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
   payload: Schema.Json
 }
 
@@ -111,13 +93,10 @@ export const mutationDigestInput = (envelope: MutationDigestIdentity): unknown =
   }
 }
 
-export const mutationDigest = (envelope: MutationDigestIdentity) => {
-  const input = mutationDigestInput(envelope)
-  return Canonical.digest(input)
-}
+export const mutationDigest = (envelope: MutationDigestIdentity) => Canonical.digest(mutationDigestInput(envelope))
 
 export const EntityKey = Schema.Struct({
-  model: Schema.NonEmptyString.check(maximumLength256),
+  model: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
   modelVersion: Identity.SchemaVersion,
   key: Schema.Json
 })
@@ -135,7 +114,7 @@ export const Retract = Schema.TaggedStruct("Retract", { entity: EntityKey })
 export const ViewChange = Schema.Union([Upsert, Delete, Retract])
 export type ViewChange = typeof ViewChange.Type
 
-const ReplicationModelName = Schema.NonEmptyString.check(maximumLength256)
+const ReplicationModelName = Schema.NonEmptyString.check(Schema.isMaxLength(256))
 
 const WindowComponentValue = Schema.Union([Schema.String, Schema.Number, Schema.Boolean])
 export type WindowComponentValue = typeof WindowComponentValue.Type
@@ -150,24 +129,26 @@ export type ReplicationWindowBounds = typeof ReplicationWindowBounds.Type
 
 export const ReplicationWindowPartition = Schema.Struct({
   key: Schema.Array(WindowComponentValue),
-  count: Schema.Int.check(greaterThanZero).pipe(Schema.optionalKey),
+  count: Schema.Int.check(Schema.isGreaterThan(0)).pipe(Schema.optionalKey),
   bounds: Schema.optionalKey(ReplicationWindowBounds)
 })
 export type ReplicationWindowPartition = typeof ReplicationWindowPartition.Type
 
 export const ReplicationWindow = Schema.Struct({
   model: ReplicationModelName,
-  index: Schema.NonEmptyString.check(maximumLength256),
-  count: Schema.Int.check(greaterThanZero),
-  partitions: Schema.Array(ReplicationWindowPartition).check(maximumReplicationWindowPartitionsLength).pipe(
-    Schema.optionalKey
-  )
+  index: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  count: Schema.Int.check(Schema.isGreaterThan(0)),
+  partitions: Schema.Array(ReplicationWindowPartition).check(
+    Schema.isMaxLength(maximumReplicationWindowPartitions)
+  ).pipe(Schema.optionalKey)
 })
 export type ReplicationWindow = typeof ReplicationWindow.Type
 
 export const ReplicationScope = Schema.Struct({
-  models: Schema.Array(ReplicationModelName).check(unique),
-  windows: Schema.Array(ReplicationWindow).check(maximumReplicationWindowsLength).pipe(Schema.optionalKey)
+  models: Schema.Array(ReplicationModelName).check(Schema.isUnique()),
+  windows: Schema.Array(ReplicationWindow).check(Schema.isMaxLength(maximumReplicationWindows)).pipe(
+    Schema.optionalKey
+  )
 })
 export type ReplicationScope = typeof ReplicationScope.Type
 
@@ -215,150 +196,148 @@ const canonicalPartitionValue = (value: WindowComponentValue): string | number =
   return value
 }
 
-export const validateReplicationScope = (
+export const validateReplicationScope = Effect.fnUntraced(function*(
   definition: Definition.Any,
   scope: ReplicationScope
-): Effect.Effect<ReplicationScope, ReplicaError.ProtocolInvalid> =>
-  Effect.gen(function*() {
-    const scopeBytes = yield* encodedBytesEffect(scope).pipe(
-      Effect.mapError((cause) =>
-        new ReplicaError.ProtocolInvalid({ message: "Replication scope cannot be canonically encoded", cause })
-      )
+): Effect.fn.Return<ReplicationScope, ReplicaError.ProtocolInvalid> {
+  const scopeBytes = yield* encodedBytesEffect(scope).pipe(
+    Effect.mapError((cause) =>
+      new ReplicaError.ProtocolInvalid({ message: "Replication scope cannot be canonically encoded", cause })
     )
-    if (scopeBytes > maximumReplicationScopeBytes) {
+  )
+  if (scopeBytes > maximumReplicationScopeBytes) {
+    return yield* new ReplicaError.ProtocolInvalid({
+      message: `Replication scope exceeds ${maximumReplicationScopeBytes} encoded bytes`
+    })
+  }
+  const normalized = normalizeReplicationScope(scope)
+  for (const model of normalized.models) {
+    if (!definition.modelByName.has(model)) {
+      return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${model}` })
+    }
+  }
+  if (normalized.windows === undefined) return normalized
+  const seen = new Set<string>()
+  let partitionCount = 0
+  for (const window of normalized.windows) {
+    const label = `${window.model}/${window.index}`
+    const identity = Canonical.stringify([window.model, window.index])
+    if (normalized.models.includes(window.model)) {
       return yield* new ReplicaError.ProtocolInvalid({
-        message: `Replication scope exceeds ${maximumReplicationScopeBytes} encoded bytes`
+        message: `Model ${window.model} cannot be both fully replicated and windowed`
       })
     }
-    const normalized = normalizeReplicationScope(scope)
-    for (const model of normalized.models) {
-      if (!definition.modelByName.has(model)) {
-        return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${model}` })
-      }
+    if (seen.has(identity)) {
+      return yield* new ReplicaError.ProtocolInvalid({ message: `Duplicate replication window: ${label}` })
     }
-    if (normalized.windows === undefined) return normalized
-    const seen = new Set<string>()
-    let partitionCount = 0
-    for (const window of normalized.windows) {
-      const label = `${window.model}/${window.index}`
-      const identity = Canonical.stringify([window.model, window.index])
-      if (normalized.models.includes(window.model)) {
+    seen.add(identity)
+    const model = definition.modelByName.get(window.model)
+    if (model === undefined) {
+      return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${window.model}` })
+    }
+    let index: SecondaryIndex.Any | undefined
+    if (Object.hasOwn(model.indexes, window.index)) index = model.indexes[window.index]
+    if (index === undefined) {
+      return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown replication window index: ${label}` })
+    }
+    if (index.sort.length === 0) {
+      return yield* new ReplicaError.ProtocolInvalid({
+        message: `Replication window index ${label} has no sort component`
+      })
+    }
+    partitionCount += window.partitions?.length ?? 0
+    if (partitionCount > maximumReplicationWindowPartitions) {
+      return yield* new ReplicaError.ProtocolInvalid({
+        message: `Replication scope exceeds ${maximumReplicationWindowPartitions} partition overrides`
+      })
+    }
+    const seenPartitions = new Set<string>()
+    for (const partition of window.partitions ?? []) {
+      if (partition.key.length !== index.partition.length) {
         return yield* new ReplicaError.ProtocolInvalid({
-          message: `Model ${window.model} cannot be both fully replicated and windowed`
+          message: `Replication window partition for ${label} expects ${index.partition.length} key components`
         })
       }
-      if (seen.has(identity)) {
-        return yield* new ReplicaError.ProtocolInvalid({ message: `Duplicate replication window: ${label}` })
-      }
-      seen.add(identity)
-      const model = definition.modelByName.get(window.model)
-      if (model === undefined) {
-        return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${window.model}` })
-      }
-      let index: SecondaryIndex.Any | undefined
-      if (Object.hasOwn(model.indexes, window.index)) index = model.indexes[window.index]
-      if (index === undefined) {
-        return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown replication window index: ${label}` })
-      }
-      if (index.sort.length === 0) {
-        return yield* new ReplicaError.ProtocolInvalid({
-          message: `Replication window index ${label} has no sort component`
-        })
-      }
-      partitionCount += window.partitions?.length ?? 0
-      if (partitionCount > maximumReplicationWindowPartitions) {
-        return yield* new ReplicaError.ProtocolInvalid({
-          message: `Replication scope exceeds ${maximumReplicationWindowPartitions} partition overrides`
-        })
-      }
-      const seenPartitions = new Set<string>()
-      for (const partition of window.partitions ?? []) {
-        if (partition.key.length !== index.partition.length) {
+      for (let component = 0; component < partition.key.length; component++) {
+        const input = partition.key[component]
+        const descriptor = index.partition[component]
+        if (!affinityMatches(descriptor.affinity, input)) {
           return yield* new ReplicaError.ProtocolInvalid({
-            message: `Replication window partition for ${label} expects ${index.partition.length} key components`
+            message: `Replication window partition key for ${label} does not match the index component types`
           })
         }
-        for (let component = 0; component < partition.key.length; component++) {
-          const input = partition.key[component]
-          const descriptor = index.partition[component]
-          if (!affinityMatches(descriptor.affinity, input)) {
+        const decoded = yield* Schema.decodeUnknownEffect(descriptor.schema)(input).pipe(
+          Effect.mapError((cause) =>
+            new ReplicaError.ProtocolInvalid({
+              message: `Replication window partition key for ${label} does not match the component schema`,
+              cause
+            })
+          )
+        )
+        const encoded = yield* Schema.encodeEffect(descriptor.schema)(decoded).pipe(
+          Effect.mapError((cause) =>
+            new ReplicaError.ProtocolInvalid({
+              message: `Replication window partition key for ${label} cannot be canonically encoded`,
+              cause
+            })
+          )
+        )
+        if (!Object.is(encoded, input)) {
+          return yield* new ReplicaError.ProtocolInvalid({
+            message: `Replication window partition key for ${label} is not the canonical encoding`
+          })
+        }
+      }
+      const partitionIdentity = Canonical.stringify(partition.key.map(canonicalPartitionValue))
+      if (seenPartitions.has(partitionIdentity)) {
+        return yield* new ReplicaError.ProtocolInvalid({
+          message: `Duplicate replication window partition for ${label}`
+        })
+      }
+      seenPartitions.add(partitionIdentity)
+      if (partition.bounds !== undefined) {
+        for (
+          const bound of [
+            partition.bounds.gt,
+            partition.bounds.gte,
+            partition.bounds.lt,
+            partition.bounds.lte
+          ]
+        ) {
+          if (bound === undefined) continue
+          const leading = index.sort[0]
+          if (!affinityMatches(leading.affinity, bound)) {
             return yield* new ReplicaError.ProtocolInvalid({
-              message: `Replication window partition key for ${label} does not match the index component types`
+              message: `Replication window bounds for ${label} do not match the leading sort component type`
             })
           }
-          const decoded = yield* Schema.decodeUnknownEffect(descriptor.schema)(input).pipe(
+          const decoded = yield* Schema.decodeUnknownEffect(leading.schema)(bound).pipe(
             Effect.mapError((cause) =>
               new ReplicaError.ProtocolInvalid({
-                message: `Replication window partition key for ${label} does not match the component schema`,
+                message: `Replication window bounds for ${label} do not match the component schema`,
                 cause
               })
             )
           )
-          const encoded = yield* Schema.encodeEffect(descriptor.schema)(decoded).pipe(
+          const encoded = yield* Schema.encodeEffect(leading.schema)(decoded).pipe(
             Effect.mapError((cause) =>
               new ReplicaError.ProtocolInvalid({
-                message: `Replication window partition key for ${label} cannot be canonically encoded`,
+                message: `Replication window bound for ${label} cannot be canonically encoded`,
                 cause
               })
             )
           )
-          if (!Object.is(encoded, input)) {
+          if (!Object.is(encoded, bound)) {
             return yield* new ReplicaError.ProtocolInvalid({
-              message: `Replication window partition key for ${label} is not the canonical encoding`
+              message: `Replication window bound for ${label} is not the canonical encoding`
             })
-          }
-        }
-        const partitionKey = partition.key.map(canonicalPartitionValue)
-        const partitionIdentity = Canonical.stringify(partitionKey)
-        if (seenPartitions.has(partitionIdentity)) {
-          return yield* new ReplicaError.ProtocolInvalid({
-            message: `Duplicate replication window partition for ${label}`
-          })
-        }
-        seenPartitions.add(partitionIdentity)
-        if (partition.bounds !== undefined) {
-          for (
-            const bound of [
-              partition.bounds.gt,
-              partition.bounds.gte,
-              partition.bounds.lt,
-              partition.bounds.lte
-            ]
-          ) {
-            if (bound === undefined) continue
-            const leading = index.sort[0]
-            if (!affinityMatches(leading.affinity, bound)) {
-              return yield* new ReplicaError.ProtocolInvalid({
-                message: `Replication window bounds for ${label} do not match the leading sort component type`
-              })
-            }
-            const decoded = yield* Schema.decodeUnknownEffect(leading.schema)(bound).pipe(
-              Effect.mapError((cause) =>
-                new ReplicaError.ProtocolInvalid({
-                  message: `Replication window bounds for ${label} do not match the component schema`,
-                  cause
-                })
-              )
-            )
-            const encoded = yield* Schema.encodeEffect(leading.schema)(decoded).pipe(
-              Effect.mapError((cause) =>
-                new ReplicaError.ProtocolInvalid({
-                  message: `Replication window bound for ${label} cannot be canonically encoded`,
-                  cause
-                })
-              )
-            )
-            if (!Object.is(encoded, bound)) {
-              return yield* new ReplicaError.ProtocolInvalid({
-                message: `Replication window bound for ${label} is not the canonical encoding`
-              })
-            }
           }
         }
       }
     }
-    return normalized
-  })
+  }
+  return normalized
+})
 
 export const replicationScopeCoversModel = (scope: ReplicationScope, model: string): boolean =>
   scope.models.includes(model) ||
@@ -380,7 +359,7 @@ const ReceiptIdentity = {
 
 export const AcceptedReceipt = Schema.TaggedStruct("Accepted", {
   ...ReceiptIdentity,
-  name: Schema.NonEmptyString.check(maximumLength256),
+  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
   serverSequence: Identity.ServerSequence,
@@ -394,7 +373,7 @@ export type RejectionOrigin = typeof RejectionOrigin.Type
 
 export const RejectedReceipt = Schema.TaggedStruct("Rejected", {
   ...ReceiptIdentity,
-  name: Schema.NonEmptyString.check(maximumLength256),
+  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
   origin: RejectionOrigin,
@@ -414,7 +393,7 @@ export type LegacyReceipt = typeof LegacyReceipt.Type
 
 export const ExpiredReceipt = Schema.TaggedStruct("Expired", {
   ...ReceiptIdentity,
-  name: Schema.NonEmptyString.check(maximumLength256),
+  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
   snapshotId: Identity.SnapshotId,
@@ -450,7 +429,7 @@ const ReplicationRequestContext = {
 export const PullRequest = Schema.Struct({
   ...ReplicationRequestContext,
   cursor: Schema.NullOr(ReplicationCursor),
-  limit: Schema.Int.check(greaterThanZero, maximumBatchLimit)
+  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBatchEntries))
 })
 export type PullRequest = typeof PullRequest.Type
 export const VersionedPullRequest = PullRequest.pipe(withProtocolVersion)
@@ -466,8 +445,8 @@ export const PullPage = Schema.Struct({
   scopeGeneration: Identity.ReplicationScopeGeneration,
   cursor: ReplicationCursor,
   serverSequence: Identity.ServerSequence,
-  changes: Schema.Array(ViewChange).check(maximumBatchLength),
-  contentBytes: Schema.Int.check(greaterThanOrEqualToZero),
+  changes: Schema.Array(ViewChange).check(Schema.isMaxLength(maximumBatchEntries)),
+  contentBytes: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   digest: MutationDigest,
   hasMore: Schema.Boolean,
   serverSchema: Identity.SchemaIdentity
@@ -477,10 +456,9 @@ export type PullPage = typeof PullPage.Type
 export const viewChangesDigest = (changes: ReadonlyArray<ViewChange>) =>
   Canonical.digest({ format: 1, changes }).pipe(Effect.map((value) => MutationDigest.make(value)))
 
-export const SnapshotDigest = Schema.String.check(digestPattern)
+export const SnapshotDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
 export type SnapshotDigest = typeof SnapshotDigest.Type
-const initialSnapshotDigestValue = "0".repeat(64)
-export const initialSnapshotDigest = SnapshotDigest.make(initialSnapshotDigestValue)
+export const initialSnapshotDigest = SnapshotDigest.make("0".repeat(64))
 
 export const SnapshotManifest = Schema.Struct({
   spaceId: Identity.SpaceId,
@@ -493,16 +471,16 @@ export const SnapshotManifest = Schema.Struct({
   snapshotId: Identity.SnapshotId,
   sequence: Identity.ServerSequence,
   terminalSequenceThrough: Identity.TerminalSequence,
-  entityCount: Schema.Int.check(greaterThanOrEqualToZero),
-  contentBytes: Schema.Int.check(greaterThanOrEqualToZero),
+  entityCount: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  contentBytes: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   digest: SnapshotDigest
 })
 export type SnapshotManifest = typeof SnapshotManifest.Type
 
 export const SnapshotEntry = Schema.Struct({
-  ordinal: Schema.Int.check(greaterThanOrEqualToZero),
+  ordinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   change: ViewChange,
-  entryBytes: Schema.Int.check(greaterThanZero)
+  entryBytes: Schema.Int.check(Schema.isGreaterThan(0))
 })
 export type SnapshotEntry = typeof SnapshotEntry.Type
 
@@ -510,12 +488,12 @@ export const snapshotEntryDigest = (previous: SnapshotDigest, entry: SnapshotEnt
   Canonical.digest({ previous, entry }).pipe(Effect.map((value) => SnapshotDigest.make(value)))
 
 export const SnapshotEntity = Schema.Struct({
-  ordinal: Schema.Int.check(greaterThanOrEqualToZero),
-  model: Schema.NonEmptyString.check(maximumLength256),
+  ordinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  model: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
   modelVersion: Identity.SchemaVersion,
   key: Schema.Json,
   value: Schema.Json,
-  entityBytes: Schema.Int.check(greaterThanZero)
+  entityBytes: Schema.Int.check(Schema.isGreaterThan(0))
 })
 export type SnapshotEntity = typeof SnapshotEntity.Type
 
@@ -532,15 +510,15 @@ export const BootstrapRequest = Schema.Struct({
   ...ReplicationRequestContext,
   cursor: ReplicationCursor,
   snapshotId: Identity.SnapshotId,
-  afterOrdinal: Schema.Int.check(greaterThanOrEqualToNegativeOne),
-  limit: Schema.Int.check(greaterThanZero, maximumBootstrapLimit)
+  afterOrdinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1)),
+  limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBootstrapEntries))
 })
 export type BootstrapRequest = typeof BootstrapRequest.Type
 export const VersionedBootstrapRequest = BootstrapRequest.pipe(withProtocolVersion)
 
 export const BootstrapPage = Schema.Struct({
   manifest: SnapshotManifest,
-  entries: Schema.Array(SnapshotEntry).check(maximumBootstrapLength),
+  entries: Schema.Array(SnapshotEntry).check(Schema.isMaxLength(maximumBootstrapEntries)),
   hasMore: Schema.Boolean,
   serverSchema: Identity.SchemaIdentity
 })
@@ -555,7 +533,10 @@ export const PresenceUpdate = Schema.Struct({
   spaceId: Identity.SpaceId,
   clientId: Identity.ClientId,
   value: Schema.Json,
-  ttlMillis: Schema.Int.check(greaterThanZero, maximumPresenceTtl)
+  ttlMillis: Schema.Int.check(
+    Schema.isGreaterThan(0),
+    Schema.isLessThanOrEqualTo(maximumPresenceTtlMillis)
+  )
 })
 export type PresenceUpdate = typeof PresenceUpdate.Type
 export const VersionedPresenceUpdate = PresenceUpdate.pipe(withProtocolVersion)
@@ -576,6 +557,6 @@ export const PendingMutation = Schema.Struct({
   optimisticResult: Schema.Json,
   changes: Schema.Array(EntityChange),
   submissionState: SubmissionState,
-  attempts: Schema.Int.check(greaterThanOrEqualToZero)
+  attempts: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 })
 export type PendingMutation = typeof PendingMutation.Type

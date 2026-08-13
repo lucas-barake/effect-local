@@ -9,7 +9,6 @@ import * as Model from "../src/Model.js"
 import * as Mutation from "../src/Mutation.js"
 import * as Protocol from "../src/Protocol.js"
 import * as Query from "../src/Query.js"
-import * as ReplicaError from "../src/ReplicaError.js"
 
 const Todo = Model.make("Todo", {
   version: 1,
@@ -20,8 +19,9 @@ const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, suc
 const ListTodos = Query.make("ListTodos", { success: Schema.Array(Todo.schema) })
 
 describe("domain contracts", () => {
-  it.effect("uses JSON null as the wire representation for void payloads and results", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "uses JSON null as the wire representation for void payloads and results",
+    Effect.fnUntraced(function*() {
       const mutation = Mutation.make("Touch", { version: 1 })
       const query = Query.make("Count", {})
       const encodedPayload = yield* Schema.encodeEffect(mutation.payloadSchema)(undefined)
@@ -30,14 +30,14 @@ describe("domain contracts", () => {
       assert.strictEqual(encodedPayload, null)
       assert.strictEqual(decodedSuccess, undefined)
       assert.strictEqual(encodedQuery, null)
-    }))
+    })
+  )
 
   it("builds a stable definition hash from Schema contracts", () => {
     const first = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
     const second = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
     assert.strictEqual(first.hash, second.hash)
-    const storedTodo = first.modelByName.get("Todo")
-    assert.strictEqual(storedTodo, Todo)
+    assert.strictEqual(first.modelByName.get("Todo"), Todo)
   })
 
   it("keeps local secondary index layouts outside wire and domain identity", () => {
@@ -63,10 +63,8 @@ describe("domain contracts", () => {
     assert.deepStrictEqual(indexed.schemaIdentity, plain.schemaIdentity)
     assert.strictEqual(indexed.hash, plain.hash)
     assert.notStrictEqual(indexed.indexLayoutHash, plain.indexLayoutHash)
-    const indexesFrozen = Object.isFrozen(IndexedTodo.indexes)
-    const sortFrozen = Object.isFrozen(IndexedTodo.indexes.byTitle.sort)
-    assert.isTrue(indexesFrozen)
-    assert.isTrue(sortFrozen)
+    assert.isTrue(Object.isFrozen(IndexedTodo.indexes))
+    assert.isTrue(Object.isFrozen(IndexedTodo.indexes.byTitle.sort))
   })
 
   it("validates secondary index and component names", () => {
@@ -135,25 +133,28 @@ describe("domain contracts", () => {
     assert.throws(() => Query.make("$Query", {}), /must not start/)
   })
 
-  it.effect("applies opt in field semantics without replication metadata", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "applies opt in field semantics without replication metadata",
+    Effect.fnUntraced(function*() {
       assert.strictEqual(yield* Field.counter.apply(10, { _tag: "Increment", delta: 3 }), 13)
-    }))
+    })
+  )
 
-  it.effect("deduplicates grow only set values by canonical identity", () =>
-    Effect.gen(function*() {
-      const semantics = Schema.Struct({ id: Schema.String, value: Schema.Number }).pipe(Field.growOnlySet)
+  it.effect(
+    "deduplicates grow only set values by canonical identity",
+    Effect.fnUntraced(function*() {
+      const semantics = Field.growOnlySet(Schema.Struct({ id: Schema.String, value: Schema.Number }))
       assert.deepStrictEqual(
         yield* semantics.apply([{ id: "a", value: 1 }], { _tag: "Add", value: { value: 1, id: "a" } }),
         [{ id: "a", value: 1 }]
       )
-    }))
+    })
+  )
 
-  it.effect("canonicalizes object order and enforces protocol page limits", () =>
-    Effect.gen(function*() {
-      const unordered = Canonical.stringify({ b: 2, a: 1 })
-      const ordered = Canonical.stringify({ a: 1, b: 2 })
-      assert.strictEqual(unordered, ordered)
+  it.effect(
+    "canonicalizes object order and enforces protocol page limits",
+    Effect.fnUntraced(function*() {
+      assert.strictEqual(Canonical.stringify({ b: 2, a: 1 }), Canonical.stringify({ a: 1, b: 2 }))
       const result = yield* Schema.decodeUnknownEffect(Protocol.PullRequest)({
         spaceId: "spc_00000000-0000-4000-8000-000000000001",
         clientId: "cli_00000000-0000-4000-8000-000000000001",
@@ -168,14 +169,15 @@ describe("domain contracts", () => {
         const message = String(result.failure)
         assert.match(message, /less than or equal to 1000/)
       }
-    }))
+    })
+  )
 
-  it.effect("decodes and normalizes a model replication scope", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "decodes and normalizes a model replication scope",
+    Effect.fnUntraced(function*() {
       const decoded = yield* Schema.decodeUnknownEffect(Protocol.ReplicationScope)({ models: ["Todo", "Other"] })
-      const normalized = Protocol.normalizeReplicationScope({ models: ["Todo", "Other"] })
       assert.deepStrictEqual(decoded, { models: ["Todo", "Other"] })
-      assert.deepStrictEqual(normalized, {
+      assert.deepStrictEqual(Protocol.normalizeReplicationScope({ models: ["Todo", "Other"] }), {
         models: ["Other", "Todo"]
       })
       const result = yield* Schema.decodeUnknownEffect(Protocol.ReplicationScope)({
@@ -186,10 +188,12 @@ describe("domain contracts", () => {
         const message = String(result.failure)
         assert.match(message, /unique/i)
       }
-    }))
+    })
+  )
 
-  it.effect("validates replication scope model names against the definition", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "validates replication scope model names against the definition",
+    Effect.fnUntraced(function*() {
       const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo] })
       assert.deepStrictEqual(
         yield* Protocol.validateReplicationScope(definition, { models: ["Todo"] }),
@@ -198,13 +202,15 @@ describe("domain contracts", () => {
       const result = yield* Protocol.validateReplicationScope(definition, { models: ["Missing"] }).pipe(Effect.result)
       assert.strictEqual(result._tag, "Failure")
       if (Result.isFailure(result)) {
-        assert.instanceOf(result.failure, ReplicaError.ProtocolInvalid)
+        assert.strictEqual(result.failure._tag, "ProtocolInvalid")
         assert.match(result.failure.message, /Unknown replication model: Missing/)
       }
-    }))
+    })
+  )
 
-  it.effect("rejects duplicate replication window partition keys", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "rejects duplicate replication window partition keys",
+    Effect.fnUntraced(function*() {
       const IndexedTodo = Model.make("IndexedTodo", {
         version: 1,
         key: Schema.String,
@@ -239,10 +245,12 @@ describe("domain contracts", () => {
       }).pipe(Effect.result)
       assert.strictEqual(result._tag, "Failure")
       if (result._tag === "Failure") assert.match(result.failure.message, /Duplicate replication window partition/)
-    }))
+    })
+  )
 
-  it.effect("keeps model and index names distinct without delimiter collisions", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "keeps model and index names distinct without delimiter collisions",
+    Effect.fnUntraced(function*() {
       const component = {
         version: 1,
         partition: [],
@@ -274,12 +282,13 @@ describe("domain contracts", () => {
         ]
       })
       assert.strictEqual(scope.windows?.length, 2)
-    }))
+    })
+  )
 
-  it.effect("validates replication window values with the component codecs", () =>
-    Effect.gen(function*() {
-      const numericStringPattern = Schema.isPattern(/^\d+$/)
-      const NumericString = Schema.String.check(numericStringPattern).annotate({
+  it.effect(
+    "validates replication window values with the component codecs",
+    Effect.fnUntraced(function*() {
+      const NumericString = Schema.String.check(Schema.isPattern(/^\d+$/)).annotate({
         identifier: "NumericString"
       })
       const Indexed = Model.make("Indexed", {
@@ -322,10 +331,12 @@ describe("domain contracts", () => {
       }).pipe(Effect.result)
       assert.strictEqual(invalid._tag, "Failure")
       if (invalid._tag === "Failure") assert.match(invalid.failure.message, /component schema/)
-    }))
+    })
+  )
 
-  it.effect("rejects noncanonical replication window component encodings", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "rejects noncanonical replication window component encodings",
+    Effect.fnUntraced(function*() {
       const Indexed = Model.make("CanonicalIndexed", {
         version: 1,
         key: Schema.String,
@@ -361,10 +372,12 @@ describe("domain contracts", () => {
       }).pipe(Effect.result)
       assert.strictEqual(invalid._tag, "Failure")
       if (invalid._tag === "Failure") assert.match(invalid.failure.message, /canonical encoding/)
-    }))
+    })
+  )
 
-  it.effect("bounds replication windows and partition overrides", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "bounds replication windows and partition overrides",
+    Effect.fnUntraced(function*() {
       const windows = Array.from({ length: 1_001 }, (_, index) => ({
         model: `Model${index}`,
         index: "byRank",
@@ -389,10 +402,12 @@ describe("domain contracts", () => {
       }).pipe(Effect.result)
       assert.strictEqual(partitionsResult._tag, "Failure")
       if (Result.isFailure(partitionsResult)) assert.match(partitionsResult.failure.message, /length/i)
-    }))
+    })
+  )
 
-  it.effect("rejects replication scopes larger than the encoded byte limit", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "rejects replication scopes larger than the encoded byte limit",
+    Effect.fnUntraced(function*() {
       const Indexed = Model.make("BoundedScope", {
         version: 1,
         key: Schema.String,
@@ -427,10 +442,12 @@ describe("domain contracts", () => {
       }).pipe(Effect.result)
       assert.strictEqual(result._tag, "Failure")
       if (result._tag === "Failure") assert.match(result.failure.message, /encoded bytes/)
-    }))
+    })
+  )
 
-  it.effect("round trips scoped replication protocol values", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "round trips scoped replication protocol values",
+    Effect.fnUntraced(function*() {
       const spaceId = "spc_00000000-0000-4000-8000-000000000001"
       const clientId = "cli_00000000-0000-4000-8000-000000000002"
       const viewId = "viw_00000000-0000-4000-8000-000000000003"
@@ -483,18 +500,22 @@ describe("domain contracts", () => {
         limit: 10
       }).pipe(Effect.result)
       assert.strictEqual(invalid._tag, "Failure")
-    }))
+    })
+  )
 
-  it.effect("represents revocation separately from authoritative deletion", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "represents revocation separately from authoritative deletion",
+    Effect.fnUntraced(function*() {
       const entity = { model: "Todo", modelVersion: 1, key: "a" }
       const change = yield* Schema.decodeUnknownEffect(Protocol.ViewChange)({ _tag: "Retract", entity })
       assert.strictEqual(change._tag, "Retract")
       assert.deepStrictEqual(change.entity.key, "a")
-    }))
+    })
+  )
 
-  it.effect("accepts only the current mutation protocol with explicit membership", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "accepts only the current mutation protocol with explicit membership",
+    Effect.fnUntraced(function*() {
       const current = {
         spaceId: "spc_00000000-0000-4000-8000-000000000001",
         clientId: "cli_00000000-0000-4000-8000-000000000001",
@@ -521,10 +542,12 @@ describe("domain contracts", () => {
         membershipIncarnation: undefined
       }).pipe(Effect.result)
       assert.strictEqual(missingMembership._tag, "Failure")
-    }))
+    })
+  )
 
-  it.effect("requires a negotiated protocol version on every operation payload", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "requires a negotiated protocol version on every operation payload",
+    Effect.fnUntraced(function*() {
       const spaceId = "spc_00000000-0000-4000-8000-000000000001"
       const schema = Definition.make({ version: 1, models: [], mutations: [] }).schemaIdentity
       const envelope = {
@@ -596,5 +619,6 @@ describe("domain contracts", () => {
           protocolVersion: Protocol.currentProtocolVersion
         })
       }
-    }))
+    })
+  )
 })

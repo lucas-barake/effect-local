@@ -1,7 +1,7 @@
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
-import * as Layer from "effect/Layer"
+import * as EffectLayer from "effect/Layer"
 import type * as IndexStore from "./IndexStore.js"
 
 export type Read =
@@ -128,6 +128,6 @@ const make = (): Service => {
   }
 }
 
-export const makeLayer = (): Layer.Layer<QueryReactivity> => Layer.sync(QueryReactivity, make)
+export const makeLayer = (): EffectLayer.Layer<QueryReactivity> => EffectLayer.sync(QueryReactivity, make)
 
-export const layer: Layer.Layer<QueryReactivity> = makeLayer()
+export const Layer: EffectLayer.Layer<QueryReactivity> = makeLayer()

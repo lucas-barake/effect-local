@@ -49,19 +49,15 @@ export const make = (options?: Options): Effect.Effect<
   RpcClient.Protocol["Service"],
   never,
   Scope.Scope | RpcSerialization.RpcSerialization | Socket.Socket
-> => {
-  const protocol = Effect.fnUntraced(function*(
-    writeResponse: (clientId: number, response: RpcMessage.FromServerEncoded) => Effect.Effect<void>,
-    clientIds: ReadonlySet<number>
-  ) {
+> =>
+  RpcClient.Protocol.make(Effect.fnUntraced(function*(writeResponse, clientIds) {
     const socket = yield* Socket.Socket
     const serialization = yield* RpcSerialization.RpcSerialization
     const hooks = yield* Effect.serviceOption(RpcClient.ConnectionHooks)
     const requestClientMap = new Map<string | number, number>()
     const write = yield* socket.writer
     let parser = serialization.makeUnsafe()
-    const encodedPing = parser.encode(RpcMessage.constPing)!
-    const writePing = write(encodedPing)
+    const writePing = write(parser.encode(RpcMessage.constPing)!)
     const pinger = yield* makePinger(writePing)
     let currentError: RpcClientError.RpcClientError | undefined
     const onOpen = Effect.suspend(() => {
@@ -81,25 +77,25 @@ export const make = (options?: Options): Effect.Effect<
     yield* Effect.suspend(() => {
       parser = serialization.makeUnsafe()
       pinger.reset()
-      return socket.runRaw((message) => {
-        const decoded = Effect.try({
-          try: () => parser.decode(message),
-          catch: (cause) =>
-            new RpcClientError.RpcClientDefect({
-              message: "Error decoding message",
-              cause
-            })
-        }).pipe(
-          Effect.flatMap(Schema.decodeUnknownEffect(FromServerMessages)),
-          Effect.catchTag("SchemaError", (cause) =>
-            Effect.fail(
+      return socket.runRaw(
+        Effect.fnUntraced(function*(message) {
+          const decoded = Effect.try({
+            try: () => parser.decode(message),
+            catch: (cause) =>
               new RpcClientError.RpcClientDefect({
                 message: "Error decoding message",
                 cause
               })
-            ))
-        )
-        return Effect.gen(function*() {
+          }).pipe(
+            Effect.flatMap(Schema.decodeUnknownEffect(FromServerMessages)),
+            Effect.catchTag("SchemaError", (cause) =>
+              Effect.fail(
+                new RpcClientError.RpcClientDefect({
+                  message: "Error decoding message",
+                  cause
+                })
+              ))
+          )
           const result = yield* Effect.result(decoded)
           if (Result.isFailure(result)) {
             yield* failCurrentSocket(new RpcClientError.RpcClientError({ reason: result.failure }))
@@ -127,8 +123,9 @@ export const make = (options?: Options): Effect.Effect<
             },
             step: constVoid
           })
-        })
-      }, { onOpen }).pipe(
+        }),
+        { onOpen }
+      ).pipe(
         Effect.raceFirst(Effect.flatMap(
           pinger.timeout,
           () =>
@@ -182,18 +179,19 @@ export const make = (options?: Options): Effect.Effect<
         if (request._tag === "Request") requestClientMap.set(request.id, clientId)
         const encoded = parser.encode(request)
         if (encoded === undefined) return Effect.void
-        return write(encoded).pipe(Effect.catch((error) => Effect.die(error)))
+        return write(encoded).pipe(
+          Effect.catchTag("SocketError", (error) => Effect.die(error))
+        )
       },
       supportsAck: true,
       supportsTransferables: false
     }
-  })
-  return RpcClient.Protocol.make(protocol)
-}
+  }))
 
-const exponentialRetryPolicy = Schedule.exponential(500, 1.5)
-const spacedRetryPolicy = Schedule.spaced(5000)
-const defaultRetryPolicy = Schedule.min([exponentialRetryPolicy, spacedRetryPolicy])
+const defaultRetryPolicy = Schedule.min([
+  Schedule.exponential(500, 1.5),
+  Schedule.spaced(5000)
+])
 
 const makePinger = Effect.fnUntraced(function*<A, E extends { readonly _tag: string }, R,>(
   writePing: Effect.Effect<A, E, R>

@@ -33,37 +33,29 @@ export const make = (limits: { readonly history: number; readonly receipts: numb
         Metric.update(receiptLimit, limits.receipts)
       ], { discard: true }).pipe((effect) => update("initialize_depths", effect)),
     recordAdmission: (outcome: "accepted" | "rejected" | "expired" | "failed") =>
-      Metric.withAttributes(admission, { outcome }).pipe(
-        Metric.update(1),
-        (effect) => update("record_admission", effect)
+      Metric.update(Metric.withAttributes(admission, { outcome }), 1).pipe((effect) =>
+        update("record_admission", effect)
       ),
     recordRejection: (rejectionClass: string) =>
-      Metric.withAttributes(rejection, { class: rejectionClass }).pipe(
-        Metric.update(1),
-        (effect) => update("record_rejection", effect)
+      Metric.update(Metric.withAttributes(rejection, { class: rejectionClass }), 1).pipe((effect) =>
+        update("record_rejection", effect)
       ),
     changeDepths: (history: number, receipts: number) =>
       Effect.all([
         Metric.modify(historyDepth, history),
         Metric.modify(receiptDepth, receipts)
       ], { discard: true }).pipe((effect) => update("change_depths", effect)),
-    changeWatchers: (delta: number) =>
-      Metric.modify(syncWatchers, delta).pipe((effect) => update("change_watchers", effect)),
+    changeWatchers: (delta: number) => update("change_watchers", Metric.modify(syncWatchers, delta)),
     recordWakeFanout: (elapsedNanos: bigint) =>
-      Duration.nanos(elapsedNanos).pipe(
-        (duration) => Metric.update(wakeFanout, duration),
-        (effect) => update("record_wake_fanout", effect)
-      ),
+      Metric.update(wakeFanout, Duration.nanos(elapsedNanos)).pipe((effect) => update("record_wake_fanout", effect)),
     recordMaintenance: (outcome: "completed" | "failed") =>
-      Metric.withAttributes(maintenance, { outcome }).pipe(
-        Metric.update(1),
-        (effect) => update("record_maintenance", effect)
+      Metric.update(Metric.withAttributes(maintenance, { outcome }), 1).pipe((effect) =>
+        update("record_maintenance", effect)
       ),
     recordPruned: (resource: "history" | "receipt", count: number) => {
       if (count === 0) return Effect.void
-      return Metric.withAttributes(pruned, { resource }).pipe(
-        Metric.update(count),
-        (effect) => update("record_pruned", effect)
+      return Metric.update(Metric.withAttributes(pruned, { resource }), count).pipe((effect) =>
+        update("record_pruned", effect)
       )
     }
   }

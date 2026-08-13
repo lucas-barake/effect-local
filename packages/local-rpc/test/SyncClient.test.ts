@@ -15,8 +15,9 @@ import * as Socket from "effect/unstable/socket/Socket"
 import * as SyncClient from "../src/SyncClient.js"
 
 describe("SyncClient", () => {
-  it.effect("uses the configured socket retry policy", () =>
-    Effect.gen(function*() {
+  it.effect(
+    "uses the configured socket retry policy",
+    Effect.fnUntraced(function*() {
       const attempts = yield* Ref.make(0)
       const firstAttempt = yield* Deferred.make<void>()
       const openError = new Socket.SocketError({
@@ -36,14 +37,14 @@ describe("SyncClient", () => {
           ),
         writer: Effect.succeed(() => Effect.void)
       })
-      const live = SyncClient.layerProtocolSocket({
+      const LiveLayer = SyncClient.layerProtocolSocket({
         retryPolicy: Schedule.spaced("5 seconds")
       }).pipe(
         Layer.provide(Layer.succeed(Socket.Socket, socket)),
         Layer.provide(RpcSerialization.layerJson)
       )
 
-      yield* Layer.build(live)
+      yield* Layer.build(LiveLayer)
       yield* Deferred.await(firstAttempt)
       assert.strictEqual(yield* Ref.get(attempts), 1)
 
@@ -52,38 +53,36 @@ describe("SyncClient", () => {
 
       yield* TestClock.adjust("1 millis")
       assert.strictEqual(yield* Ref.get(attempts), 2)
-    }))
+    })
+  )
 
   it.effect("forgets routing for an interrupted socket request", () =>
-    Effect.gen(function*() {
+    Effect.scoped(Effect.gen(function*() {
       const incoming = yield* Queue.unbounded<{
         readonly message: string | Uint8Array
         readonly processed: Deferred.Deferred<void>
       }>()
       const socketReady = yield* Deferred.make<void>()
       const socket = Socket.make({
-        runRaw: (handler, options) =>
-          Effect.gen(function*() {
-            yield* options?.onOpen ?? Effect.void
-            yield* Deferred.succeed(socketReady, undefined)
-            yield* Queue.take(incoming).pipe(
-              Effect.flatMap(({ message, processed }) =>
-                Effect.gen(function*() {
-                  const result = handler(message)
-                  if (Effect.isEffect(result)) yield* result
-                  yield* Deferred.succeed(processed, undefined)
-                })
-              ),
-              Effect.forever
-            )
-          }),
+        runRaw: Effect.fnUntraced(function*(handler, options) {
+          yield* options?.onOpen ?? Effect.void
+          yield* Deferred.succeed(socketReady, undefined)
+          yield* Queue.take(incoming).pipe(
+            Effect.flatMap(Effect.fnUntraced(function*({ message, processed }) {
+              const result = handler(message)
+              if (Effect.isEffect(result)) yield* result
+              yield* Deferred.succeed(processed, undefined)
+            })),
+            Effect.forever
+          )
+        }),
         writer: Effect.succeed(() => Effect.void)
       })
-      const live = SyncClient.layerProtocolSocket().pipe(
+      const LiveLayer = SyncClient.layerProtocolSocket().pipe(
         Layer.provide(Layer.succeed(Socket.Socket, socket)),
         Layer.provide(RpcSerialization.layerJson)
       )
-      const context = yield* Layer.build(live)
+      const context = yield* Layer.build(LiveLayer)
       const protocol = Context.get(context, RpcClient.Protocol)
       const firstClientResponses = yield* Ref.make<Array<string>>([])
       const secondClientResponses = yield* Ref.make<Array<string>>([])
@@ -116,10 +115,10 @@ describe("SyncClient", () => {
 
       assert.deepStrictEqual(yield* Ref.get(firstClientResponses), ["Exit"])
       assert.deepStrictEqual(yield* Ref.get(secondClientResponses), ["Exit"])
-    }).pipe(Effect.scoped))
+    })))
 
   it.effect("forgets routing after a socket failure", () =>
-    Effect.gen(function*() {
+    Effect.scoped(Effect.gen(function*() {
       const incoming = yield* Queue.unbounded<{
         readonly message: string | Uint8Array
         readonly processed: Deferred.Deferred<void>
@@ -135,50 +134,48 @@ describe("SyncClient", () => {
       const socket = Socket.make({
         runRaw: (handler, options) =>
           Ref.updateAndGet(connections, (count) => count + 1).pipe(
-            Effect.flatMap((connection) =>
-              Effect.gen(function*() {
-                yield* options?.onOpen ?? Effect.void
-                if (connection === 1) {
-                  yield* Deferred.succeed(firstSocketReady, undefined)
-                  yield* Deferred.await(failFirstSocket)
-                  return yield* socketError
-                }
-                yield* Deferred.succeed(secondSocketReady, undefined)
-                return yield* Queue.take(incoming).pipe(
-                  Effect.flatMap(({ message, processed }) =>
-                    Effect.gen(function*() {
-                      const result = handler(message)
-                      if (Effect.isEffect(result)) yield* result
-                      yield* Deferred.succeed(processed, undefined)
-                    })
-                  ),
-                  Effect.forever
-                )
-              })
-            )
+            Effect.flatMap(Effect.fnUntraced(function*(connection) {
+              yield* options?.onOpen ?? Effect.void
+              if (connection === 1) {
+                yield* Deferred.succeed(firstSocketReady, undefined)
+                yield* Deferred.await(failFirstSocket)
+                return yield* socketError
+              }
+              yield* Deferred.succeed(secondSocketReady, undefined)
+              return yield* Queue.take(incoming).pipe(
+                Effect.flatMap(Effect.fnUntraced(function*({ message, processed }) {
+                  const result = handler(message)
+                  if (Effect.isEffect(result)) yield* result
+                  yield* Deferred.succeed(processed, undefined)
+                })),
+                Effect.forever
+              )
+            }))
           ),
         writer: Effect.succeed(() => Effect.void)
       })
-      const live = SyncClient.layerProtocolSocket({
+      const LiveLayer = SyncClient.layerProtocolSocket({
         retryPolicy: Schedule.spaced("1 second")
       }).pipe(
         Layer.provide(Layer.succeed(Socket.Socket, socket)),
         Layer.provide(RpcSerialization.layerJson)
       )
-      const context = yield* Layer.build(live)
+      const context = yield* Layer.build(LiveLayer)
       const protocol = Context.get(context, RpcClient.Protocol)
       const firstClientResponses = yield* Ref.make<Array<string>>([])
       const secondClientResponses = yield* Ref.make<Array<string>>([])
       yield* protocol.run(1, (response) => Ref.update(firstClientResponses, (tags) => [...tags, response._tag])).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
-      yield* protocol.run(2, (response) =>
-        Effect.gen(function*() {
+      yield* protocol.run(
+        2,
+        Effect.fnUntraced(function*(response) {
           yield* Ref.update(secondClientResponses, (tags) => [...tags, response._tag])
           if (response._tag === "ClientProtocolError") {
             yield* Deferred.succeed(secondClientSawFailure, undefined)
           }
-        })).pipe(Effect.forkScoped({ startImmediately: true }))
+        })
+      ).pipe(Effect.forkScoped({ startImmediately: true }))
       yield* Deferred.await(firstSocketReady)
 
       yield* protocol.send(1, {
@@ -206,10 +203,10 @@ describe("SyncClient", () => {
 
       assert.deepStrictEqual(yield* Ref.get(firstClientResponses), ["ClientProtocolError", "Exit"])
       assert.deepStrictEqual(yield* Ref.get(secondClientResponses), ["ClientProtocolError", "Exit"])
-    }).pipe(Effect.scoped))
+    })))
 
   it.effect("fails active routes before retrying a socket open error", () =>
-    Effect.gen(function*() {
+    Effect.scoped(Effect.gen(function*() {
       const incoming = yield* Queue.unbounded<{
         readonly message: string | Uint8Array
         readonly processed: Deferred.Deferred<void>
@@ -225,48 +222,46 @@ describe("SyncClient", () => {
       const socket = Socket.make({
         runRaw: (handler, options) =>
           Ref.updateAndGet(connections, (count) => count + 1).pipe(
-            Effect.flatMap((connection) =>
-              Effect.gen(function*() {
-                yield* options?.onOpen ?? Effect.void
-                if (connection === 1) {
-                  yield* Deferred.succeed(firstSocketReady, undefined)
-                  yield* Deferred.await(failFirstSocket)
-                  return yield* socketError
-                }
-                yield* Deferred.succeed(secondSocketReady, undefined)
-                return yield* Queue.take(incoming).pipe(
-                  Effect.flatMap(({ message, processed }) =>
-                    Effect.gen(function*() {
-                      const result = handler(message)
-                      if (Effect.isEffect(result)) yield* result
-                      yield* Deferred.succeed(processed, undefined)
-                    })
-                  ),
-                  Effect.forever
-                )
-              })
-            )
+            Effect.flatMap(Effect.fnUntraced(function*(connection) {
+              yield* options?.onOpen ?? Effect.void
+              if (connection === 1) {
+                yield* Deferred.succeed(firstSocketReady, undefined)
+                yield* Deferred.await(failFirstSocket)
+                return yield* socketError
+              }
+              yield* Deferred.succeed(secondSocketReady, undefined)
+              return yield* Queue.take(incoming).pipe(
+                Effect.flatMap(Effect.fnUntraced(function*({ message, processed }) {
+                  const result = handler(message)
+                  if (Effect.isEffect(result)) yield* result
+                  yield* Deferred.succeed(processed, undefined)
+                })),
+                Effect.forever
+              )
+            }))
           ),
         writer: Effect.succeed(() => Effect.void)
       })
-      const live = SyncClient.layerProtocolSocket({
+      const LiveLayer = SyncClient.layerProtocolSocket({
         retryTransientErrors: true,
         retryPolicy: Schedule.spaced("1 second")
       }).pipe(
         Layer.provide(Layer.succeed(Socket.Socket, socket)),
         Layer.provide(RpcSerialization.layerJson)
       )
-      const context = yield* Layer.build(live)
+      const context = yield* Layer.build(LiveLayer)
       const protocol = Context.get(context, RpcClient.Protocol)
       const firstClientResponses = yield* Ref.make<Array<string>>([])
       const secondClientResponses = yield* Ref.make<Array<string>>([])
-      yield* protocol.run(1, (response) =>
-        Effect.gen(function*() {
+      yield* protocol.run(
+        1,
+        Effect.fnUntraced(function*(response) {
           yield* Ref.update(firstClientResponses, (tags) => [...tags, response._tag])
           if (response._tag === "ClientProtocolError") {
             yield* Deferred.succeed(firstClientSawFailure, undefined)
           }
-        })).pipe(Effect.forkScoped({ startImmediately: true }))
+        })
+      ).pipe(Effect.forkScoped({ startImmediately: true }))
       yield* protocol.run(2, (response) => Ref.update(secondClientResponses, (tags) => [...tags, response._tag])).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
@@ -297,33 +292,33 @@ describe("SyncClient", () => {
 
       assert.deepStrictEqual(yield* Ref.get(firstClientResponses), ["ClientProtocolError", "Exit"])
       assert.deepStrictEqual(yield* Ref.get(secondClientResponses), ["ClientProtocolError", "Exit"])
-    }).pipe(Effect.scoped))
+    })))
 
   it.effect("accepts a valid interrupted exit", () =>
-    Effect.gen(function*() {
+    Effect.scoped(Effect.gen(function*() {
       const incoming = yield* Queue.unbounded<string | Uint8Array>()
       const socketReady = yield* Deferred.make<void>()
       const responseReceived = yield* Deferred.make<void>()
       const socket = Socket.make({
-        runRaw: (handler, options) =>
-          Effect.gen(function*() {
-            yield* options?.onOpen ?? Effect.void
-            yield* Deferred.succeed(socketReady, undefined)
-            yield* Queue.take(incoming).pipe(
-              Effect.flatMap((message) => {
-                const result = handler(message)
-                if (Effect.isEffect(result)) return result
-                return Effect.void
-              }),
-              Effect.forever
-            )
-          }),
+        runRaw: Effect.fnUntraced(function*(handler, options) {
+          yield* options?.onOpen ?? Effect.void
+          yield* Deferred.succeed(socketReady, undefined)
+          yield* Queue.take(incoming).pipe(
+            Effect.flatMap((message) => {
+              const result = handler(message)
+              if (Effect.isEffect(result)) return result
+              return Effect.void
+            }),
+            Effect.forever
+          )
+        }),
         writer: Effect.succeed(() => Effect.void)
       })
-      const context = yield* SyncClient.layerProtocolSocket().pipe(
-        Layer.provide(Layer.succeed(Socket.Socket, socket)),
-        Layer.provide(RpcSerialization.layerJson),
-        Layer.build
+      const context = yield* Layer.build(
+        SyncClient.layerProtocolSocket().pipe(
+          Layer.provide(Layer.succeed(Socket.Socket, socket)),
+          Layer.provide(RpcSerialization.layerJson)
+        )
       )
       const protocol = Context.get(context, RpcClient.Protocol)
       const responses = yield* Ref.make<Array<string>>([])
@@ -350,27 +345,27 @@ describe("SyncClient", () => {
       yield* Deferred.await(responseReceived)
 
       assert.deepStrictEqual(yield* Ref.get(responses), ["Exit"])
-    }).pipe(Effect.scoped))
+    })))
 
   it.effect("preserves an unknown socket failure cause", () =>
-    Effect.gen(function*() {
+    Effect.scoped(Effect.gen(function*() {
       const socketReady = yield* Deferred.make<void>()
       const failSocket = yield* Deferred.make<void>()
       const responseReceived = yield* Deferred.make<void>()
       const socket = Socket.make({
-        runRaw: (_handler, options) =>
-          Effect.gen(function*() {
-            yield* options?.onOpen ?? Effect.void
-            yield* Deferred.succeed(socketReady, undefined)
-            yield* Deferred.await(failSocket)
-            return yield* Effect.die("socket defect")
-          }),
+        runRaw: Effect.fnUntraced(function*(_handler, options) {
+          yield* options?.onOpen ?? Effect.void
+          yield* Deferred.succeed(socketReady, undefined)
+          yield* Deferred.await(failSocket)
+          return yield* Effect.die("socket defect")
+        }),
         writer: Effect.succeed(() => Effect.void)
       })
-      const context = yield* SyncClient.layerProtocolSocket({ retryPolicy: Schedule.recurs(0) }).pipe(
-        Layer.provide(Layer.succeed(Socket.Socket, socket)),
-        Layer.provide(RpcSerialization.layerJson),
-        Layer.build
+      const context = yield* Layer.build(
+        SyncClient.layerProtocolSocket({ retryPolicy: Schedule.recurs(0) }).pipe(
+          Layer.provide(Layer.succeed(Socket.Socket, socket)),
+          Layer.provide(RpcSerialization.layerJson)
+        )
       )
       const protocol = Context.get(context, RpcClient.Protocol)
       const causes = yield* Ref.make<Array<unknown>>([])
@@ -393,10 +388,10 @@ describe("SyncClient", () => {
       yield* Deferred.await(responseReceived)
 
       const [cause] = yield* Ref.get(causes)
-      pipe(Cause.isCause(cause), (isCause) => assert.isTrue(isCause))
+      assert.isTrue(Cause.isCause(cause))
       if (!Cause.isCause(cause)) return
       const defect = Cause.findDefect(cause)
       assert.isTrue(defect._tag === "Success")
       if (defect._tag === "Success") assert.strictEqual(defect.success, "socket defect")
-    }).pipe(Effect.scoped))
+    })))
 })

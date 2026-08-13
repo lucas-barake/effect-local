@@ -213,24 +213,24 @@ const getTodo = (transaction: Parameters<ReturnType<typeof RenameTodo.of>>[0]["t
   })))
 }
 
-const putTodoHandler = PutTodo.toLayer(({ payload, transaction }) =>
+const PutTodoHandler = PutTodo.toLayer(({ payload, transaction }) =>
   transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
 )
-const renameTodoHandler = RenameTodo.toLayer(({ payload, transaction }) =>
-  Effect.gen(function*() {
+const RenameTodoHandler = RenameTodo.toLayer(
+  Effect.fnUntraced(function*({ payload, transaction }) {
     const current = yield* getTodo(transaction, payload.id)
     yield* transaction.set(Todo, payload.id, { ...current, title: payload.title })
   })
 )
-const deleteTodoHandler = DeleteTodo.toLayer(({ payload, transaction }) => transaction.delete(Todo, payload.id))
-const putManyTodosHandler = PutManyTodos.toLayer(({ payload, transaction }) =>
+const DeleteTodoHandler = DeleteTodo.toLayer(({ payload, transaction }) => transaction.delete(Todo, payload.id))
+const PutManyTodosHandler = PutManyTodos.toLayer(({ payload, transaction }) =>
   pipe(
     Array.from({ length: payload.count }, (_, index) => todo(`bulk-${index}`)),
     Effect.forEach((value) => transaction.set(Todo, value.id, value), { discard: true })
   )
 )
-const incrementTodoHandler = IncrementTodo.toLayer(({ payload, transaction }) =>
-  Effect.gen(function*() {
+const IncrementTodoHandler = IncrementTodo.toLayer(
+  Effect.fnUntraced(function*({ payload, transaction }) {
     const current = yield* getTodo(transaction, payload.id)
     const count = yield* transaction.applyField(Field.counter, current.count, {
       _tag: "Increment",
@@ -240,11 +240,10 @@ const incrementTodoHandler = IncrementTodo.toLayer(({ payload, transaction }) =>
     return count
   })
 )
-const addLabelHandler = AddLabel.toLayer(({ payload, transaction }) =>
-  Effect.gen(function*() {
+const AddLabelHandler = AddLabel.toLayer(
+  Effect.fnUntraced(function*({ payload, transaction }) {
     const current = yield* getTodo(transaction, payload.id)
-    const stringSet = Field.growOnlySet(Schema.String)
-    const labels = yield* transaction.applyField(stringSet, current.labels, {
+    const labels = yield* transaction.applyField(Field.growOnlySet(Schema.String), current.labels, {
       _tag: "Add",
       value: payload.label
     })
@@ -252,22 +251,22 @@ const addLabelHandler = AddLabel.toLayer(({ payload, transaction }) =>
     return labels
   })
 )
-const rejectAfterWriteHandler = RejectAfterWrite.toLayer(({ payload, transaction }) =>
+const RejectAfterWriteHandler = RejectAfterWrite.toLayer(({ payload, transaction }) =>
   transaction.set(Todo, payload.id, payload).pipe(Effect.andThen(Effect.fail(new RejectedError())))
 )
-const putHugeTodoHandler = PutHugeTodo.toLayer(({ payload, transaction }) => {
+const PutHugeTodoHandler = PutHugeTodo.toLayer(({ payload, transaction }) => {
   const value = todo(payload.id, hugeTitle)
   return transaction.set(Todo, payload.id, value).pipe(Effect.as(value))
 })
-const returnHugeResultHandler = ReturnHugeResult.toLayer(() => Effect.succeed(hugeTitle))
-const listTodosHandler = ListTodos.toLayer(({ query }) =>
+const ReturnHugeResultHandler = ReturnHugeResult.toLayer(() => Effect.succeed(hugeTitle))
+const ListTodosHandler = ListTodos.toLayer(({ query }) =>
   query.from(Todo, "byCount").stream().pipe(
     Stream.runCollect,
     Effect.map((items) => Array.from(items))
   )
 )
-const readCountIndexHandler = ReadCountIndex.toLayer(({ payload, query }) =>
-  Effect.gen(function*() {
+const ReadCountIndexHandler = ReadCountIndex.toLayer(
+  Effect.fnUntraced(function*({ payload, query }) {
     const builder = query.from(Todo, "byCount")
       .where({ count: { gte: payload.minimum } })
       .order(payload.direction)
@@ -284,13 +283,13 @@ const readCountIndexHandler = ReadCountIndex.toLayer(({ payload, query }) =>
   })
 )
 
-const putMessageHandler = PutMessage.toLayer(({ payload, transaction }) =>
+const PutMessageHandler = PutMessage.toLayer(({ payload, transaction }) =>
   transaction.set(Message, payload.id, payload)
 )
-const deleteMessageHandler = DeleteMessage.toLayer(({ payload, transaction }) =>
+const DeleteMessageHandler = DeleteMessage.toLayer(({ payload, transaction }) =>
   transaction.delete(Message, payload.id)
 )
-const putManyMessagesHandler = PutManyMessages.toLayer(({ payload, transaction }) =>
+const PutManyMessagesHandler = PutManyMessages.toLayer(({ payload, transaction }) =>
   pipe(
     Array.from({ length: payload.count }, (_, index) => ({
       id: `bulk-${index}`,
@@ -302,21 +301,21 @@ const putManyMessagesHandler = PutManyMessages.toLayer(({ payload, transaction }
   )
 )
 
-export const handlers = Layer.mergeAll(
-  putMessageHandler,
-  deleteMessageHandler,
-  putManyMessagesHandler,
-  putTodoHandler,
-  renameTodoHandler,
-  deleteTodoHandler,
-  putManyTodosHandler,
-  incrementTodoHandler,
-  addLabelHandler,
-  rejectAfterWriteHandler,
-  putHugeTodoHandler,
-  returnHugeResultHandler,
-  listTodosHandler,
-  readCountIndexHandler
+export const Handlers = Layer.mergeAll(
+  PutMessageHandler,
+  DeleteMessageHandler,
+  PutManyMessagesHandler,
+  PutTodoHandler,
+  RenameTodoHandler,
+  DeleteTodoHandler,
+  PutManyTodosHandler,
+  IncrementTodoHandler,
+  AddLabelHandler,
+  RejectAfterWriteHandler,
+  PutHugeTodoHandler,
+  ReturnHugeResultHandler,
+  ListTodosHandler,
+  ReadCountIndexHandler
 )
 
 export const todo = (id: string, title = "first") => ({ id, title, count: 0, labels: [] })

@@ -11,7 +11,6 @@ import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
-import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Queue from "effect/Queue"
@@ -54,14 +53,16 @@ const PutTodo = Mutation.make("FanoutBenchPutTodo", {
   success: Todo.schema
 })
 const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo] })
-const handlers = PutTodo.toLayer(({ payload, transaction }) =>
+const PutTodoHandlersLayer = PutTodo.toLayer(({ payload, transaction }) =>
   transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))
 )
-const mutationRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(handlers))
-const database = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
-  (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer)
+const MutationRuntimeLayer = MutationRuntime.layer(definition).pipe(Layer.provide(PutTodoHandlersLayer))
+const DatabaseLayer = Layer.mergeAll(
+  SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+  NodeCrypto.layer,
+  Reactivity.layer
 )
-const store = ServerStore.layerTrusted({
+const StoreLayer = ServerStore.layerTrusted({
   definition,
   retainedHistoryEntries: 0,
   maximumHistoryEntries: 10_000,
@@ -81,13 +82,13 @@ const store = ServerStore.layerTrusted({
   readAuthorizationCacheCapacity: 4_096,
   migration: { retryDelay: "1 millis", maximumAttempts: 8 }
 }).pipe(
-  Layer.provide(mutationRuntime),
-  Layer.provide(database)
+  Layer.provide(MutationRuntimeLayer),
+  Layer.provide(DatabaseLayer)
 )
-const presenceHub = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })
+const PresenceHubLayer = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })
 const assertion = PrincipalAssertion.PrincipalAssertion.make("fanout-benchmark")
-const assertionVerifier = PrincipalAssertion.layerVerifier(() => Effect.succeed(null))
-const cluster = SpaceEntity.layer({
+const AssertionVerifierLayer = PrincipalAssertion.layerVerifier(() => Effect.succeed(null))
+const ClusterLayer = SpaceEntity.layer({
   admissionMailboxCapacity: 32,
   readMailboxCapacity: 32,
   watchMailboxCapacity: 1_024,
@@ -96,9 +97,9 @@ const cluster = SpaceEntity.layer({
   maximumConcurrentBootstrapPagesPerSpace: 4,
   maximumConcurrentPresencePublicationsPerSpace: 16
 }).pipe(
-  Layer.provide(store),
-  Layer.provide(presenceHub),
-  Layer.provide(assertionVerifier),
+  Layer.provide(StoreLayer),
+  Layer.provide(PresenceHubLayer),
+  Layer.provide(AssertionVerifierLayer),
   Layer.provide(
     SingleRunner.layer({
       runnerStorage: "memory",
@@ -107,7 +108,7 @@ const cluster = SpaceEntity.layer({
         entityMessagePollInterval: 5_000,
         sendRetryInterval: 100
       }
-    }).pipe(Layer.provide(database))
+    }).pipe(Layer.provide(DatabaseLayer))
   )
 )
 
@@ -134,71 +135,66 @@ class FanoutBench extends Context.Service<FanoutBench, FanoutBenchService>()(
   "@lucas-barake/effect-local-rpc/bench/FanoutBench"
 ) {}
 
-const fanoutBench = Effect.gen(function*() {
-  const client = yield* SpaceEntity.Client
-  const runs = new Map<WatcherCount, Effect.Effect<void, ReplicaError.ReplicaError>>()
+const FanoutBenchLayer = Layer.effect(
+  FanoutBench,
+  Effect.gen(function*() {
+    const client = yield* SpaceEntity.Client
+    const runs = new Map<WatcherCount, Effect.Effect<void, ReplicaError.ReplicaError>>()
 
-  for (const fixture of fixtures) {
-    const wakes: Array<Queue.Queue<Protocol.Wake>> = []
-    const watchRequest: Protocol.WatchRequest = {
-      spaceId: fixture.spaceId,
-      clientId: fixture.clientId,
-      schema: definition.schemaIdentity,
-      scope: Protocol.ReplicationScope.make({ models: [Todo.name] }),
-      scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
-      cursor: null
-    }
-    for (let index = 0; index < fixture.watcherCount; index++) {
-      const queue = yield* Queue.unbounded<Protocol.Wake>().pipe(
-        (acquire) => Effect.acquireRelease(acquire, Queue.shutdown)
-      )
-      wakes.push(queue)
-      yield* client.watch(fixture.spaceId, watchRequest, assertion).pipe(
-        Stream.runForEach((wake) => Queue.offer(queue, wake)),
-        Effect.ensuring(Queue.shutdown(queue)),
-        Effect.forkScoped({ startImmediately: true })
-      )
-      assert.deepStrictEqual(yield* Queue.take(queue), {
-        spaceId: fixture.spaceId
-      })
-    }
-
-    const submissions: Array<Protocol.MutationEnvelope> = []
-    for (let sequence = 1; sequence <= preparedSubmissions; sequence++) {
-      const identity = {
+    for (const fixture of fixtures) {
+      const wakes: Array<Queue.Queue<Protocol.Wake>> = []
+      const watchRequest: Protocol.WatchRequest = {
         spaceId: fixture.spaceId,
         clientId: fixture.clientId,
-        mutationId: Identity.MutationId.make(
-          `mut_00000000-0000-4000-8000-${String(fixture.watcherCount).padStart(4, "0")}${
-            String(sequence).padStart(8, "0")
-          }`
-        ),
-        localSequence: Identity.LocalSequence.make(sequence),
-        basis: Identity.ServerSequence.make(sequence - 1),
-        name: PutTodo.name,
-        payload: { id: `${fixture.watcherCount}-${sequence}`, title: "fanout" },
-        digestVersion: 3 as const,
-        membershipIncarnation: fixture.membershipIncarnation,
-        sourceSchema: definition.schemaIdentity,
-        mutationVersion: PutTodo.version
+        schema: definition.schemaIdentity,
+        scope: Protocol.ReplicationScope.make({ models: [Todo.name] }),
+        scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+        cursor: null
       }
-      pipe(
-        Protocol.MutationEnvelope.make({
+      for (let index = 0; index < fixture.watcherCount; index++) {
+        const queue = yield* Effect.acquireRelease(Queue.unbounded<Protocol.Wake>(), Queue.shutdown)
+        wakes.push(queue)
+        yield* client.watch(fixture.spaceId, watchRequest, assertion).pipe(
+          Stream.runForEach((wake) => Queue.offer(queue, wake)),
+          Effect.ensuring(Queue.shutdown(queue)),
+          Effect.forkScoped({ startImmediately: true })
+        )
+        assert.deepStrictEqual(yield* Queue.take(queue), {
+          spaceId: fixture.spaceId
+        })
+      }
+
+      const submissions: Array<Protocol.MutationEnvelope> = []
+      for (let sequence = 1; sequence <= preparedSubmissions; sequence++) {
+        const identity = {
+          spaceId: fixture.spaceId,
+          clientId: fixture.clientId,
+          mutationId: Identity.MutationId.make(
+            `mut_00000000-0000-4000-8000-${String(fixture.watcherCount).padStart(4, "0")}${
+              String(sequence).padStart(8, "0")
+            }`
+          ),
+          localSequence: Identity.LocalSequence.make(sequence),
+          basis: Identity.ServerSequence.make(sequence - 1),
+          name: PutTodo.name,
+          payload: { id: `${fixture.watcherCount}-${sequence}`, title: "fanout" },
+          digestVersion: 3 as const,
+          membershipIncarnation: fixture.membershipIncarnation,
+          sourceSchema: definition.schemaIdentity,
+          mutationVersion: PutTodo.version
+        }
+        const envelope = Protocol.MutationEnvelope.make({
           ...identity,
           digest: yield* Protocol.mutationDigest(identity)
-        }),
-        (envelope) => submissions.push(envelope)
-      )
-    }
+        })
+        submissions.push(envelope)
+      }
 
-    let nextSubmission = 0
-    Effect.suspend(() => {
-      const envelope = submissions[nextSubmission++]
-      if (envelope === undefined) return Effect.die("Fanout benchmark exhausted its prepared submissions")
-      return Effect.gen(function*() {
-        for (const wake of wakes) {
-          pipe(Queue.sizeUnsafe(wake), (size) => assert.strictEqual(size, 0))
-        }
+      let nextSubmission = 0
+      const runSubmission = Effect.fnUntraced(function*() {
+        const envelope = submissions[nextSubmission++]
+        if (envelope === undefined) yield* Effect.die("Fanout benchmark exhausted its prepared submissions")
+        for (const wake of wakes) assert.strictEqual(Queue.sizeUnsafe(wake), 0)
         const receipt = yield* client.submit(
           fixture.spaceId,
           { envelope, schema: definition.schemaIdentity },
@@ -210,22 +206,28 @@ const fanoutBench = Effect.gen(function*() {
         }
         for (const wake of wakes) {
           assert.deepStrictEqual(yield* Queue.take(wake), expected)
-          pipe(Queue.sizeUnsafe(wake), (size) => assert.strictEqual(size, 0))
+          assert.strictEqual(Queue.sizeUnsafe(wake), 0)
         }
       })
-    }).pipe((run) => runs.set(fixture.watcherCount, run))
-  }
-
-  return FanoutBench.of({
-    submitAndObserve: (watcherCount) => {
-      const run = runs.get(watcherCount)
-      if (run === undefined) return Effect.die(`Missing fanout fixture for ${watcherCount} watchers`)
-      return run
+      runs.set(
+        fixture.watcherCount,
+        Effect.suspend(runSubmission)
+      )
     }
+
+    return FanoutBench.of({
+      submitAndObserve: (watcherCount) => {
+        const run = runs.get(watcherCount)
+        if (run === undefined) return Effect.die(`Missing fanout fixture for ${watcherCount} watchers`)
+        return run
+      }
+    })
   })
-}).pipe(Layer.effect(FanoutBench))
-const runtimeLayer = fanoutBench.pipe(Layer.provide(Layer.merge(cluster, database)))
-const runtime = ManagedRuntime.make(runtimeLayer)
+)
+const RuntimeLayer = FanoutBenchLayer.pipe(
+  Layer.provide(Layer.merge(ClusterLayer, DatabaseLayer))
+)
+const runtime = ManagedRuntime.make(RuntimeLayer)
 
 beforeAll(async () => {
   // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this asynchronous benchmark fixture setup boundary.
@@ -239,9 +241,7 @@ afterAll(async () => {
 
 for (const watcherCount of watcherCounts) {
   bench(`${watcherCount} same-space watchers observe every submitted sequence`, async () => {
-    await FanoutBench.use((service) => service.submitAndObserve(watcherCount)).pipe(
-      // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
-      (effect) => runtime.runPromise(effect)
-    )
+    // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
+    await runtime.runPromise(FanoutBench.use((service) => service.submitAndObserve(watcherCount)))
   }, { iterations, time: 0, warmupIterations, warmupTime: 0, throws: true })
 }

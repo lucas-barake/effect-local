@@ -1,7 +1,7 @@
 import * as Effect from "effect/Effect"
 import { pipe } from "effect/Function"
 import { Diagnostic, Plugin, Rule, RuleContext } from "oxlint-plugin-effect/rule-bindings"
-import { makeTaggedEffectErrorChecker } from "./tagged-effect-errors.mjs"
+import { makeEffectTypePolicyChecker } from "./tagged-effect-errors.mjs"
 
 const findVariable = (context, node) => {
   let scope = context.sourceCode.getScope(node)
@@ -12,6 +12,52 @@ const findVariable = (context, node) => {
   }
   return undefined
 }
+
+const transparentExpressionTypes = new Set([
+  "ParenthesizedExpression",
+  "ChainExpression",
+  "TSNonNullExpression",
+  "TSAsExpression",
+  "TSSatisfiesExpression",
+  "TSTypeAssertion",
+  "TSInstantiationExpression"
+])
+
+const unwrapExpression = (node) => {
+  let expression = node
+  while (expression !== undefined && transparentExpressionTypes.has(expression.type)) {
+    expression = expression.expression
+  }
+  return expression
+}
+
+const getStaticMemberName = (member) => {
+  if (!member.computed && member.property.type === "Identifier") return member.property.name
+  if (!member.computed) return undefined
+  const property = unwrapExpression(member.property)
+  if (property.type === "Literal" && typeof property.value === "string") return property.value
+  if (
+    property.type === "TemplateLiteral" &&
+    property.expressions.length === 0 &&
+    property.quasis.length === 1
+  ) {
+    return property.quasis[0].value.cooked
+  }
+  return undefined
+}
+
+const getStaticMember = (node) => {
+  const expression = unwrapExpression(node)
+  if (expression?.type !== "MemberExpression") return undefined
+  const name = getStaticMemberName(expression)
+  if (name === undefined) return undefined
+  return { expression, name }
+}
+
+const importedVariable = (context, node, localName) =>
+  context.sourceCode.getDeclaredVariables(node).find((variable) => variable.name === localName)
+
+const reportDiagnostic = (context, node, message) => context.report(Diagnostic.make({ node, message }))
 
 export const noYieldEffectSync = Rule.define({
   name: "no-yield-effect-sync",
@@ -37,13 +83,10 @@ export const noYieldEffectSync = Rule.define({
         if (callee.type !== "MemberExpression" || callee.computed) return Effect.void
         if (callee.object.type !== "Identifier" || !effectNamespaces.has(callee.object.name)) return Effect.void
         if (callee.property.type !== "Identifier" || callee.property.name !== "sync") return Effect.void
-        return pipe(
-          Diagnostic.make({
-            node,
-            message: "Do not yield Effect.sync inside Effect.gen. Execute the synchronous code directly."
-          }),
-          (diagnostic) => context.report(diagnostic)
-        )
+        return context.report(Diagnostic.make({
+          node,
+          message: "Do not yield Effect.sync inside Effect.gen. Execute the synchronous code directly."
+        }))
       }
     }
   }
@@ -79,20 +122,17 @@ export const noSemaphoreEffectSync = Rule.define({
           return Effect.void
         }
         if (innerCallee.property.type !== "Identifier" || innerCallee.property.name !== "sync") return Effect.void
-        return pipe(
-          Diagnostic.make({
-            node,
-            message: "Do not acquire a semaphore around Effect.sync. Synchronous JavaScript cannot interleave."
-          }),
-          (diagnostic) => context.report(diagnostic)
-        )
+        return context.report(Diagnostic.make({
+          node,
+          message: "Do not acquire a semaphore around Effect.sync. Synchronous JavaScript cannot interleave."
+        }))
       }
     }
   }
 })
 
 export const nestedCallMessage =
-  "Do not pass a call directly to another call. Compose it with .pipe(...) or pipe(...) from effect/Function."
+  "Do not nest more than two calls in one direct argument chain. Keep f(g(x)), but compose deeper calls with one .pipe(...) or pipe(...) from effect/Function pipeline."
 
 export const chainedPipeMessage =
   "Do not chain .pipe(...) calls. Move every operator from the later .pipe(...) call into the first .pipe(...) call so the value has one receiver pipeline."
@@ -108,38 +148,6 @@ export const noNestedCalls = Rule.define({
     const importedPipeBindings = new Set()
     const importedFunctionNamespaces = new Set()
 
-    const transparentExpressionTypes = new Set([
-      "ParenthesizedExpression",
-      "ChainExpression",
-      "TSNonNullExpression",
-      "TSAsExpression",
-      "TSSatisfiesExpression",
-      "TSTypeAssertion",
-      "TSInstantiationExpression"
-    ])
-
-    const unwrapExpression = (node) => {
-      let expression = node
-      while (transparentExpressionTypes.has(expression.type)) expression = expression.expression
-      return expression
-    }
-
-    const getStaticMemberName = (member) => {
-      if (!member.computed && member.property.type === "Identifier") return member.property.name
-      if (!member.computed) return undefined
-      const property = unwrapExpression(member.property)
-      if (property.type === "Literal" && property.value === "pipe") return "pipe"
-      if (
-        property.type === "TemplateLiteral" &&
-        property.expressions.length === 0 &&
-        property.quasis.length === 1 &&
-        property.quasis[0].value.cooked === "pipe"
-      ) {
-        return "pipe"
-      }
-      return undefined
-    }
-
     const isStaticPipeMemberCall = (node) => {
       const callee = unwrapExpression(node.callee)
       return callee.type === "MemberExpression" && getStaticMemberName(callee) === "pipe"
@@ -150,10 +158,7 @@ export const noNestedCalls = Rule.define({
       if (!isStaticPipeMemberCall(node)) return false
       const namespace = unwrapExpression(callee.object)
       if (namespace.type !== "Identifier") return false
-      return pipe(
-        findVariable(context, namespace),
-        (variable) => importedFunctionNamespaces.has(variable)
-      )
+      return importedFunctionNamespaces.has(findVariable(context, namespace))
     }
 
     const isReceiverPipeCall = (node) => isStaticPipeMemberCall(node) && !isImportedNamespacePipeCall(node)
@@ -161,39 +166,31 @@ export const noNestedCalls = Rule.define({
     const isImportedPipeCall = (node) => {
       const callee = unwrapExpression(node.callee)
       if (callee.type === "Identifier") {
-        return pipe(
-          findVariable(context, callee),
-          (variable) => importedPipeBindings.has(variable)
-        )
+        return importedPipeBindings.has(findVariable(context, callee))
       }
       return isImportedNamespacePipeCall(node)
     }
 
     const isPipeCall = (node) => isReceiverPipeCall(node) || isImportedPipeCall(node)
 
-    const isInsidePipeOperator = (node) => {
+    const directArgumentDepth = (node) => {
+      let depth = 1
       let child = node
       const ancestors = context.sourceCode.getAncestors(node)
       for (let index = ancestors.length - 1; index >= 0; index--) {
         const ancestor = ancestors[index]
-        if (ancestor.type === "CallExpression" && isPipeCall(ancestor)) {
-          let firstOperatorIndex = 1
-          if (isReceiverPipeCall(ancestor)) firstOperatorIndex = 0
-          if (ancestor.arguments.slice(firstOperatorIndex).includes(child)) return true
+        if (transparentExpressionTypes.has(ancestor.type) && ancestor.expression === child) {
+          child = ancestor
+          continue
         }
+        if (ancestor.type !== "CallExpression") break
+        if (isPipeCall(ancestor)) break
+        if (!ancestor.arguments.includes(child)) break
+        depth++
         child = ancestor
       }
-      return false
+      return depth
     }
-
-    const report = (node, message) =>
-      pipe(
-        Diagnostic.make({ node, message }),
-        (diagnostic) => context.report(diagnostic)
-      )
-
-    const importedVariable = (node, localName) =>
-      context.sourceCode.getDeclaredVariables(node).find((variable) => variable.name === localName)
 
     return {
       ImportDeclaration: (node) => {
@@ -201,7 +198,7 @@ export const noNestedCalls = Rule.define({
         return Effect.sync(() => {
           for (const specifier of node.specifiers) {
             if (specifier.type === "ImportNamespaceSpecifier") {
-              const variable = importedVariable(node, specifier.local.name)
+              const variable = importedVariable(context, node, specifier.local.name)
               if (variable !== undefined) importedFunctionNamespaces.add(variable)
               continue
             }
@@ -213,7 +210,7 @@ export const noNestedCalls = Rule.define({
             ) {
               continue
             }
-            const variable = importedVariable(node, specifier.local.name)
+            const variable = importedVariable(context, node, specifier.local.name)
             if (variable !== undefined) importedPipeBindings.add(variable)
           }
         })
@@ -226,18 +223,10 @@ export const noNestedCalls = Rule.define({
           isReceiverPipeCall(node) && receiver?.type === "CallExpression" &&
           isReceiverPipeCall(receiver)
         ) {
-          return report(node, chainedPipeMessage)
+          return reportDiagnostic(context, node, chainedPipeMessage)
         }
-        if (isInsidePipeOperator(node) || isPipeCall(node)) return Effect.void
-        const nestedCalls = node.arguments
-          .map(unwrapExpression)
-          .filter((argument) => argument.type === "CallExpression")
-        if (nestedCalls.length === 0) return Effect.void
-        return Effect.forEach(
-          nestedCalls,
-          (nestedCall) => report(nestedCall, nestedCallMessage),
-          { discard: true }
-        )
+        if (isPipeCall(node) || directArgumentDepth(node) !== 3) return Effect.void
+        return reportDiagnostic(context, node, nestedCallMessage)
       }
     }
   }
@@ -278,6 +267,9 @@ const rootEffectModules = new Map([
 export const unnecessaryEffectForwardingMessage = (canonicalName, replacement) =>
   `Remove this forwarding closure. ${canonicalName} is verified data-last in Effect 4.0.0-beta.103 at this exact argument position. Pass ${replacement} directly to pipe.`
 
+export const unnecessaryPipeForwardingMessage = (callee, source) =>
+  `Remove this exact unary forwarding pipe operator. Call ${callee} directly with ${source} so the receiver and data flow stay visible.`
+
 export const noUnnecessaryEffectForwarding = Rule.define({
   name: "no-unnecessary-effect-forwarding",
   meta: Rule.meta({
@@ -289,25 +281,8 @@ export const noUnnecessaryEffectForwarding = Rule.define({
     const directBindings = new Map()
     const moduleNamespaces = new Map()
     const rootNamespaces = new Set()
-
-    const transparentExpressionTypes = new Set([
-      "ParenthesizedExpression",
-      "ChainExpression",
-      "TSNonNullExpression",
-      "TSAsExpression",
-      "TSSatisfiesExpression",
-      "TSTypeAssertion",
-      "TSInstantiationExpression"
-    ])
-
-    const unwrapExpression = (node) => {
-      let expression = node
-      while (transparentExpressionTypes.has(expression.type)) expression = expression.expression
-      return expression
-    }
-
-    const importedVariable = (node, localName) =>
-      context.sourceCode.getDeclaredVariables(node).find((variable) => variable.name === localName)
+    const importedPipeBindings = new Set()
+    const importedFunctionNamespaces = new Set()
 
     const staticMember = (node) => {
       const expression = unwrapExpression(node)
@@ -319,7 +294,7 @@ export const noUnnecessaryEffectForwarding = Rule.define({
     const resolveModule = (node) => {
       const expression = unwrapExpression(node)
       if (expression.type === "Identifier") {
-        return pipe(findVariable(context, expression), (variable) => moduleNamespaces.get(variable))
+        return moduleNamespaces.get(findVariable(context, expression))
       }
       const member = staticMember(expression)
       if (member === undefined) return undefined
@@ -333,13 +308,13 @@ export const noUnnecessaryEffectForwarding = Rule.define({
     const resolveCombinator = (node) => {
       const expression = unwrapExpression(node)
       if (expression.type === "Identifier") {
-        return pipe(findVariable(context, expression), (variable) => directBindings.get(variable))
+        return directBindings.get(findVariable(context, expression))
       }
       const member = staticMember(expression)
       if (member === undefined) return undefined
       const moduleName = resolveModule(member.expression.object)
       if (moduleName === undefined) return undefined
-      const dataIndex = pipe(dataLastEffectExports.get(moduleName), (exports) => exports?.get(member.name))
+      const dataIndex = dataLastEffectExports.get(moduleName)?.get(member.name)
       if (dataIndex === undefined) return undefined
       return { canonicalName: `${moduleName.slice("effect/".length)}.${member.name}`, dataIndex }
     }
@@ -363,7 +338,7 @@ export const noUnnecessaryEffectForwarding = Rule.define({
       const exports = dataLastEffectExports.get(source)
       if (exports !== undefined) {
         for (const specifier of node.specifiers) {
-          const variable = importedVariable(node, specifier.local.name)
+          const variable = importedVariable(context, node, specifier.local.name)
           if (variable === undefined) continue
           if (specifier.type === "ImportNamespaceSpecifier") {
             moduleNamespaces.set(variable, source)
@@ -382,9 +357,24 @@ export const noUnnecessaryEffectForwarding = Rule.define({
         }
         return
       }
+      if (source === "effect/Function") {
+        for (const specifier of node.specifiers) {
+          const variable = importedVariable(context, node, specifier.local.name)
+          if (variable === undefined) continue
+          if (specifier.type === "ImportNamespaceSpecifier") {
+            importedFunctionNamespaces.add(variable)
+          } else if (
+            specifier.type === "ImportSpecifier" && specifier.importKind !== "type" &&
+            specifier.imported.type === "Identifier" && specifier.imported.name === "pipe"
+          ) {
+            importedPipeBindings.add(variable)
+          }
+        }
+        return
+      }
       if (source !== "effect") return
       for (const specifier of node.specifiers) {
-        const variable = importedVariable(node, specifier.local.name)
+        const variable = importedVariable(context, node, specifier.local.name)
         if (variable === undefined) continue
         if (specifier.type === "ImportNamespaceSpecifier") {
           rootNamespaces.add(variable)
@@ -398,7 +388,71 @@ export const noUnnecessaryEffectForwarding = Rule.define({
       }
     }
 
+    const isImportedPipeCall = (node) => {
+      const callee = unwrapExpression(node.callee)
+      if (callee.type === "Identifier") {
+        return importedPipeBindings.has(findVariable(context, callee))
+      }
+      const member = getStaticMember(callee)
+      if (member?.name !== "pipe") return false
+      const namespace = unwrapExpression(member.expression.object)
+      return namespace.type === "Identifier" &&
+        importedFunctionNamespaces.has(findVariable(context, namespace))
+    }
+
+    const getPipeOperator = (node) => {
+      let child = node
+      const ancestors = context.sourceCode.getAncestors(node)
+      for (let index = ancestors.length - 1; index >= 0; index--) {
+        const ancestor = ancestors[index]
+        if (transparentExpressionTypes.has(ancestor.type) && ancestor.expression === child) {
+          child = ancestor
+          continue
+        }
+        if (ancestor.type !== "CallExpression") return undefined
+        if (isImportedPipeCall(ancestor)) {
+          if (ancestor.arguments.indexOf(child) < 1) return undefined
+          return { source: ancestor.arguments[0] }
+        }
+        const member = getStaticMember(ancestor.callee)
+        if (member?.name !== "pipe" || ancestor.arguments.indexOf(child) < 0) return undefined
+        return { source: member.expression.object }
+      }
+      return undefined
+    }
+
+    const inspectExactUnaryPipeForwarder = (node) => {
+      const pipeOperator = getPipeOperator(node)
+      if (pipeOperator === undefined || node.async || node.generator || node.params.length !== 1) {
+        return Effect.void
+      }
+      const parameter = node.params[0]
+      if (parameter.type !== "Identifier") return Effect.void
+      const body = unwrapExpression(node.body)
+      if (body.type !== "CallExpression" || body.optional || body.arguments.length !== 1) return Effect.void
+      if (body.arguments[0].type === "SpreadElement") return Effect.void
+      const callee = unwrapExpression(body.callee)
+      if (callee.type === "MemberExpression" && (callee.computed || callee.optional)) return Effect.void
+      if (callee.type !== "Identifier" && callee.type !== "MemberExpression") return Effect.void
+      const argument = unwrapExpression(body.arguments[0])
+      if (argument.type !== "Identifier") return Effect.void
+      const parameterVariable = context.sourceCode.getDeclaredVariables(node).find(
+        (variable) => variable.name === parameter.name
+      )
+      if (parameterVariable === undefined || findVariable(context, argument) !== parameterVariable) {
+        return Effect.void
+      }
+      if (parameterVariable.references.length !== 1 || parameterVariable.references[0].identifier !== argument) {
+        return Effect.void
+      }
+      const calleeText = context.sourceCode.getText(body.callee)
+      const sourceText = context.sourceCode.getText(pipeOperator.source)
+      return reportDiagnostic(context, node, unnecessaryPipeForwardingMessage(calleeText, sourceText))
+    }
+
     const inspectForwarder = (node) => {
+      const exactUnary = inspectExactUnaryPipeForwarder(node)
+      if (exactUnary !== Effect.void) return exactUnary
       if (node.async || node.generator || node.params.length !== 1) return Effect.void
       const parameter = node.params[0]
       if (parameter.type !== "Identifier") return Effect.void
@@ -427,18 +481,275 @@ export const noUnnecessaryEffectForwarding = Rule.define({
           remainingArguments.map((argument) => context.sourceCode.getText(argument)).join(", ")
         })`
       }
-      return pipe(
-        Diagnostic.make({
-          node,
-          message: unnecessaryEffectForwardingMessage(combinator.canonicalName, replacement)
-        }),
-        (diagnostic) => context.report(diagnostic)
+      return reportDiagnostic(
+        context,
+        node,
+        unnecessaryEffectForwardingMessage(combinator.canonicalName, replacement)
       )
     }
 
     return {
       ImportDeclaration: (node) => Effect.sync(() => registerImport(node)),
       ArrowFunctionExpression: inspectForwarder
+    }
+  }
+})
+
+const makeOfficialBindingResolver = (context, effectExports) => {
+  const moduleBindings = new Map()
+  const exportBindings = new Map()
+  const rootNamespaces = new Set()
+  const importBindingNodes = new WeakSet()
+  const aliasBindingNodes = new WeakSet()
+
+  const resolveModule = (node) => {
+    const expression = unwrapExpression(node)
+    if (expression.type === "Identifier") return moduleBindings.get(findVariable(context, expression))
+    const member = getStaticMember(expression)
+    if (member?.name !== "Effect") return undefined
+    const root = unwrapExpression(member.expression.object)
+    if (root.type !== "Identifier" || !rootNamespaces.has(findVariable(context, root))) return undefined
+    return "effect/Effect"
+  }
+
+  const resolveExport = (node) => {
+    const expression = unwrapExpression(node)
+    if (expression.type === "Identifier") return exportBindings.get(findVariable(context, expression))
+    const member = getStaticMember(expression)
+    if (member === undefined) return undefined
+    const moduleName = resolveModule(member.expression.object)
+    if (moduleName === "effect/Effect" && effectExports.has(member.name)) {
+      return { moduleName, name: member.name }
+    }
+    if (moduleName === "effect/Function" && member.name === "pipe") {
+      return { moduleName, name: "pipe" }
+    }
+    return undefined
+  }
+
+  const registerImport = (node) => {
+    if (node.importKind === "type") return
+    const source = node.source.value
+    for (const specifier of node.specifiers) importBindingNodes.add(specifier.local)
+    if (source === "effect/Effect" || source === "effect/Function") {
+      for (const specifier of node.specifiers) {
+        const variable = importedVariable(context, node, specifier.local.name)
+        if (variable === undefined) continue
+        if (specifier.type === "ImportNamespaceSpecifier") {
+          moduleBindings.set(variable, source)
+        } else if (
+          specifier.type === "ImportSpecifier" && specifier.importKind !== "type" &&
+          specifier.imported.type === "Identifier"
+        ) {
+          const name = specifier.imported.name
+          if (
+            (source === "effect/Effect" && effectExports.has(name)) ||
+            (source === "effect/Function" && name === "pipe")
+          ) {
+            exportBindings.set(variable, { moduleName: source, name })
+          }
+        }
+      }
+      return
+    }
+    if (source !== "effect") return
+    for (const specifier of node.specifiers) {
+      const variable = importedVariable(context, node, specifier.local.name)
+      if (variable === undefined) continue
+      if (specifier.type === "ImportNamespaceSpecifier") {
+        rootNamespaces.add(variable)
+      } else if (
+        specifier.type === "ImportSpecifier" && specifier.importKind !== "type" &&
+        specifier.imported.type === "Identifier" && specifier.imported.name === "Effect"
+      ) {
+        moduleBindings.set(variable, "effect/Effect")
+      }
+    }
+  }
+
+  const registerConstAlias = (node) => {
+    const declaration = context.sourceCode.getAncestors(node).findLast(
+      (ancestor) => ancestor.type === "VariableDeclaration"
+    )
+    if (declaration?.kind !== "const") return
+    if (node.init === null || node.init === undefined) return
+    if (node.id.type === "Identifier") {
+      const variable = context.sourceCode.getDeclaredVariables(node).find(
+        (candidate) => candidate.name === node.id.name
+      )
+      if (variable === undefined) return
+      const moduleName = resolveModule(node.init)
+      if (moduleName !== undefined) moduleBindings.set(variable, moduleName)
+      const resolvedExport = resolveExport(node.init)
+      if (resolvedExport !== undefined) exportBindings.set(variable, resolvedExport)
+      aliasBindingNodes.add(node.id)
+      return
+    }
+    if (node.id.type !== "ObjectPattern") return
+    const moduleName = resolveModule(node.init)
+    if (moduleName !== "effect/Effect") return
+    for (const property of node.id.properties) {
+      if (property.type !== "Property" || property.computed) continue
+      let key = property.key.value
+      if (property.key.type === "Identifier") key = property.key.name
+      if (typeof key !== "string" || !effectExports.has(key)) continue
+      let value = property.value
+      if (value.type === "AssignmentPattern") value = value.left
+      if (value.type !== "Identifier") continue
+      const variable = context.sourceCode.getDeclaredVariables(node).find(
+        (candidate) => candidate.name === value.name
+      )
+      if (variable !== undefined) exportBindings.set(variable, { moduleName, name: key })
+      aliasBindingNodes.add(value)
+    }
+  }
+
+  return {
+    aliasBindingNodes,
+    importBindingNodes,
+    registerConstAlias,
+    registerImport,
+    resolveExport,
+    resolveModule
+  }
+}
+
+export const functionEffectGenMessage =
+  "Do not return Effect.gen from a function. Move the generator body into Effect.fnUntraced(function* () { ... }). If this function intentionally defines a telemetry boundary, use Effect.fn(\"spanName\")(function* () { ... }). In Effect 4.0.0-beta.103, the first argument is the generator body and arguments after it act as sequential pipe operators, so migrate a returned pipeline as Effect.fnUntraced(function* () {}, x, y, z) or Effect.fn(\"spanName\")(function* () {}, x, y, z). Each operator receives the previous result and the original function arguments."
+
+export const noFunctionEffectGen = Rule.define({
+  name: "no-function-effect-gen",
+  meta: Rule.meta({
+    type: "problem",
+    description: "Define Effect returning functions with Effect.fnUntraced or Effect.fn."
+  }),
+  create: function*() {
+    const context = yield* RuleContext
+    const bindings = makeOfficialBindingResolver(context, new Set(["gen", "fn", "fnUntraced"]))
+
+    const effectGenRoot = (node) => {
+      const expression = unwrapExpression(node)
+      if (expression.type !== "CallExpression") return undefined
+      const resolved = bindings.resolveExport(expression.callee)
+      if (resolved?.name === "gen") return expression
+      if (resolved?.moduleName === "effect/Function") return effectGenRoot(expression.arguments[0])
+      const member = getStaticMember(expression.callee)
+      if (member?.name === "pipe") return effectGenRoot(member.expression.object)
+      return undefined
+    }
+
+    const isOrdinaryFunction = (node) =>
+      (node.type === "ArrowFunctionExpression" ||
+        node.type === "FunctionExpression" ||
+        node.type === "FunctionDeclaration") &&
+      !node.async && !node.generator
+
+    const inspectReturnedExpression = (functionNode, expression) => {
+      if (!isOrdinaryFunction(functionNode)) return Effect.void
+      const root = effectGenRoot(expression)
+      if (root === undefined) return Effect.void
+      return reportDiagnostic(context, root, functionEffectGenMessage)
+    }
+
+    return {
+      ImportDeclaration: (node) => Effect.sync(() => bindings.registerImport(node)),
+      VariableDeclarator: (node) => Effect.sync(() => bindings.registerConstAlias(node)),
+      ArrowFunctionExpression: (node) => {
+        if (node.body.type === "BlockStatement") return Effect.void
+        return inspectReturnedExpression(node, node.body)
+      },
+      ReturnStatement: (node) => {
+        if (node.argument === null) return Effect.void
+        const ancestors = context.sourceCode.getAncestors(node)
+        const owner = ancestors.findLast((ancestor) =>
+          ancestor.type === "ArrowFunctionExpression" ||
+          ancestor.type === "FunctionExpression" ||
+          ancestor.type === "FunctionDeclaration"
+        )
+        if (owner === undefined) return Effect.void
+        return inspectReturnedExpression(owner, node.argument)
+      }
+    }
+  }
+})
+
+export const effectOrDieMessage =
+  "Do not use Effect.orDie. Catch each intended tagged failure with Effect.catchTag, Effect.catchTags, Effect.catchReason, or Effect.catchReasons, and call Effect.die(error) in each selected handler so defect conversion stays visible and exhaustive."
+
+export const effectCatchDieMessage =
+  "Do not convert the complete Effect error channel to defects with Effect.catch. Catch each intended tag or nested reason with Effect.catchTag, Effect.catchTags, Effect.catchReason, or Effect.catchReasons, and call Effect.die(error) in each selected handler so newly added failures remain typed until reviewed."
+
+export const noImplicitDefectConversion = Rule.define({
+  name: "no-implicit-defect-conversion",
+  meta: Rule.meta({
+    type: "problem",
+    description: "Require explicit tag or reason selection before converting typed failures to defects."
+  }),
+  create: function*() {
+    const context = yield* RuleContext
+    const bindings = makeOfficialBindingResolver(context, new Set(["orDie", "catch", "die"]))
+
+    const isCatchDieForwarder = (node) => {
+      if (bindings.resolveExport(node.callee)?.name !== "catch") return false
+      if (node.arguments.some((argument) => argument.type === "SpreadElement")) return false
+      let handlerIndex = -1
+      if (node.arguments.length === 1) handlerIndex = 0
+      else if (node.arguments.length === 2) handlerIndex = 1
+      if (handlerIndex < 0) return false
+      const handler = unwrapExpression(node.arguments[handlerIndex])
+      if (
+        (handler.type !== "ArrowFunctionExpression" && handler.type !== "FunctionExpression") ||
+        handler.async || handler.generator || handler.params.length !== 1 ||
+        handler.params[0].type !== "Identifier"
+      ) return false
+      let returned = unwrapExpression(handler.body)
+      if (returned.type === "BlockStatement") {
+        if (returned.body.length !== 1 || returned.body[0].type !== "ReturnStatement") return false
+        if (returned.body[0].argument === null) return false
+        returned = unwrapExpression(returned.body[0].argument)
+      }
+      if (
+        returned.type !== "CallExpression" || returned.arguments.length !== 1 ||
+        returned.arguments[0].type === "SpreadElement" ||
+        bindings.resolveExport(returned.callee)?.name !== "die"
+      ) return false
+      const argument = unwrapExpression(returned.arguments[0])
+      if (argument.type !== "Identifier") return false
+      const parameter = handler.params[0]
+      const variable = context.sourceCode.getDeclaredVariables(handler).find(
+        (candidate) => candidate.name === parameter.name
+      )
+      return variable !== undefined && findVariable(context, argument) === variable &&
+        variable.references.length === 1 && variable.references[0].identifier === argument
+    }
+
+    return {
+      ImportDeclaration: (node) => Effect.sync(() => bindings.registerImport(node)),
+      ExportNamedDeclaration: (node) => {
+        if (node.source?.value !== "effect/Effect" || node.exportKind === "type") return Effect.void
+        return Effect.forEach(
+          node.specifiers.filter((specifier) =>
+            specifier.type === "ExportSpecifier" &&
+            specifier.local.type === "Identifier" && specifier.local.name === "orDie"
+          ),
+          (specifier) => reportDiagnostic(context, specifier.local, effectOrDieMessage),
+          { discard: true }
+        )
+      },
+      VariableDeclarator: (node) => Effect.sync(() => bindings.registerConstAlias(node)),
+      Identifier: (node) => {
+        if (bindings.importBindingNodes.has(node) || bindings.aliasBindingNodes.has(node)) return Effect.void
+        if (bindings.resolveExport(node)?.name !== "orDie") return Effect.void
+        return reportDiagnostic(context, node, effectOrDieMessage)
+      },
+      MemberExpression: (node) => {
+        if (bindings.resolveExport(node)?.name !== "orDie") return Effect.void
+        return reportDiagnostic(context, node, effectOrDieMessage)
+      },
+      CallExpression: (node) => {
+        if (!isCatchDieForwarder(node)) return Effect.void
+        return reportDiagnostic(context, node, effectCatchDieMessage)
+      }
     }
   }
 })
@@ -500,6 +811,23 @@ const managedRuntimeBoundaries = new Set([
   "dispose"
 ])
 
+const typePolicyCheckers = new Map()
+const getTypePolicyChecker = (cwd) => {
+  let checker = typePolicyCheckers.get(cwd)
+  if (checker === undefined) {
+    checker = makeEffectTypePolicyChecker({ cwd })
+    typePolicyCheckers.set(cwd, checker)
+  }
+  return checker
+}
+const closeTypePolicyCheckers = () => {
+  for (const checker of typePolicyCheckers.values()) checker.close()
+  typePolicyCheckers.clear()
+}
+process.once("exit", closeTypePolicyCheckers)
+process.once("SIGINT", closeTypePolicyCheckers)
+process.once("SIGTERM", closeTypePolicyCheckers)
+
 export const noManualEffectBoundary = Rule.define({
   name: "no-manual-effect-boundary",
   meta: Rule.meta({
@@ -513,21 +841,28 @@ export const noManualEffectBoundary = Rule.define({
     const managedRuntimeFactories = new Set()
     const managedRuntimeValues = new Set()
     const importBindingNodes = new WeakSet()
+    const aliasBindingNodes = new WeakSet()
+    const reportedRanges = new Set()
+    let typedRuntimeViolations = []
+    const typedRuntimeRanges = new Set()
 
     const getModule = (node) => {
       if (node.type === "Identifier") {
         const variable = findVariable(context, node)
         return moduleBindings.get(variable)
       }
-      if (node.type !== "MemberExpression" || node.computed) return undefined
-      if (node.object.type !== "Identifier" || node.property.type !== "Identifier") return undefined
-      const variable = findVariable(context, node.object)
+      const member = getStaticMember(node)
+      if (member === undefined) return undefined
+      const object = unwrapExpression(member.expression.object)
+      if (object.type !== "Identifier") return undefined
+      const variable = findVariable(context, object)
       if (moduleBindings.get(variable) !== "effect") return undefined
-      return effectRootModules.get(node.property.name)
+      return effectRootModules.get(member.name)
     }
 
     const getMemberName = (node) => {
-      if (!node.computed && node.property.type === "Identifier") return node.property.name
+      const staticName = getStaticMemberName(node)
+      if (staticName !== undefined) return staticName
       if (
         node.computed &&
         node.property.type === "MemberExpression" &&
@@ -543,8 +878,9 @@ export const noManualEffectBoundary = Rule.define({
     }
 
     const isManagedRuntimeMake = (node) => {
-      if (node.type !== "CallExpression") return false
-      const callee = node.callee
+      const expression = unwrapExpression(node)
+      if (expression.type !== "CallExpression") return false
+      const callee = unwrapExpression(expression.callee)
       if (callee.type === "Identifier") {
         const variable = findVariable(context, callee)
         return managedRuntimeFactories.has(variable)
@@ -556,6 +892,7 @@ export const noManualEffectBoundary = Rule.define({
 
     const containsManagedRuntimeMake = (node) => {
       if (node === null || node === undefined) return false
+      node = unwrapExpression(node)
       if (isManagedRuntimeMake(node)) return true
       if (node.type === "Identifier") {
         const variable = findVariable(context, node)
@@ -573,13 +910,112 @@ export const noManualEffectBoundary = Rule.define({
       return false
     }
 
-    const report = (node) =>
-      pipe(
-        Diagnostic.make({ node, message: manualBoundaryMessage }),
-        (diagnostic) => context.report(diagnostic)
+    const resolveBoundary = (node) => {
+      const expression = unwrapExpression(node)
+      if (expression.type === "Identifier") {
+        return directBoundaryBindings.has(findVariable(context, expression))
+      }
+      const member = getStaticMember(expression)
+      if (member === undefined) return false
+      const moduleName = getModule(member.expression.object)
+      return boundaryModules.get(moduleName)?.has(member.name) === true
+    }
+
+    const getPatternProperty = (property) => {
+      if (
+        property.type !== "Property" || property.computed &&
+          property.key.type !== "Literal" && property.key.type !== "TemplateLiteral"
+      ) return undefined
+      let name
+      if (property.key.type === "Identifier") name = property.key.name
+      else if (property.key.type === "Literal") name = property.key.value
+      else if (property.key.expressions.length === 0 && property.key.quasis.length === 1) {
+        name = property.key.quasis[0].value.cooked
+      }
+      if (typeof name !== "string") return undefined
+      let value = property.value
+      if (value.type === "AssignmentPattern") value = value.left
+      if (value.type !== "Identifier") return undefined
+      return { name, value }
+    }
+
+    const registerConstAlias = (node) => {
+      const declaration = context.sourceCode.getAncestors(node).findLast(
+        (ancestor) => ancestor.type === "VariableDeclaration"
       )
+      if (declaration?.kind !== "const" || node.init === null) return
+      if (node.id.type === "Identifier") {
+        const variable = context.sourceCode.getDeclaredVariables(node).find(
+          (candidate) => candidate.name === node.id.name
+        )
+        if (variable === undefined) return
+        const moduleName = getModule(node.init)
+        if (moduleName !== undefined) moduleBindings.set(variable, moduleName)
+        const initializer = unwrapExpression(node.init)
+        if (resolveBoundary(initializer)) directBoundaryBindings.add(variable)
+        if (
+          initializer.type === "Identifier" &&
+          managedRuntimeFactories.has(findVariable(context, initializer))
+        ) {
+          managedRuntimeFactories.add(variable)
+        }
+        if (containsManagedRuntimeMake(initializer)) managedRuntimeValues.add(variable)
+        aliasBindingNodes.add(node.id)
+        return
+      }
+      if (node.id.type !== "ObjectPattern") return
+      const moduleName = getModule(node.init)
+      const runtimeValue = containsManagedRuntimeMake(node.init)
+      for (const property of node.id.properties) {
+        const binding = getPatternProperty(property)
+        if (binding === undefined) continue
+        const variable = context.sourceCode.getDeclaredVariables(node).find(
+          (candidate) => candidate.name === binding.value.name
+        )
+        if (variable === undefined) continue
+        if (
+          boundaryModules.get(moduleName)?.has(binding.name) === true ||
+          runtimeValue && managedRuntimeBoundaries.has(binding.name) ||
+          typedRuntimeRanges.has(`${binding.value.start}:${binding.value.end}`)
+        ) {
+          directBoundaryBindings.add(variable)
+        }
+        if (moduleName === "effect/ManagedRuntime" && binding.name === "make") {
+          managedRuntimeFactories.add(variable)
+        }
+        aliasBindingNodes.add(binding.value)
+      }
+    }
+
+    const report = (node) => {
+      const range = `${node.start}:${node.end}`
+      if (reportedRanges.has(range)) return Effect.void
+      reportedRanges.add(range)
+      return context.report(Diagnostic.make({ node, message: manualBoundaryMessage }))
+    }
 
     return {
+      Program: (node) =>
+        Effect.sync(() => {
+          const isTypeScript = context.filename.endsWith(".ts") || context.filename.endsWith(".tsx")
+          if (!isTypeScript) return
+          try {
+            typedRuntimeViolations = getTypePolicyChecker(context.cwd).analyze({
+              filename: context.filename,
+              sourceText: context.sourceCode.text
+            }).manualRuntimeBoundaries
+            for (const violation of typedRuntimeViolations) {
+              typedRuntimeRanges.add(`${violation.start}:${violation.end}`)
+            }
+          } catch (cause) {
+            context.report({
+              node,
+              message: `Could not verify ManagedRuntime boundaries. The type aware rule must run successfully: ${
+                String(cause)
+              }`
+            })
+          }
+        }),
       ImportDeclaration: (node) => {
         if (node.importKind === "type") return Effect.void
         const source = node.source.value
@@ -616,20 +1052,20 @@ export const noManualEffectBoundary = Rule.define({
         })
       },
       VariableDeclarator: (node) => {
-        if (!containsManagedRuntimeMake(node.init)) return Effect.void
-        return Effect.sync(() => {
-          for (const variable of context.sourceCode.getDeclaredVariables(node)) {
-            managedRuntimeValues.add(variable)
-          }
-        })
+        return Effect.sync(() => registerConstAlias(node))
       },
       Identifier: (node) => {
-        if (importBindingNodes.has(node)) return Effect.void
+        if (typedRuntimeRanges.has(`${node.start}:${node.end}`)) return report(node)
+        if (importBindingNodes.has(node) || aliasBindingNodes.has(node)) return Effect.void
         const variable = findVariable(context, node)
-        if (!directBoundaryBindings.has(variable)) return Effect.void
+        if (
+          !directBoundaryBindings.has(variable) ||
+          variable.references.every((reference) => reference.identifier !== node)
+        ) return Effect.void
         return report(node)
       },
       MemberExpression: (node) => {
+        if (typedRuntimeRanges.has(`${node.start}:${node.end}`)) return report(node)
         const memberName = getMemberName(node)
         if (memberName === undefined) return Effect.void
         const moduleName = getModule(node.object)
@@ -643,6 +1079,31 @@ export const noManualEffectBoundary = Rule.define({
         const variable = findVariable(context, node.object)
         if (managedRuntimeValues.has(variable)) return report(node)
         return Effect.void
+      },
+      "Program:exit": (node) => {
+        const isTypeScript = context.filename.endsWith(".ts") || context.filename.endsWith(".tsx")
+        if (!isTypeScript) return Effect.void
+        return Effect.sync(() => {
+          for (const violation of typedRuntimeViolations) {
+            if (reportedRanges.has(`${violation.start}:${violation.end}`)) continue
+            const deepestNode = context.sourceCode.getNodeByRangeIndex(violation.start)
+            let reportNode = deepestNode ?? node
+            if (deepestNode !== null) {
+              const ancestors = context.sourceCode.getAncestors(deepestNode)
+              for (const ancestor of ancestors) {
+                if (ancestor.start === violation.start && ancestor.end === violation.end) reportNode = ancestor
+              }
+              const violationText = context.sourceCode.text.slice(violation.start, violation.end)
+              if (violationText.endsWith("[Symbol.asyncDispose]")) {
+                const call = ancestors.findLast((ancestor) =>
+                  ancestor.type === "CallExpression" && ancestor.start === violation.start
+                )
+                if (call !== undefined) reportNode = call
+              }
+            }
+            report(reportNode)
+          }
+        })
       }
     }
   }
@@ -653,52 +1114,33 @@ const taggedEffectErrorMessage = (errorTypes) => {
   return `Effect error channel contains an untagged type: ${displayedTypes}. Every non never Effect error must have a required _tag. Define library errors with Schema.TaggedErrorClass and propagate or handle them by _tag. Do not hide the error with a cast, unknown, any, or an unconstrained generic.`
 }
 
-export const requireTaggedEffectError = {
-  meta: Rule.meta({
-    type: "problem",
-    description: "Require every non never member of an Effect error channel to have a _tag."
-  }),
+const layerPascalCaseMessage = (name) =>
+  `Layer value ${name} must use PascalCase. Functions that return a Layer remain camelCase.`
+
+const serviceTagMapMessage =
+  "Do not access a Context service by mapping its key. Use Effect.gen and yield the service explicitly with const service = yield* Service. When defining a reusable function, use Effect.fnUntraced with the generator body as its first argument."
+
+const makeTypePolicyRule = ({ description, failure, select, message }) => ({
+  meta: Rule.meta({ type: "problem", description }),
   createOnce(context) {
-    let checker
-    let activeFiles = 0
-    let closeRequested = false
-    const closeChecker = () => {
-      if (checker === undefined) return
-      if (activeFiles > 0) {
-        closeRequested = true
-        return
-      }
-      checker.close()
-      checker = undefined
-    }
-    const handleSignal = () => {
-      closeRequested = true
-      closeChecker()
-    }
-    process.once("exit", closeChecker)
-    process.once("SIGINT", handleSignal)
-    process.once("SIGTERM", handleSignal)
     return {
       before: () => {
         const isTypeScript = context.filename.endsWith(".ts") || context.filename.endsWith(".tsx")
         if (!isTypeScript) return false
-        if (checker === undefined) checker = makeTaggedEffectErrorChecker({ cwd: context.cwd })
-        activeFiles++
         return true
       },
       "Program:exit": (node) => {
         let violations
         try {
-          violations = checker.find({
-            filename: context.filename,
-            sourceText: context.sourceCode.text
-          })
+          violations = select(
+            getTypePolicyChecker(context.cwd).analyze({
+              filename: context.filename,
+              sourceText: context.sourceCode.text
+            })
+          )
         } catch (cause) {
           const detail = String(cause)
-          context.report({
-            node,
-            message: `Could not verify Effect error tags. The type aware rule must run successfully: ${detail}`
-          })
+          context.report({ node, message: `${failure}: ${detail}` })
           return
         }
         for (const violation of violations) {
@@ -710,16 +1152,33 @@ export const requireTaggedEffectError = {
               if (ancestor.start === violation.start && ancestor.end === violation.end) reportNode = ancestor
             }
           }
-          context.report({ node: reportNode, message: taggedEffectErrorMessage(violation.errorTypes) })
+          context.report({ node: reportNode, message: message(violation) })
         }
-      },
-      after: () => {
-        activeFiles--
-        if (closeRequested) closeChecker()
       }
     }
   }
-}
+})
+
+export const requireTaggedEffectError = makeTypePolicyRule({
+  description: "Require every non never member of an Effect error channel to have a _tag.",
+  failure: "Could not verify Effect error tags. The type aware rule must run successfully",
+  select: (analysis) => analysis.taggedEffectErrors,
+  message: (violation) => taggedEffectErrorMessage(violation.errorTypes)
+})
+
+export const requireLayerPascalCase = makeTypePolicyRule({
+  description: "Require every Effect Layer value binding to use PascalCase.",
+  failure: "Could not verify Layer value names. The type aware rule must run successfully",
+  select: (analysis) => analysis.layerNames,
+  message: (violation) => layerPascalCaseMessage(violation.name)
+})
+
+export const noServiceTagMap = makeTypePolicyRule({
+  description: "Require Context services to be yielded explicitly instead of mapped from their key.",
+  failure: "Could not verify Context service access. The type aware rule must run successfully",
+  select: (analysis) => analysis.serviceTagMaps,
+  message: () => serviceTagMapMessage
+})
 
 export default Plugin.define({
   name: "effect-local",
@@ -728,7 +1187,11 @@ export default Plugin.define({
     noSemaphoreEffectSync,
     noNestedCalls,
     noUnnecessaryEffectForwarding,
+    noFunctionEffectGen,
+    noImplicitDefectConversion,
     noManualEffectBoundary,
-    requireTaggedEffectError
+    requireTaggedEffectError,
+    requireLayerPascalCase,
+    noServiceTagMap
   }
 })

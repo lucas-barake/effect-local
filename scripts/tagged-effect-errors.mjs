@@ -1,33 +1,54 @@
 import {
   isArrayLiteralExpression,
+  isCallExpression,
+  isElementAccessExpression,
   isExpression,
   isIdentifier,
+  isNoSubstitutionTemplateLiteral,
+  isObjectBindingPattern,
   isObjectLiteralExpression,
-  isTypeNode
+  isOuterExpression,
+  isPropertyAccessExpression,
+  isStringLiteral,
+  isTypeNode,
+  isVariableDeclaration
 } from "@typescript/native-preview/unstable/ast/is"
 import { API, SignatureKind, SymbolFlags, TypeFlags } from "@typescript/native-preview/unstable/sync"
-import { pipe } from "effect/Function"
 import { realpathSync } from "node:fs"
 import { resolve } from "node:path"
 
 const effectMarker = "~effect/Effect"
+const layerMarker = "~effect/Layer"
+const serviceMarker = "~effect/Context/Service"
+const managedRuntimeMarker = "~effect/ManagedRuntime"
 
-export const makeTaggedEffectErrorChecker = ({ cwd }) => {
-  const effectUnhandledDeclaration = pipe(
-    resolve(cwd, "node_modules/effect/dist/Types.d.ts"),
-    (path) => realpathSync(path)
-  )
+export const makeEffectTypePolicyChecker = ({ cwd }) => {
+  const effectUnhandledDeclaration = realpathSync(resolve(cwd, "node_modules/effect/dist/Types.d.ts"))
   const effectUnhandledDeclarations = new Set([
     effectUnhandledDeclaration,
     effectUnhandledDeclaration.toLowerCase()
   ])
-  const effectSocketDeclaration = pipe(
-    resolve(cwd, "node_modules/effect/dist/unstable/socket/Socket.d.ts"),
-    (path) => realpathSync(path)
+  const effectSocketDeclaration = realpathSync(
+    resolve(cwd, "node_modules/effect/dist/unstable/socket/Socket.d.ts")
   )
   const effectSocketDeclarations = new Set([
     effectSocketDeclaration,
     effectSocketDeclaration.toLowerCase()
+  ])
+  const layerDeclaration = realpathSync(resolve(cwd, "node_modules/effect/dist/Layer.d.ts"))
+  const layerDeclarations = new Set([layerDeclaration, layerDeclaration.toLowerCase()])
+  const contextDeclaration = realpathSync(resolve(cwd, "node_modules/effect/dist/Context.d.ts"))
+  const contextDeclarations = new Set([contextDeclaration, contextDeclaration.toLowerCase()])
+  const effectDeclaration = realpathSync(resolve(cwd, "node_modules/effect/dist/Effect.d.ts"))
+  const effectDeclarations = new Set([effectDeclaration, effectDeclaration.toLowerCase()])
+  const functionDeclaration = realpathSync(resolve(cwd, "node_modules/effect/dist/Function.d.ts"))
+  const functionDeclarations = new Set([functionDeclaration, functionDeclaration.toLowerCase()])
+  const managedRuntimeDeclaration = realpathSync(
+    resolve(cwd, "node_modules/effect/dist/ManagedRuntime.d.ts")
+  )
+  const managedRuntimeDeclarations = new Set([
+    managedRuntimeDeclaration,
+    managedRuntimeDeclaration.toLowerCase()
   ])
   const sourceOverrides = new Map()
   let openFilename
@@ -42,7 +63,11 @@ export const makeTaggedEffectErrorChecker = ({ cwd }) => {
     }
   })
 
-  const find = ({ filename, sourceText }) => {
+  let cachedAnalysis
+  const analyze = ({ filename, sourceText }) => {
+    if (cachedAnalysis?.filename === filename && cachedAnalysis.sourceText === sourceText) {
+      return cachedAnalysis.result
+    }
     const absoluteFilename = resolve(cwd, filename)
     sourceOverrides.set(absoluteFilename, sourceText)
     let snapshot
@@ -70,7 +95,13 @@ export const makeTaggedEffectErrorChecker = ({ cwd }) => {
       if (sourceFile === undefined) throw new Error(`TypeScript did not load ${absoluteFilename}`)
       const checker = project.checker
       const expressions = []
+      const variableNames = []
+      const calls = []
+      const objectBindingPatterns = []
       const visit = (node) => {
+        if (isVariableDeclaration(node) && isIdentifier(node.name)) variableNames.push(node.name)
+        if (isCallExpression(node)) calls.push(node)
+        if (isObjectBindingPattern(node)) objectBindingPatterns.push(node)
         const typeNode = isTypeNode(node)
         const namedNode = isIdentifier(node) && node.parent.name === node
         const literalContainer = isArrayLiteralExpression(node) || isObjectLiteralExpression(node)
@@ -210,7 +241,7 @@ export const makeTaggedEffectErrorChecker = ({ cwd }) => {
       }
       collectViolationMemberIds(sourceFile)
 
-      const diagnostics = []
+      const taggedEffectErrors = []
       for (const expression of expressions) {
         const violation = violationByExpression.get(expression)
         if (violation === undefined) continue
@@ -222,13 +253,199 @@ export const makeTaggedEffectErrorChecker = ({ cwd }) => {
         if (innermostMembers.length === 0) continue
 
         const names = innermostMembers.map((member) => checker.typeToString(member))
-        diagnostics.push({
+        taggedEffectErrors.push({
           start: expression.getStart(sourceFile),
           end: expression.getEnd(),
           errorTypes: [...new Set(names)].toSorted((left, right) => left.localeCompare(right))
         })
       }
-      return diagnostics
+      const layerNameTypes = checker.getTypeAtLocation(variableNames)
+      const layerByType = new Map()
+      const hasOfficialLayerMarker = (type, seen = new Set()) => {
+        if (layerByType.has(type.id)) return layerByType.get(type.id)
+        if (seen.has(type.id)) return false
+        seen.add(type.id)
+        let result = false
+        if ((type.flags & (TypeFlags.Any | TypeFlags.Unknown)) === 0) {
+          if ((type.flags & TypeFlags.Union) !== 0) {
+            const members = type.getTypes()
+            result = members.length > 0 && members.every((member) => hasOfficialLayerMarker(member, seen))
+          } else if ((type.flags & TypeFlags.Intersection) !== 0) {
+            result = type.getTypes().some((member) => hasOfficialLayerMarker(member, seen))
+          } else {
+            const marker = checker.getPropertyOfType(type, layerMarker)
+            result = marker?.declarations.some((declaration) => {
+              if (!layerDeclarations.has(declaration.path)) return false
+              const declarationNode = declaration.resolve(project)
+              return declarationNode?.parent?.name?.text === "Variance"
+            }) === true
+            if (!result && (type.flags & (TypeFlags.TypeParameter | TypeFlags.Conditional)) !== 0) {
+              const constraint = checker.getBaseConstraintOfType(type)
+              if (constraint !== undefined) result = hasOfficialLayerMarker(constraint, seen)
+            }
+          }
+        }
+        seen.delete(type.id)
+        layerByType.set(type.id, result)
+        return result
+      }
+      const layerNames = []
+      for (let index = 0; index < variableNames.length; index++) {
+        const name = variableNames[index]
+        const type = layerNameTypes[index]
+        if (type === undefined || /^[A-Z][A-Za-z0-9]*$/.test(name.text)) continue
+        if (!hasOfficialLayerMarker(type)) continue
+        layerNames.push({ start: name.getStart(sourceFile), end: name.getEnd(), name: name.text })
+      }
+
+      const unwrapNative = (node) => {
+        let expression = node
+        while (isOuterExpression(expression)) expression = expression.expression
+        return expression
+      }
+      const hasDeclarationFrom = (symbol, name, declarations) => {
+        if (symbol === undefined) return false
+        let resolved = symbol
+        if ((symbol.flags & SymbolFlags.Alias) !== 0) resolved = checker.getAliasedSymbol(symbol)
+        return resolved.name === name && resolved.declarations.some((declaration) => declarations.has(declaration.path))
+      }
+      const isOfficialCallee = (node, name, declarations, seen = new Set()) => {
+        const expression = unwrapNative(node)
+        const symbol = checker.getSymbolAtLocation(expression)
+        if (hasDeclarationFrom(symbol, name, declarations)) return true
+        if (symbol === undefined || seen.has(symbol.id)) return false
+        seen.add(symbol.id)
+        const aliasesOfficial = symbol.declarations.some((declaration) => {
+          const declarationNode = declaration.resolve(project)
+          if (!isVariableDeclaration(declarationNode) || (declarationNode.parent.flags & 2) === 0) {
+            return false
+          }
+          return declarationNode.initializer !== undefined &&
+            isOfficialCallee(declarationNode.initializer, name, declarations, seen)
+        })
+        seen.delete(symbol.id)
+        return aliasesOfficial
+      }
+      const isNativePipeMember = (node) => {
+        const expression = unwrapNative(node)
+        if (isPropertyAccessExpression(expression)) return expression.name.text === "pipe"
+        if (!isElementAccessExpression(expression)) return false
+        const argument = unwrapNative(expression.argumentExpression)
+        return argument !== undefined &&
+          (isStringLiteral(argument) || isNoSubstitutionTemplateLiteral(argument)) &&
+          argument.text === "pipe"
+      }
+      const nativeMemberObject = (node) => {
+        const expression = unwrapNative(node)
+        if (isPropertyAccessExpression(expression) || isElementAccessExpression(expression)) {
+          return expression.expression
+        }
+        return undefined
+      }
+      const nativeStaticName = (node) => {
+        const expression = unwrapNative(node)
+        if (isPropertyAccessExpression(expression)) return expression.name.text
+        if (!isElementAccessExpression(expression)) return undefined
+        const argument = unwrapNative(expression.argumentExpression)
+        if (argument === undefined) return undefined
+        if (isStringLiteral(argument) || isNoSubstitutionTemplateLiteral(argument)) return argument.text
+        if (
+          isPropertyAccessExpression(argument) && argument.name.text === "asyncDispose" &&
+          isIdentifier(argument.expression) && argument.expression.text === "Symbol"
+        ) return "asyncDispose"
+        return undefined
+      }
+      const isOfficialService = (node) => {
+        const type = checker.getTypeAtLocation(unwrapNative(node))
+        if (type === undefined) return false
+        const marker = checker.getPropertyOfType(type, serviceMarker)
+        return marker?.declarations.some((declaration) => contextDeclarations.has(declaration.path)) === true
+      }
+      const isMapOperator = (node) => {
+        const expression = unwrapNative(node)
+        return isCallExpression(expression) && isOfficialCallee(expression.expression, "map", effectDeclarations)
+      }
+      const serviceTagMaps = []
+      const seenServiceStarts = new Set()
+      const addService = (node) => {
+        const service = unwrapNative(node)
+        if (!isOfficialService(service)) return
+        const start = service.getStart(sourceFile)
+        if (seenServiceStarts.has(start)) return
+        seenServiceStarts.add(start)
+        serviceTagMaps.push({ start, end: service.getEnd() })
+      }
+      for (const call of calls) {
+        const callee = unwrapNative(call.expression)
+        if (isOfficialCallee(callee, "map", effectDeclarations) && call.arguments.length === 2) {
+          addService(call.arguments[0])
+          continue
+        }
+        if (isOfficialCallee(callee, "pipe", functionDeclarations)) {
+          if (call.arguments.length >= 2 && isMapOperator(call.arguments[1])) addService(call.arguments[0])
+          continue
+        }
+        if (isNativePipeMember(callee) && call.arguments.length >= 1 && isMapOperator(call.arguments[0])) {
+          addService(nativeMemberObject(callee))
+        }
+      }
+
+      const managedRuntimeBoundaryNames = new Set([
+        "runFork",
+        "runCallback",
+        "runSyncExit",
+        "runSync",
+        "runPromiseExit",
+        "runPromise",
+        "context",
+        "dispose",
+        "asyncDispose"
+      ])
+      const isOfficialManagedRuntime = (node) => {
+        const expression = unwrapNative(node)
+        const type = typeByExpression.get(expression)
+        if (type === undefined || (type.flags & (TypeFlags.Any | TypeFlags.Unknown)) !== 0) return false
+        const marker = checker.getPropertyOfType(type, managedRuntimeMarker)
+        return marker?.declarations.some((declaration) => managedRuntimeDeclarations.has(declaration.path)) === true
+      }
+      const manualRuntimeBoundaries = []
+      const seenRuntimeBoundaryStarts = new Set()
+      const addRuntimeBoundary = (node) => {
+        const start = node.getStart(sourceFile)
+        if (seenRuntimeBoundaryStarts.has(start)) return
+        seenRuntimeBoundaryStarts.add(start)
+        manualRuntimeBoundaries.push({ start, end: node.getEnd() })
+      }
+      for (const expression of expressions) {
+        const name = nativeStaticName(expression)
+        if (name === undefined || !managedRuntimeBoundaryNames.has(name)) continue
+        const object = nativeMemberObject(expression)
+        if (object !== undefined && isOfficialManagedRuntime(object)) addRuntimeBoundary(expression)
+      }
+      const objectBindingPatternTypes = checker.getTypeAtLocation(objectBindingPatterns)
+      for (let index = 0; index < objectBindingPatterns.length; index++) {
+        const pattern = objectBindingPatterns[index]
+        const type = objectBindingPatternTypes[index]
+        if (type === undefined || (type.flags & (TypeFlags.Any | TypeFlags.Unknown)) !== 0) continue
+        const marker = checker.getPropertyOfType(type, managedRuntimeMarker)
+        const official = marker?.declarations.some((declaration) =>
+          managedRuntimeDeclarations.has(declaration.path)
+        ) === true
+        if (!official) continue
+        for (const element of pattern.elements) {
+          if (element.dotDotDotToken !== undefined || !isIdentifier(element.name)) continue
+          const property = element.propertyName ?? element.name
+          let name
+          if (isIdentifier(property) || isStringLiteral(property) || isNoSubstitutionTemplateLiteral(property)) {
+            name = property.text
+          }
+          if (name !== undefined && managedRuntimeBoundaryNames.has(name)) addRuntimeBoundary(element.name)
+        }
+      }
+
+      const result = { layerNames, manualRuntimeBoundaries, serviceTagMaps, taggedEffectErrors }
+      cachedAnalysis = { filename, sourceText, result }
+      return result
     } finally {
       if (snapshot !== undefined) snapshot.dispose()
       sourceOverrides.delete(absoluteFilename)
@@ -236,7 +453,8 @@ export const makeTaggedEffectErrorChecker = ({ cwd }) => {
   }
 
   return {
-    find,
+    analyze,
+    find: (input) => analyze(input).taggedEffectErrors,
     close: () => {
       api.close()
       openFilename = undefined

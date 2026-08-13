@@ -48,8 +48,12 @@
     "effect-local/noSemaphoreEffectSync": "error",
     "effect-local/noNestedCalls": "error",
     "effect-local/noUnnecessaryEffectForwarding": "error",
+    "effect-local/noFunctionEffectGen": "error",
+    "effect-local/noImplicitDefectConversion": "error",
     "effect-local/noManualEffectBoundary": "error",
-    "effect-local/requireTaggedEffectError": "error"
+    "effect-local/requireTaggedEffectError": "error",
+    "effect-local/requireLayerPascalCase": "error",
+    "effect-local/noServiceTagMap": "error"
   },
   "overrides": [
     {

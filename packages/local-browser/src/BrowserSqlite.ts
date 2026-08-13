@@ -1,7 +1,7 @@
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
-import * as Layer from "effect/Layer"
+import * as EffectLayer from "effect/Layer"
 
 export class DatabasePort extends Context.Service<DatabasePort, MessagePort>()(
   "@lucas-barake/effect-local-browser/DatabasePort"
@@ -52,21 +52,21 @@ const compatiblePort = (port: MessagePort): MessagePort =>
     }
   })
 
-const makeLayer = () =>
-  DatabasePort.pipe(
-    Effect.map((port) =>
-      SqliteClient.layer({
-        // A MessagePort from `new MessageChannel()` only dispatches queued messages once started.
-        worker: Effect.sync(() => {
-          port.start()
-          return compatiblePort(port)
-        })
+const makeLayer = Effect.fnUntraced(
+  function*() {
+    const port = yield* DatabasePort
+    return SqliteClient.layer({
+      // A MessagePort from `new MessageChannel()` only dispatches queued messages once started.
+      worker: Effect.sync(() => {
+        port.start()
+        return compatiblePort(port)
       })
-    ),
-    Layer.unwrap
-  )
+    })
+  },
+  EffectLayer.unwrap
+)
 
-export const layer = makeLayer()
+export const Layer = makeLayer()
 
 export const layerMessagePort = (port: MessagePort) =>
-  makeLayer().pipe(Layer.provide(Layer.succeed(DatabasePort, port)))
+  makeLayer().pipe(EffectLayer.provide(EffectLayer.succeed(DatabasePort, port)))

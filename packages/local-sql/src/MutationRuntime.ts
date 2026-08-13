@@ -7,7 +7,6 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
-import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Result_ from "effect/Result"
 import * as Schema from "effect/Schema"
@@ -63,50 +62,49 @@ export const layer = <D extends Definition.Any,>(
   definition: D,
   evolution: Evolution.Evolution = Evolution.make({ current: definition })
 ): Layer.Layer<MutationRuntime, never, Handlers<D>> =>
-  pipe(
+  Layer.effect(
+    MutationRuntime,
     Effect.gen(function*() {
       const context = yield* Effect.context<Handlers<D>>()
       const handlers = new Map<string, AnyHandler>()
       for (const mutation of definition.mutations) {
-        const handler = Context.getUnsafe<AnyHandler, AnyHandler>(mutation.handler)(context)
-        handlers.set(mutation.name, handler)
+        handlers.set(mutation.name, Context.getUnsafe<AnyHandler, AnyHandler>(mutation.handler)(context))
       }
-      const execute = (
+      const execute = Effect.fnUntraced(function*(
         name: string,
         payload: unknown,
         transaction: Transaction.Transaction,
         changes: Array<Protocol.EntityChange>
-      ) =>
-        Effect.gen(function*() {
-          const mutation = definition.mutationByName.get(name)
-          const handler = handlers.get(name)
-          if (mutation === undefined || handler === undefined) {
-            return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown mutation: ${name}` })
-          }
-          const decodedPayload = yield* Codec.decode(mutation.payloadSchema, payload)
-          const result = yield* handler.execute({ transaction, payload: decodedPayload }).pipe(Effect.result)
-          if (Result_.isFailure(result)) {
-            const failure = result.failure
-            if (Schema.is(mutation.rejectionSchema)(failure)) {
-              const encoded = yield* Codec.encode(mutation.rejectionSchema, failure)
-              const json = yield* Schema.decodeUnknownEffect(Schema.Json)(encoded).pipe(
-                Effect.mapError((cause) =>
-                  new ReplicaError.StorageCorrupt({ message: "Mutation rejection is not JSON", cause })
-                )
+      ) {
+        const mutation = definition.mutationByName.get(name)
+        const handler = handlers.get(name)
+        if (mutation === undefined || handler === undefined) {
+          return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown mutation: ${name}` })
+        }
+        const decodedPayload = yield* Codec.decode(mutation.payloadSchema, payload)
+        const result = yield* handler.execute({ transaction, payload: decodedPayload }).pipe(Effect.result)
+        if (Result_.isFailure(result)) {
+          const failure = result.failure
+          if (Schema.is(mutation.rejectionSchema)(failure)) {
+            const encoded = yield* Codec.encode(mutation.rejectionSchema, failure)
+            const json = yield* Schema.decodeUnknownEffect(Schema.Json)(encoded).pipe(
+              Effect.mapError((cause) =>
+                new ReplicaError.StorageCorrupt({ message: "Mutation rejection is not JSON", cause })
               )
-              return Result_.fail(json)
-            }
-            if (Schema.is(ReplicaError.ReplicaError)(failure)) return yield* Effect.fail(failure)
-            return yield* Effect.die(failure)
-          }
-          const encoded = yield* Codec.encode(mutation.successSchema, result.success)
-          const json = yield* Schema.decodeUnknownEffect(Schema.Json)(encoded).pipe(
-            Effect.mapError((cause) =>
-              new ReplicaError.StorageCorrupt({ message: "Mutation success is not JSON", cause })
             )
+            return Result_.fail(json)
+          }
+          if (Schema.is(ReplicaError.ReplicaError)(failure)) return yield* Effect.fail(failure)
+          return yield* Effect.die(failure)
+        }
+        const encoded = yield* Codec.encode(mutation.successSchema, result.success)
+        const json = yield* Schema.decodeUnknownEffect(Schema.Json)(encoded).pipe(
+          Effect.mapError((cause) =>
+            new ReplicaError.StorageCorrupt({ message: "Mutation success is not JSON", cause })
           )
-          return Result_.succeed({ result: json, changes })
-        })
+        )
+        return Result_.succeed({ result: json, changes })
+      })
       const prepare = (envelope: Protocol.MutationEnvelope) =>
         Evolution.migrateMutationPayload({
           evolution,
@@ -136,6 +134,5 @@ export const layer = <D extends Definition.Any,>(
             Effect.flatMap((current) => execute(current.name, current.payload, transaction, changes))
           )
       })
-    }),
-    Layer.effect(MutationRuntime)
+    })
   )
