@@ -38,6 +38,57 @@ const collectBytes = <E extends { readonly _tag: string }, R,>(stream: Stream.St
 
 describe("attachment client", () => {
   it.effect(
+    "revalidates remote custody before retrying a pending attachment",
+    Effect.fnUntraced(
+      function*() {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-client-custody-" })
+        const remote = yield* Ref.make<Uint8Array | undefined>(undefined)
+        const layerDatabase = SqliteClient.layer({ filename: `${root}/client.sqlite`, disableWAL: true }).pipe(
+          Layer.provide(Reactivity.layer)
+        )
+        const layerStorage = FileSystemAttachmentStorage.layer({
+          directory: `${root}/objects`,
+          maximumBytes: 8
+        })
+        const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
+        const layerTransfer = Layer.succeed(
+          AttachmentTransfer.AttachmentTransfer,
+          AttachmentTransfer.AttachmentTransfer.of({
+            upload: (request) =>
+              collectBytes(request.bytes(0)).pipe(
+                Effect.flatMap((bytes) => Ref.set(remote, bytes))
+              ),
+            download: () => Stream.fail(new ReplicaError.ServerUnavailable())
+          })
+        )
+        const context = yield* AttachmentClient.layer.pipe(
+          Layer.provide(layerInfrastructure),
+          Layer.provide(layerTransfer),
+          Layer.provideMerge(layerInfrastructure),
+          Layer.build
+        )
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const client = Context.get(context, AttachmentClient.AttachmentClient)
+        yield* Migrations.client({ definition: Domain.definition, spaceId, clientId }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql)
+        )
+        const reference = yield* client.stage(spaceId, Stream.make(hello))
+
+        yield* client.ensureUploaded(spaceId, clientId, membershipIncarnation, [reference])
+        assert.deepStrictEqual(yield* Ref.get(remote), hello)
+
+        yield* Ref.set(remote, undefined)
+        yield* client.ensureUploaded(spaceId, clientId, membershipIncarnation, [reference])
+
+        assert.deepStrictEqual(yield* Ref.get(remote), hello)
+      },
+      provideNodeServices,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
     "keeps offline staged bytes across restart and releases them after pending settlement",
     Effect.fnUntraced(
       function*() {

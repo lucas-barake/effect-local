@@ -386,8 +386,6 @@ export const layer: Layer.Layer<
                 actual: reference.bytes
               })
             }
-            if (found.value.remote_available === 1) return yield* Effect.void
-            if (!(yield* storage.exists(found.value.object_key))) return yield* notFound(reference)
             yield* transfer.upload({
               spaceId,
               clientId,
