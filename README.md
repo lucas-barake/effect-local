@@ -50,13 +50,13 @@ invariants and failure model.
 
 ## Packages
 
-| Package                              | Purpose                                                           |
-| ------------------------------------ | ----------------------------------------------------------------- |
-| `@lucas-barake/effect-local`         | Models, mutations, queries, field semantics, protocol, and errors |
-| `@lucas-barake/effect-local-sql`     | SQLite state, server log, and Workflow reconciliation             |
-| `@lucas-barake/effect-local-rpc`     | WebSocket RPC, Cluster space routing, and presence                |
-| `@lucas-barake/effect-local-browser` | Browser SQLite ports, Effect Atom graph, and local presence       |
-| `@lucas-barake/effect-local-test`    | Production shaped test layers and deterministic network faults    |
+| Package                              | Purpose                                                                 |
+| ------------------------------------ | ----------------------------------------------------------------------- |
+| `@lucas-barake/effect-local`         | Models, mutations, queries, attachment references, protocol, and errors |
+| `@lucas-barake/effect-local-sql`     | SQLite state, attachment lifecycle, server log, and reconciliation      |
+| `@lucas-barake/effect-local-rpc`     | WebSocket control plane, HTTP byte plane, Cluster routing, and presence |
+| `@lucas-barake/effect-local-browser` | Browser SQLite ports, OPFS attachments, Effect Atom, and presence       |
+| `@lucas-barake/effect-local-test`    | Production shaped test layers and deterministic network faults          |
 
 All packages are ESM. Public modules are available as subpaths such as
 `@lucas-barake/effect-local/Mutation`. Paths under `internal/*` are private.
@@ -285,6 +285,54 @@ decoded through `PutTask.rejectionSchema`; authorization, capacity, legacy, and 
 origin tagged JSON branches. `settlementCapacity` bounds each space's live feed. A subscriber that does not keep up
 backpressures settlement delivery and reconciliation, but never the local `mutate` commit. Leaving the space or closing
 the replica scope shuts down its settlement Stream.
+
+## Attachments
+
+Models reference bytes with the branded JSON value
+`{ _tag: "Attachment", digest: "sha256:<hex>", bytes: number }`. Content identity contains only the raw SHA-256 digest
+and exact length. Keep file names, media types, dimensions, duration, and presentation data in normal model fields.
+
+Stage bytes before committing the mutation that references them. Staging is durable and works offline. Reconciliation
+uploads every referenced object before submitting the mutation. A recipient installs the entity immediately, then
+`readAttachment` fetches, verifies, and caches the object only when consumed.
+
+```ts
+import * as Stream from "effect/Stream"
+
+const attachment = yield* space.stageAttachment(Stream.make(photoBytes))
+
+yield* space.mutate(SendMessage, {
+  id: messageId,
+  text: "",
+  photo: attachment,
+  fileName: "sunset.jpg",
+  mediaType: "image/jpeg"
+})
+
+const content = space.readAttachment(attachment)
+yield* Stream.runForEach(content, renderChunk)
+yield* space.releaseAttachment(attachment)
+```
+
+Client SQLite stores ownership, availability, and cleanup metadata. Bytes stay in a separate `AttachmentStorage`.
+Node applications can use `FileSystemAttachmentStorage`. Browser applications use
+`BrowserAttachmentStorage.layerMessagePort` with the application owned `BrowserAttachmentWorker` to store direct OPFS
+files outside SQLite WASM. The Atom graph exposes `graph.attachment(spaceId)(reference)` as a lazy `AsyncResult` for
+placeholder, failure, and resolved byte states.
+
+`AttachmentHttpServer.layer` contributes authenticated HEAD, PATCH, and GET routes to the application's `HttpRouter`.
+`AttachmentHttpClient.layer` supplies fresh storage backed streams. HEAD reports the durable offset, PATCH resumes and
+verifies the complete digest before promotion, and GET supports one byte range. The application still owns its HTTP
+server, TLS, Origin policy, bearer verification, and reverse proxy.
+
+Server objects are isolated by space. Upload and read authorization receive the principal, space, client membership,
+and reference. A read also requires a current referencing entity accepted by normal entity read authorization. Per
+object and per space limits bound storage. The last authoritative reference schedules grace period collection through
+an immutable object key. Recipient retractions and history pruning do not define server liveness.
+
+Attachment bytes never enter mutation envelopes, accepted history, entity JSON, bootstrap pages, or snapshots. Only
+the compact reference crosses the JSON control plane. Transfer outages and upload leases are retryable. Invalid
+references, length or digest mismatches, quotas, and authorization denial are terminal.
 
 Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect Workflow. Supply
 `ClusterWorkflowEngine.layer` and the official runner Layer separately. For one SQLite owner this is normally
@@ -748,6 +796,8 @@ The complete deployment sequence is:
 - Queues, mutation payloads, presence payloads, pull pages, bootstrap pages, snapshots, receipts, and retained history
   are bounded by explicit configuration.
 - Presence is best effort, bounded, TTL based, and never enters the durable mutation log.
+- Attachment bytes use a separately bounded and authenticated byte plane. Mutation history, entity JSON, bootstrap
+  pages, and snapshots contain only compact content references.
 - Cluster routes each space to one live owner across runners. Entity operations are volatile. A failed submit remains
   in the client's pending SQLite outbox until exact resubmission returns the SQL backed terminal receipt. Pull and watch
   recover from the durable server sequence.
