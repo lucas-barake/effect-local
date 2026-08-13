@@ -36,6 +36,7 @@ import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as TerminalRejection from "./internal/TerminalRejection.js"
 import * as SqlTransaction from "./internal/transaction.js"
 import * as WakeVisibility from "./internal/wakeVisibility.js"
+import * as WindowSchema from "./internal/windowSchema.js"
 import * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
 import * as SchemaEvolution from "./SchemaEvolution.js"
@@ -2100,6 +2101,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         watch: (request) => {
           return Stream.unwrap(
             Protocol.validateReplicationScope(options.definition, request.scope).pipe(
+              Effect.tap((scope) => WindowSchema.validate(scope, request.schema, options.definition.schemaIdentity)),
               Effect.flatMap((scope) => prepareSpace(request.spaceId, request.schema).pipe(Effect.as(scope))),
               Effect.map((scope) => watch({ ...request, scope }, null))
             )
@@ -2110,6 +2112,11 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             const authorization = yield* captureReadAuthorization(request, principal)
             yield* readAuthorizations.authorize(authorization.key, authorization.lookup).pipe(
               Effect.tapErrorTag("CapacityExceeded", () => metrics.recordRejection("CapacityExceeded"))
+            )
+            yield* WindowSchema.validate(
+              authorization.request.scope,
+              authorization.request.schema,
+              options.definition.schemaIdentity
             )
             yield* prepareSpace(request.spaceId, request.schema)
             return watch(authorization.request, authorization.principal, authorization)

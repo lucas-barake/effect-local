@@ -13,6 +13,7 @@ import * as AcceptedLog from "./acceptedLog.js"
 import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
 import * as StorageUnavailable from "./storageUnavailable.js"
+import * as WindowSchema from "./windowSchema.js"
 
 export interface Authorization {
   readonly scope: (
@@ -1115,13 +1116,8 @@ export const make = (options: Options) => {
       yield* validatePreparedSpace(expectedGeneration, space)
       const targetDefinition = yield* options.resolveDefinition(request.schema)
       const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
-      const schemaIsCurrent = request.schema.version === options.definition.schemaIdentity.version &&
-        request.schema.hash === options.definition.schemaIdentity.hash
-      if (normalized.windows !== undefined && !schemaIsCurrent) {
-        return yield* new ReplicaError.ProtocolInvalid({
-          message: "Windowed replication scope requires the current server schema"
-        })
-      }
+      yield* WindowSchema.validate(normalized, request.schema, options.definition.schemaIdentity)
+      const schemaIsCurrent = WindowSchema.isCurrent(request.schema, options.definition.schemaIdentity)
       const normalizedDigest = yield* scopeDigest(normalized)
       const principalHash = yield* principalDigest(principal)
       const stored = yield* findView({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
@@ -1283,15 +1279,7 @@ export const make = (options: Options) => {
       yield* validatePreparedSpace(expectedGeneration, space)
       const targetDefinition = yield* options.resolveDefinition(request.schema)
       const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
-      if (
-        normalized.windows !== undefined &&
-        (request.schema.version !== options.definition.schemaIdentity.version ||
-          request.schema.hash !== options.definition.schemaIdentity.hash)
-      ) {
-        return yield* new ReplicaError.ProtocolInvalid({
-          message: "Windowed replication scope requires the current server schema"
-        })
-      }
+      yield* WindowSchema.validate(normalized, request.schema, options.definition.schemaIdentity)
       const normalizedDigest = yield* scopeDigest(normalized)
       const principalHash = yield* principalDigest(principal)
       let stored = yield* findSnapshot(request.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
