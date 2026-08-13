@@ -50,6 +50,7 @@ export interface Options {
   readonly pageSize?: number
   readonly retryDelay?: Duration.Input
   readonly maximumRetryDelay?: Duration.Input
+  readonly onStatusChange?: (status: ReplicaStatus.ReplicaStatus) => Effect.Effect<void>
 }
 
 export interface ManagedSpace {
@@ -462,7 +463,7 @@ export const layerManager: Layer.Layer<Manager, ReplicaError.InvalidConfiguratio
   .effect(Manager, makeManager())
 
 export const layerOnePass = (
-  options: Pick<Options, "definition" | "spaceId" | "pageSize">
+  options: Pick<Options, "definition" | "spaceId" | "pageSize" | "onStatusChange">
 ): Layer.Layer<Reconciliation, ReplicaError.InvalidConfiguration, LocalStore.Store | SyncEngine.SyncEngine> =>
   Layer.effect(
     Reconciliation,
@@ -480,27 +481,42 @@ export const layerOnePass = (
       const status = yield* Ref.make<ReplicaStatus.ReplicaStatus>({ _tag: "Offline", pending: 0 })
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
       const setStatus = (value: ReplicaStatus.ReplicaStatus) =>
-        Ref.set(status, value).pipe(Effect.andThen(local.invalidateStatus))
+        Ref.set(status, value).pipe(
+          Effect.andThen(local.invalidateStatus),
+          Effect.andThen(options.onStatusChange?.(value) ?? Effect.void)
+        )
       const reportFailure = (error: ReplicaError.ReplicaError, preserveConnecting: boolean) =>
         local.pendingCount.pipe(
           Effect.catch(() => Effect.succeed(0)),
           Effect.flatMap((pending) =>
-            Ref.modify(status, (current): readonly [boolean, ReplicaStatus.ReplicaStatus] => {
-              if (error._tag === "CredentialRejected") return [true, { _tag: "NeedsAuthentication", pending }]
-              if (current._tag === "NeedsAuthentication") return [false, current]
-              if (preserveConnecting && current._tag === "Connecting" && isTransientFailure(error)) {
-                return [false, current]
+            Ref.modify(
+              status,
+              (current): readonly [ReplicaStatus.ReplicaStatus | undefined, ReplicaStatus.ReplicaStatus] => {
+                if (error._tag === "CredentialRejected") {
+                  const next = { _tag: "NeedsAuthentication", pending } as const
+                  return [next, next]
+                }
+                if (current._tag === "NeedsAuthentication") return [undefined, current]
+                if (preserveConnecting && current._tag === "Connecting" && isTransientFailure(error)) {
+                  return [undefined, current]
+                }
+                if (
+                  error._tag === "AuthenticatorUnavailable" ||
+                  error._tag === "ServerUnavailable" ||
+                  error._tag === "OperationTimeout"
+                ) {
+                  const next = { _tag: "Offline", pending } as const
+                  return [next, next]
+                }
+                const next = { _tag: "Failed", pending, message: error._tag } as const
+                return [next, next]
               }
-              if (
-                error._tag === "AuthenticatorUnavailable" ||
-                error._tag === "ServerUnavailable" ||
-                error._tag === "OperationTimeout"
-              ) return [true, { _tag: "Offline", pending }]
-              return [true, { _tag: "Failed", pending, message: error._tag }]
-            }).pipe(
-              Effect.flatMap((changed) => {
-                if (changed) return local.invalidateStatus
-                return Effect.void
+            ).pipe(
+              Effect.flatMap((next) => {
+                if (next === undefined) return Effect.void
+                return local.invalidateStatus.pipe(
+                  Effect.andThen(options.onStatusChange?.(next) ?? Effect.void)
+                )
               })
             )
           )

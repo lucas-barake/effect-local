@@ -47,7 +47,7 @@ export type AggregateState = typeof AggregateState.Type
 
 export const Aggregate = Schema.Struct({
   state: AggregateState,
-  spaces: Schema.Array(SpaceStatus),
+  spaces: Schema.Int,
   totalPending: Schema.Int,
   counts: Schema.Struct({
     offline: Schema.Int,

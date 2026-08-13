@@ -85,7 +85,7 @@ describe("multi space Replica", () => {
       assert.strictEqual(Option.getOrThrow(yield* a.get(Domain.Todo, "same")).title, "A")
       assert.strictEqual(Option.getOrThrow(yield* b.get(Domain.Todo, "same")).title, "B")
       const aggregate = yield* replica.status
-      assert.deepStrictEqual(aggregate.spaces.map((status) => status.spaceId), [spaceA, spaceB])
+      assert.strictEqual(aggregate.spaces, 2)
       assert.strictEqual(aggregate.totalPending, 2)
     }, Effect.scoped)
   )

@@ -18,6 +18,7 @@ import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
+import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -103,6 +104,7 @@ interface RememberedEntry {
   leaving: boolean
   leaveCompletion: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
   workflowRegistration: ReconciliationWorkflow.RegistrationService | undefined
+  summaryStatus: ReplicaStatus.ReplicaStatus
 }
 
 const RememberedRow = Schema.Struct({
@@ -128,27 +130,35 @@ const defectReplicaError = <A,>(
     })
   )
 
-const aggregateStatus = (spaces: ReadonlyArray<ReplicaStatus.SpaceStatus>): ReplicaStatus.Aggregate => {
-  const counts = {
-    offline: spaces.filter((status) => status._tag === "Offline").length,
-    connecting: spaces.filter((status) => status._tag === "Connecting").length,
-    online: spaces.filter((status) => status._tag === "Online" || status._tag === "SchemaUpdateAvailable").length,
-    needsAuthentication: spaces.filter((status) => status._tag === "NeedsAuthentication").length,
-    failed: spaces.filter((status) => status._tag === "Failed").length
-  }
+type AggregateCounts = ReplicaStatus.Aggregate["counts"]
+type AggregateCategory = keyof AggregateCounts
+
+const statusCategories: {
+  readonly [Tag in ReplicaStatus.ReplicaStatus["_tag"]]: AggregateCategory
+} = {
+  Offline: "offline",
+  Connecting: "connecting",
+  Online: "online",
+  SchemaUpdateAvailable: "online",
+  NeedsAuthentication: "needsAuthentication",
+  Failed: "failed"
+}
+
+const statusCategory = (status: ReplicaStatus.ReplicaStatus): AggregateCategory => statusCategories[status._tag]
+
+const aggregateStatus = (
+  spaces: number,
+  totalPending: number,
+  counts: AggregateCounts
+): ReplicaStatus.Aggregate => {
   let state: ReplicaStatus.AggregateState = "Degraded"
-  if (spaces.length === 0) state = "Idle"
+  if (spaces === 0) state = "Idle"
   else if (counts.failed > 0) state = "Failed"
   else if (counts.needsAuthentication > 0) state = "NeedsAuthentication"
-  else if (counts.online === spaces.length) state = "Online"
-  else if (counts.offline === spaces.length) state = "Offline"
+  else if (counts.online === spaces) state = "Online"
+  else if (counts.offline === spaces) state = "Offline"
   else if (counts.connecting > 0) state = "Connecting"
-  return {
-    state,
-    spaces,
-    totalPending: spaces.reduce((total, status) => total + status.pending, 0),
-    counts
-  }
+  return { state, spaces, totalPending, counts }
 }
 
 const makeLayer = <D extends Definition.Any, R,>(
@@ -169,6 +179,13 @@ const makeLayer = <D extends Definition.Any, R,>(
       const parentScope = yield* Effect.scope
       const rootContext = yield* Effect.context<BaseRequirements<D> | QueryReactivity.QueryReactivity | R>()
       const entries = new Map<Identity.SpaceId, RememberedEntry>()
+      const aggregate = yield* Ref.make(aggregateStatus(0, 0, {
+        offline: 0,
+        connecting: 0,
+        online: 0,
+        needsAuthentication: 0,
+        failed: 0
+      }))
       let nextGeneration = 0
       let accessOrder = 0
       const workflow = yield* workflowEngine
@@ -238,6 +255,76 @@ const makeLayer = <D extends Definition.Any, R,>(
         if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
         return new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })
       }
+      const invalidateAggregate = reactivity.invalidate([ReactivityKey.aggregateStatus])
+      const changeAggregate = (
+        update: (current: ReplicaStatus.Aggregate) => ReplicaStatus.Aggregate,
+        invalidate = true
+      ) => {
+        const changed = Ref.update(aggregate, update)
+        if (!invalidate) return changed.pipe(Effect.uninterruptible)
+        return changed.pipe(Effect.andThen(invalidateAggregate), Effect.uninterruptible)
+      }
+      const addContribution = (entry: RememberedEntry, invalidate = true) =>
+        changeAggregate((current) => {
+          const category = statusCategory(entry.summaryStatus)
+          return aggregateStatus(
+            current.spaces + 1,
+            current.totalPending + entry.summaryStatus.pending,
+            { ...current.counts, [category]: current.counts[category] + 1 }
+          )
+        }, invalidate)
+      const removeContribution = (entry: RememberedEntry) =>
+        changeAggregate((current) => {
+          const category = statusCategory(entry.summaryStatus)
+          return aggregateStatus(
+            current.spaces - 1,
+            current.totalPending - entry.summaryStatus.pending,
+            { ...current.counts, [category]: current.counts[category] - 1 }
+          )
+        })
+      const modifyContribution = (
+        entry: RememberedEntry,
+        update: (current: ReplicaStatus.ReplicaStatus) => ReplicaStatus.ReplicaStatus
+      ) =>
+        Effect.suspend(() => {
+          if (entries.get(entry.spaceId) !== entry || entry.leaving) return Effect.void
+          return Ref.modify(aggregate, (current): readonly [boolean, ReplicaStatus.Aggregate] => {
+            const previous = entry.summaryStatus
+            const next = update(previous)
+            const previousCategory = statusCategory(previous)
+            const nextCategory = statusCategory(next)
+            if (previousCategory === nextCategory && previous.pending === next.pending) return [false, current]
+            entry.summaryStatus = next
+            let counts = current.counts
+            if (previousCategory !== nextCategory) {
+              counts = {
+                ...counts,
+                [previousCategory]: counts[previousCategory] - 1,
+                [nextCategory]: counts[nextCategory] + 1
+              }
+            }
+            return [
+              true,
+              aggregateStatus(
+                current.spaces,
+                current.totalPending + next.pending - previous.pending,
+                counts
+              )
+            ]
+          }).pipe(
+            Effect.flatMap((changed) => {
+              if (changed) return invalidateAggregate
+              return Effect.void
+            }),
+            Effect.uninterruptible
+          )
+        })
+      const updateContribution = (
+        entry: RememberedEntry,
+        next: ReplicaStatus.ReplicaStatus
+      ) => modifyContribution(entry, () => next)
+      const updatePendingContribution = (entry: RememberedEntry, pending: number) =>
+        modifyContribution(entry, (current) => ({ ...current, pending }))
       const readMemberships = SqlSchema.findAll({
         Request: Schema.Void,
         Result: RememberedRow,
@@ -270,7 +357,6 @@ const makeLayer = <D extends Definition.Any, R,>(
             ON p.space_id = s.space_id AND p.schema_generation = s.active_schema_generation
           WHERE s.space_id = ${spaceId}`
       })
-
       const decodeScope = (encoded: string) =>
         Codec.parse(encoded).pipe(
           Effect.flatMap((value) => Codec.decode(Protocol.ReplicationScope, value)),
@@ -286,8 +372,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const invalidateActivation = (spaceId: Identity.SpaceId) =>
         reactivity.invalidate([
           ReactivityKey.activation(spaceId),
-          ReactivityKey.status(spaceId),
-          ReactivityKey.aggregateStatus
+          ReactivityKey.status(spaceId)
         ])
 
       const checkRuntime = (entry: RememberedEntry, runtime: ActiveRuntime) =>
@@ -319,7 +404,11 @@ const makeLayer = <D extends Definition.Any, R,>(
           let interruptReconciliation = Effect.void
           if (workflow !== undefined) {
             const workflowContext = Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow)
-            const layerReconciliation = Reconciler.layerOnePass({ ...options, spaceId }).pipe(
+            const layerReconciliation = Reconciler.layerOnePass({
+              ...options,
+              spaceId,
+              onStatusChange: (status) => updateContribution(entry, status)
+            }).pipe(
               Layer.provide(layerLocalStore)
             )
             const runtime = yield* Layer.mergeAll(
@@ -363,7 +452,11 @@ const makeLayer = <D extends Definition.Any, R,>(
             const runtime = yield* Layer.mergeAll(
               layerLocalStore,
               layerQueryExecutor,
-              Reconciler.layerOnePass({ ...options, spaceId }).pipe(Layer.provide(layerLocalStore))
+              Reconciler.layerOnePass({
+                ...options,
+                spaceId,
+                onStatusChange: (status) => updateContribution(entry, status)
+              }).pipe(Layer.provide(layerLocalStore))
             ).pipe(
               Layer.buildWithScope(childScope),
               Effect.provide(rootContext),
@@ -479,6 +572,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             return false
           }
           const count = yield* pendingCount(entry.spaceId).pipe(Effect.mapError(mapStorageError))
+          yield* updateContribution(entry, { _tag: "Offline", pending: count.count })
           if (count.count > 0 && !entry.leaving) yield* enqueueBackground(entry)
           return true
         }))
@@ -645,6 +739,11 @@ const makeLayer = <D extends Definition.Any, R,>(
           mutate: (mutation, payload) =>
             withActive(entry, (runtime) =>
               runtime.local.mutate(mutation, payload).pipe(
+                Effect.tap(() =>
+                  runtime.local.pendingCount.pipe(
+                    Effect.flatMap((pending) => updatePendingContribution(entry, pending))
+                  )
+                ),
                 Effect.tap(() => runtime.reconciler.notify)
               )),
           get: (model, key) => withActive(entry, (runtime) => runtime.local.get(model, key)),
@@ -695,7 +794,16 @@ const makeLayer = <D extends Definition.Any, R,>(
                 const canceled = yield* runtime.local.resolveQuarantine(receipt, "Discard")
                 yield* continueCancellation(runtime, canceled)
                 return receipt
-              })().pipe(Effect.ensuring(defectReplicaError(runtime.reconciler.notify)))),
+              })().pipe(
+                Effect.ensuring(
+                  defectReplicaError(
+                    runtime.local.pendingCount.pipe(
+                      Effect.flatMap((pending) => updatePendingContribution(entry, pending)),
+                      Effect.andThen(runtime.reconciler.notify)
+                    )
+                  )
+                )
+              )),
           resubmitQuarantined: <M extends Mutation.Any,>(
             mutationId: Identity.MutationId,
             mutation: M,
@@ -723,7 +831,16 @@ const makeLayer = <D extends Definition.Any, R,>(
                   return Quarantine.AlreadyResolved.make({ receipt })
                 }
                 return Quarantine.Resubmitted.make({ pending })
-              })().pipe(Effect.ensuring(defectReplicaError(runtime.reconciler.notify)))),
+              })().pipe(
+                Effect.ensuring(
+                  defectReplicaError(
+                    runtime.local.pendingCount.pipe(
+                      Effect.flatMap((pending) => updatePendingContribution(entry, pending)),
+                      Effect.andThen(runtime.reconciler.notify)
+                    )
+                  )
+                )
+              )),
           status: Effect.suspend(() => {
             const runtime = entry.runtime
             if (entry.activation === "Active" && runtime !== undefined) {
@@ -758,7 +875,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           lastUsed: 0,
           leaving: false,
           leaveCompletion: undefined,
-          workflowRegistration: undefined
+          workflowRegistration: undefined,
+          summaryStatus: { _tag: "Offline", pending: row.count }
         }
         if (workflow !== undefined) {
           const lease = ReconciliationWorkflow.RuntimeLease.of({
@@ -840,10 +958,10 @@ const makeLayer = <D extends Definition.Any, R,>(
               )
             )
             entries.set(spaceId, entry)
+            yield* addContribution(entry)
             yield* reactivity.invalidate([
               ReactivityKey.membership(spaceId),
-              ReactivityKey.spaces,
-              ReactivityKey.aggregateStatus
+              ReactivityKey.spaces
             ])
             return entry.handle
           })
@@ -875,15 +993,14 @@ const makeLayer = <D extends Definition.Any, R,>(
               ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
             ),
             Effect.tap(() =>
-              Effect.sync(() => {
-                entries.delete(spaceId)
-              })
+              removeContribution(current).pipe(
+                Effect.andThen(Effect.sync(() => entries.delete(spaceId)))
+              )
             ),
             Effect.tap(() =>
               reactivity.invalidate([
                 ReactivityKey.membership(spaceId),
-                ReactivityKey.spaces,
-                ReactivityKey.aggregateStatus
+                ReactivityKey.spaces
               ])
             ),
             Effect.asVoid,
@@ -915,14 +1032,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           .map((entry) => entry.handle)
       )
 
-      const status = Effect.gen(function*() {
-        const statuses = yield* Effect.forEach(
-          Array.from(entries.values()).filter((entry) => !entry.leaving),
-          (entry) => entry.handle.status,
-          { concurrency: "unbounded" }
-        )
-        return aggregateStatus(statuses.toSorted((left, right) => left.spaceId.localeCompare(right.spaceId)))
-      })
+      const status = Ref.get(aggregate)
 
       const backgroundTurn = Effect.gen(function*() {
         const spaceId = yield* Queue.take(backgroundQueue)
@@ -949,7 +1059,9 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const restored = yield* readMemberships(undefined).pipe(Effect.mapError(mapStorageError))
       for (const row of restored) {
-        entries.set(row.space_id, yield* createEntry(row))
+        const entry = yield* createEntry(row)
+        entries.set(row.space_id, entry)
+        yield* addContribution(entry, false)
       }
       const configured: Array<Identity.SpaceId> = []
       if (options.initialSpaces !== undefined) configured.push(...options.initialSpaces)

@@ -1092,8 +1092,7 @@ export const layer = (
         if (pendingChanged) {
           keys.push(
             ReactivityKey.pending(options.spaceId),
-            ReactivityKey.status(options.spaceId),
-            ReactivityKey.aggregateStatus
+            ReactivityKey.status(options.spaceId)
           )
         }
         return Array.from(new Set(keys))
@@ -1928,8 +1927,7 @@ export const layer = (
           keys = [
             ...keys,
             ReactivityKey.pending(options.spaceId),
-            ReactivityKey.status(options.spaceId),
-            ReactivityKey.aggregateStatus
+            ReactivityKey.status(options.spaceId)
           ]
         }
         if (keys.length > 0) {
@@ -3275,10 +3273,7 @@ export const layer = (
         prepareBootstrap,
         stageBootstrapPage,
         installBootstrap,
-        invalidateStatus: reactivity.invalidate([
-          ReactivityKey.status(options.spaceId),
-          ReactivityKey.aggregateStatus
-        ])
+        invalidateStatus: reactivity.invalidate([ReactivityKey.status(options.spaceId)])
       }
       return Store.of(service)
     })

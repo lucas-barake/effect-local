@@ -422,6 +422,45 @@ describe("Replica Atom graph", () => {
     })
   )
 
+  it.effect(
+    "reacts to per-space scope and activation commands",
+    Effect.fnUntraced(function*() {
+      const graph = BrowserReplica.make(layerReplica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const scopeAtom = graph.scope(spaceId)
+      const activationAtom = graph.activation(spaceId)
+      const setScope = graph.setScope(spaceId)
+      const activate = graph.activate(spaceId)
+      const deactivate = graph.deactivate(spaceId)
+      const mounted = [
+        registry.mount(scopeAtom),
+        registry.mount(activationAtom),
+        registry.mount(setScope),
+        registry.mount(activate),
+        registry.mount(deactivate)
+      ]
+      yield* Effect.addFinalizer(() => Effect.sync(() => mounted.forEach((unmount) => unmount())))
+
+      registry.set(deactivate, undefined)
+      yield* AtomRegistry.getResult(registry, deactivate, { suspendOnWaiting: true })
+      assert.strictEqual(yield* AtomRegistry.getResult(registry, activationAtom), "Inactive")
+
+      const empty = Protocol.ReplicationScope.make({ models: [] })
+      registry.set(setScope, empty)
+      yield* AtomRegistry.getResult(registry, setScope, { suspendOnWaiting: true })
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, scopeAtom), empty)
+      assert.strictEqual(yield* AtomRegistry.getResult(registry, activationAtom), "Active")
+
+      registry.set(deactivate, undefined)
+      yield* AtomRegistry.getResult(registry, deactivate, { suspendOnWaiting: true })
+      registry.set(activate, undefined)
+      yield* AtomRegistry.getResult(registry, activate, { suspendOnWaiting: true })
+      assert.strictEqual(yield* AtomRegistry.getResult(registry, activationAtom), "Active")
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, scopeAtom), empty)
+    }, Effect.scoped)
+  )
+
   it("uses the shared runtime factory by default and preserves an explicit factory", () => {
     const graph = BrowserReplica.make(layerReplica)
     assert.strictEqual(graph.factory, Atom.runtime)
@@ -541,11 +580,18 @@ describe("Replica Atom graph", () => {
         AtomRegistry.getResult(registry, firstMutation, { suspendOnWaiting: true }),
         AtomRegistry.getResult(registry, secondMutation, { suspendOnWaiting: true })
       ])
-      yield* Effect.yieldNow
-      assert.strictEqual(Option.getOrThrow(yield* AtomRegistry.getResult(registry, firstEntity)).title, "first")
-      assert.strictEqual(Option.getOrThrow(yield* AtomRegistry.getResult(registry, secondEntity)).title, "second")
+      const firstValue = Option.getOrThrow(
+        yield* AtomRegistry.getResult(registry, firstEntity, { suspendOnWaiting: true })
+      )
+      const secondValue = Option.getOrThrow(
+        yield* AtomRegistry.getResult(registry, secondEntity, { suspendOnWaiting: true })
+      )
+      assert.strictEqual(firstValue.title, "first")
+      assert.strictEqual(secondValue.title, "second")
       pipe(
-        (yield* AtomRegistry.getResult(registry, firstQuery)).filter((todo) => todo.id === "shared"),
+        (yield* AtomRegistry.getResult(registry, firstQuery, { suspendOnWaiting: true })).filter((todo) =>
+          todo.id === "shared"
+        ),
         (todos) =>
           assert.deepStrictEqual(todos, [{
             id: "shared",
@@ -553,7 +599,9 @@ describe("Replica Atom graph", () => {
           }])
       )
       pipe(
-        (yield* AtomRegistry.getResult(registry, secondQuery)).filter((todo) => todo.id === "shared"),
+        (yield* AtomRegistry.getResult(registry, secondQuery, { suspendOnWaiting: true })).filter((todo) =>
+          todo.id === "shared"
+        ),
         (todos) =>
           assert.deepStrictEqual(todos, [{
             id: "shared",
@@ -576,12 +624,7 @@ describe("Replica Atom graph", () => {
       assert.strictEqual(secondReceipt.spaceId, secondSpaceId)
       const status = yield* AtomRegistry.getResult(registry, graph.status(spaceId))
       assert.strictEqual(status.spaceId, spaceId)
-      pipe(
-        (yield* AtomRegistry.getResult(registry, graph.aggregateStatus)).spaces.map((spaceStatus) =>
-          spaceStatus.spaceId
-        ),
-        (spaceIds) => assert.deepStrictEqual(spaceIds, [spaceId, secondSpaceId])
-      )
+      assert.strictEqual((yield* AtomRegistry.getResult(registry, graph.aggregateStatus)).spaces, 2)
 
       registry.set(graph.join, thirdSpaceId)
       const joinedSpaces = Option.getOrThrow(
