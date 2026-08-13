@@ -106,7 +106,10 @@ const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide
 
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
-  scope,
+  defaultScope: scope,
+  scope: scope,
+  maximumActiveSpaces: 4,
+  foregroundActiveSpaces: 2,
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,

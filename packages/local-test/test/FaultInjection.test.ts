@@ -46,7 +46,10 @@ const migration = {
   maximumAttempts: 8
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const clientHistory = {
+  defaultScope: Protocol.ReplicationScope.make({ models: [Todo.name] }),
   scope: Protocol.ReplicationScope.make({ models: [Todo.name] }),
+  maximumActiveSpaces: 4,
+  foregroundActiveSpaces: 2,
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,

@@ -162,7 +162,10 @@ const entityOptions = {
   maximumConcurrentPresencePublicationsPerSpace: 16
 } satisfies SpaceEntity.HandlerOptions
 const clientHistory = {
-  scope,
+  defaultScope: scope,
+  scope: scope,
+  maximumActiveSpaces: 4,
+  foregroundActiveSpaces: 2,
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,
@@ -612,6 +615,7 @@ describe("WebSocket synchronization", () => {
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
+      yield* space.activate
       yield* Effect.all([
         awaitStatus(reactivity, space, "Online"),
         Deferred.await(harness.watchStarted)
@@ -641,6 +645,7 @@ describe("WebSocket synchronization", () => {
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
+      yield* space.activate
       yield* Effect.all([
         awaitStatus(reactivity, space, "Online"),
         Deferred.await(harness.watchStarted)
@@ -678,6 +683,7 @@ describe("WebSocket synchronization", () => {
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
+      yield* space.activate
       yield* Effect.all([
         awaitStatus(reactivity, space, "Online"),
         Deferred.await(harness.watchStarted)
@@ -744,6 +750,7 @@ describe("WebSocket synchronization", () => {
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
+      yield* space.activate
       yield* Effect.all([
         awaitStatus(reactivity, space, "Online"),
         Deferred.await(harness.watchStarted)
@@ -773,7 +780,7 @@ describe("WebSocket synchronization", () => {
           definition,
           evolution,
           clientId,
-          scope,
+          defaultScope: scope,
           initialSpaces: [spaceId, secondSpaceId],
           retryDelay: "1 millis"
         }).pipe(

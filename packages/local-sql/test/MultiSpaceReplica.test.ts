@@ -32,7 +32,9 @@ const spaceB = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const scope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
 const clientHistory = {
-  scope,
+  defaultScope: scope,
+  maximumActiveSpaces: 4,
+  foregroundActiveSpaces: 2,
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,
@@ -169,7 +171,7 @@ describe("multi space Replica", () => {
   )
 
   it.effect(
-    "releases a joining reservation when its owner is interrupted",
+    "releases a workflow registration reservation when its owner is interrupted",
     Effect.fnUntraced(function*() {
       const engineContext = yield* Layer.build(WorkflowEngine.layerMemory)
       const engine = Context.get(engineContext, WorkflowEngine.WorkflowEngine)
@@ -204,7 +206,9 @@ describe("multi space Replica", () => {
       yield* Deferred.await(firstRegistration)
       yield* Fiber.interrupt(first)
 
-      assert.strictEqual((yield* replica.join(spaceA)).spaceId, spaceA)
+      const remembered = yield* replica.join(spaceA)
+      yield* remembered.activate
+      assert.strictEqual(yield* remembered.activation, "Active")
     }, Effect.scoped)
   )
 
@@ -443,7 +447,7 @@ describe("multi space Replica", () => {
   )
 
   it.effect(
-    "bounds reconciliation turns across many joined spaces",
+    "bounds reconciliation turns across many activated spaces",
     Effect.fnUntraced(function*() {
       const spaces = Array.from({ length: 6 }, (_, index) => {
         const suffix = String(index + 1).padStart(12, "0")
@@ -491,11 +495,117 @@ describe("multi space Replica", () => {
         Layer.provide(Reactivity.layer)
       )
       const context = yield* Layer.build(layerReplica)
+      const replica = Context.get(context, Replica.Replica)
+      const activations = yield* Effect.forEach(
+        spaces,
+        (spaceId) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.activate)),
+        { concurrency: "unbounded" }
+      ).pipe(Effect.forkScoped({ startImmediately: true }))
       yield* Deferred.await(twoStarted)
-      yield* Context.get(context, Replica.Replica).status
 
       assert.isAtMost(yield* Ref.get(maximum), 2)
       yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(activations)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "remembers many inactive spaces without opening watch streams",
+    Effect.fnUntraced(function*() {
+      const spaces = Array.from({ length: 1_000 }, (_, index) => {
+        const suffix = String(index + 1).padStart(12, "0")
+        return Identity.SpaceId.make(`spc_00000000-0000-4000-8000-${suffix}`)
+      })
+      const activeWatches = yield* Ref.make(0)
+      const countedRemote = SyncEngine.SyncEngine.of({
+        ...remoteService,
+        watch: () =>
+          Effect.acquireRelease(
+            Ref.update(activeWatches, (count) => count + 1).pipe(Effect.as(Stream.never)),
+            () => Ref.update(activeWatches, (count) => count - 1)
+          ).pipe(Stream.unwrap)
+      })
+      const layerReplica = SqlReplica.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        clientId,
+        initialSpaces: spaces,
+        maximumActiveSpaces: 8,
+        foregroundActiveSpaces: 4
+      }).pipe(
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, countedRemote)),
+        Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(Reactivity.layer)
+      )
+      const context = yield* Layer.build(layerReplica)
+      const replica = Context.get(context, Replica.Replica)
+      const remembered = yield* replica.spaces
+      const activations = yield* Effect.forEach(remembered, (space) => space.activation)
+
+      assert.lengthOf(remembered, 1_000)
+      assert.strictEqual(yield* Ref.get(activeWatches), 0)
+      assert.isTrue(activations.every((activation) => activation === "Inactive"))
+      yield* remembered[0].activate
+      yield* Effect.yieldNow
+      assert.strictEqual(yield* Ref.get(activeWatches), 1)
+      yield* remembered[0].deactivate
+      assert.strictEqual(yield* Ref.get(activeWatches), 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "persists scope independently for each remembered space",
+    Effect.fnUntraced(function*() {
+      const context = yield* Layer.build(layerLive)
+      const replica = Context.get(context, Replica.Replica)
+      const first = yield* replica.space(spaceA)
+      const second = yield* replica.space(spaceB)
+      const empty = Protocol.ReplicationScope.make({ models: [] })
+
+      yield* first.setScope(empty)
+      yield* first.deactivate
+
+      assert.deepStrictEqual(yield* first.scope, empty)
+      assert.deepStrictEqual(yield* second.scope, scope)
+      assert.strictEqual(yield* first.activation, "Inactive")
+      yield* first.activate
+      assert.deepStrictEqual(yield* first.scope, empty)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "evicts the least recently used unleased foreground runtime",
+    Effect.fnUntraced(function*() {
+      const spaceC = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
+      const layerReplica = SqlReplica.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        clientId,
+        initialSpaces: [spaceA, spaceB, spaceC],
+        maximumActiveSpaces: 4,
+        foregroundActiveSpaces: 2
+      }).pipe(
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(layerRemote),
+        Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(Reactivity.layer)
+      )
+      const context = yield* Layer.build(layerReplica)
+      const replica = Context.get(context, Replica.Replica)
+      const first = yield* replica.space(spaceA)
+      const second = yield* replica.space(spaceB)
+      const third = yield* replica.space(spaceC)
+
+      yield* first.activate
+      yield* second.activate
+      yield* third.activate
+
+      assert.strictEqual(yield* first.activation, "Inactive")
+      assert.strictEqual(yield* second.activation, "Active")
+      assert.strictEqual(yield* third.activation, "Active")
     }, Effect.scoped)
   )
 })

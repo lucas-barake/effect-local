@@ -71,7 +71,10 @@ const migration = {
   maximumAttempts: 8
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const clientHistory = {
+  defaultScope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
   scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
+  maximumActiveSpaces: 4,
+  foregroundActiveSpaces: 2,
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,
@@ -295,6 +298,7 @@ describe("reconciliation workflow", () => {
       const context = yield* Layer.build(layerReplica)
       const replica = Context.get(context, Replica.Replica)
       const space = yield* replica.space(spaceId)
+      yield* space.activate
       yield* Deferred.await(pullEntered)
       yield* space.mutate(Domain.PutTodo, Domain.todo("next-generation"))
 
@@ -350,6 +354,7 @@ describe("reconciliation workflow", () => {
       )
       const context = yield* Layer.build(layerReplica)
       const space = yield* Context.get(context, Replica.Replica).space(spaceId)
+      yield* space.activate
       yield* Deferred.await(watchSubscribed)
       yield* Deferred.await(credentialWaitStarted)
       assert.strictEqual((yield* space.status)._tag, "NeedsAuthentication")
@@ -440,6 +445,7 @@ describe("reconciliation workflow", () => {
       )
       const context = yield* Layer.merge(layerReplica, layerReplicaDatabase).pipe(Layer.build)
       const space = yield* Context.get(context, Replica.Replica).space(spaceId)
+      yield* space.activate
       const reactivity = Context.get(context, Reactivity.Reactivity)
       const online = yield* reactivity.stream([`effect-local:space:${spaceId}:status`], space.status).pipe(
         Stream.filter((status) => status._tag === "Online"),
@@ -502,7 +508,10 @@ describe("reconciliation workflow", () => {
       const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
 
-      const layerRunner = SingleRunner.layer({ runnerStorage: "sql" }).pipe(
+      const layerRunner = SingleRunner.layer({
+        runnerStorage: "sql",
+        shardingConfig: { entityTerminationTimeout: 0 }
+      }).pipe(
         Layer.provide(database())
       )
       const layerWorkflowEngine = ClusterWorkflowEngine.layer.pipe(

@@ -35,8 +35,8 @@ export class Reconciliation extends Context.Service<Reconciliation, Reconciliati
 
 export interface Service {
   readonly sync: Effect.Effect<void, ReplicaError.ReplicaError>
-  readonly notify: Effect.Effect<void>
-  readonly status: Effect.Effect<ReplicaStatus.ReplicaStatus>
+  readonly notify: Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly status: Effect.Effect<ReplicaStatus.ReplicaStatus, ReplicaError.ReplicaError>
   readonly shutdown: Effect.Effect<void>
 }
 
