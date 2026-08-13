@@ -1,3 +1,5 @@
+export * as AttachmentStorage from "./AttachmentStorage.js"
+export * as FileSystemAttachmentStorage from "./FileSystemAttachmentStorage.js"
 export * as IndexStore from "./IndexStore.js"
 export * as LocalStore from "./LocalStore.js"
 export * as Migrations from "./Migrations.js"

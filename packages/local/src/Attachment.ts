@@ -19,6 +19,18 @@ export const ByteLength = Schema.Number.annotate({ identifier: byteLengthIdentif
   Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)
 )
 
+const PositiveByteLength = Schema.Number.check(
+  Schema.isInt(),
+  Schema.isGreaterThan(0),
+  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)
+)
+
+export const Range = Schema.Struct({
+  offset: ByteLength,
+  length: Schema.optionalKey(PositiveByteLength)
+})
+export type Range = typeof Range.Type
+
 export const Reference = Schema.Struct({
   _tag: Schema.tag("Attachment"),
   digest: Digest,
@@ -44,6 +56,34 @@ export class InvalidAttachmentReference extends Schema.TaggedErrorClass<InvalidA
 export class AttachmentTooLarge extends Schema.TaggedErrorClass<AttachmentTooLarge>(
   "@lucas-barake/effect-local/AttachmentTooLarge"
 )("AttachmentTooLarge", { limit: ByteLength }) {}
+
+export class AttachmentNotFound extends Schema.TaggedErrorClass<AttachmentNotFound>(
+  "@lucas-barake/effect-local/AttachmentNotFound"
+)("AttachmentNotFound", { key: Schema.String }) {}
+
+export class AttachmentStorageError extends Schema.TaggedErrorClass<AttachmentStorageError>(
+  "@lucas-barake/effect-local/AttachmentStorageError"
+)("AttachmentStorageError", { operation: Schema.String, cause: Schema.Defect() }) {}
+
+export class AttachmentOffsetConflict extends Schema.TaggedErrorClass<AttachmentOffsetConflict>(
+  "@lucas-barake/effect-local/AttachmentOffsetConflict"
+)("AttachmentOffsetConflict", { expected: ByteLength, actual: ByteLength }) {}
+
+export class AttachmentLengthMismatch extends Schema.TaggedErrorClass<AttachmentLengthMismatch>(
+  "@lucas-barake/effect-local/AttachmentLengthMismatch"
+)("AttachmentLengthMismatch", { expected: ByteLength, actual: ByteLength }) {}
+
+export class AttachmentDigestMismatch extends Schema.TaggedErrorClass<AttachmentDigestMismatch>(
+  "@lucas-barake/effect-local/AttachmentDigestMismatch"
+)("AttachmentDigestMismatch", { expected: Digest, actual: Digest }) {}
+
+export class InvalidAttachmentRange extends Schema.TaggedErrorClass<InvalidAttachmentRange>(
+  "@lucas-barake/effect-local/InvalidAttachmentRange"
+)("InvalidAttachmentRange", {
+  bytes: ByteLength,
+  offset: ByteLength,
+  length: Schema.optionalKey(ByteLength)
+}) {}
 
 const isJsonArray = (
   value: Schema.JsonArray | Schema.JsonObject
