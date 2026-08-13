@@ -40,7 +40,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
       }
       if (
         !Number.isSafeInteger(options.maximumPendingRequests) || options.maximumPendingRequests <= 0 ||
-        options.maximumPendingRequests === Number.MAX_SAFE_INTEGER
+        options.maximumPendingRequests > AttachmentWorkerProtocol.maximumRequestsPerLane
       ) {
         return yield* new Attachment.AttachmentStorageError({
           operation: "configure.maximumPendingRequests",
@@ -69,7 +69,7 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
       const readChunkBytes = options.readChunkBytes
       const locks = yield* RcMap.make({ lookup: () => Semaphore.make(1) })
       const requestPermits = yield* Semaphore.make(options.maximumPendingRequests)
-      const cleanupPermit = yield* Semaphore.make(1)
+      const cleanupPermit = yield* Semaphore.make(options.maximumPendingRequests)
       const pending = new Map<number, (value: unknown) => void>()
       let nextRequestId = 0
       const receive = (event: MessageEvent<unknown>) => {

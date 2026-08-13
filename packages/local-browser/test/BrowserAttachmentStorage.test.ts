@@ -369,6 +369,132 @@ describe("browser attachment storage", () => {
   )
 
   it.effect(
+    "admits every bounded cleanup after an earlier cleanup times out behind blocked writes",
+    Effect.fnUntraced(function*() {
+      const allowWriteRequests = yield* Deferred.make<void>()
+      const releaseWrites = yield* Deferred.make<void>()
+      const createdKeys = yield* Queue.unbounded<AttachmentStorage.ObjectKey>()
+      const receivedWrites = yield* Queue.unbounded<void>()
+      const receivedCleanups = yield* Queue.unbounded<void>()
+      const removedKeys = yield* Queue.unbounded<AttachmentStorage.ObjectKey>()
+      const files = new Set<AttachmentStorage.ObjectKey>()
+      const directory = AttachmentDirectory.AttachmentDirectory.of({
+        create: (key) =>
+          Effect.sync(() => {
+            files.add(key)
+            Queue.offerUnsafe(createdKeys, key)
+          }),
+        offset: (key) => files.has(key) ? Effect.succeed(0) : Effect.fail(new Attachment.AttachmentNotFound({ key })),
+        write: (key, expectedOffset, bytes) =>
+          files.has(key)
+            ? Deferred.await(releaseWrites).pipe(Effect.as(expectedOffset + bytes.length))
+            : Effect.fail(new Attachment.AttachmentNotFound({ key })),
+        read: (key) =>
+          files.has(key)
+            ? Effect.succeed(new Uint8Array(0))
+            : Effect.fail(new Attachment.AttachmentNotFound({ key })),
+        exists: (key) => Effect.succeed(files.has(key)),
+        remove: (key) =>
+          Effect.sync(() => {
+            files.delete(key)
+            Queue.offerUnsafe(removedKeys, key)
+          })
+      })
+      const channel = new MessageChannel()
+      const observeRequests = (event: MessageEvent<{ readonly _tag?: string }>) => {
+        if (event.data._tag === "Write") Queue.offerUnsafe(receivedWrites, undefined)
+        if (event.data._tag === "CleanupRemove") Queue.offerUnsafe(receivedCleanups, undefined)
+      }
+      channel.port1.addEventListener("message", observeRequests)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          channel.port1.removeEventListener("message", observeRequests)
+          channel.port1.close()
+          channel.port2.close()
+        })
+      )
+      yield* AttachmentWorkerProtocol.serve(channel.port1, {
+        maximumBytes: 8,
+        maximumPendingRequests: 2
+      }).pipe(
+        Effect.provideService(AttachmentDirectory.AttachmentDirectory, directory),
+        Effect.forkScoped({ startImmediately: true })
+      )
+      const context = yield* Layer.build(
+        BrowserAttachmentStorage.layerMessagePort(channel.port2, {
+          maximumBytes: 8,
+          readChunkBytes: 2,
+          maximumPendingRequests: 2,
+          cleanupRequestTimeout: "1 second"
+        }).pipe(Layer.provide(NodeCrypto.layer))
+      )
+      const storage = Context.get(context, AttachmentStorage.AttachmentStorage)
+      const bytes = Stream.unwrap(Deferred.await(allowWriteRequests).pipe(Effect.as(Stream.make(new Uint8Array(8)))))
+      const firstStage = yield* storage.stage(bytes).pipe(Effect.forkScoped({ startImmediately: true }))
+      const secondStage = yield* storage.stage(bytes).pipe(Effect.forkScoped({ startImmediately: true }))
+      const firstKey = yield* Queue.take(createdKeys)
+      const secondKey = yield* Queue.take(createdKeys)
+      assert.notStrictEqual(firstKey, secondKey)
+      yield* Deferred.succeed(allowWriteRequests, undefined)
+      yield* Queue.take(receivedWrites)
+      yield* Queue.take(receivedWrites)
+
+      const firstInterruption = yield* Fiber.interrupt(firstStage).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Queue.take(receivedCleanups)
+      yield* TestClock.adjust("1 second")
+      yield* Fiber.join(firstInterruption)
+      const secondInterruption = yield* Fiber.interrupt(secondStage).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Queue.take(receivedCleanups)
+      yield* Deferred.succeed(releaseWrites, undefined)
+      yield* Queue.take(removedKeys)
+      yield* Fiber.join(secondInterruption)
+      assert.strictEqual(files.size, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "rejects request lane bounds whose combined worker capacity is unsafe",
+    Effect.fnUntraced(function*() {
+      const channel = new MessageChannel()
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          channel.port1.close()
+          channel.port2.close()
+        })
+      )
+      const invalidMaximumPendingRequests = Math.floor(Number.MAX_SAFE_INTEGER / 2) + 1
+      const client = yield* Layer.build(
+        BrowserAttachmentStorage.layerMessagePort(channel.port2, {
+          maximumBytes: 8,
+          readChunkBytes: 2,
+          maximumPendingRequests: invalidMaximumPendingRequests,
+          cleanupRequestTimeout: "1 second"
+        }).pipe(Layer.provide(NodeCrypto.layer))
+      ).pipe(Effect.result)
+      assert.isTrue(Result.isFailure(client))
+      if (Result.isFailure(client)) {
+        assert.strictEqual(client.failure.operation, "configure.maximumPendingRequests")
+      }
+
+      const worker = yield* AttachmentWorkerProtocol.serve(channel.port1, {
+        maximumBytes: 8,
+        maximumPendingRequests: invalidMaximumPendingRequests
+      }).pipe(
+        Effect.provideService(AttachmentDirectory.AttachmentDirectory, makeDirectory().service),
+        Effect.result
+      )
+      assert.isTrue(Result.isFailure(worker))
+      if (Result.isFailure(worker)) {
+        assert.strictEqual(worker.failure.operation, "worker.configure.maximumPendingRequests")
+      }
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "forgets a request callback when postMessage throws",
     Effect.fnUntraced(function*() {
       let messageError: ((event: MessageEvent<unknown>) => void) | undefined

@@ -67,6 +67,8 @@ export interface Options {
   readonly maximumPendingRequests: number
 }
 
+export const maximumRequestsPerLane = Math.floor(Number.MAX_SAFE_INTEGER / 2)
+
 const send = (port: MessagePort, response: Response) =>
   Effect.try({
     try: () => {
@@ -85,7 +87,7 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
   }
   if (
     !Number.isSafeInteger(options.maximumPendingRequests) || options.maximumPendingRequests <= 0 ||
-    options.maximumPendingRequests === Number.MAX_SAFE_INTEGER
+    options.maximumPendingRequests > maximumRequestsPerLane
   ) {
     yield* new Attachment.AttachmentStorageError({
       operation: "worker.configure.maximumPendingRequests",
@@ -95,7 +97,7 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
   const directory = yield* AttachmentDirectory.AttachmentDirectory
   const queue = yield* Effect.acquireRelease(
     Queue.dropping<{ readonly event: MessageEvent<unknown>; readonly lane: "cleanup" | "ordinary" }>(
-      options.maximumPendingRequests + 1
+      options.maximumPendingRequests * 2
     ),
     Queue.shutdown
   )
@@ -110,7 +112,10 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
       typeof data.id === "number" && Number.isSafeInteger(data.id) && data.id >= 0
     ) id = data.id
     const cleanup = typeof data === "object" && data !== null && "_tag" in data && data._tag === "CleanupRemove"
-    if (cleanup && pendingCleanupRequests < 1 && Queue.offerUnsafe(queue, { event, lane: "cleanup" })) {
+    if (
+      cleanup && pendingCleanupRequests < options.maximumPendingRequests &&
+      Queue.offerUnsafe(queue, { event, lane: "cleanup" })
+    ) {
       pendingCleanupRequests++
     } else if (
       !cleanup && pendingOrdinaryRequests < options.maximumPendingRequests &&
