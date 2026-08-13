@@ -13,6 +13,7 @@ export const ClientAttachmentRow = Schema.Struct({
   bytes: Attachment.ByteLength,
   object_key: AttachmentStorage.ObjectKey,
   remote_available: Schema.Literals([0, 1]),
+  cache_managed: Schema.Literals([0, 1]),
   created_at: NonNegativeInt,
   last_accessed_at: NonNegativeInt
 })
@@ -39,11 +40,18 @@ export const ServerAttachmentObjectRow = Schema.Struct({
   object_key: AttachmentStorage.ObjectKey,
   state: Schema.Literals(["Staging", "Complete"]),
   storage_offset: Attachment.ByteLength,
+  staging_client_id: Identity.ClientId,
+  staging_membership_incarnation: Identity.MembershipIncarnation,
   lease_token: Schema.NullOr(Schema.String),
   lease_expires_at: Schema.NullOr(NonNegativeInt),
   garbage_collect_after: Schema.NullOr(NonNegativeInt),
   created_at: NonNegativeInt,
   last_accessed_at: NonNegativeInt
+})
+
+export const ServerAttachmentUsageRow = Schema.Struct({
+  object_count: NonNegativeInt,
+  byte_count: NonNegativeInt
 })
 
 export const ServerAttachmentReferenceRow = Schema.Struct({

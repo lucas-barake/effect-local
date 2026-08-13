@@ -13,14 +13,18 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient"
 import * as HttpRouter from "effect/unstable/http/HttpRouter"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -84,20 +88,39 @@ describe("attachment HTTP transport", () => {
           Layer.provide(Reactivity.layer)
         )
         const layerStorage = FileSystemAttachmentStorage.layer({ directory: `${root}/objects`, maximumBytes: 16 })
-        const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
-        const layerAttachments = AttachmentServer.layer({
+        const storageContext = yield* layerStorage.pipe(Layer.build)
+        const storage = Context.get(storageContext, AttachmentStorage.AttachmentStorage)
+        const readStarted = yield* Deferred.make<void>()
+        const releaseRead = yield* Deferred.make<void>()
+        const gatedStorage = AttachmentStorage.AttachmentStorage.of({
+          ...storage,
+          read: (objectKey, requestedReference, range) =>
+            Stream.unwrap(Effect.gen(function*() {
+              yield* Deferred.succeed(readStarted, undefined)
+              yield* Deferred.await(releaseRead)
+              return storage.read(objectKey, requestedReference, range)
+            }))
+        })
+        const layerInfrastructure = Layer.merge(
+          layerDatabase,
+          Layer.succeed(AttachmentStorage.AttachmentStorage, gatedStorage)
+        )
+        const attachmentOptions = {
           maximumObjectBytes: 16,
           maximumObjectsPerSpace: 8,
           maximumBytesPerSpace: 64,
+          maximumReferencesPerObject: 8,
           uploadGrantLifetime: "1 minute",
           uploadLeaseLifetime: "1 minute",
+          readLeaseLifetime: "1 minute",
           stagingLifetime: "1 day",
           garbageCollectionGracePeriod: "1 minute",
           deletionBatchSize: 8,
           authorizeAccess: () => Effect.void,
           authorizeUpload: () => Effect.void,
           authorizeRead: () => Effect.void
-        }).pipe(Layer.provide(layerInfrastructure))
+        } as const
+        const layerAttachments = AttachmentServer.layer(attachmentOptions).pipe(Layer.provide(layerInfrastructure))
         const layerRuntime = MutationRuntime.layer(definition)
         const layerServer = ServerStore.layerTrusted(history).pipe(
           Layer.provide(layerRuntime),
@@ -107,6 +130,7 @@ describe("attachment HTTP transport", () => {
         const services = yield* Layer.mergeAll(layerInfrastructure, layerAttachments, layerServer).pipe(Layer.build)
         const server = Context.get(services, ServerStore.ServerStore)
         const attachments = Context.get(services, AttachmentServer.AttachmentServer)
+        const sql = Context.get(services, SqlClient.SqlClient)
         yield* server.pull({
           spaceId,
           clientId,
@@ -201,6 +225,7 @@ describe("attachment HTTP transport", () => {
           { method: "HEAD", uploadOffset: null },
           { method: "PATCH", uploadOffset: "2" }
         ])
+        yield* sql`DELETE FROM effect_local_server_attachment_upload_grants WHERE space_id = ${spaceId}`
 
         const denied = yield* Stream.mkUint8Array(transfer.download(identity)).pipe(
           Effect.provideService(FetchHttpClient.Fetch, fetch),
@@ -221,19 +246,68 @@ describe("attachment HTTP transport", () => {
           authority: { _tag: "Mutation", clientId, membershipIncarnation }
         })
         const valueJson = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Json))(entityValue)
-        const sql = Context.get(services, SqlClient.SqlClient)
         yield* sql`INSERT INTO effect_local_server_entities_data
       (space_id, generation, model, model_version, entity_key, value_json, entity_bytes)
       VALUES (${spaceId}, 0, ${Message.name}, ${Message.version}, ${"\"message\""},
         ${valueJson}, 1)`
 
-        assert.deepStrictEqual(
-          yield* Stream.mkUint8Array(transfer.download(identity)).pipe(
-            Effect.provideService(FetchHttpClient.Fetch, fetch)
-          ),
-          bytes
+        const download = yield* Stream.mkUint8Array(transfer.download(identity)).pipe(
+          Effect.provideService(FetchHttpClient.Fetch, fetch),
+          Effect.forkChild
         )
+        yield* Deferred.await(readStarted)
+        yield* attachments.replaceEntityReferences({
+          spaceId,
+          schemaGeneration: 0,
+          model: Message.name,
+          modelVersion: Message.version,
+          entityKey: "\"message\"",
+          authority: { _tag: "Mutation", clientId, membershipIncarnation }
+        })
+        const layerSecondStorage = FileSystemAttachmentStorage.layer({
+          directory: `${root}/objects`,
+          maximumBytes: 16
+        })
+        const layerSecondInfrastructure = Layer.mergeAll(
+          Layer.succeed(SqlClient.SqlClient, sql),
+          layerSecondStorage,
+          NodeCrypto.layer
+        )
+        const secondContext = yield* AttachmentServer.layer(attachmentOptions).pipe(
+          Layer.provide(layerSecondInfrastructure),
+          Layer.build
+        )
+        const secondServer = Context.get(secondContext, AttachmentServer.AttachmentServer)
+        yield* TestClock.adjust("2 minutes")
+        assert.strictEqual(yield* secondServer.maintain(spaceId), 0)
+        yield* Deferred.succeed(releaseRead, undefined)
+        assert.deepStrictEqual(yield* Fiber.join(download), bytes)
         assert.strictEqual(downloadCacheControl, "private, no-store")
+        const leases = yield* sql<{ readonly expires_at: number }>`SELECT expires_at
+          FROM effect_local_server_attachment_read_leases WHERE space_id = ${spaceId}`
+        assert.lengthOf(leases, 0)
+        const candidates = yield* sql<{
+          readonly garbage_collect_after: number | null
+          readonly reference_count: number
+          readonly grant_count: number
+        }>`SELECT o.garbage_collect_after,
+            (SELECT COUNT(*) FROM effect_local_server_attachment_references r
+              WHERE r.space_id = o.space_id AND r.digest = o.digest) AS reference_count,
+            (SELECT COUNT(*) FROM effect_local_server_attachment_upload_grants g
+              WHERE g.space_id = o.space_id AND g.digest = o.digest) AS grant_count
+          FROM effect_local_server_attachment_objects o WHERE o.space_id = ${spaceId}`
+        assert.deepStrictEqual(
+          candidates.map(({ grant_count, reference_count }) => ({ grant_count, reference_count })),
+          [{
+            grant_count: 0,
+            reference_count: 0
+          }]
+        )
+        assert.isNotNull(candidates[0].garbage_collect_after)
+        yield* TestClock.adjust("2 minutes")
+        const maintenanceNow = yield* Clock.currentTimeMillis
+        assert.isAtMost(candidates[0].garbage_collect_after, maintenanceNow)
+        assert.strictEqual(yield* secondServer.maintain(spaceId), 1)
         const storageService = Context.get(services, AttachmentStorage.AttachmentStorage)
         const prepared = yield* attachments.prepareUpload({ ...identity, principal: { subject: "reader" } })
         const object = yield* storageService.exists(prepared.objectKey)

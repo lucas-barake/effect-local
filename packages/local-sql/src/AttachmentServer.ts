@@ -6,6 +6,7 @@ import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as RcMap from "effect/RcMap"
@@ -34,8 +35,10 @@ export interface Options<R = never,> {
   readonly maximumObjectBytes: number
   readonly maximumObjectsPerSpace: number
   readonly maximumBytesPerSpace: number
+  readonly maximumReferencesPerObject: number
   readonly uploadGrantLifetime: Duration.Input
   readonly uploadLeaseLifetime: Duration.Input
+  readonly readLeaseLifetime: Duration.Input
   readonly stagingLifetime: Duration.Input
   readonly garbageCollectionGracePeriod: Duration.Input
   readonly deletionBatchSize: number
@@ -100,7 +103,7 @@ export class AttachmentServer extends Context.Service<AttachmentServer, Service>
 ) {}
 
 const Lookup = Schema.Struct({ spaceId: Identity.SpaceId, digest: Attachment.Digest })
-const Count = Schema.Struct({ objects: Schema.Number, bytes: Schema.Number })
+const Count = Schema.Struct({ count: Schema.Number })
 const ReadableEntity = Schema.Struct({
   model: Schema.String,
   model_version: Identity.SchemaVersion,
@@ -133,6 +136,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         "attachments.maximumBytesPerSpace",
         options.maximumBytesPerSpace
       )
+      const maximumReferencesPerObject = yield* Configuration.positiveSafeInteger(
+        "attachments.maximumReferencesPerObject",
+        options.maximumReferencesPerObject
+      )
       const uploadGrantLifetime = yield* Configuration.positiveIntegerDurationMillis(
         "attachments.uploadGrantLifetime",
         options.uploadGrantLifetime
@@ -140,6 +147,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
       const uploadLeaseLifetime = yield* Configuration.positiveIntegerDurationMillis(
         "attachments.uploadLeaseLifetime",
         options.uploadLeaseLifetime
+      )
+      const readLeaseLifetime = yield* Configuration.positiveIntegerDurationMillis(
+        "attachments.readLeaseLifetime",
+        options.readLeaseLifetime
       )
       const stagingLifetime = yield* Configuration.positiveIntegerDurationMillis(
         "attachments.stagingLifetime",
@@ -168,15 +179,16 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         Result: Rows.ServerAttachmentObjectRow,
         execute: ({ digest, spaceId }) =>
           sql`SELECT space_id, digest, bytes, object_key, state, storage_offset,
-        lease_token, lease_expires_at, garbage_collect_after, created_at, last_accessed_at
+        staging_client_id, staging_membership_incarnation, lease_token, lease_expires_at,
+        garbage_collect_after, created_at, last_accessed_at
         FROM effect_local_server_attachment_objects WHERE space_id = ${spaceId} AND digest = ${digest}`
       })
       const spaceUsage = SqlSchema.findOne({
         Request: Identity.SpaceId,
-        Result: Count,
+        Result: Rows.ServerAttachmentUsageRow,
         execute: (spaceId) =>
-          sql`SELECT COUNT(*) AS objects, COALESCE(SUM(bytes), 0) AS bytes
-        FROM effect_local_server_attachment_objects WHERE space_id = ${spaceId}`
+          sql`SELECT object_count, byte_count FROM effect_local_server_attachment_usage
+            WHERE space_id = ${spaceId}`
       })
       const readableEntityPage = SqlSchema.findAll({
         Request: Schema.Struct({
@@ -215,7 +227,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           WHERE space_id = ${spaceId} AND digest = ${digest} AND state = 'Staging'
             AND object_key = ${objectKey}
             AND (lease_token IS NULL OR lease_expires_at <= ${now})
-          RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
+          RETURNING space_id, digest, bytes, object_key, state, storage_offset,
+            staging_client_id, staging_membership_incarnation, lease_token,
             lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
       })
       const find = (spaceId: Identity.SpaceId, digest: Attachment.Digest) =>
@@ -249,7 +262,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               WHERE space_id = ${object.space_id} AND digest = ${object.digest}
                 AND object_key = ${object.object_key} AND state = 'Staging'
                 AND lease_token = ${object.lease_token} AND lease_expires_at <= ${now}
-              RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
+              RETURNING space_id, digest, bytes, object_key, state, storage_offset,
+                staging_client_id, staging_membership_incarnation, lease_token,
                 lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
           })(undefined).pipe(Effect.catchTags({
             SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
@@ -307,6 +321,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               WHERE space_id = ${input.spaceId}`
                 const concurrent = yield* find(input.spaceId, input.reference.digest)
                 if (Option.isSome(concurrent)) return false
+                yield* sql`INSERT OR IGNORE INTO effect_local_server_attachment_usage
+                  (space_id, object_count, byte_count) VALUES (${input.spaceId}, 0, 0)`
                 const usage = yield* spaceUsage(input.spaceId).pipe(
                   Effect.catchTags({
                     SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
@@ -319,22 +335,23 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                       )
                   })
                 )
-                if (usage.objects >= maximumObjectsPerSpace) {
+                if (usage.object_count >= maximumObjectsPerSpace) {
                   return yield* new ReplicaError.CapacityExceeded({
                     resource: "attachment objects per space",
                     limit: maximumObjectsPerSpace
                   })
                 }
-                if (usage.bytes + input.reference.bytes > maximumBytesPerSpace) {
+                if (usage.byte_count + input.reference.bytes > maximumBytesPerSpace) {
                   return yield* new ReplicaError.CapacityExceeded({
                     resource: "attachment bytes per space",
                     limit: maximumBytesPerSpace
                   })
                 }
                 yield* sql`INSERT INTO effect_local_server_attachment_objects
-              (space_id, digest, bytes, object_key, state, storage_offset, created_at, last_accessed_at)
+              (space_id, digest, bytes, object_key, state, storage_offset, staging_client_id,
+                staging_membership_incarnation, created_at, last_accessed_at)
               VALUES (${input.spaceId}, ${input.reference.digest}, ${input.reference.bytes}, ${objectKey},
-                'Staging', 0, ${now}, ${now})`
+                'Staging', 0, ${input.clientId}, ${input.membershipIncarnation}, ${now}, ${now})`
                 return true
               })).pipe(
                 Effect.onError(() =>
@@ -360,6 +377,15 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               return yield* new Attachment.AttachmentLengthMismatch({
                 expected: object.bytes,
                 actual: input.reference.bytes
+              })
+            }
+            if (
+              object.state === "Staging" &&
+              (object.staging_client_id !== input.clientId ||
+                object.staging_membership_incarnation !== input.membershipIncarnation)
+            ) {
+              return yield* new ReplicaError.AuthorizationDenied({
+                reason: { _tag: "AttachmentUploadOwnerMismatch" }
               })
             }
             object = yield* rotateExpiredStaging(object, now)
@@ -444,6 +470,15 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               return yield* new Attachment.AttachmentLengthMismatch({
                 expected: object.bytes,
                 actual: input.reference.bytes
+              })
+            }
+            if (
+              object.state === "Staging" &&
+              (object.staging_client_id !== input.clientId ||
+                object.staging_membership_incarnation !== input.membershipIncarnation)
+            ) {
+              return yield* new ReplicaError.AuthorizationDenied({
+                reason: { _tag: "AttachmentUploadOwnerMismatch" }
               })
             }
             if (object.state === "Complete") {
@@ -621,6 +656,36 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 return yield* new Attachment.AttachmentUnavailable({ digest: reference.digest })
               }
             }
+            const usage = yield* SqlSchema.findOneOption({
+              Request: Schema.Void,
+              Result: Count,
+              execute: () =>
+                sql`SELECT COUNT(*) AS count
+                FROM effect_local_server_attachment_references
+                WHERE space_id = ${input.spaceId} AND schema_generation = ${input.schemaGeneration}
+                  AND digest = ${reference.digest}
+                  AND NOT (model = ${input.model} AND entity_key = ${input.entityKey})`
+            })(undefined).pipe(Effect.catchTags({
+              SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({
+                    message: "Attachment reference quota state is corrupt",
+                    cause
+                  })
+                )
+            }))
+            if (Option.isNone(usage)) {
+              return yield* new ReplicaError.StorageCorrupt({
+                message: "Attachment reference quota query returned no result"
+              })
+            }
+            if (usage.value.count >= maximumReferencesPerObject) {
+              return yield* new ReplicaError.CapacityExceeded({
+                resource: "attachment references per object",
+                limit: maximumReferencesPerObject
+              })
+            }
           }
           yield* sql`DELETE FROM effect_local_server_attachment_references
           WHERE space_id = ${input.spaceId} AND schema_generation = ${input.schemaGeneration}
@@ -717,17 +782,64 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             reason: { _tag: "AttachmentReadDenied" }
           })
         }
-        const found = yield* find(input.spaceId, input.reference.digest)
-        if (Option.isNone(found) || found.value.state !== "Complete") {
-          return yield* new Attachment.AttachmentUnavailable({ digest: input.reference.digest })
-        }
-        if (found.value.bytes !== input.reference.bytes) {
-          return yield* new Attachment.AttachmentLengthMismatch({
-            expected: found.value.bytes,
-            actual: input.reference.bytes
-          })
-        }
-        return storage.read(found.value.object_key, input.reference, input.range)
+        const leaseToken = yield* crypto.randomUUIDv4.pipe(
+          Effect.mapError((cause) =>
+            new Attachment.AttachmentStorageError({
+              operation: "read.leaseToken",
+              cause
+            })
+          )
+        )
+        const now = yield* Clock.currentTimeMillis
+        const object = yield* sql.withTransaction(Effect.gen(function*() {
+          const found = yield* find(input.spaceId, input.reference.digest)
+          if (Option.isNone(found) || found.value.state !== "Complete") {
+            return yield* new Attachment.AttachmentUnavailable({ digest: input.reference.digest })
+          }
+          if (found.value.bytes !== input.reference.bytes) {
+            return yield* new Attachment.AttachmentLengthMismatch({
+              expected: found.value.bytes,
+              actual: input.reference.bytes
+            })
+          }
+          yield* sql`INSERT INTO effect_local_server_attachment_read_leases
+            (lease_token, space_id, digest, object_key, expires_at, created_at)
+            VALUES (${leaseToken}, ${input.spaceId}, ${input.reference.digest}, ${found.value.object_key},
+              ${now + readLeaseLifetime}, ${now})`
+          return found.value
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        const release = sql`DELETE FROM effect_local_server_attachment_read_leases
+          WHERE lease_token = ${leaseToken}`.pipe(
+          Effect.tapError((error) =>
+            Effect.logWarning("Attachment read lease will expire").pipe(
+              Effect.annotateLogs("error", error._tag)
+            )
+          ),
+          Effect.ignore
+        )
+        const renew = Effect.forever(
+          Effect.gen(function*() {
+            const renewalInterval = Math.floor(readLeaseLifetime / 2)
+            yield* Effect.sleep(Math.max(1, renewalInterval))
+            const renewedAt = yield* Clock.currentTimeMillis
+            yield* sql`UPDATE effect_local_server_attachment_read_leases
+              SET expires_at = ${renewedAt + readLeaseLifetime}
+              WHERE lease_token = ${leaseToken}`
+          }).pipe(
+            Effect.tapError((error) =>
+              Effect.logWarning("Attachment read lease renewal failed").pipe(
+                Effect.annotateLogs("error", error._tag)
+              )
+            ),
+            Effect.ignore
+          )
+        )
+        return Stream.unwrap(Effect.gen(function*() {
+          const renewal = yield* Effect.forkChild(renew)
+          return storage.read(object.object_key, input.reference, input.range).pipe(
+            Stream.ensuring(Fiber.interrupt(renewal).pipe(Effect.andThen(release)))
+          )
+        }))
       }, Effect.withSpan("AttachmentServer.prepareRead"))
 
       const read: Service["read"] = (input) => Stream.unwrap(prepareRead(input))
@@ -738,12 +850,15 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           WHERE space_id = ${spaceId} AND expires_at <= ${now}`.pipe(
           Effect.mapError(StorageUnavailable.make)
         )
+        yield* sql`DELETE FROM effect_local_server_attachment_read_leases
+          WHERE expires_at <= ${now}`.pipe(Effect.mapError(StorageUnavailable.make))
         const completeDue = yield* SqlSchema.findAll({
           Request: Schema.Struct({ spaceId: Identity.SpaceId, now: Schema.Number, maximum: Schema.Number }),
           Result: Rows.ServerAttachmentObjectRow,
           execute: ({ maximum, now: requestedNow, spaceId: requestedSpaceId }) =>
-            sql`SELECT space_id, digest, bytes, object_key, state,
-              storage_offset, lease_token, lease_expires_at, garbage_collect_after, created_at, last_accessed_at
+            sql`SELECT space_id, digest, bytes, object_key, state, storage_offset,
+              staging_client_id, staging_membership_incarnation, lease_token, lease_expires_at,
+              garbage_collect_after, created_at, last_accessed_at
             FROM effect_local_server_attachment_objects AS o
             WHERE o.space_id = ${requestedSpaceId} AND o.state = 'Complete'
               AND o.garbage_collect_after IS NOT NULL
@@ -752,6 +867,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 WHERE r.space_id = o.space_id AND r.digest = o.digest)
               AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
                 WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${requestedNow})
+              AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_read_leases AS l
+                WHERE l.space_id = o.space_id AND l.digest = o.digest AND l.object_key = o.object_key
+                  AND l.expires_at > ${requestedNow})
               AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= ${requestedNow})
             ORDER BY o.garbage_collect_after, o.digest LIMIT ${maximum}`
         })({ spaceId, now, maximum: deletionBatchSize }).pipe(
@@ -770,8 +888,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           Request: Schema.Struct({ spaceId: Identity.SpaceId, now: Schema.Number, maximum: Schema.Number }),
           Result: Rows.ServerAttachmentObjectRow,
           execute: ({ maximum, now: requestedNow, spaceId: requestedSpaceId }) =>
-            sql`SELECT space_id, digest, bytes, object_key, state,
-              storage_offset, lease_token, lease_expires_at, garbage_collect_after, created_at, last_accessed_at
+            sql`SELECT space_id, digest, bytes, object_key, state, storage_offset,
+              staging_client_id, staging_membership_incarnation, lease_token, lease_expires_at,
+              garbage_collect_after, created_at, last_accessed_at
             FROM effect_local_server_attachment_objects AS o
             WHERE o.space_id = ${requestedSpaceId} AND o.state = 'Staging'
               AND o.last_accessed_at <= ${requestedNow - stagingLifetime}
@@ -805,7 +924,11 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                     WHERE r.space_id = o.space_id AND r.digest = o.digest)
                   AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
                     WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${now})
-                RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
+                  AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_read_leases AS l
+                    WHERE l.space_id = o.space_id AND l.digest = o.digest AND l.object_key = o.object_key
+                      AND l.expires_at > ${now})
+                RETURNING space_id, digest, bytes, object_key, state, storage_offset,
+                  staging_client_id, staging_membership_incarnation, lease_token,
                   lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
             } else {
               execute = () =>
@@ -816,7 +939,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   AND (o.lease_expires_at IS NULL OR o.lease_expires_at <= ${now})
                   AND NOT EXISTS (SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
                     WHERE g.space_id = o.space_id AND g.digest = o.digest AND g.expires_at > ${now})
-                RETURNING space_id, digest, bytes, object_key, state, storage_offset, lease_token,
+                RETURNING space_id, digest, bytes, object_key, state, storage_offset,
+                  staging_client_id, staging_membership_incarnation, lease_token,
                   lease_expires_at, garbage_collect_after, created_at, last_accessed_at`
             }
             const removed = yield* SqlSchema.findOneOption({

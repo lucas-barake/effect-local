@@ -22,6 +22,7 @@ import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as AttachmentClient from "../src/AttachmentClient.js"
@@ -43,6 +44,14 @@ const membershipIncarnation = Identity.MembershipIncarnation.make(
 const hello = Uint8Array.from([104, 101, 108, 108, 111])
 const layerNodeServices = Layer.mergeAll(NodeCrypto.layer, NodeFileSystem.layer, NodePath.layer)
 const provideNodeServices = Effect.provide(layerNodeServices)
+const attachmentCacheOptions = {
+  maximumLocalBytes: 64,
+  maximumLocalObjects: 8,
+  maximumCacheBytes: 64,
+  maximumCacheObjects: 8,
+  maximumCacheAge: "1 day",
+  evictionBatchSize: 4
+} as const
 
 const AttachmentMessage = Model.make("AttachmentClientMessage", {
   version: 1,
@@ -87,6 +96,272 @@ const collectBytes = <E extends { readonly _tag: string }, R,>(stream: Stream.St
 
 describe("attachment client", () => {
   it.effect(
+    "bounds the lazy cache by LRU while retaining owned objects",
+    Effect.fnUntraced(
+      function*() {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-cache-" })
+        const payloads = [Uint8Array.of(1), Uint8Array.of(2), Uint8Array.of(3)]
+        const references = yield* Effect.forEach(payloads, (bytes) =>
+          Attachment.hash(Stream.make(bytes)).pipe(
+            Effect.map((hashed) => Attachment.Reference.make(hashed))
+          ))
+        const downloads = yield* Ref.make(new Map<Attachment.Digest, number>())
+        const bytesByDigest = new Map(references.map((reference, index) => [reference.digest, payloads[index]]))
+        const layerDatabase = SqliteClient.layer({ filename: `${root}/client.sqlite`, disableWAL: true })
+        const layerStorage = FileSystemAttachmentStorage.layer({ directory: `${root}/objects`, maximumBytes: 8 })
+        const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
+        const layerTransfer = Layer.succeed(
+          AttachmentTransfer.AttachmentTransfer,
+          AttachmentTransfer.AttachmentTransfer.of({
+            upload: () => Effect.die("unexpected upload"),
+            download: ({ reference }) =>
+              Stream.fromEffect(Ref.update(downloads, (current) => {
+                const updated = new Map(current)
+                updated.set(reference.digest, (updated.get(reference.digest) ?? 0) + 1)
+                return updated
+              })).pipe(Stream.flatMap(() => Stream.make(bytesByDigest.get(reference.digest)!)))
+          })
+        )
+        const context = yield* AttachmentClient.layer({
+          maximumLocalBytes: 8,
+          maximumLocalObjects: 8,
+          maximumCacheBytes: 2,
+          maximumCacheObjects: 2,
+          maximumCacheAge: "1 day",
+          evictionBatchSize: 2
+        }).pipe(
+          Layer.provide(layerInfrastructure),
+          Layer.provide(layerTransfer),
+          Layer.provideMerge(layerInfrastructure),
+          Layer.build
+        )
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const client = Context.get(context, AttachmentClient.AttachmentClient)
+        yield* Migrations.client({ definition: Domain.definition, spaceId, clientId }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql)
+        )
+        const read = (reference: Attachment.Reference) =>
+          collectBytes(client.read(spaceId, clientId, membershipIncarnation, reference))
+
+        yield* read(references[0])
+        yield* TestClock.adjust("1 second")
+        yield* read(references[1])
+        yield* TestClock.adjust("1 second")
+        yield* read(references[0])
+        yield* TestClock.adjust("1 second")
+        yield* read(references[2])
+
+        const cached = yield* sql<{ readonly digest: string }>`SELECT digest FROM effect_local_client_attachments
+          WHERE cache_managed = 1 ORDER BY digest`
+        assert.deepStrictEqual(
+          cached.map((row) => row.digest).toSorted(),
+          [references[0].digest, references[2].digest].toSorted()
+        )
+        assert.strictEqual((yield* Ref.get(downloads)).get(references[0].digest), 1)
+
+        yield* client.associatePending(
+          spaceId,
+          Identity.MutationId.make(
+            "mut_00000000-0000-4000-8000-000000000010"
+          ),
+          [references[0]]
+        )
+        yield* TestClock.adjust("1 second")
+        yield* read(references[1])
+        const retained = yield* sql<{ readonly digest: string }>`SELECT digest FROM effect_local_client_attachments
+          WHERE cache_managed = 1 ORDER BY digest`
+        assert.include(retained.map((row) => row.digest), references[0].digest)
+        assert.notInclude(retained.map((row) => row.digest), references[2].digest)
+      },
+      provideNodeServices,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "serializes concurrent cache admissions and counts zero byte objects",
+    Effect.fnUntraced(
+      function*() {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-cache-admission-" })
+        const emptyReference = Attachment.Reference.make(yield* Attachment.hash(Stream.make(new Uint8Array())))
+        const otherSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
+        const layerDatabase = SqliteClient.layer({ filename: `${root}/client.sqlite`, disableWAL: true })
+        const layerStorage = FileSystemAttachmentStorage.layer({ directory: `${root}/objects`, maximumBytes: 8 })
+        const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
+        const layerTransfer = Layer.succeed(
+          AttachmentTransfer.AttachmentTransfer,
+          AttachmentTransfer.AttachmentTransfer.of({
+            upload: () => Effect.die("unexpected upload"),
+            download: () => Stream.make(new Uint8Array())
+          })
+        )
+        const context = yield* AttachmentClient.layer({
+          maximumLocalBytes: 8,
+          maximumLocalObjects: 8,
+          maximumCacheBytes: 1,
+          maximumCacheObjects: 1,
+          maximumCacheAge: "1 day",
+          evictionBatchSize: 1
+        }).pipe(
+          Layer.provide(layerInfrastructure),
+          Layer.provide(layerTransfer),
+          Layer.provideMerge(layerInfrastructure),
+          Layer.build
+        )
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const client = Context.get(context, AttachmentClient.AttachmentClient)
+        yield* Migrations.client({ definition: Domain.definition, spaceId, clientId }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql)
+        )
+        yield* Migrations.client({ definition: Domain.definition, spaceId: otherSpaceId, clientId }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql)
+        )
+
+        yield* Effect.all([
+          collectBytes(client.read(spaceId, clientId, membershipIncarnation, emptyReference)),
+          collectBytes(client.read(otherSpaceId, clientId, membershipIncarnation, emptyReference))
+        ], { concurrency: "unbounded" })
+
+        const cached = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_client_attachments WHERE cache_managed = 1`
+        assert.strictEqual(cached[0].count, 1)
+      },
+      provideNodeServices,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "bounds offline staging by bytes and objects while preserving deduplication",
+    Effect.fnUntraced(
+      function*() {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-stage-capacity-" })
+        const layerDatabase = SqliteClient.layer({ filename: `${root}/client.sqlite`, disableWAL: true })
+        const layerStorage = FileSystemAttachmentStorage.layer({ directory: `${root}/objects`, maximumBytes: 8 })
+        const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
+        const layerTransfer = Layer.succeed(
+          AttachmentTransfer.AttachmentTransfer,
+          AttachmentTransfer.AttachmentTransfer.of({
+            upload: () => Effect.die("unexpected upload"),
+            download: () => Stream.die("unexpected download")
+          })
+        )
+        const context = yield* AttachmentClient.layer({
+          maximumLocalBytes: 1,
+          maximumLocalObjects: 3,
+          maximumCacheBytes: 2,
+          maximumCacheObjects: 2,
+          maximumCacheAge: "1 day",
+          evictionBatchSize: 1
+        }).pipe(
+          Layer.provide(layerInfrastructure),
+          Layer.provide(layerTransfer),
+          Layer.provideMerge(layerInfrastructure),
+          Layer.build
+        )
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const client = Context.get(context, AttachmentClient.AttachmentClient)
+        yield* Migrations.client({ definition: Domain.definition, spaceId, clientId }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql)
+        )
+
+        const firstBytes = Uint8Array.of(1)
+        const secondBytes = Uint8Array.of(2)
+        const empty = yield* client.stage(spaceId, Stream.make(new Uint8Array()))
+        const one = yield* client.stage(spaceId, Stream.make(firstBytes))
+        const duplicate = yield* client.stage(spaceId, Stream.make(firstBytes))
+        const rejected = yield* client.stage(spaceId, Stream.make(secondBytes)).pipe(Effect.result)
+
+        assert.strictEqual(duplicate.digest, one.digest)
+        assert.isTrue(Result.isFailure(rejected))
+        if (Result.isFailure(rejected)) {
+          assert.strictEqual(rejected.failure._tag, "CapacityExceeded")
+          if (rejected.failure._tag === "CapacityExceeded") {
+            assert.strictEqual(rejected.failure.resource, "client attachment storage")
+            assert.strictEqual(rejected.failure.limit, 1)
+          }
+        }
+        const usage = yield* sql<{ readonly object_count: number; readonly byte_count: number }>`
+          SELECT COUNT(*) AS object_count, COALESCE(SUM(bytes), 0) AS byte_count
+          FROM effect_local_client_attachments`
+        assert.deepStrictEqual(usage, [{ object_count: 2, byte_count: 1 }])
+        assert.deepStrictEqual(
+          yield* collectBytes(client.read(spaceId, clientId, membershipIncarnation, empty)),
+          new Uint8Array()
+        )
+        assert.deepStrictEqual(
+          yield* collectBytes(client.read(spaceId, clientId, membershipIncarnation, one)),
+          Uint8Array.of(1)
+        )
+      },
+      provideNodeServices,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "serializes concurrent offline staging admissions",
+    Effect.fnUntraced(
+      function*() {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-stage-concurrent-" })
+        const layerDatabase = SqliteClient.layer({ filename: `${root}/client.sqlite`, disableWAL: true })
+        const layerStorage = FileSystemAttachmentStorage.layer({ directory: `${root}/objects`, maximumBytes: 8 })
+        const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
+        const layerTransfer = Layer.succeed(
+          AttachmentTransfer.AttachmentTransfer,
+          AttachmentTransfer.AttachmentTransfer.of({
+            upload: () => Effect.die("unexpected upload"),
+            download: () => Stream.die("unexpected download")
+          })
+        )
+        const context = yield* AttachmentClient.layer({
+          maximumLocalBytes: 1,
+          maximumLocalObjects: 1,
+          maximumCacheBytes: 1,
+          maximumCacheObjects: 1,
+          maximumCacheAge: "1 day",
+          evictionBatchSize: 1
+        }).pipe(
+          Layer.provide(layerInfrastructure),
+          Layer.provide(layerTransfer),
+          Layer.provideMerge(layerInfrastructure),
+          Layer.build
+        )
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const client = Context.get(context, AttachmentClient.AttachmentClient)
+        yield* Migrations.client({ definition: Domain.definition, spaceId, clientId }).pipe(
+          Effect.provideService(SqlClient.SqlClient, sql)
+        )
+
+        const firstBytes = Uint8Array.of(1)
+        const secondBytes = Uint8Array.of(2)
+        const staged = yield* Effect.all([
+          client.stage(spaceId, Stream.make(firstBytes)).pipe(Effect.result),
+          client.stage(spaceId, Stream.make(secondBytes)).pipe(Effect.result)
+        ], { concurrency: "unbounded" })
+
+        assert.strictEqual(staged.filter(Result.isSuccess).length, 1)
+        assert.strictEqual(staged.filter(Result.isFailure).length, 1)
+        const failed = staged.find(Result.isFailure)
+        assert.isDefined(failed)
+        if (failed !== undefined && Result.isFailure(failed)) {
+          assert.strictEqual(failed.failure._tag, "CapacityExceeded")
+        }
+        const usage = yield* sql<{ readonly object_count: number; readonly byte_count: number }>`
+          SELECT COUNT(*) AS object_count, COALESCE(SUM(bytes), 0) AS byte_count
+          FROM effect_local_client_attachments`
+        assert.deepStrictEqual(usage, [{ object_count: 1, byte_count: 1 }])
+      },
+      provideNodeServices,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
     "preserves the persistence failure when staged byte cleanup also fails",
     Effect.fnUntraced(
       function*() {
@@ -121,7 +396,7 @@ describe("attachment client", () => {
             download: () => Stream.die("unexpected download")
           })
         )
-        const client = yield* AttachmentClient.layer.pipe(
+        const client = yield* AttachmentClient.layer(attachmentCacheOptions).pipe(
           Layer.provide(Layer.merge(layerDatabase, layerStorage)),
           Layer.provide(layerTransfer),
           Layer.build,
@@ -163,7 +438,7 @@ describe("attachment client", () => {
             download: () => Stream.fail(new ReplicaError.ServerUnavailable())
           })
         )
-        const context = yield* AttachmentClient.layer.pipe(
+        const context = yield* AttachmentClient.layer(attachmentCacheOptions).pipe(
           Layer.provide(layerInfrastructure),
           Layer.provide(layerTransfer),
           Layer.provideMerge(layerInfrastructure),
@@ -249,7 +524,7 @@ describe("attachment client", () => {
           SyncEngine.SyncEngine,
           SyncEngine.SyncEngine.of({
             waitForCredentialChange: () => Effect.never,
-            submit: server.submit,
+            submit: (request) => TestClock.adjust("2 millis").pipe(Effect.andThen(server.submit(request))),
             discard: (request) => server.discard(request, null),
             pull: server.pull,
             bootstrap: server.bootstrap,
@@ -263,7 +538,11 @@ describe("attachment client", () => {
           const layerDatabase = SqliteClient.layer({ filename: database, disableWAL: true })
           const layerStorage = FileSystemAttachmentStorage.layer({ directory: objects, maximumBytes: 8 })
           const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
-          const layerAttachments = AttachmentClient.layer.pipe(
+          const layerAttachments = AttachmentClient.layer({
+            ...attachmentCacheOptions,
+            maximumCacheBytes: 5,
+            maximumCacheAge: "1 milli"
+          }).pipe(
             Layer.provide(layerInfrastructure),
             Layer.provide(layerTransfer)
           )
@@ -344,8 +623,12 @@ describe("attachment client", () => {
           SELECT COUNT(*) AS count FROM effect_local_client_attachment_owners
           WHERE space_id = ${spaceId} AND digest = ${reference.digest}`
         assert.strictEqual(ownersAfter[0].count, 0)
+        const cachedAfterSettlement = yield* restartedSql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count FROM effect_local_client_attachments
+          WHERE space_id = ${spaceId} AND digest = ${reference.digest}`
+        assert.strictEqual(cachedAfterSettlement[0].count, 0)
         assert.deepStrictEqual(yield* collectBytes(restartedSpace.readAttachment(reference)), hello)
-        assert.strictEqual(yield* Ref.get(downloads), 0)
+        assert.strictEqual(yield* Ref.get(downloads), 1)
         yield* Scope.close(secondScope, Exit.void)
       },
       provideNodeServices,

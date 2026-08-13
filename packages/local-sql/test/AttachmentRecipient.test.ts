@@ -50,6 +50,14 @@ const senderId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000000
 const recipientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
 const bytes = Uint8Array.from([112, 104, 111, 116, 111])
 const layerNodeServices = Layer.mergeAll(NodeCrypto.layer, NodeFileSystem.layer, NodePath.layer)
+const attachmentCacheOptions = {
+  maximumLocalBytes: 64 * 1024 * 1024,
+  maximumLocalObjects: 8,
+  maximumCacheBytes: 64,
+  maximumCacheObjects: 8,
+  maximumCacheAge: "1 day",
+  evictionBatchSize: 4
+} as const
 const provideNodeServices = Effect.provide(layerNodeServices)
 
 const serverOptions = {
@@ -142,7 +150,7 @@ const clientLayer = (options: {
     maximumBytes: 16
   })
   const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
-  const layerAttachments = AttachmentClient.layer.pipe(
+  const layerAttachments = AttachmentClient.layer(attachmentCacheOptions).pipe(
     Layer.provide(layerInfrastructure),
     Layer.provide(options.layerTransfer)
   )
@@ -190,8 +198,10 @@ describe("attachment recipients", () => {
           maximumObjectBytes: 16,
           maximumObjectsPerSpace: 4,
           maximumBytesPerSpace: 64,
+          maximumReferencesPerObject: 8,
           uploadGrantLifetime: "1 hour",
           uploadLeaseLifetime: "1 minute",
+          readLeaseLifetime: "1 minute",
           stagingLifetime: "1 day",
           garbageCollectionGracePeriod: "1 hour",
           deletionBatchSize: 8,

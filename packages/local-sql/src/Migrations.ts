@@ -1338,6 +1338,7 @@ const clientV14 = makeMigration({
         length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
       ),
       remote_available INTEGER NOT NULL DEFAULT 0 CHECK (remote_available IN (0, 1)),
+      cache_managed INTEGER NOT NULL DEFAULT 0 CHECK (cache_managed IN (0, 1)),
       created_at INTEGER NOT NULL CHECK (created_at >= 0),
       last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= created_at),
       PRIMARY KEY (space_id, digest),
@@ -1356,7 +1357,7 @@ const clientV14 = makeMigration({
     `CREATE INDEX effect_local_client_attachment_owners_identity
       ON effect_local_client_attachment_owners (space_id, owner_kind, owner_id, digest)`,
     `CREATE INDEX effect_local_client_attachments_eviction
-      ON effect_local_client_attachments (space_id, remote_available, last_accessed_at, digest)`,
+      ON effect_local_client_attachments (cache_managed, remote_available, last_accessed_at, space_id, digest)`,
     `CREATE TABLE effect_local_client_attachment_deletions (
       object_key TEXT PRIMARY KEY CHECK (
         length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
@@ -1391,43 +1392,74 @@ const clientV14 = makeMigration({
       END`,
     `CREATE TRIGGER effect_local_client_pending_attachment_release
       AFTER DELETE ON effect_local_client_pending_data BEGIN
+        INSERT OR IGNORE INTO effect_local_client_attachment_deletions
+          (object_key, next_attempt_at, created_at)
+          SELECT a.object_key, 0, 0
+          FROM effect_local_client_attachment_owners AS target
+          JOIN effect_local_client_attachments AS a
+            ON a.space_id = target.space_id AND a.digest = target.digest
+          WHERE target.space_id = OLD.space_id AND target.owner_kind = 'Pending'
+            AND target.owner_id = OLD.mutation_id AND a.remote_available = 0
+            AND NOT EXISTS (
+              SELECT 1 FROM effect_local_client_pending_data AS p
+              WHERE p.space_id = OLD.space_id AND p.mutation_id = OLD.mutation_id
+            ) AND NOT EXISTS (
+              SELECT 1 FROM effect_local_client_attachment_owners AS other
+              WHERE other.space_id = target.space_id AND other.digest = target.digest
+                AND NOT (other.owner_kind = 'Pending' AND other.owner_id = OLD.mutation_id)
+            );
+        DELETE FROM effect_local_client_attachments
+          WHERE (space_id, digest) IN (
+            SELECT target.space_id, target.digest
+            FROM effect_local_client_attachment_owners AS target
+            WHERE target.space_id = OLD.space_id AND target.owner_kind = 'Pending'
+              AND target.owner_id = OLD.mutation_id
+              AND NOT EXISTS (
+                SELECT 1 FROM effect_local_client_pending_data AS p
+                WHERE p.space_id = OLD.space_id AND p.mutation_id = OLD.mutation_id
+              )
+          ) AND remote_available = 0 AND NOT EXISTS (
+            SELECT 1 FROM effect_local_client_attachment_owners AS other
+            WHERE other.space_id = effect_local_client_attachments.space_id
+              AND other.digest = effect_local_client_attachments.digest
+              AND NOT (other.owner_kind = 'Pending' AND other.owner_id = OLD.mutation_id)
+          );
         DELETE FROM effect_local_client_attachment_owners
           WHERE space_id = OLD.space_id AND owner_kind = 'Pending' AND owner_id = OLD.mutation_id
             AND NOT EXISTS (
               SELECT 1 FROM effect_local_client_pending_data AS p
               WHERE p.space_id = OLD.space_id AND p.mutation_id = OLD.mutation_id
             );
-        INSERT OR IGNORE INTO effect_local_client_attachment_deletions
-          (object_key, next_attempt_at, created_at)
-          SELECT a.object_key, 0, 0 FROM effect_local_client_attachments AS a
-          WHERE a.space_id = OLD.space_id AND a.remote_available = 0 AND NOT EXISTS (
-            SELECT 1 FROM effect_local_client_attachment_owners AS o
-            WHERE o.space_id = a.space_id AND o.digest = a.digest
-          );
-        DELETE FROM effect_local_client_attachments
-          WHERE space_id = OLD.space_id AND remote_available = 0 AND NOT EXISTS (
-            SELECT 1 FROM effect_local_client_attachment_owners AS o
-            WHERE o.space_id = effect_local_client_attachments.space_id
-              AND o.digest = effect_local_client_attachments.digest
-          );
       END`,
     `CREATE TRIGGER effect_local_client_quarantine_attachment_release
       AFTER DELETE ON effect_local_client_quarantine BEGIN
-        DELETE FROM effect_local_client_attachment_owners
-          WHERE space_id = OLD.space_id AND owner_kind = 'Quarantine' AND owner_id = OLD.mutation_id;
         INSERT OR IGNORE INTO effect_local_client_attachment_deletions
           (object_key, next_attempt_at, created_at)
-          SELECT a.object_key, 0, 0 FROM effect_local_client_attachments AS a
-          WHERE a.space_id = OLD.space_id AND a.remote_available = 0 AND NOT EXISTS (
-            SELECT 1 FROM effect_local_client_attachment_owners AS o
-            WHERE o.space_id = a.space_id AND o.digest = a.digest
-          );
+          SELECT a.object_key, 0, 0
+          FROM effect_local_client_attachment_owners AS target
+          JOIN effect_local_client_attachments AS a
+            ON a.space_id = target.space_id AND a.digest = target.digest
+          WHERE target.space_id = OLD.space_id AND target.owner_kind = 'Quarantine'
+            AND target.owner_id = OLD.mutation_id AND a.remote_available = 0
+            AND NOT EXISTS (
+              SELECT 1 FROM effect_local_client_attachment_owners AS other
+              WHERE other.space_id = target.space_id AND other.digest = target.digest
+                AND NOT (other.owner_kind = 'Quarantine' AND other.owner_id = OLD.mutation_id)
+            );
         DELETE FROM effect_local_client_attachments
-          WHERE space_id = OLD.space_id AND remote_available = 0 AND NOT EXISTS (
-            SELECT 1 FROM effect_local_client_attachment_owners AS o
-            WHERE o.space_id = effect_local_client_attachments.space_id
-              AND o.digest = effect_local_client_attachments.digest
+          WHERE (space_id, digest) IN (
+            SELECT target.space_id, target.digest
+            FROM effect_local_client_attachment_owners AS target
+            WHERE target.space_id = OLD.space_id AND target.owner_kind = 'Quarantine'
+              AND target.owner_id = OLD.mutation_id
+          ) AND remote_available = 0 AND NOT EXISTS (
+            SELECT 1 FROM effect_local_client_attachment_owners AS other
+            WHERE other.space_id = effect_local_client_attachments.space_id
+              AND other.digest = effect_local_client_attachments.digest
+              AND NOT (other.owner_kind = 'Quarantine' AND other.owner_id = OLD.mutation_id)
           );
+        DELETE FROM effect_local_client_attachment_owners
+          WHERE space_id = OLD.space_id AND owner_kind = 'Quarantine' AND owner_id = OLD.mutation_id;
       END`
   ]
 })
@@ -1880,16 +1912,25 @@ const serverV13 = makeMigration({
       ),
       state TEXT NOT NULL CHECK (state IN ('Staging', 'Complete')),
       storage_offset INTEGER NOT NULL DEFAULT 0 CHECK (storage_offset >= 0 AND storage_offset <= bytes),
+      staging_client_id TEXT NOT NULL,
+      staging_membership_incarnation TEXT NOT NULL,
       lease_token TEXT,
       lease_expires_at INTEGER,
       garbage_collect_after INTEGER,
       created_at INTEGER NOT NULL CHECK (created_at >= 0),
       last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= created_at),
       PRIMARY KEY (space_id, digest),
+      UNIQUE (space_id, digest, object_key),
       CHECK ((state = 'Complete' AND storage_offset = bytes) OR state = 'Staging'),
       CHECK ((lease_token IS NULL AND lease_expires_at IS NULL) OR
         (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_expires_at >= 0)),
       CHECK (garbage_collect_after IS NULL OR garbage_collect_after >= 0)
+    )`,
+    `CREATE TABLE effect_local_server_attachment_usage (
+      space_id TEXT PRIMARY KEY,
+      object_count INTEGER NOT NULL CHECK (object_count >= 0),
+      byte_count INTEGER NOT NULL CHECK (byte_count >= 0),
+      FOREIGN KEY (space_id) REFERENCES effect_local_server_spaces(space_id) ON DELETE CASCADE
     )`,
     `CREATE TABLE effect_local_server_attachment_upload_grants (
       space_id TEXT NOT NULL,
@@ -1936,6 +1977,29 @@ const serverV13 = makeMigration({
       CHECK ((claim_token IS NULL AND claimed_until IS NULL) OR
         (claim_token IS NOT NULL AND claimed_until IS NOT NULL AND claimed_until >= 0))
     )`,
+    `CREATE TABLE effect_local_server_attachment_read_leases (
+      lease_token TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      object_key TEXT NOT NULL,
+      expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+      created_at INTEGER NOT NULL CHECK (created_at >= 0),
+      FOREIGN KEY (space_id, digest, object_key)
+        REFERENCES effect_local_server_attachment_objects(space_id, digest, object_key) ON DELETE CASCADE
+    )`,
+    `CREATE TRIGGER effect_local_server_attachment_usage_insert AFTER INSERT
+      ON effect_local_server_attachment_objects BEGIN
+        INSERT INTO effect_local_server_attachment_usage (space_id, object_count, byte_count)
+          VALUES (NEW.space_id, 1, NEW.bytes)
+          ON CONFLICT (space_id) DO UPDATE SET
+            object_count = object_count + 1, byte_count = byte_count + NEW.bytes;
+      END`,
+    `CREATE TRIGGER effect_local_server_attachment_usage_delete AFTER DELETE
+      ON effect_local_server_attachment_objects BEGIN
+        UPDATE effect_local_server_attachment_usage SET
+          object_count = object_count - 1, byte_count = byte_count - OLD.bytes
+          WHERE space_id = OLD.space_id;
+      END`,
     `CREATE INDEX effect_local_server_attachment_objects_complete_gc
       ON effect_local_server_attachment_objects (space_id, garbage_collect_after, digest)
       WHERE state = 'Complete' AND garbage_collect_after IS NOT NULL`,
@@ -1950,6 +2014,10 @@ const serverV13 = makeMigration({
       ON effect_local_server_attachment_references (space_id, schema_generation, digest, model, entity_key)`,
     `CREATE INDEX effect_local_server_attachment_references_object
       ON effect_local_server_attachment_references (space_id, digest, schema_generation)`,
+    `CREATE INDEX effect_local_server_attachment_read_leases_object
+      ON effect_local_server_attachment_read_leases (space_id, digest, object_key, expires_at)`,
+    `CREATE INDEX effect_local_server_attachment_read_leases_expiry
+      ON effect_local_server_attachment_read_leases (expires_at, lease_token)`,
     `CREATE INDEX effect_local_server_attachment_deletions_due
       ON effect_local_server_attachment_deletions (next_attempt_at, object_key)`,
     `CREATE TRIGGER effect_local_server_attachment_space_delete BEFORE DELETE

@@ -218,7 +218,10 @@ describe("storage migration catalogs", () => {
         "effect_local_server_snapshot_projections",
         "effect_local_server_snapshot_projection_entities",
         "effect_local_server_attachment_objects",
+        "effect_local_server_attachment_usage",
         "effect_local_server_attachment_upload_grants",
+        "effect_local_server_attachment_possessions",
+        "effect_local_server_attachment_read_leases",
         "effect_local_server_attachment_references",
         "effect_local_server_attachment_deletions"
       ])
@@ -276,8 +279,23 @@ describe("storage migration catalogs", () => {
         execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_client_attachment_owners`
       })(undefined)
       assert.strictEqual(owners.count, 1)
+      yield* sql`INSERT INTO effect_local_client_quarantine
+        (space_id, membership_incarnation, mutation_id, local_sequence, basis, name, payload_json,
+          digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
+          rejection_json, target_schema_version, target_schema_hash)
+        SELECT space_id, membership_incarnation, mutation_id, local_sequence, basis, name, payload_json,
+          digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
+          '"rejected"', ${Domain.definition.schemaIdentity.version}, ${Domain.definition.schemaIdentity.hash}
+        FROM effect_local_client_pending_data WHERE mutation_id = ${mutationId} AND schema_generation = 1`
       yield* sql`DELETE FROM effect_local_client_pending_data
         WHERE mutation_id = ${mutationId} AND schema_generation = 1`
+      const quarantinedOwners = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_client_attachment_owners`
+      })(undefined)
+      assert.strictEqual(quarantinedOwners.count, 1)
+      yield* sql`DELETE FROM effect_local_client_quarantine WHERE mutation_id = ${mutationId}`
       const releasedOwners = yield* SqlSchema.findOne({
         Request: Schema.Void,
         Result: CountRow,
@@ -293,6 +311,15 @@ describe("storage migration catalogs", () => {
       })(undefined)
       assert.strictEqual(clientDeletions.count, 1)
 
+      const releasePlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
+        SELECT a.object_key FROM effect_local_client_attachment_owners AS target
+        JOIN effect_local_client_attachments AS a
+          ON a.space_id = target.space_id AND a.digest = target.digest
+        WHERE target.space_id = ${spaceId} AND target.owner_kind = 'Pending'
+          AND target.owner_id = ${mutationId}`
+      assert.isTrue(releasePlan.some((row) => row.detail.includes("effect_local_client_attachment_owners_identity")))
+      assert.isTrue(releasePlan.some((row) => row.detail.includes("sqlite_autoindex_effect_local_client_attachments")))
+
       yield* sql`INSERT INTO effect_local_server_spaces
         (space_id, definition_hash, next_server_sequence, schema_version, schema_hash, schema_generation,
           next_terminal_sequence, history_floor, receipt_floor, retained_history_count,
@@ -301,8 +328,20 @@ describe("storage migration catalogs", () => {
         VALUES (${spaceId}, ${Domain.definition.hash}, 1, ${Domain.definition.schemaIdentity.version},
           ${Domain.definition.schemaIdentity.hash}, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1)`
       yield* sql`INSERT INTO effect_local_server_attachment_objects
-        (space_id, digest, bytes, object_key, state, storage_offset, created_at, last_accessed_at)
-        VALUES (${spaceId}, ${attachmentDigest}, 5, ${objectKey}, 'Complete', 5, 1, 1)`
+        (space_id, digest, bytes, object_key, state, storage_offset, staging_client_id,
+          staging_membership_incarnation, created_at, last_accessed_at)
+        VALUES (${spaceId}, ${attachmentDigest}, 5, ${objectKey}, 'Complete', 5, ${clientId},
+          ${membershipIncarnation}, 1, 1)`
+      const usage = yield* sql<{ readonly object_count: number; readonly byte_count: number }>`
+        SELECT object_count, byte_count FROM effect_local_server_attachment_usage
+        WHERE space_id = ${spaceId}`
+      assert.deepStrictEqual(usage, [{ object_count: 1, byte_count: 5 }])
+      const usagePlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
+        SELECT object_count, byte_count FROM effect_local_server_attachment_usage
+        WHERE space_id = ${spaceId}`
+      assert.isTrue(
+        usagePlan.some((row) => row.detail.includes("sqlite_autoindex_effect_local_server_attachment_usage"))
+      )
       yield* sql`INSERT INTO effect_local_server_attachment_references
         (space_id, schema_generation, digest, model, model_version, entity_key)
         VALUES (${spaceId}, 0, ${attachmentDigest}, 'Todo', 1, 'todo-1')`
@@ -320,6 +359,9 @@ describe("storage migration catalogs", () => {
           WHERE object_key = ${objectKey}`
       })(undefined)
       assert.strictEqual(deletions.count, 1)
+      const deletedUsage = yield* sql<{ readonly object_count: number }>`
+        SELECT object_count FROM effect_local_server_attachment_usage WHERE space_id = ${spaceId}`
+      assert.lengthOf(deletedUsage, 0)
     }, provideDatabase)
   )
 

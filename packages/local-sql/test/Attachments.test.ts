@@ -21,10 +21,13 @@ import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as AttachmentClient from "../src/AttachmentClient.js"
 import * as AttachmentServer from "../src/AttachmentServer.js"
+import * as AttachmentStorage from "../src/AttachmentStorage.js"
 import * as AttachmentTransfer from "../src/AttachmentTransfer.js"
 import * as FileSystemAttachmentStorage from "../src/FileSystemAttachmentStorage.js"
+import * as Codec from "../src/internal/codec.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as SqlReplica from "../src/SqlReplica.js"
@@ -47,6 +50,14 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000000
 const hello = Uint8Array.from([104, 101, 108, 108, 111])
 const layerNodeServices = Layer.mergeAll(NodeCrypto.layer, NodeFileSystem.layer, NodePath.layer)
 const provideNodeServices = Effect.provide(layerNodeServices)
+const attachmentCacheOptions = {
+  maximumLocalBytes: 64 * 1024 * 1024,
+  maximumLocalObjects: 8,
+  maximumCacheBytes: 64,
+  maximumCacheObjects: 8,
+  maximumCacheAge: "1 day",
+  evictionBatchSize: 4
+} as const
 const layerUnavailableTransfer = Layer.succeed(
   AttachmentTransfer.AttachmentTransfer,
   AttachmentTransfer.AttachmentTransfer.of({
@@ -119,7 +130,7 @@ describe("replica attachments", () => {
           maximumBytes: 8
         })
         const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
-        const layerAttachments = AttachmentClient.layer.pipe(
+        const layerAttachments = AttachmentClient.layer(attachmentCacheOptions).pipe(
           Layer.provide(layerInfrastructure),
           Layer.provide(layerUnavailableTransfer)
         )
@@ -164,6 +175,171 @@ describe("replica attachments", () => {
   )
 
   it.effect(
+    "keeps large media out of pending, authoritative, entity, and snapshot JSON",
+    Effect.fnUntraced(
+      function*() {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-wire-" })
+        const media = new Uint8Array(512 * 1024)
+        let state = 0x9e3779b9
+        for (let index = 0; index < media.length; index++) {
+          state ^= state << 13
+          state ^= state >>> 17
+          state ^= state << 5
+          media[index] = state & 0xff
+        }
+        assert.isAbove(media.byteLength, Protocol.maximumMutationBytes)
+
+        const layerClientDatabase = SqliteClient.layer({ filename: `${root}/client.sqlite`, disableWAL: true })
+        const layerClientStorage = FileSystemAttachmentStorage.layer({
+          directory: `${root}/client-objects`,
+          maximumBytes: media.byteLength
+        })
+        const layerClientInfrastructure = Layer.merge(layerClientDatabase, layerClientStorage)
+        const layerClientAttachments = AttachmentClient.layer(attachmentCacheOptions).pipe(
+          Layer.provide(layerClientInfrastructure),
+          Layer.provide(layerUnavailableTransfer)
+        )
+        const layerReplica = SqlReplica.layer(replicaOptions).pipe(
+          Layer.provide(layerClientAttachments),
+          Layer.provide(layerHandlers),
+          Layer.provide(layerRemote),
+          Layer.provide(layerClientDatabase),
+          Layer.provide(NodeCrypto.layer),
+          Layer.provide(Reactivity.layer)
+        )
+        const clientContext = yield* Layer.mergeAll(
+          layerReplica,
+          layerClientAttachments,
+          layerClientInfrastructure
+        ).pipe(Layer.build)
+        const replica = Context.get(clientContext, Replica.Replica)
+        const clientAttachments = Context.get(clientContext, AttachmentClient.AttachmentClient)
+        const clientStorage = Context.get(clientContext, AttachmentStorage.AttachmentStorage)
+        const clientSql = Context.get(clientContext, SqlClient.SqlClient)
+        const space = yield* replica.space(spaceId)
+        const reference = yield* space.stageAttachment(Stream.make(media))
+        const pending = yield* space.mutate(PutMessage, {
+          id: "large-media",
+          body: "reference only",
+          attachment: reference
+        })
+        yield* space.releaseAttachment(reference)
+        const expectedValue = {
+          id: "large-media",
+          body: "reference only",
+          attachment: { _tag: "Attachment" as const, digest: reference.digest, bytes: media.byteLength }
+        }
+        assert.deepStrictEqual(pending.envelope.payload, expectedValue)
+        assert.isBelow(yield* Protocol.encodedBytesEffect(pending.envelope), Protocol.maximumMutationBytes)
+        const pendingRows = yield* clientSql<{ readonly payload_json: string }>`
+          SELECT payload_json FROM effect_local_client_pending_data
+          WHERE space_id = ${spaceId} AND mutation_id = ${pending.envelope.mutationId}`
+        assert.lengthOf(pendingRows, 1)
+        assert.deepStrictEqual(yield* Codec.parse(pendingRows[0].payload_json), expectedValue)
+        assert.isBelow(pendingRows[0].payload_json.length, 1_024)
+
+        const layerServerDatabase = SqliteClient.layer({ filename: `${root}/server.sqlite`, disableWAL: true })
+        const layerServerStorage = FileSystemAttachmentStorage.layer({
+          directory: `${root}/server-objects`,
+          maximumBytes: media.byteLength
+        })
+        const layerServerInfrastructure = Layer.merge(layerServerDatabase, layerServerStorage)
+        const layerServerAttachments = AttachmentServer.layer({
+          maximumObjectBytes: media.byteLength,
+          maximumObjectsPerSpace: 4,
+          maximumBytesPerSpace: media.byteLength * 2,
+          maximumReferencesPerObject: 8,
+          uploadGrantLifetime: "1 hour",
+          uploadLeaseLifetime: "1 minute",
+          readLeaseLifetime: "1 minute",
+          stagingLifetime: "1 day",
+          garbageCollectionGracePeriod: "1 hour",
+          deletionBatchSize: 8,
+          authorizeAccess: () => Effect.void,
+          authorizeUpload: () => Effect.void,
+          authorizeRead: () => Effect.void
+        }).pipe(Layer.provide(layerServerInfrastructure))
+        const layerRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(layerHandlers))
+        const layerServer = ServerStore.layerTrusted(serverOptions).pipe(
+          Layer.provide(layerServerAttachments),
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase),
+          Layer.provide(NodeCrypto.layer),
+          Layer.provide(Reactivity.layer)
+        )
+        const serverContext = yield* Layer.mergeAll(
+          layerServer,
+          layerServerAttachments,
+          layerServerInfrastructure
+        ).pipe(Layer.build)
+        const server = Context.get(serverContext, ServerStore.ServerStore)
+        const serverAttachments = Context.get(serverContext, AttachmentServer.AttachmentServer)
+        const serverSql = Context.get(serverContext, SqlClient.SqlClient)
+        yield* server.pull(Protocol.PullRequest.make({
+          spaceId,
+          clientId,
+          schema: definition.schemaIdentity,
+          scope: Protocol.ReplicationScope.make({ models: [Message.name] }),
+          scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+          cursor: null,
+          limit: 10
+        }))
+        const identity = {
+          spaceId,
+          clientId,
+          membershipIncarnation: pending.envelope.membershipIncarnation,
+          reference,
+          principal: null
+        }
+        const prepared = yield* serverAttachments.prepareUpload(identity)
+        const localKey = yield* clientAttachments.objectKey(spaceId, reference)
+        yield* serverAttachments.appendUpload({
+          ...identity,
+          expectedOffset: prepared.offset,
+          bytes: clientStorage.read(localKey, reference)
+        })
+        assert.strictEqual((yield* server.submit(pending.envelope))._tag, "Accepted")
+        yield* server.maintain(spaceId)
+
+        const logRows = yield* serverSql<{ readonly entry_json: string }>`
+          SELECT entry_json FROM effect_local_authoritative_log WHERE space_id = ${spaceId}`
+        assert.lengthOf(logRows, 1)
+        const accepted = yield* Codec.parse(logRows[0].entry_json).pipe(
+          Effect.flatMap((json) => Codec.decode(Protocol.AcceptedMutation, json))
+        )
+        assert.lengthOf(accepted.changes, 1)
+        const change = accepted.changes[0]
+        assert.strictEqual(change._tag, "Upsert")
+        if (change._tag === "Upsert") assert.deepStrictEqual(change.value, expectedValue)
+        assert.isBelow(logRows[0].entry_json.length, 2_048)
+
+        const entityRows = yield* serverSql<{ readonly value_json: string }>`
+          SELECT value_json FROM effect_local_server_entities_data
+          WHERE space_id = ${spaceId} AND model = ${Message.name}`
+        assert.lengthOf(entityRows, 1)
+        assert.deepStrictEqual(yield* Codec.parse(entityRows[0].value_json), expectedValue)
+        assert.isBelow(entityRows[0].value_json.length, 1_024)
+
+        const snapshotRows = yield* serverSql<{
+          readonly value_json: string
+          readonly wire_json: string
+        }>`SELECT value_json, wire_json FROM effect_local_server_snapshot_entities
+          WHERE space_id = ${spaceId} AND model = ${Message.name}`
+        assert.lengthOf(snapshotRows, 1)
+        assert.deepStrictEqual(yield* Codec.parse(snapshotRows[0].value_json), expectedValue)
+        const snapshot = yield* Codec.parse(snapshotRows[0].wire_json).pipe(
+          Effect.flatMap((json) => Codec.decode(Protocol.SnapshotEntity, json))
+        )
+        assert.deepStrictEqual(snapshot.value, expectedValue)
+        assert.isBelow(snapshotRows[0].wire_json.length, 2_048)
+      },
+      provideNodeServices,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
     "uploads durable bytes after connectivity returns and before submitting the mutation",
     Effect.fnUntraced(
       function*() {
@@ -182,8 +358,10 @@ describe("replica attachments", () => {
           maximumObjectBytes: 8,
           maximumObjectsPerSpace: 4,
           maximumBytesPerSpace: 32,
+          maximumReferencesPerObject: 8,
           uploadGrantLifetime: "1 hour",
           uploadLeaseLifetime: "1 minute",
+          readLeaseLifetime: "1 minute",
           stagingLifetime: "1 day",
           garbageCollectionGracePeriod: "1 hour",
           deletionBatchSize: 8,
@@ -273,7 +451,7 @@ describe("replica attachments", () => {
           maximumBytes: 8
         })
         const layerInfrastructure = Layer.merge(layerClientDatabase, layerStorage)
-        const layerAttachments = AttachmentClient.layer.pipe(
+        const layerAttachments = AttachmentClient.layer(attachmentCacheOptions).pipe(
           Layer.provide(layerInfrastructure),
           Layer.provide(layerTransfer)
         )

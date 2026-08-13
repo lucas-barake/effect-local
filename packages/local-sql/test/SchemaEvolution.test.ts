@@ -319,6 +319,90 @@ const evolution = Evolution.make({
   })]
 })
 
+const TodoRetainingAttachmentV2 = Model.make("Todo", {
+  version: 2,
+  key: Schema.Number,
+  schema: Schema.Struct({
+    id: Schema.Number,
+    title: Schema.String,
+    done: Schema.Boolean,
+    attachment: Schema.optionalKey(Attachment.Reference)
+  })
+})
+const PutTodoRetainingAttachmentV2 = Mutation.make("PutTodo", {
+  version: 2,
+  payload: TodoRetainingAttachmentV2.schema,
+  success: TodoRetainingAttachmentV2.schema,
+  rejection: SchemaPolicyRejectedError
+})
+const definitionRetainingAttachmentV2 = Definition.make({
+  version: 2,
+  models: [TodoRetainingAttachmentV2],
+  mutations: [PutTodoRetainingAttachmentV2]
+})
+const layerHandlersRetainingAttachmentV2 = PutTodoRetainingAttachmentV2.toLayer(({ payload, transaction }) =>
+  transaction.set(TodoRetainingAttachmentV2, payload.id, payload).pipe(Effect.as(payload))
+)
+const optionalAttachment = (
+  attachment: Attachment.Reference | undefined
+): { readonly attachment?: Attachment.Reference } => {
+  if (attachment === undefined) return {}
+  return { attachment }
+}
+const evolutionRetainingAttachment = Evolution.make({
+  current: definitionRetainingAttachmentV2,
+  steps: [Evolution.step({
+    id: "definition/1-to-2-retain-attachment",
+    from: definitionV1,
+    to: definitionRetainingAttachmentV2,
+    models: [Evolution.model({
+      id: "todo/1-to-2-retain-attachment",
+      from: TodoV1,
+      to: TodoRetainingAttachmentV2,
+      key: Number,
+      value: ({ value }) => ({
+        id: Number(value.id),
+        title: value.title,
+        done: false,
+        ...optionalAttachment(value.attachment)
+      }),
+      downgradeKey: String,
+      downgradeValue: ({ value }) => ({
+        id: String(value.id),
+        title: value.title,
+        ...optionalAttachment(value.attachment)
+      })
+    })],
+    mutations: [Evolution.mutation({
+      id: "put-todo/1-to-2-retain-attachment",
+      from: PutTodoV1,
+      to: PutTodoRetainingAttachmentV2,
+      payload: (payload) => ({
+        id: Number(payload.id),
+        title: payload.title,
+        done: false,
+        ...optionalAttachment(payload.attachment)
+      }),
+      success: (success) => ({
+        id: Number(success.id),
+        title: success.title,
+        done: false,
+        ...optionalAttachment(success.attachment)
+      }),
+      downgradePayload: ({ id, title, attachment }) => ({
+        id: String(id),
+        title,
+        ...optionalAttachment(attachment)
+      }),
+      downgradeSuccess: ({ id, title, attachment }) => ({
+        id: String(id),
+        title,
+        ...optionalAttachment(attachment)
+      })
+    })]
+  })]
+})
+
 const collidingProjectionEvolution = Evolution.make({
   current: definitionV2,
   steps: [Evolution.step({
@@ -1432,41 +1516,146 @@ describe("client schema evolution", () => {
   )
 
   it.effect(
-    "builds target attachment references before the server generation flip",
+    "persists target attachment references before activating the evolved generation",
     Effect.fnUntraced(
       function*() {
-        const localV1 = yield* buildStore(definitionV1, layerHandlersV1)
-        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1)
-        const pending = yield* localV1.mutate(PutTodoV1, { id: "8", title: "attachment-generation" })
-        assert.strictEqual((yield* serverV1.submit(pending.envelope))._tag, "Accepted")
-        const references = yield* Ref.make<
-          ReadonlyArray<
-            Parameters<AttachmentServer.Service["replaceEntityReferences"]>[0]
-          >
-        >([])
-        const attachments = AttachmentServer.AttachmentServer.of({
-          prepareUpload: () => Effect.die("unexpected upload preparation"),
-          appendUpload: () => Effect.die("unexpected upload append"),
-          replaceEntityReferences: (input) => Ref.update(references, (current) => [...current, input]),
-          activateGeneration: () => Effect.void,
-          prepareRead: () => Effect.die("unexpected attachment read preparation"),
+        const sql = yield* SqlClient.SqlClient
+        const reference = Attachment.Reference.make({
+          digest: Attachment.Digest.make(
+            "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+          ),
+          bytes: 5
+        })
+        const objectKey = AttachmentStorage.ObjectKey.make("b".repeat(32))
+        const unavailableStorage = AttachmentStorage.AttachmentStorage.of({
+          create: () => Effect.die("unexpected attachment create"),
+          stage: () => Effect.die("unexpected attachment stage"),
+          append: () => Effect.die("unexpected attachment append"),
+          offset: () => Effect.die("unexpected attachment offset"),
+          verify: () => Effect.die("unexpected attachment verify"),
           read: () => Stream.fromEffect(Effect.die("unexpected attachment read")),
-          maintain: () => Effect.die("unexpected attachment maintenance")
+          exists: () => Effect.die("unexpected attachment existence check"),
+          remove: () => Effect.die("unexpected attachment removal")
         })
-
-        const serverV2 = yield* buildServer(definitionV2, layerHandlersV2, evolution, undefined, attachments)
-        yield* serverV2.pull(pullRequest(definitionV2))
-
-        const rebuilt = yield* Ref.get(references)
-        assert.lengthOf(rebuilt, 1)
-        assert.strictEqual(rebuilt[0].schemaGeneration, 1)
-        assert.strictEqual(rebuilt[0].model, TodoV2.name)
-        assert.strictEqual(rebuilt[0].modelVersion, TodoV2.version)
-        assert.deepStrictEqual(rebuilt[0].value, {
-          id: 8,
-          title: "attachment-generation",
-          done: false
+        const attachmentContext = yield* AttachmentServer.layer({
+          maximumObjectBytes: 8,
+          maximumObjectsPerSpace: 8,
+          maximumBytesPerSpace: 64,
+          maximumReferencesPerObject: 8,
+          uploadGrantLifetime: "1 minute",
+          uploadLeaseLifetime: "1 minute",
+          readLeaseLifetime: "1 minute",
+          stagingLifetime: "1 day",
+          garbageCollectionGracePeriod: "1 minute",
+          deletionBatchSize: 8,
+          authorizeAccess: () => Effect.void,
+          authorizeUpload: () => Effect.void,
+          authorizeRead: () => Effect.void
+        }).pipe(
+          Layer.provide(Layer.succeed(AttachmentStorage.AttachmentStorage, unavailableStorage)),
+          Layer.build
+        )
+        const attachments = Context.get(attachmentContext, AttachmentServer.AttachmentServer)
+        const clientAttachments = AttachmentClient.AttachmentClient.of({
+          stage: () => Effect.die("unexpected client attachment stage"),
+          associatePending: () => Effect.void,
+          release: () => Effect.die("unexpected client attachment release"),
+          objectKey: () => Effect.die("unexpected client attachment lookup"),
+          read: () => Stream.fromEffect(Effect.die("unexpected client attachment read")),
+          markRemoteAvailable: () => Effect.die("unexpected client remote update"),
+          ensureUploaded: () => Effect.die("unexpected client attachment upload"),
+          drainDeletions: () => Effect.die("unexpected client attachment deletion"),
+          maintain: Effect.die("unexpected client attachment maintenance")
         })
+        const localV1 = yield* buildStore(definitionV1, layerHandlersV1, undefined, clientId, clientAttachments)
+        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1, undefined, undefined, attachments)
+        yield* serverV1.pull(pullRequest(definitionV1))
+        yield* sql`INSERT INTO effect_local_server_attachment_objects
+          (space_id, digest, bytes, object_key, state, storage_offset, staging_client_id,
+            staging_membership_incarnation, created_at, last_accessed_at)
+          VALUES (${spaceId}, ${reference.digest}, ${reference.bytes}, ${objectKey}, 'Complete',
+            ${reference.bytes}, ${clientId}, ${membershipIncarnation}, 0, 0)`
+        const pending = yield* localV1.mutate(PutTodoV1, {
+          id: "8",
+          title: "attachment-retained-by-evolution",
+          attachment: reference
+        })
+        yield* sql`INSERT INTO effect_local_server_attachment_possessions
+          (space_id, digest, client_id, membership_incarnation)
+          VALUES (${spaceId}, ${reference.digest}, ${clientId}, ${pending.envelope.membershipIncarnation})`
+        assert.strictEqual((yield* serverV1.submit(pending.envelope))._tag, "Accepted")
+
+        const reached = yield* Deferred.make<void>()
+        const afterBatch = Effect.gen(function*() {
+          const progress = (yield* sql<{
+            readonly generation: number
+            readonly phase: string
+          }>`SELECT generation, phase FROM effect_local_server_evolution WHERE space_id = ${spaceId}`)[0]
+          if (progress === undefined || progress.phase !== "Flip") return
+          yield* Deferred.succeed(reached, undefined)
+          yield* Effect.never
+        }).pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
+        const layerRuntimeV2 = MutationRuntime.layer(
+          definitionRetainingAttachmentV2,
+          evolutionRetainingAttachment
+        ).pipe(Layer.provide(layerHandlersRetainingAttachmentV2))
+        const fiber = yield* SchemaEvolution.server({
+          definition: definitionRetainingAttachmentV2,
+          evolution: evolutionRetainingAttachment,
+          spaceId,
+          batchSize: 1,
+          afterBatch,
+          replaceAttachmentReferences: attachments.replaceEntityReferences,
+          activateAttachmentGeneration: attachments.activateGeneration
+        }).pipe(
+          Effect.provide(layerRuntimeV2),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(reached)
+        yield* Fiber.interrupt(fiber)
+
+        const generations = yield* sql<{
+          readonly active_schema_generation: number
+          readonly schema_generation: number
+        }>`SELECT active_schema_generation, schema_generation
+          FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
+        assert.strictEqual(generations[0].active_schema_generation, 0)
+        assert.strictEqual(generations[0].schema_generation, 1)
+        const references = yield* sql<{
+          readonly digest: string
+          readonly model: string
+          readonly model_version: number
+          readonly schema_generation: number
+        }>`SELECT digest, model, model_version, schema_generation
+          FROM effect_local_server_attachment_references
+          WHERE space_id = ${spaceId} ORDER BY schema_generation`
+        assert.deepStrictEqual(references, [{
+          digest: reference.digest,
+          model: TodoV1.name,
+          model_version: TodoV1.version,
+          schema_generation: 0
+        }, {
+          digest: reference.digest,
+          model: TodoRetainingAttachmentV2.name,
+          model_version: TodoRetainingAttachmentV2.version,
+          schema_generation: 1
+        }])
+
+        yield* SchemaEvolution.server({
+          definition: definitionRetainingAttachmentV2,
+          evolution: evolutionRetainingAttachment,
+          spaceId,
+          batchSize: 1,
+          replaceAttachmentReferences: attachments.replaceEntityReferences,
+          activateAttachmentGeneration: attachments.activateGeneration
+        }).pipe(Effect.provide(layerRuntimeV2))
+        const active = yield* sql<{ readonly active_schema_generation: number }>`
+          SELECT active_schema_generation FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
+        assert.strictEqual(active[0].active_schema_generation, 1)
+        const object = yield* sql<{ readonly garbage_collect_after: number | null }>`
+          SELECT garbage_collect_after FROM effect_local_server_attachment_objects
+          WHERE space_id = ${spaceId} AND digest = ${reference.digest}`
+        assert.isNull(object[0].garbage_collect_after)
       },
       Effect.scoped,
       provideDatabase
@@ -1500,8 +1689,10 @@ describe("client schema evolution", () => {
           maximumObjectBytes: 8,
           maximumObjectsPerSpace: 8,
           maximumBytesPerSpace: 64,
+          maximumReferencesPerObject: 8,
           uploadGrantLifetime: "1 minute",
           uploadLeaseLifetime: "1 minute",
+          readLeaseLifetime: "1 minute",
           stagingLifetime: "1 day",
           garbageCollectionGracePeriod: "1 minute",
           deletionBatchSize: 8,
@@ -1521,15 +1712,17 @@ describe("client schema evolution", () => {
           read: () => Stream.fromEffect(Effect.die("unexpected client attachment read")),
           markRemoteAvailable: () => Effect.die("unexpected client remote update"),
           ensureUploaded: () => Effect.die("unexpected client attachment upload"),
-          drainDeletions: () => Effect.die("unexpected client attachment deletion")
+          drainDeletions: () => Effect.die("unexpected client attachment deletion"),
+          maintain: Effect.die("unexpected client attachment maintenance")
         })
         const localV1 = yield* buildStore(definitionV1, layerHandlersV1, undefined, clientId, clientAttachments)
         const serverV1 = yield* buildServer(definitionV1, layerHandlersV1, undefined, undefined, attachments)
         yield* serverV1.pull(pullRequest(definitionV1))
         yield* sql`INSERT INTO effect_local_server_attachment_objects
-          (space_id, digest, bytes, object_key, state, storage_offset, created_at, last_accessed_at)
+          (space_id, digest, bytes, object_key, state, storage_offset, staging_client_id,
+            staging_membership_incarnation, created_at, last_accessed_at)
           VALUES (${spaceId}, ${reference.digest}, ${reference.bytes}, ${objectKey}, 'Complete',
-            ${reference.bytes}, 0, 0)`
+            ${reference.bytes}, ${clientId}, ${membershipIncarnation}, 0, 0)`
         const pending = yield* localV1.mutate(PutTodoV1, {
           id: "9",
           title: "attachment-removed-by-evolution",
@@ -1577,7 +1770,14 @@ describe("client schema evolution", () => {
           layerStorage,
           layerTransfer
         )
-        const attachmentContext = yield* AttachmentClient.layer.pipe(
+        const attachmentContext = yield* AttachmentClient.layer({
+          maximumLocalBytes: 64 * 1024 * 1024,
+          maximumLocalObjects: 8,
+          maximumCacheBytes: 64,
+          maximumCacheObjects: 8,
+          maximumCacheAge: "1 day",
+          evictionBatchSize: 4
+        }).pipe(
           Layer.provide(layerAttachmentDependencies),
           Layer.build
         )

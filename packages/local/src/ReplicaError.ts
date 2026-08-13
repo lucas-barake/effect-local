@@ -172,7 +172,8 @@ export const StorageError = Schema.Union([
   Attachment.AttachmentUploadBusy,
   Attachment.AttachmentStorageError,
   Attachment.AttachmentLengthMismatch,
-  Attachment.AttachmentDigestMismatch
+  Attachment.AttachmentDigestMismatch,
+  CapacityExceeded
 ])
 export type StorageError = typeof StorageError.Type
 

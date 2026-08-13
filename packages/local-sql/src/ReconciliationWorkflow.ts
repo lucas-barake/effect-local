@@ -231,6 +231,7 @@ const isTransientFailure = (error: ReplicaError.ReplicaError): boolean => {
     case "OperationTimeout":
     case "AttachmentUnavailable":
     case "AttachmentUploadBusy":
+    case "AttachmentOffsetConflict":
       return true
     default:
       return false

@@ -2,11 +2,12 @@ import { NodeCrypto, NodeFileSystem, NodePath } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Result from "effect/Result"
-import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as AttachmentStorage from "../src/AttachmentStorage.js"
 import * as FileSystemAttachmentStorage from "../src/FileSystemAttachmentStorage.js"
@@ -16,8 +17,6 @@ const digest = Attachment.Digest.make(
   "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
 )
 const reference = Attachment.Reference.make({ _tag: "Attachment", digest, bytes: hello.length })
-
-class Interrupted extends Schema.TaggedErrorClass<Interrupted>("test/Interrupted")("Interrupted", {}) {}
 
 const layerNodeServices = Layer.mergeAll(NodeCrypto.layer, NodeFileSystem.layer, NodePath.layer)
 const provideNodeServices = Effect.provide(layerNodeServices)
@@ -65,14 +64,19 @@ describe("attachment file storage", () => {
         const storage = yield* makeStorage()
         const key = yield* storage.create()
         const first = hello.subarray(0, 3)
-        const partial = Stream.concat(Stream.make(first), Stream.fail(new Interrupted()))
-        const interrupted = yield* storage.append(
+        const prefixConsumed = yield* Deferred.make<void>()
+        const partial = Stream.concat(
+          Stream.make(first),
+          Stream.fromEffect(Deferred.succeed(prefixConsumed, undefined).pipe(Effect.andThen(Effect.never)))
+        )
+        const appending = yield* storage.append(
           key,
           reference,
           0,
           partial
-        ).pipe(Effect.result)
-        assert.isTrue(Result.isFailure(interrupted))
+        ).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(prefixConsumed)
+        yield* Fiber.interrupt(appending)
         assert.strictEqual(yield* storage.offset(key), 3)
 
         const conflict = yield* storage.append(key, reference, 0, Stream.empty).pipe(Effect.result)

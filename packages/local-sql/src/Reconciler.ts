@@ -107,6 +107,7 @@ const isTransientFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "ServerUnavailable" ||
   error._tag === "AttachmentUnavailable" ||
   error._tag === "AttachmentUploadBusy" ||
+  error._tag === "AttachmentOffsetConflict" ||
   error._tag === "OperationTimeout"
 
 export const makeManager = Effect.fnUntraced(function*(options: {
@@ -502,6 +503,9 @@ export const layerOnePass = (
       const local = yield* LocalStore.Store
       const remote = yield* SyncEngine.SyncEngine
       const attachments = yield* Effect.serviceOption(AttachmentClient.AttachmentClient)
+      let maintainAttachments: Effect.Effect<void, ReplicaError.ReplicaError> = Effect.void
+      if (Option.isSome(attachments)) maintainAttachments = attachments.value.maintain.pipe(Effect.asVoid)
+      const settleAndMaintain = local.settleReceipts.pipe(Effect.andThen(maintainAttachments))
       const gate = yield* Semaphore.make(1)
       const status = yield* Ref.make<ReplicaStatus.ReplicaStatus>({ _tag: "Offline", pending: 0 })
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
@@ -672,7 +676,7 @@ export const layerOnePass = (
       }).pipe(Effect.tapErrorTag("AuthorizationDenied", () => local.revokeReplication))
 
       const submitPending = Effect.gen(function*() {
-        yield* local.settleReceipts
+        yield* settleAndMaintain
         while (true) {
           const pending = yield* local.pendingToSubmit
           let installedExpiredSnapshot = false
@@ -702,7 +706,7 @@ export const layerOnePass = (
               return remoteReceipt
             }).pipe(Effect.tapError(() => local.markRetrying(mutation.envelope.mutationId)))
             if (receipt._tag === "Expired") {
-              yield* local.settleReceipts
+              yield* settleAndMaintain
               const unresolved = (yield* local.pendingToSubmit).some(
                 (candidate) => candidate.envelope.mutationId === receipt.mutationId
               )
@@ -713,7 +717,7 @@ export const layerOnePass = (
             }
           }
           if (installedExpiredSnapshot) continue
-          yield* local.settleReceipts
+          yield* settleAndMaintain
           return
         }
       })
@@ -724,7 +728,7 @@ export const layerOnePass = (
         yield* catchUp
         yield* submitPending
         yield* catchUp
-        yield* local.settleReceipts
+        yield* settleAndMaintain
         yield* succeeded
       })).pipe(
         Effect.tapError(failed),
