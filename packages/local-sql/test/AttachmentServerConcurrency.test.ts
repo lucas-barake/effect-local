@@ -634,6 +634,13 @@ describe("delegated attachment deletion concurrency", () => {
         if (Result.isFailure(failed)) assert.strictEqual(failed.failure._tag, "StorageUnavailable")
         yield* sql.unsafe("DROP TRIGGER fail_attachment_finalize_recovery")
         yield* TestClock.adjust("2 minutes")
+        assert.strictEqual(yield* second.sweepSpace(spaceId), 0)
+        const recoverable = yield* sql<{ readonly state: string }>`SELECT state
+          FROM effect_local_server_attachment_attempts WHERE attempt_id = ${prepared.attemptId}`
+        assert.deepStrictEqual(recoverable, [{ state: "Finalizing" }])
+        const aborts = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_attachment_deletions WHERE operation = 'AbortUpload'`
+        assert.deepStrictEqual(aborts, [{ count: 0 }])
         provider.setListPartsHandler(({ upload }) =>
           Effect.fail(new AttachmentObjectStore.AttachmentProviderUploadNotFound({ upload }))
         )

@@ -1601,6 +1601,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               finalization_token, finalization_expires_at, created_at, last_accessed_at
             FROM effect_local_server_attachment_attempts AS a
             WHERE a.space_id = ${spaceId} AND a.last_accessed_at <= ${now - stagingLifetime}
+              AND a.state <> 'Finalizing'
               AND (a.finalization_expires_at IS NULL OR a.finalization_expires_at <= ${now})
               AND NOT EXISTS (
                 SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
@@ -1635,6 +1636,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 FROM effect_local_server_attachment_attempts AS a
                 WHERE a.attempt_id = ${attempt.attempt_id}
                   AND a.provider_upload_id = ${attempt.provider_upload_id}
+                  AND a.state <> 'Finalizing'
                   AND a.last_accessed_at <= ${now - stagingLifetime}
                   AND (a.finalization_expires_at IS NULL OR a.finalization_expires_at <= ${now})
                   AND NOT EXISTS (
@@ -1648,6 +1650,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               execute: () =>
                 sql`DELETE FROM effect_local_server_attachment_attempts
                 WHERE attempt_id = ${attempt.attempt_id}
+                  AND state <> 'Finalizing'
                   AND last_accessed_at <= ${now - stagingLifetime}
                   AND (finalization_expires_at IS NULL OR finalization_expires_at <= ${now})
                   AND (
