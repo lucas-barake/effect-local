@@ -42,6 +42,7 @@ export interface Options<R = never,> {
   readonly garbageCollectionGracePeriod: Duration.Input
   readonly deletionBatchSize: number
   readonly verificationChunkBytes?: number
+  readonly maximumVerificationChunks: number
   readonly deletionRetryDelay?: Duration.Input
   readonly grantSafetyInterval?: Duration.Input
   readonly authorizeAccess: (input: AuthorizationInput) => Effect.Effect<void, AuthorizationRejection, R>
@@ -87,6 +88,7 @@ export interface Service {
     spaceId: Identity.SpaceId,
     schemaGeneration: number
   ) => Effect.Effect<void, ReplicaError.StorageError>
+  readonly expireGrants: Effect.Effect<void, ReplicaError.StorageError>
   readonly sweepSpace: (spaceId: Identity.SpaceId) => Effect.Effect<number, ReplicaError.ReplicaError>
   readonly drainOutbox: Effect.Effect<number, ReplicaError.ReplicaError>
   readonly maintain: (spaceId: Identity.SpaceId) => Effect.Effect<number, ReplicaError.ReplicaError>
@@ -169,6 +171,16 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         "attachments.verificationChunkBytes",
         options.verificationChunkBytes ?? 5 * 1024 * 1024
       )
+      const maximumVerificationChunks = yield* Configuration.positiveSafeInteger(
+        "attachments.maximumVerificationChunks",
+        options.maximumVerificationChunks
+      )
+      if (Math.ceil(maximumObjectBytes / verificationChunkBytes) > maximumVerificationChunks) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "attachments.maximumVerificationChunks",
+          message: "attachments.maximumVerificationChunks cannot cover attachments.maximumObjectBytes"
+        })
+      }
       const deletionRetryDelay = yield* Configuration.positiveIntegerDurationMillis(
         "attachments.deletionRetryDelay",
         options.deletionRetryDelay ?? "1 second"
@@ -190,7 +202,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
 
       const newId = (operation: string) =>
         crypto.randomUUIDv4.pipe(
-          Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation, cause }))
+          Effect.catchTag(
+            "PlatformError",
+            (cause) => Effect.fail(new Attachment.AttachmentStorageError({ operation, cause }))
+          )
         )
       const newPhysicalKey = (operation: string) =>
         newId(operation).pipe(
@@ -202,7 +217,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         return options.authorizeAccess(input).pipe(
           Effect.provide(context),
           Effect.andThen(uploadAuthorization),
-          Effect.mapError((reason) => new ReplicaError.AuthorizationDenied({ reason: { ...reason } }))
+          Effect.catch((reason: AuthorizationRejection) =>
+            Effect.fail(new ReplicaError.AuthorizationDenied({ reason: { ...reason } }))
+          )
         )
       }
       const validateReference = (reference: Attachment.Reference) => {
@@ -269,6 +286,55 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             )`.pipe(
           Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
         )
+      const retireOwnedFinalization = (
+        attempt: typeof Rows.ServerAttachmentAttemptRow.Type,
+        token: string
+      ) =>
+        sql`DELETE FROM effect_local_server_attachment_attempts
+          WHERE attempt_id = ${attempt.attempt_id}
+            AND provider_namespace = ${attempt.provider_namespace}
+            AND provider_upload_id = ${attempt.provider_upload_id}
+            AND finalization_token = ${token}`.pipe(
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+        )
+
+      const finalizationHeartbeat = (
+        attemptId: string,
+        digest: Attachment.Digest,
+        token: string
+      ) => {
+        const heartbeatInterval = finalizationLeaseLifetime / 2
+        return Effect.sleep(Math.max(1, heartbeatInterval)).pipe(
+          Effect.andThen(Effect.gen(function*() {
+            const now = yield* Clock.currentTimeMillis
+            const renewed = yield* SqlSchema.findOneOption({
+              Request: Schema.Void,
+              Result: AttemptIdRow,
+              execute: () =>
+                sql`UPDATE effect_local_server_attachment_attempts
+                  SET finalization_expires_at = ${now + finalizationLeaseLifetime},
+                    last_accessed_at = ${now}
+                  WHERE attempt_id = ${attemptId} AND finalization_token = ${token}
+                  RETURNING attempt_id`
+            })(undefined).pipe(
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({
+                      message: "Attachment finalization renewal is corrupt",
+                      cause
+                    })
+                  )
+              })
+            )
+            if (Option.isNone(renewed)) {
+              yield* new Attachment.AttachmentUploadBusy({ digest })
+            }
+          })),
+          Effect.forever
+        )
+      }
 
       const hasPossession = SqlSchema.findOneOption({
         Request: AttemptLookup,
@@ -401,20 +467,35 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             cause: { bytes: attempt.bytes, partSize: begun.partSize }
           })
         }
-        yield* sql`UPDATE effect_local_server_attachment_attempts
-          SET provider_upload_id = ${begun.upload.id}, part_size = ${begun.partSize},
-            state = 'Uploading'
-          WHERE attempt_id = ${attempt.attempt_id} AND state = 'Reserved'
-            AND provider_upload_id IS NULL`.pipe(
-          Effect.catchTag("SqlError", (cause) =>
-            Effect.fail(StorageUnavailable.make(cause)))
-        )
-        const current = yield* findAttempt({
-          spaceId: attempt.space_id,
-          digest: attempt.digest,
-          clientId: attempt.client_id,
-          membershipIncarnation: attempt.membership_incarnation
-        })
+        const current = yield* sql.withTransaction(Effect.gen(function*() {
+          yield* sql`UPDATE effect_local_server_attachment_attempts
+            SET provider_upload_id = ${begun.upload.id}, part_size = ${begun.partSize},
+              state = 'Uploading'
+            WHERE attempt_id = ${attempt.attempt_id} AND state = 'Reserved'
+              AND provider_upload_id IS NULL`
+          const persisted = yield* findAttempt({
+            spaceId: attempt.space_id,
+            digest: attempt.digest,
+            clientId: attempt.client_id,
+            membershipIncarnation: attempt.membership_incarnation
+          })
+          if (Option.isNone(persisted) || persisted.value.provider_upload_id !== begun.upload.id) {
+            const outboxId = yield* newId("upload.beginRaceAbort")
+            const queuedAt = yield* Clock.currentTimeMillis
+            yield* sql`INSERT INTO effect_local_server_attachment_deletions
+              (outbox_id, space_id, digest, bytes, operation, provider_namespace,
+                provider_id, next_attempt_at, created_at)
+              SELECT ${outboxId}, ${attempt.space_id}, ${attempt.digest}, ${attempt.bytes},
+                'AbortUpload', ${attempt.provider_namespace}, ${begun.upload.id}, ${queuedAt}, ${queuedAt}
+              WHERE NOT EXISTS (
+                SELECT 1 FROM effect_local_server_attachment_deletions
+                WHERE operation = 'AbortUpload' AND provider_namespace = ${attempt.provider_namespace}
+                  AND provider_id = ${begun.upload.id}
+              )`
+          }
+          return persisted
+        })).pipe(Effect.catchTag("SqlError", (cause) =>
+          Effect.fail(StorageUnavailable.make(cause))))
         if (
           Option.isNone(current) || current.value.provider_upload_id !== begun.upload.id ||
           current.value.part_size !== begun.partSize
@@ -536,8 +617,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             }
             attempt = yield* beginAttempt(attempt)
             const adapter = yield* objectStores.resolve(attempt.provider_namespace).pipe(
-              Effect.catchTag("AttachmentObjectStoreUnavailable", (cause) =>
-                Effect.fail(new Attachment.AttachmentStorageError({ operation: "upload.resolve", cause })))
+              Effect.catchTag(
+                "AttachmentObjectStoreUnavailable",
+                (cause) => Effect.fail(new Attachment.AttachmentStorageError({ operation: "upload.resolve", cause }))
+              )
             )
             const progress = yield* inspectParts(adapter, attempt)
             if (progress.offset === input.reference.bytes) {
@@ -546,8 +629,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 SET last_accessed_at = ${readyAt}
                 WHERE attempt_id = ${attempt.attempt_id}
                   AND provider_upload_id = ${attempt.provider_upload_id}`.pipe(
-                Effect.catchTag("SqlError", (cause) =>
-                  Effect.fail(StorageUnavailable.make(cause)))
+                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
               )
               return AttachmentTransfer.UploadReady.make({
                 attemptId: AttachmentTransfer.AttemptId.make(attempt.attempt_id)
@@ -602,8 +684,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             VALUES (${grantId}, ${attempt.attempt_id}, ${input.clientId},
               ${input.membershipIncarnation}, ${progress.partNumber}, ${progress.offset},
               ${bytes}, ${grant.expiresAt}, ${now})`.pipe(
-              Effect.catchTag("SqlError", (cause) =>
-                Effect.fail(StorageUnavailable.make(cause)))
+              Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
             )
             yield* sql`UPDATE effect_local_server_attachment_attempts
               SET last_accessed_at = ${now}
@@ -715,233 +796,247 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               )
               ownsFinalization = Option.isSome(claimed)
             }
-            let verified = yield* adapter.inspectFinalized({
-              spaceId: attempt.space_id,
-              upload,
-              reference: input.reference
-            }).pipe(
-              Effect.catchTags({
-                AttachmentObjectStoreUnavailable: (cause) =>
-                  Effect.fail(new Attachment.AttachmentStorageError({ operation: "upload.inspect", cause })),
-                AttachmentProviderUploadNotFound: () =>
-                  retireMissingAttempt(attempt).pipe(
-                    Effect.andThen(
-                      Effect.fail(new Attachment.AttachmentUnavailable({ digest: input.reference.digest }))
-                    )
-                  ),
-                AttachmentProviderObjectNotFound: () =>
-                  retireMissingAttempt(attempt).pipe(
-                    Effect.andThen(
-                      Effect.fail(new Attachment.AttachmentUnavailable({ digest: input.reference.digest }))
-                    )
-                  )
-              }),
-              Effect.flatMap((value) => {
-                if (value === null) return Effect.succeed(null)
-                return Schema.decodeUnknownEffect(AttachmentObjectStore.VerifiedObject)(value)
-              }),
-              Effect.catchTag("SchemaError", (cause) =>
-                Effect.fail(
-                  new Attachment.AttachmentStorageError({
-                    operation: "upload.inspect.decode",
-                    cause
-                  })
-                ))
-            )
-            if (verified === null) {
-              if (!ownsFinalization) {
-                return yield* new Attachment.AttachmentUploadBusy({ digest: input.reference.digest })
-              }
-              verified = yield* adapter.finalizeUpload({
+            if (!ownsFinalization || finalizationToken === null) {
+              return yield* new Attachment.AttachmentUploadBusy({ digest: input.reference.digest })
+            }
+            const ownedToken = finalizationToken
+            return yield* Effect.gen(function*() {
+              let verified = yield* adapter.inspectFinalized({
                 spaceId: attempt.space_id,
                 upload,
                 reference: input.reference
               }).pipe(
                 Effect.catchTags({
                   AttachmentObjectStoreUnavailable: (cause) =>
-                    Effect.fail(new Attachment.AttachmentStorageError({ operation: "upload.finalize", cause })),
+                    Effect.fail(new Attachment.AttachmentStorageError({ operation: "upload.inspect", cause })),
                   AttachmentProviderUploadNotFound: () =>
-                    retireMissingAttempt(attempt).pipe(
+                    retireOwnedFinalization(attempt, ownedToken).pipe(
                       Effect.andThen(
                         Effect.fail(new Attachment.AttachmentUnavailable({ digest: input.reference.digest }))
                       )
                     ),
                   AttachmentProviderObjectNotFound: () =>
-                    retireMissingAttempt(attempt).pipe(
+                    retireOwnedFinalization(attempt, ownedToken).pipe(
                       Effect.andThen(
                         Effect.fail(new Attachment.AttachmentUnavailable({ digest: input.reference.digest }))
                       )
                     )
                 }),
-                Effect.flatMap(Schema.decodeUnknownEffect(AttachmentObjectStore.VerifiedObject)),
-                Effect.catchTag("SchemaError", (cause) =>
-                  Effect.fail(
-                    new Attachment.AttachmentStorageError({
-                      operation: "upload.finalize.decode",
-                      cause
-                    })
-                  ))
-              )
-            }
-            if (!ownsFinalization || finalizationToken === null) {
-              return yield* new Attachment.AttachmentUploadBusy({ digest: input.reference.digest })
-            }
-            if (
-              verified.object.namespace !== attempt.provider_namespace ||
-              verified.reference.digest !== input.reference.digest ||
-              verified.reference.bytes !== input.reference.bytes ||
-              verified.chunkBytes !== verificationChunkBytes ||
-              verified.chunkCount !== Math.ceil(input.reference.bytes / verificationChunkBytes)
-            ) {
-              return yield* new Attachment.AttachmentStorageError({
-                operation: "upload.finalize.verification",
-                cause: verified
-              })
-            }
-            const chunks: Array<AttachmentTransfer.VerifiedChunk> = []
-            let nextIndex = 0
-            while (true) {
-              const page = yield* adapter.listVerifiedChunks({
-                spaceId: attempt.space_id,
-                object: verified.object,
-                afterIndex: nextIndex,
-                limit: AttachmentObjectStore.maximumManifestPageChunks
-              }).pipe(
-                Effect.catchTags({
-                  AttachmentObjectStoreUnavailable: (cause) =>
-                    Effect.fail(new Attachment.AttachmentStorageError({ operation: "upload.manifest", cause })),
-                  AttachmentProviderUploadNotFound: () =>
-                    retireMissingAttempt(attempt).pipe(
-                      Effect.andThen(
-                        Effect.fail(new Attachment.AttachmentUnavailable({ digest: input.reference.digest }))
-                      )
-                    ),
-                  AttachmentProviderObjectNotFound: () =>
-                    retireMissingAttempt(attempt).pipe(
-                      Effect.andThen(
-                        Effect.fail(new Attachment.AttachmentUnavailable({ digest: input.reference.digest }))
-                      )
-                    )
+                Effect.flatMap((value) => {
+                  if (value === null) return Effect.succeed(null)
+                  return Schema.decodeUnknownEffect(AttachmentObjectStore.VerifiedObject)(value)
                 }),
-                Effect.flatMap(Schema.decodeUnknownEffect(AttachmentObjectStore.VerifiedChunkPage)),
                 Effect.catchTag("SchemaError", (cause) =>
                   Effect.fail(
                     new Attachment.AttachmentStorageError({
-                      operation: "upload.manifest.decode",
+                      operation: "upload.inspect.decode",
                       cause
                     })
                   ))
               )
-              chunks.push(...page.chunks)
-              if (chunks.length > verified.chunkCount) {
-                return yield* new Attachment.AttachmentStorageError({
-                  operation: "upload.manifest.tooLarge",
-                  cause: { actual: chunks.length, expected: verified.chunkCount }
-                })
-              }
-              if (page.nextIndex === null) {
-                break
-              }
-              if (
-                page.chunks.length === 0 || page.nextIndex <= nextIndex ||
-                page.nextIndex > verified.chunkCount
-              ) {
-                return yield* new Attachment.AttachmentStorageError({
-                  operation: "upload.manifest.pagination",
-                  cause: page
-                })
-              }
-              nextIndex = page.nextIndex
-            }
-            let offset = 0
-            for (let index = 0; index < chunks.length; index++) {
-              const chunk = chunks[index]
-              if (
-                chunk.index !== index || chunk.offset !== offset ||
-                chunk.bytes > verified.chunkBytes ||
-                (index < chunks.length - 1 && chunk.bytes !== verified.chunkBytes)
-              ) {
-                return yield* new Attachment.AttachmentStorageError({
-                  operation: "upload.manifest.invalid",
-                  cause: { index, offset, chunk }
-                })
-              }
-              offset += chunk.bytes
-            }
-            if (chunks.length !== verified.chunkCount || offset !== input.reference.bytes) {
-              return yield* new Attachment.AttachmentStorageError({
-                operation: "upload.manifest.incomplete",
-                cause: { chunks: chunks.length, expectedChunks: verified.chunkCount, offset }
-              })
-            }
-            const committedAt = yield* Clock.currentTimeMillis
-            yield* sql.withTransaction(Effect.gen(function*() {
-              const claim = yield* SqlSchema.findOneOption({
-                Request: Schema.Void,
-                Result: AttemptIdRow,
-                execute: () =>
-                  sql`SELECT attempt_id FROM effect_local_server_attachment_attempts
-                  WHERE attempt_id = ${attempt.attempt_id}
-                    AND provider_upload_id = ${attempt.provider_upload_id}
-                    AND finalization_token = ${finalizationToken}`
-              })(undefined).pipe(
-                Effect.catchTags({
-                  SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
-                  SchemaError: (cause) =>
+              if (verified === null) {
+                verified = yield* adapter.finalizeUpload({
+                  spaceId: attempt.space_id,
+                  upload,
+                  reference: input.reference
+                }).pipe(
+                  Effect.catchTags({
+                    AttachmentObjectStoreUnavailable: (cause) =>
+                      Effect.fail(new Attachment.AttachmentStorageError({ operation: "upload.finalize", cause })),
+                    AttachmentProviderUploadNotFound: () =>
+                      retireOwnedFinalization(attempt, ownedToken).pipe(
+                        Effect.andThen(
+                          Effect.fail(new Attachment.AttachmentUnavailable({ digest: input.reference.digest }))
+                        )
+                      ),
+                    AttachmentProviderObjectNotFound: () =>
+                      retireOwnedFinalization(attempt, ownedToken).pipe(
+                        Effect.andThen(
+                          Effect.fail(new Attachment.AttachmentUnavailable({ digest: input.reference.digest }))
+                        )
+                      )
+                  }),
+                  Effect.flatMap(Schema.decodeUnknownEffect(AttachmentObjectStore.VerifiedObject)),
+                  Effect.catchTag("SchemaError", (cause) =>
                     Effect.fail(
-                      new ReplicaError.StorageCorrupt({
-                        message: "Attachment finalization fence is corrupt",
+                      new Attachment.AttachmentStorageError({
+                        operation: "upload.finalize.decode",
                         cause
                       })
-                    )
-                })
-              )
-              if (Option.isNone(claim)) {
-                yield* new Attachment.AttachmentUploadBusy({ digest: input.reference.digest })
+                    ))
+                )
               }
-              const claimedDeletion = yield* SqlSchema.findOne({
-                Request: Schema.Void,
-                Result: CountRow,
-                execute: () =>
-                  sql`SELECT COUNT(*) AS count FROM effect_local_server_attachment_deletions
+              if (
+                verified.object.namespace !== attempt.provider_namespace ||
+                verified.reference.digest !== input.reference.digest ||
+                verified.reference.bytes !== input.reference.bytes ||
+                verified.chunkBytes !== verificationChunkBytes ||
+                verified.chunkCount !== Math.ceil(input.reference.bytes / verificationChunkBytes) ||
+                verified.chunkCount > maximumVerificationChunks
+              ) {
+                return yield* new Attachment.AttachmentStorageError({
+                  operation: "upload.finalize.verification",
+                  cause: verified
+                })
+              }
+              const chunks: Array<AttachmentTransfer.VerifiedChunk> = []
+              let nextIndex = 0
+              while (true) {
+                const page = yield* adapter.listVerifiedChunks({
+                  spaceId: attempt.space_id,
+                  object: verified.object,
+                  afterIndex: nextIndex,
+                  limit: AttachmentObjectStore.maximumManifestPageChunks
+                }).pipe(
+                  Effect.catchTags({
+                    AttachmentObjectStoreUnavailable: (cause) =>
+                      Effect.fail(new Attachment.AttachmentStorageError({ operation: "upload.manifest", cause })),
+                    AttachmentProviderUploadNotFound: () =>
+                      retireOwnedFinalization(attempt, ownedToken).pipe(
+                        Effect.andThen(
+                          Effect.fail(new Attachment.AttachmentUnavailable({ digest: input.reference.digest }))
+                        )
+                      ),
+                    AttachmentProviderObjectNotFound: () =>
+                      retireOwnedFinalization(attempt, ownedToken).pipe(
+                        Effect.andThen(
+                          Effect.fail(new Attachment.AttachmentUnavailable({ digest: input.reference.digest }))
+                        )
+                      )
+                  }),
+                  Effect.flatMap(Schema.decodeUnknownEffect(AttachmentObjectStore.VerifiedChunkPage)),
+                  Effect.catchTag("SchemaError", (cause) =>
+                    Effect.fail(
+                      new Attachment.AttachmentStorageError({
+                        operation: "upload.manifest.decode",
+                        cause
+                      })
+                    ))
+                )
+                if (
+                  page.chunks.length > verified.chunkCount - chunks.length ||
+                  page.chunks.length > maximumVerificationChunks - chunks.length
+                ) {
+                  return yield* new Attachment.AttachmentStorageError({
+                    operation: "upload.manifest.tooLarge",
+                    cause: {
+                      actual: chunks.length + page.chunks.length,
+                      expected: Math.min(verified.chunkCount, maximumVerificationChunks)
+                    }
+                  })
+                }
+                chunks.push(...page.chunks)
+                if (page.nextIndex === null) {
+                  break
+                }
+                if (
+                  page.chunks.length === 0 || page.nextIndex <= nextIndex ||
+                  page.nextIndex > verified.chunkCount || page.nextIndex > maximumVerificationChunks
+                ) {
+                  return yield* new Attachment.AttachmentStorageError({
+                    operation: "upload.manifest.pagination",
+                    cause: page
+                  })
+                }
+                nextIndex = page.nextIndex
+              }
+              let offset = 0
+              for (let index = 0; index < chunks.length; index++) {
+                const chunk = chunks[index]
+                if (
+                  chunk.index !== index || chunk.offset !== offset ||
+                  chunk.bytes > verified.chunkBytes ||
+                  (index < chunks.length - 1 && chunk.bytes !== verified.chunkBytes)
+                ) {
+                  return yield* new Attachment.AttachmentStorageError({
+                    operation: "upload.manifest.invalid",
+                    cause: { index, offset, chunk }
+                  })
+                }
+                offset += chunk.bytes
+              }
+              if (chunks.length !== verified.chunkCount || offset !== input.reference.bytes) {
+                return yield* new Attachment.AttachmentStorageError({
+                  operation: "upload.manifest.incomplete",
+                  cause: { chunks: chunks.length, expectedChunks: verified.chunkCount, offset }
+                })
+              }
+              const committedAt = yield* Clock.currentTimeMillis
+              const chunkRows = chunks.map((chunk) => ({
+                space_id: input.spaceId,
+                digest: input.reference.digest,
+                chunk_index: chunk.index,
+                chunk_offset: chunk.offset,
+                chunk_bytes: chunk.bytes,
+                chunk_digest: chunk.digest
+              }))
+              yield* sql.withTransaction(Effect.gen(function*() {
+                const claim = yield* SqlSchema.findOneOption({
+                  Request: Schema.Void,
+                  Result: AttemptIdRow,
+                  execute: () =>
+                    sql`SELECT attempt_id FROM effect_local_server_attachment_attempts
+                  WHERE attempt_id = ${attempt.attempt_id}
+                    AND provider_upload_id = ${attempt.provider_upload_id}
+                    AND finalization_token = ${ownedToken}`
+                })(undefined).pipe(
+                  Effect.catchTags({
+                    SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                    SchemaError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.StorageCorrupt({
+                          message: "Attachment finalization fence is corrupt",
+                          cause
+                        })
+                      )
+                  })
+                )
+                if (Option.isNone(claim)) {
+                  yield* new Attachment.AttachmentUploadBusy({ digest: input.reference.digest })
+                }
+                const claimedDeletion = yield* SqlSchema.findOne({
+                  Request: Schema.Void,
+                  Result: CountRow,
+                  execute: () =>
+                    sql`SELECT COUNT(*) AS count FROM effect_local_server_attachment_deletions
                   WHERE operation = 'DeleteObject'
                     AND provider_namespace = ${verified.object.namespace}
                     AND provider_id = ${verified.object.id}
                     AND provider_version = ${verified.object.version}
                     AND (claim_token IS NOT NULL OR attempt_count > 0)`
-              })(undefined).pipe(
-                Effect.catchTags({
-                  SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
-                  NoSuchElementError: () =>
-                    Effect.fail(
-                      new ReplicaError.StorageCorrupt({
-                        message: "Attachment deletion fence query returned no result"
-                      })
-                    ),
-                  SchemaError: (cause) =>
-                    Effect.fail(
-                      new ReplicaError.StorageCorrupt({
-                        message: "Attachment deletion fence state is corrupt",
-                        cause
-                      })
-                    )
-                })
-              )
-              if (claimedDeletion.count > 0) {
-                yield* new Attachment.AttachmentUploadBusy({ digest: input.reference.digest })
-              }
-              yield* sql`DELETE FROM effect_local_server_attachment_deletions
+                })(undefined).pipe(
+                  Effect.catchTags({
+                    SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                    NoSuchElementError: () =>
+                      Effect.fail(
+                        new ReplicaError.StorageCorrupt({
+                          message: "Attachment deletion fence query returned no result"
+                        })
+                      ),
+                    SchemaError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.StorageCorrupt({
+                          message: "Attachment deletion fence state is corrupt",
+                          cause
+                        })
+                      )
+                  })
+                )
+                if (claimedDeletion.count > 0) {
+                  yield* new Attachment.AttachmentUploadBusy({ digest: input.reference.digest })
+                }
+                yield* sql`DELETE FROM effect_local_server_attachment_deletions
                 WHERE operation = 'DeleteObject'
                   AND provider_namespace = ${verified.object.namespace}
                   AND provider_id = ${verified.object.id}
                   AND provider_version = ${verified.object.version}
                   AND claim_token IS NULL AND attempt_count = 0`
-              const existing = yield* findObject(input.spaceId, input.reference.digest)
-              if (Option.isNone(existing)) {
-                const objectVersion = AttachmentTransfer.ObjectVersion.make(
-                  yield* newId("upload.objectVersion")
-                )
-                yield* sql`INSERT INTO effect_local_server_attachment_objects
+                const existing = yield* findObject(input.spaceId, input.reference.digest)
+                if (Option.isNone(existing)) {
+                  const objectVersion = AttachmentTransfer.ObjectVersion.make(
+                    yield* newId("upload.objectVersion")
+                  )
+                  yield* sql`INSERT INTO effect_local_server_attachment_objects
                   (space_id, digest, bytes, object_version, state, provider_namespace, provider_object_id,
                   provider_object_version, chunk_bytes, chunk_count, garbage_collect_after,
                   created_at, last_accessed_at)
@@ -950,19 +1045,17 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   ${verified.object.namespace}, ${verified.object.id}, ${verified.object.version},
                   ${verified.chunkBytes}, ${verified.chunkCount},
                   ${committedAt + garbageCollectionGracePeriod}, ${committedAt}, ${committedAt})`
-                for (const chunk of chunks) {
-                  yield* sql`INSERT INTO effect_local_server_attachment_chunks
-                  (space_id, digest, chunk_index, chunk_offset, chunk_bytes, chunk_digest)
-                  VALUES (${input.spaceId}, ${input.reference.digest}, ${chunk.index},
-                    ${chunk.offset}, ${chunk.bytes}, ${chunk.digest})`
-                }
-              } else if (existing.value.state === "Missing") {
-                const objectVersion = AttachmentTransfer.ObjectVersion.make(
-                  yield* newId("upload.repairObjectVersion")
-                )
-                yield* sql`DELETE FROM effect_local_server_attachment_chunks
+                  for (let batchOffset = 0; batchOffset < chunkRows.length; batchOffset += 100) {
+                    yield* sql`INSERT INTO effect_local_server_attachment_chunks
+                    ${sql.insert(chunkRows.slice(batchOffset, batchOffset + 100))}`
+                  }
+                } else if (existing.value.state === "Missing") {
+                  const objectVersion = AttachmentTransfer.ObjectVersion.make(
+                    yield* newId("upload.repairObjectVersion")
+                  )
+                  yield* sql`DELETE FROM effect_local_server_attachment_chunks
                   WHERE space_id = ${input.spaceId} AND digest = ${input.reference.digest}`
-                yield* sql`UPDATE effect_local_server_attachment_objects
+                  yield* sql`UPDATE effect_local_server_attachment_objects
                   SET object_version = ${objectVersion}, state = 'Available',
                     provider_namespace = ${verified.object.namespace},
                     provider_object_id = ${verified.object.id},
@@ -971,43 +1064,44 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                     last_accessed_at = ${committedAt}
                   WHERE space_id = ${input.spaceId} AND digest = ${input.reference.digest}
                     AND state = 'Missing'`
-                for (const chunk of chunks) {
-                  yield* sql`INSERT INTO effect_local_server_attachment_chunks
-                    (space_id, digest, chunk_index, chunk_offset, chunk_bytes, chunk_digest)
-                    VALUES (${input.spaceId}, ${input.reference.digest}, ${chunk.index},
-                      ${chunk.offset}, ${chunk.bytes}, ${chunk.digest})`
-                }
-              } else {
-                if (existing.value.bytes !== input.reference.bytes) {
-                  yield* new Attachment.AttachmentLengthMismatch({
-                    expected: existing.value.bytes,
-                    actual: input.reference.bytes
-                  })
-                }
-                if (
-                  existing.value.provider_namespace !== verified.object.namespace ||
-                  existing.value.provider_object_id !== verified.object.id ||
-                  existing.value.provider_object_version !== verified.object.version
-                ) {
-                  const outboxId = yield* newId("upload.proofDeletion")
-                  yield* sql`INSERT INTO effect_local_server_attachment_deletions
+                  for (let batchOffset = 0; batchOffset < chunkRows.length; batchOffset += 100) {
+                    yield* sql`INSERT INTO effect_local_server_attachment_chunks
+                    ${sql.insert(chunkRows.slice(batchOffset, batchOffset + 100))}`
+                  }
+                } else {
+                  if (existing.value.bytes !== input.reference.bytes) {
+                    yield* new Attachment.AttachmentLengthMismatch({
+                      expected: existing.value.bytes,
+                      actual: input.reference.bytes
+                    })
+                  }
+                  if (
+                    existing.value.provider_namespace !== verified.object.namespace ||
+                    existing.value.provider_object_id !== verified.object.id ||
+                    existing.value.provider_object_version !== verified.object.version
+                  ) {
+                    const outboxId = yield* newId("upload.proofDeletion")
+                    yield* sql`INSERT INTO effect_local_server_attachment_deletions
                     (outbox_id, space_id, digest, bytes, operation, provider_namespace,
                       provider_id, provider_version, next_attempt_at, created_at)
                     VALUES (${outboxId}, ${input.spaceId}, ${input.reference.digest},
                       ${input.reference.bytes}, 'DeleteObject', ${verified.object.namespace},
                       ${verified.object.id}, ${verified.object.version}, ${committedAt}, ${committedAt})`
+                  }
                 }
-              }
-              yield* sql`INSERT OR IGNORE INTO effect_local_server_attachment_possessions
+                yield* sql`INSERT OR IGNORE INTO effect_local_server_attachment_possessions
               (space_id, digest, client_id, membership_incarnation)
               VALUES (${input.spaceId}, ${input.reference.digest}, ${input.clientId},
                 ${input.membershipIncarnation})`
-              yield* sql`DELETE FROM effect_local_server_attachment_attempts
+                yield* sql`DELETE FROM effect_local_server_attachment_attempts
                 WHERE attempt_id = ${attempt.attempt_id}
                   AND provider_upload_id = ${attempt.provider_upload_id}
-                  AND finalization_token = ${finalizationToken}`
-            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-            return AttachmentTransfer.UploadComplete.make({})
+                  AND finalization_token = ${ownedToken}`
+              })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+              return AttachmentTransfer.UploadComplete.make({})
+            }).pipe(
+              Effect.raceFirst(finalizationHeartbeat(attempt.attempt_id, input.reference.digest, ownedToken))
+            )
           })
         )
       }, Effect.withSpan("AttachmentServer.finalizeUpload"))
@@ -1150,8 +1244,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         const sliceOffset = rangeOffset - chunk.offset
         const sliceLength = Math.min(rangeLength, chunk.bytes - sliceOffset)
         const adapter = yield* objectStores.resolve(object.provider_namespace).pipe(
-          Effect.catchTag("AttachmentObjectStoreUnavailable", (cause) =>
-            Effect.fail(new Attachment.AttachmentStorageError({ operation: "download.resolve", cause })))
+          Effect.catchTag(
+            "AttachmentObjectStoreUnavailable",
+            (cause) => Effect.fail(new Attachment.AttachmentStorageError({ operation: "download.resolve", cause }))
+          )
         )
         const exactObject = AttachmentObjectStore.ObjectIdentity.make({
           namespace: object.provider_namespace,
@@ -1177,8 +1273,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   AND provider_namespace = ${object.provider_namespace}
                   AND provider_object_id = ${object.provider_object_id}
                   AND provider_object_version = ${object.provider_object_version}`.pipe(
-                Effect.catchTag("SqlError", (cause) =>
-                  Effect.fail(StorageUnavailable.make(cause))),
+                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
                 Effect.andThen(Effect.fail(
                   new Attachment.AttachmentUnavailable({ digest: input.reference.digest })
                 ))
@@ -1228,8 +1323,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             RETURNING digest`
         })(undefined).pipe(
           Effect.catchTags({
-            SqlError: (cause) =>
-              Effect.fail(StorageUnavailable.make(cause)),
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
             SchemaError: (cause) =>
               Effect.fail(
                 new ReplicaError.StorageCorrupt({
@@ -1398,7 +1492,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         )
       }, Effect.withSpan("AttachmentServer.activateGeneration"))
 
-      const sweepSpace: Service["sweepSpace"] = Effect.fnUntraced(function*(spaceId) {
+      const expireGrants: Service["expireGrants"] = Effect.gen(function*() {
         const now = yield* Clock.currentTimeMillis
         yield* sql`DELETE FROM effect_local_server_attachment_upload_grants
           WHERE expires_at <= ${now}`.pipe(
@@ -1408,6 +1502,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           WHERE expires_at <= ${now}`.pipe(
           Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
         )
+      }).pipe(Effect.withSpan("AttachmentServer.expireGrants"))
+
+      const sweepSpace: Service["sweepSpace"] = Effect.fnUntraced(function*(spaceId) {
+        const now = yield* Clock.currentTimeMillis
         const staleAttempts = yield* SqlSchema.findAll({
           Request: Schema.Void,
           Result: Rows.ServerAttachmentAttemptRow,
@@ -1717,7 +1815,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
       }).pipe(Effect.withSpan("AttachmentServer.drainOutbox"))
 
       const maintain = (spaceId: Identity.SpaceId) =>
-        sweepSpace(spaceId).pipe(
+        expireGrants.pipe(
+          Effect.andThen(sweepSpace(spaceId)),
           Effect.flatMap((swept) => drainOutbox.pipe(Effect.map((drained) => swept + drained)))
         )
 
@@ -1727,6 +1826,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         prepareDownload,
         replaceEntityReferences,
         activateGeneration,
+        expireGrants,
         sweepSpace,
         drainOutbox,
         maintain

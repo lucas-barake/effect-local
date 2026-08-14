@@ -424,6 +424,7 @@ describe("replica attachments", () => {
           garbageCollectionGracePeriod: "1 hour",
           deletionBatchSize: 8,
           verificationChunkBytes: media.byteLength,
+          maximumVerificationChunks: 8,
           authorizeAccess: () => Effect.void,
           authorizeUpload: () => Effect.void,
           authorizeRead: () => Effect.void
@@ -535,6 +536,7 @@ describe("replica attachments", () => {
           garbageCollectionGracePeriod: "1 hour",
           deletionBatchSize: 8,
           verificationChunkBytes: 8,
+          maximumVerificationChunks: 8,
           authorizeAccess: () => Effect.void,
           authorizeUpload: () => Effect.void,
           authorizeRead: () => Effect.void

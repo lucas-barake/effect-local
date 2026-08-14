@@ -31,9 +31,11 @@ export type ReadFailure =
 
 export interface Service {
   readonly create: (key?: ObjectKey) => Effect.Effect<ObjectKey, Attachment.AttachmentStorageError>
+  // The byte stream is supplied per operation, so its environment remains owned by the caller.
   readonly stage: <E extends { readonly _tag: string }, R,>(
     bytes: Stream.Stream<Uint8Array, E, R>
   ) => Effect.Effect<Staged, E | Attachment.AttachmentTooLarge | Attachment.AttachmentStorageError, R>
+  // Appended bytes are supplied per operation, so their environment remains owned by the caller.
   readonly append: <E extends { readonly _tag: string }, R,>(
     key: ObjectKey,
     reference: Attachment.Reference,

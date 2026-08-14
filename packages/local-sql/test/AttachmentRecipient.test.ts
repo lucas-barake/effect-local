@@ -371,6 +371,7 @@ describe("attachment recipients", () => {
           garbageCollectionGracePeriod: "1 hour",
           deletionBatchSize: 8,
           verificationChunkBytes: 16,
+          maximumVerificationChunks: 8,
           authorizeAccess: () => Effect.void,
           authorizeUpload: () => Effect.void,
           authorizeRead: () => Effect.void

@@ -559,6 +559,7 @@ const buildAttachmentServer = AttachmentServer.layer({
   stagingLifetime: "1 day",
   garbageCollectionGracePeriod: "1 minute",
   deletionBatchSize: 8,
+  maximumVerificationChunks: 8,
   authorizeAccess: () => Effect.void,
   authorizeUpload: () => Effect.void,
   authorizeRead: () => Effect.void
@@ -1564,7 +1565,8 @@ describe("client schema evolution", () => {
           markRemoteAvailable: () => Effect.die("unexpected client remote update"),
           ensureUploaded: () => Effect.die("unexpected client attachment upload"),
           drainDeletions: () => Effect.die("unexpected client attachment deletion"),
-          maintain: Effect.die("unexpected client attachment maintenance")
+          maintain: Effect.die("unexpected client attachment maintenance"),
+          maintenance: Effect.never
         })
         const localV1 = yield* buildStore(definitionV1, layerHandlersV1, undefined, clientId, clientAttachments)
         const serverV1 = yield* buildServer(definitionV1, layerHandlersV1, undefined, undefined, attachments)
@@ -1684,7 +1686,8 @@ describe("client schema evolution", () => {
           markRemoteAvailable: () => Effect.die("unexpected client remote update"),
           ensureUploaded: () => Effect.die("unexpected client attachment upload"),
           drainDeletions: () => Effect.die("unexpected client attachment deletion"),
-          maintain: Effect.die("unexpected client attachment maintenance")
+          maintain: Effect.die("unexpected client attachment maintenance"),
+          maintenance: Effect.never
         })
         const localV1 = yield* buildStore(definitionV1, layerHandlersV1, undefined, clientId, clientAttachments)
         const serverV1 = yield* buildServer(definitionV1, layerHandlersV1, undefined, undefined, attachments)

@@ -9,11 +9,13 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
+import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as Statement from "effect/unstable/sql/Statement"
 import * as AttachmentObjectStore from "../src/AttachmentObjectStore.js"
 import * as AttachmentServer from "../src/AttachmentServer.js"
 import * as Codec from "../src/internal/codec.js"
@@ -61,7 +63,10 @@ const history = {
   migration: { retryDelay: "1 millis", maximumAttempts: 8 }
 } as const
 
-const makeProvider = () => {
+const makeProvider = (
+  providerReference: Attachment.Reference = reference,
+  verificationChunkBytes = 5
+) => {
   const uploaded = new Map<string, number>()
   const objects = new Map<string, AttachmentObjectStore.ObjectIdentity>()
   const missingUploads = new Set<string>()
@@ -79,7 +84,7 @@ const makeProvider = () => {
           namespace,
           id: AttachmentObjectStore.ProviderId.make(attemptId)
         }),
-        partSize: 5
+        partSize: providerReference.bytes
       }))
     },
     listUploadedParts: ({ upload }) => {
@@ -87,7 +92,9 @@ const makeProvider = () => {
         return Effect.fail(new AttachmentObjectStore.AttachmentProviderUploadNotFound({ upload }))
       }
       let parts: ReadonlyArray<AttachmentObjectStore.UploadedPart> = []
-      if (uploaded.get(upload.id) === 5) parts = [{ partNumber: 1, bytes: 5 }]
+      if (uploaded.get(upload.id) === providerReference.bytes) {
+        parts = [{ partNumber: 1, bytes: providerReference.bytes }]
+      }
       return Effect.succeed(AttachmentObjectStore.UploadedPartPage.make({
         parts,
         nextPartNumber: null
@@ -111,9 +118,9 @@ const makeProvider = () => {
       objects.set(upload.id, object)
       return Effect.succeed(AttachmentObjectStore.VerifiedObject.make({
         object,
-        reference,
-        chunkBytes: 5,
-        chunkCount: 1
+        reference: providerReference,
+        chunkBytes: verificationChunkBytes,
+        chunkCount: Math.ceil(providerReference.bytes / verificationChunkBytes)
       }))
     },
     inspectFinalized: ({ upload }) => {
@@ -125,17 +132,32 @@ const makeProvider = () => {
       return Effect.succeed(
         AttachmentObjectStore.VerifiedObject.make({
           object,
-          reference,
-          chunkBytes: 5,
-          chunkCount: 1
+          reference: providerReference,
+          chunkBytes: verificationChunkBytes,
+          chunkCount: Math.ceil(providerReference.bytes / verificationChunkBytes)
         })
       )
     },
-    listVerifiedChunks: () =>
-      Effect.succeed(AttachmentObjectStore.VerifiedChunkPage.make({
-        chunks: [{ index: 0, offset: 0, bytes: 5, digest }],
-        nextIndex: null
-      })),
+    listVerifiedChunks: ({ afterIndex, limit }) => {
+      const chunkCount = Math.ceil(providerReference.bytes / verificationChunkBytes)
+      const end = Math.min(chunkCount, afterIndex + limit)
+      const chunks = Array.from({ length: end - afterIndex }, (_, offset) => {
+        const index = afterIndex + offset
+        const chunkOffset = index * verificationChunkBytes
+        return {
+          index,
+          offset: chunkOffset,
+          bytes: Math.min(verificationChunkBytes, providerReference.bytes - chunkOffset),
+          digest: providerReference.digest
+        }
+      })
+      let nextIndex: number | null = null
+      if (end < chunkCount) nextIndex = end
+      return Effect.succeed(AttachmentObjectStore.VerifiedChunkPage.make({
+        chunks,
+        nextIndex
+      }))
+    },
     grantDownload: ({ expiresAt, object }) => {
       downloadRequests.push(object.id)
       if (missingObjects.has(object.id)) {
@@ -179,6 +201,17 @@ const makeContext = Effect.fnUntraced(function*(
   limits: { readonly maximumObjectsPerSpace: number; readonly maximumBytesPerSpace: number } = {
     maximumObjectsPerSpace: 4,
     maximumBytesPerSpace: 32
+  },
+  verification: {
+    readonly maximumObjectBytes: number
+    readonly verificationChunkBytes: number
+    readonly maximumVerificationChunks: number
+    readonly reference: Attachment.Reference
+  } = {
+    maximumObjectBytes: 8,
+    verificationChunkBytes: 5,
+    maximumVerificationChunks: 8,
+    reference
   }
 ) {
   const fs = yield* FileSystem.FileSystem
@@ -186,15 +219,15 @@ const makeContext = Effect.fnUntraced(function*(
   const layerDatabase = SqliteClient.layer({ filename: `${root}/server.sqlite`, disableWAL: true }).pipe(
     Layer.provide(Reactivity.layer)
   )
-  const provider = makeProvider()
+  const provider = makeProvider(verification.reference, verification.verificationChunkBytes)
   const layerObjectStore = AttachmentObjectStore.layer({
     namespaceForNewObjects: namespace,
     adapters: [provider.adapter]
   })
   const layerInfrastructure = Layer.mergeAll(layerDatabase, layerObjectStore, NodeCrypto.layer)
   const authorization = { access: initialAccess, read: true }
-  const layerAttachments = AttachmentServer.layer({
-    maximumObjectBytes: 8,
+  const attachmentOptions = {
+    maximumObjectBytes: verification.maximumObjectBytes,
     maximumObjectsPerSpace: limits.maximumObjectsPerSpace,
     maximumBytesPerSpace: limits.maximumBytesPerSpace,
     maximumReferencesPerObject: 4,
@@ -204,7 +237,8 @@ const makeContext = Effect.fnUntraced(function*(
     stagingLifetime: "1 minute",
     garbageCollectionGracePeriod: "1 minute",
     deletionBatchSize: 8,
-    verificationChunkBytes: 5,
+    verificationChunkBytes: verification.verificationChunkBytes,
+    maximumVerificationChunks: verification.maximumVerificationChunks,
     authorizeAccess: () => {
       if (authorization.access) return Effect.void
       return Effect.fail(new Denied({ reason: "denied" }))
@@ -214,7 +248,8 @@ const makeContext = Effect.fnUntraced(function*(
       if (authorization.read) return Effect.void
       return Effect.fail(new Denied({ reason: "read denied" }))
     }
-  }).pipe(Layer.provide(layerInfrastructure))
+  } as const satisfies AttachmentServer.Options
+  const layerAttachments = AttachmentServer.layer(attachmentOptions).pipe(Layer.provide(layerInfrastructure))
   const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
   const layerServer = ServerStore.layerTrusted(history).pipe(
     Layer.provide(layerRuntime),
@@ -254,6 +289,64 @@ const provideTestPlatform = Effect.provide(
 )
 
 describe("delegated attachment server", () => {
+  it.effect(
+    "rejects verification limits that cannot cover the maximum object size",
+    Effect.fnUntraced(
+      function*() {
+        const outcome = yield* makeContext(true, undefined, {
+          maximumObjectBytes: 8,
+          verificationChunkBytes: 5,
+          maximumVerificationChunks: 1,
+          reference
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(outcome))
+        if (Result.isFailure(outcome)) {
+          assert.strictEqual(outcome.failure._tag, "InvalidConfiguration")
+        }
+      },
+      provideTestPlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "persists a bounded verification manifest in bulk pages",
+    Effect.fnUntraced(
+      function*() {
+        const largeReference = Attachment.Reference.make({ digest, bytes: 250 })
+        const { attachments, provider } = yield* makeContext(
+          true,
+          { maximumObjectsPerSpace: 4, maximumBytesPerSpace: 512 },
+          {
+            maximumObjectBytes: 250,
+            verificationChunkBytes: 1,
+            maximumVerificationChunks: 300,
+            reference: largeReference
+          }
+        )
+        const largeIdentity = { ...identity, reference: largeReference }
+        const prepared = yield* attachments.prepareUpload(largeIdentity)
+        assert.strictEqual(prepared._tag, "UploadPart")
+        if (prepared._tag !== "UploadPart") return
+        provider.uploaded.set(prepared.attemptId, largeReference.bytes)
+        const inserts = yield* Ref.make(0)
+        const transformer: Statement.Transformer = (statement) => {
+          const [query] = statement.compile()
+          if (query.startsWith("INSERT INTO effect_local_server_attachment_chunks")) {
+            return Ref.update(inserts, (count) => count + 1).pipe(Effect.as(statement))
+          }
+          return Effect.succeed(statement)
+        }
+        yield* attachments.finalizeUpload({ ...largeIdentity, attemptId: prepared.attemptId }).pipe(
+          Effect.provideService(Statement.CurrentTransformer, transformer)
+        )
+        assert.strictEqual(yield* Ref.get(inserts), 3)
+      },
+      provideTestPlatform,
+      Effect.scoped
+    )
+  )
+
   it.effect(
     "resumes direct multipart upload and lazily grants a verified chunk",
     Effect.fnUntraced(
@@ -622,6 +715,7 @@ describe("delegated attachment server", () => {
         }
         assert.strictEqual(yield* attachments.drainOutbox, 1)
         assert.lengthOf(provider.deleted, 1)
+        yield* TestClock.adjust("2 minutes")
         const deletedProof = yield* attachments.finalizeUpload({
           ...identity,
           attemptId: prepared.attemptId
@@ -681,7 +775,19 @@ describe("delegated attachment server", () => {
         yield* Effect.forEach(spaces, insertSpace, { discard: true }).pipe(sql.withTransaction)
 
         yield* TestClock.adjust("2 minutes")
-        yield* server.maintainAll
+        const expiryStatements = yield* Ref.make<Array<string>>([])
+        const transformer: Statement.Transformer = (statement) => {
+          const [query] = statement.compile()
+          if (
+            query.startsWith("DELETE FROM effect_local_server_attachment_upload_grants") ||
+            query.startsWith("DELETE FROM effect_local_server_attachment_download_grants")
+          ) {
+            return Ref.update(expiryStatements, (queries) => [...queries, query]).pipe(Effect.as(statement))
+          }
+          return Effect.succeed(statement)
+        }
+        yield* server.maintainAll.pipe(Effect.provideService(Statement.CurrentTransformer, transformer))
+        assert.lengthOf(yield* Ref.get(expiryStatements), 2)
         assert.lengthOf(provider.aborted, 8)
         for (const request of provider.abortSpaces) {
           const expected = spaces.find((space) => space.providerId === request.uploadId)

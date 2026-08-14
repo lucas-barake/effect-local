@@ -5,7 +5,6 @@ import * as Exit from "effect/Exit"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Path from "effect/Path"
-import type * as PlatformError from "effect/PlatformError"
 import * as RcMap from "effect/RcMap"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
@@ -19,8 +18,6 @@ export interface Options {
 
 const writeChunkBytes = 256 * 1_024
 
-const isNotFound = (cause: PlatformError.PlatformError) => cause.reason._tag === "NotFound"
-
 export const layer = (options: Options) =>
   Layer.effect(
     AttachmentStorage.AttachmentStorage,
@@ -33,10 +30,14 @@ export const layer = (options: Options) =>
         options.maximumBytes
       )
       yield* fs.makeDirectory(options.directory, { recursive: true }).pipe(
-        Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "initialize", cause })),
+        Effect.catchTag("PlatformError", (cause) =>
+          Effect.fail(new Attachment.AttachmentStorageError({ operation: "initialize", cause }))),
         Effect.withSpan("FileSystemAttachmentStorage.initialize")
       )
-      const locks = yield* RcMap.make({ lookup: () => Semaphore.make(1) })
+      const locks = yield* RcMap.make({
+        lookup: () =>
+          Semaphore.make(1)
+      })
 
       const objectPath = (key: AttachmentStorage.ObjectKey) => path.join(options.directory, `${key}.blob`)
       const withLock = <A, E extends { readonly _tag: string }, R,>(
@@ -128,27 +129,36 @@ export const layer = (options: Options) =>
         let key = requestedKey
         if (key === undefined) {
           const uuid = yield* crypto.randomUUIDv4.pipe(
-            Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "create.key", cause }))
+            Effect.catchTag("PlatformError", (cause) =>
+              Effect.fail(new Attachment.AttachmentStorageError({ operation: "create.key", cause })))
           )
           key = AttachmentStorage.ObjectKey.make(uuid.replaceAll("-", ""))
         }
         const destination = objectPath(key)
         const opened = fs.open(destination, { flag: "wx" }).pipe(Effect.scoped)
         yield* opened.pipe(
-          Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "create", cause }))
+          Effect.catchTag("PlatformError", (cause) =>
+            Effect.fail(new Attachment.AttachmentStorageError({ operation: "create", cause })))
         )
         return key
       })
 
       const offset: AttachmentStorage.Service["offset"] = (key) =>
         fs.stat(objectPath(key)).pipe(
-          Effect.mapError((cause): AttachmentStorage.StorageFailure => {
-            if (isNotFound(cause)) return new Attachment.AttachmentNotFound({ key })
-            return new Attachment.AttachmentStorageError({ operation: "offset", cause })
-          }),
+          Effect.catchReasons(
+            "PlatformError",
+            {
+              NotFound: () =>
+                Effect.fail(new Attachment.AttachmentNotFound({ key }))
+            },
+            (_reason, cause) =>
+              Effect.fail(new Attachment.AttachmentStorageError({ operation: "offset", cause }))
+          ),
           Effect.flatMap((info): Effect.Effect<number, Attachment.AttachmentStorageError> => {
             const size = Number(info.size)
-            if (Number.isSafeInteger(size)) return Effect.succeed(size)
+            if (Number.isSafeInteger(size)) {
+              return Effect.succeed(size)
+            }
             return Effect.fail(new Attachment.AttachmentStorageError({ operation: "offset", cause: info.size }))
           }),
           Effect.withSpan("FileSystemAttachmentStorage.offset")
@@ -159,7 +169,8 @@ export const layer = (options: Options) =>
         return withLock(
           key,
           fs.remove(destination, { force: true }).pipe(
-            Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "remove", cause })),
+            Effect.catchTag("PlatformError", (cause) =>
+              Effect.fail(new Attachment.AttachmentStorageError({ operation: "remove", cause }))),
             Effect.withSpan("FileSystemAttachmentStorage.remove")
           )
         )
@@ -181,19 +192,20 @@ export const layer = (options: Options) =>
             Effect.scoped(Effect.gen(function*() {
               const destination = objectPath(key)
               const file = yield* fs.open(destination, { flag: "w" }).pipe(
-                Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "stage.open", cause }))
+                Effect.catchTag("PlatformError", (cause) =>
+                  Effect.fail(new Attachment.AttachmentStorageError({ operation: "stage.open", cause })))
               )
               const hashed = yield* hashCoalesced(
                 bytes,
                 (chunk) =>
                   file.writeAll(chunk).pipe(
-                    Effect.mapError((cause) =>
-                      new Attachment.AttachmentStorageError({ operation: "stage.write", cause })
-                    )
+                    Effect.catchTag("PlatformError", (cause) =>
+                      Effect.fail(new Attachment.AttachmentStorageError({ operation: "stage.write", cause })))
                   )
               )
               yield* file.sync.pipe(
-                Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "stage.sync", cause }))
+                Effect.catchTag("PlatformError", (cause) =>
+                  Effect.fail(new Attachment.AttachmentStorageError({ operation: "stage.sync", cause })))
               )
               return {
                 key,
@@ -234,13 +246,20 @@ export const layer = (options: Options) =>
               return yield* new Attachment.AttachmentOffsetConflict({ expected: expectedOffset, actual })
             }
             const limit = Math.min(reference.bytes, maximumBytes)
-            if (actual > limit) return yield* new Attachment.AttachmentTooLarge({ limit })
+            if (actual > limit) {
+              return yield* new Attachment.AttachmentTooLarge({ limit })
+            }
             return yield* Effect.scoped(Effect.gen(function*() {
               const file = yield* fs.open(objectPath(key), { flag: "r+" }).pipe(
-                Effect.mapError((cause): AttachmentStorage.StorageFailure => {
-                  if (isNotFound(cause)) return new Attachment.AttachmentNotFound({ key })
-                  return new Attachment.AttachmentStorageError({ operation: "append.open", cause })
-                })
+                Effect.catchReasons(
+                  "PlatformError",
+                  {
+                    NotFound: () =>
+                      Effect.fail(new Attachment.AttachmentNotFound({ key }))
+                  },
+                  (_reason, cause) =>
+                    Effect.fail(new Attachment.AttachmentStorageError({ operation: "append.open", cause }))
+                )
               )
               yield* file.seek(actual, "start")
               let written = 0
@@ -251,15 +270,17 @@ export const layer = (options: Options) =>
                 (chunk) =>
                   Effect.uninterruptible(
                     file.writeAll(chunk).pipe(
-                      Effect.mapError((cause) =>
-                        new Attachment.AttachmentStorageError({ operation: "append.write", cause })
-                      ),
+                      Effect.catchTag("PlatformError", (cause) =>
+                        Effect.fail(new Attachment.AttachmentStorageError({ operation: "append.write", cause }))),
                       Effect.andThen(file.sync.pipe(
-                        Effect.mapError((cause) =>
-                          new Attachment.AttachmentStorageError({ operation: "append.sync", cause })
-                        )
+                        Effect.catchTag("PlatformError", (cause) =>
+                          Effect.fail(new Attachment.AttachmentStorageError({ operation: "append.sync", cause })))
                       )),
-                      Effect.tap(() => Effect.sync(() => written += chunk.length))
+                      Effect.tap(() =>
+                        Effect.sync(() =>
+                          written += chunk.length
+                        )
+                      )
                     )
                   )
               )
@@ -280,7 +301,8 @@ export const layer = (options: Options) =>
           })
         }
         const source = fs.stream(objectPath(key)).pipe(
-          Stream.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "verify.read", cause }))
+          Stream.catchTag("PlatformError", (cause) =>
+            Stream.fail(new Attachment.AttachmentStorageError({ operation: "verify.read", cause })))
         )
         const actual = yield* Attachment.hash(source)
         if (actual.digest !== reference.digest) {
@@ -301,9 +323,13 @@ export const layer = (options: Options) =>
           if (actual !== reference.bytes) {
             return yield* new Attachment.AttachmentLengthMismatch({ expected: reference.bytes, actual })
           }
-          if (range === undefined) return undefined
+          if (range === undefined) {
+            return undefined
+          }
           let length = reference.bytes - range.offset
-          if (range.length !== undefined) length = range.length
+          if (range.length !== undefined) {
+            length = range.length
+          }
           if (
             !Number.isSafeInteger(range.offset) || range.offset < 0 ||
             !Number.isSafeInteger(length) || length <= 0 ||
@@ -319,7 +345,8 @@ export const layer = (options: Options) =>
         })
         return Stream.unwrap(validate.pipe(Effect.map((validated) =>
           fs.stream(objectPath(key), validated).pipe(
-            Stream.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "read", cause }))
+            Stream.catchTag("PlatformError", (cause) =>
+              Stream.fail(new Attachment.AttachmentStorageError({ operation: "read", cause })))
           )
         ))).pipe(Stream.withSpan("FileSystemAttachmentStorage.read"))
       }
@@ -327,7 +354,8 @@ export const layer = (options: Options) =>
       const exists: AttachmentStorage.Service["exists"] = (key) => {
         const destination = objectPath(key)
         return fs.exists(destination).pipe(
-          Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "exists", cause })),
+          Effect.catchTag("PlatformError", (cause) =>
+            Effect.fail(new Attachment.AttachmentStorageError({ operation: "exists", cause }))),
           Effect.withSpan("FileSystemAttachmentStorage.exists")
         )
       }

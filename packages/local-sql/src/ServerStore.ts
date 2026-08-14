@@ -1784,15 +1784,20 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             )
         })
       const maintain = (spaceId: Identity.SpaceId) => {
-        let drain: Effect.Effect<number | void, ReplicaError.ReplicaError> = Effect.void
-        if (Option.isSome(attachments)) drain = attachments.value.drainOutbox
+        let globalMaintenance: Effect.Effect<number | void, ReplicaError.ReplicaError> = Effect.void
+        if (Option.isSome(attachments)) {
+          globalMaintenance = attachments.value.expireGrants.pipe(
+            Effect.andThen(attachments.value.drainOutbox)
+          )
+        }
         return maintainSpace(spaceId).pipe(
-          Effect.andThen(drain),
+          Effect.andThen(globalMaintenance),
           Effect.asVoid,
           Effect.ensuring(scheduleMetricDepthRefresh)
         )
       }
       const maintainAll = Effect.gen(function*() {
+        if (Option.isSome(attachments)) yield* attachments.value.expireGrants
         let after = ""
         while (true) {
           const spaces = yield* findSpaces({ after, limit: options.maintenanceSpaceBatchSize }).pipe(

@@ -158,13 +158,14 @@ export const collect = Effect.fnUntraced(function*(
     }
     if (current._tag === "Attachment") {
       const reference = yield* Schema.decodeUnknownEffect(Reference)(current).pipe(
-        Effect.mapError((cause) =>
-          new InvalidAttachmentReference({
-            path: materializePath(path),
-            reason: "InvalidShape",
-            cause
-          })
-        )
+        Effect.catchTag("SchemaError", (cause) =>
+          Effect.fail(
+            new InvalidAttachmentReference({
+              path: materializePath(path),
+              reason: "InvalidShape",
+              cause
+            })
+          ))
       )
       const existing = references.get(reference.digest)
       if (existing !== undefined && existing.bytes !== reference.bytes) {

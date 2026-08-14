@@ -260,6 +260,9 @@ const makeLayer = <D extends Definition.Any, R,>(
         clientId: options.clientId,
         migration: options.migration
       })
+      if (Option.isSome(attachments)) {
+        yield* attachments.value.maintenance.pipe(Effect.forkScoped({ startImmediately: true }))
+      }
 
       const normalizedDefaultScope = yield* Protocol.validateReplicationScope(
         options.definition,

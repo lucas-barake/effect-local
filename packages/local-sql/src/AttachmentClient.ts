@@ -29,6 +29,7 @@ export type ClientFailure =
   | ReplicaError.ReplicaError
 
 export interface Service {
+  // The staged byte stream is supplied per operation, so its environment remains owned by the caller.
   readonly stage: <E extends { readonly _tag: string }, R,>(
     spaceId: Identity.SpaceId,
     bytes: Stream.Stream<Uint8Array, E, R>
@@ -72,6 +73,7 @@ export interface Service {
     references: ReadonlyArray<Attachment.Reference>
   ) => Effect.Effect<void, ClientFailure>
   readonly maintain: Effect.Effect<number, Attachment.AttachmentStorageError | ReplicaError.ReplicaError>
+  readonly maintenance: Effect.Effect<never>
   readonly drainDeletions: (
     maximum: number
   ) => Effect.Effect<number, Attachment.AttachmentStorageError | ReplicaError.ReplicaError>
@@ -87,6 +89,7 @@ export interface Options {
   readonly maximumCacheBytes: number
   readonly maximumCacheObjects: number
   readonly maximumCacheAge: Duration.Input
+  readonly maintenanceInterval?: Duration.Input
   readonly evictionBatchSize: number
 }
 
@@ -145,6 +148,10 @@ export const layer = (options: Options): Layer.Layer<
       const maximumCacheAgeMillis = yield* Configuration.positiveIntegerDurationMillis(
         "attachments.maximumCacheAge",
         options.maximumCacheAge
+      )
+      const maintenanceIntervalMillis = yield* Configuration.positiveIntegerDurationMillis(
+        "attachments.maintenanceInterval",
+        options.maintenanceInterval ?? "1 minute"
       )
       const evictionBatchSize = yield* Configuration.positiveSafeInteger(
         "attachments.evictionBatchSize",
@@ -257,6 +264,29 @@ export const layer = (options: Options): Layer.Layer<
               )
           })
         )
+      const retainExistingComplete = Effect.fnUntraced(function*(row: typeof Rows.ClientAttachmentRow.Type) {
+        if (yield* storage.exists(row.object_key)) return true
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* sql`DELETE FROM effect_local_client_attachment_read_claims
+            WHERE object_key = ${row.object_key}`
+          yield* sql`DELETE FROM effect_local_client_attachments
+            WHERE space_id = ${row.space_id} AND digest = ${row.digest}
+              AND object_key = ${row.object_key}`
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        return false
+      })
+      const retainExistingChunk = Effect.fnUntraced(function*(row: Rows.ClientAttachmentChunkRow) {
+        if (yield* storage.exists(row.object_key)) return true
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* sql`DELETE FROM effect_local_client_attachment_read_claims
+            WHERE object_key = ${row.object_key}`
+          yield* sql`DELETE FROM effect_local_client_attachment_chunks
+            WHERE space_id = ${row.space_id} AND digest = ${row.digest}
+              AND object_version = ${row.object_version} AND chunk_index = ${row.chunk_index}
+              AND object_key = ${row.object_key}`
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        return false
+      })
       const withLock = <A, E extends { readonly _tag: string }, R,>(
         spaceId: Identity.SpaceId,
         digest: Attachment.Digest,
@@ -309,14 +339,6 @@ export const layer = (options: Options): Layer.Layer<
         const now = yield* Clock.currentTimeMillis
         yield* sql.withTransaction(Effect.gen(function*() {
           yield* sql`DELETE FROM effect_local_client_attachment_read_claims WHERE expires_at <= ${now}`
-          yield* sql`UPDATE effect_local_client_attachments SET active_reads = (
-            SELECT COUNT(*) FROM effect_local_client_attachment_read_claims AS r
-            WHERE r.object_key = effect_local_client_attachments.object_key
-          )`
-          yield* sql`UPDATE effect_local_client_attachment_chunks SET active_reads = (
-            SELECT COUNT(*) FROM effect_local_client_attachment_read_claims AS r
-            WHERE r.object_key = effect_local_client_attachment_chunks.object_key
-          )`
           yield* sql`UPDATE effect_local_client_attachment_chunks SET promotion_token = NULL
             WHERE promotion_token IN (
               SELECT claim_token FROM effect_local_client_attachment_promotions
@@ -623,6 +645,15 @@ export const layer = (options: Options): Layer.Layer<
         yield* drainAllDeletions()
         return evicted
       })).pipe(Effect.withSpan("AttachmentClient.maintain"))
+      const maintenance = maintain.pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("Attachment client maintenance will be retried").pipe(
+            Effect.annotateLogs("error", error._tag)
+          )
+        ),
+        Effect.andThen(Effect.sleep(maintenanceIntervalMillis)),
+        Effect.forever
+      )
 
       const stage: Service["stage"] = Effect.fnUntraced(
         function*<E extends { readonly _tag: string }, R,>(
@@ -862,7 +893,7 @@ export const layer = (options: Options): Layer.Layer<
             Result: ObjectKeyRow,
             execute: () =>
               sql`UPDATE effect_local_client_attachment_chunks SET
-              active_reads = active_reads + 1
+              last_accessed_at = ${now}
               WHERE space_id = ${row.space_id} AND digest = ${row.digest}
                 AND object_version = ${row.object_version} AND chunk_index = ${row.chunk_index}
                 AND state = 'Verified'
@@ -885,7 +916,7 @@ export const layer = (options: Options): Layer.Layer<
             Result: ObjectKeyRow,
             execute: () =>
               sql`UPDATE effect_local_client_attachments SET
-              active_reads = active_reads + 1
+              last_accessed_at = ${now}
               WHERE space_id = ${row.space_id} AND digest = ${row.digest}
                 AND object_key = ${row.object_key}
               RETURNING object_key`
@@ -909,22 +940,11 @@ export const layer = (options: Options): Layer.Layer<
             acquire,
             (claim) => {
               if (claim.kind === "Chunk") {
-                return sql.withTransaction(Effect.gen(function*() {
-                  yield* sql`DELETE FROM effect_local_client_attachment_read_claims
-                    WHERE claim_token = ${claim.token}`
-                  yield* sql`UPDATE effect_local_client_attachment_chunks SET active_reads = active_reads - 1
-                WHERE space_id = ${row.space_id} AND digest = ${row.digest}
-                  AND object_version = ${row.object_version} AND chunk_index = ${row.chunk_index}
-                    AND active_reads > 0`
-                })).pipe(Effect.catchTag("SqlError", () => Effect.void))
+                return sql`DELETE FROM effect_local_client_attachment_read_claims
+                  WHERE claim_token = ${claim.token}`.pipe(Effect.catchTag("SqlError", () => Effect.void))
               }
-              return sql.withTransaction(Effect.gen(function*() {
-                yield* sql`DELETE FROM effect_local_client_attachment_read_claims
-                  WHERE claim_token = ${claim.token}`
-                yield* sql`UPDATE effect_local_client_attachments SET active_reads = active_reads - 1
-              WHERE space_id = ${row.space_id} AND digest = ${row.digest}
-                  AND object_key = ${row.object_key} AND active_reads > 0`
-              })).pipe(Effect.catchTag("SqlError", () => Effect.void))
+              return sql`DELETE FROM effect_local_client_attachment_read_claims
+                WHERE claim_token = ${claim.token}`.pipe(Effect.catchTag("SqlError", () => Effect.void))
             }
           ).pipe(Effect.map((claim) => {
             const renewal = Stream.fromEffect(renewReadClaim(claim.token, row.digest))
@@ -939,6 +959,7 @@ export const layer = (options: Options): Layer.Layer<
       }
 
       const evictOneVerifiedChunk = Effect.fnUntraced(function*() {
+        const now = yield* Clock.currentTimeMillis
         const candidate = yield* sql.withTransaction(
           SqlSchema.findOneOption({
             Request: Schema.Void,
@@ -948,9 +969,17 @@ export const layer = (options: Options): Layer.Layer<
                 WHERE (space_id, digest, object_version, chunk_index) = (
                   SELECT space_id, digest, object_version, chunk_index
                   FROM effect_local_client_attachment_chunks
-                  WHERE state = 'Verified' AND active_reads = 0 AND promotion_token IS NULL
+                  WHERE state = 'Verified' AND promotion_token IS NULL AND NOT EXISTS (
+                    SELECT 1 FROM effect_local_client_attachment_read_claims AS r
+                    WHERE r.object_key = effect_local_client_attachment_chunks.object_key
+                      AND r.expires_at > ${now}
+                  )
                   ORDER BY last_accessed_at, space_id, digest, object_version, chunk_index LIMIT 1
-                ) AND state = 'Verified' AND active_reads = 0 AND promotion_token IS NULL
+                ) AND state = 'Verified' AND promotion_token IS NULL AND NOT EXISTS (
+                  SELECT 1 FROM effect_local_client_attachment_read_claims AS r
+                  WHERE r.object_key = effect_local_client_attachment_chunks.object_key
+                    AND r.expires_at > ${now}
+                )
                 RETURNING space_id, digest, object_version, chunk_index, chunk_offset, chunk_bytes,
                   chunk_digest, object_key, state, claim_token, claim_expires_at, promotion_token, active_reads,
                   created_at, last_accessed_at`
@@ -999,6 +1028,11 @@ export const layer = (options: Options): Layer.Layer<
         reference: Attachment.Reference,
         objectVersion: AttachmentProtocol.ObjectVersion
       ) {
+        const complete = yield* find(spaceId, reference.digest)
+        if (Option.isSome(complete)) {
+          if (yield* retainExistingComplete(complete.value)) return
+        }
+        const now = yield* Clock.currentTimeMillis
         const chunks = yield* SqlSchema.findAll({
           Request: Schema.Void,
           Result: Rows.ClientAttachmentChunkRow,
@@ -1009,7 +1043,11 @@ export const layer = (options: Options): Layer.Layer<
             FROM effect_local_client_attachment_chunks
             WHERE space_id = ${spaceId} AND digest = ${reference.digest}
               AND object_version = ${objectVersion} AND state = 'Verified'
-              AND promotion_token IS NULL AND active_reads = 0
+              AND promotion_token IS NULL AND NOT EXISTS (
+                SELECT 1 FROM effect_local_client_attachment_read_claims AS r
+                WHERE r.object_key = effect_local_client_attachment_chunks.object_key
+                  AND r.expires_at > ${now}
+              )
             ORDER BY chunk_offset, chunk_index`
         })(undefined).pipe(
           Effect.catchTags({
@@ -1024,13 +1062,15 @@ export const layer = (options: Options): Layer.Layer<
           })
         )
         if (chunks.length < 2) return
+        for (const chunk of chunks) {
+          if (!(yield* retainExistingChunk(chunk))) return
+        }
         let covered = 0
         for (const chunk of chunks) {
           if (chunk.chunk_offset !== covered) return
           covered += chunk.chunk_bytes
         }
         if (covered !== reference.bytes) return
-        const now = yield* Clock.currentTimeMillis
         const generated = yield* generateChunkClaim(undefined).pipe(
           Effect.catchTags({
             SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
@@ -1104,7 +1144,11 @@ export const layer = (options: Options): Layer.Layer<
           yield* sql`UPDATE effect_local_client_attachment_chunks SET promotion_token = ${generated.claim_token}
             WHERE space_id = ${spaceId} AND digest = ${reference.digest}
               AND object_version = ${objectVersion} AND state = 'Verified'
-              AND promotion_token IS NULL AND active_reads = 0`
+              AND promotion_token IS NULL AND NOT EXISTS (
+                SELECT 1 FROM effect_local_client_attachment_read_claims AS r
+                WHERE r.object_key = effect_local_client_attachment_chunks.object_key
+                  AND r.expires_at > ${now}
+              )`
           const pinned = yield* SqlSchema.findOne({
             Request: Schema.Void,
             Result: CountRow,
@@ -1385,14 +1429,33 @@ export const layer = (options: Options): Layer.Layer<
             if (row.state === "Filling" && row.claim_expires_at !== null && row.claim_expires_at > now) {
               return undefined
             }
-            yield* sql`UPDATE effect_local_client_attachment_chunks SET
-              state = 'Filling', claim_token = ${generated.claim_token},
-              claim_expires_at = ${claimExpiresAt}, last_accessed_at = ${now}
-            WHERE space_id = ${spaceId} AND digest = ${reference.digest}
-              AND object_version = ${response.objectVersion} AND chunk_index = ${chunk.index}
-              AND (state = 'Deleting' OR claim_expires_at <= ${now})`
+            const reclaimed = yield* SqlSchema.findOneOption({
+              Request: Schema.Void,
+              Result: ObjectKeyRow,
+              execute: () =>
+                sql`UPDATE effect_local_client_attachment_chunks SET
+                object_key = ${generated.object_key}, state = 'Filling',
+                claim_token = ${generated.claim_token}, claim_expires_at = ${claimExpiresAt},
+                promotion_token = NULL, last_accessed_at = ${now}
+              WHERE space_id = ${spaceId} AND digest = ${reference.digest}
+                AND object_version = ${response.objectVersion} AND chunk_index = ${chunk.index}
+                AND object_key = ${row.object_key}
+                AND (state = 'Deleting' OR claim_expires_at <= ${now})
+              RETURNING object_key`
+            })(undefined).pipe(Effect.catchTag("SchemaError", (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Client attachment chunk reclaim result is corrupt",
+                  cause
+                })
+              )))
+            if (Option.isNone(reclaimed)) return undefined
+            yield* sql`INSERT OR IGNORE INTO effect_local_client_attachment_deletions
+              (object_key, bytes, cache_managed, next_attempt_at, created_at)
+              VALUES (${row.object_key}, ${row.chunk_bytes}, 1, ${now}, ${now})`
             return {
               ...row,
+              object_key: generated.object_key,
               state: "Filling" as const,
               claim_token: generated.claim_token,
               claim_expires_at: claimExpiresAt,
@@ -1594,11 +1657,14 @@ export const layer = (options: Options): Layer.Layer<
                 )
             })
           )
-          if (Option.isSome(existing)) return existing.value
+          if (Option.isSome(existing)) {
+            if (yield* retainExistingChunk(existing.value)) return existing.value
+            continue
+          }
           const promoted = yield* find(spaceId, reference.digest)
           if (
             Option.isSome(promoted) && promoted.value.object_version !== null &&
-            promoted.value.bytes === reference.bytes && (yield* storage.exists(promoted.value.object_key))
+            promoted.value.bytes === reference.bytes && (yield* retainExistingComplete(promoted.value))
           ) {
             return Rows.ClientAttachmentChunkRow.make({
               space_id: spaceId,
@@ -1668,7 +1734,7 @@ export const layer = (options: Options): Layer.Layer<
               actual: reference.bytes
             })
           }
-          if (Option.isSome(complete) && (yield* storage.exists(complete.value.object_key))) {
+          if (Option.isSome(complete) && (yield* retainExistingComplete(complete.value))) {
             const now = yield* Clock.currentTimeMillis
             const generated = yield* generateChunkClaim(undefined).pipe(Effect.catchTags({
               SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
@@ -1693,7 +1759,7 @@ export const layer = (options: Options): Layer.Layer<
                 Result: ObjectKeyRow,
                 execute: () =>
                   sql`UPDATE effect_local_client_attachments SET
-                  active_reads = active_reads + 1, last_accessed_at = ${now}
+                  last_accessed_at = ${now}
                   WHERE space_id = ${spaceId} AND digest = ${reference.digest}
                 RETURNING object_key`
               })(undefined).pipe(Effect.catchTag("SchemaError", (cause) =>
@@ -1723,13 +1789,8 @@ export const layer = (options: Options): Layer.Layer<
             return storage.read(claimed.value.object_key, reference, range).pipe(
               Stream.merge(renewal, { haltStrategy: "left" }),
               Stream.ensuring(Effect.gen(function*() {
-                yield* sql.withTransaction(Effect.gen(function*() {
-                  yield* sql`DELETE FROM effect_local_client_attachment_read_claims
-                    WHERE claim_token = ${generated.claim_token}`
-                  yield* sql`UPDATE effect_local_client_attachments SET active_reads = active_reads - 1
-                    WHERE space_id = ${spaceId} AND digest = ${reference.digest}
-                      AND object_key = ${claimed.value.object_key} AND active_reads > 0`
-                })).pipe(Effect.catchTag("SqlError", () => Effect.void))
+                yield* sql`DELETE FROM effect_local_client_attachment_read_claims
+                  WHERE claim_token = ${generated.claim_token}`.pipe(Effect.catchTag("SqlError", () => Effect.void))
                 const count = activeReads.get(activeKey)
                 if (count === undefined || count === 1) activeReads.delete(activeKey)
                 else activeReads.set(activeKey, count - 1)
@@ -1739,30 +1800,25 @@ export const layer = (options: Options): Layer.Layer<
               }))
             )
           }
-          return Stream.unfold(validated.offset, (offset) => {
-            if (offset >= validated.end) return Effect.succeed(undefined)
-            return ensureVerifiedChunk(
-              spaceId,
-              clientId,
-              membershipIncarnation,
-              reference,
-              offset,
-              validated.end
-            ).pipe(
-              Effect.flatMap((row) =>
-                readVerifiedChunk(row, offset, validated.end).pipe(
-                  Stream.runCollect,
-                  Effect.map((chunks) => Uint8Array.from(chunks.flatMap((chunk) => Array.from(chunk)))),
-                  Effect.map((bytes) =>
-                    [
-                      bytes,
-                      Math.min(validated.end, row.chunk_offset + row.chunk_bytes)
-                    ] as const
-                  )
+          const readRange = (offset: number): Stream.Stream<Uint8Array, ClientFailure> => {
+            if (offset >= validated.end) return Stream.empty
+            return Stream.unwrap(
+              ensureVerifiedChunk(
+                spaceId,
+                clientId,
+                membershipIncarnation,
+                reference,
+                offset,
+                validated.end
+              ).pipe(Effect.map((row) => {
+                const nextOffset = Math.min(validated.end, row.chunk_offset + row.chunk_bytes)
+                return readVerifiedChunk(row, offset, validated.end).pipe(
+                  Stream.concat(readRange(nextOffset))
                 )
-              )
+              }))
             )
-          })
+          }
+          return readRange(validated.offset)
         })).pipe(
           Stream.scoped,
           Stream.withSpan("AttachmentClient.read", {
@@ -1856,6 +1912,7 @@ export const layer = (options: Options): Layer.Layer<
         markRemoteAvailable,
         ensureUploaded,
         maintain,
+        maintenance,
         drainDeletions
       })
     })
