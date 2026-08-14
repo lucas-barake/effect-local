@@ -13,6 +13,12 @@
       ],
       "ignoreDependencies": ["@effect/platform-browser"]
     },
+    "packages/local-rpc": {
+      "entry": [
+        "src/index.ts",
+        "bench/AttachmentTransport.bench.ts"
+      ]
+    },
     "packages/local-test": {
       "ignoreDependencies": ["@effect/platform-node-shared"]
     }

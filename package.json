@@ -9,6 +9,7 @@
     "clean": "node scripts/clean.mjs",
     "bench": "vitest bench --run",
     "bench:attachments": "vite packages/local-browser/bench --config packages/local-browser/bench/vite.config.ts",
+    "bench:attachment-transport": "node --experimental-strip-types packages/local-rpc/bench/AttachmentTransport.bench.ts",
     "build": "tsgo -b tsconfig.packages.json",
     "build:tsc": "tsc -b tsconfig.packages.json",
     "circular": "madge --extensions ts --circular --no-color --no-spinner packages/*/src",
