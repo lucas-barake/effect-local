@@ -1601,7 +1601,6 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               finalization_token, finalization_expires_at, created_at, last_accessed_at
             FROM effect_local_server_attachment_attempts AS a
             WHERE a.space_id = ${spaceId} AND a.last_accessed_at <= ${now - stagingLifetime}
-              AND a.state <> 'Finalizing'
               AND (a.finalization_expires_at IS NULL OR a.finalization_expires_at <= ${now})
               AND NOT EXISTS (
                 SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
@@ -1622,6 +1621,111 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         )
         let swept = 0
         for (const selected of staleAttempts) {
+          if (selected.state === "Finalizing") {
+            if (
+              selected.provider_upload_id === null || selected.finalization_token === null ||
+              selected.finalization_expires_at === null
+            ) {
+              continue
+            }
+            const adapter = yield* objectStores.resolve(selected.provider_namespace).pipe(
+              Effect.map(Option.some),
+              Effect.catchTag("AttachmentObjectStoreUnavailable", () => Effect.succeed(Option.none()))
+            )
+            if (Option.isNone(adapter)) continue
+            const upload = AttachmentObjectStore.UploadIdentity.make({
+              namespace: selected.provider_namespace,
+              id: AttachmentObjectStore.ProviderId.make(selected.provider_upload_id)
+            })
+            const reference = Attachment.Reference.make({
+              digest: selected.digest,
+              bytes: selected.bytes
+            })
+            let providerUnavailable = false
+            const verified = yield* adapter.value.inspectFinalized({
+              spaceId: selected.space_id,
+              upload,
+              reference
+            }).pipe(
+              Effect.catchTags({
+                AttachmentObjectStoreUnavailable: () => {
+                  providerUnavailable = true
+                  return Effect.succeed(null)
+                },
+                AttachmentProviderUploadNotFound: () => Effect.succeed(null),
+                AttachmentProviderObjectNotFound: () => Effect.succeed(null)
+              }),
+              Effect.flatMap((value) => {
+                if (value === null) return Effect.succeed(null)
+                return Schema.decodeUnknownEffect(AttachmentObjectStore.VerifiedObject)(value)
+              }),
+              Effect.catchTag("SchemaError", (cause) =>
+                Effect.fail(
+                  new Attachment.AttachmentStorageError({
+                    operation: "upload.sweepInspect.decode",
+                    cause
+                  })
+                ))
+            )
+            if (providerUnavailable || verified !== null) continue
+            const outboxId = yield* newId("upload.finalizingAbortOutbox")
+            const removed = yield* sql.withTransaction(Effect.gen(function*() {
+              yield* sql`INSERT INTO effect_local_server_attachment_deletions
+                (outbox_id, space_id, digest, bytes, operation, provider_namespace,
+                  provider_id, next_attempt_at, created_at)
+                SELECT ${outboxId}, a.space_id, a.digest, a.bytes, 'AbortUpload',
+                  a.provider_namespace, a.provider_upload_id, ${now}, ${now}
+                FROM effect_local_server_attachment_attempts AS a
+                WHERE a.attempt_id = ${selected.attempt_id}
+                  AND a.state = 'Finalizing'
+                  AND a.provider_namespace = ${selected.provider_namespace}
+                  AND a.provider_upload_id = ${selected.provider_upload_id}
+                  AND a.finalization_token = ${selected.finalization_token}
+                  AND a.finalization_expires_at = ${selected.finalization_expires_at}
+                  AND a.finalization_expires_at <= ${now}
+                  AND a.last_accessed_at <= ${now - stagingLifetime}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM effect_local_server_attachment_upload_grants
+                    WHERE attempt_id = a.attempt_id AND expires_at > ${now}
+                  )`
+              return yield* SqlSchema.findOneOption({
+                Request: Schema.Void,
+                Result: AttemptIdRow,
+                execute: () =>
+                  sql`DELETE FROM effect_local_server_attachment_attempts
+                    WHERE attempt_id = ${selected.attempt_id}
+                      AND state = 'Finalizing'
+                      AND provider_namespace = ${selected.provider_namespace}
+                      AND provider_upload_id = ${selected.provider_upload_id}
+                      AND finalization_token = ${selected.finalization_token}
+                      AND finalization_expires_at = ${selected.finalization_expires_at}
+                      AND finalization_expires_at <= ${now}
+                      AND last_accessed_at <= ${now - stagingLifetime}
+                      AND EXISTS (
+                        SELECT 1 FROM effect_local_server_attachment_deletions
+                        WHERE outbox_id = ${outboxId}
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM effect_local_server_attachment_upload_grants
+                        WHERE attempt_id = ${selected.attempt_id} AND expires_at > ${now}
+                      )
+                    RETURNING attempt_id`
+              })(undefined).pipe(
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                  SchemaError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({
+                        message: "Attachment Finalizing attempt removal is corrupt",
+                        cause
+                      })
+                    )
+                })
+              )
+            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            if (Option.isSome(removed)) swept++
+            continue
+          }
           let attempt = selected
           if (selected.provider_upload_id === null) attempt = yield* beginAttempt(selected)
           const removed = yield* sql.withTransaction(Effect.gen(function*() {

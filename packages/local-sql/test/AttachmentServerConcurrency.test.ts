@@ -622,7 +622,11 @@ describe("delegated attachment deletion concurrency", () => {
           })
           return Effect.succeed(finalized)
         })
-        provider.setInspectHandler(() => Effect.succeed(finalized))
+        let inspectCalls = 0
+        provider.setInspectHandler(() => {
+          inspectCalls++
+          return Effect.succeed(finalized)
+        })
         yield* sql.unsafe(`CREATE TRIGGER fail_attachment_finalize_recovery
           BEFORE INSERT ON effect_local_server_attachment_objects
           BEGIN SELECT RAISE(ABORT, 'injected finalize recovery failure'); END`)
@@ -635,6 +639,7 @@ describe("delegated attachment deletion concurrency", () => {
         yield* sql.unsafe("DROP TRIGGER fail_attachment_finalize_recovery")
         yield* TestClock.adjust("2 minutes")
         assert.strictEqual(yield* second.sweepSpace(spaceId), 0)
+        assert.strictEqual(inspectCalls, 2)
         const recoverable = yield* sql<{ readonly state: string }>`SELECT state
           FROM effect_local_server_attachment_attempts WHERE attempt_id = ${prepared.attemptId}`
         assert.deepStrictEqual(recoverable, [{ state: "Finalizing" }])
@@ -657,6 +662,89 @@ describe("delegated attachment deletion concurrency", () => {
         const objects = yield* sql<{ readonly state: string }>`SELECT state
           FROM effect_local_server_attachment_objects WHERE space_id = ${spaceId} AND digest = ${uploadDigest}`
         assert.deepStrictEqual(objects, [{ state: "Available" }])
+      },
+      providePlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "retires abandoned Finalizing custody only after provider inspection confirms no object",
+    Effect.fnUntraced(
+      function*() {
+        const { first, provider, sql } = yield* makeHarness()
+        const prepared = yield* first.prepareUpload(identity)
+        assert.strictEqual(prepared._tag, "UploadPart")
+        if (prepared._tag !== "UploadPart") return
+        const providerUploadId = AttachmentObjectStore.ProviderId.make(prepared.attemptId)
+        provider.setInspectHandler(() =>
+          Effect.fail(
+            new AttachmentObjectStore.AttachmentObjectStoreUnavailable({
+              namespace,
+              operation: "inspect.injected"
+            })
+          )
+        )
+        const failed = yield* first.finalizeUpload({
+          ...identity,
+          attemptId: prepared.attemptId
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(failed))
+        if (Result.isFailure(failed)) assert.strictEqual(failed.failure._tag, "AttachmentStorageError")
+        provider.setInspectHandler(() => Effect.succeed(null))
+        yield* TestClock.adjust("2 minutes")
+
+        assert.deepStrictEqual(yield* usageState(sql), { object_count: 1, byte_count: 1 })
+        assert.strictEqual(yield* first.sweepSpace(spaceId), 1)
+        const attempts = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_attachment_attempts WHERE attempt_id = ${prepared.attemptId}`
+        assert.deepStrictEqual(attempts, [{ count: 0 }])
+        const aborts = yield* sql<{ readonly provider_id: string }>`SELECT provider_id
+          FROM effect_local_server_attachment_deletions WHERE operation = 'AbortUpload'`
+        assert.deepStrictEqual(aborts, [{ provider_id: providerUploadId }])
+        assert.deepStrictEqual(yield* usageState(sql), { object_count: 1, byte_count: 1 })
+        assert.strictEqual(yield* first.drainOutbox, 1)
+        assert.deepStrictEqual(provider.aborted.map(({ id }) => id), [providerUploadId])
+        assert.deepStrictEqual(yield* usageState(sql), { object_count: 0, byte_count: 0 })
+      },
+      providePlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "retries abandoned Finalizing inspection when the provider is unavailable",
+    Effect.fnUntraced(
+      function*() {
+        const { first, provider, sql } = yield* makeHarness()
+        const prepared = yield* first.prepareUpload(identity)
+        assert.strictEqual(prepared._tag, "UploadPart")
+        if (prepared._tag !== "UploadPart") return
+        let inspectCalls = 0
+        provider.setInspectHandler(() => {
+          inspectCalls++
+          return Effect.fail(
+            new AttachmentObjectStore.AttachmentObjectStoreUnavailable({
+              namespace,
+              operation: "inspect.injected"
+            })
+          )
+        })
+        const failed = yield* first.finalizeUpload({
+          ...identity,
+          attemptId: prepared.attemptId
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(failed))
+        yield* TestClock.adjust("2 minutes")
+
+        assert.strictEqual(yield* first.sweepSpace(spaceId), 0)
+        assert.strictEqual(inspectCalls, 2)
+        const attempts = yield* sql<{ readonly state: string }>`SELECT state
+          FROM effect_local_server_attachment_attempts WHERE attempt_id = ${prepared.attemptId}`
+        assert.deepStrictEqual(attempts, [{ state: "Finalizing" }])
+        const aborts = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_attachment_deletions WHERE operation = 'AbortUpload'`
+        assert.deepStrictEqual(aborts, [{ count: 0 }])
       },
       providePlatform,
       Effect.scoped
