@@ -1,3 +1,5 @@
+export * as AttachmentDirectHttpClient from "./AttachmentDirectHttpClient.js"
+export * as AttachmentRpcClient from "./AttachmentRpcClient.js"
 export * as Authentication from "./Authentication.js"
 export * as PresenceClient from "./PresenceClient.js"
 export * as PresenceHub from "./PresenceHub.js"

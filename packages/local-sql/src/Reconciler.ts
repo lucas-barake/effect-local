@@ -1,3 +1,4 @@
+import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
@@ -17,6 +18,7 @@ import * as Ref from "effect/Ref"
 import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
+import * as AttachmentClient from "./AttachmentClient.js"
 import * as Configuration from "./internal/configuration.js"
 import * as LocalStore from "./LocalStore.js"
 import * as SyncEngine from "./SyncEngine.js"
@@ -103,6 +105,9 @@ const managedKey = (spaceId: Identity.SpaceId, generation: number) => `${spaceId
 const isTransientFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "AuthenticatorUnavailable" ||
   error._tag === "ServerUnavailable" ||
+  error._tag === "AttachmentUnavailable" ||
+  error._tag === "AttachmentUploadBusy" ||
+  error._tag === "AttachmentOffsetConflict" ||
   error._tag === "OperationTimeout"
 
 export const makeManager = Effect.fnUntraced(function*(options: {
@@ -229,7 +234,17 @@ export const makeManager = Effect.fnUntraced(function*(options: {
           CredentialRejected: (error) => Effect.die(error),
           AuthenticatorUnavailable: (error) => Effect.die(error),
           OperationTimeout: (error) => Effect.die(error),
-          AuthorizationDenied: (error) => Effect.die(error)
+          AuthorizationDenied: (error) => Effect.die(error),
+          InvalidAttachmentReference: (error) => Effect.die(error),
+          AttachmentTooLarge: (error) => Effect.die(error),
+          AttachmentNotFound: (error) => Effect.die(error),
+          AttachmentUnavailable: (error) => Effect.die(error),
+          AttachmentUploadBusy: (error) => Effect.die(error),
+          AttachmentStorageError: (error) => Effect.die(error),
+          AttachmentOffsetConflict: (error) => Effect.die(error),
+          AttachmentLengthMismatch: (error) => Effect.die(error),
+          AttachmentDigestMismatch: (error) => Effect.die(error),
+          InvalidAttachmentRange: (error) => Effect.die(error)
         }),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
@@ -286,7 +301,17 @@ export const makeManager = Effect.fnUntraced(function*(options: {
           CredentialRejected: (error) => Effect.die(error),
           AuthenticatorUnavailable: (error) => Effect.die(error),
           OperationTimeout: (error) => Effect.die(error),
-          AuthorizationDenied: (error) => Effect.die(error)
+          AuthorizationDenied: (error) => Effect.die(error),
+          InvalidAttachmentReference: (error) => Effect.die(error),
+          AttachmentTooLarge: (error) => Effect.die(error),
+          AttachmentNotFound: (error) => Effect.die(error),
+          AttachmentUnavailable: (error) => Effect.die(error),
+          AttachmentUploadBusy: (error) => Effect.die(error),
+          AttachmentStorageError: (error) => Effect.die(error),
+          AttachmentOffsetConflict: (error) => Effect.die(error),
+          AttachmentLengthMismatch: (error) => Effect.die(error),
+          AttachmentDigestMismatch: (error) => Effect.die(error),
+          InvalidAttachmentRange: (error) => Effect.die(error)
         }),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
@@ -477,6 +502,8 @@ export const layerOnePass = (
       }
       const local = yield* LocalStore.Store
       const remote = yield* SyncEngine.SyncEngine
+      const attachments = yield* Effect.serviceOption(AttachmentClient.AttachmentClient)
+      const settleReceipts = local.settleReceipts
       const gate = yield* Semaphore.make(1)
       const status = yield* Ref.make<ReplicaStatus.ReplicaStatus>({ _tag: "Offline", pending: 0 })
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
@@ -647,12 +674,27 @@ export const layerOnePass = (
       }).pipe(Effect.tapErrorTag("AuthorizationDenied", () => local.revokeReplication))
 
       const submitPending = Effect.gen(function*() {
-        yield* local.settleReceipts
+        yield* settleReceipts
         while (true) {
           const pending = yield* local.pendingToSubmit
           let installedExpiredSnapshot = false
           for (const mutation of pending) {
             const receipt = yield* Effect.gen(function*() {
+              const references = yield* Attachment.collect(mutation.envelope.payload)
+              if (references.length > 0) {
+                if (Option.isNone(attachments)) {
+                  return yield* new ReplicaError.InvalidConfiguration({
+                    option: "attachments",
+                    message: "Attachment transfer is not configured"
+                  })
+                }
+                yield* attachments.value.ensureUploaded(
+                  options.spaceId,
+                  mutation.envelope.clientId,
+                  mutation.envelope.membershipIncarnation,
+                  references
+                )
+              }
               yield* local.markSubmitting(mutation.envelope.mutationId)
               const remoteReceipt = yield* remote.submit({
                 envelope: mutation.envelope,
@@ -662,7 +704,7 @@ export const layerOnePass = (
               return remoteReceipt
             }).pipe(Effect.tapError(() => local.markRetrying(mutation.envelope.mutationId)))
             if (receipt._tag === "Expired") {
-              yield* local.settleReceipts
+              yield* settleReceipts
               const unresolved = (yield* local.pendingToSubmit).some(
                 (candidate) => candidate.envelope.mutationId === receipt.mutationId
               )
@@ -673,7 +715,7 @@ export const layerOnePass = (
             }
           }
           if (installedExpiredSnapshot) continue
-          yield* local.settleReceipts
+          yield* settleReceipts
           return
         }
       })
@@ -684,7 +726,7 @@ export const layerOnePass = (
         yield* catchUp
         yield* submitPending
         yield* catchUp
-        yield* local.settleReceipts
+        yield* settleReceipts
         yield* succeeded
       })).pipe(
         Effect.tapError(failed),

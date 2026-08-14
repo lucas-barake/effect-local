@@ -89,9 +89,11 @@ describe("principal assertions", () => {
           readMailboxCapacity: 32,
           watchMailboxCapacity: 32,
           presencePublicationMailboxCapacity: 32,
+          attachmentControlMailboxCapacity: 32,
           maximumConcurrentBootstrapAuthorizations: 16,
           maximumConcurrentBootstrapPagesPerSpace: 4,
-          maximumConcurrentPresencePublicationsPerSpace: 16
+          maximumConcurrentPresencePublicationsPerSpace: 16,
+          maximumConcurrentAttachmentControlsPerSpace: 16
         })
         const layerLiveHandlers = layerHandlers.pipe(
           Layer.provide(layerStore),

@@ -10,6 +10,7 @@ import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import type * as AttachmentServer from "./AttachmentServer.js"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as Codec from "./internal/codec.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
@@ -1455,6 +1456,8 @@ export interface ServerOptions {
   readonly batchSize?: number | undefined
   readonly batchBytes?: number | undefined
   readonly afterBatch?: Effect.Effect<void> | undefined
+  readonly replaceAttachmentReferences?: AttachmentServer.Service["replaceEntityReferences"]
+  readonly activateAttachmentGeneration?: AttachmentServer.Service["activateGeneration"]
 }
 
 export const server = Effect.fn("SchemaEvolution.server")(function*(options: ServerOptions) {
@@ -1961,6 +1964,11 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
           yield* registerLineage(row.model, migrated)
           const key = migrated.key
           const value = migrated.value
+          if (value === undefined) {
+            return yield* new ReplicaError.StorageCorrupt({
+              message: `Migrated entity for ${row.model} has no value`
+            })
+          }
           const keyJson = yield* Codec.stringify(key)
           const valueJson = yield* Codec.stringify(value)
           const entityBytes = yield* Protocol.encodedBytesEffect({
@@ -1973,6 +1981,15 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
               (space_id, generation, model, model_version, entity_key, value_json, entity_bytes)
               VALUES (${options.spaceId}, ${state.generation}, ${row.model}, ${migrated.modelVersion},
                 ${keyJson}, ${valueJson}, ${entityBytes})`
+          yield* (options.replaceAttachmentReferences?.({
+            spaceId: options.spaceId,
+            schemaGeneration: state.generation,
+            model: row.model,
+            modelVersion: migrated.modelVersion,
+            entityKey: keyJson,
+            value,
+            authority: { _tag: "SchemaEvolution" }
+          }) ?? Effect.void)
           targetEntityCount += 1
           targetEntityBytes += entityBytes
         }
@@ -2034,6 +2051,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
             entity_count = ${state.target_entity_count}, entity_bytes = ${state.target_entity_bytes}
             WHERE space_id = ${options.spaceId} AND schema_generation = ${state.generation}
               AND active_schema_generation = ${state.source_generation}`
+        yield* (options.activateAttachmentGeneration?.(options.spaceId, state.generation) ?? Effect.void)
         yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupScopedSnapshotEntries'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
       }))
@@ -2121,6 +2139,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
           Effect.mapError(StorageUnavailable.make)
         )
         if (remaining.count === 0) {
+          yield* sql`DELETE FROM effect_local_server_attachment_references
+            WHERE space_id = ${options.spaceId} AND schema_generation = ${state.source_generation}`
           yield* sql`UPDATE effect_local_server_evolution SET phase = 'Finalize'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
         }

@@ -50,13 +50,13 @@ invariants and failure model.
 
 ## Packages
 
-| Package                              | Purpose                                                           |
-| ------------------------------------ | ----------------------------------------------------------------- |
-| `@lucas-barake/effect-local`         | Models, mutations, queries, field semantics, protocol, and errors |
-| `@lucas-barake/effect-local-sql`     | SQLite state, server log, and Workflow reconciliation             |
-| `@lucas-barake/effect-local-rpc`     | WebSocket RPC, Cluster space routing, and presence                |
-| `@lucas-barake/effect-local-browser` | Browser SQLite ports, Effect Atom graph, and local presence       |
-| `@lucas-barake/effect-local-test`    | Production shaped test layers and deterministic network faults    |
+| Package                              | Purpose                                                                 |
+| ------------------------------------ | ----------------------------------------------------------------------- |
+| `@lucas-barake/effect-local`         | Models, mutations, queries, attachment references, protocol, and errors |
+| `@lucas-barake/effect-local-sql`     | SQLite state, attachment lifecycle, server log, and reconciliation      |
+| `@lucas-barake/effect-local-rpc`     | WebSocket control, direct provider transfer, Cluster routing, presence  |
+| `@lucas-barake/effect-local-browser` | Browser SQLite ports, OPFS attachments, Effect Atom, and presence       |
+| `@lucas-barake/effect-local-test`    | Production shaped test layers and deterministic network faults          |
 
 All packages are ESM. Public modules are available as subpaths such as
 `@lucas-barake/effect-local/Mutation`. Paths under `internal/*` are private.
@@ -286,6 +286,103 @@ origin tagged JSON branches. `settlementCapacity` bounds each space's live feed.
 backpressures settlement delivery and reconciliation, but never the local `mutate` commit. Leaving the space or closing
 the replica scope shuts down its settlement Stream.
 
+## Attachments
+
+Models reference bytes with the branded JSON value
+`{ _tag: "Attachment", digest: "sha256:<hex>", bytes: number }`. Content identity contains only the raw SHA-256 digest
+and exact length. Keep file names, media types, dimensions, duration, and presentation data in normal model fields.
+
+Stage bytes before committing the mutation that references them. Staging is durable and works offline. Reconciliation
+uploads every referenced object before submitting the mutation. A recipient installs the entity immediately, then
+`readAttachment` fetches, verifies, and caches the object only when consumed.
+
+```ts
+import * as Stream from "effect/Stream"
+
+const attachment = yield* space.stageAttachment(Stream.make(photoBytes))
+
+yield* space.mutate(SendMessage, {
+  id: messageId,
+  text: "",
+  photo: attachment,
+  fileName: "sunset.jpg",
+  mediaType: "image/jpeg"
+})
+
+const content = space.readAttachment(attachment)
+yield* Stream.runForEach(content, renderChunk)
+yield* space.releaseAttachment(attachment)
+```
+
+Client SQLite stores ownership, availability, and cleanup metadata. Bytes stay in a separate `AttachmentStorage`.
+Node clients can use `FileSystemAttachmentStorage`. Browser applications use
+`BrowserAttachmentStorage.layerMessagePort` with the application owned `BrowserAttachmentWorker` to store direct OPFS
+files outside SQLite WASM. The Atom graph exposes `graph.attachment(spaceId, reference)` as a lazy `AsyncResult` for
+placeholder, failure, and resolved byte states. The Atom materializes the complete object. Large media should consume
+the ranged `Space.readAttachment` stream instead.
+
+`AttachmentClient.layer` requires hard local byte and object limits plus separate cache byte, object, age, and eviction
+batch limits. Offline staged and pending objects count toward the local limits and are never evicted. Browser storage
+also requires `maximumPendingRequests` on the page and worker sides plus a cleanup timeout. Transferred buffers cannot
+form an unbounded queue, and reserved cleanup capacity lets interruption remove partial OPFS files. Remote range misses
+download one fixed verification chunk directly into a separately charged OPFS file. The client verifies its exact
+length and SHA-256 before exposing the requested slice. Complete chunk coverage is promoted to the whole object only
+after the flat SHA-256 also matches. OPFS is origin scoped and best effort. Applications that need stronger browser
+retention should request persistent storage and handle denial.
+
+Production attachment bytes do not cross the application HTTP server. `AttachmentRpcClient.layerFromSession` sends
+bounded prepare, finalize, and download-control RPCs through the same authenticated protocol session as sync.
+`AttachmentDirectHttpClient.layer` then streams the granted `PUT` or `GET` directly between the device and the object
+provider. Upload and download origins have separate allowlists. Redirects, ambient credentials, unsafe headers,
+userinfo, fragments, private targets, and plain HTTP are rejected. Exact HTTP development origins require an explicit
+`insecureDevelopmentOrigins` entry. Provider CORS must allow the granted methods, headers, and exposed range headers.
+
+The server requires an application supplied `AttachmentObjectStore.Adapter`. The adapter owns S3, R2, GCS, a CDN, or
+another provider. It begins and lists multipart uploads, signs one exact part or verified download chunk, finalizes or
+recovers an immutable upload, returns the verified flat SHA-256 plus fixed-chunk manifest, and idempotently aborts or
+deletes provider objects. Provider multipart checksums are not assumed to equal the reference SHA-256. Keep every
+configured adapter namespace available while durable rows still reference it.
+
+```ts
+import * as AttachmentDirectHttpClient from "@lucas-barake/effect-local-rpc/AttachmentDirectHttpClient"
+import * as AttachmentRpcClient from "@lucas-barake/effect-local-rpc/AttachmentRpcClient"
+import * as AttachmentObjectStore from "@lucas-barake/effect-local-sql/AttachmentObjectStore"
+import * as Layer from "effect/Layer"
+import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient"
+
+const layerObjectStores = AttachmentObjectStore.layer({
+  namespaceForNewObjects: AttachmentObjectStore.Namespace.make("primary"),
+  adapters: [applicationObjectStore]
+})
+
+const layerDirectAttachments = AttachmentDirectHttpClient.layer({
+  uploadOrigins: ["https://uploads.example.com"],
+  downloadOrigins: ["https://media.example.com"],
+  insecureDevelopmentOrigins: []
+}).pipe(Layer.provide(FetchHttpClient.layer))
+
+const layerAttachmentTransfer = AttachmentRpcClient.layerFromSession({
+  rpcTimeout: "30 seconds"
+}).pipe(
+  Layer.provide(layerDirectAttachments),
+  Layer.provide(layerProtocolSession)
+)
+```
+
+Server objects are isolated by space. Upload and read authorization receive the principal, space, client membership,
+and reference. A verified upload records possession for that membership. Knowing a digest or probing a complete object
+does not authorize a new entity reference. A read also requires a current referencing entity accepted by normal entity
+read authorization. Per object and per space limits charge canonical objects, proof uploads, promotions, and objects
+waiting for physical deletion. The last authoritative reference schedules collection after the configured grace and
+grant safety periods. Recipient retractions and history pruning do not define server liveness. `ServerStore` maintenance
+automatically sweeps attachment metadata and drains a bounded, claimed provider deletion outbox. Referenced objects stay
+in authoritative object storage until the final reference disappears.
+
+Attachment bytes never enter mutation envelopes, accepted history, entity JSON, bootstrap pages, or snapshots. Only
+the compact reference and short lived control grants cross the JSON plane. Signed URLs, provider object identities, and
+signing headers never enter models or durable client state. Transfer outages and expired grants are retryable. Invalid
+grants, references, length or digest mismatches, quotas, and authorization denial are terminal.
+
 Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect Workflow. Supply
 `ClusterWorkflowEngine.layer` and the official runner Layer separately. For one SQLite owner this is normally
 `SingleRunner.layer({ runnerStorage: "sql" })`. Configure `retryDelay`, `maximumRetryDelay`, and `maximumAttempts` on
@@ -341,6 +438,9 @@ const scrolledBack = Protocol.ReplicationScope.make({
   })]
 })
 ```
+
+`layerProtocolSession` is the same authenticated session Layer used by sync. Provide `layerObjectStores` to
+`AttachmentServer.layer`, then provide that attachment server to `SpaceEntity.layer`.
 
 Steady pulls are derived from the authoritative log suffix since a per-view delivered watermark: the server touches
 only the entities that changed, the partitions those changes affected, and the client's acknowledged view, instead of
@@ -459,7 +559,9 @@ benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1
 ```ts
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 
-export const graph = BrowserReplica.make(layerReplica)
+export const graph = BrowserReplica.make(layerReplica, {
+  maximumWholeAttachmentBytes: 8 * 1024 * 1024
+})
 
 export const taskAtom = graph.entity(spaceId, Task)("task-1")
 export const tasksAtom = graph.query(spaceId, ListTasks)({ completed: false })
@@ -748,6 +850,8 @@ The complete deployment sequence is:
 - Queues, mutation payloads, presence payloads, pull pages, bootstrap pages, snapshots, receipts, and retained history
   are bounded by explicit configuration.
 - Presence is best effort, bounded, TTL based, and never enters the durable mutation log.
+- Attachment bytes use a separately bounded and authenticated byte plane. Mutation history, entity JSON, bootstrap
+  pages, and snapshots contain only compact content references.
 - Cluster routes each space to one live owner across runners. Entity operations are volatile. A failed submit remains
   in the client's pending SQLite outbox until exact resubmission returns the SQL backed terminal receipt. Pull and watch
   recover from the durable server sequence.

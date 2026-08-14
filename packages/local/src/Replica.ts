@@ -3,6 +3,7 @@ import type * as Effect from "effect/Effect"
 import type * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as Stream from "effect/Stream"
+import type * as Attachment from "./Attachment.js"
 import type * as Identity from "./Identity.js"
 import type * as Model from "./Model.js"
 import type * as Mutation from "./Mutation.js"
@@ -69,6 +70,16 @@ export interface Space {
   readonly activation: Effect.Effect<Activation, ReplicaError.ReplicaError>
   readonly activate: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly deactivate: Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly stageAttachment: <E extends { readonly _tag: string }, R,>(
+    bytes: Stream.Stream<Uint8Array, E, R>
+  ) => Effect.Effect<Attachment.Reference, E | ReplicaError.ReplicaError, R>
+  readonly readAttachment: (
+    reference: Attachment.Reference,
+    range?: Attachment.Range
+  ) => Stream.Stream<Uint8Array, ReplicaError.ReplicaError>
+  readonly releaseAttachment: (
+    reference: Attachment.Reference
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly mutate: <M extends Mutation.Any,>(
     mutation: M,
     payload: Mutation.Payload<M>

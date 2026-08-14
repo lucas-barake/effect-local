@@ -25,6 +25,7 @@ import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as AttachmentServer from "./AttachmentServer.js"
 import * as AcceptedLog from "./internal/acceptedLog.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
@@ -229,6 +230,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
       const sql = yield* SqlClient.SqlClient
       const crypto = yield* Crypto.Crypto
       const runtime = yield* MutationRuntime.MutationRuntime
+      const attachments = yield* Effect.serviceOption(AttachmentServer.AttachmentServer)
       const evolution = options.evolution ?? Evolution.make({ current: options.definition })
       const acceptedSchemaVersions = options.acceptedSchemaVersions ?? 0
       if (!Number.isSafeInteger(acceptedSchemaVersions) || acceptedSchemaVersions < 0) {
@@ -866,6 +868,13 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           evolution,
           spaceId
         }
+        if (Option.isSome(attachments)) {
+          evolutionOptions = {
+            ...evolutionOptions,
+            replaceAttachmentReferences: attachments.value.replaceEntityReferences,
+            activateAttachmentGeneration: attachments.value.activateGeneration
+          }
+        }
         if (options.schemaEvolutionBatchSize !== undefined) {
           evolutionOptions = { ...evolutionOptions, batchSize: options.schemaEvolutionBatchSize }
         }
@@ -1206,13 +1215,21 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               const changes: Array<Protocol.EntityChange> = []
               const mutationName = mutation.name
               const mutationPayload = mutation.payload
-              const transaction = SqlTransaction.server({
+              let transactionOptions: Parameters<typeof SqlTransaction.server>[0] = {
                 sql,
-                definition: options.definition,
                 spaceId: envelope.spaceId,
                 generation: storedSpace.active_schema_generation,
+                clientId: envelope.clientId,
+                membershipIncarnation: envelope.membershipIncarnation,
                 changes
-              })
+              }
+              if (Option.isSome(attachments)) {
+                transactionOptions = {
+                  ...transactionOptions,
+                  replaceAttachmentReferences: attachments.value.replaceEntityReferences
+                }
+              }
+              const transaction = SqlTransaction.server(transactionOptions)
               const executedMutation = Effect.flatMap(
                 runtime.execute(
                   mutationName,
@@ -1743,7 +1760,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
       })
 
-      const maintainSpace = (spaceId: Identity.SpaceId) =>
+      const maintainHistory = (spaceId: Identity.SpaceId) =>
         prepareSnapshot(spaceId).pipe(
           Effect.flatMap(publishAndPrune),
           Effect.tap((pruned) =>
@@ -1757,21 +1774,43 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           Effect.asVoid,
           Effect.withSpan("ServerStore.maintain", { attributes: { "space.id": spaceId } })
         )
-      const maintain = (spaceId: Identity.SpaceId) =>
-        maintainSpace(spaceId).pipe(Effect.ensuring(scheduleMetricDepthRefresh))
+      const maintainSpace = (spaceId: Identity.SpaceId) =>
+        Option.match(attachments, {
+          onNone: () => maintainHistory(spaceId),
+          onSome: (attachmentServer) =>
+            maintainHistory(spaceId).pipe(
+              Effect.andThen(attachmentServer.sweepSpace(spaceId)),
+              Effect.asVoid
+            )
+        })
+      const maintain = (spaceId: Identity.SpaceId) => {
+        let globalMaintenance: Effect.Effect<number | void, ReplicaError.ReplicaError> = Effect.void
+        if (Option.isSome(attachments)) {
+          globalMaintenance = attachments.value.expireGrants.pipe(
+            Effect.andThen(attachments.value.drainOutbox)
+          )
+        }
+        return maintainSpace(spaceId).pipe(
+          Effect.andThen(globalMaintenance),
+          Effect.asVoid,
+          Effect.ensuring(scheduleMetricDepthRefresh)
+        )
+      }
       const maintainAll = Effect.gen(function*() {
+        if (Option.isSome(attachments)) yield* attachments.value.expireGrants
         let after = ""
         while (true) {
           const spaces = yield* findSpaces({ after, limit: options.maintenanceSpaceBatchSize }).pipe(
             Effect.mapError(StorageUnavailable.make)
           )
-          if (spaces.length === 0) return
+          if (spaces.length === 0) break
           yield* Effect.forEach(spaces, ({ space_id }) => maintainSpace(space_id), {
             concurrency: options.maintenanceConcurrency,
             discard: true
           })
           after = spaces.at(-1)!.space_id
         }
+        if (Option.isSome(attachments)) yield* attachments.value.drainOutbox
       }).pipe(Effect.ensuring(scheduleMetricDepthRefresh))
       const projectScopedEntity = Effect.fnUntraced(function*(
         target: Definition.Any,

@@ -93,9 +93,11 @@ const layerCluster = SpaceEntity.layer({
   readMailboxCapacity: 32,
   watchMailboxCapacity: 1_024,
   presencePublicationMailboxCapacity: 32,
+  attachmentControlMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
-  maximumConcurrentPresencePublicationsPerSpace: 16
+  maximumConcurrentPresencePublicationsPerSpace: 16,
+  maximumConcurrentAttachmentControlsPerSpace: 16
 }).pipe(
   Layer.provide(layerStore),
   Layer.provide(layerPresenceHub),

@@ -224,6 +224,20 @@ const layerRetryConfiguration = (options: Options) =>
     })
   )
 
+const isTransientFailure = (error: ReplicaError.ReplicaError): boolean => {
+  switch (error._tag) {
+    case "AuthenticatorUnavailable":
+    case "ServerUnavailable":
+    case "OperationTimeout":
+    case "AttachmentUnavailable":
+    case "AttachmentUploadBusy":
+    case "AttachmentOffsetConflict":
+      return true
+    default:
+      return false
+  }
+}
+
 const handler = (
   options: Options,
   configuration: RetryConfigurationService,
@@ -301,16 +315,7 @@ const handler = (
         yield* Effect.scoped(lease.acquire.pipe(
           Effect.flatMap((runtime) => runtime.reconciliation.failed(result.failure))
         ))
-        if (
-          result.failure._tag === "CredentialRejected" ||
-          result.failure._tag === "ProtocolInvalid" ||
-          result.failure._tag === "StaleSchema" ||
-          result.failure._tag === "SpaceUnavailable" ||
-          result.failure._tag === "StaleReplicationScope" ||
-          result.failure._tag === "UpgradeRequired" ||
-          result.failure._tag === "AuthorizationDenied" ||
-          attempt >= configuration.maximumAttempts
-        ) {
+        if (!isTransientFailure(result.failure) || attempt >= configuration.maximumAttempts) {
           yield* result.failure
           return
         }

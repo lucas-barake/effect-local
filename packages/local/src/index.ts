@@ -1,3 +1,5 @@
+export * as Attachment from "./Attachment.js"
+export * as AttachmentTransfer from "./AttachmentTransfer.js"
 export * as Canonical from "./Canonical.js"
 export * as Definition from "./Definition.js"
 export * as Evolution from "./Evolution.js"

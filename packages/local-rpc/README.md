@@ -7,10 +7,11 @@ publication, and presence watch streams over one WebSocket. `SyncServer.layer` k
 and routes each operation through `SpaceEntity.Client`. `SyncClient.layer` adapts the generated typed client to
 `SyncEngine`.
 
-`SpaceEntity` routes one space through four volatile Cluster entity types. `SpaceAdmissionEntity` serializes Submit and
+`SpaceEntity` routes one space through five volatile Cluster entity types. `SpaceAdmissionEntity` serializes Submit and
 Discard. `SpaceReadEntity` forks Pull and immutable Bootstrap page reads. `SpaceWatchEntity` forks long lived sync and
 presence streams. `SpacePresencePublishEntity` bounds concurrent presence publications. Separate finite mailboxes keep
-paused Bootstrap pages and long lived streams out of mutation admission. `SpaceEntity.layerClient` aggregates the four
+paused Bootstrap pages and long lived streams out of mutation admission. `SpaceAttachmentControlEntity` bounds
+prepare, finalize, and download-grant work. `SpaceEntity.layerClient` aggregates the five
 generated clients for the public facade. `SpaceEntity.layer(options)` composes handlers and that client.
 
 ```ts
@@ -29,9 +30,11 @@ const layerSpace = SpaceEntity.layer({
   readMailboxCapacity: 64,
   watchMailboxCapacity: 2_048,
   presencePublicationMailboxCapacity: 256,
+  attachmentControlMailboxCapacity: 256,
   maximumConcurrentBootstrapAuthorizations: 64,
   maximumConcurrentBootstrapPagesPerSpace: 8,
-  maximumConcurrentPresencePublicationsPerSpace: 64
+  maximumConcurrentPresencePublicationsPerSpace: 64,
+  maximumConcurrentAttachmentControlsPerSpace: 16
 }).pipe(
   Layer.provide(layerStore),
   Layer.provide(layerPresence),
@@ -39,10 +42,15 @@ const layerSpace = SpaceEntity.layer({
 )
 ```
 
-All seven numeric `SpaceEntity` options are required positive safe integers. A full mailbox maps to `ServerUnavailable`.
+All nine numeric `SpaceEntity` options are required positive safe integers. A full mailbox maps to `ServerUnavailable`.
 Bootstrap concurrency is fail fast. `maximumConcurrentBootstrapAuthorizations` bounds assertion verification and
 bootstrap preparation across the Layer. `maximumConcurrentBootstrapPagesPerSpace` bounds published page reads per
 space. Saturation reports typed `CapacityExceeded` with resource `bootstrap authorizations` or `bootstrap pages`.
+
+Attachment control uses the same authenticated `ProtocolSession`. `AttachmentRpcClient.layerFromSession` requests
+grants through RPC, while `AttachmentDirectHttpClient.layer` sends bytes only to separately allowlisted provider upload
+and download origins. The application server never exposes an attachment byte route. The application supplied
+`AttachmentObjectStore` adapter owns provider signing, verified finalization, and deletion.
 
 For one process, provide `SingleRunner.layer` with the selected runner storage. A Node multi runner deployment provides
 `SocketRunner.layer` with `NodeClusterSocket.layerSocketServer` and `NodeClusterSocket.layerClientProtocol`, then supplies

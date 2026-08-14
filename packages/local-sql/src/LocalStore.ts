@@ -1,3 +1,4 @@
+import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Evolution from "@lucas-barake/effect-local/Evolution"
@@ -25,6 +26,7 @@ import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import type * as AttachmentClient from "./AttachmentClient.js"
 import * as IndexStore from "./IndexStore.js"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as ClientMetrics from "./internal/clientMetrics.js"
@@ -57,6 +59,7 @@ export interface Options {
   readonly maximumBootstrapPageBytes: number
   readonly settlementCapacity: number
   readonly migration: Migrations.Options
+  readonly attachments?: AttachmentClient.Service
 }
 
 export interface ReconciliationGenerations {
@@ -2862,6 +2865,13 @@ export const layer = (
             new ReplicaError.StorageCorrupt({ message: "Mutation payload is not JSON", cause })
           )
         )
+        const attachmentReferences = yield* Attachment.collect(payloadJsonValue)
+        if (attachmentReferences.length > 0 && options.attachments === undefined) {
+          return yield* new ReplicaError.InvalidConfiguration({
+            option: "attachments",
+            message: "Attachment storage is not configured"
+          })
+        }
         const identity = {
           spaceId: options.spaceId,
           clientId: options.clientId,
@@ -2924,6 +2934,9 @@ export const layer = (
               ${yield* Codec.stringify(envelope.payload)}, ${digest}, ${envelope.digestVersion},
               ${envelope.sourceSchema.version}, ${envelope.sourceSchema.hash}, ${envelope.mutationVersion},
               ${yield* Codec.stringify(executed.success.result)}, ${yield* Codec.stringify(changes)}, 'Queued', 0)`
+        if (options.attachments !== undefined) {
+          yield* options.attachments.associatePending(options.spaceId, mutationId, attachmentReferences)
+        }
         yield* sql`UPDATE effect_local_client_spaces
             SET next_local_sequence = next_local_sequence + 1,
                 visible_revision = visible_revision + 1,

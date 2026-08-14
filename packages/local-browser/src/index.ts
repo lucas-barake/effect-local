@@ -1,3 +1,5 @@
+export * as BrowserAttachmentStorage from "./BrowserAttachmentStorage.js"
+export * as BrowserAttachmentWorker from "./BrowserAttachmentWorker.js"
 export * as BrowserReplica from "./BrowserReplica.js"
 export * as BrowserSqlite from "./BrowserSqlite.js"
 export * as Presence from "./Presence.js"

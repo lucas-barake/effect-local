@@ -1,9 +1,155 @@
+import * as Attachment from "@lucas-barake/effect-local/Attachment"
+import * as AttachmentTransfer from "@lucas-barake/effect-local/AttachmentTransfer"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Schema from "effect/Schema"
+import * as AttachmentObjectStore from "../AttachmentObjectStore.js"
+import * as AttachmentStorage from "../AttachmentStorage.js"
 
 const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
+
+export const ClientAttachmentRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  digest: Attachment.Digest,
+  bytes: Attachment.ByteLength,
+  object_version: Schema.NullOr(AttachmentTransfer.ObjectVersion),
+  object_key: AttachmentStorage.ObjectKey,
+  remote_available: Schema.Literals([0, 1]),
+  cache_managed: Schema.Literals([0, 1]),
+  active_reads: NonNegativeInt,
+  created_at: NonNegativeInt,
+  last_accessed_at: NonNegativeInt
+})
+
+export const ClientAttachmentOwnerRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  digest: Attachment.Digest,
+  owner_kind: Schema.Literals(["Staged", "Pending", "Quarantine"]),
+  owner_id: Schema.String,
+  created_at: NonNegativeInt
+})
+
+export const ClientAttachmentChunkRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  digest: Attachment.Digest,
+  object_version: AttachmentTransfer.ObjectVersion,
+  chunk_index: NonNegativeInt,
+  chunk_offset: NonNegativeInt,
+  chunk_bytes: PositiveInt,
+  chunk_digest: Attachment.Digest,
+  object_key: AttachmentStorage.ObjectKey,
+  state: Schema.Literals(["Filling", "Verified", "Deleting"]),
+  claim_token: Schema.NullOr(Schema.String),
+  claim_expires_at: Schema.NullOr(NonNegativeInt),
+  promotion_token: Schema.NullOr(Schema.String),
+  active_reads: NonNegativeInt,
+  created_at: NonNegativeInt,
+  last_accessed_at: NonNegativeInt
+})
+export type ClientAttachmentChunkRow = typeof ClientAttachmentChunkRow.Type
+
+export const ClientAttachmentPromotionRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  digest: Attachment.Digest,
+  object_version: AttachmentTransfer.ObjectVersion,
+  bytes: PositiveInt,
+  object_key: AttachmentStorage.ObjectKey,
+  state: Schema.Literals(["Filling", "Deleting"]),
+  claim_token: Schema.NullOr(Schema.String),
+  claim_expires_at: Schema.NullOr(NonNegativeInt),
+  created_at: NonNegativeInt,
+  last_accessed_at: NonNegativeInt
+})
+export type ClientAttachmentPromotionRow = typeof ClientAttachmentPromotionRow.Type
+
+export const ClientAttachmentUsageRow = Schema.Struct({
+  local_object_count: NonNegativeInt,
+  local_byte_count: NonNegativeInt,
+  cache_object_count: NonNegativeInt,
+  cache_byte_count: NonNegativeInt
+})
+
+export const ClientAttachmentDeletionRow = Schema.Struct({
+  object_key: AttachmentStorage.ObjectKey,
+  bytes: Attachment.ByteLength,
+  cache_managed: Schema.Literals([0, 1]),
+  attempt_count: NonNegativeInt,
+  next_attempt_at: NonNegativeInt,
+  created_at: NonNegativeInt
+})
+
+export const ServerAttachmentObjectRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  digest: Attachment.Digest,
+  bytes: Attachment.ByteLength,
+  object_version: AttachmentTransfer.ObjectVersion,
+  state: Schema.Literals(["Available", "Missing"]),
+  provider_namespace: AttachmentObjectStore.Namespace,
+  provider_object_id: AttachmentObjectStore.ProviderId,
+  provider_object_version: AttachmentObjectStore.ProviderVersion,
+  chunk_bytes: PositiveInt,
+  chunk_count: NonNegativeInt,
+  garbage_collect_after: Schema.NullOr(NonNegativeInt),
+  created_at: NonNegativeInt,
+  last_accessed_at: NonNegativeInt
+})
+
+export const ServerAttachmentAttemptRow = Schema.Struct({
+  attempt_id: Schema.NonEmptyString,
+  space_id: Identity.SpaceId,
+  digest: Attachment.Digest,
+  bytes: Attachment.ByteLength,
+  client_id: Identity.ClientId,
+  membership_incarnation: Identity.MembershipIncarnation,
+  provider_namespace: AttachmentObjectStore.Namespace,
+  physical_key: AttachmentObjectStore.PhysicalKey,
+  provider_upload_id: Schema.NullOr(AttachmentObjectStore.ProviderId),
+  part_size: Schema.NullOr(PositiveInt),
+  state: Schema.Literals(["Reserved", "Uploading", "Finalizing"]),
+  finalization_token: Schema.NullOr(Schema.String),
+  finalization_expires_at: Schema.NullOr(NonNegativeInt),
+  created_at: NonNegativeInt,
+  last_accessed_at: NonNegativeInt
+})
+
+export const ServerAttachmentChunkRow = Schema.Struct({
+  chunk_index: NonNegativeInt,
+  chunk_offset: Attachment.ByteLength,
+  chunk_bytes: PositiveInt,
+  chunk_digest: Attachment.Digest
+})
+
+export const ServerAttachmentUsageRow = Schema.Struct({
+  object_count: NonNegativeInt,
+  byte_count: NonNegativeInt
+})
+
+export const ServerAttachmentReferenceRow = Schema.Struct({
+  space_id: Identity.SpaceId,
+  schema_generation: NonNegativeInt,
+  digest: Attachment.Digest,
+  model: Schema.String,
+  model_version: Identity.SchemaVersion,
+  entity_key: Schema.String
+})
+
+export const ServerAttachmentDeletionRow = Schema.Struct({
+  outbox_id: Schema.NonEmptyString,
+  space_id: Identity.SpaceId,
+  digest: Attachment.Digest,
+  bytes: Attachment.ByteLength,
+  operation: Schema.Literals(["AbortUpload", "DeleteObject"]),
+  provider_namespace: AttachmentObjectStore.Namespace,
+  provider_id: AttachmentObjectStore.ProviderId,
+  provider_version: Schema.NullOr(AttachmentObjectStore.ProviderVersion),
+  charge_usage: Schema.Literals([0, 1]),
+  attempt_count: NonNegativeInt,
+  next_attempt_at: NonNegativeInt,
+  claim_token: Schema.NullOr(Schema.String),
+  claimed_until: Schema.NullOr(NonNegativeInt),
+  created_at: NonNegativeInt
+})
 
 export const ClientMetaRow = Schema.Struct({
   space_id: Identity.SpaceId,

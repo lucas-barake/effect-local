@@ -1,5 +1,4 @@
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
-import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
@@ -10,6 +9,7 @@ import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import type * as AttachmentServer from "../AttachmentServer.js"
 import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
 import * as StorageUnavailable from "./storageUnavailable.js"
@@ -144,10 +144,12 @@ export const local = (options: {
 
 export const server = (options: {
   readonly sql: SqlClient.SqlClient
-  readonly definition: Definition.Any
   readonly spaceId: Identity.SpaceId
   readonly generation: number
+  readonly clientId: Identity.ClientId
+  readonly membershipIncarnation: Identity.MembershipIncarnation
   readonly changes: Array<Protocol.EntityChange>
+  readonly replaceAttachmentReferences?: AttachmentServer.Service["replaceEntityReferences"]
 }): Transaction.Transaction => {
   const find = SqlSchema.findOneOption({
     Request: Schema.Struct({ spaceId: Schema.String, model: Schema.String, key: Schema.String }),
@@ -184,6 +186,19 @@ export const server = (options: {
         ON CONFLICT (space_id, generation, model, entity_key) DO UPDATE
           SET model_version = excluded.model_version, value_json = excluded.value_json,
             entity_bytes = excluded.entity_bytes`
+      yield* (options.replaceAttachmentReferences?.({
+        spaceId: options.spaceId,
+        schemaGeneration: options.generation,
+        model: model.name,
+        modelVersion: model.version,
+        entityKey: encoded.keyJson,
+        value: encoded.encodedValue,
+        authority: {
+          _tag: "Mutation",
+          clientId: options.clientId,
+          membershipIncarnation: options.membershipIncarnation
+        }
+      }) ?? Effect.void)
       options.changes.push({
         _tag: "Upsert",
         entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
@@ -195,6 +210,18 @@ export const server = (options: {
       yield* options.sql`DELETE FROM effect_local_server_entities_data
         WHERE space_id = ${options.spaceId} AND generation = ${options.generation}
           AND model = ${model.name} AND entity_key = ${encoded.keyJson}`
+      yield* (options.replaceAttachmentReferences?.({
+        spaceId: options.spaceId,
+        schemaGeneration: options.generation,
+        model: model.name,
+        modelVersion: model.version,
+        entityKey: encoded.keyJson,
+        authority: {
+          _tag: "Mutation",
+          clientId: options.clientId,
+          membershipIncarnation: options.membershipIncarnation
+        }
+      }) ?? Effect.void)
       options.changes.push({
         _tag: "Delete",
         entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }

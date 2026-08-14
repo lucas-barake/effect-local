@@ -28,6 +28,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as AttachmentClient from "./AttachmentClient.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
@@ -174,6 +175,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const sql = yield* SqlClient.SqlClient
       const reactivity = yield* Reactivity.Reactivity
       const remote = yield* SyncEngine.SyncEngine
+      const attachments = yield* Effect.serviceOption(AttachmentClient.AttachmentClient)
       const parentScope = yield* Effect.scope
       const rootContext = yield* Effect.context<BaseRequirements<D> | QueryReactivity.QueryReactivity | R>()
       const entries = new Map<Identity.SpaceId, RememberedEntry>()
@@ -258,6 +260,9 @@ const makeLayer = <D extends Definition.Any, R,>(
         clientId: options.clientId,
         migration: options.migration
       })
+      if (Option.isSome(attachments)) {
+        yield* attachments.value.maintenance.pipe(Effect.forkScoped({ startImmediately: true }))
+      }
 
       const normalizedDefaultScope = yield* Protocol.validateReplicationScope(
         options.definition,
@@ -408,11 +413,15 @@ const makeLayer = <D extends Definition.Any, R,>(
             ).pipe(Scope.provide(childScope))
           }
           const layerMutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
-          const layerLocalStore = LocalStore.layer({
+          let localStoreOptions: LocalStore.Options = {
             ...options,
             scope: entry.replicationScope,
             spaceId
-          }).pipe(Layer.provide(layerMutationRuntime))
+          }
+          if (Option.isSome(attachments)) {
+            localStoreOptions = { ...localStoreOptions, attachments: attachments.value }
+          }
+          const layerLocalStore = LocalStore.layer(localStoreOptions).pipe(Layer.provide(layerMutationRuntime))
           const layerQueryExecutor = QueryExecutor.layer(options.definition, spaceId)
           let local: LocalStore.Service
           let queries: QueryExecutor.Service
@@ -680,6 +689,15 @@ const makeLayer = <D extends Definition.Any, R,>(
           return true
         }))
 
+      const evictMembership = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
+        yield* Effect.asVoid(
+          sql.withTransaction(sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`)
+        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        if (Option.isNone(attachments)) return
+        let deleted = 128
+        while (deleted === 128) deleted = yield* attachments.value.drainDeletions(128)
+      })
+
       const ensureForegroundCapacity = (entry: RememberedEntry): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.suspend(() => {
           if (foregroundResidents.size <= options.foregroundActiveSpaces) return Effect.void
@@ -780,10 +798,10 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.leases = Math.max(0, entry.leases - 1)
         }).pipe(Effect.andThen(signalCapacity))
 
-      const withActive = <A, E extends { readonly _tag: string },>(
+      const withActive = <A, E extends { readonly _tag: string }, R2,>(
         entry: RememberedEntry,
-        use: (runtime: ActiveRuntime) => Effect.Effect<A, E>
-      ): Effect.Effect<A, E | ReplicaError.ReplicaError> =>
+        use: (runtime: ActiveRuntime) => Effect.Effect<A, E, R2>
+      ): Effect.Effect<A, E | ReplicaError.ReplicaError, R2> =>
         Effect.acquireUseRelease(
           acquire(entry, true),
           (runtime) => {
@@ -854,6 +872,52 @@ const makeLayer = <D extends Definition.Any, R,>(
           }),
           activate: activate(entry, true).pipe(Effect.asVoid),
           deactivate: deactivate(entry, true).pipe(Effect.asVoid),
+          stageAttachment: (bytes) => {
+            if (Option.isNone(attachments)) {
+              return Effect.fail(
+                new ReplicaError.InvalidConfiguration({
+                  option: "attachments",
+                  message: "Attachment storage is not configured"
+                })
+              )
+            }
+            return withActive(entry, () => attachments.value.stage(entry.spaceId, bytes))
+          },
+          readAttachment: (reference, range) => {
+            if (Option.isNone(attachments)) {
+              return Stream.fail(
+                new ReplicaError.InvalidConfiguration({
+                  option: "attachments",
+                  message: "Attachment storage is not configured"
+                })
+              )
+            }
+            return Stream.scoped(
+              Stream.fromEffect(runtimeLease).pipe(
+                Stream.tap((runtime) => checkRuntime(entry, runtime)),
+                Stream.flatMap((runtime) =>
+                  attachments.value.read(
+                    entry.spaceId,
+                    options.clientId,
+                    runtime.local.membershipIncarnation,
+                    reference,
+                    range
+                  )
+                )
+              )
+            )
+          },
+          releaseAttachment: (reference) => {
+            if (Option.isNone(attachments)) {
+              return Effect.fail(
+                new ReplicaError.InvalidConfiguration({
+                  option: "attachments",
+                  message: "Attachment storage is not configured"
+                })
+              )
+            }
+            return withActive(entry, () => attachments.value.release(entry.spaceId, reference))
+          },
           mutate: (mutation, payload) =>
             withActive(entry, (runtime) =>
               runtime.local.mutate(mutation, payload).pipe(
@@ -1142,25 +1206,14 @@ const makeLayer = <D extends Definition.Any, R,>(
             return yield* restore(Deferred.await(current.leaveCompletion))
           }
           if (current === undefined) {
-            return yield* restore(
-              sql.withTransaction(
-                sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
-              ).pipe(
-                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
-                Effect.asVoid
-              )
-            )
+            return yield* restore(evictMembership(spaceId))
           }
           const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           current.leaving = true
           current.leaveCompletion = completion
           const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
             Effect.andThen(deactivate(current, true)),
-            Effect.andThen(
-              sql.withTransaction(
-                sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
-              ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-            ),
+            Effect.andThen(evictMembership(spaceId)),
             Effect.tap(() =>
               removeContribution(current).pipe(
                 Effect.andThen(Effect.sync(() => entries.delete(spaceId)))
