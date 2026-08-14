@@ -102,9 +102,11 @@ const handlerOptions = {
   readMailboxCapacity: 32,
   watchMailboxCapacity: 32,
   presencePublicationMailboxCapacity: 32,
+  attachmentControlMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 4,
   maximumConcurrentBootstrapPagesPerSpace: 1,
-  maximumConcurrentPresencePublicationsPerSpace: 4
+  maximumConcurrentPresencePublicationsPerSpace: 4,
+  maximumConcurrentAttachmentControlsPerSpace: 4
 } satisfies SpaceEntity.HandlerOptions
 
 const envelope = (spaceId: Identity.SpaceId) => {

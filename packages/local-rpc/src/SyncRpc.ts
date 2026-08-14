@@ -1,3 +1,6 @@
+import * as Attachment from "@lucas-barake/effect-local/Attachment"
+import * as AttachmentTransfer from "@lucas-barake/effect-local/AttachmentTransfer"
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
@@ -172,6 +175,50 @@ export class WatchPresence extends Rpc.make("WatchPresence", {
   stream: true
 }) {}
 
+export const AttachmentAuthorizationRequest = Schema.Struct({
+  spaceId: Identity.SpaceId,
+  clientId: Identity.ClientId,
+  membershipIncarnation: Identity.MembershipIncarnation,
+  reference: Attachment.Reference
+})
+export type AttachmentAuthorizationRequest = typeof AttachmentAuthorizationRequest.Type
+
+export const VersionedAttachmentAuthorizationRequest = Schema.Struct({
+  ...AttachmentAuthorizationRequest.fields,
+  protocolVersion: Protocol.ProtocolVersion
+})
+
+export const VersionedFinalizeAttachmentUploadRequest = Schema.Struct({
+  ...VersionedAttachmentAuthorizationRequest.fields,
+  attemptId: AttachmentTransfer.AttemptId
+})
+
+export const VersionedPrepareAttachmentDownloadRequest = Schema.Struct({
+  ...VersionedAttachmentAuthorizationRequest.fields,
+  range: Schema.optionalKey(Attachment.Range)
+})
+
+export class PrepareAttachmentUpload extends Rpc.make("PrepareAttachmentUpload", {
+  payload: VersionedAttachmentAuthorizationRequest.fields,
+  success: AttachmentTransfer.PrepareUploadResult,
+  error: ReplicaError.ReplicaError,
+  defect: RemoteDefect
+}) {}
+
+export class FinalizeAttachmentUpload extends Rpc.make("FinalizeAttachmentUpload", {
+  payload: VersionedFinalizeAttachmentUploadRequest.fields,
+  success: AttachmentTransfer.UploadComplete,
+  error: ReplicaError.ReplicaError,
+  defect: RemoteDefect
+}) {}
+
+export class PrepareAttachmentDownload extends Rpc.make("PrepareAttachmentDownload", {
+  payload: VersionedPrepareAttachmentDownloadRequest.fields,
+  success: AttachmentTransfer.DownloadGrant,
+  error: ReplicaError.ReplicaError,
+  defect: RemoteDefect
+}) {}
+
 export const Rpcs = RpcGroup.make(
   Negotiate,
   Submit,
@@ -180,7 +227,10 @@ export const Rpcs = RpcGroup.make(
   Bootstrap,
   Watch,
   PublishPresence,
-  WatchPresence
+  WatchPresence,
+  PrepareAttachmentUpload,
+  FinalizeAttachmentUpload,
+  PrepareAttachmentDownload
 ).middleware(
   Authentication.Authentication
 )

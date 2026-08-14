@@ -1,4 +1,7 @@
+import * as AttachmentServer from "@lucas-barake/effect-local-sql/AttachmentServer"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
+import * as Attachment from "@lucas-barake/effect-local/Attachment"
+import * as AttachmentTransfer from "@lucas-barake/effect-local/AttachmentTransfer"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -81,6 +84,42 @@ export class WatchPresence extends Rpc.make("WatchPresence", {
   stream: true
 }).annotateMerge(volatileAnnotations) {}
 
+const AttachmentAuthorizationRequest = Schema.Struct({
+  spaceId: Identity.SpaceId,
+  clientId: Identity.ClientId,
+  membershipIncarnation: Identity.MembershipIncarnation,
+  reference: Attachment.Reference
+})
+
+const PrepareAttachmentDownloadRequest = Schema.Struct({
+  ...AttachmentAuthorizationRequest.fields,
+  range: Schema.optionalKey(Attachment.Range)
+})
+
+export class PrepareAttachmentUpload extends Rpc.make("PrepareAttachmentUpload", {
+  payload: { request: AttachmentAuthorizationRequest, assertion: PrincipalAssertion.PrincipalAssertion },
+  success: AttachmentTransfer.PrepareUploadResult,
+  error: ReplicaError.ReplicaError
+}).annotateMerge(volatileAnnotations) {}
+
+export class FinalizeAttachmentUpload extends Rpc.make("FinalizeAttachmentUpload", {
+  payload: {
+    request: Schema.Struct({
+      ...AttachmentAuthorizationRequest.fields,
+      attemptId: AttachmentTransfer.AttemptId
+    }),
+    assertion: PrincipalAssertion.PrincipalAssertion
+  },
+  success: AttachmentTransfer.UploadComplete,
+  error: ReplicaError.ReplicaError
+}).annotateMerge(volatileAnnotations) {}
+
+export class PrepareAttachmentDownload extends Rpc.make("PrepareAttachmentDownload", {
+  payload: { request: PrepareAttachmentDownloadRequest, assertion: PrincipalAssertion.PrincipalAssertion },
+  success: AttachmentTransfer.DownloadGrant,
+  error: ReplicaError.ReplicaError
+}).annotateMerge(volatileAnnotations) {}
+
 export const SpaceAdmissionEntity = Entity.make("EffectLocal/SpaceAdmission", [
   Submit,
   Discard
@@ -98,6 +137,12 @@ export const SpaceWatchEntity = Entity.make("EffectLocal/SpaceWatch", [
 
 export const SpacePresencePublishEntity = Entity.make("EffectLocal/SpacePresencePublish", [
   PublishPresence
+])
+
+export const SpaceAttachmentControlEntity = Entity.make("EffectLocal/SpaceAttachmentControl", [
+  PrepareAttachmentUpload,
+  FinalizeAttachmentUpload,
+  PrepareAttachmentDownload
 ])
 
 export interface ClientService {
@@ -135,6 +180,21 @@ export interface ClientService {
     spaceId: Identity.SpaceId,
     assertion: PrincipalAssertion.PrincipalAssertion
   ) => Stream.Stream<Protocol.PresenceUpdate, ReplicaError.ReplicaError>
+  readonly prepareAttachmentUpload: (
+    spaceId: Identity.SpaceId,
+    request: typeof AttachmentAuthorizationRequest.Type,
+    assertion: PrincipalAssertion.PrincipalAssertion
+  ) => Effect.Effect<AttachmentTransfer.PrepareUploadResult, ReplicaError.ReplicaError>
+  readonly finalizeAttachmentUpload: (
+    spaceId: Identity.SpaceId,
+    request: typeof AttachmentAuthorizationRequest.Type & { readonly attemptId: AttachmentTransfer.AttemptId },
+    assertion: PrincipalAssertion.PrincipalAssertion
+  ) => Effect.Effect<AttachmentTransfer.UploadComplete, ReplicaError.ReplicaError>
+  readonly prepareAttachmentDownload: (
+    spaceId: Identity.SpaceId,
+    request: typeof PrepareAttachmentDownloadRequest.Type,
+    assertion: PrincipalAssertion.PrincipalAssertion
+  ) => Effect.Effect<AttachmentTransfer.DownloadGrant, ReplicaError.ReplicaError>
 }
 
 export class Client extends Context.Service<Client, ClientService>()(
@@ -145,7 +205,8 @@ const mapClient = (
   makeAdmissionClient: Effect.Success<typeof SpaceAdmissionEntity.client>,
   makeReadClient: Effect.Success<typeof SpaceReadEntity.client>,
   makeWatchClient: Effect.Success<typeof SpaceWatchEntity.client>,
-  makePresencePublishClient: Effect.Success<typeof SpacePresencePublishEntity.client>
+  makePresencePublishClient: Effect.Success<typeof SpacePresencePublishEntity.client>,
+  makeAttachmentControlClient: Effect.Success<typeof SpaceAttachmentControlEntity.client>
 ): ClientService => ({
   submit: (spaceId, request, assertion) =>
     makeAdmissionClient(spaceId).Submit({ request, assertion }).pipe(
@@ -202,6 +263,30 @@ const mapClient = (
         AlreadyProcessingMessage: () => Stream.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Stream.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
+    ),
+  prepareAttachmentUpload: (spaceId, request, assertion) =>
+    makeAttachmentControlClient(spaceId).PrepareAttachmentUpload({ request, assertion }).pipe(
+      Effect.catchTags({
+        MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
+      })
+    ),
+  finalizeAttachmentUpload: (spaceId, request, assertion) =>
+    makeAttachmentControlClient(spaceId).FinalizeAttachmentUpload({ request, assertion }).pipe(
+      Effect.catchTags({
+        MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
+      })
+    ),
+  prepareAttachmentDownload: (spaceId, request, assertion) =>
+    makeAttachmentControlClient(spaceId).PrepareAttachmentDownload({ request, assertion }).pipe(
+      Effect.catchTags({
+        MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
+      })
     )
 })
 
@@ -210,9 +295,11 @@ export interface HandlerOptions {
   readonly readMailboxCapacity: number
   readonly watchMailboxCapacity: number
   readonly presencePublicationMailboxCapacity: number
+  readonly attachmentControlMailboxCapacity: number
   readonly maximumConcurrentBootstrapAuthorizations: number
   readonly maximumConcurrentBootstrapPagesPerSpace: number
   readonly maximumConcurrentPresencePublicationsPerSpace: number
+  readonly maximumConcurrentAttachmentControlsPerSpace: number
   readonly maxIdleTime?: Duration.Input
   readonly disableFatalDefects?: boolean
   readonly defectRetryPolicy?: Schedule.Schedule<any>
@@ -257,6 +344,15 @@ export const layerHandlers = (options: HandlerOptions) =>
         })
       }
       if (
+        !Number.isSafeInteger(options.attachmentControlMailboxCapacity) ||
+        options.attachmentControlMailboxCapacity <= 0
+      ) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "attachmentControlMailboxCapacity",
+          message: "attachmentControlMailboxCapacity must be a positive safe integer"
+        })
+      }
+      if (
         !Number.isSafeInteger(options.maximumConcurrentBootstrapAuthorizations) ||
         options.maximumConcurrentBootstrapAuthorizations <= 0
       ) {
@@ -281,6 +377,15 @@ export const layerHandlers = (options: HandlerOptions) =>
         return yield* new ReplicaError.InvalidConfiguration({
           option: "maximumConcurrentPresencePublicationsPerSpace",
           message: "maximumConcurrentPresencePublicationsPerSpace must be a positive safe integer"
+        })
+      }
+      if (
+        !Number.isSafeInteger(options.maximumConcurrentAttachmentControlsPerSpace) ||
+        options.maximumConcurrentAttachmentControlsPerSpace <= 0
+      ) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "maximumConcurrentAttachmentControlsPerSpace",
+          message: "maximumConcurrentAttachmentControlsPerSpace must be a positive safe integer"
         })
       }
 
@@ -447,11 +552,101 @@ export const layerHandlers = (options: HandlerOptions) =>
         }
       )
 
+      const layerAttachmentControlHandlers = SpaceAttachmentControlEntity.toLayer(
+        Effect.gen(function*() {
+          const address = yield* Entity.CurrentAddress
+          const attachments = yield* Effect.serviceOption(AttachmentServer.AttachmentServer)
+          const verifier = yield* PrincipalAssertion.Verifier
+          let spaceId: Identity.SpaceId | undefined
+          if (Schema.is(Identity.SpaceId)(address.entityId)) spaceId = address.entityId
+          const service = Option.getOrUndefined(attachments)
+          const authorize = <B,>(
+            request: typeof AttachmentAuthorizationRequest.Type,
+            assertion: PrincipalAssertion.PrincipalAssertion,
+            execute: (
+              service: AttachmentServer.Service,
+              principal: typeof Schema.Json.Type
+            ) => Effect.Effect<B, ReplicaError.ReplicaError>
+          ) => {
+            if (spaceId === undefined || request.spaceId !== spaceId) {
+              return Effect.fail(
+                new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
+              )
+            }
+            if (service === undefined) return Effect.fail(new ReplicaError.ServerUnavailable())
+            return verifier.verify(assertion).pipe(Effect.flatMap((principal) => execute(service, principal)))
+          }
+
+          return SpaceAttachmentControlEntity.of({
+            PrepareAttachmentUpload: ({ payload }) =>
+              authorize(
+                payload.request,
+                payload.assertion,
+                (attachmentService, principal) =>
+                  attachmentService.prepareUpload({ ...payload.request, principal }).pipe(
+                    Effect.flatMap((result) =>
+                      AttachmentTransfer.encodeControl(AttachmentTransfer.PrepareUploadResult, result).pipe(
+                        Effect.mapError(() =>
+                          new ReplicaError.ProtocolInvalid({
+                            message: "The attachment control response is too large"
+                          })
+                        ),
+                        Effect.as(result)
+                      )
+                    )
+                  )
+              ),
+            FinalizeAttachmentUpload: ({ payload }) =>
+              authorize(
+                payload.request,
+                payload.assertion,
+                (attachmentService, principal) =>
+                  attachmentService.finalizeUpload({ ...payload.request, principal }).pipe(
+                    Effect.flatMap((result) =>
+                      AttachmentTransfer.encodeControl(AttachmentTransfer.UploadComplete, result).pipe(
+                        Effect.mapError(() =>
+                          new ReplicaError.ProtocolInvalid({
+                            message: "The attachment control response is too large"
+                          })
+                        ),
+                        Effect.as(result)
+                      )
+                    )
+                  )
+              ),
+            PrepareAttachmentDownload: ({ payload }) =>
+              authorize(
+                payload.request,
+                payload.assertion,
+                (attachmentService, principal) =>
+                  attachmentService.prepareDownload({ ...payload.request, principal }).pipe(
+                    Effect.flatMap((result) =>
+                      AttachmentTransfer.encodeControl(AttachmentTransfer.DownloadGrant, result).pipe(
+                        Effect.mapError(() =>
+                          new ReplicaError.ProtocolInvalid({
+                            message: "The attachment control response is too large"
+                          })
+                        ),
+                        Effect.as(result)
+                      )
+                    )
+                  )
+              )
+          })
+        }),
+        {
+          ...common,
+          concurrency: options.maximumConcurrentAttachmentControlsPerSpace,
+          mailboxCapacity: options.attachmentControlMailboxCapacity
+        }
+      )
+
       return Layer.mergeAll(
         layerAdmissionHandlers,
         layerReadHandlers,
         layerWatchHandlers,
-        layerPresencePublicationHandlers
+        layerPresencePublicationHandlers,
+        layerAttachmentControlHandlers
       )
     })
   )
@@ -463,7 +658,8 @@ export const layerClient: Layer.Layer<Client, never, Sharding.Sharding> = Layer.
     const read = yield* SpaceReadEntity.client
     const watch = yield* SpaceWatchEntity.client
     const presencePublication = yield* SpacePresencePublishEntity.client
-    return mapClient(admission, read, watch, presencePublication)
+    const attachmentControl = yield* SpaceAttachmentControlEntity.client
+    return mapClient(admission, read, watch, presencePublication, attachmentControl)
   })
 )
 

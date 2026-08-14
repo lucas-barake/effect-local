@@ -1,3 +1,4 @@
+import * as AttachmentTransfer from "@lucas-barake/effect-local/AttachmentTransfer"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
@@ -85,7 +86,49 @@ const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
             Effect.map((assertion) => client.watchPresence(spaceId, assertion))
           ))
         )
+      ),
+    PrepareAttachmentUpload: (request) => {
+      const { protocolVersion, ...authorization } = request
+      return requireVersion(protocolVersion).pipe(
+        Effect.andThen(
+          AttachmentTransfer.encodeControl(SyncRpc.VersionedAttachmentAuthorizationRequest, request).pipe(
+            Effect.mapError(() =>
+              new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+            )
+          )
+        ),
+        Effect.andThen(issueAssertion),
+        Effect.flatMap((assertion) => client.prepareAttachmentUpload(request.spaceId, authorization, assertion))
       )
+    },
+    FinalizeAttachmentUpload: (request) => {
+      const { protocolVersion, ...authorization } = request
+      return requireVersion(protocolVersion).pipe(
+        Effect.andThen(
+          AttachmentTransfer.encodeControl(SyncRpc.VersionedFinalizeAttachmentUploadRequest, request).pipe(
+            Effect.mapError(() =>
+              new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+            )
+          )
+        ),
+        Effect.andThen(issueAssertion),
+        Effect.flatMap((assertion) => client.finalizeAttachmentUpload(request.spaceId, authorization, assertion))
+      )
+    },
+    PrepareAttachmentDownload: (request) => {
+      const { protocolVersion, ...authorization } = request
+      return requireVersion(protocolVersion).pipe(
+        Effect.andThen(
+          AttachmentTransfer.encodeControl(SyncRpc.VersionedPrepareAttachmentDownloadRequest, request).pipe(
+            Effect.mapError(() =>
+              new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+            )
+          )
+        ),
+        Effect.andThen(issueAssertion),
+        Effect.flatMap((assertion) => client.prepareAttachmentDownload(request.spaceId, authorization, assertion))
+      )
+    }
   })
 })
 
