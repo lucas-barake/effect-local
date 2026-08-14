@@ -85,7 +85,9 @@ const replicaOptions = (clientId: Identity.ClientId): SqlReplica.Options<typeof 
   definition,
   clientId,
   initialSpaces: [spaceId],
-  scope: Protocol.ReplicationScope.make({ models: [Message.name] }),
+  defaultScope: Protocol.ReplicationScope.make({ models: [Message.name] }),
+  maximumActiveSpaces: 4,
+  foregroundActiveSpaces: 2,
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,
@@ -258,6 +260,7 @@ describe("attachment recipients", () => {
         }).pipe(Layer.build)
         const senderReplica = Context.get(senderContext, Replica.Replica)
         const senderSpace = yield* senderReplica.space(spaceId)
+        yield* senderSpace.activate
         yield* Deferred.await(senderReachedRemote)
 
         const reference = yield* senderSpace.stageAttachment(Stream.make(bytes))
@@ -303,6 +306,7 @@ describe("attachment recipients", () => {
         }).pipe(Layer.build)
         const recipientReplica = Context.get(recipientContext, Replica.Replica)
         const recipientSpace = yield* recipientReplica.space(spaceId)
+        yield* recipientSpace.activate
         const recipientSql = Context.get(recipientContext, SqlClient.SqlClient)
         const recipientStorage = Context.get(recipientContext, AttachmentStorage.AttachmentStorage)
         const recipientAttachments = Context.get(recipientContext, AttachmentClient.AttachmentClient)

@@ -66,7 +66,6 @@ export const make = <E,>(
   const runtime = factory(layer)
   const idleTTL = Duration.toMillis(options?.idleTTL ?? Duration.seconds(30))
 
-  const spaceKey = (spaceId: Identity.SpaceId) => `effect-local:space:${spaceId}`
   const attachmentFamily = Atom.family((key: AttachmentKey) =>
     runtime.atom(
       Replica.Replica.use((replica) =>
