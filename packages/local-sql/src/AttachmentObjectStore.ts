@@ -47,45 +47,35 @@ export const ObjectIdentity = Schema.Struct({
 })
 export type ObjectIdentity = typeof ObjectIdentity.Type
 
-const PositiveBytes = Schema.Int.check(
-  Schema.isGreaterThan(0),
-  Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)
-)
-const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
-const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
-const PartNumber = PositiveInt.check(Schema.isLessThanOrEqualTo(10_000))
-const NullablePartNumber = Schema.NullOr(PartNumber)
-const NullableChunkIndex = Schema.NullOr(NonNegativeInt)
-
 export const BegunUpload = Schema.Struct({
   upload: UploadIdentity,
-  partSize: PositiveBytes
+  partSize: AttachmentTransfer.UploadPart.fields.bytes
 })
 export type BegunUpload = typeof BegunUpload.Type
 
 export const UploadedPart = Schema.Struct({
-  partNumber: PartNumber,
-  bytes: PositiveBytes
+  partNumber: AttachmentTransfer.UploadPart.fields.partNumber,
+  bytes: AttachmentTransfer.UploadPart.fields.bytes
 })
 export type UploadedPart = typeof UploadedPart.Type
 
 export const UploadedPartPage = Schema.Struct({
   parts: Schema.Array(UploadedPart).check(Schema.isMaxLength(maximumUploadedPartPageSize)),
-  nextPartNumber: NullablePartNumber
+  nextPartNumber: Schema.NullOr(AttachmentTransfer.UploadPart.fields.partNumber)
 })
 export type UploadedPartPage = typeof UploadedPartPage.Type
 
 export const DirectUploadGrant = Schema.Struct({
-  expiresAt: NonNegativeInt,
-  request: AttachmentTransfer.DirectUploadRequest
+  expiresAt: AttachmentTransfer.UploadPart.fields.expiresAt,
+  request: AttachmentTransfer.UploadPart.fields.request
 })
 export type DirectUploadGrant = typeof DirectUploadGrant.Type
 
 export const VerifiedObject = Schema.Struct({
   object: ObjectIdentity,
   reference: Attachment.Reference,
-  chunkBytes: PositiveBytes,
-  chunkCount: NonNegativeInt
+  chunkBytes: AttachmentTransfer.VerifiedChunk.fields.bytes,
+  chunkCount: Schema.Natural
 })
 export type VerifiedObject = typeof VerifiedObject.Type
 
@@ -93,13 +83,13 @@ export const VerifiedChunkPage = Schema.Struct({
   chunks: Schema.Array(AttachmentTransfer.VerifiedChunk).check(
     Schema.isMaxLength(maximumManifestPageChunks)
   ),
-  nextIndex: NullableChunkIndex
+  nextIndex: Schema.NullOr(AttachmentTransfer.VerifiedChunk.fields.index)
 })
 export type VerifiedChunkPage = typeof VerifiedChunkPage.Type
 
 export const DirectDownloadGrant = Schema.Struct({
-  expiresAt: NonNegativeInt,
-  request: AttachmentTransfer.DirectDownloadRequest
+  expiresAt: AttachmentTransfer.DownloadGrant.fields.expiresAt,
+  request: AttachmentTransfer.DownloadGrant.fields.request
 })
 export type DirectDownloadGrant = typeof DirectDownloadGrant.Type
 

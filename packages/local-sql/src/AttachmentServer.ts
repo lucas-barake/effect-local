@@ -112,7 +112,6 @@ const ReadableEntity = Schema.Struct({
   value_json: Schema.String
 })
 const DigestRow = Schema.Struct({ digest: Attachment.Digest })
-const CountRow = Schema.Struct({ count: Schema.Int })
 const AttemptIdRow = Schema.Struct({ attempt_id: Schema.String })
 
 export const layer = <R = never,>(options: Options<R>): Layer.Layer<
@@ -996,7 +995,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 }
                 const claimedDeletion = yield* SqlSchema.findOne({
                   Request: Schema.Void,
-                  Result: CountRow,
+                  Result: Rows.CountRow,
                   execute: () =>
                     sql`SELECT COUNT(*) AS count FROM effect_local_server_attachment_deletions
                   WHERE operation = 'DeleteObject'
@@ -1414,7 +1413,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             }
             const count = yield* SqlSchema.findOne({
               Request: Schema.Void,
-              Result: CountRow,
+              Result: Rows.CountRow,
               execute: () =>
                 sql`SELECT COUNT(*) AS count FROM effect_local_server_attachment_references
                 WHERE space_id = ${input.spaceId} AND schema_generation = ${input.schemaGeneration}
@@ -1731,7 +1730,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           if (row.operation === "DeleteObject" && row.provider_version !== null) {
             const live = yield* SqlSchema.findOne({
               Request: Schema.Void,
-              Result: CountRow,
+              Result: Rows.CountRow,
               execute: () =>
                 sql`SELECT COUNT(*) AS count FROM effect_local_server_attachment_objects
                 WHERE provider_namespace = ${row.provider_namespace}
