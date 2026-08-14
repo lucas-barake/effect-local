@@ -229,18 +229,17 @@ describe("multi space Replica", () => {
       const firstRegistrationEntered = yield* Deferred.make<void>()
       const releaseFirstRegistration = yield* Deferred.make<void>()
       let registrations = 0
+      const register: typeof engine.register = (workflow, execute) => {
+        registrations += 1
+        if (registrations !== 1) return engine.register(workflow, execute)
+        return Deferred.succeed(firstRegistrationEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseFirstRegistration)),
+          Effect.andThen(engine.register(workflow, execute))
+        )
+      }
       const gatedEngine = new Proxy(engine, {
         get: (target, property, receiver) => {
-          if (property === "register") {
-            return (...args: Parameters<typeof engine.register>) => {
-              registrations += 1
-              if (registrations !== 1) return target.register(...args)
-              return Deferred.succeed(firstRegistrationEntered, undefined).pipe(
-                Effect.andThen(Deferred.await(releaseFirstRegistration)),
-                Effect.andThen(target.register(...args))
-              )
-            }
-          }
+          if (property === "register") return register
           return Reflect.get(target, property, receiver)
         }
       })
