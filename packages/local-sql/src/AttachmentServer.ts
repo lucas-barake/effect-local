@@ -273,18 +273,55 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               )
           })
         )
-      const retireMissingAttempt = (
+      const retireMissingAttempt = Effect.fnUntraced(function*(
         attempt: typeof Rows.ServerAttachmentAttemptRow.Type
-      ) =>
-        sql`DELETE FROM effect_local_server_attachment_attempts
-          WHERE attempt_id = ${attempt.attempt_id}
-            AND provider_namespace = ${attempt.provider_namespace}
-            AND (
-              (${attempt.provider_upload_id} IS NULL AND provider_upload_id IS NULL) OR
-              provider_upload_id = ${attempt.provider_upload_id}
-            )`.pipe(
-          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+      ) {
+        const now = yield* Clock.currentTimeMillis
+        const activeFinalization = yield* sql.withTransaction(Effect.gen(function*() {
+          const retired = yield* SqlSchema.findOneOption({
+            Request: Schema.Void,
+            Result: AttemptIdRow,
+            execute: () =>
+              sql`DELETE FROM effect_local_server_attachment_attempts
+                WHERE attempt_id = ${attempt.attempt_id}
+                  AND provider_namespace = ${attempt.provider_namespace}
+                  AND (
+                    (${attempt.provider_upload_id} IS NULL AND provider_upload_id IS NULL) OR
+                    provider_upload_id = ${attempt.provider_upload_id}
+                  )
+                  AND (
+                    finalization_token IS NULL OR finalization_expires_at IS NULL OR
+                    finalization_expires_at <= ${now}
+                  )
+                RETURNING attempt_id`
+          })(undefined)
+          if (Option.isSome(retired)) return false
+          const active = yield* SqlSchema.findOneOption({
+            Request: Schema.Void,
+            Result: AttemptIdRow,
+            execute: () =>
+              sql`SELECT attempt_id FROM effect_local_server_attachment_attempts
+                WHERE attempt_id = ${attempt.attempt_id}
+                  AND provider_namespace = ${attempt.provider_namespace}
+                  AND finalization_token IS NOT NULL AND finalization_expires_at > ${now}`
+          })(undefined)
+          return Option.isSome(active)
+        })).pipe(
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Attachment missing upload retirement state is corrupt",
+                  cause
+                })
+              )
+          })
         )
+        if (activeFinalization) {
+          yield* new Attachment.AttachmentUploadBusy({ digest: attempt.digest })
+        }
+      })
       const retireOwnedFinalization = (
         attempt: typeof Rows.ServerAttachmentAttemptRow.Type,
         token: string
@@ -334,6 +371,31 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           Effect.forever
         )
       }
+
+      const retireRejectedBegin = Effect.fnUntraced(function*(
+        attempt: typeof Rows.ServerAttachmentAttemptRow.Type,
+        providerId: AttachmentObjectStore.ProviderId
+      ) {
+        const outboxId = yield* newId("upload.invalidBeginAbort")
+        const queuedAt = yield* Clock.currentTimeMillis
+        yield* sql.withTransaction(Effect.gen(function*() {
+          yield* sql`DELETE FROM effect_local_server_attachment_attempts
+            WHERE attempt_id = ${attempt.attempt_id} AND state = 'Reserved'
+              AND provider_upload_id IS NULL`
+          yield* sql`INSERT INTO effect_local_server_attachment_deletions
+            (outbox_id, space_id, digest, bytes, operation, provider_namespace,
+              provider_id, next_attempt_at, created_at)
+            SELECT ${outboxId}, ${attempt.space_id}, ${attempt.digest}, ${attempt.bytes},
+              'AbortUpload', ${attempt.provider_namespace}, ${providerId}, ${queuedAt}, ${queuedAt}
+            WHERE NOT EXISTS (
+              SELECT 1 FROM effect_local_server_attachment_deletions
+              WHERE operation = 'AbortUpload' AND provider_namespace = ${attempt.provider_namespace}
+                AND provider_id = ${providerId}
+            )`
+        })).pipe(
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+        )
+      })
 
       const hasPossession = SqlSchema.findOneOption({
         Request: AttemptLookup,
@@ -455,12 +517,14 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             ))
         )
         if (begun.upload.namespace !== attempt.provider_namespace) {
+          yield* retireRejectedBegin(attempt, begun.upload.id)
           return yield* new Attachment.AttachmentStorageError({
             operation: "upload.begin.namespace",
             cause: begun
           })
         }
         if (Math.ceil(attempt.bytes / begun.partSize) > 10_000) {
+          yield* retireRejectedBegin(attempt, begun.upload.id)
           return yield* new Attachment.AttachmentStorageError({
             operation: "upload.begin.partCount",
             cause: { bytes: attempt.bytes, partSize: begun.partSize }

@@ -314,7 +314,7 @@ describe("delegated attachment server", () => {
     Effect.fnUntraced(
       function*() {
         const largeReference = Attachment.Reference.make({ digest, bytes: 250 })
-        const { attachments, provider } = yield* makeContext(
+        const { attachments, provider, sql } = yield* makeContext(
           true,
           { maximumObjectsPerSpace: 4, maximumBytesPerSpace: 512 },
           {
@@ -340,7 +340,25 @@ describe("delegated attachment server", () => {
         yield* attachments.finalizeUpload({ ...largeIdentity, attemptId: prepared.attemptId }).pipe(
           Effect.provideService(Statement.CurrentTransformer, transformer)
         )
-        assert.strictEqual(yield* Ref.get(inserts), 3)
+        const chunks = yield* sql<{
+          readonly chunk_index: number
+          readonly chunk_offset: number
+          readonly chunk_bytes: number
+          readonly chunk_digest: string
+        }>`SELECT chunk_index, chunk_offset, chunk_bytes, chunk_digest
+          FROM effect_local_server_attachment_chunks
+          WHERE space_id = ${spaceId} AND digest = ${largeReference.digest}
+          ORDER BY chunk_index`
+        assert.lengthOf(chunks, largeReference.bytes)
+        for (let index = 0; index < chunks.length; index++) {
+          assert.deepStrictEqual(chunks[index], {
+            chunk_index: index,
+            chunk_offset: index,
+            chunk_bytes: 1,
+            chunk_digest: largeReference.digest
+          })
+        }
+        assert.isBelow(yield* Ref.get(inserts), largeReference.bytes)
       },
       provideTestPlatform,
       Effect.scoped

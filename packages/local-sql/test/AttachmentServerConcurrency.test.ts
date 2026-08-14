@@ -64,6 +64,9 @@ type DeleteHandler = (
 type BeginHandler = (
   input: Parameters<AttachmentObjectStore.Adapter["beginUpload"]>[0]
 ) => ReturnType<AttachmentObjectStore.Adapter["beginUpload"]>
+type ListPartsHandler = (
+  input: Parameters<AttachmentObjectStore.Adapter["listUploadedParts"]>[0]
+) => ReturnType<AttachmentObjectStore.Adapter["listUploadedParts"]>
 type InspectHandler = (
   input: Parameters<AttachmentObjectStore.Adapter["inspectFinalized"]>[0]
 ) => ReturnType<AttachmentObjectStore.Adapter["inspectFinalized"]>
@@ -106,17 +109,18 @@ const makeProvider = () => {
       nextIndex: null
     }))
   let beginHandler = defaultBegin
+  let listPartsHandler: ListPartsHandler = () =>
+    Effect.succeed(AttachmentObjectStore.UploadedPartPage.make({
+      parts: [],
+      nextPartNumber: null
+    }))
   let inspectHandler: InspectHandler = () => Effect.succeed(null)
   let finalizeHandler = defaultFinalize
   let manifestHandler = defaultManifest
   const adapter: AttachmentObjectStore.Adapter = {
     namespace,
     beginUpload: (input) => beginHandler(input),
-    listUploadedParts: () =>
-      Effect.succeed(AttachmentObjectStore.UploadedPartPage.make({
-        parts: [],
-        nextPartNumber: null
-      })),
+    listUploadedParts: (input) => listPartsHandler(input),
     grantUploadPart: ({ expiresAt }) =>
       Effect.succeed(AttachmentObjectStore.DirectUploadGrant.make({
         expiresAt,
@@ -150,6 +154,9 @@ const makeProvider = () => {
     deleted,
     setBeginHandler: (handler: BeginHandler) => {
       beginHandler = handler
+    },
+    setListPartsHandler: (handler: ListPartsHandler) => {
+      listPartsHandler = handler
     },
     setInspectHandler: (handler: InspectHandler) => {
       inspectHandler = handler
@@ -288,6 +295,39 @@ const layerPlatform = Layer.mergeAll(NodeCrypto.layer, NodeFileSystem.layer, Nod
 const providePlatform = Effect.provide(layerPlatform)
 
 describe("delegated attachment deletion concurrency", () => {
+  it.effect(
+    "durably aborts and retires an invalid decoded provider begin result",
+    Effect.fnUntraced(
+      function*() {
+        const { first, provider, sql } = yield* makeHarness()
+        const invalidUploadId = AttachmentObjectStore.ProviderId.make("invalid-begin-upload")
+        provider.setBeginHandler(({ reference }) =>
+          Effect.succeed(AttachmentObjectStore.BegunUpload.make({
+            upload: AttachmentObjectStore.UploadIdentity.make({
+              namespace: AttachmentObjectStore.Namespace.make("wrong-namespace"),
+              id: invalidUploadId
+            }),
+            partSize: reference.bytes
+          }))
+        )
+
+        const result = yield* first.prepareUpload(identity).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(result))
+        if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, "AttachmentStorageError")
+        const attempts = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_attachment_attempts WHERE space_id = ${spaceId} AND digest = ${uploadDigest}`
+        assert.deepStrictEqual(attempts, [{ count: 0 }])
+        const deletions = yield* sql<{ readonly provider_id: string }>`SELECT provider_id
+          FROM effect_local_server_attachment_deletions WHERE operation = 'AbortUpload'`
+        assert.deepStrictEqual(deletions, [{ provider_id: invalidUploadId }])
+        assert.strictEqual(yield* first.drainOutbox, 1)
+        assert.deepStrictEqual(provider.aborted.map(({ id }) => id), [invalidUploadId])
+      },
+      providePlatform,
+      Effect.scoped
+    )
+  )
+
   it.effect(
     "durably aborts the provider upload that loses a Reserved attempt race",
     Effect.fnUntraced(
@@ -429,6 +469,70 @@ describe("delegated attachment deletion concurrency", () => {
         const objects = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
           FROM effect_local_server_attachment_objects WHERE space_id = ${spaceId} AND digest = ${uploadDigest}`
         assert.deepStrictEqual(objects, [{ count: 1 }])
+      },
+      providePlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "preserves the active finalization owner when prepare observes a consumed upload",
+    Effect.fnUntraced(
+      function*() {
+        const { first, provider, second, sql } = yield* makeHarness()
+        const prepared = yield* first.prepareUpload(identity)
+        assert.strictEqual(prepared._tag, "UploadPart")
+        if (prepared._tag !== "UploadPart") return
+        let consumed = false
+        provider.setFinalizeHandler((input) => {
+          consumed = true
+          return Effect.succeed(AttachmentObjectStore.VerifiedObject.make({
+            object: AttachmentObjectStore.ObjectIdentity.make({
+              namespace,
+              id: AttachmentObjectStore.ProviderId.make(`object-${input.upload.id}`),
+              version: AttachmentObjectStore.ProviderVersion.make("v1")
+            }),
+            reference: input.reference,
+            chunkBytes: 5,
+            chunkCount: 1
+          }))
+        })
+        provider.setListPartsHandler(({ upload }) => {
+          if (consumed) {
+            return Effect.fail(new AttachmentObjectStore.AttachmentProviderUploadNotFound({ upload }))
+          }
+          return Effect.succeed(AttachmentObjectStore.UploadedPartPage.make({
+            parts: [],
+            nextPartNumber: null
+          }))
+        })
+        const manifestEntered = yield* Deferred.make<void>()
+        const releaseManifest = yield* Deferred.make<void>()
+        provider.setManifestHandler(() =>
+          Deferred.succeed(manifestEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseManifest)),
+            Effect.as(AttachmentObjectStore.VerifiedChunkPage.make({
+              chunks: [{ index: 0, offset: 0, bytes: 1, digest: uploadDigest }],
+              nextIndex: null
+            }))
+          )
+        )
+
+        const owner = yield* first.finalizeUpload({
+          ...identity,
+          attemptId: prepared.attemptId
+        }).pipe(Effect.forkChild)
+        yield* Deferred.await(manifestEntered)
+        const concurrentPrepare = yield* second.prepareUpload(identity).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(concurrentPrepare))
+        if (Result.isFailure(concurrentPrepare)) {
+          assert.strictEqual(concurrentPrepare.failure._tag, "AttachmentUploadBusy")
+        }
+        yield* Deferred.succeed(releaseManifest, undefined)
+        assert.deepStrictEqual(yield* Fiber.join(owner), { _tag: "UploadComplete" })
+        const objects = yield* sql<{ readonly state: string }>`SELECT state
+          FROM effect_local_server_attachment_objects WHERE space_id = ${spaceId} AND digest = ${uploadDigest}`
+        assert.deepStrictEqual(objects, [{ state: "Available" }])
       },
       providePlatform,
       Effect.scoped
