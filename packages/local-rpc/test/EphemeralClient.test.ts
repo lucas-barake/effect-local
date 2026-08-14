@@ -23,6 +23,82 @@ const member = Protocol.EphemeralMember.make({
 
 describe("EphemeralClient", () => {
   it.effect(
+    "normalizes duration inputs before the RPC boundary",
+    Effect.fnUntraced(function*() {
+      const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
+      const joinedTtlMillis = yield* Deferred.make<number>()
+      const publishedTtlMillis = yield* Deferred.make<number>()
+      // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
+      const fakeClient = {
+        JoinEphemeral: (request: typeof Protocol.VersionedEphemeralJoinRequest.Type) =>
+          Deferred.succeed(joinedTtlMillis, request.ttlMillis).pipe(Effect.as(messages)),
+        HeartbeatEphemeral: () => Effect.succeed(null),
+        PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) => {
+          let ttlMillis = 0
+          if ("ttlMillis" in request.request) ttlMillis = request.request.ttlMillis
+          return Deferred.succeed(publishedTtlMillis, ttlMillis).pipe(Effect.as(null))
+        }
+      } as unknown as ProtocolSession.Service["client"]
+      const session = ProtocolSession.ProtocolSession.of({
+        client: fakeClient,
+        version: Effect.succeed(Protocol.currentProtocolVersion),
+        rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
+      })
+      const layerClient = EphemeralClient.layerFromSession().pipe(
+        Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
+      )
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const snapshot = yield* Deferred.make<void>()
+        yield* Queue.offer(
+          messages,
+          Protocol.EphemeralSessionStarted.make({
+            spaceId,
+            member,
+            sessionToken: Identity.EphemeralSessionToken.make(
+              "eps_00000000-0000-4000-8000-000000000001"
+            ),
+            leaseMillis: 60_000
+          })
+        )
+        yield* Queue.offer(
+          messages,
+          Protocol.EphemeralSnapshot.make({
+            spaceId,
+            revision: Identity.EphemeralRevision.make(1),
+            members: [{ member, value: null, expiresAtMillis: 60_000 }],
+            states: []
+          })
+        )
+        const joined = yield* client.join({ spaceId, member, value: null, ttl: "1 minute" }).pipe(
+          Stream.tap((message) => {
+            if (message._tag === "Snapshot") return Deferred.succeed(snapshot, undefined)
+            return Effect.void
+          }),
+          Stream.runDrain,
+          Effect.forkChild({ startImmediately: true })
+        )
+        const joinedTtl = yield* Deferred.await(joinedTtlMillis).pipe(
+          Effect.raceFirst(Fiber.join(joined).pipe(Effect.as(-1)))
+        )
+        assert.strictEqual(joinedTtl, 60_000)
+        yield* Deferred.await(snapshot)
+        yield* client.publish({
+          _tag: "Event",
+          spaceId,
+          member,
+          channel: "typing",
+          value: true,
+          ttl: "5 seconds"
+        })
+        assert.strictEqual(yield* Deferred.await(publishedTtlMillis), 5_000)
+        yield* Fiber.interrupt(joined)
+      })
+      yield* program.pipe(Effect.provide(layerClient))
+    })
+  )
+
+  it.effect(
     "schedules heartbeat from the server accepted lease",
     Effect.fnUntraced(function*() {
       const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
@@ -64,7 +140,7 @@ describe("EphemeralClient", () => {
             states: []
           })
         )
-        const joined = yield* client.join({ spaceId, member, value: null, ttlMillis: 60_000 }).pipe(
+        const joined = yield* client.join({ spaceId, member, value: null, ttl: "1 minute" }).pipe(
           Stream.tap((message) => {
             if (message._tag === "Snapshot") return Deferred.succeed(snapshot, undefined)
             return Effect.void
@@ -134,7 +210,7 @@ describe("EphemeralClient", () => {
       )
       const program = Effect.gen(function*() {
         const client = yield* EphemeralClient.EphemeralClient
-        const joined = yield* client.join({ spaceId, member, value: null, ttlMillis: 10_000 }).pipe(
+        const joined = yield* client.join({ spaceId, member, value: null, ttl: "10 seconds" }).pipe(
           Stream.tap((message) => {
             if (message._tag === "Snapshot" && message.revision === 2) {
               return Deferred.succeed(recovered, undefined)
@@ -206,7 +282,7 @@ describe("EphemeralClient", () => {
         Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
       )
       const result = yield* EphemeralClient.EphemeralClient.use((client) =>
-        client.join({ spaceId, member, value: null, ttlMillis: 10_000 }).pipe(Stream.runDrain)
+        client.join({ spaceId, member, value: null, ttl: "10 seconds" }).pipe(Stream.runDrain)
       ).pipe(Effect.provide(layerClient), Effect.result)
       assert.isTrue(Result.isFailure(result))
       assert.strictEqual(yield* Ref.get(joins), 1)

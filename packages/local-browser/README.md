@@ -24,7 +24,7 @@ export const conversationLiveAtom = graph.ephemeral({
   spaceId,
   member,
   value: { status: "online" },
-  ttlMillis: 30_000
+  ttl: "30 seconds"
 })
 
 export const publishEphemeralAtom = graph.publishEphemeral
@@ -49,7 +49,10 @@ stores retained state in Effect `HashMap` so one position update does not scan t
 `HashMap.values(view.states)`. The browser does not run a second TTL store. Server expiry messages are the source of
 truth.
 
-Set `graph.publishEphemeral` with any `Protocol.EphemeralPublishRequest`:
+Join and TTL-bearing publish requests accept `ttl: Duration.Input`; the client validates and encodes it at the RPC
+boundary.
+
+Set `graph.publishEphemeral` with any `EphemeralClient.PublishRequest`:
 
 ```ts
 registry.set(graph.publishEphemeral, {
@@ -58,7 +61,7 @@ registry.set(graph.publishEphemeral, {
   member,
   channel: "typing",
   value: { active: true },
-  ttlMillis: 5_000
+  ttl: "5 seconds"
 })
 
 registry.set(graph.publishEphemeral, {
@@ -68,7 +71,7 @@ registry.set(graph.publishEphemeral, {
   channel: "read",
   key: "conversation-42",
   value: { message: 108 },
-  ttlMillis: 60_000
+  ttl: "1 minute"
 })
 ```
 

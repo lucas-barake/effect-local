@@ -20,7 +20,7 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
-import type * as Duration from "effect/Duration"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
@@ -232,9 +232,16 @@ describe("Replica Atom graph", () => {
           })
         )
       }
+      const toWirePublish = (
+        request: EphemeralClient.PublishRequest
+      ): Protocol.EphemeralPublishRequest => {
+        if (request._tag !== "Event" && request._tag !== "SetState") return request
+        const { ttl, ...wire } = request
+        return { ...wire, ttlMillis: Duration.toMillis(ttl) }
+      }
       const client = EphemeralClient.EphemeralClient.of({
-        join: (request) =>
-          hub.join(request, null).pipe(
+        join: ({ ttl, ...request }) =>
+          hub.join({ ...request, ttlMillis: Duration.toMillis(ttl) }, null).pipe(
             Stream.tap((message) => {
               if (message._tag !== "SessionStarted") return Effect.void
               sessions.set(sessionKey(request), message.sessionToken)
@@ -247,7 +254,7 @@ describe("Replica Atom graph", () => {
           ),
         publish: (request) =>
           sessionToken(request).pipe(
-            Effect.flatMap((token) => hub.publish(request, token, null))
+            Effect.flatMap((token) => hub.publish(toWirePublish(request), token, null))
           ),
         heartbeat: (request) =>
           sessionToken(request).pipe(
@@ -282,8 +289,8 @@ describe("Replica Atom graph", () => {
         spaceId,
         member: memberA,
         value: { status: "online" },
-        ttlMillis: 10_000
-      } satisfies Protocol.EphemeralJoinRequest
+        ttl: "10 seconds"
+      } satisfies EphemeralClient.JoinRequest
       const layerEphemeralClient = Layer.succeed(EphemeralClient.EphemeralClient, client)
       const graph = BrowserReplica.make(Layer.merge(layerReplica, layerEphemeralClient))
       const registry = AtomRegistry.make()
@@ -367,7 +374,7 @@ describe("Replica Atom graph", () => {
         spaceId,
         member: memberC,
         value: null,
-        ttlMillis: 10_000
+        ttl: "10 seconds"
       })
       const unmountLate = registry.mount(lateView)
       yield* Effect.addFinalizer(() => Effect.sync(unmountLate))
@@ -387,7 +394,7 @@ describe("Replica Atom graph", () => {
         channel: "read",
         key: "sentinel",
         value: true,
-        ttlMillis: 30_000
+        ttl: "30 seconds"
       })
       assert.deepStrictEqual(Option.getOrThrow(yield* Fiber.join(lateSettled)).events, [])
 
@@ -415,7 +422,7 @@ describe("Replica Atom graph", () => {
         member: memberA,
         channel: "typing",
         value: true,
-        ttlMillis: 1_000
+        ttl: "1 second"
       })
       yield* AtomRegistry.getResult(registry, graph.publishEphemeral, { suspendOnWaiting: true })
       assert.deepStrictEqual(
@@ -480,7 +487,7 @@ describe("Replica Atom graph", () => {
         spaceId,
         member: memberA,
         value: null,
-        ttlMillis: 10_000
+        ttl: "10 seconds"
       })
       const unmount = registry.mount(view)
       yield* Effect.addFinalizer(() => Effect.sync(unmount))

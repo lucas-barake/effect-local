@@ -495,7 +495,7 @@ export const conversationLiveAtom = graph.ephemeral({
   spaceId,
   member,
   value: { status: "online" },
-  ttlMillis: 30_000
+  ttl: "30 seconds"
 })
 export const publishEphemeralAtom = graph.publishEphemeral
 ```

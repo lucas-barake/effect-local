@@ -37,8 +37,8 @@ class QueryKey<P,> implements Equal.Equal {
 
 class EphemeralJoinKey implements Equal.Equal {
   readonly value: string
-  readonly request: Protocol.EphemeralJoinRequest
-  constructor(request: Protocol.EphemeralJoinRequest) {
+  readonly request: EphemeralClient.JoinRequest
+  constructor(request: EphemeralClient.JoinRequest) {
     this.value = `${request.spaceId}:${request.member.clientId}:${request.member.membershipIncarnation}:${
       Canonical.hash(request)
     }`
@@ -186,8 +186,8 @@ export const make = <E,>(
     )
     return runtime.atom(stream).pipe(Atom.setIdleTTL(idleTTL))
   })
-  const ephemeralView = (request: Protocol.EphemeralJoinRequest) => ephemeral(new EphemeralJoinKey(request))
-  const publishEphemeral = runtime.fn<Protocol.EphemeralPublishRequest>()(
+  const ephemeralView = (request: EphemeralClient.JoinRequest) => ephemeral(new EphemeralJoinKey(request))
+  const publishEphemeral = runtime.fn<EphemeralClient.PublishRequest>()(
     (request) => EphemeralClient.EphemeralClient.use((client) => client.publish(request)),
     { concurrent: true }
   )

@@ -69,6 +69,9 @@ those deployment policies.
 
 ## Ephemeral semantics
 
+`EphemeralClient.join` and TTL-bearing publish requests accept `ttl: Duration.Input`. Only the serialized RPC
+protocol uses integer `ttlMillis` fields.
+
 A join identifies a member by `(clientId, membershipIncarnation)` and returns one ordered stream:
 
 - The first message is a snapshot containing the complete current roster and retained state for that space.

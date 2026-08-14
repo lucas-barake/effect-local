@@ -851,7 +851,7 @@ describe("WebSocket synchronization", () => {
         spaceId,
         member: ephemeralMember,
         value: null,
-        ttlMillis: 5_000
+        ttl: "5 seconds"
       }).pipe(
         Stream.tap((message) => {
           if (message._tag === "Snapshot") return Deferred.succeed(snapshot, undefined)
@@ -867,7 +867,7 @@ describe("WebSocket synchronization", () => {
         member: ephemeralMember,
         channel: "typing",
         value: true,
-        ttlMillis: 5_000
+        ttl: "5 seconds"
       })
       yield* Fiber.interrupt(joined)
 
@@ -1102,7 +1102,7 @@ describe("WebSocket synchronization", () => {
           spaceId,
           member: ephemeralMember,
           value: { status: "online" },
-          ttlMillis: 5_000
+          ttl: "5 seconds"
         }).pipe(
           Stream.tap((message) => {
             if (message._tag === "Snapshot") return Deferred.succeed(ready, undefined)
@@ -1119,7 +1119,7 @@ describe("WebSocket synchronization", () => {
           member: ephemeralMember,
           channel: "typing",
           value: { active: true },
-          ttlMillis: 5_000
+          ttl: "5 seconds"
         })
         assert.deepStrictEqual((yield* Deferred.await(received)).entry.value, { active: true })
         yield* Fiber.interrupt(joined)
