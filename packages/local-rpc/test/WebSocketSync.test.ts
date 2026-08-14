@@ -6,6 +6,7 @@ import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
 import * as Definition from "@lucas-barake/effect-local/Definition"
+import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
@@ -66,6 +67,9 @@ const ephemeralMember = Protocol.EphemeralMember.make({
   membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
 })
 const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
+const TypingChannel = Ephemeral.make("typing", { kind: "event", payload: { active: Schema.Boolean } })
+const AnonymousProfile = Ephemeral.member()
+const StatusProfile = Ephemeral.member({ status: Schema.String })
 
 const Todo = Model.make("Todo", {
   version: 1,
@@ -846,30 +850,18 @@ describe("WebSocket synchronization", () => {
       const ephemeral = yield* EphemeralClient.EphemeralClient
 
       yield* remote.pull(pullRequest())
-      const snapshot = yield* Deferred.make<void>()
-      const joined = yield* ephemeral.join({
+      yield* ephemeral.session(AnonymousProfile, {
         spaceId,
         member: ephemeralMember,
-        value: null,
-        ttl: "5 seconds"
-      }).pipe(
-        Stream.tap((message) => {
-          if (message._tag === "Snapshot") return Deferred.succeed(snapshot, undefined)
-          return Effect.void
-        }),
-        Stream.runDrain,
-        Effect.forkChild({ startImmediately: true })
-      )
-      yield* Deferred.await(snapshot)
-      yield* ephemeral.publish({
-        _tag: "Event",
-        spaceId,
-        member: ephemeralMember,
-        channel: "typing",
-        value: true,
+        value: undefined,
         ttl: "5 seconds"
       })
-      yield* Fiber.interrupt(joined)
+      yield* ephemeral.publish(TypingChannel, {
+        spaceId,
+        member: ephemeralMember,
+        payload: { active: true },
+        ttl: "5 seconds"
+      })
 
       assert.deepStrictEqual(MutableRef.get(protocolObservations), [
         { _tag: "Negotiate" },
@@ -1096,33 +1088,26 @@ describe("WebSocket synchronization", () => {
         const ephemeral = yield* EphemeralClient.EphemeralClient
         const sql = yield* SqlClient.SqlClient
         const before = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM effect_local_authoritative_log`
-        const ready = yield* Deferred.make<void>()
-        const received = yield* Deferred.make<Protocol.EphemeralEvent>()
-        const joined = yield* ephemeral.join({
+        const session = yield* ephemeral.session(StatusProfile, {
           spaceId,
           member: ephemeralMember,
           value: { status: "online" },
           ttl: "5 seconds"
-        }).pipe(
-          Stream.tap((message) => {
-            if (message._tag === "Snapshot") return Deferred.succeed(ready, undefined)
-            if (message._tag === "Event") return Deferred.succeed(received, message)
-            return Effect.void
-          }),
-          Stream.runDrain,
+        })
+        const received = yield* session.events(TypingChannel).pipe(
+          Stream.runHead,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* Deferred.await(ready)
-        yield* ephemeral.publish({
-          _tag: "Event",
+        yield* ephemeral.publish(TypingChannel, {
           spaceId,
           member: ephemeralMember,
-          channel: "typing",
-          value: { active: true },
+          payload: { active: true },
           ttl: "5 seconds"
         })
-        assert.deepStrictEqual((yield* Deferred.await(received)).entry.value, { active: true })
-        yield* Fiber.interrupt(joined)
+        assert.deepStrictEqual(
+          Option.getOrUndefined(yield* Fiber.join(received))?.payload,
+          { active: true }
+        )
         const after = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM effect_local_authoritative_log`
         assert.strictEqual(after[0]?.count, before[0]?.count)
       },

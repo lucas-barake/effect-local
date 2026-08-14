@@ -162,8 +162,12 @@ const layerSync = Effect.gen(function*() {
   Layer.provide(layerServer)
 )
 const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
+  session: () => Effect.die(new Error("unused")),
+  publish: () => Effect.die(new Error("unused")),
+  clear: () => Effect.die(new Error("unused")),
+  remove: () => Effect.die(new Error("unused")),
   join: () => Stream.never,
-  publish: () => Effect.void,
+  publishEncoded: () => Effect.void,
   heartbeat: () => Effect.void
 })
 const layerReplica = Layer.merge(
@@ -240,6 +244,10 @@ describe("Replica Atom graph", () => {
         return { ...wire, ttlMillis: Duration.toMillis(ttl) }
       }
       const client = EphemeralClient.EphemeralClient.of({
+        session: () => Effect.die(new Error("unused")),
+        publish: () => Effect.die(new Error("unused")),
+        clear: () => Effect.die(new Error("unused")),
+        remove: () => Effect.die(new Error("unused")),
         join: ({ ttl, ...request }) =>
           hub.join({ ...request, ttlMillis: Duration.toMillis(ttl) }, null).pipe(
             Stream.tap((message) => {
@@ -252,7 +260,7 @@ describe("Replica Atom graph", () => {
               return Result.succeed(message)
             })
           ),
-        publish: (request) =>
+        publishEncoded: (request) =>
           sessionToken(request).pipe(
             Effect.flatMap((token) => hub.publish(toWirePublish(request), token, null))
           ),
@@ -387,7 +395,7 @@ describe("Replica Atom graph", () => {
         Stream.runHead,
         Effect.forkScoped({ startImmediately: true })
       )
-      yield* client.publish({
+      yield* client.publishEncoded({
         _tag: "SetState",
         spaceId,
         member: memberA,
@@ -475,8 +483,12 @@ describe("Replica Atom graph", () => {
       const messages = yield* Queue.unbounded<Protocol.EphemeralMessage>()
       yield* Effect.addFinalizer(() => Queue.shutdown(messages))
       const client = EphemeralClient.EphemeralClient.of({
+        session: () => Effect.die(new Error("unused")),
+        publish: () => Effect.die(new Error("unused")),
+        clear: () => Effect.die(new Error("unused")),
+        remove: () => Effect.die(new Error("unused")),
         join: () => Stream.fromQueue(messages),
-        publish: () => Effect.void,
+        publishEncoded: () => Effect.void,
         heartbeat: () => Effect.void
       })
       const layerEphemeralClient = Layer.succeed(EphemeralClient.EphemeralClient, client)

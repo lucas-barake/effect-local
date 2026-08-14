@@ -78,6 +78,25 @@ export function make(name: string, options: {
   return { kind: "event", name, payloadSchema }
 }
 
+export interface Member<P extends Schema.Top,> {
+  readonly kind: "member"
+  readonly payloadSchema: P
+}
+
+export interface AnyMember {
+  readonly kind: "member"
+  readonly payloadSchema: SchemaInput.WireSchema
+}
+
+export function member<P extends SchemaInput.Input = typeof SchemaInput.Void,>(
+  payload?: SchemaInput.Valid<P>
+): Member<SchemaInput.Wire<P>>
+export function member(payload?: SchemaInput.Input): AnyMember {
+  let payloadSchema: SchemaInput.WireSchema = SchemaInput.Void
+  if (payload !== undefined) payloadSchema = SchemaInput.normalize(payload)
+  return { kind: "member", payloadSchema }
+}
+
 export interface Group<Definitions extends ReadonlyArray<Any>,> {
   readonly definitions: Definitions
   readonly byName: ReadonlyMap<string, Any>
@@ -96,5 +115,5 @@ export const group = <const Definitions extends ReadonlyArray<Any>,>(
   return Object.freeze({ definitions, byName })
 }
 
-export type Payload<D extends Any,> = D["payloadSchema"]["Type"]
+export type Payload<D extends Any | AnyMember,> = D["payloadSchema"]["Type"]
 export type Key<D extends AnyState,> = D["keySchema"]["Type"]

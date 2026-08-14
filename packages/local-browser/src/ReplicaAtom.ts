@@ -188,7 +188,7 @@ export const make = <E,>(
   })
   const ephemeralView = (request: EphemeralClient.JoinRequest) => ephemeral(new EphemeralJoinKey(request))
   const publishEphemeral = runtime.fn<EphemeralClient.PublishRequest>()(
-    (request) => EphemeralClient.EphemeralClient.use((client) => client.publish(request)),
+    (request) => EphemeralClient.EphemeralClient.use((client) => client.publishEncoded(request)),
     { concurrent: true }
   )
 

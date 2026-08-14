@@ -72,6 +72,19 @@ describe("Ephemeral definitions", () => {
   )
 
   it.effect(
+    "member definitions normalize their payload schema",
+    Effect.fnUntraced(function*() {
+      const Profile = Ephemeral.member({ displayName: Schema.String })
+      assert.strictEqual(Profile.kind, "member")
+      const encoded = yield* Schema.encodeEffect(Profile.payloadSchema)({ displayName: "Ada" })
+      assert.deepStrictEqual(encoded, { displayName: "Ada" })
+      const Anonymous = Ephemeral.member()
+      const nothing = yield* Schema.encodeEffect(Anonymous.payloadSchema)(undefined)
+      assert.strictEqual(nothing, null)
+    })
+  )
+
+  it.effect(
     "defaults a missing payload to the void wire schema",
     Effect.fnUntraced(function*() {
       const Ping = Ephemeral.make("Ping", { kind: "event" })
