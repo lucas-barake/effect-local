@@ -1,3 +1,4 @@
+export * as AttachmentDirectHttpClient from "./AttachmentDirectHttpClient.js"
 export * as AttachmentHttpClient from "./AttachmentHttpClient.js"
 export * as AttachmentHttpServer from "./AttachmentHttpServer.js"
 export * as Authentication from "./Authentication.js"
