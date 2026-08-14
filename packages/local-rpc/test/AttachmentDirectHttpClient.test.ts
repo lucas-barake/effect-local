@@ -66,8 +66,15 @@ const downloadGrant = (
   })
 }
 
-const layer = (fetch: typeof globalThis.fetch, allowedOrigins: ReadonlyArray<string> = [origin]) =>
-  AttachmentDirectHttpClient.layer({ allowedOrigins }).pipe(
+const layer = (
+  fetch: typeof globalThis.fetch,
+  options: Partial<AttachmentDirectHttpClient.Options> = {}
+) =>
+  AttachmentDirectHttpClient.layer({
+    uploadOrigins: options.uploadOrigins ?? [origin],
+    downloadOrigins: options.downloadOrigins ?? [origin],
+    insecureDevelopmentOrigins: options.insecureDevelopmentOrigins ?? []
+  }).pipe(
     Layer.provide(FetchHttpClient.layer),
     Layer.provide(Layer.succeed(FetchHttpClient.Fetch, fetch))
   )
@@ -90,11 +97,88 @@ const failureTag = <E extends { readonly _tag: string },>(exit: Exit.Exit<unknow
 }
 
 describe("AttachmentDirectHttpClient", () => {
-  it.effect("requires a nonempty public HTTPS origin allowlist", () =>
+  it.effect("refuses an origin authorized only for the other operation", () =>
+    Effect.gen(function*() {
+      const uploadOrigin = "https://uploads.example"
+      const downloadOrigin = "https://downloads.example"
+      const fetch = (async (input: URL | RequestInfo, init?: RequestInit) => {
+        const request = new Request(input, init)
+        if (request.method === "PUT") {
+          await request.arrayBuffer()
+          return new Response(null, { status: 200 })
+        }
+        return new Response(Uint8Array.of(1, 2, 3), {
+          status: 200,
+          headers: { "content-length": "3" }
+        })
+      }) as typeof globalThis.fetch
+      const client = yield* AttachmentDirectHttpClient.AttachmentDirectHttpClient.pipe(
+        Effect.provide(layer(fetch, {
+          uploadOrigins: [uploadOrigin],
+          downloadOrigins: [downloadOrigin]
+        }))
+      )
+
+      const uploadExit = yield* client.upload(
+        uploadGrant(`${downloadOrigin}/object`),
+        Stream.make(Uint8Array.of(1, 2, 3))
+      ).pipe(Effect.exit)
+      assert(Exit.isFailure(uploadExit))
+      assert.strictEqual(failureTag(uploadExit), "AttachmentGrantRejected")
+
+      const downloadExit = yield* client.download(downloadGrant(`${uploadOrigin}/object`)).pipe(
+        Stream.runDrain,
+        Effect.exit
+      )
+      assert(Exit.isFailure(downloadExit))
+      assert.strictEqual(failureTag(downloadExit), "AttachmentGrantRejected")
+    }))
+
+  it.effect("allows only an exact explicitly configured insecure development origin", () =>
+    Effect.gen(function*() {
+      const developmentOrigin = "http://127.0.0.1:9000"
+      const fetch = (async (input: URL | RequestInfo, init?: RequestInit) => {
+        await new Request(input, init).arrayBuffer()
+        return new Response(null, { status: 200 })
+      }) as typeof globalThis.fetch
+      const client = yield* AttachmentDirectHttpClient.AttachmentDirectHttpClient.pipe(
+        Effect.provide(layer(fetch, {
+          uploadOrigins: [developmentOrigin],
+          insecureDevelopmentOrigins: [developmentOrigin]
+        }))
+      )
+      yield* client.upload(
+        uploadGrant(`${developmentOrigin}/object`),
+        Stream.make(Uint8Array.of(1, 2, 3))
+      )
+
+      for (const url of ["http://127.0.0.1:9001/object", "http://localhost:9000/object"]) {
+        const exit = yield* client.upload(uploadGrant(url), Stream.make(Uint8Array.of(1, 2, 3))).pipe(Effect.exit)
+        assert(Exit.isFailure(exit))
+        assert.strictEqual(failureTag(exit), "AttachmentGrantRejected")
+      }
+    }))
+
+  it.effect("refuses empty, unconfigured insecure or private, and malformed origin configuration", () =>
     Effect.gen(function*() {
       for (const allowedOrigins of [[], ["http://objects.example"], ["https://127.0.0.1"]]) {
         const exit = yield* AttachmentDirectHttpClient.AttachmentDirectHttpClient.pipe(
-          Effect.provide(layer(globalThis.fetch, allowedOrigins)),
+          Effect.provide(layer(globalThis.fetch, { uploadOrigins: allowedOrigins })),
+          Effect.exit
+        )
+        assert(Exit.isFailure(exit))
+        assert.strictEqual(failureTag(exit), "AttachmentDirectHttpConfigurationError")
+      }
+      for (
+        const invalidDevelopmentOrigin of [
+          "http://user@localhost:9000",
+          "http://localhost:9000/path",
+          "http://localhost:9000?query=value",
+          "http://localhost:9000#fragment"
+        ]
+      ) {
+        const exit = yield* AttachmentDirectHttpClient.AttachmentDirectHttpClient.pipe(
+          Effect.provide(layer(globalThis.fetch, { insecureDevelopmentOrigins: [invalidDevelopmentOrigin] })),
           Effect.exit
         )
         assert(Exit.isFailure(exit))

@@ -74,7 +74,9 @@ export type AttachmentDirectHttpError =
   | AttachmentTransferRangeMismatch
 
 export interface Options {
-  readonly allowedOrigins: ReadonlyArray<string>
+  readonly uploadOrigins: ReadonlyArray<string>
+  readonly downloadOrigins: ReadonlyArray<string>
+  readonly insecureDevelopmentOrigins: ReadonlyArray<string>
 }
 
 export interface Service {
@@ -166,23 +168,48 @@ const parseUrl = (input: string) => {
   return undefined
 }
 
-const parseAllowedOrigins = (origins: ReadonlyArray<string>) => {
+const isOriginUrl = (url: URL) =>
+  url.username === "" &&
+  url.password === "" &&
+  url.hash === "" &&
+  url.search === "" &&
+  (url.pathname === "" || url.pathname === "/")
+
+const parseDevelopmentOrigins = (origins: ReadonlyArray<string>) => {
+  const allowed = new Set<string>()
+  for (const input of origins) {
+    const url = parseUrl(input)
+    if (url === undefined || !isOriginUrl(url)) {
+      return Effect.fail(new AttachmentDirectHttpConfigurationError({ reason: "InvalidOrigin" }))
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return Effect.fail(new AttachmentDirectHttpConfigurationError({ reason: "InsecureOrigin" }))
+    }
+    allowed.add(url.origin)
+  }
+  return Effect.succeed(allowed)
+}
+
+const parseAllowedOrigins = (
+  origins: ReadonlyArray<string>,
+  insecureDevelopmentOrigins: ReadonlySet<string>
+) => {
   if (origins.length === 0) {
     return Effect.fail(new AttachmentDirectHttpConfigurationError({ reason: "EmptyAllowlist" }))
   }
   const allowed = new Set<string>()
   for (const input of origins) {
     const url = parseUrl(input)
-    if (
-      url === undefined || url.username !== "" || url.password !== "" || url.hash !== "" ||
-      url.search !== "" || (url.pathname !== "" && url.pathname !== "/")
-    ) {
+    if (url === undefined || !isOriginUrl(url)) {
       return Effect.fail(new AttachmentDirectHttpConfigurationError({ reason: "InvalidOrigin" }))
     }
-    if (url.protocol !== "https:") {
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
       return Effect.fail(new AttachmentDirectHttpConfigurationError({ reason: "InsecureOrigin" }))
     }
-    if (isPrivateHost(url.hostname)) {
+    if (url.protocol === "http:" && !insecureDevelopmentOrigins.has(url.origin)) {
+      return Effect.fail(new AttachmentDirectHttpConfigurationError({ reason: "InsecureOrigin" }))
+    }
+    if (isPrivateHost(url.hostname) && !insecureDevelopmentOrigins.has(url.origin)) {
       return Effect.fail(new AttachmentDirectHttpConfigurationError({ reason: "PrivateOrigin" }))
     }
     allowed.add(url.origin)
@@ -193,18 +220,22 @@ const parseAllowedOrigins = (origins: ReadonlyArray<string>) => {
 const validateUrl = (
   input: string,
   operation: Operation,
-  allowedOrigins: ReadonlySet<string>
+  allowedOrigins: ReadonlySet<string>,
+  insecureDevelopmentOrigins: ReadonlySet<string>
 ) => {
   const url = parseUrl(input)
   if (url === undefined) return Effect.fail(new AttachmentGrantRejected({ operation, reason: "InvalidUrl" }))
-  if (url.protocol !== "https:") {
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
     return Effect.fail(new AttachmentGrantRejected({ operation, reason: "InsecureUrl" }))
   }
   if (url.username !== "" || url.password !== "") {
     return Effect.fail(new AttachmentGrantRejected({ operation, reason: "UserInfo" }))
   }
   if (url.hash !== "") return Effect.fail(new AttachmentGrantRejected({ operation, reason: "Fragment" }))
-  if (isPrivateHost(url.hostname)) {
+  if (url.protocol === "http:" && !insecureDevelopmentOrigins.has(url.origin)) {
+    return Effect.fail(new AttachmentGrantRejected({ operation, reason: "InsecureUrl" }))
+  }
+  if (isPrivateHost(url.hostname) && !insecureDevelopmentOrigins.has(url.origin)) {
     return Effect.fail(new AttachmentGrantRejected({ operation, reason: "PrivateAddress" }))
   }
   if (!allowedOrigins.has(url.origin)) {
@@ -245,7 +276,9 @@ const execute = <E extends { readonly _tag: string }, R,>(
   )
 
 const makeService = Effect.fnUntraced(function*(options: Options) {
-  const allowedOrigins = yield* parseAllowedOrigins(options.allowedOrigins)
+  const insecureDevelopmentOrigins = yield* parseDevelopmentOrigins(options.insecureDevelopmentOrigins)
+  const uploadOrigins = yield* parseAllowedOrigins(options.uploadOrigins, insecureDevelopmentOrigins)
+  const downloadOrigins = yield* parseAllowedOrigins(options.downloadOrigins, insecureDevelopmentOrigins)
   const client = yield* HttpClient.HttpClient
 
   const upload: Service["upload"] = Effect.fn("AttachmentDirectHttpClient.upload", { kind: "client" })(
@@ -259,7 +292,7 @@ const makeService = Effect.fnUntraced(function*(options: Options) {
       )
       const now = yield* Clock.currentTimeMillis
       if (now >= grant.expiresAt) return yield* new AttachmentGrantExpired({ operation: "Upload" })
-      const url = yield* validateUrl(grant.request.url, "Upload", allowedOrigins)
+      const url = yield* validateUrl(grant.request.url, "Upload", uploadOrigins, insecureDevelopmentOrigins)
       const headers = yield* validateHeaders(grant.request.headers, "Upload")
       let actual = 0
       const body = source.pipe(Stream.tap((chunk) => {
@@ -304,7 +337,7 @@ const makeService = Effect.fnUntraced(function*(options: Options) {
       )
       const now = yield* Clock.currentTimeMillis
       if (now >= grant.expiresAt) return yield* new AttachmentGrantExpired({ operation: "Download" })
-      const url = yield* validateUrl(grant.request.url, "Download", allowedOrigins)
+      const url = yield* validateUrl(grant.request.url, "Download", downloadOrigins, insecureDevelopmentOrigins)
       const headers = yield* validateHeaders(grant.request.headers, "Download")
       const range = headers.range
       const expectedRange = `bytes=${grant.chunk.offset}-${grant.chunk.offset + grant.chunk.bytes - 1}`
