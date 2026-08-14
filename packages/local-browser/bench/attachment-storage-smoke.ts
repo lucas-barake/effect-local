@@ -1,4 +1,6 @@
 /* oxlint-disable effect/noGlobals -- This browser smoke page owns its native Worker and reports results through page state. */
+import * as Schema from "effect/Schema"
+
 const status = document.querySelector<HTMLParagraphElement>("#status")!
 const results = document.querySelector<HTMLPreElement>("#results")!
 const worker = new Worker(new URL("./attachment-storage-smoke-worker.ts", import.meta.url), { type: "module" })
@@ -26,13 +28,15 @@ worker.addEventListener("message", (
     window.__attachmentStorageSmoke = { status: "failed", error: event.data.error }
     status.textContent = "Failed"
   }
-  results.textContent = JSON.stringify(window.__attachmentStorageSmoke)
+  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- The native worker listener must render its result synchronously.
+  results.textContent = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(window.__attachmentStorageSmoke)
   worker.terminate()
 })
 worker.addEventListener("error", (event) => {
   window.__attachmentStorageSmoke = { status: "failed", error: event.message }
   status.textContent = "Failed"
-  results.textContent = JSON.stringify(window.__attachmentStorageSmoke)
+  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- The native worker listener must render its error synchronously.
+  results.textContent = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))(window.__attachmentStorageSmoke)
   worker.terminate()
 })
 

@@ -2,6 +2,7 @@
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import * as Effect from "effect/Effect"
 import * as ManagedRuntime from "effect/ManagedRuntime"
+import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 
 interface Sample {
@@ -187,7 +188,10 @@ const run = async () => {
     storageDelta: afterStorage - beforeStorage
   }
   status.textContent = "Complete"
-  results.textContent = JSON.stringify(window.__attachmentBenchmark, null, 2)
+  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- The browser benchmark Promise host renders its measured result here.
+  results.textContent = await Schema.encodePromise(Schema.fromJsonString(Schema.Unknown, { space: 2 }))(
+    window.__attachmentBenchmark
+  )
 }
 
 run().catch((error) => {
