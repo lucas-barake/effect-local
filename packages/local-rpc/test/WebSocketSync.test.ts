@@ -854,7 +854,10 @@ describe("WebSocket synchronization", () => {
       const representativePrefix = bytes.subarray(0, 24)
       const byteArray = Schema.Array(Schema.Int)
       const byteArrayJson = Schema.fromJsonString(byteArray)
-      const jsonNumericPrefix = yield* Schema.encodeEffect(byteArrayJson)(Array.from(representativePrefix))
+      const closedJsonNumericPrefix = yield* Schema.encodeEffect(byteArrayJson)(Array.from(representativePrefix))
+      const jsonNumericPrefix = `${closedJsonNumericPrefix.slice(0, -1)},`
+      const fullJsonNumericEncoding = yield* Schema.encodeEffect(byteArrayJson)(Array.from(bytes))
+      assert.include(fullJsonNumericEncoding, jsonNumericPrefix)
       const base64Prefix = Encoding.encodeBase64(representativePrefix)
       const reference = Attachment.Reference.make({
         _tag: "Attachment",
