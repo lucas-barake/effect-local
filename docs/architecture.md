@@ -154,7 +154,7 @@ publications carry only notifications.
 mailboxes bound active watchers plus pending verification. Join verification and command work use separate per space
 allowances. Bootstrap assertion verification and preparation share one fail fast Layer wide allowance. Published page
 reads use a separate per space allowance. Saturation reports `CapacityExceeded` with resource
-`bootstrap authorizations` or `bootstrap pages`.
+`bootstrap authorizations`, `bootstrap pages`, or `ephemeral join verifications`.
 
 `ServerStore.maximumWatchersPerSpace` is the active sync watcher allowance. `EphemeralHub.maximumWatchersPerSpace` is a
 separate joined-stream allowance. `ServerStore.wakeCapacity` is the sliding sync hint depth. `EphemeralHub.capacity`

@@ -60,7 +60,8 @@ const layerSpace = SpaceEntity.layer({
 All nine numeric `SpaceEntity` options are required positive safe integers. Size `ephemeralJoinMailboxCapacity` for
 active watchers plus bounded pending verification. Join verification and command work have separate concurrency
 limits. A full entity mailbox maps to `ServerUnavailable`. Bootstrap concurrency is fail fast. Saturation reports
-typed `CapacityExceeded` with resource `bootstrap authorizations` or `bootstrap pages`.
+typed `CapacityExceeded` with resource `bootstrap authorizations`, `bootstrap pages`, or
+`ephemeral join verifications`.
 
 For one process, provide `SingleRunner.layer` with the selected runner storage. A multi-runner deployment provides
 Effect Cluster runner transport, storage, health, serialization, and sharding Layers. This package does not choose

@@ -356,7 +356,6 @@ describe("SpaceEntity", () => {
       const joinClient = yield* makeJoinClient(spaceA)
       const assertion = yield* assertionOf(null)
       const firstReady = yield* Deferred.make<void>()
-      const secondReady = yield* Deferred.make<void>()
       const start = (joinMember: Protocol.EphemeralMember, ready: Deferred.Deferred<void>) =>
         joinClient.JoinEphemeral({
           request: { spaceId: spaceA, member: joinMember, value: null, ttlMillis: 5_000 },
@@ -371,14 +370,27 @@ describe("SpaceEntity", () => {
         )
       const first = yield* start(member, firstReady)
       yield* Queue.take(entered)
-      const second = yield* start(secondMember, secondReady)
-      yield* Effect.yieldNow
-      yield* Effect.yieldNow
-      assert.strictEqual(Queue.sizeUnsafe(entered), 0)
+      const second = yield* joinClient.JoinEphemeral({
+        request: { spaceId: spaceA, member: secondMember, value: null, ttlMillis: 5_000 },
+        assertion
+      }).pipe(
+        Stream.runDrain,
+        Effect.timeout("1 second"),
+        Effect.result,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* TestClock.adjust("1 second")
+      const secondResult = yield* Fiber.join(second)
+      assert.isTrue(Result.isFailure(secondResult))
+      if (Result.isFailure(secondResult)) {
+        assert.strictEqual(secondResult.failure._tag, "CapacityExceeded")
+        if (secondResult.failure._tag === "CapacityExceeded") {
+          assert.strictEqual(secondResult.failure.resource, "ephemeral join verifications")
+        }
+      }
       yield* Deferred.succeed(release, undefined)
       yield* Deferred.await(firstReady)
-      yield* Deferred.await(secondReady)
-      yield* Fiber.interruptAll([first, second])
+      yield* Fiber.interrupt(first)
     })).pipe(
       Effect.provide(layerShardingConfig),
       Effect.provide(NodeCrypto.layer)

@@ -485,12 +485,20 @@ export const layerHandlers = (options: HandlerOptions) =>
                 )
               )
             }
-            const verified = Semaphore.withPermit(
-              joinVerifications,
-              verifier.verify(payload.assertion).pipe(
-                Effect.map((principal) => ephemeral.join(payload.request, principal))
+            const verified = Effect.gen(function*() {
+              const result = yield* Semaphore.withPermitsIfAvailable(
+                joinVerifications,
+                1,
+                verifier.verify(payload.assertion).pipe(
+                  Effect.map((principal) => ephemeral.join(payload.request, principal))
+                )
               )
-            )
+              if (Option.isSome(result)) return result.value
+              return yield* capacityExceeded(
+                "ephemeral join verifications",
+                options.maximumConcurrentEphemeralJoinVerificationsPerSpace
+              )
+            })
             return Rpc.fork(Stream.unwrap(verified))
           },
           PublishEphemeral: ({ payload }: {
