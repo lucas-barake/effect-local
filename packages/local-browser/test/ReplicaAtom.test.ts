@@ -258,7 +258,7 @@ describe("Replica Atom graph", () => {
         AttachmentTransfer.AttachmentTransfer,
         AttachmentTransfer.AttachmentTransfer.of({
           upload: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-          download: ({ reference }) => Stream.fail(new Attachment.AttachmentUnavailable({ digest: reference.digest }))
+          download: ({ reference }) => Effect.fail(new Attachment.AttachmentUnavailable({ digest: reference.digest }))
         })
       )
       const layerAttachments = AttachmentClient.layer({
