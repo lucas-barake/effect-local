@@ -377,6 +377,67 @@ describe("delegated attachment deletion concurrency", () => {
   )
 
   it.effect(
+    "does not abort the provider upload adopted by the valid begin winner",
+    Effect.fnUntraced(
+      function*() {
+        const { first, provider, second, sql } = yield* makeHarness()
+        const validEntered = yield* Deferred.make<void>()
+        const invalidEntered = yield* Deferred.make<void>()
+        const releaseValid = yield* Deferred.make<void>()
+        const releaseInvalid = yield* Deferred.make<void>()
+        const sharedUploadId = AttachmentObjectStore.ProviderId.make("shared-provider-upload")
+        let calls = 0
+        provider.setBeginHandler(({ reference }) => {
+          calls++
+          if (calls === 1) {
+            return Deferred.succeed(validEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseValid)),
+              Effect.as(AttachmentObjectStore.BegunUpload.make({
+                upload: AttachmentObjectStore.UploadIdentity.make({ namespace, id: sharedUploadId }),
+                partSize: reference.bytes
+              }))
+            )
+          }
+          return Deferred.succeed(invalidEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseInvalid)),
+            Effect.as(AttachmentObjectStore.BegunUpload.make({
+              upload: AttachmentObjectStore.UploadIdentity.make({
+                namespace: AttachmentObjectStore.Namespace.make("wrong-namespace"),
+                id: sharedUploadId
+              }),
+              partSize: reference.bytes
+            }))
+          )
+        })
+
+        const valid = yield* first.prepareUpload(identity).pipe(Effect.forkChild)
+        yield* Deferred.await(validEntered)
+        const invalid = yield* second.prepareUpload(identity).pipe(Effect.result, Effect.forkChild)
+        yield* Deferred.await(invalidEntered)
+        yield* Deferred.succeed(releaseValid, undefined)
+        assert.strictEqual((yield* Fiber.join(valid))._tag, "UploadPart")
+        yield* Deferred.succeed(releaseInvalid, undefined)
+        const invalidResult = yield* Fiber.join(invalid)
+        assert.isTrue(Result.isFailure(invalidResult))
+        if (Result.isFailure(invalidResult)) {
+          assert.strictEqual(invalidResult.failure._tag, "AttachmentStorageError")
+        }
+        const attempts = yield* sql<{ readonly provider_upload_id: string; readonly state: string }>`
+          SELECT provider_upload_id, state FROM effect_local_server_attachment_attempts
+          WHERE space_id = ${spaceId} AND digest = ${uploadDigest}`
+        assert.deepStrictEqual(attempts, [{ provider_upload_id: sharedUploadId, state: "Uploading" }])
+        const deletions = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_attachment_deletions WHERE operation = 'AbortUpload'`
+        assert.deepStrictEqual(deletions, [{ count: 0 }])
+        assert.strictEqual(yield* first.drainOutbox, 0)
+        assert.lengthOf(provider.aborted, 0)
+      },
+      providePlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
     "renews finalization ownership across inspect, finalize, and manifest provider calls",
     Effect.fnUntraced(
       function*() {
@@ -530,6 +591,62 @@ describe("delegated attachment deletion concurrency", () => {
         }
         yield* Deferred.succeed(releaseManifest, undefined)
         assert.deepStrictEqual(yield* Fiber.join(owner), { _tag: "UploadComplete" })
+        const objects = yield* sql<{ readonly state: string }>`SELECT state
+          FROM effect_local_server_attachment_objects WHERE space_id = ${spaceId} AND digest = ${uploadDigest}`
+        assert.deepStrictEqual(objects, [{ state: "Available" }])
+      },
+      providePlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "recovers finalized provider custody after the lease expires and multipart state is gone",
+    Effect.fnUntraced(
+      function*() {
+        const { first, provider, second, sql } = yield* makeHarness()
+        const prepared = yield* first.prepareUpload(identity)
+        assert.strictEqual(prepared._tag, "UploadPart")
+        if (prepared._tag !== "UploadPart") return
+        let finalized: AttachmentObjectStore.VerifiedObject | null = null
+        provider.setFinalizeHandler(({ reference, upload }) => {
+          finalized = AttachmentObjectStore.VerifiedObject.make({
+            object: AttachmentObjectStore.ObjectIdentity.make({
+              namespace,
+              id: AttachmentObjectStore.ProviderId.make(`object-${upload.id}`),
+              version: AttachmentObjectStore.ProviderVersion.make("v1")
+            }),
+            reference,
+            chunkBytes: 5,
+            chunkCount: 1
+          })
+          return Effect.succeed(finalized)
+        })
+        provider.setInspectHandler(() => Effect.succeed(finalized))
+        yield* sql.unsafe(`CREATE TRIGGER fail_attachment_finalize_recovery
+          BEFORE INSERT ON effect_local_server_attachment_objects
+          BEGIN SELECT RAISE(ABORT, 'injected finalize recovery failure'); END`)
+        const failed = yield* first.finalizeUpload({
+          ...identity,
+          attemptId: prepared.attemptId
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(failed))
+        if (Result.isFailure(failed)) assert.strictEqual(failed.failure._tag, "StorageUnavailable")
+        yield* sql.unsafe("DROP TRIGGER fail_attachment_finalize_recovery")
+        yield* TestClock.adjust("2 minutes")
+        provider.setListPartsHandler(({ upload }) =>
+          Effect.fail(new AttachmentObjectStore.AttachmentProviderUploadNotFound({ upload }))
+        )
+
+        const prepareAfterCrash = yield* second.prepareUpload(identity).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(prepareAfterCrash))
+        if (Result.isFailure(prepareAfterCrash)) {
+          assert.strictEqual(prepareAfterCrash.failure._tag, "AttachmentUploadBusy")
+        }
+        assert.deepStrictEqual(
+          yield* second.finalizeUpload({ ...identity, attemptId: prepared.attemptId }),
+          { _tag: "UploadComplete" }
+        )
         const objects = yield* sql<{ readonly state: string }>`SELECT state
           FROM effect_local_server_attachment_objects WHERE space_id = ${spaceId} AND digest = ${uploadDigest}`
         assert.deepStrictEqual(objects, [{ state: "Available" }])
