@@ -49,6 +49,7 @@ Read this file before any work. Treat these rules as required for every package.
 
 ## Composition And Effects
 
+- Keep `unknown` out of Effect error and requirement channels. Use a specific tagged error type and explicit Context services. The success channel may be `unknown` at an untyped boundary.
 - Use `.pipe(...)` for readable linear data last composition. Use `Effect.gen` for sequential dependent workflows. Keep direct data first calls when they are clearer.
 - Use `Effect.sync` only to suspend a synchronous side effect that is not expected to throw. Use `Effect.suspend` when the thunk returns an Effect.
 - Inside `Effect.gen`, execute synchronous code directly. Never write `yield* Effect.sync(...)`; the generator body is already suspended by the enclosing Effect.
@@ -66,6 +67,7 @@ Read this file before any work. Treat these rules as required for every package.
 
 ## Persistence And Validation
 
+- Parse and serialize JSON through an Effect Schema codec built with `Schema.fromJsonString`. Do not call `JSON.parse` or `JSON.stringify` directly.
 - Never trust an external boundary. Decode every value that crosses into the program — SQL rows, wire payloads, archives, file contents — with a Schema. For SQL reads use `SqlSchema` request and result decoding; never assert row shapes with a bare `sql<T>` type parameter in library code.
 - Decode external, archive, and durable values with their domain Schemas before calling branded constructors.
 - Validate redundant persisted metadata, types, hashes, and sequence fields before replay.

@@ -1,7 +1,8 @@
 import { pipe } from "effect/Function"
+import * as Schema from "effect/Schema"
 import assert from "node:assert/strict"
 import { spawnSync } from "node:child_process"
-import { existsSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { resolve } from "node:path"
 import { Testing } from "oxlint-plugin-effect/rule-bindings"
 import {
@@ -15,12 +16,19 @@ import {
   noImplicitDefectConversion,
   noNestedCalls,
   noSemaphoreEffectSync,
+  noUnknownEffectChannelsMessage,
   noUnnecessaryEffectForwarding,
   noYieldEffectSync,
   unnecessaryEffectForwardingMessage,
   unnecessaryPipeForwardingMessage
 } from "./oxlint-plugin.mjs"
 import { makeEffectTypePolicyChecker } from "./tagged-effect-errors.mjs"
+
+const jsonStringCodec = Schema.fromJsonString(Schema.Unknown)
+// oxlint-disable-next-line effect-local/noManualEffectBoundary -- The CLI fixture harness must synchronously decode completed Oxlint process output.
+const decodeJson = Schema.decodeUnknownSync(jsonStringCodec)
+// oxlint-disable-next-line effect-local/noManualEffectBoundary -- The CLI fixture harness must synchronously serialize configuration and assertion details.
+const encodeJson = Schema.encodeUnknownSync(jsonStringCodec)
 
 const effectImport = Testing.importDeclWithSpecifiers(
   "effect/Effect",
@@ -229,7 +237,7 @@ const runOxlintFixture = (name, source, rules) => {
     jsPlugins: [pluginFilename],
     rules: configuredRules
   }))
-  pipe(fixtureConfig, JSON.stringify, (configuredSource) => writeFileSync(configFilename, configuredSource))
+  pipe(fixtureConfig, encodeJson, (configuredSource) => writeFileSync(configFilename, configuredSource))
   try {
     const result = spawnSync(
       "pnpm",
@@ -249,9 +257,63 @@ const runOxlintFixture = (name, source, rules) => {
     )
     if (result.error !== undefined) throw result.error
     assert.equal(result.status, 1, result.stderr)
-    const output = JSON.parse(result.stdout)
+    const output = decodeJson(result.stdout)
     assert.equal(output.number_of_files, 1, result.stdout)
     return output.diagnostics
+  } finally {
+    rmSync(directory, { force: true, recursive: true })
+  }
+}
+
+const runOxlintPackageFixture = (name, source, rules, extraFiles = {}, expectedStatus = 1) => {
+  const directory = mkdtempSync(resolve(worktree, "packages/oxlint-fixture-"))
+  const sourceDirectory = resolve(directory, "src")
+  mkdirSync(sourceDirectory)
+  const filename = resolve(sourceDirectory, name)
+  mkdirSync(resolve(filename, ".."), { recursive: true })
+  writeFileSync(filename, source)
+  for (const [relativeName, contents] of Object.entries(extraFiles)) {
+    const extraFilename = resolve(directory, relativeName)
+    mkdirSync(resolve(extraFilename, ".."), { recursive: true })
+    writeFileSync(extraFilename, contents)
+  }
+  writeFileSync(
+    resolve(directory, "package.json"),
+    encodeJson({
+      name: "@effect-local/oxlint-fixture",
+      type: "module",
+      exports: { ".": "./src/index.ts", "./*": "./src/*.ts", "./internal/*": null }
+    })
+  )
+  const configFilename = resolve(directory, "oxlint.json")
+  const pluginFilename = resolve(worktree, "scripts/oxlint-plugin.mjs")
+  writeFileSync(
+    configFilename,
+    encodeJson({
+      jsPlugins: [pluginFilename],
+      rules: Object.fromEntries(rules.map((rule) => [`effect-local/${rule}`, "error"]))
+    })
+  )
+  try {
+    const result = spawnSync(
+      "pnpm",
+      [
+        "exec",
+        "oxlint",
+        "--config",
+        configFilename,
+        "--disable-nested-config",
+        sourceDirectory,
+        "--format",
+        "json",
+        "--threads",
+        "1"
+      ],
+      { cwd: worktree, encoding: "utf8" }
+    )
+    if (result.error !== undefined) throw result.error
+    assert.equal(result.status, expectedStatus, `${result.stderr}\n${result.stdout}`)
+    return decodeJson(result.stdout).diagnostics
   } finally {
     rmSync(directory, { force: true, recursive: true })
   }
@@ -328,7 +390,7 @@ const nestedCallDiagnostics = runOxlintFixture(
 const onlyNestedCallDiagnostics = nestedCallDiagnostics.every(
   (diagnostic) => diagnostic.code === "effect-local(noNestedCalls)"
 )
-const nestedCallDetail = JSON.stringify(nestedCallDiagnostics)
+const nestedCallDetail = encodeJson(nestedCallDiagnostics)
 assert.equal(onlyNestedCallDiagnostics, true, nestedCallDetail)
 const nestedCompositionDiagnostics = nestedCallDiagnostics.filter(
   (diagnostic) => diagnostic.message === nestedCallMessage
@@ -377,7 +439,7 @@ const shadowedPipeDiagnostics = runOxlintFixture(
   shadowedPipeFixtureSource,
   ["noNestedCalls"]
 )
-const shadowedPipeDetail = JSON.stringify(shadowedPipeDiagnostics)
+const shadowedPipeDetail = encodeJson(shadowedPipeDiagnostics)
 assert.equal(shadowedPipeDiagnostics.length, 1, shadowedPipeDetail)
 assert.equal(shadowedPipeDiagnostics[0].code, "effect-local(noNestedCalls)")
 assert.equal(shadowedPipeDiagnostics[0].message, nestedCallMessage)
@@ -452,7 +514,7 @@ const forwardingDiagnostics = runOxlintFixture(
   forwardingFixtureSource,
   ["noUnnecessaryEffectForwarding"]
 )
-const forwardingDetail = JSON.stringify(forwardingDiagnostics)
+const forwardingDetail = encodeJson(forwardingDiagnostics)
 assert.equal(forwardingDiagnostics.length, 16, forwardingDetail)
 assert.deepEqual(
   diagnosticOffsets(forwardingDiagnostics),
@@ -531,7 +593,7 @@ const functionEffectGenFixtureDiagnostics = runOxlintFixture(
 const functionEffectGenDiagnostics = functionEffectGenFixtureDiagnostics.filter(
   (diagnostic) => diagnostic.code === "effect-local(noFunctionEffectGen)"
 )
-const functionEffectGenDetail = JSON.stringify(functionEffectGenDiagnostics)
+const functionEffectGenDetail = encodeJson(functionEffectGenDiagnostics)
 assert.equal(functionEffectGenDiagnostics.length, 11, functionEffectGenDetail)
 assert.equal(
   functionEffectGenDiagnostics.every((diagnostic) => diagnostic.message === functionEffectGenMessage),
@@ -589,7 +651,7 @@ const implicitDefectDiagnostics = runOxlintFixture(
   implicitDefectFixtureSource,
   ["noImplicitDefectConversion"]
 )
-const implicitDetail = JSON.stringify(implicitDefectDiagnostics)
+const implicitDetail = encodeJson(implicitDefectDiagnostics)
 const orDieDiagnostics = implicitDefectDiagnostics.filter(
   (diagnostic) => diagnostic.message === effectOrDieMessage
 )
@@ -629,11 +691,11 @@ const implicitDefectReexportDiagnostics = runOxlintFixture(
   implicitDefectReexportSource,
   ["noImplicitDefectConversion"]
 ).filter((diagnostic) => diagnostic.code === "effect-local(noImplicitDefectConversion)")
-assert.equal(implicitDefectReexportDiagnostics.length, 2, JSON.stringify(implicitDefectReexportDiagnostics))
+assert.equal(implicitDefectReexportDiagnostics.length, 2, encodeJson(implicitDefectReexportDiagnostics))
 assert.deepEqual(
   diagnosticOffsets(implicitDefectReexportDiagnostics),
   [offsetOf(implicitDefectReexportSource, "orDie"), offsetAfter(implicitDefectReexportSource, ", orDie", "orDie")],
-  JSON.stringify(implicitDefectReexportDiagnostics)
+  encodeJson(implicitDefectReexportDiagnostics)
 )
 
 const layerFixtureSource = `import * as Layer from "effect/Layer"
@@ -697,7 +759,7 @@ const layerDiagnostics = runOxlintFixture(
   layerFixtureSource,
   ["requireLayerName"]
 ).filter((diagnostic) => diagnostic.code === "effect-local(requireLayerName)")
-const layerDetail = JSON.stringify(layerDiagnostics)
+const layerDetail = encodeJson(layerDiagnostics)
 assert.equal(layerDiagnostics.length, 16, layerDetail)
 assert.ok(
   layerDiagnostics.every((diagnostic) =>
@@ -759,7 +821,7 @@ const serviceMapDiagnostics = runOxlintFixture(
   serviceMapFixtureSource,
   ["noServiceTagMap"]
 ).filter((diagnostic) => diagnostic.code === "effect-local(noServiceTagMap)")
-const serviceMapDetail = JSON.stringify(serviceMapDiagnostics)
+const serviceMapDetail = encodeJson(serviceMapDiagnostics)
 assert.equal(serviceMapDiagnostics.length, 7, serviceMapDetail)
 const serviceMapTarget = new Map([
   ["_dataFirst", "Service"],
@@ -844,11 +906,11 @@ const boundaryDiagnostics = runOxlintFixture(
 const manualDiagnostics = boundaryDiagnostics.filter(
   (diagnostic) => diagnostic.code === "effect-local(noManualEffectBoundary)"
 )
-assert.equal(manualDiagnostics.length, 33, JSON.stringify(manualDiagnostics))
+assert.equal(manualDiagnostics.length, 33, encodeJson(manualDiagnostics))
 const onlyManualDiagnostics = boundaryDiagnostics.every(
   (diagnostic) => diagnostic.code === "effect-local(noManualEffectBoundary)"
 )
-assert.equal(onlyManualDiagnostics, true, JSON.stringify(boundaryDiagnostics))
+assert.equal(onlyManualDiagnostics, true, encodeJson(boundaryDiagnostics))
 const hasGuidance = boundaryDiagnostics.every((diagnostic) => diagnostic.message === manualBoundaryMessage)
 assert.equal(hasGuidance, true)
 assert.deepEqual(
@@ -889,8 +951,43 @@ assert.deepEqual(
     ["void dispose()", "dispose"]
   ].map(([marker, needle]) => offsetAfter(manualBoundaryFixtureSource, marker, needle))
     .toSorted((left, right) => left - right),
-  JSON.stringify(manualDiagnostics)
+  encodeJson(manualDiagnostics)
 )
+
+const missingDependencyDirectory = mkdtempSync(resolve(worktree, "oxlint-missing-dependency-"))
+try {
+  const missingDependencySource = resolve(missingDependencyDirectory, "fixture.ts")
+  const missingDependencyConfig = resolve(missingDependencyDirectory, "oxlint.json")
+  writeFileSync(missingDependencySource, "export const value = 1\n")
+  writeFileSync(
+    missingDependencyConfig,
+    encodeJson({
+      jsPlugins: [resolve(worktree, "scripts/oxlint-plugin.mjs")],
+      rules: { "effect-local/noManualEffectBoundary": "error" }
+    })
+  )
+  const missingDependencyResult = spawnSync(
+    resolve(worktree, "node_modules/.bin/oxlint"),
+    [
+      "--config",
+      missingDependencyConfig,
+      "--disable-nested-config",
+      missingDependencySource,
+      "--format",
+      "json",
+      "--threads",
+      "1"
+    ],
+    { cwd: missingDependencyDirectory, encoding: "utf8" }
+  )
+  if (missingDependencyResult.error !== undefined) throw missingDependencyResult.error
+  assert.equal(missingDependencyResult.status, 1, missingDependencyResult.stderr)
+  const diagnostics = decodeJson(missingDependencyResult.stdout).diagnostics
+  assert.equal(diagnostics.length, 1, missingDependencyResult.stdout)
+  assert.match(diagnostics[0].message, /^Could not verify ManagedRuntime boundaries\./)
+} finally {
+  rmSync(missingDependencyDirectory, { force: true, recursive: true })
+}
 
 const taggedFixtureSource = `import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
@@ -986,8 +1083,8 @@ try {
 const untaggedDiagnostics = taggedDiagnostics.filter(
   (diagnostic) => diagnostic.code === "effect-local(requireTaggedEffectError)"
 )
-const taggedDetail = JSON.stringify(untaggedDiagnostics)
-assert.equal(untaggedDiagnostics.length, 20, taggedDetail)
+const taggedDetail = encodeJson(untaggedDiagnostics)
+assert.equal(untaggedDiagnostics.length, 19, taggedDetail)
 
 const taggedOffsets = new Set(untaggedDiagnostics.map((diagnostic) => diagnostic.labels[0].span.offset))
 const taggedMessageByOffset = new Map(
@@ -1037,3 +1134,401 @@ assert.match(socketConcreteMessage, /untagged type: string\./)
 assert.match(localGenericMessage, /untagged type: E\./)
 assert.match(declaredStringMessage, /untagged type: string\./)
 assert.match(declaredNumberMessage, /untagged type: number\./)
+
+const classFactorySource = `class Value {}
+const makeValue = () => new Value()
+function createValue() { return new Value() }
+const expression = function() { return new Value() }
+const stored = { make: () => new Value() }
+const Alias = Value
+const aliasFactory = () => new Alias()
+const Assigned = class {}
+const assignedFactory = () => new Assigned()
+const methodFactory = { make() { return new Value() } }
+declare const consume: (factory: () => Value) => void
+declare const consumeOptions: (options: { readonly make: () => Value }) => void
+consume(() => new Value())
+consumeOptions({ make: () => new Value() })
+consume({ make: () => new Value() }.make)
+function prepared() { const input = 1; void input; return new Value() }
+const proxy = () => new Proxy({}, {})
+`
+const classFactoryDiagnostics = runOxlintFixture(
+  "class-instance-factory-fixture.ts",
+  classFactorySource,
+  ["noClassInstanceFactory"]
+).filter((diagnostic) => diagnostic.code === "effect-local(noClassInstanceFactory)")
+assert.equal(classFactoryDiagnostics.length, 8, encodeJson(classFactoryDiagnostics))
+assert.deepEqual(
+  diagnosticOffsets(classFactoryDiagnostics),
+  [
+    offsetOf(classFactorySource, "() => new Value()"),
+    offsetOf(classFactorySource, "function createValue"),
+    offsetOf(classFactorySource, "function() { return new Value() }"),
+    offsetAfter(classFactorySource, "const stored", "() => new Value()"),
+    offsetAfter(classFactorySource, "aliasFactory", "() => new Alias()"),
+    offsetAfter(classFactorySource, "assignedFactory", "() => new Assigned()"),
+    offsetAfter(classFactorySource, "methodFactory", "make()"),
+    offsetAfter(classFactorySource, "consume({", "() => new Value()")
+  ].toSorted((left, right) => left - right),
+  encodeJson(classFactoryDiagnostics)
+)
+assert.ok(
+  classFactoryDiagnostics.every((diagnostic) =>
+    diagnostic.message ===
+      "Instantiate this class directly where the value is needed. Do not hide construction in a mapper or factory function. Prefer local verbosity so every construction site stays explicit."
+  )
+)
+
+const newPolicySource = `import * as Effect from "effect/Effect"
+import { sync as suspendSync } from "effect/Effect"
+import { it } from "vitest"
+import { it as effectIt } from "@effect/vitest"
+import * as EffectTest from "@effect/vitest"
+import * as timers from "node:timers/promises"
+import * as Schema from "effect/Schema"
+import { forkDetach as detach } from "effect/Effect"
+
+class Tagged { readonly _tag = "Tagged" as const }
+declare const tagged: Tagged
+const _instance = tagged instanceof Tagged
+const cleanup = Effect.void
+const _badSync = Effect.sync(() => cleanup)
+const _badAlias = suspendSync(() => cleanup)
+declare const flag: boolean
+const _badUnion = Effect.sync(() => flag ? Effect.void : 0)
+const _goodSync = Effect.sync(() => 1).pipe(Effect.as(cleanup))
+it("plain effect", () => Effect.void)
+effectIt("plain effect", () => Effect.void)
+const runTest = it
+runTest("aliased effect", () => Effect.void)
+it.skip("conditional effect", () => flag ? Effect.void : undefined)
+const effectCallback = () => Effect.void
+it("named effect", effectCallback)
+const namedTimer = () => new Promise((resolve) => setTimeout(resolve, 1))
+it("named timer", namedTimer)
+function declaredTimer() { return new Promise((resolve) => setTimeout(resolve, 1)) }
+const aliasedTimer = declaredTimer
+it("declared timer", declaredTimer)
+it("aliased declared timer", aliasedTimer)
+effectIt.effect("virtual time", () => Effect.sleep("1 second"))
+effectIt.live("wall time", () => Effect.sleep("1 second"))
+effectIt.live.skip("modified wall time", () => Effect.sleep("1 second"))
+EffectTest.it.live.skip("namespace wall time", () => Effect.sleep("1 second"))
+it.skip("modified timer", () => new Promise((resolve) => setTimeout(resolve, 1)))
+runTest("aliased timer", () => new Promise((resolve) => globalThis.setTimeout(resolve, 1)))
+it("timer", () => new Promise((resolve) => setTimeout(resolve, 1)))
+it("timer namespace", () => timers.setTimeout(1))
+const decode = Schema.decodeEffect(Schema.String)
+export { decode }
+export const { decodeEffect: destructuredDecode } = Schema
+import { decodeEffect as importedDecode } from "effect/Schema"
+export { importedDecode }
+export default Schema.encodeEffect(Schema.String)
+void detach(Effect.void)
+`
+const newPolicyDiagnostics = runOxlintFixture(
+  "new-policy-fixture.ts",
+  newPolicySource,
+  [
+    "noEffectSyncReturningEffect",
+    "effectTestsUseEffect",
+    "noInstanceofTaggedError",
+    "noTestWallClockWait",
+    "noExportedSchemaCodecAlias",
+    "noDetachedFork"
+  ]
+)
+const policyCounts = new Map()
+for (const diagnostic of newPolicyDiagnostics) {
+  policyCounts.set(diagnostic.code, (policyCounts.get(diagnostic.code) ?? 0) + 1)
+}
+const assertPolicyOffsets = (rule, offsets) => {
+  const diagnostics = newPolicyDiagnostics.filter((diagnostic) => diagnostic.code === `effect-local(${rule})`)
+  assert.deepEqual(
+    diagnosticOffsets(diagnostics),
+    offsets.toSorted((left, right) => left - right),
+    encodeJson(newPolicyDiagnostics)
+  )
+}
+assert.equal(policyCounts.get("effect-local(noEffectSyncReturningEffect)"), 3, encodeJson(newPolicyDiagnostics))
+assert.equal(policyCounts.get("effect-local(effectTestsUseEffect)"), 5, encodeJson(newPolicyDiagnostics))
+assert.equal(policyCounts.get("effect-local(noInstanceofTaggedError)"), 1, encodeJson(newPolicyDiagnostics))
+assert.equal(policyCounts.get("effect-local(noTestWallClockWait)"), 10, encodeJson(newPolicyDiagnostics))
+assert.equal(policyCounts.get("effect-local(noExportedSchemaCodecAlias)"), 4, encodeJson(newPolicyDiagnostics))
+assert.equal(policyCounts.get("effect-local(noDetachedFork)"), 1, encodeJson(newPolicyDiagnostics))
+assertPolicyOffsets("noEffectSyncReturningEffect", [
+  offsetOf(newPolicySource, "Effect.sync(() => cleanup)"),
+  offsetOf(newPolicySource, "suspendSync(() => cleanup)"),
+  offsetOf(newPolicySource, "Effect.sync(() => flag")
+])
+assertPolicyOffsets("effectTestsUseEffect", [
+  offsetOf(newPolicySource, "it(\"plain effect\""),
+  offsetOf(newPolicySource, "effectIt(\"plain effect\""),
+  offsetOf(newPolicySource, "runTest(\"aliased effect\""),
+  offsetOf(newPolicySource, "it.skip(\"conditional effect\""),
+  offsetOf(newPolicySource, "it(\"named effect\"")
+])
+assertPolicyOffsets("noTestWallClockWait", [
+  offsetAfter(newPolicySource, "effectIt.live(\"wall time\"", "Effect.sleep"),
+  offsetAfter(newPolicySource, "effectIt.live.skip", "Effect.sleep"),
+  offsetAfter(newPolicySource, "EffectTest.it.live.skip", "Effect.sleep"),
+  offsetAfter(newPolicySource, "it.skip(\"modified timer\"", "setTimeout"),
+  offsetAfter(newPolicySource, "runTest(\"aliased timer\"", "globalThis.setTimeout"),
+  offsetAfter(newPolicySource, "it(\"timer\"", "setTimeout"),
+  offsetAfter(newPolicySource, "it(\"timer namespace\"", "timers.setTimeout"),
+  offsetAfter(newPolicySource, "const namedTimer", "setTimeout"),
+  offsetAfter(newPolicySource, "function declaredTimer", "setTimeout"),
+  offsetAfter(newPolicySource, "function declaredTimer", "setTimeout")
+])
+assertPolicyOffsets("noExportedSchemaCodecAlias", [
+  offsetAfter(newPolicySource, "export { decode", "decode"),
+  offsetAfter(newPolicySource, "export { importedDecode", "importedDecode"),
+  offsetAfter(newPolicySource, "export default", "Schema.encodeEffect"),
+  offsetAfter(newPolicySource, "destructuredDecode", "destructuredDecode")
+])
+
+const packagePolicySource = `import * as Data from "effect/Data"
+import type { SqlClient } from "effect/unstable/sql/SqlClient"
+class Bad extends Data.TaggedError("Bad")<{}> {}
+const AssignedBad = class extends Data.TaggedError("AssignedBad")<{}> {}
+declare const sql: SqlClient
+const rows = sql<{ readonly id: string }>\`select id from rows\`
+void rows
+`
+const packagePolicyDiagnostics = runOxlintPackageFixture(
+  "Policy.ts",
+  packagePolicySource,
+  ["requireSchemaTaggedError", "noBareSqlRowType"]
+)
+assert.equal(
+  packagePolicyDiagnostics.filter((diagnostic) => diagnostic.code === "effect-local(requireSchemaTaggedError)").length,
+  2,
+  encodeJson(packagePolicyDiagnostics)
+)
+assert.equal(
+  packagePolicyDiagnostics.filter((diagnostic) => diagnostic.code === "effect-local(noBareSqlRowType)").length,
+  1,
+  encodeJson(packagePolicyDiagnostics)
+)
+
+const internalExportDiagnostics = runOxlintPackageFixture(
+  "index.ts",
+  `export * from "./internal/secret.js"\n`,
+  ["noInternalEntrypointExport"],
+  { "src/internal/secret.ts": "export const secret = true\n" }
+).filter((diagnostic) => diagnostic.code === "effect-local(noInternalEntrypointExport)")
+assert.equal(internalExportDiagnostics.length, 1, encodeJson(internalExportDiagnostics))
+
+const boundaryPolicySource = `import * as Effect from "effect/Effect"
+class Tagged extends Error { readonly _tag = "Tagged" as const }
+export interface HandlerOptions { readonly retryMillis: number }
+export interface GoodOptions { readonly retry: import("effect/Duration").Input }
+export interface Metrics { readonly latencyMillis: number }
+interface PrivateInput { readonly idleSeconds: number }
+export const configure = (_input: PrivateInput) => undefined
+export const configureInline = (_input: { readonly pauseMillis: number }) => undefined
+type ExtraConfig = { readonly delayMillis: number }
+type CombinedConfig = ExtraConfig & { readonly retrySeconds: number }
+export const configureCombined = (_input: CombinedConfig) => undefined
+export const translate = (cause: unknown): Tagged => { void cause; return new Tagged() }
+const helpers = { make() { return new Tagged() } }
+const failTagged = () => Effect.fail(new Tagged())
+const failTaggedBlock = (cause: unknown) => { void cause; return Effect.fail(new Tagged()) }
+`
+const boundaryPolicyDiagnostics = runOxlintPackageFixture(
+  "Boundary.ts",
+  boundaryPolicySource,
+  ["durationInputAtConfigBoundary", "noModuleErrorHelper", "noClassInstanceFactory"]
+)
+const boundaryRuleOffsets = (rule) =>
+  diagnosticOffsets(
+    boundaryPolicyDiagnostics.filter((diagnostic) => diagnostic.code === `effect-local(${rule})`)
+  )
+assert.equal(
+  boundaryPolicyDiagnostics.filter(
+    (diagnostic) => diagnostic.code === "effect-local(durationInputAtConfigBoundary)"
+  ).length,
+  4,
+  encodeJson(boundaryPolicyDiagnostics)
+)
+assert.deepEqual(
+  boundaryRuleOffsets("durationInputAtConfigBoundary"),
+  ["idleSeconds", "pauseMillis", "delayMillis", "retrySeconds"]
+    .map((name) => offsetOf(boundaryPolicySource, name))
+    .toSorted((left, right) => left - right),
+  encodeJson(boundaryPolicyDiagnostics)
+)
+assert.equal(
+  boundaryPolicyDiagnostics.filter((diagnostic) => diagnostic.code === "effect-local(noModuleErrorHelper)").length,
+  4,
+  encodeJson(boundaryPolicyDiagnostics)
+)
+assert.equal(
+  boundaryPolicyDiagnostics.filter((diagnostic) => diagnostic.code === "effect-local(noClassInstanceFactory)").length,
+  0,
+  encodeJson(boundaryPolicyDiagnostics)
+)
+
+const sharedConstructorFiles = {
+  "src/SharedError.ts": `export class SharedError extends Error { readonly _tag = "SharedError" as const }\n`,
+  "src/First.ts": `import { make } from "./internal/shared.js"\nexport const first = make("first")\n`,
+  "src/Second.ts": `import * as Shared from "./internal/shared.js"\nexport const second = Shared.make("second")\n`
+}
+const sharedConstructorDiagnostics = runOxlintPackageFixture(
+  "internal/shared.ts",
+  `import { SharedError } from "../SharedError.js"\nexport const make = (message: string): SharedError => new SharedError(message)\n`,
+  ["noModuleErrorHelper"],
+  sharedConstructorFiles,
+  0
+)
+assert.equal(sharedConstructorDiagnostics.length, 0, encodeJson(sharedConstructorDiagnostics))
+
+const duplicateConstructorDiagnostics = runOxlintPackageFixture(
+  "internal/first.ts",
+  `import { SharedError } from "../SharedError.js"\nexport const make = (message: string): SharedError => new SharedError(message)\n`,
+  ["noModuleErrorHelper"],
+  {
+    ...sharedConstructorFiles,
+    "src/internal/second.ts":
+      `import { SharedError } from "../SharedError.js"\nexport const makeOther = (message: string): SharedError => new SharedError(message)\n`,
+    "src/First.ts": `import { make } from "./internal/first.js"\nexport const first = make("first")\n`,
+    "src/Second.ts": `import { make } from "./internal/first.js"\nexport const second = make("second")\n`
+  }
+).filter((diagnostic) => diagnostic.code === "effect-local(noModuleErrorHelper)")
+assert.equal(duplicateConstructorDiagnostics.length, 2, encodeJson(duplicateConstructorDiagnostics))
+
+const importedDurationDiagnostics = runOxlintPackageFixture(
+  "Boundary.ts",
+  `import type { ExternalOptions } from "./Options.js"
+interface ReusedOptions { readonly timeoutMillis: number }
+const normalize = (input: ReusedOptions): ReusedOptions => input
+const configureLater = (_input: ReusedOptions) => undefined
+export const configureExternal = (_input: ExternalOptions) => undefined
+export { configureLater }
+void normalize
+`,
+  ["durationInputAtConfigBoundary"],
+  { "src/Options.ts": "export interface ExternalOptions { readonly retryMillis: number }\n" }
+).filter((diagnostic) => diagnostic.code === "effect-local(durationInputAtConfigBoundary)")
+assert.equal(importedDurationDiagnostics.length, 2, encodeJson(importedDurationDiagnostics))
+assert.ok(importedDurationDiagnostics.some((diagnostic) => diagnostic.message.includes("retryMillis")))
+
+const mappedSharedConstructorDiagnostics = runOxlintPackageFixture(
+  "internal/shared.ts",
+  `import { SharedError } from "../SharedError.js"\nexport const make = (message: string): SharedError => new SharedError(message)\n`,
+  ["noModuleErrorHelper"],
+  {
+    "src/SharedError.ts": `export class SharedError extends Error { readonly _tag = "SharedError" as const }\n`,
+    "src/First.ts":
+      `import { make } from "./internal/shared.js"\nimport * as Effect from "effect/Effect"\nexport const first = Effect.fail("x").pipe(Effect.mapError(make))\n`,
+    "src/Second.ts":
+      `import * as Shared from "./internal/shared.js"\nimport * as Effect from "effect/Effect"\nexport const second = Effect.fail("x").pipe(Effect.mapError(Shared.make))\n`
+  },
+  0
+)
+assert.equal(mappedSharedConstructorDiagnostics.length, 0, encodeJson(mappedSharedConstructorDiagnostics))
+
+const unknownChannelSource = `import * as Effect from "effect/Effect"
+interface Tagged { readonly _tag: "Tagged" }
+declare const badError: Effect.Effect<string, unknown>
+declare const badRequirements: Effect.Effect<string, Tagged, unknown>
+declare const badBoth: Effect.Effect<string, unknown, unknown>
+declare const inferredUnknown: unknown
+const inferred = Effect.fail(inferredUnknown)
+declare const goodSuccess: Effect.Effect<unknown, Tagged>
+declare const goodSpecific: Effect.Effect<string, Tagged, never>
+declare const goodAny: Effect.Effect<string, any, any>
+`
+const unknownChannelDiagnostics = runOxlintFixture(
+  "unknown-effect-channels-fixture.ts",
+  unknownChannelSource,
+  ["noUnknownEffectChannels"]
+).filter((diagnostic) => diagnostic.code === "effect-local(noUnknownEffectChannels)")
+assert.equal(unknownChannelDiagnostics.length, 4, encodeJson(unknownChannelDiagnostics))
+assert.deepEqual(
+  diagnosticOffsets(unknownChannelDiagnostics),
+  [
+    offsetAfter(unknownChannelSource, "badError", "Effect.Effect"),
+    offsetAfter(unknownChannelSource, "badRequirements", "Effect.Effect"),
+    offsetAfter(unknownChannelSource, "badBoth", "Effect.Effect"),
+    offsetOf(unknownChannelSource, "Effect.fail")
+  ].toSorted((left, right) => left - right),
+  encodeJson(unknownChannelDiagnostics)
+)
+assert.deepEqual(
+  new Map(unknownChannelDiagnostics.map((diagnostic) => [diagnostic.labels[0].span.offset, diagnostic.message])),
+  new Map([
+    [offsetAfter(unknownChannelSource, "badError", "Effect.Effect"), noUnknownEffectChannelsMessage(["error"])],
+    [
+      offsetAfter(unknownChannelSource, "badRequirements", "Effect.Effect"),
+      noUnknownEffectChannelsMessage(["requirements"])
+    ],
+    [
+      offsetAfter(unknownChannelSource, "badBoth", "Effect.Effect"),
+      noUnknownEffectChannelsMessage(["error", "requirements"])
+    ],
+    [offsetOf(unknownChannelSource, "Effect.fail"), noUnknownEffectChannelsMessage(["error"])]
+  ])
+)
+
+const unknownChannelOwnershipSource = `import type * as Effect from "effect/Effect"
+declare const _value: Effect.Effect<void, unknown>
+`
+const unknownChannelOwnershipDiagnostics = runOxlintFixture(
+  "unknown-effect-channel-ownership-fixture.ts",
+  unknownChannelOwnershipSource,
+  ["noUnknownEffectChannels", "requireTaggedEffectError"]
+)
+assert.deepEqual(
+  unknownChannelOwnershipDiagnostics.map((diagnostic) => diagnostic.code),
+  ["effect-local(noUnknownEffectChannels)"],
+  encodeJson(unknownChannelOwnershipDiagnostics)
+)
+
+const jsonPolicySource = `const parsed = JSON.parse("{}")
+const encoded = JSON["stringify"]({})
+const globalParsed = globalThis.JSON.parse("{}")
+const windowParsed = window.JSON.parse("{}")
+const selfEncoded = self.JSON.stringify({})
+const JsonAlias = JSON
+const aliasEncoded = JsonAlias.stringify({})
+const { parse: parseJson, ["stringify"]: stringifyJson } = JSON
+const shadowed = (JSON: { parse: (value: string) => unknown }) => JSON.parse("{}")
+const shadowedGlobal = (globalThis: { JSON: { stringify: (value: unknown) => string } }) =>
+  globalThis.JSON.stringify({})
+void parsed
+void encoded
+void globalParsed
+void windowParsed
+void selfEncoded
+void aliasEncoded
+void parseJson
+void stringifyJson
+void shadowed
+void shadowedGlobal
+`
+const jsonPolicyDiagnostics = runOxlintFixture(
+  "json-codec-policy-fixture.ts",
+  jsonPolicySource,
+  ["noJsonParseStringify"]
+).filter((diagnostic) => diagnostic.code === "effect-local(noJsonParseStringify)")
+assert.equal(jsonPolicyDiagnostics.length, 8, encodeJson(jsonPolicyDiagnostics))
+assert.deepEqual(
+  diagnosticOffsets(jsonPolicyDiagnostics),
+  [
+    offsetOf(jsonPolicySource, "JSON.parse"),
+    offsetOf(jsonPolicySource, "JSON[\"stringify\"]"),
+    offsetOf(jsonPolicySource, "globalThis.JSON.parse"),
+    offsetOf(jsonPolicySource, "window.JSON.parse"),
+    offsetOf(jsonPolicySource, "self.JSON.stringify"),
+    offsetOf(jsonPolicySource, "JsonAlias.stringify"),
+    offsetOf(jsonPolicySource, "parse: parseJson"),
+    offsetOf(jsonPolicySource, "[\"stringify\"]: stringifyJson")
+  ].toSorted((left, right) => left - right),
+  encodeJson(jsonPolicyDiagnostics)
+)
+assert.ok(jsonPolicyDiagnostics.every((diagnostic) =>
+  diagnostic.message ===
+    "Do not use JSON.parse or JSON.stringify. Define a JSON codec with Schema.fromJsonString and decode or encode through Effect Schema."
+))
