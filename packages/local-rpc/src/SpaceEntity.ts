@@ -384,7 +384,7 @@ export const layerHandlers = (options: HandlerOptions) =>
 
           return SpaceReadEntity.of({
             Pull: ({ payload }) =>
-              Rpc.fork(Effect.suspend(() => {
+              Effect.suspend(() => {
                 if (spaceId === undefined || payload.request.spaceId !== spaceId) {
                   return Effect.fail(
                     new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
@@ -393,43 +393,40 @@ export const layerHandlers = (options: HandlerOptions) =>
                 return verifier.verify(payload.assertion).pipe(
                   Effect.flatMap((principal) => store.pullAuthorized(payload.request, principal))
                 )
-              })),
-            Bootstrap: ({ payload }) =>
-              Rpc.fork(
-                Effect.gen(function*() {
-                  if (spaceId === undefined || payload.request.spaceId !== spaceId) {
-                    return yield* new ReplicaError.ProtocolInvalid({
-                      message: "The routed space does not match the payload"
-                    })
-                  }
-                  const prepared = yield* Semaphore.withPermitsIfAvailable(
-                    bootstrapAuthorizations,
-                    1,
-                    verifier.verify(payload.assertion).pipe(
-                      Effect.flatMap((principal) => store.prepareBootstrapAuthorized(payload.request, principal))
-                    )
-                  )
-                  if (Option.isNone(prepared)) {
-                    return yield* capacityExceeded(
-                      "bootstrap authorizations",
-                      options.maximumConcurrentBootstrapAuthorizations
-                    )
-                  }
-                  const result = yield* Semaphore.withPermitsIfAvailable(
-                    bootstrapPages,
-                    1,
-                    prepared.value
-                  )
-                  if (Option.isSome(result)) return result.value
-                  return yield* capacityExceeded(
-                    "bootstrap pages",
-                    options.maximumConcurrentBootstrapPagesPerSpace
-                  )
+              }),
+            Bootstrap: Effect.fnUntraced(function*({ payload }) {
+              if (spaceId === undefined || payload.request.spaceId !== spaceId) {
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message: "The routed space does not match the payload"
                 })
+              }
+              const prepared = yield* Semaphore.withPermitsIfAvailable(
+                bootstrapAuthorizations,
+                1,
+                verifier.verify(payload.assertion).pipe(
+                  Effect.flatMap((principal) => store.prepareBootstrapAuthorized(payload.request, principal))
+                )
               )
+              if (Option.isNone(prepared)) {
+                return yield* capacityExceeded(
+                  "bootstrap authorizations",
+                  options.maximumConcurrentBootstrapAuthorizations
+                )
+              }
+              const result = yield* Semaphore.withPermitsIfAvailable(
+                bootstrapPages,
+                1,
+                prepared.value
+              )
+              if (Option.isSome(result)) return result.value
+              return yield* capacityExceeded(
+                "bootstrap pages",
+                options.maximumConcurrentBootstrapPagesPerSpace
+              )
+            })
           })
         }),
-        { ...common, concurrency: 1, mailboxCapacity: options.readMailboxCapacity }
+        { ...common, concurrency: "unbounded", mailboxCapacity: options.readMailboxCapacity }
       )
 
       const layerWatchHandlers = SpaceWatchEntity.toLayer(
@@ -443,19 +440,17 @@ export const layerHandlers = (options: HandlerOptions) =>
           return SpaceWatchEntity.of({
             Watch: ({ payload }) => {
               if (spaceId === undefined || payload.request.spaceId !== spaceId) {
-                return Rpc.fork(
-                  Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
-                )
+                return Stream.fail(new ReplicaError.ProtocolInvalid({ message: "The routed space is invalid" }))
               }
-              return Rpc.fork(Stream.unwrap(
+              return Stream.unwrap(
                 verifier.verify(payload.assertion).pipe(
                   Effect.flatMap((principal) => store.watchAuthorized(payload.request, principal))
                 )
-              ))
+              )
             }
           })
         }),
-        { ...common, concurrency: 1, mailboxCapacity: options.watchMailboxCapacity }
+        { ...common, concurrency: "unbounded", mailboxCapacity: options.watchMailboxCapacity }
       )
 
       const ephemeralHandlers = Effect.gen(function*() {
@@ -479,10 +474,8 @@ export const layerHandlers = (options: HandlerOptions) =>
             }
           }) => {
             if (!routed(payload.request)) {
-              return Rpc.fork(
-                Stream.fail(
-                  new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
-                )
+              return Stream.fail(
+                new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
               )
             }
             const verified = Effect.gen(function*() {
@@ -499,7 +492,7 @@ export const layerHandlers = (options: HandlerOptions) =>
                 options.maximumConcurrentEphemeralJoinVerificationsPerSpace
               )
             })
-            return Rpc.fork(Stream.unwrap(verified))
+            return Stream.unwrap(verified)
           },
           PublishEphemeral: ({ payload }: {
             readonly payload: {
@@ -556,7 +549,7 @@ export const layerHandlers = (options: HandlerOptions) =>
             JoinEphemeral: handlers.JoinEphemeral
           })
         )),
-        { ...common, concurrency: 1, mailboxCapacity: options.ephemeralJoinMailboxCapacity }
+        { ...common, concurrency: "unbounded", mailboxCapacity: options.ephemeralJoinMailboxCapacity }
       )
 
       const layerEphemeralCommandHandlers = SpaceEphemeralCommandEntity.toLayer(

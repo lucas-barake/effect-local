@@ -520,8 +520,8 @@ export const layer = <R = never,>(
               () => Metric.modify(watcherCount, -1)
             )
             const token = {}
-            const sessionToken = yield* crypto.randomUUIDv4.pipe(
-              Effect.map((uuid) => Identity.EphemeralSessionToken.make(`eps_${uuid}`)),
+            const sessionToken = yield* Identity.makeEphemeralSessionToken.pipe(
+              Effect.provideService(Crypto.Crypto, crypto),
               Effect.catch(() => Effect.fail(new ReplicaError.ServerUnavailable()))
             )
             const departed = yield* Deferred.make<void, ReplicaError.EphemeralSessionUnavailable>()

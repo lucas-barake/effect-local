@@ -7,7 +7,6 @@ import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
-import * as Result from "effect/Result"
 import * as Schedule from "effect/Schedule"
 import * as Stream from "effect/Stream"
 import type * as RpcClient from "effect/unstable/rpc/RpcClient"
@@ -272,10 +271,9 @@ export const layerFromSession = (
                     sessions.set(sessionKey(request), { owner, sessionToken: message.sessionToken })
                     return Deferred.succeed(started, message)
                   }),
-                  Stream.filterMap((message) => {
-                    if (message._tag === "SessionStarted") return Result.fail(message)
-                    return Result.succeed(message)
-                  })
+                  Stream.filter(
+                    (message): message is Protocol.EphemeralMessage => message._tag !== "SessionStarted"
+                  )
                 )
                 const heartbeatLoop = Deferred.await(started).pipe(
                   Effect.flatMap((accepted) => {

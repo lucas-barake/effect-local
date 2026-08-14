@@ -622,10 +622,10 @@ export const VersionedEphemeralPublishRequest = Schema.Struct({
 
 export const EphemeralHeartbeatRequest = Schema.Struct(EphemeralRequestIdentity)
 export type EphemeralHeartbeatRequest = typeof EphemeralHeartbeatRequest.Type
-export const VersionedEphemeralHeartbeatRequest = Schema.Struct({
-  ...EphemeralRequestIdentity,
-  sessionToken: Identity.EphemeralSessionToken
-}).pipe(withProtocolVersion)
+export const VersionedEphemeralHeartbeatRequest = EphemeralHeartbeatRequest.pipe(
+  Schema.fieldsAssign({ sessionToken: Identity.EphemeralSessionToken }),
+  withProtocolVersion
+)
 
 const EphemeralEntryIdentity = {
   member: EphemeralMember,
