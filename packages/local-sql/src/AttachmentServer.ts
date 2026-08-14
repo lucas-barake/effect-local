@@ -1592,7 +1592,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
 
       const sweepSpace: Service["sweepSpace"] = Effect.fnUntraced(function*(spaceId) {
         const now = yield* Clock.currentTimeMillis
-        const staleAttempts = yield* SqlSchema.findAll({
+        const finalizingAttempts = yield* SqlSchema.findAll({
           Request: Schema.Void,
           Result: Rows.ServerAttachmentAttemptRow,
           execute: () =>
@@ -1601,6 +1601,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               finalization_token, finalization_expires_at, created_at, last_accessed_at
             FROM effect_local_server_attachment_attempts AS a
             WHERE a.space_id = ${spaceId} AND a.last_accessed_at <= ${now - stagingLifetime}
+              AND a.state = 'Finalizing'
               AND (a.finalization_expires_at IS NULL OR a.finalization_expires_at <= ${now})
               AND NOT EXISTS (
                 SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
@@ -1619,6 +1620,35 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
               )
           })
         )
+        const ordinaryAttempts = yield* SqlSchema.findAll({
+          Request: Schema.Void,
+          Result: Rows.ServerAttachmentAttemptRow,
+          execute: () =>
+            sql`SELECT attempt_id, space_id, digest, bytes, client_id, membership_incarnation,
+              provider_namespace, physical_key, provider_upload_id, part_size, state,
+              finalization_token, finalization_expires_at, created_at, last_accessed_at
+            FROM effect_local_server_attachment_attempts AS a
+            WHERE a.space_id = ${spaceId} AND a.last_accessed_at <= ${now - stagingLifetime}
+              AND a.state <> 'Finalizing'
+              AND (a.finalization_expires_at IS NULL OR a.finalization_expires_at <= ${now})
+              AND NOT EXISTS (
+                SELECT 1 FROM effect_local_server_attachment_upload_grants AS g
+                WHERE g.attempt_id = a.attempt_id AND g.expires_at > ${now}
+              )
+            ORDER BY a.last_accessed_at, a.attempt_id LIMIT ${deletionBatchSize}`
+        })(undefined).pipe(
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Attachment ordinary stale attempt state is corrupt",
+                  cause
+                })
+              )
+          })
+        )
+        const staleAttempts = [...finalizingAttempts, ...ordinaryAttempts]
         let swept = 0
         for (const selected of staleAttempts) {
           if (selected.state === "Finalizing") {
@@ -1628,22 +1658,26 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             ) {
               continue
             }
-            const deferFinalizing = sql`UPDATE effect_local_server_attachment_attempts
-              SET last_accessed_at = ${now}
-              WHERE attempt_id = ${selected.attempt_id}
-                AND state = 'Finalizing'
-                AND provider_namespace = ${selected.provider_namespace}
-                AND provider_upload_id = ${selected.provider_upload_id}
-                AND finalization_token = ${selected.finalization_token}
-                AND finalization_expires_at = ${selected.finalization_expires_at}
-                AND finalization_expires_at <= ${now}
-                AND last_accessed_at <= ${now - stagingLifetime}
-                AND NOT EXISTS (
-                  SELECT 1 FROM effect_local_server_attachment_upload_grants
-                  WHERE attempt_id = ${selected.attempt_id} AND expires_at > ${now}
-                )`.pipe(
-              Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
-            )
+            const deferFinalizing = Effect.gen(function*() {
+              const deferredAt = yield* Clock.currentTimeMillis
+              yield* sql`UPDATE effect_local_server_attachment_attempts
+                SET last_accessed_at = ${deferredAt}
+                WHERE attempt_id = ${selected.attempt_id}
+                  AND state = 'Finalizing'
+                  AND provider_namespace = ${selected.provider_namespace}
+                  AND provider_upload_id = ${selected.provider_upload_id}
+                  AND finalization_token = ${selected.finalization_token}
+                  AND finalization_expires_at = ${selected.finalization_expires_at}
+                  AND finalization_expires_at <= ${deferredAt}
+                  AND last_accessed_at = ${selected.last_accessed_at}
+                  AND last_accessed_at <= ${now - stagingLifetime}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM effect_local_server_attachment_upload_grants
+                    WHERE attempt_id = ${selected.attempt_id} AND expires_at > ${deferredAt}
+                  )`.pipe(
+                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+              )
+            })
             const adapter = yield* objectStores.resolve(selected.provider_namespace).pipe(
               Effect.map(Option.some),
               Effect.catchTag("AttachmentObjectStoreUnavailable", () => Effect.succeed(Option.none()))
@@ -1831,7 +1865,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   AND g.expires_at > ${now}
               )
             ORDER BY o.garbage_collect_after, o.digest
-            LIMIT ${Math.max(0, deletionBatchSize - staleAttempts.length)}`
+            LIMIT ${deletionBatchSize}`
         })(undefined).pipe(
           Effect.catchTags({
             SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),

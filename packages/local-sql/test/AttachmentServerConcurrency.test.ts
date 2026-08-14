@@ -726,6 +726,18 @@ describe("delegated attachment deletion concurrency", () => {
         let inspectCalls = 0
         provider.setInspectHandler(() => {
           inspectCalls++
+          if (inspectCalls === 2) {
+            return TestClock.adjust("2 minutes").pipe(
+              Effect.andThen(
+                Effect.fail(
+                  new AttachmentObjectStore.AttachmentObjectStoreUnavailable({
+                    namespace,
+                    operation: "inspect.injected"
+                  })
+                )
+              )
+            )
+          }
           return Effect.fail(
             new AttachmentObjectStore.AttachmentObjectStoreUnavailable({
               namespace,
@@ -747,19 +759,69 @@ describe("delegated attachment deletion concurrency", () => {
             'Uploading', 1, 1)`
         yield* TestClock.adjust("2 minutes")
 
-        assert.strictEqual(yield* first.sweepSpace(spaceId), 0)
+        yield* first.sweepSpace(spaceId)
         assert.strictEqual(inspectCalls, 2)
         const attempts = yield* sql<{ readonly last_accessed_at: number; readonly state: string }>`
           SELECT last_accessed_at, state
           FROM effect_local_server_attachment_attempts WHERE attempt_id = ${prepared.attemptId}`
-        assert.deepStrictEqual(attempts, [{ last_accessed_at: 120_000, state: "Finalizing" }])
-        const aborts = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        assert.deepStrictEqual(attempts, [{ last_accessed_at: 240_000, state: "Finalizing" }])
+        const aborts = yield* sql<{ readonly provider_id: string }>`SELECT provider_id
           FROM effect_local_server_attachment_deletions WHERE operation = 'AbortUpload'`
-        assert.deepStrictEqual(aborts, [{ count: 0 }])
-        assert.strictEqual(yield* first.sweepSpace(spaceId), 1)
+        assert.deepStrictEqual(aborts, [{ provider_id: "ordinary-upload" }])
+        yield* first.sweepSpace(spaceId)
         const ordinary = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
           FROM effect_local_server_attachment_attempts WHERE attempt_id = 'ordinary-stale'`
         assert.deepStrictEqual(ordinary, [{ count: 0 }])
+      },
+      providePlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "does not let cadence-aligned Finalizing retries starve due object deletion",
+    Effect.fnUntraced(
+      function*() {
+        const { first, provider, sql } = yield* makeHarness(32, 1)
+        const prepared = yield* first.prepareUpload(identity)
+        assert.strictEqual(prepared._tag, "UploadPart")
+        if (prepared._tag !== "UploadPart") return
+        provider.setInspectHandler(() =>
+          Effect.fail(
+            new AttachmentObjectStore.AttachmentObjectStoreUnavailable({
+              namespace,
+              operation: "inspect.injected"
+            })
+          )
+        )
+        assert.isTrue(Result.isFailure(
+          yield* first.finalizeUpload({
+            ...identity,
+            attemptId: prepared.attemptId
+          }).pipe(Effect.result)
+        ))
+        const dueProviderId = AttachmentObjectStore.ProviderId.make("due-object")
+        yield* sql`INSERT INTO effect_local_server_attachment_objects
+          (space_id, digest, bytes, object_version, state, provider_namespace,
+            provider_object_id, provider_object_version, chunk_bytes, chunk_count,
+            garbage_collect_after, created_at, last_accessed_at)
+          VALUES (${spaceId}, ${deletionDigest}, 5, 'due-version', 'Available', ${namespace},
+            ${dueProviderId}, 'v1', 5, 1, 0, 0, 0)`
+
+        for (let pass = 0; pass < 3; pass++) {
+          yield* TestClock.adjust("1 minute")
+          yield* first.sweepSpace(spaceId)
+        }
+        const objects = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_attachment_objects WHERE space_id = ${spaceId} AND digest = ${deletionDigest}`
+        assert.deepStrictEqual(objects, [{ count: 0 }])
+        const deletions = yield* sql<{ readonly provider_id: string }>`SELECT provider_id
+          FROM effect_local_server_attachment_deletions WHERE operation = 'DeleteObject'`
+        assert.deepStrictEqual(deletions, [{ provider_id: dueProviderId }])
+        assert.deepStrictEqual(yield* usageState(sql), { object_count: 2, byte_count: 6 })
+        assert.strictEqual(yield* first.drainOutbox, 1)
+        assert.deepStrictEqual(provider.deleted.map(({ id }) => id), [dueProviderId])
+        assert.deepStrictEqual(yield* usageState(sql), { object_count: 1, byte_count: 1 })
       },
       providePlatform,
       Effect.scoped
