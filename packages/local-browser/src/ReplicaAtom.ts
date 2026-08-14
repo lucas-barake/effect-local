@@ -1,3 +1,4 @@
+import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
@@ -12,6 +13,7 @@ import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Hash from "effect/Hash"
 import type * as Layer from "effect/Layer"
+import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import type * as AtomRegistry from "effect/unstable/reactivity/AtomRegistry"
@@ -32,9 +34,112 @@ class QueryKey<P,> implements Equal.Equal {
   }
 }
 
+class EphemeralJoinKey implements Equal.Equal {
+  readonly value: string
+  readonly request: Protocol.EphemeralJoinRequest
+  constructor(request: Protocol.EphemeralJoinRequest) {
+    this.value = `${request.spaceId}:${request.member.clientId}:${request.member.membershipIncarnation}:${
+      Canonical.hash(request)
+    }`
+    this.request = request
+  }
+  [Equal.symbol](that: unknown): boolean {
+    return that instanceof EphemeralJoinKey && this.value === that.value
+  }
+  [Hash.symbol](): number {
+    return Hash.string(this.value)
+  }
+}
+
+export interface EphemeralView {
+  readonly spaceId: Identity.SpaceId
+  readonly revision: Identity.EphemeralRevision
+  readonly members: ReadonlyArray<Protocol.EphemeralMemberEntry>
+  readonly states: ReadonlyArray<Protocol.EphemeralStateEntry>
+  readonly events: ReadonlyArray<Protocol.EphemeralEventEntry>
+}
+
+const sameMember = (left: Protocol.EphemeralMember, right: Protocol.EphemeralMember) =>
+  left.clientId === right.clientId && left.membershipIncarnation === right.membershipIncarnation
+
+const reduceEphemeral = (
+  current: EphemeralView | undefined,
+  message: Protocol.EphemeralMessage
+): EphemeralView | undefined => {
+  if (message._tag === "Snapshot") {
+    return {
+      spaceId: message.spaceId,
+      revision: message.revision,
+      members: message.members,
+      states: message.states,
+      events: []
+    }
+  }
+  if (current === undefined) return undefined
+  if (message._tag === "MemberUpserted") {
+    return {
+      ...current,
+      revision: message.revision,
+      members: [
+        ...current.members.filter((entry) => !sameMember(entry.member, message.entry.member)),
+        message.entry
+      ]
+    }
+  }
+  if (message._tag === "MemberLeft") {
+    return {
+      ...current,
+      revision: message.revision,
+      members: current.members.filter((entry) => !sameMember(entry.member, message.member)),
+      events: current.events.filter((entry) => !sameMember(entry.member, message.member))
+    }
+  }
+  if (message._tag === "StateSet") {
+    return {
+      ...current,
+      revision: message.revision,
+      states: [
+        ...current.states.filter((entry) =>
+          !sameMember(entry.member, message.entry.member) ||
+          entry.channel !== message.entry.channel || entry.key !== message.entry.key
+        ),
+        message.entry
+      ]
+    }
+  }
+  if (message._tag === "StateRemoved") {
+    return {
+      ...current,
+      revision: message.revision,
+      states: current.states.filter((entry) =>
+        !sameMember(entry.member, message.member) || entry.channel !== message.channel || entry.key !== message.key
+      )
+    }
+  }
+  if (message._tag === "Event") {
+    return {
+      ...current,
+      revision: message.revision,
+      events: [
+        ...current.events.filter((entry) =>
+          !sameMember(entry.member, message.entry.member) || entry.channel !== message.entry.channel
+        ),
+        message.entry
+      ]
+    }
+  }
+  return {
+    ...current,
+    revision: message.revision,
+    events: current.events.filter((entry) =>
+      !sameMember(entry.member, message.member) || entry.channel !== message.channel
+    )
+  }
+}
+
 export const make = <E,>(
   layer: Layer.Layer<
-    Replica.Replica | QueryReactivity.QueryReactivity,
+    Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient,
     E,
     AtomRegistry.AtomRegistry | Reactivity.Reactivity
   >,
@@ -46,6 +151,30 @@ export const make = <E,>(
   const factory = options?.factory ?? Atom.runtime
   const runtime = factory(layer)
   const idleTTL = Duration.toMillis(options?.idleTTL ?? Duration.seconds(30))
+
+  const ephemeral = Atom.family((key: EphemeralJoinKey) => {
+    const stream = Stream.unwrap(
+      Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        return client.join(key.request).pipe(
+          Stream.mapAccum(
+            (): EphemeralView | undefined => undefined,
+            (current, message) => {
+              const next = reduceEphemeral(current, message)
+              if (next === undefined) return [current, []] as const
+              return [next, [next]] as const
+            }
+          )
+        )
+      })
+    )
+    return runtime.atom(stream).pipe(Atom.setIdleTTL(idleTTL))
+  })
+  const ephemeralView = (request: Protocol.EphemeralJoinRequest) => ephemeral(new EphemeralJoinKey(request))
+  const publishEphemeral = runtime.fn<Protocol.EphemeralPublishRequest>()(
+    (request) => EphemeralClient.EphemeralClient.use((client) => client.publish(request)),
+    { concurrent: true }
+  )
 
   const entity = <M extends Model.Any,>(spaceId: Identity.SpaceId, model: M) =>
     Atom.family((key: Model.Key<M>) =>
@@ -229,6 +358,8 @@ export const make = <E,>(
     spaces,
     aggregateStatus,
     join,
-    leave
+    leave,
+    ephemeral: ephemeralView,
+    publishEphemeral
   } as const
 }

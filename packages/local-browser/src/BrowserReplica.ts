@@ -1,3 +1,4 @@
+import type * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import type * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as Duration from "effect/Duration"
@@ -9,7 +10,7 @@ import * as ReplicaAtom from "./ReplicaAtom.js"
 
 export const make = <E,>(
   layer: Layer.Layer<
-    Replica.Replica | QueryReactivity.QueryReactivity,
+    Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient,
     E,
     AtomRegistry.AtomRegistry | Reactivity.Reactivity
   >,

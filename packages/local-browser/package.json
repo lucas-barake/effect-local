@@ -49,6 +49,7 @@
   },
   "dependencies": {
     "@lucas-barake/effect-local": "workspace:^",
+    "@lucas-barake/effect-local-rpc": "workspace:^",
     "@lucas-barake/effect-local-sql": "workspace:^"
   },
   "peerDependencies": {
