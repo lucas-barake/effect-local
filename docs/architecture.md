@@ -40,7 +40,7 @@ Server SQL contains:
 - immutable client and scope bound snapshot manifests and their authorized current entity rows
 
 Workflow storage contains reconciliation execution control only. It does not contain mutation payloads, receipts, log
-entries, or canonical state. Cluster messages and publications are routed wake and presence signals. They are never
+entries, or canonical state. Cluster messages and publications are routed wake and bounded ephemeral signals. They are never
 application data authority.
 
 ## Mutation lifecycle
@@ -113,9 +113,9 @@ idempotent reconciliation operation as the in memory scheduler.
 
 The server front door is an authenticated WebSocket RPC facade. It routes every operation by space through four Effect
 Cluster entity types. `SpaceAdmissionEntity` runs Submit and Discard sequentially. `SpaceReadEntity` forks Pull and
-immutable snapshot Bootstrap pages. `SpaceWatchEntity` forks long lived sync and presence streams.
-`SpacePresencePublishEntity` runs bounded concurrent presence publications. Each entity has its own required finite
-mailbox, so a paused Bootstrap page or a full watch lane cannot occupy mutation admission.
+immutable snapshot Bootstrap pages. `SpaceWatchEntity` forks long lived sync watches. `SpaceEphemeralEntity` runs
+joined ephemeral streams, publications, and heartbeats. Each entity has its own required finite mailbox, so a paused
+Bootstrap page or a full stream lane cannot occupy mutation admission.
 
 An accepted admission publishes a shared in memory wake after its SQL transaction commits. Subscribers read that
 publication from the per space hub. Fanout does not acquire a SQLite transaction or write a space row for each watcher.
@@ -138,7 +138,7 @@ Entity keys invalidate exact records. Query dependencies invalidate once per spa
 
 ## Capacity
 
-Protocol limits bound a mutation, a pull page, a bootstrap page, and a presence update by count and encoded bytes.
+Protocol limits bound a mutation, a pull page, a bootstrap page, and ephemeral requests by count and encoded bytes.
 Server options set hard history, receipt, entity, snapshot byte, and bootstrap byte limits. Admission cross checks
 space counters against trigger maintained shadow counters under the lock before executing a handler and checks
 resulting snapshot capacity inside the handler savepoint. The client bounds pending mutations, retained receipts,
@@ -147,16 +147,17 @@ dispatcher with independent watches and turns. Workflow generations coalesce dur
 publications carry only notifications.
 
 `SpaceEntity.HandlerOptions` requires positive finite `admissionMailboxCapacity`, `readMailboxCapacity`,
-`watchMailboxCapacity`, and `presencePublicationMailboxCapacity` values. It also requires
+`watchMailboxCapacity`, and `ephemeralMailboxCapacity` values. It also requires
 `maximumConcurrentBootstrapAuthorizations`, `maximumConcurrentBootstrapPagesPerSpace`, and
-`maximumConcurrentPresencePublicationsPerSpace`. Bootstrap assertion verification and preparation share one fail fast
+`maximumConcurrentEphemeralRequestsPerSpace`. Bootstrap assertion verification and preparation share one fail fast
 Layer wide allowance. Published page reads use a separate per space allowance. Saturation reports `CapacityExceeded`
 with resource `bootstrap authorizations` or `bootstrap pages`.
 
-`ServerStore.maximumWatchersPerSpace` is the active sync watcher allowance. `PresenceHub.maximumWatchersPerSpace` is a
-separate active presence watcher allowance. `ServerStore.wakeCapacity` and `PresenceHub.capacity` are sliding
-publication queue depths, not watcher limits. Excess watchers fail with typed `CapacityExceeded` resources `sync
-watchers` or `presence watchers`. Interrupted, denied, and revoked streams release their watcher allowance.
+`ServerStore.maximumWatchersPerSpace` is the active sync watcher allowance. `EphemeralHub.maximumWatchersPerSpace` is a
+separate joined-stream allowance. `ServerStore.wakeCapacity` is the sliding sync hint depth. `EphemeralHub.capacity`
+bounds one shared dropping delta generation. Overflow closes that generation so clients rejoin from a fresh roster and
+retained-state snapshot. Excess watchers fail with typed `CapacityExceeded` resources `sync watchers` or `ephemeral
+watchers`. Interrupted, denied, and revoked streams release their watcher allowance.
 
 Sync watch authorization successes share one structural `(spaceId, clientId, normalized scope, principal)` lookup and expire after
 `readAuthorizationRefreshInterval`. `maximumConcurrentReadAuthorizations` bounds policy work and
@@ -169,11 +170,11 @@ through the interval. If a fresh success is not available at the existing succes
 the stream fails with `AuthorizationDenied`. The configured interval is therefore the fail closed revocation bound even
 when policy work hangs or the client stops pulling. Pull and Bootstrap perform uncached one shot authorization checks.
 
-Capacity failures use the Schema tagged `CapacityExceeded { resource, limit }` error across SQL, presence, and RPC
+Capacity failures use the Schema tagged `CapacityExceeded { resource, limit }` error across SQL, ephemera, and RPC
 boundaries. Full Cluster mailboxes map to `ServerUnavailable` because the request did not enter its domain handler.
 
 Operational metrics report admission outcome and rejection class, history and receipt depth beside their limits, sync
-and presence watcher populations, wake fanout duration, durable bootstrap installs, maintenance outcomes and prune
+and ephemeral watcher populations, wake fanout duration, durable bootstrap installs, maintenance outcomes and prune
 volumes, and pending client mutation population. Labels are bounded categories. They do not contain resource
 identifiers. The production fanout benchmark is `packages/local-rpc/bench/Fanout.bench.ts`.
 

@@ -1,21 +1,91 @@
 # @lucas-barake/effect-local-browser
 
-Browser SQLite, Effect Atom, and best effort presence for Effect Local.
+Browser SQLite ports and the joined Effect Atom graph for Effect Local.
 
-`BrowserSqlite.layerMessagePort` adapts an application owned SQLite WASM worker port. `BrowserReplica.make` creates one
-Atom runtime with space addressed entity families, query families, concurrent mutation functions, receipts, and
-per space status. It exposes `scope`, `setScope`, `activation`, `activate`, and `deactivate` families beside `spaces`,
-`join`, `leave`, and the constant size `aggregateStatus`. It uses Effect `Reactivity`, so committed local writes and
-installed server entries refresh only matching space and model dependencies. Membership, aggregate, scope, activation,
-and addressed status have separate keys. Leaving a space invalidates retained atoms for that address.
+`BrowserSqlite.layerMessagePort` adapts an application-owned SQLite WASM worker port. `BrowserReplica.make` creates one
+Atom runtime with space-addressed entities, queries, mutations, receipts, settlements, lifecycle operations, and
+ephemera. It requires the production `Replica`, `QueryReactivity`, and `EphemeralClient` services in the supplied Layer.
 
-Pass either `SqlReplica.layer` or `SqlReplica.layerWorkflow` to the graph. The Workflow composition can run in an
-application owned dedicated Worker or SharedWorker with SQL backed `SingleRunner` and `ClusterWorkflowEngine`.
-`BrowserReplica` deliberately does not create a Worker or choose its URL, database name, credentials, runner storage,
-or lifecycle policy. A SharedWorker must build one replica runtime per database and share it across page ports.
-`Atom.runtime` stays on the page side when an application adds an RPC bridge to a worker owned replica.
+```ts
+import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
+import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
+import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Layer from "effect/Layer"
 
-`Presence.make` Schema decodes ephemeral values, expires them by TTL, and prevents slow stale decodes or scope
-finalizers from replacing newer client state. Presence never enters SQLite or the mutation log.
+const graph = BrowserReplica.make(Layer.merge(layerReplica, EphemeralClient.layer))
+
+const member = Protocol.EphemeralMember.make({
+  clientId,
+  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
+})
+
+export const conversationLiveAtom = graph.ephemeral({
+  spaceId,
+  member,
+  value: { status: "online" },
+  ttlMillis: 30_000
+})
+
+export const publishEphemeralAtom = graph.publishEphemeral
+```
+
+The ephemeral atom resolves to:
+
+```ts
+interface EphemeralView {
+  readonly spaceId: Identity.SpaceId
+  readonly revision: Identity.EphemeralRevision
+  readonly members: ReadonlyArray<Protocol.EphemeralMemberEntry>
+  readonly states: ReadonlyArray<Protocol.EphemeralStateEntry>
+  readonly events: ReadonlyArray<Protocol.EphemeralEventEntry>
+}
+```
+
+The first server snapshot replaces the roster and retained state and clears all live events. Later deltas upsert and
+remove entries by member, channel, and key. `MemberLeft` removes that member and their current events while leaving
+their retained state until its own server TTL. `EventCleared` and `StateRemoved` clear the matching entry. The browser
+does not run a second TTL store. Server expiry messages are the source of truth.
+
+Set `graph.publishEphemeral` with any `Protocol.EphemeralPublishRequest`:
+
+```ts
+registry.set(graph.publishEphemeral, {
+  _tag: "Event",
+  spaceId,
+  member,
+  channel: "typing",
+  value: { active: true },
+  ttlMillis: 5_000
+})
+
+registry.set(graph.publishEphemeral, {
+  _tag: "SetState",
+  spaceId,
+  member,
+  channel: "read",
+  key: "conversation-42",
+  value: { message: 108 },
+  ttlMillis: 60_000
+})
+```
+
+Events reach current subscribers only. Retained state and the roster replay to later joiners. Every request includes a
+space, so one atom cannot observe another space. The scoped client maintains heartbeats and rejoins with a replacement
+snapshot after server fan-out overflow. Disposing the registry or evicting the idle atom closes the joined stream and
+lets the server emit member departure.
+
+Ephemera never enters browser SQLite or the durable mutation log. Persist a read or delivery position with an ordinary
+domain mutation when it must survive server restart or the configured state TTL.
+
+The remaining graph families expose `entity`, `query`, `mutation`, `pending`, `receipt`, `settlements`, `scope`,
+`setScope`, `activation`, `activate`, `deactivate`, `status`, `spaces`, `join`, `leave`, and the constant-size
+`aggregateStatus`. Effect `Reactivity` refreshes only mounted reads whose exact space, entity, or index range changed.
+Leaving a space invalidates retained atoms for that address.
+
+Pass either `SqlReplica.layer` or `SqlReplica.layerWorkflow` as the replica portion of the Layer. The Workflow
+composition can run in an application-owned dedicated Worker or SharedWorker. `BrowserReplica` does not choose the
+Worker URL, database name, credentials, runner storage, or lifecycle policy. `Atom.runtime` stays on the page side when
+the application bridges to a worker-owned replica.
 
 See the [repository guide](https://github.com/lucas-barake/effect-local#readme).
