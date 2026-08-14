@@ -69,18 +69,87 @@ those deployment policies.
 
 ## Ephemeral semantics
 
-`EphemeralClient.join` and TTL-bearing publish requests accept `ttl: Duration.Input`. Only the serialized RPC
-protocol uses integer `ttlMillis` fields.
+The client API is schema first. A channel is declared once with `Ephemeral.make` and requires an explicit
+`kind: "event"` or `kind: "state"`; the roster value schema comes from `Ephemeral.member`. The definition's name is the
+wire channel, its payload schema encodes on publish and decodes on receive, and a state definition adds a typed key
+codec whose encoded form must satisfy the bounded wire key. `Ephemeral.group` rejects duplicate names when an
+application collects its definitions.
 
-A join identifies a member by `(clientId, membershipIncarnation)` and returns one ordered stream:
+```ts
+import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
+import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
+import * as Effect from "effect/Effect"
+import * as Schema from "effect/Schema"
+
+const ConversationId = Schema.String.pipe(Schema.brand("ConversationId"))
+
+const Typing = Ephemeral.make("Typing", {
+  kind: "event",
+  payload: { conversationId: ConversationId, active: Schema.Boolean }
+})
+
+const ReadPosition = Ephemeral.make("ReadPosition", {
+  kind: "state",
+  key: ConversationId,
+  payload: { messageId: Schema.String }
+})
+
+const Presence = Ephemeral.member({ status: Schema.String })
+
+const program = Effect.gen(function*() {
+  const ephemeral = yield* EphemeralClient.EphemeralClient
+  const session = yield* ephemeral.session(Presence, {
+    spaceId,
+    member,
+    value: { status: "online" },
+    ttl: "30 seconds"
+  })
+  yield* ephemeral.publish(Typing, {
+    spaceId,
+    member,
+    payload: { conversationId: ConversationId.make("conversation-42"), active: true },
+    ttl: "5 seconds"
+  })
+  yield* ephemeral.publish(ReadPosition, {
+    spaceId,
+    member,
+    key: ConversationId.make("conversation-42"),
+    payload: { messageId: "message-108" },
+    ttl: "1 minute"
+  })
+  const typing = session.events(Typing)
+  const positions = session.state(ReadPosition)
+  const roster = session.members
+  yield* session.updateMember({ status: "away" })
+})
+```
+
+`session` opens exactly one joined server stream per `(spaceId, clientId, membershipIncarnation)` and every typed
+projection derives from it. Identical concurrent session requests share the same runtime; a request with a different
+member value or ttl for a live member fails with `InvalidConfiguration` instead of silently evicting the previous
+server session. `session.events` yields decoded live envelopes for its definition only. `session.state` yields the
+full decoded entry list for its definition, immediately on subscription (late subscribers included) and on every
+change. `session.members` yields the decoded roster. `clear` and `remove` are the typed counterparts of event
+clearing and state removal.
+
+Payload and key encoding failures fail the publish with a typed `EphemeralEncodeError`. A malformed remote value —
+for example a peer running an incompatible schema for one channel — fails only the projection stream that decodes it,
+with a typed `EphemeralDecodeError`; the shared session and every other projection continue, and resubscribing a state
+projection replays the current view. There is no schema version negotiation for ephemeral definitions; they never
+participate in durable `Definition` schema identity or replication negotiation.
+
+`session` and TTL-bearing publishes accept `ttl: Duration.Input`. Only the serialized RPC protocol uses integer
+`ttlMillis` fields.
+
+The underlying transport identifies a member by `(clientId, membershipIncarnation)` and delivers one ordered stream:
 
 - The first message is a snapshot containing the complete current roster and retained state for that space.
-- `Event` is a live-only stream value for typing or similar signals. It is never included in a later snapshot. The
-  server emits `EventCleared` when its TTL expires, and callers may clear it sooner.
-- `SetState` is last-writer-wins state per `(member, channel, key)`. It replays to later joiners and supports explicit
+- An event is live only, for typing or similar signals. It is never included in a later snapshot. The server clears it
+  when its TTL expires, and callers may clear it sooner.
+- State is last-writer-wins per `(member, definition, key)`. It replays to later joiners and supports explicit
   removal. Read positions and delivery positions fit this shape.
-- Member liveness is server leased. `EphemeralClient` heartbeats while its joined stream is scoped. Stream teardown or
-  lease expiry removes the roster entry and emits `MemberLeft`.
+- Member liveness is server leased. `EphemeralClient` heartbeats while its session is scoped. Session teardown or
+  lease expiry removes the roster entry and emits a departure.
 - A new join for the same member identity replaces the old session. The old stream terminates without reconnecting,
   and its live events are cleared before the replacement becomes current.
 - Retained state survives member departure until its own server-enforced TTL. This lets a later member observe the

@@ -464,9 +464,11 @@ benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1
 ```ts
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
+import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
 
 export const graph = BrowserReplica.make(Layer.merge(layerReplica, EphemeralClient.layer))
 
@@ -491,13 +493,28 @@ const member = Protocol.EphemeralMember.make({
   membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
 })
 
-export const conversationLiveAtom = graph.ephemeral({
+const ConversationId = Schema.String.pipe(Schema.brand("ConversationId"))
+const Typing = Ephemeral.make("Typing", {
+  kind: "event",
+  payload: { conversationId: ConversationId, active: Schema.Boolean }
+})
+const ReadPosition = Ephemeral.make("ReadPosition", {
+  kind: "state",
+  key: ConversationId,
+  payload: { messageId: Schema.String }
+})
+const Presence = Ephemeral.member({ status: Schema.String })
+
+export const sessionAtom = graph.ephemeral(Presence, {
   spaceId,
   member,
   value: { status: "online" },
   ttl: "30 seconds"
 })
-export const publishEphemeralAtom = graph.publishEphemeral
+export const typingAtom = graph.ephemeralEvents(sessionAtom, Typing)
+export const positionsAtom = graph.ephemeralState(sessionAtom, ReadPosition)
+export const rosterAtom = graph.ephemeralMembers(sessionAtom)
+export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId, member })
 ```
 
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
@@ -506,10 +523,13 @@ actually read. Local commits and reconciliation batches refresh only affected mo
 receipt, scope, activation, and status atoms also require a space address. A settlement atom resolves to the lazy live Stream. Mounting
 the atom does not consume or replay events. Materializing that Stream owns one scoped subscription. The membership and
 aggregate atoms use separate keys, so a write does not rebuild the membership list or unrelated statuses. Mutation
-and lifecycle command atoms are concurrent and preserve their typed result. `conversationLiveAtom` holds the current
-roster, replayable state, and live events for its space. Set `publishEphemeralAtom` with an `Event`, `ClearEvent`,
-`SetState`, `RemoveState`, or `UpdateMember` request. Pass an
-application factory with `options.factory` when the application already owns a deliberate custom runtime.
+and lifecycle command atoms are concurrent and preserve their typed result. Ephemeral channels are declared once with
+`Ephemeral.make` (an explicit event or state kind) and drive typed publish commands and typed projections. All typed
+projections for one member share the session atom's single joined stream: events are live only, state and the roster
+replay their current decoded view to late subscribers, and a malformed remote value fails only the projection for its
+own definition with a typed decode error. Set `publishTypingAtom` with `{ payload, ttl }` and observe the command's
+`AsyncResult`. Pass an application factory with `options.factory` when the application already owns a deliberate
+custom runtime.
 
 ## Selective field semantics
 
