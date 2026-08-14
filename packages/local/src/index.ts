@@ -1,5 +1,6 @@
 export * as Canonical from "./Canonical.js"
 export * as Definition from "./Definition.js"
+export * as Ephemeral from "./Ephemeral.js"
 export * as Evolution from "./Evolution.js"
 export * as Field from "./Field.js"
 export * as Identity from "./Identity.js"
