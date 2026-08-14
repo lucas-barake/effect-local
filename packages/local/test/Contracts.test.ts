@@ -601,13 +601,35 @@ describe("domain contracts", () => {
           afterOrdinal: -1,
           limit: 1
         }],
-        [Protocol.VersionedPresenceUpdate, {
+        [Protocol.VersionedEphemeralJoinRequest, {
           spaceId,
-          clientId: envelope.clientId,
+          member: {
+            clientId: envelope.clientId,
+            membershipIncarnation: envelope.membershipIncarnation
+          },
           value: null,
           ttlMillis: 1
         }],
-        [Protocol.VersionedWatchPresenceRequest, { spaceId }]
+        [Protocol.VersionedEphemeralPublishRequest, {
+          request: {
+            _tag: "Event",
+            spaceId,
+            member: {
+              clientId: envelope.clientId,
+              membershipIncarnation: envelope.membershipIncarnation
+            },
+            channel: "typing",
+            value: null,
+            ttlMillis: 1
+          }
+        }],
+        [Protocol.VersionedEphemeralHeartbeatRequest, {
+          spaceId,
+          member: {
+            clientId: envelope.clientId,
+            membershipIncarnation: envelope.membershipIncarnation
+          }
+        }]
       ] as const
 
       for (const [contract, operation] of operations) {

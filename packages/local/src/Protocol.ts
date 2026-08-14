@@ -10,11 +10,15 @@ export const maximumMutationBytes = 256 * 1024
 export const maximumBatchEntries = 1_000
 export const maximumBatchBytes = 4 * 1024 * 1024
 export const maximumReceiptBytes = 4 * 1024 * 1024
-export const maximumPresenceBytes = 16 * 1024
+export const maximumEphemeralPayloadBytes = 16 * 1024
+export const maximumEphemeralChannelLength = 256
+export const maximumEphemeralKeyLength = 256
 export const maximumReplicationScopeBytes = 4 * 1024 * 1024
 export const maximumReplicationWindows = 1_000
 export const maximumReplicationWindowPartitions = 1_000
-export const maximumPresenceTtlMillis = 60_000
+export const maximumEphemeralMemberTtlMillis = 60_000
+export const maximumEphemeralEventTtlMillis = 60_000
+export const maximumEphemeralStateTtlMillis = 7 * 24 * 60 * 60 * 1_000
 export const maximumBootstrapEntries = 1_000
 
 export const ProtocolVersion = Schema.Int.check(Schema.isGreaterThan(0))
@@ -529,19 +533,181 @@ export const Wake = Schema.Struct({
 })
 export type Wake = typeof Wake.Type
 
-export const PresenceUpdate = Schema.Struct({
-  spaceId: Identity.SpaceId,
+export const EphemeralMember = Schema.Struct({
   clientId: Identity.ClientId,
+  membershipIncarnation: Identity.MembershipIncarnation
+})
+export type EphemeralMember = typeof EphemeralMember.Type
+
+export const EphemeralChannel = Schema.NonEmptyString.check(
+  Schema.isMaxLength(maximumEphemeralChannelLength)
+)
+export type EphemeralChannel = typeof EphemeralChannel.Type
+
+export const EphemeralKey = Schema.NonEmptyString.check(Schema.isMaxLength(maximumEphemeralKeyLength))
+export type EphemeralKey = typeof EphemeralKey.Type
+
+const EphemeralRequestIdentity = {
+  spaceId: Identity.SpaceId,
+  member: EphemeralMember
+}
+
+export const EphemeralJoinRequest = Schema.Struct({
+  ...EphemeralRequestIdentity,
   value: Schema.Json,
   ttlMillis: Schema.Int.check(
     Schema.isGreaterThan(0),
-    Schema.isLessThanOrEqualTo(maximumPresenceTtlMillis)
+    Schema.isLessThanOrEqualTo(maximumEphemeralMemberTtlMillis)
   )
 })
-export type PresenceUpdate = typeof PresenceUpdate.Type
-export const VersionedPresenceUpdate = PresenceUpdate.pipe(withProtocolVersion)
+export type EphemeralJoinRequest = typeof EphemeralJoinRequest.Type
+export const VersionedEphemeralJoinRequest = EphemeralJoinRequest.pipe(withProtocolVersion)
 
-export const VersionedWatchPresenceRequest = Schema.Struct({ spaceId: Identity.SpaceId }).pipe(withProtocolVersion)
+export const EphemeralEventRequest = Schema.TaggedStruct("Event", {
+  ...EphemeralRequestIdentity,
+  channel: EphemeralChannel,
+  value: Schema.Json,
+  ttlMillis: Schema.Int.check(
+    Schema.isGreaterThan(0),
+    Schema.isLessThanOrEqualTo(maximumEphemeralEventTtlMillis)
+  )
+})
+export type EphemeralEventRequest = typeof EphemeralEventRequest.Type
+
+export const EphemeralClearEventRequest = Schema.TaggedStruct("ClearEvent", {
+  ...EphemeralRequestIdentity,
+  channel: EphemeralChannel
+})
+export type EphemeralClearEventRequest = typeof EphemeralClearEventRequest.Type
+
+export const EphemeralSetStateRequest = Schema.TaggedStruct("SetState", {
+  ...EphemeralRequestIdentity,
+  channel: EphemeralChannel,
+  key: EphemeralKey,
+  value: Schema.Json,
+  ttlMillis: Schema.Int.check(
+    Schema.isGreaterThan(0),
+    Schema.isLessThanOrEqualTo(maximumEphemeralStateTtlMillis)
+  )
+})
+export type EphemeralSetStateRequest = typeof EphemeralSetStateRequest.Type
+
+export const EphemeralRemoveStateRequest = Schema.TaggedStruct("RemoveState", {
+  ...EphemeralRequestIdentity,
+  channel: EphemeralChannel,
+  key: EphemeralKey
+})
+export type EphemeralRemoveStateRequest = typeof EphemeralRemoveStateRequest.Type
+
+export const EphemeralUpdateMemberRequest = Schema.TaggedStruct("UpdateMember", {
+  ...EphemeralRequestIdentity,
+  value: Schema.Json
+})
+export type EphemeralUpdateMemberRequest = typeof EphemeralUpdateMemberRequest.Type
+
+export const EphemeralPublishRequest = Schema.Union([
+  EphemeralEventRequest,
+  EphemeralClearEventRequest,
+  EphemeralSetStateRequest,
+  EphemeralRemoveStateRequest,
+  EphemeralUpdateMemberRequest
+])
+export type EphemeralPublishRequest = typeof EphemeralPublishRequest.Type
+export const VersionedEphemeralPublishRequest = Schema.Struct({
+  request: EphemeralPublishRequest
+}).pipe(withProtocolVersion)
+
+export const EphemeralHeartbeatRequest = Schema.Struct(EphemeralRequestIdentity)
+export type EphemeralHeartbeatRequest = typeof EphemeralHeartbeatRequest.Type
+export const VersionedEphemeralHeartbeatRequest = EphemeralHeartbeatRequest.pipe(withProtocolVersion)
+
+const EphemeralEntryIdentity = {
+  member: EphemeralMember,
+  expiresAtMillis: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}
+
+export const EphemeralMemberEntry = Schema.Struct({
+  ...EphemeralEntryIdentity,
+  value: Schema.Json
+})
+export type EphemeralMemberEntry = typeof EphemeralMemberEntry.Type
+
+export const EphemeralStateEntry = Schema.Struct({
+  ...EphemeralEntryIdentity,
+  channel: EphemeralChannel,
+  key: EphemeralKey,
+  value: Schema.Json
+})
+export type EphemeralStateEntry = typeof EphemeralStateEntry.Type
+
+export const EphemeralEventEntry = Schema.Struct({
+  ...EphemeralEntryIdentity,
+  channel: EphemeralChannel,
+  value: Schema.Json
+})
+export type EphemeralEventEntry = typeof EphemeralEventEntry.Type
+
+const EphemeralDeltaIdentity = {
+  spaceId: Identity.SpaceId,
+  revision: Identity.EphemeralRevision
+}
+
+export const EphemeralSnapshot = Schema.TaggedStruct("Snapshot", {
+  ...EphemeralDeltaIdentity,
+  members: Schema.Array(EphemeralMemberEntry),
+  states: Schema.Array(EphemeralStateEntry)
+})
+export type EphemeralSnapshot = typeof EphemeralSnapshot.Type
+
+export const EphemeralMemberUpserted = Schema.TaggedStruct("MemberUpserted", {
+  ...EphemeralDeltaIdentity,
+  entry: EphemeralMemberEntry
+})
+export type EphemeralMemberUpserted = typeof EphemeralMemberUpserted.Type
+
+export const EphemeralMemberLeft = Schema.TaggedStruct("MemberLeft", {
+  ...EphemeralDeltaIdentity,
+  member: EphemeralMember
+})
+export type EphemeralMemberLeft = typeof EphemeralMemberLeft.Type
+
+export const EphemeralStateSet = Schema.TaggedStruct("StateSet", {
+  ...EphemeralDeltaIdentity,
+  entry: EphemeralStateEntry
+})
+export type EphemeralStateSet = typeof EphemeralStateSet.Type
+
+export const EphemeralStateRemoved = Schema.TaggedStruct("StateRemoved", {
+  ...EphemeralDeltaIdentity,
+  member: EphemeralMember,
+  channel: EphemeralChannel,
+  key: EphemeralKey
+})
+export type EphemeralStateRemoved = typeof EphemeralStateRemoved.Type
+
+export const EphemeralEvent = Schema.TaggedStruct("Event", {
+  ...EphemeralDeltaIdentity,
+  entry: EphemeralEventEntry
+})
+export type EphemeralEvent = typeof EphemeralEvent.Type
+
+export const EphemeralEventCleared = Schema.TaggedStruct("EventCleared", {
+  ...EphemeralDeltaIdentity,
+  member: EphemeralMember,
+  channel: EphemeralChannel
+})
+export type EphemeralEventCleared = typeof EphemeralEventCleared.Type
+
+export const EphemeralMessage = Schema.Union([
+  EphemeralSnapshot,
+  EphemeralMemberUpserted,
+  EphemeralMemberLeft,
+  EphemeralStateSet,
+  EphemeralStateRemoved,
+  EphemeralEvent,
+  EphemeralEventCleared
+])
+export type EphemeralMessage = typeof EphemeralMessage.Type
 
 export const SubmissionState = Schema.Literals([
   "Queued",

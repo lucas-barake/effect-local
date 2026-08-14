@@ -55,6 +55,9 @@ export type ReplicationViewRevision = typeof ReplicationViewRevision.Type
 export const ReplicationScopeGeneration = sequence("ReplicationScopeGeneration", 0)
 export type ReplicationScopeGeneration = typeof ReplicationScopeGeneration.Type
 
+export const EphemeralRevision = sequence("EphemeralRevision", 0)
+export type EphemeralRevision = typeof EphemeralRevision.Type
+
 export const SchemaVersion = sequence("SchemaVersion", 1)
 export type SchemaVersion = typeof SchemaVersion.Type
 

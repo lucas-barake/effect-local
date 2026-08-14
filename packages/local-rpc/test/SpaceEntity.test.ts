@@ -27,7 +27,7 @@ import * as Entity from "effect/unstable/cluster/Entity"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import * as PresenceHub from "../src/PresenceHub.js"
+import * as EphemeralHub from "../src/EphemeralHub.js"
 import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
 
@@ -35,6 +35,10 @@ const spaceA = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const spaceB = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
+const member = Protocol.EphemeralMember.make({
+  clientId,
+  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
+})
 
 const Todo = Model.make("Todo", {
   version: 1,
@@ -101,10 +105,10 @@ const handlerOptions = {
   admissionMailboxCapacity: 32,
   readMailboxCapacity: 32,
   watchMailboxCapacity: 32,
-  presencePublicationMailboxCapacity: 32,
+  ephemeralMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 4,
   maximumConcurrentBootstrapPagesPerSpace: 1,
-  maximumConcurrentPresencePublicationsPerSpace: 4
+  maximumConcurrentEphemeralRequestsPerSpace: 4
 } satisfies SpaceEntity.HandlerOptions
 
 const envelope = (spaceId: Identity.SpaceId) => {
@@ -125,38 +129,38 @@ const envelope = (spaceId: Identity.SpaceId) => {
 }
 
 describe("SpaceEntity", () => {
-  it.effect("routes synchronization and presence through the split space boundaries", () =>
+  it.effect("routes synchronization and ephemera through the split space boundaries", () =>
     Effect.scoped(Effect.gen(function*() {
-      const presenceReady = yield* Deferred.make<void>()
-      const layerPresence = PresenceHub.layer({
+      const ephemeralReady = yield* Deferred.make<void>()
+      const layerEphemeral = EphemeralHub.layer({
         maximumWatchersPerSpace: 1_024,
         authorize: (input) => {
-          if (input._tag === "Watch") return Deferred.succeed(presenceReady, undefined).pipe(Effect.asVoid)
+          if (input._tag === "Join") return Deferred.succeed(ephemeralReady, undefined).pipe(Effect.asVoid)
           return Effect.void
         }
       })
       const actualStore = yield* Layer.build(layerStore).pipe(
         Effect.map(Context.get(ServerStore.ServerStore))
       )
-      const actualPresence = yield* Layer.build(layerPresence).pipe(
-        Effect.map(Context.get(PresenceHub.PresenceHub))
+      const actualEphemeral = yield* Layer.build(layerEphemeral).pipe(
+        Effect.map(Context.get(EphemeralHub.EphemeralHub))
       )
       const layerEntityHandlers = SpaceEntity.layerHandlers(handlerOptions).pipe(
         Layer.provide(layerAssertionVerifier),
         Layer.provide(Layer.succeed(ServerStore.ServerStore, actualStore)),
-        Layer.provide(Layer.succeed(PresenceHub.PresenceHub, actualPresence))
+        Layer.provide(Layer.succeed(EphemeralHub.EphemeralHub, actualEphemeral))
       )
       const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, layerEntityHandlers)
       const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerEntityHandlers)
       const makeWatchClient = yield* Entity.makeTestClient(SpaceEntity.SpaceWatchEntity, layerEntityHandlers)
-      const makePresencePublishClient = yield* Entity.makeTestClient(
-        SpaceEntity.SpacePresencePublishEntity,
+      const makeEphemeralClient = yield* Entity.makeTestClient(
+        SpaceEntity.SpaceEphemeralEntity,
         layerEntityHandlers
       )
       const admissionClient = yield* makeAdmissionClient(spaceA)
       const readClient = yield* makeReadClient(spaceA)
       const watchClient = yield* makeWatchClient(spaceA)
-      const presencePublishClient = yield* makePresencePublishClient(spaceA)
+      const ephemeralClient = yield* makeEphemeralClient(spaceA)
       const wakes = yield* Queue.unbounded<Protocol.Wake>()
       const watchAssertion = yield* assertionOf({ subject: "reader" })
       const watch = yield* watchClient.Watch({
@@ -220,22 +224,20 @@ describe("SpaceEntity", () => {
       })
       assert.deepStrictEqual(bootstrap.entries.map((entry) => entry.change._tag), ["Upsert"])
 
-      const watchPresenceAssertion = yield* assertionOf({ subject: "reader" })
-      const watchedPresence = yield* watchClient.WatchPresence({ assertion: watchPresenceAssertion }).pipe(
+      const joinAssertion = yield* assertionOf({ subject: "reader" })
+      const joined = yield* ephemeralClient.JoinEphemeral({
+        request: { spaceId: spaceA, member, value: { status: "online" }, ttlMillis: 5_000 },
+        assertion: joinAssertion
+      }).pipe(
         Stream.runHead,
         Effect.forkChild({ startImmediately: true })
       )
-      yield* Deferred.await(presenceReady)
-      const update: Protocol.PresenceUpdate = {
-        spaceId: spaceA,
-        clientId,
-        value: { cursor: 4 },
-        ttlMillis: 5_000
+      yield* Deferred.await(ephemeralReady)
+      const received = Option.getOrUndefined(yield* Fiber.join(joined))
+      assert.strictEqual(received?._tag, "Snapshot")
+      if (received?._tag === "Snapshot") {
+        assert.deepStrictEqual(received.members.map((entry) => entry.member), [member])
       }
-      const publishPresenceAssertion = yield* assertionOf({ subject: "writer" })
-      yield* presencePublishClient.PublishPresence({ update, assertion: publishPresenceAssertion })
-      const received = yield* Fiber.join(watchedPresence)
-      assert.deepStrictEqual(Option.getOrUndefined(received), update)
       yield* Fiber.interrupt(watch)
     })).pipe(
       Effect.provide(layerShardingConfig),
@@ -249,17 +251,17 @@ describe("SpaceEntity", () => {
         const layerEntityHandlers = SpaceEntity.layerHandlers(handlerOptions).pipe(
           Layer.provide(layerAssertionVerifier),
           Layer.provide(layerStore),
-          Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }))
+          Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }))
         )
         const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, layerEntityHandlers)
         const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerEntityHandlers)
-        const makePresencePublishClient = yield* Entity.makeTestClient(
-          SpaceEntity.SpacePresencePublishEntity,
+        const makeEphemeralClient = yield* Entity.makeTestClient(
+          SpaceEntity.SpaceEphemeralEntity,
           layerEntityHandlers
         )
         const admissionClient = yield* makeAdmissionClient(spaceA)
         const readClient = yield* makeReadClient(spaceA)
-        const presencePublishClient = yield* makePresencePublishClient(spaceA)
+        const ephemeralClient = yield* makeEphemeralClient(spaceA)
         const submitted = yield* envelope(spaceB)
 
         const submitAssertion = yield* assertionOf(null)
@@ -310,14 +312,20 @@ describe("SpaceEntity", () => {
         const bootstrapError = bootstrapResult.failure
         assert.strictEqual(bootstrapError._tag, "ProtocolInvalid")
 
-        const presenceAssertion = yield* assertionOf(null)
-        const presenceResult = yield* presencePublishClient.PublishPresence({
-          update: { spaceId: spaceB, clientId, value: null, ttlMillis: 5_000 },
-          assertion: presenceAssertion
+        const ephemeralAssertion = yield* assertionOf(null)
+        const ephemeralResult = yield* ephemeralClient.PublishEphemeral({
+          request: {
+            _tag: "Event",
+            spaceId: spaceB,
+            member,
+            channel: "typing",
+            value: null,
+            ttlMillis: 5_000
+          },
+          assertion: ephemeralAssertion
         }).pipe(Effect.result)
-        if (!Result.isFailure(presenceResult)) assert.fail("expected presence protocol failure")
-        const presenceError = presenceResult.failure
-        assert.strictEqual(presenceError._tag, "ProtocolInvalid")
+        if (!Result.isFailure(ephemeralResult)) assert.fail("expected ephemeral protocol failure")
+        assert.strictEqual(ephemeralResult.failure._tag, "ProtocolInvalid")
       },
       provideShardingConfig,
       provideNodeCrypto
@@ -376,7 +384,7 @@ describe("SpaceEntity", () => {
       const layerCluster = SpaceEntity.layer(handlerOptions).pipe(
         Layer.provide(layerAssertionVerifier),
         Layer.provide(Layer.succeed(ServerStore.ServerStore, wrapped)),
-        Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+        Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
         Layer.provide(
           SingleRunner.layer({
             runnerStorage: "memory",
@@ -478,7 +486,7 @@ describe("SpaceEntity", () => {
       const layerCluster = SpaceEntity.layer(handlerOptions).pipe(
         Layer.provide(layerAssertionVerifier),
         Layer.provide(Layer.succeed(ServerStore.ServerStore, wrapped)),
-        Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+        Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
         Layer.provide(
           SingleRunner.layer({
             runnerStorage: "memory",
@@ -599,7 +607,7 @@ describe("SpaceEntity", () => {
       }).pipe(
         Layer.provide(layerVerifier),
         Layer.provide(Layer.succeed(ServerStore.ServerStore, wrapped)),
-        Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+        Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
         Layer.provide(
           SingleRunner.layer({
             runnerStorage: "memory",

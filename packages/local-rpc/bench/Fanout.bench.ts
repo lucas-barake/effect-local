@@ -19,7 +19,7 @@ import * as Stream from "effect/Stream"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { afterAll, assert, beforeAll, bench } from "vitest"
-import * as PresenceHub from "../src/PresenceHub.js"
+import * as EphemeralHub from "../src/EphemeralHub.js"
 import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
 
@@ -85,20 +85,20 @@ const layerStore = ServerStore.layerTrusted({
   Layer.provide(layerMutationRuntime),
   Layer.provide(layerDatabase)
 )
-const layerPresenceHub = PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })
+const layerEphemeralHub = EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })
 const assertion = PrincipalAssertion.PrincipalAssertion.make("fanout-benchmark")
 const layerAssertionVerifier = PrincipalAssertion.layerVerifier(() => Effect.succeed(null))
 const layerCluster = SpaceEntity.layer({
   admissionMailboxCapacity: 32,
   readMailboxCapacity: 32,
   watchMailboxCapacity: 1_024,
-  presencePublicationMailboxCapacity: 32,
+  ephemeralMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
-  maximumConcurrentPresencePublicationsPerSpace: 16
+  maximumConcurrentEphemeralRequestsPerSpace: 16
 }).pipe(
   Layer.provide(layerStore),
-  Layer.provide(layerPresenceHub),
+  Layer.provide(layerEphemeralHub),
   Layer.provide(layerAssertionVerifier),
   Layer.provide(
     SingleRunner.layer({

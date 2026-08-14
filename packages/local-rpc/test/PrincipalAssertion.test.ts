@@ -15,7 +15,7 @@ import * as Schema from "effect/Schema"
 import * as Entity from "effect/unstable/cluster/Entity"
 import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import * as PresenceHub from "../src/PresenceHub.js"
+import * as EphemeralHub from "../src/EphemeralHub.js"
 import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
 
@@ -88,14 +88,14 @@ describe("principal assertions", () => {
           admissionMailboxCapacity: 32,
           readMailboxCapacity: 32,
           watchMailboxCapacity: 32,
-          presencePublicationMailboxCapacity: 32,
+          ephemeralMailboxCapacity: 32,
           maximumConcurrentBootstrapAuthorizations: 16,
           maximumConcurrentBootstrapPagesPerSpace: 4,
-          maximumConcurrentPresencePublicationsPerSpace: 16
+          maximumConcurrentEphemeralRequestsPerSpace: 16
         })
         const layerLiveHandlers = layerHandlers.pipe(
           Layer.provide(layerStore),
-          Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+          Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
           Layer.provide(layerVerifier)
         )
         const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerLiveHandlers)

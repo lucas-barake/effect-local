@@ -70,22 +70,31 @@ const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
           ))
         )
       ),
-    PublishPresence: (update) => {
-      const { protocolVersion, ...presence } = update
-      return requireVersion(protocolVersion).pipe(
-        Effect.andThen(issueAssertion),
-        Effect.flatMap((assertion) => client.publishPresence(update.spaceId, presence, assertion)),
-        Effect.as(null)
-      )
-    },
-    WatchPresence: ({ spaceId, protocolVersion }) =>
-      Stream.fromEffect(requireVersion(protocolVersion)).pipe(
+    JoinEphemeral: (request) => {
+      const { protocolVersion, ...join } = request
+      return Stream.fromEffect(requireVersion(protocolVersion)).pipe(
         Stream.flatMap(() =>
           Stream.unwrap(issueAssertion.pipe(
-            Effect.map((assertion) => client.watchPresence(spaceId, assertion))
+            Effect.map((assertion) => client.joinEphemeral(request.spaceId, join, assertion))
           ))
         )
       )
+    },
+    PublishEphemeral: ({ request, protocolVersion }) => {
+      return requireVersion(protocolVersion).pipe(
+        Effect.andThen(issueAssertion),
+        Effect.flatMap((assertion) => client.publishEphemeral(request.spaceId, request, assertion)),
+        Effect.as(null)
+      )
+    },
+    HeartbeatEphemeral: (request) => {
+      const { protocolVersion, ...heartbeat } = request
+      return requireVersion(protocolVersion).pipe(
+        Effect.andThen(issueAssertion),
+        Effect.flatMap((assertion) => client.heartbeatEphemeral(request.spaceId, heartbeat, assertion)),
+        Effect.as(null)
+      )
+    }
   })
 })
 

@@ -1,6 +1,6 @@
 export * as Authentication from "./Authentication.js"
-export * as PresenceClient from "./PresenceClient.js"
-export * as PresenceHub from "./PresenceHub.js"
+export * as EphemeralClient from "./EphemeralClient.js"
+export * as EphemeralHub from "./EphemeralHub.js"
 export * as PrincipalAssertion from "./PrincipalAssertion.js"
 export * as ProtocolSession from "./ProtocolSession.js"
 export * as SpaceEntity from "./SpaceEntity.js"

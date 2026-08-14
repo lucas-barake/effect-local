@@ -157,19 +157,26 @@ export class Watch extends Rpc.make("Watch", {
   stream: true
 }) {}
 
-export class PublishPresence extends Rpc.make("PublishPresence", {
-  payload: Protocol.VersionedPresenceUpdate.fields,
+export class JoinEphemeral extends Rpc.make("JoinEphemeral", {
+  payload: Protocol.VersionedEphemeralJoinRequest.fields,
+  success: Protocol.EphemeralMessage,
+  error: ReplicaError.ReplicaError,
+  defect: RemoteDefect,
+  stream: true
+}) {}
+
+export class PublishEphemeral extends Rpc.make("PublishEphemeral", {
+  payload: Protocol.VersionedEphemeralPublishRequest.fields,
   success: Schema.Null,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect
 }) {}
 
-export class WatchPresence extends Rpc.make("WatchPresence", {
-  payload: Protocol.VersionedWatchPresenceRequest.fields,
-  success: Protocol.PresenceUpdate,
+export class HeartbeatEphemeral extends Rpc.make("HeartbeatEphemeral", {
+  payload: Protocol.VersionedEphemeralHeartbeatRequest.fields,
+  success: Schema.Null,
   error: ReplicaError.ReplicaError,
-  defect: RemoteDefect,
-  stream: true
+  defect: RemoteDefect
 }) {}
 
 export const Rpcs = RpcGroup.make(
@@ -179,8 +186,9 @@ export const Rpcs = RpcGroup.make(
   Pull,
   Bootstrap,
   Watch,
-  PublishPresence,
-  WatchPresence
+  JoinEphemeral,
+  PublishEphemeral,
+  HeartbeatEphemeral
 ).middleware(
   Authentication.Authentication
 )

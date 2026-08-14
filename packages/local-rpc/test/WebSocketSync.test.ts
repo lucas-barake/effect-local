@@ -48,8 +48,8 @@ class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationEr
 )("TestAuthorizationError", { reason: Schema.String }) {}
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "../src/Authentication.js"
-import * as PresenceClient from "../src/PresenceClient.js"
-import * as PresenceHub from "../src/PresenceHub.js"
+import * as EphemeralClient from "../src/EphemeralClient.js"
+import * as EphemeralHub from "../src/EphemeralHub.js"
 import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as ProtocolSession from "../src/ProtocolSession.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
@@ -61,6 +61,10 @@ const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001"
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const forbiddenSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const ephemeralMember = Protocol.EphemeralMember.make({
+  clientId,
+  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
+})
 const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
 
 const Todo = Model.make("Todo", {
@@ -156,10 +160,10 @@ const entityOptions = {
   admissionMailboxCapacity: 64,
   readMailboxCapacity: 64,
   watchMailboxCapacity: 64,
-  presencePublicationMailboxCapacity: 64,
+  ephemeralMailboxCapacity: 64,
   maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
-  maximumConcurrentPresencePublicationsPerSpace: 16
+  maximumConcurrentEphemeralRequestsPerSpace: 16
 } satisfies SpaceEntity.HandlerOptions
 const clientHistory = {
   defaultScope: scope,
@@ -254,7 +258,7 @@ const layerRevokedAuthenticationClient = Layer.fresh(Authentication.layerClient)
 const layerCluster = SpaceEntity.layer(entityOptions).pipe(
   Layer.provide(layerAssertionVerifier),
   Layer.provide(layerStore),
-  Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+  Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
   Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
 )
 
@@ -295,7 +299,7 @@ const layerSocket = Effect.gen(function*() {
   return yield* Socket.makeWebSocket(`http://127.0.0.1:${address.port}/sync`)
 }).pipe(Layer.effect(Socket.Socket), Layer.provide(layerCountedConstructor))
 const layerClientProtocol = SyncClient.layerProtocolSocket().pipe(Layer.provide(layerSocket))
-const layerClient = Layer.merge(SyncClient.layer, PresenceClient.layer).pipe(
+const layerClient = Layer.merge(SyncClient.layer, EphemeralClient.layer).pipe(
   Layer.provide(layerClientProtocol),
   Layer.provide(layerAuthenticationClient)
 )
@@ -343,7 +347,7 @@ const layerInvalidProtocolLive = layerInvalidProtocolClient.pipe(
 type ProtocolObservation =
   | { readonly _tag: "Negotiate" }
   | { readonly _tag: "Pull"; readonly version: Protocol.ProtocolVersion }
-  | { readonly _tag: "PublishPresence"; readonly version: Protocol.ProtocolVersion }
+  | { readonly _tag: "PublishEphemeral"; readonly version: Protocol.ProtocolVersion }
 
 const protocolObservations = MutableRef.make<Array<ProtocolObservation>>([])
 const observingAuthentication = Effect.gen(function*() {
@@ -362,11 +366,11 @@ const observingAuthentication = Effect.gen(function*() {
           { _tag: "Pull" as const, version: payload.protocolVersion }
         ])
       } else if (
-        options.rpc._tag === "PublishPresence" && Schema.is(Protocol.VersionedPresenceUpdate)(payload)
+        options.rpc._tag === "PublishEphemeral" && Schema.is(Protocol.VersionedEphemeralPublishRequest)(payload)
       ) {
         MutableRef.update(protocolObservations, (observations) => [
           ...observations,
-          { _tag: "PublishPresence" as const, version: payload.protocolVersion }
+          { _tag: "PublishEphemeral" as const, version: payload.protocolVersion }
         ])
       }
     }).pipe(Effect.andThen(authenticate(effect, options)))
@@ -386,7 +390,7 @@ const layerProtocol2Server = SyncServer.layerWithOptions({ supportedProtocolVers
   Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const layerConfigurableProtocolSession = ProtocolSession.layerWithOptions({ supportedProtocolVersions: [1, 2] })
-const layerConfigurableClient = Layer.merge(SyncClient.layerFromSession(), PresenceClient.layerFromSession()).pipe(
+const layerConfigurableClient = Layer.merge(SyncClient.layerFromSession(), EphemeralClient.layerFromSession()).pipe(
   Layer.provide(layerConfigurableProtocolSession),
   Layer.provide(layerClientProtocol),
   Layer.provide(layerAuthenticationClient)
@@ -526,7 +530,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const layerLifecycleCluster = SpaceEntity.layer(entityOptions).pipe(
     Layer.provide(layerAssertionVerifier),
     Layer.provide(layerLifecycleStore),
-    Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+    Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
     Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
   )
   const layerLifecycleWebSocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(
@@ -829,24 +833,42 @@ describe("WebSocket synchronization", () => {
   )
 
   it.effect(
-    "shares one negotiated protocol version across configurable sync and presence clients",
+    "shares one negotiated protocol version across configurable sync and ephemeral clients",
     Effect.fnUntraced(function*() {
       MutableRef.set(protocolObservations, [])
       const remote = yield* SyncEngine.SyncEngine
-      const presence = yield* PresenceClient.PresenceClient
+      const ephemeral = yield* EphemeralClient.EphemeralClient
 
       yield* remote.pull(pullRequest())
-      yield* presence.publish({
+      const snapshot = yield* Deferred.make<void>()
+      const joined = yield* ephemeral.join({
         spaceId,
-        clientId,
-        value: { cursor: 3 },
+        member: ephemeralMember,
+        value: null,
+        ttlMillis: 5_000
+      }).pipe(
+        Stream.tap((message) => {
+          if (message._tag === "Snapshot") return Deferred.succeed(snapshot, undefined)
+          return Effect.void
+        }),
+        Stream.runDrain,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(snapshot)
+      yield* ephemeral.publish({
+        _tag: "Event",
+        spaceId,
+        member: ephemeralMember,
+        channel: "typing",
+        value: true,
         ttlMillis: 5_000
       })
+      yield* Fiber.interrupt(joined)
 
       assert.deepStrictEqual(MutableRef.get(protocolObservations), [
         { _tag: "Negotiate" },
         { _tag: "Pull", version: Protocol.ProtocolVersion.make(2) },
-        { _tag: "PublishPresence", version: Protocol.ProtocolVersion.make(2) }
+        { _tag: "PublishEphemeral", version: Protocol.ProtocolVersion.make(2) }
       ])
     }, provideConfigurableLive)
   )
@@ -1062,23 +1084,37 @@ describe("WebSocket synchronization", () => {
   )
 
   it.effect(
-    "multiplexes bounded ephemeral presence over the same WebSocket protocol",
+    "multiplexes bounded ephemeral events over the same WebSocket protocol",
     Effect.fnUntraced(
       function*() {
-        const presence = yield* PresenceClient.PresenceClient
-        const received = yield* presence.watch(spaceId).pipe(
-          Stream.runHead,
+        const ephemeral = yield* EphemeralClient.EphemeralClient
+        const ready = yield* Deferred.make<void>()
+        const received = yield* Deferred.make<Protocol.EphemeralEvent>()
+        const joined = yield* ephemeral.join({
+          spaceId,
+          member: ephemeralMember,
+          value: { status: "online" },
+          ttlMillis: 5_000
+        }).pipe(
+          Stream.tap((message) => {
+            if (message._tag === "Snapshot") return Deferred.succeed(ready, undefined)
+            if (message._tag === "Event") return Deferred.succeed(received, message)
+            return Effect.void
+          }),
+          Stream.runDrain,
           Effect.forkChild({ startImmediately: true })
         )
-        const update: Protocol.PresenceUpdate = {
+        yield* Deferred.await(ready)
+        yield* ephemeral.publish({
+          _tag: "Event",
           spaceId,
-          clientId,
-          value: { cursor: 3 },
+          member: ephemeralMember,
+          channel: "typing",
+          value: { active: true },
           ttlMillis: 5_000
-        }
-        yield* presence.publish(update)
-        const value = yield* Fiber.join(received)
-        assert.deepStrictEqual(Option.getOrUndefined(value), update)
+        })
+        assert.deepStrictEqual((yield* Deferred.await(received)).entry.value, { active: true })
+        yield* Fiber.interrupt(joined)
       },
       TestClock.withLive,
       provideLive
