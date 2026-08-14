@@ -22,6 +22,10 @@ The application chooses the worker URL, port lifetime, OPFS directory, byte limi
 requests on both sides of the port, and cleanup request timeout. The worker reserves one bounded request slot so an
 interrupted write can remove its partial file even when ordinary request capacity is full.
 
+Whole objects and verified remote range chunks use separate OPFS files. SQLite owns their bounded admission, claims,
+promotion, eviction, and deletion metadata. A range is exposed only after its complete verification chunk passes exact
+length and SHA-256 checks. OPFS remains best effort origin storage unless the application obtains persistent storage.
+
 `pnpm bench:attachments --host 127.0.0.1 --port 4173 --force` serves the real Chromium OPFS smoke at
 `/attachment-storage-smoke.html`. It reports deterministic completion or failure through
 `window.__attachmentStorageSmoke`.
