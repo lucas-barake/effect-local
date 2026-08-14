@@ -134,6 +134,7 @@ const DownloadGrantFields = Schema.Struct({
   _tag: Schema.tag("DownloadGrant"),
   grantId: GrantId,
   objectVersion: ObjectVersion,
+  objectBytes: Attachment.ByteLength,
   expiresAt: ExpiresAt,
   chunk: VerifiedChunk,
   slice: Schema.Struct({
@@ -144,6 +145,9 @@ const DownloadGrantFields = Schema.Struct({
 })
 
 export const DownloadGrant = DownloadGrantFields.check(Schema.makeFilter((grant) => {
+  if (grant.chunk.offset + grant.chunk.bytes > grant.objectBytes) {
+    return "attachment download chunk exceeds the immutable object length"
+  }
   if (grant.slice.offset + grant.slice.length <= grant.chunk.bytes) return undefined
   return "attachment download slice exceeds its verification chunk"
 }))
