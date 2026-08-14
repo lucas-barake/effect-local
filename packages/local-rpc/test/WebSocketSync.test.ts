@@ -1088,6 +1088,8 @@ describe("WebSocket synchronization", () => {
     Effect.fnUntraced(
       function*() {
         const ephemeral = yield* EphemeralClient.EphemeralClient
+        const sql = yield* SqlClient.SqlClient
+        const before = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM effect_local_authoritative_log`
         const ready = yield* Deferred.make<void>()
         const received = yield* Deferred.make<Protocol.EphemeralEvent>()
         const joined = yield* ephemeral.join({
@@ -1115,9 +1117,11 @@ describe("WebSocket synchronization", () => {
         })
         assert.deepStrictEqual((yield* Deferred.await(received)).entry.value, { active: true })
         yield* Fiber.interrupt(joined)
+        const after = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM effect_local_authoritative_log`
+        assert.strictEqual(after[0]?.count, before[0]?.count)
       },
       TestClock.withLive,
-      provideLive
+      provideRetryDependencies
     )
   )
 

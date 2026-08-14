@@ -106,6 +106,46 @@ describe("EphemeralHub", () => {
   )
 
   it.effect(
+    "closes an overflowing generation so the next join snapshots retained state",
+    Effect.fnUntraced(function*() {
+      return yield* Effect.gen(function*() {
+        const hub = yield* EphemeralHub.EphemeralHub
+        const snapshotReady = yield* Deferred.make<void>()
+        const releaseSnapshot = yield* Deferred.make<void>()
+        const slow = yield* hub.join(joinRequest(spaceA, memberA), null).pipe(
+          Stream.tap((message) => {
+            if (message._tag !== "Snapshot") return Effect.void
+            return Deferred.succeed(snapshotReady, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseSnapshot))
+            )
+          }),
+          Stream.runDrain,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(snapshotReady)
+
+        yield* hub.publish(
+          Protocol.EphemeralSetStateRequest.make({
+            spaceId: spaceA,
+            member: memberA,
+            channel: "read",
+            key: "conversation-1",
+            value: { message: 42 },
+            ttlMillis: 30_000
+          }),
+          null
+        )
+        yield* Deferred.succeed(releaseSnapshot, undefined)
+        yield* Fiber.join(slow)
+
+        const late = yield* startJoin(hub, joinRequest(spaceA, memberB))
+        assert.deepStrictEqual(late.snapshot.states.map((entry) => entry.value), [{ message: 42 }])
+        yield* Fiber.interrupt(late.fiber)
+      }).pipe(Effect.provide(EphemeralHub.layerTrusted({ ...options, capacity: 1 })))
+    })
+  )
+
+  it.effect(
     "delivers live events, clears them at server expiry, and never replays them",
     Effect.fnUntraced(function*() {
       return yield* Effect.gen(function*() {

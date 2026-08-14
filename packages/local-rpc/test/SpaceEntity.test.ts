@@ -16,7 +16,6 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
-import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
@@ -38,6 +37,10 @@ const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-0000000
 const member = Protocol.EphemeralMember.make({
   clientId,
   membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
+})
+const secondMember = Protocol.EphemeralMember.make({
+  clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000002")
 })
 
 const Todo = Model.make("Todo", {
@@ -224,20 +227,42 @@ describe("SpaceEntity", () => {
       })
       assert.deepStrictEqual(bootstrap.entries.map((entry) => entry.change._tag), ["Upsert"])
 
+      const firstReady = yield* Deferred.make<void>()
+      const secondReady = yield* Deferred.make<void>()
+      const secondLeft = yield* Deferred.make<void>()
       const joinAssertion = yield* assertionOf({ subject: "reader" })
       const joined = yield* ephemeralClient.JoinEphemeral({
         request: { spaceId: spaceA, member, value: { status: "online" }, ttlMillis: 5_000 },
         assertion: joinAssertion
       }).pipe(
-        Stream.runHead,
+        Stream.tap((message) => {
+          if (message._tag === "Snapshot") return Deferred.succeed(firstReady, undefined)
+          if (message._tag === "MemberLeft" && message.member.clientId === secondMember.clientId) {
+            return Deferred.succeed(secondLeft, undefined)
+          }
+          return Effect.void
+        }),
+        Stream.runDrain,
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(ephemeralReady)
-      const received = Option.getOrUndefined(yield* Fiber.join(joined))
-      assert.strictEqual(received?._tag, "Snapshot")
-      if (received?._tag === "Snapshot") {
-        assert.deepStrictEqual(received.members.map((entry) => entry.member), [member])
-      }
+      yield* Deferred.await(firstReady)
+      const secondAssertion = yield* assertionOf({ subject: "reader" })
+      const secondJoined = yield* ephemeralClient.JoinEphemeral({
+        request: { spaceId: spaceA, member: secondMember, value: null, ttlMillis: 5_000 },
+        assertion: secondAssertion
+      }).pipe(
+        Stream.tap((message) => {
+          if (message._tag === "Snapshot") return Deferred.succeed(secondReady, undefined)
+          return Effect.void
+        }),
+        Stream.runDrain,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(secondReady)
+      yield* Fiber.interrupt(secondJoined)
+      yield* Deferred.await(secondLeft)
+      yield* Fiber.interrupt(joined)
       yield* Fiber.interrupt(watch)
     })).pipe(
       Effect.provide(layerShardingConfig),
