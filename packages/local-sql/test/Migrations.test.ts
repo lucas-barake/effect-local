@@ -197,6 +197,9 @@ describe("storage migration catalogs", () => {
         "effect_local_client_index_catalog",
         "effect_local_client_index_state",
         "effect_local_client_attachments",
+        "effect_local_client_attachment_chunks",
+        "effect_local_client_attachment_promotions",
+        "effect_local_client_attachment_read_claims",
         "effect_local_client_attachment_owners",
         "effect_local_client_attachment_deletions",
         "effect_local_server_evolution",
@@ -218,10 +221,12 @@ describe("storage migration catalogs", () => {
         "effect_local_server_snapshot_projections",
         "effect_local_server_snapshot_projection_entities",
         "effect_local_server_attachment_objects",
+        "effect_local_server_attachment_chunks",
+        "effect_local_server_attachment_attempts",
         "effect_local_server_attachment_usage",
         "effect_local_server_attachment_upload_grants",
         "effect_local_server_attachment_possessions",
-        "effect_local_server_attachment_read_leases",
+        "effect_local_server_attachment_download_grants",
         "effect_local_server_attachment_references",
         "effect_local_server_attachment_deletions"
       ])
@@ -315,7 +320,11 @@ describe("storage migration catalogs", () => {
       assert.strictEqual(clientDeletions.count, 1)
       const releasedUsage = yield* sql<{ readonly local_object_count: number }>`
         SELECT local_object_count FROM effect_local_client_attachment_usage WHERE id = 1`
-      assert.deepStrictEqual(releasedUsage, [{ local_object_count: 0 }])
+      assert.deepStrictEqual(releasedUsage, [{ local_object_count: 1 }])
+      yield* sql`DELETE FROM effect_local_client_attachment_deletions WHERE object_key = ${objectKey}`
+      const physicallyReleasedUsage = yield* sql<{ readonly local_object_count: number }>`
+        SELECT local_object_count FROM effect_local_client_attachment_usage WHERE id = 1`
+      assert.deepStrictEqual(physicallyReleasedUsage, [{ local_object_count: 0 }])
 
       const releasePlan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
         SELECT a.object_key FROM effect_local_client_attachment_owners AS target
@@ -334,10 +343,10 @@ describe("storage migration catalogs", () => {
         VALUES (${spaceId}, ${Domain.definition.hash}, 1, ${Domain.definition.schemaIdentity.version},
           ${Domain.definition.schemaIdentity.hash}, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1)`
       yield* sql`INSERT INTO effect_local_server_attachment_objects
-        (space_id, digest, bytes, object_key, state, storage_offset, staging_client_id,
-          staging_membership_incarnation, created_at, last_accessed_at)
-        VALUES (${spaceId}, ${attachmentDigest}, 5, ${objectKey}, 'Complete', 5, ${clientId},
-          ${membershipIncarnation}, 1, 1)`
+        (space_id, digest, bytes, object_version, state, provider_namespace, provider_object_id,
+          provider_object_version, chunk_bytes, chunk_count, created_at, last_accessed_at)
+        VALUES (${spaceId}, ${attachmentDigest}, 5, 'object-version', 'Available', 'primary',
+          ${objectKey}, 'provider-version', 5, 1, 1, 1)`
       const usage = yield* sql<{ readonly object_count: number; readonly byte_count: number }>`
         SELECT object_count, byte_count FROM effect_local_server_attachment_usage
         WHERE space_id = ${spaceId}`
@@ -362,12 +371,31 @@ describe("storage migration catalogs", () => {
         Result: CountRow,
         execute: () =>
           sql`SELECT COUNT(*) AS count FROM effect_local_server_attachment_deletions
-          WHERE object_key = ${objectKey}`
+          WHERE operation = 'DeleteObject' AND provider_id = ${objectKey}`
       })(undefined)
       assert.strictEqual(deletions.count, 1)
       const deletedUsage = yield* sql<{ readonly object_count: number }>`
         SELECT object_count FROM effect_local_server_attachment_usage WHERE space_id = ${spaceId}`
       assert.lengthOf(deletedUsage, 0)
+
+      yield* sql`INSERT INTO effect_local_server_spaces
+        (space_id, definition_hash, next_server_sequence, schema_version, schema_hash, schema_generation,
+          next_terminal_sequence, history_floor, receipt_floor, retained_history_count,
+          retained_receipt_count, entity_count, entity_bytes, snapshot_sequence,
+          snapshot_terminal_sequence, metadata_verified)
+        VALUES (${spaceId}, ${Domain.definition.hash}, 1, ${Domain.definition.schemaIdentity.version},
+          ${Domain.definition.schemaIdentity.hash}, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1)`
+      yield* sql`INSERT INTO effect_local_server_attachment_objects
+        (space_id, digest, bytes, object_version, state, provider_namespace, provider_object_id,
+          provider_object_version, chunk_bytes, chunk_count, created_at, last_accessed_at)
+        VALUES (${spaceId}, ${attachmentDigest}, 5, 'replacement-version', 'Available', 'primary',
+          'replacement-object', 'replacement-provider-version', 5, 1, 2, 2)`
+      yield* sql`DELETE FROM effect_local_server_attachment_deletions
+        WHERE operation = 'DeleteObject' AND provider_id = ${objectKey}`
+      const recreatedUsage = yield* sql<{ readonly object_count: number; readonly byte_count: number }>`
+        SELECT object_count, byte_count FROM effect_local_server_attachment_usage
+        WHERE space_id = ${spaceId}`
+      assert.deepStrictEqual(recreatedUsage, [{ object_count: 1, byte_count: 5 }])
     }, provideDatabase)
   )
 
@@ -677,12 +705,42 @@ describe("storage migration catalogs", () => {
         cache_byte_count: 5
       }])
 
+      yield* sql`INSERT INTO effect_local_client_attachment_chunks
+        (space_id, digest, object_version, chunk_index, chunk_offset, chunk_bytes,
+          chunk_digest, object_key, state, claim_token, claim_expires_at, created_at, last_accessed_at)
+        VALUES (${spaceId}, ${attachmentDigest}, 'object-v1', 0, 0, 3,
+          ${attachmentDigest}, '00000000000000000000000000000003', 'Filling', 'claim-v1', 10, 1, 1)`
+      assert.deepStrictEqual(yield* usage(), [{
+        local_object_count: 2,
+        local_byte_count: 8,
+        cache_object_count: 2,
+        cache_byte_count: 8
+      }])
+      yield* sql`UPDATE effect_local_client_attachment_chunks
+        SET state = 'Verified', claim_token = NULL, claim_expires_at = NULL
+        WHERE space_id = ${spaceId} AND digest = ${attachmentDigest}`
+      yield* sql`DELETE FROM effect_local_client_attachment_chunks
+        WHERE space_id = ${spaceId} AND digest = ${attachmentDigest}`
+      assert.deepStrictEqual(yield* usage(), [{
+        local_object_count: 1,
+        local_byte_count: 5,
+        cache_object_count: 1,
+        cache_byte_count: 5
+      }])
+
       const plan = yield* sql<{ readonly detail: string }>`EXPLAIN QUERY PLAN
         SELECT local_object_count, local_byte_count, cache_object_count, cache_byte_count
         FROM effect_local_client_attachment_usage WHERE id = 1`
       assert.isTrue(plan.some((row) => row.detail.includes("INTEGER PRIMARY KEY")))
 
       yield* sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
+      assert.deepStrictEqual(yield* usage(), [{
+        local_object_count: 1,
+        local_byte_count: 5,
+        cache_object_count: 1,
+        cache_byte_count: 5
+      }])
+      yield* sql`DELETE FROM effect_local_client_attachment_deletions`
       assert.deepStrictEqual(yield* usage(), [{
         local_object_count: 0,
         local_byte_count: 0,

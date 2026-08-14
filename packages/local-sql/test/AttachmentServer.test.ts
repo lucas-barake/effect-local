@@ -2,25 +2,20 @@ import { NodeCrypto, NodeFileSystem, NodePath } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Attachment from "@lucas-barake/effect-local/Attachment"
+import * as AttachmentTransfer from "@lucas-barake/effect-local/AttachmentTransfer"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
-import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
-import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
-import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
-import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as AttachmentObjectStore from "../src/AttachmentObjectStore.js"
 import * as AttachmentServer from "../src/AttachmentServer.js"
-import * as AttachmentStorage from "../src/AttachmentStorage.js"
-import * as FileSystemAttachmentStorage from "../src/FileSystemAttachmentStorage.js"
 import * as Codec from "../src/internal/codec.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as ServerStore from "../src/ServerStore.js"
@@ -35,10 +30,11 @@ const otherClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000
 const otherMembershipIncarnation = Identity.MembershipIncarnation.make(
   "inc_00000000-0000-4000-8000-000000000002"
 )
-const principal = { user: "reader" }
-const hello = Uint8Array.from([104, 101, 108, 108, 111])
-const layerNodeServices = Layer.mergeAll(NodeCrypto.layer, NodeFileSystem.layer, NodePath.layer)
-const provideNodeServices = Effect.provide(layerNodeServices)
+const digest = Attachment.Digest.make(
+  "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+)
+const reference = Attachment.Reference.make({ digest, bytes: 5 })
+const namespace = AttachmentObjectStore.Namespace.make("test")
 
 class Denied extends Schema.TaggedErrorClass<Denied, Schema.JsonObject>(
   "@lucas-barake/effect-local-sql/test/AttachmentDenied"
@@ -65,129 +61,238 @@ const history = {
   migration: { retryDelay: "1 millis", maximumAttempts: 8 }
 } as const
 
-const collectBytes = <E extends { readonly _tag: string }, R,>(stream: Stream.Stream<Uint8Array, E, R>) =>
-  stream.pipe(
-    Stream.runCollect,
-    Effect.map((chunks) => Uint8Array.from(chunks.flatMap((chunk) => Array.from(chunk))))
-  )
+const makeProvider = () => {
+  const uploaded = new Map<string, number>()
+  const objects = new Map<string, AttachmentObjectStore.ObjectIdentity>()
+  const missingUploads = new Set<string>()
+  const missingObjects = new Set<string>()
+  const deleted: Array<string> = []
+  const aborted: Array<string> = []
+  const abortSpaces: Array<{ readonly spaceId: Identity.SpaceId; readonly uploadId: string }> = []
+  const downloadRequests: Array<string> = []
+  const adapter: AttachmentObjectStore.Adapter = {
+    namespace,
+    beginUpload: ({ attemptId }) => {
+      uploaded.set(attemptId, uploaded.get(attemptId) ?? 0)
+      return Effect.succeed(AttachmentObjectStore.BegunUpload.make({
+        upload: AttachmentObjectStore.UploadIdentity.make({
+          namespace,
+          id: AttachmentObjectStore.ProviderId.make(attemptId)
+        }),
+        partSize: 5
+      }))
+    },
+    listUploadedParts: ({ upload }) => {
+      if (missingUploads.has(upload.id)) {
+        return Effect.fail(new AttachmentObjectStore.AttachmentProviderUploadNotFound({ upload }))
+      }
+      let parts: ReadonlyArray<AttachmentObjectStore.UploadedPart> = []
+      if (uploaded.get(upload.id) === 5) parts = [{ partNumber: 1, bytes: 5 }]
+      return Effect.succeed(AttachmentObjectStore.UploadedPartPage.make({
+        parts,
+        nextPartNumber: null
+      }))
+    },
+    grantUploadPart: ({ expiresAt }) =>
+      Effect.succeed(AttachmentObjectStore.DirectUploadGrant.make({
+        expiresAt,
+        request: AttachmentTransfer.DirectUploadRequest.make({
+          method: "PUT",
+          url: AttachmentTransfer.GrantUrl.make("https://objects.example/upload"),
+          headers: []
+        })
+      })),
+    finalizeUpload: ({ upload }) => {
+      const object = AttachmentObjectStore.ObjectIdentity.make({
+        namespace,
+        id: AttachmentObjectStore.ProviderId.make(`object-${upload.id}`),
+        version: AttachmentObjectStore.ProviderVersion.make("v1")
+      })
+      objects.set(upload.id, object)
+      return Effect.succeed(AttachmentObjectStore.VerifiedObject.make({
+        object,
+        reference,
+        chunkBytes: 5,
+        chunkCount: 1
+      }))
+    },
+    inspectFinalized: ({ upload }) => {
+      const object = objects.get(upload.id)
+      if (object === undefined) return Effect.succeed(null)
+      if (missingObjects.has(object.id)) {
+        return Effect.fail(new AttachmentObjectStore.AttachmentProviderObjectNotFound({ object }))
+      }
+      return Effect.succeed(
+        AttachmentObjectStore.VerifiedObject.make({
+          object,
+          reference,
+          chunkBytes: 5,
+          chunkCount: 1
+        })
+      )
+    },
+    listVerifiedChunks: () =>
+      Effect.succeed(AttachmentObjectStore.VerifiedChunkPage.make({
+        chunks: [{ index: 0, offset: 0, bytes: 5, digest }],
+        nextIndex: null
+      })),
+    grantDownload: ({ expiresAt, object }) => {
+      downloadRequests.push(object.id)
+      if (missingObjects.has(object.id)) {
+        return Effect.fail(new AttachmentObjectStore.AttachmentProviderObjectNotFound({ object }))
+      }
+      return Effect.succeed(AttachmentObjectStore.DirectDownloadGrant.make({
+        expiresAt,
+        request: AttachmentTransfer.DirectDownloadRequest.make({
+          method: "GET",
+          url: AttachmentTransfer.GrantUrl.make("https://objects.example/download"),
+          headers: []
+        })
+      }))
+    },
+    abortUpload: ({ spaceId: authoritativeSpaceId, upload }) =>
+      Effect.sync(() => {
+        aborted.push(upload.id)
+        abortSpaces.push({ spaceId: authoritativeSpaceId, uploadId: upload.id })
+      }),
+    deleteObject: ({ object }) =>
+      Effect.sync(() => {
+        deleted.push(object.id)
+        missingObjects.add(object.id)
+      })
+  }
+  return {
+    adapter,
+    uploaded,
+    missingUploads,
+    missingObjects,
+    deleted,
+    aborted,
+    abortSpaces,
+    downloadRequests,
+    objects
+  }
+}
 
-describe("attachment server", () => {
+const makeContext = Effect.fnUntraced(function*(
+  initialAccess = true,
+  limits: { readonly maximumObjectsPerSpace: number; readonly maximumBytesPerSpace: number } = {
+    maximumObjectsPerSpace: 4,
+    maximumBytesPerSpace: 32
+  }
+) {
+  const fs = yield* FileSystem.FileSystem
+  const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-delegated-attachment-" })
+  const layerDatabase = SqliteClient.layer({ filename: `${root}/server.sqlite`, disableWAL: true }).pipe(
+    Layer.provide(Reactivity.layer)
+  )
+  const provider = makeProvider()
+  const layerObjectStore = AttachmentObjectStore.layer({
+    namespaceForNewObjects: namespace,
+    adapters: [provider.adapter]
+  })
+  const layerInfrastructure = Layer.mergeAll(layerDatabase, layerObjectStore, NodeCrypto.layer)
+  const authorization = { access: initialAccess, read: true }
+  const layerAttachments = AttachmentServer.layer({
+    maximumObjectBytes: 8,
+    maximumObjectsPerSpace: limits.maximumObjectsPerSpace,
+    maximumBytesPerSpace: limits.maximumBytesPerSpace,
+    maximumReferencesPerObject: 4,
+    uploadGrantLifetime: "1 minute",
+    uploadLeaseLifetime: "1 minute",
+    readLeaseLifetime: "2 minutes",
+    stagingLifetime: "1 minute",
+    garbageCollectionGracePeriod: "1 minute",
+    deletionBatchSize: 8,
+    verificationChunkBytes: 5,
+    authorizeAccess: () => {
+      if (authorization.access) return Effect.void
+      return Effect.fail(new Denied({ reason: "denied" }))
+    },
+    authorizeUpload: () => Effect.void,
+    authorizeRead: () => {
+      if (authorization.read) return Effect.void
+      return Effect.fail(new Denied({ reason: "read denied" }))
+    }
+  }).pipe(Layer.provide(layerInfrastructure))
+  const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
+  const layerServer = ServerStore.layerTrusted(history).pipe(
+    Layer.provide(layerRuntime),
+    Layer.provide(layerAttachments),
+    Layer.provide(layerDatabase),
+    Layer.provide(NodeCrypto.layer)
+  )
+  const context = yield* Layer.mergeAll(layerInfrastructure, layerAttachments, layerServer).pipe(Layer.build)
+  const server = Context.get(context, ServerStore.ServerStore)
+  yield* server.pull({
+    spaceId,
+    clientId,
+    schema: Domain.definition.schemaIdentity,
+    scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
+    scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+    cursor: null,
+    limit: 10
+  })
+  return {
+    attachments: Context.get(context, AttachmentServer.AttachmentServer),
+    server,
+    sql: Context.get(context, SqlClient.SqlClient),
+    provider,
+    authorization
+  }
+})
+
+const identity = {
+  spaceId,
+  clientId,
+  membershipIncarnation,
+  reference,
+  principal: { user: "owner" }
+}
+const provideTestPlatform = Effect.provide(
+  Layer.mergeAll(NodeCrypto.layer, NodeFileSystem.layer, NodePath.layer)
+)
+
+describe("delegated attachment server", () => {
   it.effect(
-    "resumes uploads, authorizes lazy reads, and collects the last reference",
+    "resumes direct multipart upload and lazily grants a verified chunk",
     Effect.fnUntraced(
       function*() {
-        const fs = yield* FileSystem.FileSystem
-        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-server-" })
-        const layerDatabase = SqliteClient.layer({ filename: `${root}/server.sqlite`, disableWAL: true }).pipe(
-          Layer.provide(Reactivity.layer)
-        )
-        const layerStorage = FileSystemAttachmentStorage.layer({
-          directory: `${root}/objects`,
-          maximumBytes: 8
-        })
-        const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
-        const layerAttachments = AttachmentServer.layer({
-          maximumObjectBytes: 8,
-          maximumObjectsPerSpace: 1,
-          maximumBytesPerSpace: 32,
-          maximumReferencesPerObject: 1,
-          uploadGrantLifetime: "1 day",
-          uploadLeaseLifetime: "1 minute",
-          readLeaseLifetime: "1 minute",
-          stagingLifetime: "1 minute",
-          garbageCollectionGracePeriod: "1 minute",
-          deletionBatchSize: 8,
-          authorizeAccess: () => Effect.void,
-          authorizeUpload: ({ principal: requestedPrincipal }) => {
-            if (requestedPrincipal === "denied-upload") {
-              return Effect.fail(new Denied({ reason: "denied" }))
-            }
-            return Effect.void
-          },
-          authorizeRead: ({ principal: requestedPrincipal }) => {
-            if (requestedPrincipal === "denied") {
-              return Effect.fail(new Denied({ reason: "denied" }))
-            }
-            return Effect.void
-          }
-        }).pipe(Layer.provide(layerInfrastructure))
-        const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
-        const layerServer = ServerStore.layerTrusted(history).pipe(
-          Layer.provide(layerRuntime),
-          Layer.provide(layerDatabase),
-          Layer.provide(NodeCrypto.layer)
-        )
-        const context = yield* Layer.mergeAll(layerInfrastructure, layerAttachments, layerServer).pipe(Layer.build)
-        const attachments = Context.get(context, AttachmentServer.AttachmentServer)
-        const storage = Context.get(context, AttachmentStorage.AttachmentStorage)
-        const server = Context.get(context, ServerStore.ServerStore)
-        yield* server.pull({
-          spaceId,
-          clientId,
-          schema: Domain.definition.schemaIdentity,
-          scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
-          scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
-          cursor: null,
-          limit: 10
-        })
-        const reference = Attachment.Reference.make({
-          _tag: "Attachment",
-          digest: Attachment.Digest.make(
-            "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-          ),
-          bytes: hello.length
-        })
-        const identity = { spaceId, clientId, membershipIncarnation, reference, principal }
-        const deniedUpload = yield* attachments.prepareUpload({
-          ...identity,
-          principal: "denied-upload"
-        }).pipe(Effect.result)
-        assert.isTrue(Result.isFailure(deniedUpload))
-        if (Result.isFailure(deniedUpload)) {
-          assert.strictEqual(deniedUpload.failure._tag, "AuthorizationDenied")
-        }
-        const prefix = hello.slice(0, 2)
-        const interrupted = Stream.concat(
-          Stream.make(prefix),
-          Stream.fail(new ReplicaError.ServerUnavailable())
-        )
+        const { attachments, provider, server, sql } = yield* makeContext()
+        const part = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(part._tag, "UploadPart")
+        if (part._tag !== "UploadPart") return
+        assert.strictEqual(part.offset, 0)
+        assert.strictEqual(part.bytes, 5)
+        assert.strictEqual(part.request.url, "https://objects.example/upload")
 
-        const first = yield* attachments.prepareUpload(identity)
-        const interruptedUpload = attachments.appendUpload({
-          ...identity,
-          expectedOffset: first.offset,
-          bytes: interrupted
-        })
-        const failure = yield* interruptedUpload.pipe(Effect.result)
-        assert.isTrue(Result.isFailure(failure))
-        if (Result.isFailure(failure)) assert.strictEqual(failure.failure._tag, "ServerUnavailable")
-        yield* TestClock.adjust("2 minutes")
-        assert.strictEqual(yield* attachments.maintain(spaceId), 0)
-        assert.isTrue(yield* storage.exists(first.objectKey))
+        provider.uploaded.set(part.attemptId, 5)
         const resumed = yield* attachments.prepareUpload(identity)
-        assert.strictEqual(resumed.offset, 2)
-        const complete = yield* attachments.appendUpload({
+        assert.deepStrictEqual(resumed, { _tag: "UploadReady", attemptId: part.attemptId })
+        yield* sql.unsafe(`CREATE TRIGGER fail_attachment_finalize
+        BEFORE INSERT ON effect_local_server_attachment_objects
+        BEGIN SELECT RAISE(ABORT, 'injected finalize commit failure'); END`)
+        const failedFinalize = yield* attachments.finalizeUpload({
           ...identity,
-          expectedOffset: resumed.offset,
-          bytes: Stream.make(hello.slice(2))
-        })
-        assert.isTrue(complete.complete)
-        const otherReference = Attachment.Reference.make({
-          _tag: "Attachment",
-          digest: Attachment.Digest.make(
-            "sha256:486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7"
-          ),
-          bytes: hello.length
-        })
-        const quota = yield* attachments.prepareUpload({
-          ...identity,
-          reference: otherReference
+          attemptId: part.attemptId
         }).pipe(Effect.result)
-        assert.isTrue(Result.isFailure(quota))
-        if (Result.isFailure(quota)) assert.strictEqual(quota.failure._tag, "CapacityExceeded")
+        assert.isTrue(Result.isFailure(failedFinalize))
+        if (Result.isFailure(failedFinalize)) {
+          assert.strictEqual(failedFinalize.failure._tag, "StorageUnavailable")
+        }
+        yield* sql.unsafe("DROP TRIGGER fail_attachment_finalize")
+        yield* TestClock.adjust("2 minutes")
+        assert.deepStrictEqual(
+          yield* attachments.finalizeUpload({ ...identity, attemptId: part.attemptId }),
+          { _tag: "UploadComplete" }
+        )
+        assert.deepStrictEqual(
+          yield* attachments.finalizeUpload({ ...identity, attemptId: part.attemptId }),
+          { _tag: "UploadComplete" }
+        )
 
         const encodedReference = yield* Schema.encodeEffect(Attachment.Reference)(reference)
-        const entityValue = {
+        const value = {
           id: "message",
           title: "hello",
           count: 0,
@@ -200,51 +305,28 @@ describe("attachment server", () => {
           model: Domain.Todo.name,
           modelVersion: Domain.Todo.version,
           entityKey: "\"message\"",
-          value: entityValue,
+          value,
           authority: { _tag: "Mutation", clientId, membershipIncarnation }
         })
-        const excessReference = yield* attachments.replaceEntityReferences({
-          spaceId,
-          schemaGeneration: 0,
+        const valueJson = yield* Codec.stringify(value)
+        const entityBytes = yield* Protocol.encodedBytesEffect({
           model: Domain.Todo.name,
           modelVersion: Domain.Todo.version,
-          entityKey: "\"second-message\"",
-          value: entityValue,
-          authority: { _tag: "Mutation", clientId, membershipIncarnation }
-        }).pipe(Effect.result)
-        assert.isTrue(Result.isFailure(excessReference))
-        if (Result.isFailure(excessReference)) {
-          assert.strictEqual(excessReference.failure._tag, "CapacityExceeded")
-        }
-        const sql = Context.get(context, SqlClient.SqlClient)
-        const valueJson = yield* Codec.stringify(entityValue)
+          key: "message",
+          value
+        })
         yield* sql`INSERT INTO effect_local_server_entities_data
-          (space_id, generation, model, model_version, entity_key, value_json, entity_bytes)
-          VALUES (${spaceId}, 0, ${Domain.Todo.name}, ${Domain.Todo.version}, ${"\"message\""},
-            ${valueJson}, 1)`
-        const readEntered = yield* Deferred.make<void>()
-        const releaseRead = yield* Deferred.make<void>()
-        const heldRead = yield* attachments.read({ ...identity, range: { offset: 1, length: 3 } }).pipe(
-          Stream.tap(() => Deferred.succeed(readEntered, undefined).pipe(Effect.andThen(Deferred.await(releaseRead)))),
-          collectBytes,
-          Effect.forkChild
-        )
-        yield* Deferred.await(readEntered)
-        const initialReadLease = yield* sql<{ readonly expires_at: number }>`SELECT expires_at
-          FROM effect_local_server_attachment_read_leases WHERE space_id = ${spaceId}`
-        assert.lengthOf(initialReadLease, 1)
-        const initialReadLeaseExpiry = initialReadLease[0].expires_at
-        const failedRenewalExpiry = initialReadLeaseExpiry + 30_000
-        yield* sql.unsafe(`CREATE TRIGGER fail_first_attachment_read_renewal
-          BEFORE UPDATE OF expires_at ON effect_local_server_attachment_read_leases
-          WHEN NEW.expires_at = ${failedRenewalExpiry}
-          BEGIN SELECT RAISE(ABORT, 'transient read lease renewal failure'); END`)
-        yield* TestClock.adjust("2 minutes")
-        const renewedReadLease = yield* sql<{ readonly expires_at: number }>`SELECT expires_at
-          FROM effect_local_server_attachment_read_leases WHERE space_id = ${spaceId}`
-        assert.lengthOf(renewedReadLease, 1)
-        assert.isAbove(renewedReadLease[0].expires_at, initialReadLeaseExpiry)
-        assert.isAbove(renewedReadLease[0].expires_at, yield* Clock.currentTimeMillis)
+        (space_id, generation, model, model_version, entity_key, value_json, entity_bytes)
+        VALUES (${spaceId}, 0, ${Domain.Todo.name}, ${Domain.Todo.version}, ${"\"message\""},
+          ${valueJson}, 0)`
+        yield* sql`UPDATE effect_local_server_spaces
+        SET entity_count = 1, entity_bytes = ${entityBytes}
+        WHERE space_id = ${spaceId}`
+        const grant = yield* attachments.prepareDownload({ ...identity, range: { offset: 1, length: 3 } })
+        assert.strictEqual(grant.request.url, "https://objects.example/download")
+        assert.deepStrictEqual(grant.slice, { offset: 1, length: 3 })
+        assert.deepStrictEqual(grant.chunk, { index: 0, offset: 0, bytes: 5, digest })
+
         yield* attachments.replaceEntityReferences({
           spaceId,
           schemaGeneration: 0,
@@ -253,258 +335,372 @@ describe("attachment server", () => {
           entityKey: "\"message\"",
           authority: { _tag: "Mutation", clientId, membershipIncarnation }
         })
-        yield* TestClock.adjust("2 minutes")
-        assert.strictEqual(yield* attachments.maintain(spaceId), 0)
-        yield* Deferred.succeed(releaseRead, undefined)
-        assert.deepStrictEqual(yield* Fiber.join(heldRead), hello.slice(1, 4))
-        const deniedRead = collectBytes(attachments.read({ ...identity, principal: "denied" }))
-        const denied = yield* deniedRead.pipe(Effect.result)
+        yield* TestClock.adjust("90 seconds")
+        yield* server.maintainAll
+        assert.lengthOf(provider.deleted, 0)
+        yield* TestClock.adjust("1 minute")
+        yield* server.maintainAll
+        assert.lengthOf(provider.deleted, 1)
+      },
+      provideTestPlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "denies control grants before contacting the provider",
+    Effect.fnUntraced(
+      function*() {
+        const { attachments, provider } = yield* makeContext(false)
+        const denied = yield* attachments.prepareUpload(identity).pipe(Effect.result)
         assert.isTrue(Result.isFailure(denied))
         if (Result.isFailure(denied)) assert.strictEqual(denied.failure._tag, "AuthorizationDenied")
+        assert.strictEqual(provider.uploaded.size, 0)
+      },
+      provideTestPlatform,
+      Effect.scoped
+    )
+  )
 
+  it.effect(
+    "denies finalization after access is revoked without contacting the provider",
+    Effect.fnUntraced(
+      function*() {
+        const { attachments, authorization, provider } = yield* makeContext()
+        const prepared = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(prepared._tag, "UploadPart")
+        if (prepared._tag !== "UploadPart") return
+        provider.uploaded.set(prepared.attemptId, 5)
+        authorization.access = false
+
+        const denied = yield* attachments.finalizeUpload({
+          ...identity,
+          attemptId: prepared.attemptId
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(denied))
+        if (Result.isFailure(denied)) assert.strictEqual(denied.failure._tag, "AuthorizationDenied")
+        assert.strictEqual(provider.objects.size, 0)
+      },
+      provideTestPlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "denies download when no current referencing entity passes read authorization",
+    Effect.fnUntraced(
+      function*() {
+        const { attachments, authorization, provider, sql } = yield* makeContext()
+        const prepared = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(prepared._tag, "UploadPart")
+        if (prepared._tag !== "UploadPart") return
+        provider.uploaded.set(prepared.attemptId, 5)
+        yield* attachments.finalizeUpload({ ...identity, attemptId: prepared.attemptId })
+
+        const encodedReference = yield* Schema.encodeEffect(Attachment.Reference)(reference)
+        const value = {
+          id: "denied-message",
+          title: "denied",
+          count: 0,
+          labels: [],
+          attachment: encodedReference
+        }
         yield* attachments.replaceEntityReferences({
           spaceId,
           schemaGeneration: 0,
           model: Domain.Todo.name,
           modelVersion: Domain.Todo.version,
-          entityKey: "\"message\"",
+          entityKey: "\"denied-message\"",
+          value,
           authority: { _tag: "Mutation", clientId, membershipIncarnation }
         })
-        yield* TestClock.adjust("2 days")
-        assert.strictEqual(yield* attachments.maintain(spaceId), 1)
-        assert.strictEqual(yield* storage.exists(first.objectKey), false)
+        const valueJson = yield* Codec.stringify(value)
+        yield* sql`INSERT INTO effect_local_server_entities_data
+          (space_id, generation, model, model_version, entity_key, value_json, entity_bytes)
+          VALUES (${spaceId}, 0, ${Domain.Todo.name}, ${Domain.Todo.version}, ${"\"denied-message\""},
+            ${valueJson}, 0)`
+        authorization.read = false
+
+        const denied = yield* attachments.prepareDownload(identity).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(denied))
+        if (Result.isFailure(denied)) assert.strictEqual(denied.failure._tag, "AuthorizationDenied")
+        assert.lengthOf(provider.downloadRequests, 0)
       },
-      provideNodeServices,
+      provideTestPlatform,
       Effect.scoped
     )
   )
 
   it.effect(
-    "does not let another client complete and claim an interrupted upload",
+    "requires an independent proof upload from a second membership",
     Effect.fnUntraced(
       function*() {
-        const fs = yield* FileSystem.FileSystem
-        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-possession-" })
-        const layerDatabase = SqliteClient.layer({ filename: `${root}/server.sqlite`, disableWAL: true }).pipe(
-          Layer.provide(Reactivity.layer)
-        )
-        const layerStorage = FileSystemAttachmentStorage.layer({
-          directory: `${root}/objects`,
-          maximumBytes: 8
-        })
-        const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
-        const layerAttachments = AttachmentServer.layer({
-          maximumObjectBytes: 8,
-          maximumObjectsPerSpace: 2,
-          maximumBytesPerSpace: 32,
-          maximumReferencesPerObject: 8,
-          uploadGrantLifetime: "1 day",
-          uploadLeaseLifetime: "1 minute",
-          readLeaseLifetime: "1 minute",
-          stagingLifetime: "1 day",
-          garbageCollectionGracePeriod: "1 minute",
-          deletionBatchSize: 8,
-          authorizeAccess: () => Effect.void,
-          authorizeUpload: () => Effect.void,
-          authorizeRead: () => Effect.void
-        }).pipe(Layer.provide(layerInfrastructure))
-        const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
-        const layerServer = ServerStore.layerTrusted(history).pipe(
-          Layer.provide(layerRuntime),
-          Layer.provide(layerDatabase),
-          Layer.provide(NodeCrypto.layer)
-        )
-        const context = yield* Layer.mergeAll(layerInfrastructure, layerAttachments, layerServer).pipe(Layer.build)
-        const attachments = Context.get(context, AttachmentServer.AttachmentServer)
-        const server = Context.get(context, ServerStore.ServerStore)
-        yield* server.pull({
-          spaceId,
-          clientId,
-          schema: Domain.definition.schemaIdentity,
-          scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
-          scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
-          cursor: null,
-          limit: 10
-        })
-        const reference = Attachment.Reference.make({
-          _tag: "Attachment",
-          digest: Attachment.Digest.make(
-            "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-          ),
-          bytes: hello.length
-        })
-        const owner = { spaceId, clientId, membershipIncarnation, reference, principal: { user: "owner" } }
-        const attacker = {
-          spaceId,
+        const { attachments, provider } = yield* makeContext()
+        const first = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(first._tag, "UploadPart")
+        if (first._tag !== "UploadPart") return
+        provider.uploaded.set(first.attemptId, 5)
+        yield* attachments.finalizeUpload({ ...identity, attemptId: first.attemptId })
+
+        const secondIdentity = {
+          ...identity,
           clientId: otherClientId,
-          membershipIncarnation: otherMembershipIncarnation,
-          reference,
-          principal: { user: "attacker" }
+          membershipIncarnation: otherMembershipIncarnation
         }
-        const prepared = yield* attachments.prepareUpload(owner)
-        const prefix = hello.slice(0, 2)
-        const interruptedBytes = Stream.make(prefix).pipe(
-          Stream.concat(Stream.fail(new ReplicaError.ServerUnavailable()))
-        )
-        const interrupted = yield* attachments.appendUpload({
-          ...owner,
-          expectedOffset: prepared.offset,
-          bytes: interruptedBytes
-        }).pipe(Effect.result)
-        assert.isTrue(Result.isFailure(interrupted))
-
-        const takeoverEffect = Effect.gen(function*() {
-          const resumed = yield* attachments.prepareUpload(attacker)
-          const suffix = hello.slice(resumed.offset)
-          yield* attachments.appendUpload({
-            ...attacker,
-            expectedOffset: resumed.offset,
-            bytes: Stream.make(suffix)
-          })
-          const encodedReference = yield* Schema.encodeEffect(Attachment.Reference)(reference)
-          yield* attachments.replaceEntityReferences({
-            spaceId,
-            schemaGeneration: 0,
-            model: Domain.Todo.name,
-            modelVersion: Domain.Todo.version,
-            entityKey: "\"attacker\"",
-            value: { attachment: encodedReference },
-            authority: {
-              _tag: "Mutation",
-              clientId: otherClientId,
-              membershipIncarnation: otherMembershipIncarnation
-            }
-          })
-        })
-        const takeover = yield* takeoverEffect.pipe(Effect.result)
-        assert.isTrue(Result.isFailure(takeover))
-        if (Result.isFailure(takeover)) assert.strictEqual(takeover.failure._tag, "AuthorizationDenied")
+        const second = yield* attachments.prepareUpload(secondIdentity)
+        assert.strictEqual(second._tag, "UploadPart")
+        assert.strictEqual(provider.uploaded.size, 2)
       },
-      provideNodeServices,
+      provideTestPlatform,
       Effect.scoped
     )
   )
 
   it.effect(
-    "fences a stale writer by rotating the staging object after lease expiry",
+    "fences an expired upload attempt before issuing a replacement",
     Effect.fnUntraced(
       function*() {
-        const fs = yield* FileSystem.FileSystem
-        const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-lease-" })
-        const layerDatabase = SqliteClient.layer({ filename: `${root}/server.sqlite`, disableWAL: true }).pipe(
-          Layer.provide(Reactivity.layer)
-        )
-        const layerStorage = FileSystemAttachmentStorage.layer({
-          directory: `${root}/objects`,
-          maximumBytes: 8
-        })
-        const layerInfrastructure = Layer.merge(layerDatabase, layerStorage)
-        const attachmentOptions = {
-          maximumObjectBytes: 8,
-          maximumObjectsPerSpace: 2,
-          maximumBytesPerSpace: 32,
-          maximumReferencesPerObject: 8,
-          uploadGrantLifetime: "1 day",
-          uploadLeaseLifetime: "1 minute",
-          readLeaseLifetime: "1 minute",
-          stagingLifetime: "1 day",
-          garbageCollectionGracePeriod: "1 minute",
-          deletionBatchSize: 8,
-          authorizeAccess: () => Effect.void,
-          authorizeUpload: () => Effect.void,
-          authorizeRead: () => Effect.void
-        } as const
-        const layerAttachments = AttachmentServer.layer(attachmentOptions).pipe(Layer.provide(layerInfrastructure))
-        const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
-        const layerServer = ServerStore.layerTrusted(history).pipe(
-          Layer.provide(layerRuntime),
-          Layer.provide(layerDatabase),
-          Layer.provide(NodeCrypto.layer)
-        )
-        const context = yield* Layer.mergeAll(layerInfrastructure, layerAttachments, layerServer).pipe(Layer.build)
-        const firstServer = Context.get(context, AttachmentServer.AttachmentServer)
-        const storage = Context.get(context, AttachmentStorage.AttachmentStorage)
-        const sql = Context.get(context, SqlClient.SqlClient)
-        const server = Context.get(context, ServerStore.ServerStore)
-        yield* server.pull({
-          spaceId,
-          clientId,
-          schema: Domain.definition.schemaIdentity,
-          scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
-          scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
-          cursor: null,
-          limit: 10
-        })
-        const layerSecondStorage = FileSystemAttachmentStorage.layer({
-          directory: `${root}/objects`,
-          maximumBytes: 8
-        })
-        const layerSecondSql = Layer.succeed(SqlClient.SqlClient, sql)
-        const layerSecondInfrastructure = Layer.mergeAll(layerSecondSql, layerSecondStorage, NodeCrypto.layer)
-        const secondContext = yield* AttachmentServer.layer(attachmentOptions).pipe(
-          Layer.provide(layerSecondInfrastructure),
-          Layer.build
-        )
-        const secondServer = Context.get(secondContext, AttachmentServer.AttachmentServer)
-        const reference = Attachment.Reference.make({
-          _tag: "Attachment",
-          digest: Attachment.Digest.make(
-            "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-          ),
-          bytes: hello.length
-        })
-        const identity = { spaceId, clientId, membershipIncarnation, reference, principal }
-        const initial = yield* firstServer.prepareUpload(identity)
-        const prefix = hello.slice(0, 2)
-        const interrupted = yield* firstServer.appendUpload({
-          ...identity,
-          expectedOffset: initial.offset,
-          bytes: Stream.make(prefix).pipe(Stream.concat(Stream.fail(new ReplicaError.ServerUnavailable())))
-        }).pipe(Effect.result)
-        assert.isTrue(Result.isFailure(interrupted))
-        const staleHead = yield* secondServer.prepareUpload(identity)
-        assert.strictEqual(staleHead.offset, prefix.length)
-        const staleWriterStarted = yield* Deferred.make<void>()
-        const resumeStaleWriter = yield* Deferred.make<void>()
-        const suffix = Effect.gen(function*() {
-          yield* Deferred.succeed(staleWriterStarted, undefined)
-          yield* Deferred.await(resumeStaleWriter)
-          return hello.slice(2)
-        })
-        const staleWriter = yield* firstServer.appendUpload({
-          ...identity,
-          expectedOffset: staleHead.offset,
-          bytes: Stream.fromEffect(suffix)
-        }).pipe(Effect.forkChild)
-        yield* Deferred.await(staleWriterStarted)
+        const { attachments, provider } = yield* makeContext()
+        const first = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(first._tag, "UploadPart")
+        if (first._tag !== "UploadPart") return
         yield* TestClock.adjust("2 minutes")
+        assert.strictEqual(yield* attachments.sweepSpace(spaceId), 1)
+        assert.strictEqual(yield* attachments.drainOutbox, 1)
+        assert.deepStrictEqual(provider.aborted, [first.attemptId])
 
-        const replacement = yield* secondServer.prepareUpload(identity)
-        assert.strictEqual(replacement.offset, 0)
-        assert.notStrictEqual(replacement.objectKey, initial.objectKey)
-        const stalePatch = yield* secondServer.appendUpload({
+        const replacement = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(replacement._tag, "UploadPart")
+        if (replacement._tag !== "UploadPart") return
+        assert.notStrictEqual(replacement.attemptId, first.attemptId)
+        const stale = yield* attachments.finalizeUpload({
           ...identity,
-          expectedOffset: staleHead.offset,
-          bytes: Stream.make(hello.slice(staleHead.offset))
+          attemptId: first.attemptId
         }).pipe(Effect.result)
-        assert.isTrue(Result.isFailure(stalePatch))
-        if (Result.isFailure(stalePatch)) {
-          assert.strictEqual(stalePatch.failure._tag, "AttachmentOffsetConflict")
-        }
-        const completed = yield* secondServer.appendUpload({
-          ...identity,
-          expectedOffset: replacement.offset,
-          bytes: Stream.make(hello)
-        })
-        assert.isTrue(completed.complete)
-        yield* Deferred.succeed(resumeStaleWriter, undefined)
-        const staleResult = yield* Fiber.join(staleWriter).pipe(Effect.result)
-        assert.isTrue(Result.isFailure(staleResult))
-        if (Result.isFailure(staleResult)) assert.strictEqual(staleResult.failure._tag, "AttachmentUploadBusy")
-        assert.deepStrictEqual(yield* collectBytes(storage.read(completed.objectKey, reference)), hello)
+        assert.isTrue(Result.isFailure(stale))
+        if (Result.isFailure(stale)) assert.strictEqual(stale.failure._tag, "AttachmentUnavailable")
       },
-      provideNodeServices,
+      provideTestPlatform,
       Effect.scoped
     )
+  )
+
+  it.effect(
+    "rotates an upload attempt when the provider has lost its multipart state",
+    Effect.fnUntraced(
+      function*() {
+        const { attachments, provider } = yield* makeContext()
+        const first = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(first._tag, "UploadPart")
+        if (first._tag !== "UploadPart") return
+        provider.missingUploads.add(first.attemptId)
+
+        const missing = yield* attachments.prepareUpload(identity).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(missing))
+        if (Result.isFailure(missing)) assert.strictEqual(missing.failure._tag, "AttachmentUnavailable")
+
+        const replacement = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(replacement._tag, "UploadPart")
+        if (replacement._tag !== "UploadPart") return
+        assert.notStrictEqual(replacement.attemptId, first.attemptId)
+      },
+      provideTestPlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "recovers the provider identity before sweeping an ambiguously begun upload",
+    Effect.fnUntraced(
+      function*() {
+        const { attachments, provider, sql } = yield* makeContext()
+        yield* sql.unsafe(`CREATE TRIGGER fail_attachment_begin_commit
+        BEFORE UPDATE OF provider_upload_id ON effect_local_server_attachment_attempts
+        BEGIN SELECT RAISE(ABORT, 'injected begin commit failure'); END`)
+
+        const failed = yield* attachments.prepareUpload(identity).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(failed))
+        if (Result.isFailure(failed)) assert.strictEqual(failed.failure._tag, "StorageUnavailable")
+        assert.strictEqual(provider.uploaded.size, 1)
+
+        yield* sql.unsafe("DROP TRIGGER fail_attachment_begin_commit")
+        yield* TestClock.adjust("2 minutes")
+        assert.strictEqual(yield* attachments.sweepSpace(spaceId), 1)
+        assert.strictEqual(yield* attachments.drainOutbox, 1)
+        assert.lengthOf(provider.aborted, 1)
+        assert.strictEqual(provider.aborted[0], [...provider.uploaded.keys()][0])
+      },
+      provideTestPlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "repairs a canonical object the provider no longer has",
+    Effect.fnUntraced(
+      function*() {
+        const { attachments, provider, sql } = yield* makeContext(true, {
+          maximumObjectsPerSpace: 1,
+          maximumBytesPerSpace: 5
+        })
+        const first = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(first._tag, "UploadPart")
+        if (first._tag !== "UploadPart") return
+        provider.uploaded.set(first.attemptId, 5)
+        yield* attachments.finalizeUpload({ ...identity, attemptId: first.attemptId })
+
+        const encodedReference = yield* Schema.encodeEffect(Attachment.Reference)(reference)
+        const value = {
+          id: "repair-message",
+          title: "repair",
+          count: 0,
+          labels: [],
+          attachment: encodedReference
+        }
+        yield* attachments.replaceEntityReferences({
+          spaceId,
+          schemaGeneration: 0,
+          model: Domain.Todo.name,
+          modelVersion: Domain.Todo.version,
+          entityKey: "\"repair-message\"",
+          value,
+          authority: { _tag: "Mutation", clientId, membershipIncarnation }
+        })
+        const valueJson = yield* Codec.stringify(value)
+        yield* sql`INSERT INTO effect_local_server_entities_data
+        (space_id, generation, model, model_version, entity_key, value_json, entity_bytes)
+        VALUES (${spaceId}, 0, ${Domain.Todo.name}, ${Domain.Todo.version}, ${"\"repair-message\""},
+          ${valueJson}, 0)`
+        const originalGrant = yield* attachments.prepareDownload(identity)
+        provider.missingObjects.add(`object-${first.attemptId}`)
+        const missing = yield* attachments.prepareDownload(identity).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(missing))
+        if (Result.isFailure(missing)) assert.strictEqual(missing.failure._tag, "AttachmentUnavailable")
+
+        const repair = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(repair._tag, "UploadPart")
+        if (repair._tag !== "UploadPart") return
+        provider.uploaded.set(repair.attemptId, 5)
+        yield* attachments.finalizeUpload({ ...identity, attemptId: repair.attemptId })
+        const repairedGrant = yield* attachments.prepareDownload(identity)
+        assert.notStrictEqual(repairedGrant.objectVersion, originalGrant.objectVersion)
+      },
+      provideTestPlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "does not promote an object identity while its deletion is claimed",
+    Effect.fnUntraced(
+      function*() {
+        const { attachments, provider, sql } = yield* makeContext()
+        const prepared = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(prepared._tag, "UploadPart")
+        if (prepared._tag !== "UploadPart") return
+        provider.uploaded.set(prepared.attemptId, 5)
+        yield* sql`INSERT INTO effect_local_server_attachment_deletions
+        (outbox_id, space_id, digest, bytes, operation, provider_namespace, provider_id,
+          provider_version, next_attempt_at, claim_token, claimed_until, created_at)
+        VALUES ('claimed-object-delete', ${spaceId}, ${digest}, 5, 'DeleteObject', ${namespace},
+          ${`object-${prepared.attemptId}`}, 'v1', 0, 'active-claim', 60000, 0)`
+
+        const fenced = yield* attachments.finalizeUpload({ ...identity, attemptId: prepared.attemptId }).pipe(
+          Effect.result
+        )
+        assert.isTrue(Result.isFailure(fenced))
+        if (Result.isFailure(fenced)) assert.strictEqual(fenced.failure._tag, "AttachmentUploadBusy")
+
+        yield* TestClock.adjust("2 minutes")
+        const expiredClaim = yield* attachments.finalizeUpload({
+          ...identity,
+          attemptId: prepared.attemptId
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(expiredClaim))
+        if (Result.isFailure(expiredClaim)) {
+          assert.strictEqual(expiredClaim.failure._tag, "AttachmentUploadBusy")
+        }
+        assert.strictEqual(yield* attachments.drainOutbox, 1)
+        assert.lengthOf(provider.deleted, 1)
+        const deletedProof = yield* attachments.finalizeUpload({
+          ...identity,
+          attemptId: prepared.attemptId
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(deletedProof))
+        if (Result.isFailure(deletedProof)) {
+          assert.strictEqual(deletedProof.failure._tag, "AttachmentUnavailable")
+        }
+
+        const replacement = yield* attachments.prepareUpload(identity)
+        assert.strictEqual(replacement._tag, "UploadPart")
+        if (replacement._tag !== "UploadPart") return
+        provider.uploaded.set(replacement.attemptId, 5)
+        assert.deepStrictEqual(
+          yield* attachments.finalizeUpload({ ...identity, attemptId: replacement.attemptId }),
+          { _tag: "UploadComplete" }
+        )
+        const deletion = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        FROM effect_local_server_attachment_deletions WHERE outbox_id = 'claimed-object-delete'`
+        assert.deepStrictEqual(deletion, [{ count: 0 }])
+      },
+      provideTestPlatform,
+      Effect.scoped
+    )
+  )
+
+  it.effect(
+    "bounds provider cleanup while maintaining one thousand attachment spaces",
+    Effect.fnUntraced(
+      function*() {
+        const { provider, server, sql } = yield* makeContext()
+        const spaces = Array.from({ length: 1_000 }, (_, index) => ({
+          spaceId: Identity.SpaceId.make(
+            `spc_00000000-0000-4000-9000-${String(index + 1).padStart(12, "0")}`
+          ),
+          attemptId: `maintenance-attempt-${index + 1}`,
+          physicalKey: (index + 1).toString(16).padStart(32, "0"),
+          providerId: `maintenance-upload-${index + 1}`
+        }))
+        const insertSpace = Effect.fnUntraced(function*(space: (typeof spaces)[number]) {
+          yield* sql`INSERT INTO effect_local_server_spaces
+              (space_id, definition_hash, next_server_sequence, schema_version, schema_hash,
+                schema_generation, next_terminal_sequence, history_floor, receipt_floor,
+                retained_history_count, retained_receipt_count, entity_count, entity_bytes,
+                snapshot_sequence, snapshot_terminal_sequence, metadata_verified)
+              VALUES (${space.spaceId}, ${Domain.definition.hash}, 1,
+                ${Domain.definition.schemaIdentity.version}, ${Domain.definition.schemaIdentity.hash},
+                0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1)`
+          yield* sql`INSERT INTO effect_local_server_attachment_attempts
+              (attempt_id, space_id, digest, bytes, client_id, membership_incarnation,
+                provider_namespace, physical_key, provider_upload_id, part_size, state,
+                created_at, last_accessed_at)
+              VALUES (${space.attemptId}, ${space.spaceId}, ${digest}, 5, ${clientId},
+                ${membershipIncarnation}, ${namespace}, ${space.physicalKey}, ${space.providerId},
+                5, 'Uploading', 0, 0)`
+        })
+        yield* Effect.forEach(spaces, insertSpace, { discard: true }).pipe(sql.withTransaction)
+
+        yield* TestClock.adjust("2 minutes")
+        yield* server.maintainAll
+        assert.lengthOf(provider.aborted, 8)
+        for (const request of provider.abortSpaces) {
+          const expected = spaces.find((space) => space.providerId === request.uploadId)
+          assert.isDefined(expected)
+          assert.strictEqual(request.spaceId, expected.spaceId)
+        }
+        const remainingAttempts = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_attachment_attempts WHERE attempt_id LIKE 'maintenance-attempt-%'`
+        assert.deepStrictEqual(remainingAttempts, [{ count: 0 }])
+        const remainingOutbox = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_attachment_deletions WHERE operation = 'AbortUpload'`
+        assert.deepStrictEqual(remainingOutbox, [{ count: 992 }])
+
+        yield* server.maintainAll
+        assert.lengthOf(provider.aborted, 16)
+      },
+      provideTestPlatform,
+      Effect.scoped
+    ),
+    30_000
   )
 })

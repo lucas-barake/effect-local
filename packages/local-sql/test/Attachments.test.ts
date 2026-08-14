@@ -2,6 +2,7 @@ import { NodeCrypto, NodeFileSystem, NodePath } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Attachment from "@lucas-barake/effect-local/Attachment"
+import * as AttachmentProtocol from "@lucas-barake/effect-local/AttachmentTransfer"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -23,6 +24,7 @@ import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as AttachmentClient from "../src/AttachmentClient.js"
+import * as AttachmentObjectStore from "../src/AttachmentObjectStore.js"
 import * as AttachmentServer from "../src/AttachmentServer.js"
 import * as AttachmentStorage from "../src/AttachmentStorage.js"
 import * as AttachmentTransfer from "../src/AttachmentTransfer.js"
@@ -62,7 +64,7 @@ const layerUnavailableTransfer = Layer.succeed(
   AttachmentTransfer.AttachmentTransfer,
   AttachmentTransfer.AttachmentTransfer.of({
     upload: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-    download: () => Stream.fail(new ReplicaError.ServerUnavailable())
+    download: () => Effect.fail(new ReplicaError.ServerUnavailable())
   })
 )
 const layerRemote = Layer.succeed(
@@ -118,6 +120,172 @@ const collectBytes = <E extends { readonly _tag: string }, R,>(stream: Stream.St
     Stream.runCollect,
     Effect.map((chunks) => Uint8Array.from(chunks.flatMap((chunk) => Array.from(chunk))))
   )
+
+const objectStoreNamespace = AttachmentObjectStore.Namespace.make("integration")
+
+const makeDelegatedObjectStore = () => {
+  const uploads = new Map<string, {
+    readonly reference: Attachment.Reference
+    readonly verificationChunkBytes: number
+    readonly bytes: Uint8Array
+    readonly parts: Map<number, number>
+  }>()
+  const objects = new Map<string, {
+    readonly identity: AttachmentObjectStore.ObjectIdentity
+    readonly reference: Attachment.Reference
+    readonly verificationChunkBytes: number
+    readonly bytes: Uint8Array
+  }>()
+  const uploadGrants = new Map<string, {
+    readonly uploadId: string
+    readonly partNumber: number
+    readonly offset: number
+    readonly bytes: number
+  }>()
+  const downloadGrants = new Map<string, {
+    readonly objectId: string
+    readonly chunk: AttachmentProtocol.VerifiedChunk
+  }>()
+  const adapter: AttachmentObjectStore.Adapter = {
+    namespace: objectStoreNamespace,
+    beginUpload: ({ attemptId, reference, verificationChunkBytes }) => {
+      if (!uploads.has(attemptId)) {
+        uploads.set(attemptId, {
+          reference,
+          verificationChunkBytes,
+          bytes: new Uint8Array(reference.bytes),
+          parts: new Map()
+        })
+      }
+      return Effect.succeed(AttachmentObjectStore.BegunUpload.make({
+        upload: AttachmentObjectStore.UploadIdentity.make({
+          namespace: objectStoreNamespace,
+          id: AttachmentObjectStore.ProviderId.make(attemptId)
+        }),
+        partSize: reference.bytes
+      }))
+    },
+    listUploadedParts: ({ afterPartNumber, limit, upload }) => {
+      const state = uploads.get(upload.id)
+      if (state === undefined) {
+        return Effect.fail(new AttachmentObjectStore.AttachmentProviderUploadNotFound({ upload }))
+      }
+      const parts = [...state.parts]
+        .filter(([partNumber]) => partNumber > afterPartNumber)
+        .toSorted(([left], [right]) => left - right)
+        .slice(0, limit)
+        .map(([partNumber, bytes]) => ({ partNumber, bytes }))
+      return Effect.succeed(AttachmentObjectStore.UploadedPartPage.make({ parts, nextPartNumber: null }))
+    },
+    grantUploadPart: ({ bytes, expiresAt, offset, partNumber, upload }) => {
+      const url = `https://objects.example/upload/${upload.id}/${partNumber}`
+      uploadGrants.set(url, { uploadId: upload.id, partNumber, offset, bytes })
+      return Effect.succeed(AttachmentObjectStore.DirectUploadGrant.make({
+        expiresAt,
+        request: { method: "PUT", url: AttachmentProtocol.GrantUrl.make(url), headers: [] }
+      }))
+    },
+    finalizeUpload: ({ upload }) => {
+      const state = uploads.get(upload.id)
+      if (state === undefined) {
+        return Effect.fail(new AttachmentObjectStore.AttachmentProviderUploadNotFound({ upload }))
+      }
+      const identity = AttachmentObjectStore.ObjectIdentity.make({
+        namespace: objectStoreNamespace,
+        id: AttachmentObjectStore.ProviderId.make(`object-${upload.id}`),
+        version: AttachmentObjectStore.ProviderVersion.make("v1")
+      })
+      objects.set(identity.id, { identity, ...state })
+      return Effect.succeed(AttachmentObjectStore.VerifiedObject.make({
+        object: identity,
+        reference: state.reference,
+        chunkBytes: state.verificationChunkBytes,
+        chunkCount: Math.ceil(state.reference.bytes / state.verificationChunkBytes)
+      }))
+    },
+    inspectFinalized: ({ upload }) => {
+      const state = objects.get(`object-${upload.id}`)
+      if (state === undefined) return Effect.succeed(null)
+      return Effect.succeed(AttachmentObjectStore.VerifiedObject.make({
+        object: state.identity,
+        reference: state.reference,
+        chunkBytes: state.verificationChunkBytes,
+        chunkCount: Math.ceil(state.reference.bytes / state.verificationChunkBytes)
+      }))
+    },
+    listVerifiedChunks: ({ object }) => {
+      const state = objects.get(object.id)
+      if (state === undefined) {
+        return Effect.fail(new AttachmentObjectStore.AttachmentProviderObjectNotFound({ object }))
+      }
+      return Effect.succeed(AttachmentObjectStore.VerifiedChunkPage.make({
+        chunks: [{ index: 0, offset: 0, bytes: state.reference.bytes, digest: state.reference.digest }],
+        nextIndex: null
+      }))
+    },
+    grantDownload: ({ chunk, expiresAt, object }) => {
+      const url = `https://objects.example/download/${object.id}/${chunk.index}`
+      downloadGrants.set(url, { objectId: object.id, chunk })
+      return Effect.succeed(AttachmentObjectStore.DirectDownloadGrant.make({
+        expiresAt,
+        request: { method: "GET", url: AttachmentProtocol.GrantUrl.make(url), headers: [] }
+      }))
+    },
+    abortUpload: () => Effect.void,
+    deleteObject: ({ object }) =>
+      Effect.sync(() => {
+        objects.delete(object.id)
+      })
+  }
+  const upload = Effect.fnUntraced(function*<E extends { readonly _tag: string }, R,>(
+    request: AttachmentProtocol.DirectUploadRequest,
+    source: Stream.Stream<Uint8Array, E, R>
+  ) {
+    const grant = uploadGrants.get(request.url)
+    if (grant === undefined) return yield* Effect.die("unknown attachment upload grant")
+    const state = uploads.get(grant.uploadId)
+    if (state === undefined) return yield* Effect.die("unknown attachment upload")
+    const body = yield* collectBytes(source)
+    if (body.byteLength < grant.bytes) return yield* Effect.die("short attachment upload")
+    state.bytes.set(body.subarray(0, grant.bytes), grant.offset)
+    state.parts.set(grant.partNumber, grant.bytes)
+    return undefined
+  })
+  const download = (
+    request: AttachmentProtocol.DirectDownloadRequest
+  ) => {
+    const grant = downloadGrants.get(request.url)
+    if (grant === undefined) return Effect.die("unknown attachment download grant")
+    const state = objects.get(grant.objectId)
+    if (state === undefined) return Effect.die("unknown attachment object")
+    return Effect.succeed(state.bytes.slice(grant.chunk.offset, grant.chunk.offset + grant.chunk.bytes))
+  }
+  return {
+    layer: AttachmentObjectStore.layer({
+      namespaceForNewObjects: objectStoreNamespace,
+      adapters: [adapter]
+    }),
+    upload,
+    download
+  }
+}
+
+const uploadDirect = Effect.fnUntraced(function*<E extends { readonly _tag: string }, R,>(
+  server: AttachmentServer.Service,
+  provider: ReturnType<typeof makeDelegatedObjectStore>,
+  identity: Parameters<AttachmentServer.Service["prepareUpload"]>[0],
+  bytes: (offset: number) => Stream.Stream<Uint8Array, E, R>
+) {
+  while (true) {
+    const prepared = yield* server.prepareUpload(identity)
+    if (prepared._tag === "UploadComplete") return
+    if (prepared._tag === "UploadReady") {
+      yield* server.finalizeUpload({ ...identity, attemptId: prepared.attemptId })
+      return
+    }
+    yield* provider.upload(prepared.request, bytes(prepared.offset))
+  }
+})
 
 describe("replica attachments", () => {
   it.effect(
@@ -242,11 +410,8 @@ describe("replica attachments", () => {
         assert.isBelow(pendingRows[0].payload_json.length, 1_024)
 
         const layerServerDatabase = SqliteClient.layer({ filename: `${root}/server.sqlite`, disableWAL: true })
-        const layerServerStorage = FileSystemAttachmentStorage.layer({
-          directory: `${root}/server-objects`,
-          maximumBytes: media.byteLength
-        })
-        const layerServerInfrastructure = Layer.merge(layerServerDatabase, layerServerStorage)
+        const objectStore = makeDelegatedObjectStore()
+        const layerServerInfrastructure = Layer.merge(layerServerDatabase, objectStore.layer)
         const layerServerAttachments = AttachmentServer.layer({
           maximumObjectBytes: media.byteLength,
           maximumObjectsPerSpace: 4,
@@ -258,6 +423,7 @@ describe("replica attachments", () => {
           stagingLifetime: "1 day",
           garbageCollectionGracePeriod: "1 hour",
           deletionBatchSize: 8,
+          verificationChunkBytes: media.byteLength,
           authorizeAccess: () => Effect.void,
           authorizeUpload: () => Effect.void,
           authorizeRead: () => Effect.void
@@ -294,13 +460,17 @@ describe("replica attachments", () => {
           reference,
           principal: null
         }
-        const prepared = yield* serverAttachments.prepareUpload(identity)
         const localKey = yield* clientAttachments.objectKey(spaceId, reference)
-        yield* serverAttachments.appendUpload({
-          ...identity,
-          expectedOffset: prepared.offset,
-          bytes: clientStorage.read(localKey, reference)
-        })
+        yield* uploadDirect(
+          serverAttachments,
+          objectStore,
+          identity,
+          (offset) =>
+            clientStorage.read(localKey, reference, {
+              offset,
+              length: reference.bytes - offset
+            })
+        )
         assert.strictEqual((yield* server.submit(pending.envelope))._tag, "Accepted")
         yield* server.maintain(spaceId)
 
@@ -351,11 +521,8 @@ describe("replica attachments", () => {
         const submitted = yield* Deferred.make<void>()
         const events = yield* Ref.make<ReadonlyArray<string>>([])
         const layerServerDatabase = SqliteClient.layer({ filename: `${root}/server.sqlite`, disableWAL: true })
-        const layerServerStorage = FileSystemAttachmentStorage.layer({
-          directory: `${root}/server-objects`,
-          maximumBytes: 8
-        })
-        const layerServerInfrastructure = Layer.merge(layerServerDatabase, layerServerStorage)
+        const objectStore = makeDelegatedObjectStore()
+        const layerServerInfrastructure = Layer.merge(layerServerDatabase, objectStore.layer)
         const layerServerAttachments = AttachmentServer.layer({
           maximumObjectBytes: 8,
           maximumObjectsPerSpace: 4,
@@ -367,6 +534,7 @@ describe("replica attachments", () => {
           stagingLifetime: "1 day",
           garbageCollectionGracePeriod: "1 hour",
           deletionBatchSize: 8,
+          verificationChunkBytes: 8,
           authorizeAccess: () => Effect.void,
           authorizeUpload: () => Effect.void,
           authorizeRead: () => Effect.void
@@ -404,12 +572,7 @@ describe("replica attachments", () => {
                 reference,
                 principal: null
               }
-              const prepared = yield* serverAttachments.prepareUpload(identity)
-              yield* serverAttachments.appendUpload({
-                ...identity,
-                expectedOffset: prepared.offset,
-                bytes: bytes(prepared.offset)
-              })
+              yield* uploadDirect(serverAttachments, objectStore, identity, bytes)
               yield* Ref.update(events, (current) => [...current, "upload"])
             }),
             download: ({
@@ -418,17 +581,25 @@ describe("replica attachments", () => {
               range,
               reference,
               spaceId: requestedSpaceId
-            }) => {
-              let request: Parameters<AttachmentServer.Service["read"]>[0] = {
-                spaceId: requestedSpaceId,
-                clientId: requestedClientId,
-                membershipIncarnation,
-                reference,
-                principal: null
-              }
-              if (range !== undefined) request = { ...request, range }
-              return serverAttachments.read(request)
-            }
+            }) =>
+              Effect.fnUntraced(function*() {
+                let request: Parameters<AttachmentServer.Service["prepareDownload"]>[0] = {
+                  spaceId: requestedSpaceId,
+                  clientId: requestedClientId,
+                  membershipIncarnation,
+                  reference,
+                  principal: null
+                }
+                if (range !== undefined) request = { ...request, range }
+                const grant = yield* serverAttachments.prepareDownload(request)
+                const downloaded = yield* objectStore.download(grant.request)
+                return {
+                  objectVersion: grant.objectVersion,
+                  objectBytes: reference.bytes,
+                  chunk: grant.chunk,
+                  bytes: Stream.make(downloaded)
+                }
+              })()
           })
         )
         const layerConnectedRemote = Layer.succeed(
@@ -529,7 +700,7 @@ describe("replica attachments", () => {
           reference,
           principal: null
         })
-        assert.isTrue(alreadyComplete.complete)
+        assert.strictEqual(alreadyComplete._tag, "UploadPart")
         const stolen = yield* submitWithoutGrant(
           unprovenClientId,
           unprovenIncarnation,
@@ -539,16 +710,14 @@ describe("replica attachments", () => {
         ).pipe(Effect.result)
         assert.isTrue(Result.isFailure(stolen))
         if (Result.isFailure(stolen)) assert.strictEqual(stolen.failure._tag, "AttachmentUnavailable")
-        assert.deepStrictEqual(
-          yield* collectBytes(serverAttachments.read({
-            spaceId,
-            clientId,
-            membershipIncarnation: pending.envelope.membershipIncarnation,
-            reference,
-            principal: null
-          })),
-          hello
-        )
+        const downloadGrant = yield* serverAttachments.prepareDownload({
+          spaceId,
+          clientId,
+          membershipIncarnation: pending.envelope.membershipIncarnation,
+          reference,
+          principal: null
+        })
+        assert.deepStrictEqual(yield* objectStore.download(downloadGrant.request), hello)
       },
       provideNodeServices,
       Effect.scoped

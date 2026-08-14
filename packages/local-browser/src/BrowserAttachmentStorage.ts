@@ -223,11 +223,16 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
         return Attachment.hash(stored, { maximumBytes }).pipe(Effect.onExit(() => flush))
       }
 
-      const create: AttachmentStorage.Service["create"] = Effect.fn("BrowserAttachmentStorage.create")(function*() {
-        const uuid = yield* crypto.randomUUIDv4.pipe(
-          Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "create.key", cause }))
-        )
-        const key = AttachmentStorage.ObjectKey.make(uuid.replaceAll("-", ""))
+      const create: AttachmentStorage.Service["create"] = Effect.fn("BrowserAttachmentStorage.create")(function*(
+        requestedKey
+      ) {
+        let key = requestedKey
+        if (key === undefined) {
+          const uuid = yield* crypto.randomUUIDv4.pipe(
+            Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "create.key", cause }))
+          )
+          key = AttachmentStorage.ObjectKey.make(uuid.replaceAll("-", ""))
+        }
         const response = yield* request({ _tag: "Create", key })
         if (response._tag !== "Created") {
           let operation: string = response._tag

@@ -30,7 +30,7 @@ export type ReadFailure =
   | Attachment.InvalidAttachmentRange
 
 export interface Service {
-  readonly create: () => Effect.Effect<ObjectKey, Attachment.AttachmentStorageError>
+  readonly create: (key?: ObjectKey) => Effect.Effect<ObjectKey, Attachment.AttachmentStorageError>
   readonly stage: <E extends { readonly _tag: string }, R,>(
     bytes: Stream.Stream<Uint8Array, E, R>
   ) => Effect.Effect<Staged, E | Attachment.AttachmentTooLarge | Attachment.AttachmentStorageError, R>

@@ -1,5 +1,6 @@
 import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import * as AttachmentTransfer from "@lucas-barake/effect-local/AttachmentTransfer"
+import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
@@ -126,17 +127,20 @@ export type ProviderError =
 export interface Adapter {
   readonly namespace: Namespace
   readonly beginUpload: (input: {
+    readonly spaceId: Identity.SpaceId
     readonly attemptId: AttachmentTransfer.AttemptId
     readonly physicalKey: PhysicalKey
     readonly reference: Attachment.Reference
     readonly verificationChunkBytes: number
   }) => Effect.Effect<BegunUpload, ProviderError>
   readonly listUploadedParts: (input: {
+    readonly spaceId: Identity.SpaceId
     readonly upload: UploadIdentity
     readonly afterPartNumber: number
     readonly limit: number
   }) => Effect.Effect<UploadedPartPage, ProviderError>
   readonly grantUploadPart: (input: {
+    readonly spaceId: Identity.SpaceId
     readonly upload: UploadIdentity
     readonly partNumber: number
     readonly offset: number
@@ -144,25 +148,35 @@ export interface Adapter {
     readonly expiresAt: number
   }) => Effect.Effect<DirectUploadGrant, ProviderError>
   readonly finalizeUpload: (input: {
+    readonly spaceId: Identity.SpaceId
     readonly upload: UploadIdentity
     readonly reference: Attachment.Reference
   }) => Effect.Effect<VerifiedObject, ProviderError>
   readonly inspectFinalized: (input: {
+    readonly spaceId: Identity.SpaceId
     readonly upload: UploadIdentity
     readonly reference: Attachment.Reference
   }) => Effect.Effect<VerifiedObject | null, ProviderError>
   readonly listVerifiedChunks: (input: {
+    readonly spaceId: Identity.SpaceId
     readonly object: ObjectIdentity
     readonly afterIndex: number
     readonly limit: number
   }) => Effect.Effect<VerifiedChunkPage, ProviderError>
   readonly grantDownload: (input: {
+    readonly spaceId: Identity.SpaceId
     readonly object: ObjectIdentity
     readonly chunk: AttachmentTransfer.VerifiedChunk
     readonly expiresAt: number
   }) => Effect.Effect<DirectDownloadGrant, ProviderError>
-  readonly abortUpload: (upload: UploadIdentity) => Effect.Effect<void, AttachmentObjectStoreUnavailable>
-  readonly deleteObject: (object: ObjectIdentity) => Effect.Effect<void, AttachmentObjectStoreUnavailable>
+  readonly abortUpload: (input: {
+    readonly spaceId: Identity.SpaceId
+    readonly upload: UploadIdentity
+  }) => Effect.Effect<void, AttachmentObjectStoreUnavailable>
+  readonly deleteObject: (input: {
+    readonly spaceId: Identity.SpaceId
+    readonly object: ObjectIdentity
+  }) => Effect.Effect<void, AttachmentObjectStoreUnavailable>
 }
 
 export interface Service {

@@ -1334,11 +1334,13 @@ const clientV14 = makeMigration({
         substr(digest, 8) NOT GLOB '*[^0-9a-f]*'
       ),
       bytes INTEGER NOT NULL CHECK (bytes >= 0),
+      object_version TEXT,
       object_key TEXT NOT NULL UNIQUE CHECK (
         length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
       ),
       remote_available INTEGER NOT NULL DEFAULT 0 CHECK (remote_available IN (0, 1)),
       cache_managed INTEGER NOT NULL DEFAULT 0 CHECK (cache_managed IN (0, 1)),
+      active_reads INTEGER NOT NULL DEFAULT 0 CHECK (active_reads >= 0),
       created_at INTEGER NOT NULL CHECK (created_at >= 0),
       last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= created_at),
       PRIMARY KEY (space_id, digest),
@@ -1354,6 +1356,112 @@ const clientV14 = makeMigration({
       FOREIGN KEY (space_id, digest)
         REFERENCES effect_local_client_attachments(space_id, digest) ON DELETE CASCADE
     )`,
+    `CREATE TABLE effect_local_client_attachment_chunks (
+      space_id TEXT NOT NULL,
+      digest TEXT NOT NULL CHECK (
+        length(digest) = 71 AND substr(digest, 1, 7) = 'sha256:' AND
+        substr(digest, 8) NOT GLOB '*[^0-9a-f]*'
+      ),
+      object_version TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+      chunk_offset INTEGER NOT NULL CHECK (chunk_offset >= 0),
+      chunk_bytes INTEGER NOT NULL CHECK (chunk_bytes > 0),
+      chunk_digest TEXT NOT NULL CHECK (
+        length(chunk_digest) = 71 AND substr(chunk_digest, 1, 7) = 'sha256:' AND
+        substr(chunk_digest, 8) NOT GLOB '*[^0-9a-f]*'
+      ),
+      object_key TEXT NOT NULL UNIQUE CHECK (
+        length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
+      ),
+      state TEXT NOT NULL CHECK (state IN ('Filling', 'Verified', 'Deleting')),
+      claim_token TEXT,
+      claim_expires_at INTEGER,
+      promotion_token TEXT,
+      active_reads INTEGER NOT NULL DEFAULT 0 CHECK (active_reads >= 0),
+      created_at INTEGER NOT NULL CHECK (created_at >= 0),
+      last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= created_at),
+      PRIMARY KEY (space_id, digest, object_version, chunk_index),
+      UNIQUE (space_id, digest, object_version, chunk_offset),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE,
+      CHECK (chunk_offset + chunk_bytes <= 9007199254740991),
+      CHECK ((state = 'Filling' AND claim_token IS NOT NULL AND claim_expires_at IS NOT NULL
+          AND claim_expires_at >= 0 AND promotion_token IS NULL) OR
+        (state = 'Verified' AND claim_token IS NULL AND claim_expires_at IS NULL) OR
+        (state = 'Deleting' AND claim_token IS NULL AND claim_expires_at IS NULL
+          AND promotion_token IS NULL))
+    )`,
+    `CREATE INDEX effect_local_client_attachment_chunks_covering
+      ON effect_local_client_attachment_chunks
+        (space_id, digest, state, chunk_offset, chunk_bytes, last_accessed_at)`,
+    `CREATE INDEX effect_local_client_attachment_chunks_claims
+      ON effect_local_client_attachment_chunks (state, claim_expires_at, space_id, digest)`,
+    `CREATE TRIGGER effect_local_client_attachment_chunk_usage_insert
+      AFTER INSERT ON effect_local_client_attachment_chunks BEGIN
+        UPDATE effect_local_client_attachment_usage SET
+          local_object_count = local_object_count + 1,
+          local_byte_count = local_byte_count + NEW.chunk_bytes,
+          cache_object_count = cache_object_count + 1,
+          cache_byte_count = cache_byte_count + NEW.chunk_bytes
+        WHERE id = 1;
+      END`,
+    `CREATE TRIGGER effect_local_client_attachment_chunk_usage_delete
+      AFTER DELETE ON effect_local_client_attachment_chunks BEGIN
+        UPDATE effect_local_client_attachment_usage SET
+          local_object_count = local_object_count - 1,
+          local_byte_count = local_byte_count - OLD.chunk_bytes,
+          cache_object_count = cache_object_count - 1,
+          cache_byte_count = cache_byte_count - OLD.chunk_bytes
+        WHERE id = 1;
+      END`,
+    `CREATE TABLE effect_local_client_attachment_promotions (
+      space_id TEXT NOT NULL,
+      digest TEXT NOT NULL CHECK (
+        length(digest) = 71 AND substr(digest, 1, 7) = 'sha256:' AND
+        substr(digest, 8) NOT GLOB '*[^0-9a-f]*'
+      ),
+      object_version TEXT NOT NULL,
+      bytes INTEGER NOT NULL CHECK (bytes > 0),
+      object_key TEXT NOT NULL UNIQUE CHECK (
+        length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
+      ),
+      state TEXT NOT NULL CHECK (state IN ('Filling', 'Deleting')),
+      claim_token TEXT,
+      claim_expires_at INTEGER,
+      created_at INTEGER NOT NULL CHECK (created_at >= 0),
+      last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= created_at),
+      PRIMARY KEY (space_id, digest, object_version),
+      CHECK ((state = 'Filling' AND claim_token IS NOT NULL AND claim_expires_at IS NOT NULL
+          AND claim_expires_at >= 0) OR
+        (state = 'Deleting' AND claim_token IS NULL AND claim_expires_at IS NULL))
+    )`,
+    `CREATE INDEX effect_local_client_attachment_promotions_cleanup
+      ON effect_local_client_attachment_promotions (state, claim_expires_at, last_accessed_at)`,
+    `CREATE TABLE effect_local_client_attachment_read_claims (
+      claim_token TEXT PRIMARY KEY,
+      object_key TEXT NOT NULL,
+      expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
+      created_at INTEGER NOT NULL CHECK (created_at >= 0)
+    )`,
+    `CREATE INDEX effect_local_client_attachment_read_claims_object
+      ON effect_local_client_attachment_read_claims (object_key, expires_at)`,
+    `CREATE TRIGGER effect_local_client_attachment_promotion_usage_insert
+      AFTER INSERT ON effect_local_client_attachment_promotions BEGIN
+        UPDATE effect_local_client_attachment_usage SET
+          local_object_count = local_object_count + 1,
+          local_byte_count = local_byte_count + NEW.bytes,
+          cache_object_count = cache_object_count + 1,
+          cache_byte_count = cache_byte_count + NEW.bytes
+        WHERE id = 1;
+      END`,
+    `CREATE TRIGGER effect_local_client_attachment_promotion_usage_delete
+      AFTER DELETE ON effect_local_client_attachment_promotions BEGIN
+        UPDATE effect_local_client_attachment_usage SET
+          local_object_count = local_object_count - 1,
+          local_byte_count = local_byte_count - OLD.bytes,
+          cache_object_count = cache_object_count - 1,
+          cache_byte_count = cache_byte_count - OLD.bytes
+        WHERE id = 1;
+      END`,
     `CREATE INDEX effect_local_client_attachment_owners_identity
       ON effect_local_client_attachment_owners (space_id, owner_kind, owner_id, digest)`,
     `CREATE INDEX effect_local_client_attachments_eviction
@@ -1406,17 +1514,45 @@ const clientV14 = makeMigration({
       object_key TEXT PRIMARY KEY CHECK (
         length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
       ),
+      bytes INTEGER NOT NULL CHECK (bytes >= 0),
+      cache_managed INTEGER NOT NULL CHECK (cache_managed IN (0, 1)),
       attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
       next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
       created_at INTEGER NOT NULL CHECK (created_at >= 0)
     )`,
     `CREATE INDEX effect_local_client_attachment_deletions_due
       ON effect_local_client_attachment_deletions (next_attempt_at, object_key)`,
+    `CREATE TRIGGER effect_local_client_attachment_deletion_usage_insert
+      AFTER INSERT ON effect_local_client_attachment_deletions BEGIN
+        UPDATE effect_local_client_attachment_usage SET
+          local_object_count = local_object_count + 1,
+          local_byte_count = local_byte_count + NEW.bytes,
+          cache_object_count = cache_object_count + NEW.cache_managed,
+          cache_byte_count = cache_byte_count + CASE WHEN NEW.cache_managed = 1 THEN NEW.bytes ELSE 0 END
+        WHERE id = 1;
+      END`,
+    `CREATE TRIGGER effect_local_client_attachment_deletion_usage_delete
+      AFTER DELETE ON effect_local_client_attachment_deletions BEGIN
+        UPDATE effect_local_client_attachment_usage SET
+          local_object_count = local_object_count - 1,
+          local_byte_count = local_byte_count - OLD.bytes,
+          cache_object_count = cache_object_count - OLD.cache_managed,
+          cache_byte_count = cache_byte_count - CASE WHEN OLD.cache_managed = 1 THEN OLD.bytes ELSE 0 END
+        WHERE id = 1;
+      END`,
     `CREATE TRIGGER effect_local_client_attachment_space_delete BEFORE DELETE
       ON effect_local_client_spaces BEGIN
         INSERT OR IGNORE INTO effect_local_client_attachment_deletions
-          (object_key, next_attempt_at, created_at)
-          SELECT object_key, 0, 0 FROM effect_local_client_attachments WHERE space_id = OLD.space_id;
+          (object_key, bytes, cache_managed, next_attempt_at, created_at)
+          SELECT object_key, bytes, cache_managed, 0, 0
+          FROM effect_local_client_attachments WHERE space_id = OLD.space_id;
+        INSERT OR IGNORE INTO effect_local_client_attachment_deletions
+          (object_key, bytes, cache_managed, next_attempt_at, created_at)
+          SELECT object_key, chunk_bytes, 1, 0, 0
+          FROM effect_local_client_attachment_chunks WHERE space_id = OLD.space_id;
+        UPDATE effect_local_client_attachment_promotions
+          SET state = 'Deleting', claim_token = NULL, claim_expires_at = NULL
+          WHERE space_id = OLD.space_id;
       END`,
     `CREATE TRIGGER effect_local_client_quarantine_attachment_acquire
       AFTER INSERT ON effect_local_client_quarantine BEGIN
@@ -1437,8 +1573,8 @@ const clientV14 = makeMigration({
     `CREATE TRIGGER effect_local_client_pending_attachment_release
       AFTER DELETE ON effect_local_client_pending_data BEGIN
         INSERT OR IGNORE INTO effect_local_client_attachment_deletions
-          (object_key, next_attempt_at, created_at)
-          SELECT a.object_key, 0, 0
+          (object_key, bytes, cache_managed, next_attempt_at, created_at)
+          SELECT a.object_key, a.bytes, a.cache_managed, 0, 0
           FROM effect_local_client_attachment_owners AS target
           JOIN effect_local_client_attachments AS a
             ON a.space_id = target.space_id AND a.digest = target.digest
@@ -1478,8 +1614,8 @@ const clientV14 = makeMigration({
     `CREATE TRIGGER effect_local_client_quarantine_attachment_release
       AFTER DELETE ON effect_local_client_quarantine BEGIN
         INSERT OR IGNORE INTO effect_local_client_attachment_deletions
-          (object_key, next_attempt_at, created_at)
-          SELECT a.object_key, 0, 0
+          (object_key, bytes, cache_managed, next_attempt_at, created_at)
+          SELECT a.object_key, a.bytes, a.cache_managed, 0, 0
           FROM effect_local_client_attachment_owners AS target
           JOIN effect_local_client_attachments AS a
             ON a.space_id = target.space_id AND a.digest = target.digest
@@ -1951,24 +2087,60 @@ const serverV13 = makeMigration({
         substr(digest, 8) NOT GLOB '*[^0-9a-f]*'
       ),
       bytes INTEGER NOT NULL CHECK (bytes >= 0),
-      object_key TEXT NOT NULL UNIQUE CHECK (
-        length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
-      ),
-      state TEXT NOT NULL CHECK (state IN ('Staging', 'Complete')),
-      storage_offset INTEGER NOT NULL DEFAULT 0 CHECK (storage_offset >= 0 AND storage_offset <= bytes),
-      staging_client_id TEXT NOT NULL,
-      staging_membership_incarnation TEXT NOT NULL,
-      lease_token TEXT,
-      lease_expires_at INTEGER,
+      object_version TEXT NOT NULL UNIQUE,
+      state TEXT NOT NULL CHECK (state IN ('Available', 'Missing')),
+      provider_namespace TEXT NOT NULL,
+      provider_object_id TEXT NOT NULL,
+      provider_object_version TEXT NOT NULL,
+      chunk_bytes INTEGER NOT NULL CHECK (chunk_bytes > 0),
+      chunk_count INTEGER NOT NULL CHECK (chunk_count >= 0),
       garbage_collect_after INTEGER,
       created_at INTEGER NOT NULL CHECK (created_at >= 0),
       last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= created_at),
       PRIMARY KEY (space_id, digest),
-      UNIQUE (space_id, digest, object_key),
-      CHECK ((state = 'Complete' AND storage_offset = bytes) OR state = 'Staging'),
-      CHECK ((lease_token IS NULL AND lease_expires_at IS NULL) OR
-        (lease_token IS NOT NULL AND lease_expires_at IS NOT NULL AND lease_expires_at >= 0)),
+      UNIQUE (provider_namespace, provider_object_id, provider_object_version),
       CHECK (garbage_collect_after IS NULL OR garbage_collect_after >= 0)
+    )`,
+    `CREATE TABLE effect_local_server_attachment_chunks (
+      space_id TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
+      chunk_offset INTEGER NOT NULL CHECK (chunk_offset >= 0),
+      chunk_bytes INTEGER NOT NULL CHECK (chunk_bytes > 0),
+      chunk_digest TEXT NOT NULL CHECK (
+        length(chunk_digest) = 71 AND substr(chunk_digest, 1, 7) = 'sha256:' AND
+        substr(chunk_digest, 8) NOT GLOB '*[^0-9a-f]*'
+      ),
+      PRIMARY KEY (space_id, digest, chunk_index),
+      UNIQUE (space_id, digest, chunk_offset),
+      FOREIGN KEY (space_id, digest)
+        REFERENCES effect_local_server_attachment_objects(space_id, digest) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE effect_local_server_attachment_attempts (
+      attempt_id TEXT PRIMARY KEY,
+      space_id TEXT NOT NULL,
+      digest TEXT NOT NULL,
+      bytes INTEGER NOT NULL CHECK (bytes >= 0),
+      client_id TEXT NOT NULL,
+      membership_incarnation TEXT NOT NULL,
+      provider_namespace TEXT NOT NULL,
+      physical_key TEXT NOT NULL UNIQUE CHECK (
+        length(physical_key) = 32 AND physical_key NOT GLOB '*[^0-9a-f]*'
+      ),
+      provider_upload_id TEXT,
+      part_size INTEGER CHECK (part_size IS NULL OR part_size > 0),
+      state TEXT NOT NULL CHECK (state IN ('Reserved', 'Uploading', 'Finalizing')),
+      finalization_token TEXT,
+      finalization_expires_at INTEGER,
+      created_at INTEGER NOT NULL CHECK (created_at >= 0),
+      last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= created_at),
+      UNIQUE (space_id, digest, client_id, membership_incarnation),
+      UNIQUE (provider_namespace, provider_upload_id),
+      CHECK ((provider_upload_id IS NULL AND part_size IS NULL AND state = 'Reserved') OR
+        (provider_upload_id IS NOT NULL AND part_size IS NOT NULL AND state IN ('Uploading', 'Finalizing'))),
+      CHECK ((finalization_token IS NULL AND finalization_expires_at IS NULL) OR
+        (finalization_token IS NOT NULL AND finalization_expires_at IS NOT NULL
+          AND finalization_expires_at >= 0))
     )`,
     `CREATE TABLE effect_local_server_attachment_usage (
       space_id TEXT PRIMARY KEY,
@@ -1977,14 +2149,17 @@ const serverV13 = makeMigration({
       FOREIGN KEY (space_id) REFERENCES effect_local_server_spaces(space_id) ON DELETE CASCADE
     )`,
     `CREATE TABLE effect_local_server_attachment_upload_grants (
-      space_id TEXT NOT NULL,
-      digest TEXT NOT NULL,
+      grant_id TEXT PRIMARY KEY,
+      attempt_id TEXT NOT NULL,
       client_id TEXT NOT NULL,
       membership_incarnation TEXT NOT NULL,
+      part_number INTEGER NOT NULL CHECK (part_number > 0 AND part_number <= 10000),
+      byte_offset INTEGER NOT NULL CHECK (byte_offset >= 0),
+      bytes INTEGER NOT NULL CHECK (bytes > 0),
       expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
-      PRIMARY KEY (space_id, digest, client_id, membership_incarnation),
-      FOREIGN KEY (space_id, digest)
-        REFERENCES effect_local_server_attachment_objects(space_id, digest) ON DELETE CASCADE
+      created_at INTEGER NOT NULL CHECK (created_at >= 0),
+      FOREIGN KEY (attempt_id)
+        REFERENCES effect_local_server_attachment_attempts(attempt_id) ON DELETE CASCADE
     )`,
     `CREATE TABLE effect_local_server_attachment_possessions (
       space_id TEXT NOT NULL,
@@ -2007,12 +2182,15 @@ const serverV13 = makeMigration({
         REFERENCES effect_local_server_attachment_objects(space_id, digest) ON DELETE RESTRICT
     )`,
     `CREATE TABLE effect_local_server_attachment_deletions (
-      object_key TEXT PRIMARY KEY CHECK (
-        length(object_key) = 32 AND object_key NOT GLOB '*[^0-9a-f]*'
-      ),
+      outbox_id TEXT PRIMARY KEY,
       space_id TEXT NOT NULL,
       digest TEXT NOT NULL,
       bytes INTEGER NOT NULL CHECK (bytes >= 0),
+      operation TEXT NOT NULL CHECK (operation IN ('AbortUpload', 'DeleteObject')),
+      provider_namespace TEXT NOT NULL,
+      provider_id TEXT NOT NULL,
+      provider_version TEXT,
+      charge_usage INTEGER NOT NULL DEFAULT 1 CHECK (charge_usage IN (0, 1)),
       attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
       next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
       claim_token TEXT,
@@ -2021,57 +2199,115 @@ const serverV13 = makeMigration({
       CHECK ((claim_token IS NULL AND claimed_until IS NULL) OR
         (claim_token IS NOT NULL AND claimed_until IS NOT NULL AND claimed_until >= 0))
     )`,
-    `CREATE TABLE effect_local_server_attachment_read_leases (
-      lease_token TEXT PRIMARY KEY,
+    `CREATE TABLE effect_local_server_attachment_download_grants (
+      grant_id TEXT PRIMARY KEY,
       space_id TEXT NOT NULL,
       digest TEXT NOT NULL,
-      object_key TEXT NOT NULL,
+      object_version TEXT NOT NULL,
+      provider_namespace TEXT NOT NULL,
+      provider_object_id TEXT NOT NULL,
+      provider_object_version TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
       expires_at INTEGER NOT NULL CHECK (expires_at >= 0),
-      created_at INTEGER NOT NULL CHECK (created_at >= 0),
-      FOREIGN KEY (space_id, digest, object_key)
-        REFERENCES effect_local_server_attachment_objects(space_id, digest, object_key) ON DELETE CASCADE
+      created_at INTEGER NOT NULL CHECK (created_at >= 0)
     )`,
     `CREATE TRIGGER effect_local_server_attachment_usage_insert AFTER INSERT
       ON effect_local_server_attachment_objects BEGIN
+        INSERT INTO effect_local_server_attachment_usage (space_id, object_count, byte_count)
+          VALUES (NEW.space_id, NEW.state = 'Available', NEW.bytes * (NEW.state = 'Available'))
+          ON CONFLICT (space_id) DO UPDATE SET
+            object_count = object_count + (NEW.state = 'Available'),
+            byte_count = byte_count + NEW.bytes * (NEW.state = 'Available');
+      END`,
+    `CREATE TRIGGER effect_local_server_attachment_usage_delete AFTER DELETE
+      ON effect_local_server_attachment_objects BEGIN
+        UPDATE effect_local_server_attachment_usage SET
+          object_count = object_count - (OLD.state = 'Available'),
+          byte_count = byte_count - OLD.bytes * (OLD.state = 'Available')
+          WHERE space_id = OLD.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_server_attachment_usage_state_update
+      AFTER UPDATE OF state ON effect_local_server_attachment_objects
+      WHEN OLD.state != NEW.state BEGIN
+        UPDATE effect_local_server_attachment_usage SET
+          object_count = object_count + (NEW.state = 'Available') - (OLD.state = 'Available'),
+          byte_count = byte_count + NEW.bytes * (NEW.state = 'Available')
+            - OLD.bytes * (OLD.state = 'Available')
+          WHERE space_id = NEW.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_server_attachment_attempt_usage_insert AFTER INSERT
+      ON effect_local_server_attachment_attempts BEGIN
         INSERT INTO effect_local_server_attachment_usage (space_id, object_count, byte_count)
           VALUES (NEW.space_id, 1, NEW.bytes)
           ON CONFLICT (space_id) DO UPDATE SET
             object_count = object_count + 1, byte_count = byte_count + NEW.bytes;
       END`,
-    `CREATE TRIGGER effect_local_server_attachment_usage_delete AFTER DELETE
-      ON effect_local_server_attachment_objects BEGIN
+    `CREATE TRIGGER effect_local_server_attachment_attempt_usage_delete AFTER DELETE
+      ON effect_local_server_attachment_attempts BEGIN
+        UPDATE effect_local_server_attachment_usage SET
+          object_count = object_count - 1, byte_count = byte_count - OLD.bytes
+          WHERE space_id = OLD.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_server_attachment_deletion_usage_insert AFTER INSERT
+      ON effect_local_server_attachment_deletions BEGIN
+        INSERT INTO effect_local_server_attachment_usage (space_id, object_count, byte_count)
+          VALUES (NEW.space_id, NEW.charge_usage, NEW.bytes * NEW.charge_usage)
+          ON CONFLICT (space_id) DO UPDATE SET
+            object_count = object_count + NEW.charge_usage,
+            byte_count = byte_count + NEW.bytes * NEW.charge_usage;
+      END`,
+    `CREATE TRIGGER effect_local_server_attachment_deletion_usage_delete AFTER DELETE
+      ON effect_local_server_attachment_deletions WHEN OLD.charge_usage = 1 BEGIN
+        UPDATE effect_local_server_attachment_usage SET
+          object_count = object_count - 1, byte_count = byte_count - OLD.bytes
+          WHERE space_id = OLD.space_id;
+      END`,
+    `CREATE TRIGGER effect_local_server_attachment_deletion_usage_release
+      AFTER UPDATE OF charge_usage ON effect_local_server_attachment_deletions
+      WHEN OLD.charge_usage = 1 AND NEW.charge_usage = 0 BEGIN
         UPDATE effect_local_server_attachment_usage SET
           object_count = object_count - 1, byte_count = byte_count - OLD.bytes
           WHERE space_id = OLD.space_id;
       END`,
     `CREATE INDEX effect_local_server_attachment_objects_complete_gc
       ON effect_local_server_attachment_objects (space_id, garbage_collect_after, digest)
-      WHERE state = 'Complete' AND garbage_collect_after IS NOT NULL`,
-    `CREATE INDEX effect_local_server_attachment_objects_staging_gc
-      ON effect_local_server_attachment_objects (space_id, last_accessed_at, digest)
-      WHERE state = 'Staging'`,
+      WHERE garbage_collect_after IS NOT NULL`,
+    `CREATE INDEX effect_local_server_attachment_attempts_stale
+      ON effect_local_server_attachment_attempts (space_id, last_accessed_at, attempt_id)`,
     `CREATE INDEX effect_local_server_attachment_upload_grants_expiry
-      ON effect_local_server_attachment_upload_grants (expires_at, space_id, digest)`,
-    `CREATE INDEX effect_local_server_attachment_upload_grants_object
-      ON effect_local_server_attachment_upload_grants (space_id, digest, expires_at)`,
+      ON effect_local_server_attachment_upload_grants (expires_at, attempt_id)`,
     `CREATE INDEX effect_local_server_attachment_references_digest
       ON effect_local_server_attachment_references (space_id, schema_generation, digest, model, entity_key)`,
     `CREATE INDEX effect_local_server_attachment_references_object
       ON effect_local_server_attachment_references (space_id, digest, schema_generation)`,
-    `CREATE INDEX effect_local_server_attachment_read_leases_object
-      ON effect_local_server_attachment_read_leases (space_id, digest, object_key, expires_at)`,
-    `CREATE INDEX effect_local_server_attachment_read_leases_expiry
-      ON effect_local_server_attachment_read_leases (expires_at, lease_token)`,
+    `CREATE INDEX effect_local_server_attachment_download_grants_object
+      ON effect_local_server_attachment_download_grants
+        (space_id, digest, object_version, provider_namespace, provider_object_id,
+          provider_object_version, expires_at)`,
+    `CREATE INDEX effect_local_server_attachment_download_grants_expiry
+      ON effect_local_server_attachment_download_grants (expires_at, grant_id)`,
     `CREATE INDEX effect_local_server_attachment_deletions_due
-      ON effect_local_server_attachment_deletions (next_attempt_at, object_key)`,
+      ON effect_local_server_attachment_deletions (next_attempt_at, claimed_until, outbox_id)`,
     `CREATE TRIGGER effect_local_server_attachment_space_delete BEFORE DELETE
       ON effect_local_server_spaces BEGIN
         DELETE FROM effect_local_server_attachment_references WHERE space_id = OLD.space_id;
         INSERT OR IGNORE INTO effect_local_server_attachment_deletions
-          (object_key, space_id, digest, bytes, next_attempt_at, created_at)
-          SELECT object_key, space_id, digest, bytes, 0, 0
+          (outbox_id, space_id, digest, bytes, operation, provider_namespace, provider_id,
+            provider_version, next_attempt_at, created_at)
+          SELECT lower(hex(randomblob(16))), space_id, digest, bytes, 'DeleteObject',
+            provider_namespace, provider_object_id, provider_object_version, 0, 0
           FROM effect_local_server_attachment_objects WHERE space_id = OLD.space_id;
+        INSERT OR IGNORE INTO effect_local_server_attachment_deletions
+          (outbox_id, space_id, digest, bytes, operation, provider_namespace, provider_id,
+            next_attempt_at, created_at)
+          SELECT lower(hex(randomblob(16))), space_id, digest, bytes, 'AbortUpload',
+            provider_namespace, provider_upload_id, 0, 0
+          FROM effect_local_server_attachment_attempts
+          WHERE space_id = OLD.space_id AND provider_upload_id IS NOT NULL;
         DELETE FROM effect_local_server_attachment_objects WHERE space_id = OLD.space_id;
+        DELETE FROM effect_local_server_attachment_attempts WHERE space_id = OLD.space_id;
+        UPDATE effect_local_server_attachment_deletions SET charge_usage = 0
+          WHERE space_id = OLD.space_id AND charge_usage = 1;
       END`
   ]
 })

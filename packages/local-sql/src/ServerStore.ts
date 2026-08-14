@@ -1760,7 +1760,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
       })
 
-      const maintainSpace = (spaceId: Identity.SpaceId) =>
+      const maintainHistory = (spaceId: Identity.SpaceId) =>
         prepareSnapshot(spaceId).pipe(
           Effect.flatMap(publishAndPrune),
           Effect.tap((pruned) =>
@@ -1774,21 +1774,38 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
           Effect.asVoid,
           Effect.withSpan("ServerStore.maintain", { attributes: { "space.id": spaceId } })
         )
-      const maintain = (spaceId: Identity.SpaceId) =>
-        maintainSpace(spaceId).pipe(Effect.ensuring(scheduleMetricDepthRefresh))
+      const maintainSpace = (spaceId: Identity.SpaceId) =>
+        Option.match(attachments, {
+          onNone: () => maintainHistory(spaceId),
+          onSome: (attachmentServer) =>
+            maintainHistory(spaceId).pipe(
+              Effect.andThen(attachmentServer.sweepSpace(spaceId)),
+              Effect.asVoid
+            )
+        })
+      const maintain = (spaceId: Identity.SpaceId) => {
+        let drain: Effect.Effect<number | void, ReplicaError.ReplicaError> = Effect.void
+        if (Option.isSome(attachments)) drain = attachments.value.drainOutbox
+        return maintainSpace(spaceId).pipe(
+          Effect.andThen(drain),
+          Effect.asVoid,
+          Effect.ensuring(scheduleMetricDepthRefresh)
+        )
+      }
       const maintainAll = Effect.gen(function*() {
         let after = ""
         while (true) {
           const spaces = yield* findSpaces({ after, limit: options.maintenanceSpaceBatchSize }).pipe(
             Effect.mapError(StorageUnavailable.make)
           )
-          if (spaces.length === 0) return
+          if (spaces.length === 0) break
           yield* Effect.forEach(spaces, ({ space_id }) => maintainSpace(space_id), {
             concurrency: options.maintenanceConcurrency,
             discard: true
           })
           after = spaces.at(-1)!.space_id
         }
+        if (Option.isSome(attachments)) yield* attachments.value.drainOutbox
       }).pipe(Effect.ensuring(scheduleMetricDepthRefresh))
       const projectScopedEntity = Effect.fnUntraced(function*(
         target: Definition.Any,

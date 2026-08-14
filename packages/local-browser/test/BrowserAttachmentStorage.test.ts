@@ -160,6 +160,10 @@ describe("browser attachment storage", () => {
       const secondScope = yield* Scope.make()
       const second = yield* Layer.buildWithScope(layer, secondScope)
       const restarted = Context.get(second, AttachmentStorage.AttachmentStorage)
+      const reservedKey = AttachmentStorage.ObjectKey.make("0123456789abcdef0123456789abcdef")
+      assert.strictEqual(yield* restarted.create(reservedKey), reservedKey)
+      assert.isTrue(yield* restarted.exists(reservedKey))
+      yield* restarted.remove(reservedKey)
       assert.deepStrictEqual(
         yield* collectBytes(restarted.read(staged.key, staged.reference)),
         Uint8Array.from([1, 2, 3, 4, 5])
