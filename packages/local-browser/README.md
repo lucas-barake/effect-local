@@ -9,6 +9,8 @@ per space status. It exposes `scope`, `setScope`, `activation`, `activate`, and 
 installed server entries refresh only matching space and model dependencies. Its `attachment` family exposes lazy
 `AsyncResult` placeholder, failure, and byte states through `Space.readAttachment`. Membership, aggregate, scope,
 activation, and addressed status have separate keys. Leaving a space invalidates retained atoms for that address.
+Set the required `maximumWholeAttachmentBytes` graph option to bound this whole-object Atom. Use
+`Space.readAttachment` directly when consumers can stream larger attachments.
 
 Pass either `SqlReplica.layer` or `SqlReplica.layerWorkflow` to the graph. The Workflow composition can run in an
 application owned dedicated Worker or SharedWorker with SQL backed `SingleRunner` and `ClusterWorkflowEngine`.

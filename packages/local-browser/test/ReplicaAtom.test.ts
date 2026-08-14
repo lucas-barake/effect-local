@@ -42,6 +42,7 @@ const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001"
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const thirdSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const graphOptions = { maximumWholeAttachmentBytes: 8 * 1_024 * 1_024 } as const
 const TodoSchema = Schema.Struct({ id: Schema.String, title: Schema.String })
 const Todo = Model.make("Todo", {
   version: 1,
@@ -202,6 +203,7 @@ describe("Replica Atom graph", () => {
     "exposes attachment placeholder, failure, and lazily resolved bytes",
     Effect.fnUntraced(function*() {
       const bytes = Uint8Array.from([1, 2, 3])
+      let transferDownloads = 0
       const availableReady = yield* Deferred.make<Attachment.Reference>()
       const allowRead = yield* Deferred.make<void>()
       const files = new Map<AttachmentStorage.ObjectKey, Uint8Array>()
@@ -258,7 +260,10 @@ describe("Replica Atom graph", () => {
         AttachmentTransfer.AttachmentTransfer,
         AttachmentTransfer.AttachmentTransfer.of({
           upload: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-          download: ({ reference }) => Effect.fail(new Attachment.AttachmentUnavailable({ digest: reference.digest }))
+          download: ({ reference }) => {
+            transferDownloads++
+            return Effect.fail(new Attachment.AttachmentUnavailable({ digest: reference.digest }))
+          }
         })
       )
       const layerAttachments = AttachmentClient.layer({
@@ -303,7 +308,7 @@ describe("Replica Atom graph", () => {
           )
         })
       )
-      const graph = BrowserReplica.make(layerAttachmentReplica)
+      const graph = BrowserReplica.make(layerAttachmentReplica, { maximumWholeAttachmentBytes: 8 })
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       yield* AtomRegistry.getResult(registry, graph.spaces)
@@ -317,6 +322,11 @@ describe("Replica Atom graph", () => {
         _tag: "Attachment",
         digest: available.digest,
         bytes: available.bytes + 1
+      })
+      const oversized = Attachment.Reference.make({
+        _tag: "Attachment",
+        digest: Attachment.Digest.make(`sha256:${"3".repeat(64)}`),
+        bytes: 2 ** 32
       })
       const attachment = graph.attachment(spaceId, available)
       const unmount = registry.mount(attachment)
@@ -354,6 +364,16 @@ describe("Replica Atom graph", () => {
           assert.strictEqual(error.actual, overflowing.bytes)
         }
       }
+      const downloadsBeforeOversized = transferDownloads
+      const oversizedAtom = graph.attachment(spaceId, oversized)
+      const oversizedResult = yield* Effect.exit(AtomRegistry.getResult(registry, oversizedAtom))
+      assert.isTrue(Exit.isFailure(oversizedResult))
+      if (Exit.isFailure(oversizedResult)) {
+        const error = Option.getOrThrow(Cause.findErrorOption(oversizedResult.cause))
+        assert.strictEqual(error._tag, "AttachmentTooLarge")
+        if (error._tag === "AttachmentTooLarge") assert.strictEqual(error.limit, 8)
+      }
+      assert.strictEqual(transferDownloads, downloadsBeforeOversized)
     }, Effect.scoped)
   )
 
@@ -361,7 +381,7 @@ describe("Replica Atom graph", () => {
     "reacts to pending mutation submission and settlement",
     Effect.fnUntraced(function*() {
       const faultsReady = yield* Deferred.make<FaultInjection.Service>()
-      const graph = BrowserReplica.make(faultedReplica(faultsReady))
+      const graph = BrowserReplica.make(faultedReplica(faultsReady), graphOptions)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const pending = graph.pendingFor(spaceId, PutTodo)
@@ -411,7 +431,7 @@ describe("Replica Atom graph", () => {
     "reruns only an indexed query whose result range can change",
     Effect.fnUntraced(function*() {
       rangeReads.clear()
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = BrowserReplica.make(layerReplica, graphOptions)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const related = graph.query(spaceId, RangeTodos)({ lower: "a", upper: "m" })
@@ -448,7 +468,7 @@ describe("Replica Atom graph", () => {
   it.effect(
     "refreshes an entity atom when its key has a different encoded representation",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = BrowserReplica.make(layerReplica, graphOptions)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const entity = graph.entity(spaceId, Numbered)(1)
@@ -497,7 +517,7 @@ describe("Replica Atom graph", () => {
         Layer.effect(Replica.Replica),
         Layer.provideMerge(layerReplica)
       )
-      const graph = BrowserReplica.make(layerObserved)
+      const graph = BrowserReplica.make(layerObserved, graphOptions)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const changed = graph.entity(spaceId, Todo)("changed")
@@ -564,7 +584,7 @@ describe("Replica Atom graph", () => {
         Layer.effect(Replica.Replica),
         Layer.provideMerge(layerReplica)
       )
-      const graph = BrowserReplica.make(layerObserved)
+      const graph = BrowserReplica.make(layerObserved, graphOptions)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const membership = graph.spaces
@@ -593,7 +613,7 @@ describe("Replica Atom graph", () => {
   it.effect(
     "reacts to per-space scope and activation commands",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = BrowserReplica.make(layerReplica, graphOptions)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const scopeAtom = graph.scope(spaceId)
@@ -630,12 +650,56 @@ describe("Replica Atom graph", () => {
   )
 
   it("uses the shared runtime factory by default and preserves an explicit factory", () => {
-    const graph = BrowserReplica.make(layerReplica)
+    const graph = BrowserReplica.make(layerReplica, graphOptions)
     assert.strictEqual(graph.factory, Atom.runtime)
 
     const factory = Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
-    const customGraph = BrowserReplica.make(layerReplica, { factory })
+    const customGraph = BrowserReplica.make(layerReplica, { ...graphOptions, factory })
     assert.strictEqual(customGraph.factory, factory)
+  })
+
+  it.effect(
+    "rejects an invalid whole attachment limit before reading a space",
+    Effect.fnUntraced(function*() {
+      const graph = BrowserReplica.make(layerReplica, { maximumWholeAttachmentBytes: 0 })
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const reference = Attachment.Reference.make({
+        _tag: "Attachment",
+        digest: Attachment.Digest.make(`sha256:${"4".repeat(64)}`),
+        bytes: 0
+      })
+      const attachment = graph.attachment(spaceId, reference)
+      const result = yield* Effect.exit(AtomRegistry.getResult(registry, attachment))
+      assert.isTrue(Exit.isFailure(result))
+      if (Exit.isFailure(result)) {
+        const error = Option.getOrThrow(Cause.findErrorOption(result.cause))
+        assert.strictEqual(error._tag, "InvalidConfiguration")
+        if (error._tag === "InvalidConfiguration") {
+          assert.strictEqual(error.option, "maximumWholeAttachmentBytes")
+        }
+      }
+    }, Effect.scoped)
+  )
+
+  it("reads the whole attachment limit once when constructing the graph", () => {
+    let reads = 0
+    const options = {
+      get maximumWholeAttachmentBytes() {
+        reads++
+        return 8
+      }
+    }
+    const graph = BrowserReplica.make(layerReplica, options)
+    const reference = Attachment.Reference.make({
+      _tag: "Attachment",
+      digest: Attachment.Digest.make(`sha256:${"5".repeat(64)}`),
+      bytes: 1
+    })
+
+    graph.attachment(spaceId, reference)
+    graph.attachment(spaceId, reference)
+    assert.strictEqual(reads, 1)
   })
 
   it("normalizes the configured idle duration once when the graph is constructed", () => {
@@ -646,7 +710,7 @@ describe("Replica Atom graph", () => {
         return 17
       }
     } satisfies Duration.Input
-    const graph = BrowserReplica.make(layerReplica, { idleTTL })
+    const graph = BrowserReplica.make(layerReplica, { ...graphOptions, idleTTL })
     const readsAfterConstruction = reads
 
     assert.isAbove(readsAfterConstruction, 0)
@@ -665,6 +729,7 @@ describe("Replica Atom graph", () => {
     "runs mutation, entity, query, receipt, and status state through one reactive runtime",
     Effect.fnUntraced(function*() {
       const graph = BrowserReplica.make(layerReplica, {
+        ...graphOptions,
         factory: Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
       })
       const registry = AtomRegistry.make()
@@ -719,7 +784,7 @@ describe("Replica Atom graph", () => {
   it.effect(
     "keeps addressed atoms isolated and shares membership through one runtime",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = BrowserReplica.make(layerReplica, graphOptions)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const firstEntity = graph.entity(spaceId, Todo)("shared")

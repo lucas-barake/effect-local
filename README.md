@@ -559,7 +559,9 @@ benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1
 ```ts
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 
-export const graph = BrowserReplica.make(layerReplica)
+export const graph = BrowserReplica.make(layerReplica, {
+  maximumWholeAttachmentBytes: 8 * 1024 * 1024
+})
 
 export const taskAtom = graph.entity(spaceId, Task)("task-1")
 export const tasksAtom = graph.query(spaceId, ListTasks)({ completed: false })

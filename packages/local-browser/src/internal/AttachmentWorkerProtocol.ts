@@ -135,7 +135,10 @@ export const serve = Effect.fnUntraced(function*(port: MessagePort, options: Opt
   )
   const handleRequest = Effect.fnUntraced(function*(event: MessageEvent<unknown>) {
     const decoded = yield* Schema.decodeUnknownEffect(Request)(event.data).pipe(
-      Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "worker.decode", cause }))
+      Effect.catchTag(
+        "SchemaError",
+        (cause) => Effect.fail(new Attachment.AttachmentStorageError({ operation: "worker.decode", cause }))
+      )
     )
     let response: Response
     switch (decoded._tag) {

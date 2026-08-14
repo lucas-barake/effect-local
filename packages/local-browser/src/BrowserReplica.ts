@@ -13,7 +13,8 @@ export const make = <E,>(
     E,
     AtomRegistry.AtomRegistry | Reactivity.Reactivity
   >,
-  options?: {
+  options: {
+    readonly maximumWholeAttachmentBytes: number
     readonly factory?: Atom.RuntimeFactory
     readonly idleTTL?: Duration.Input
   }

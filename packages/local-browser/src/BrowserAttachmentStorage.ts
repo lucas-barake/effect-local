@@ -114,7 +114,9 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
         })
         pending.delete(id)
         return yield* Schema.decodeUnknownEffect(AttachmentWorkerProtocol.Response)(response).pipe(
-          Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "response.decode", cause }))
+          Effect.catchTag("SchemaError", (cause) => {
+            return Effect.fail(new Attachment.AttachmentStorageError({ operation: "response.decode", cause }))
+          })
         )
       })
       const request = (
@@ -229,7 +231,9 @@ export const layerMessagePort = (port: MessagePort, options: Options) =>
         let key = requestedKey
         if (key === undefined) {
           const uuid = yield* crypto.randomUUIDv4.pipe(
-            Effect.mapError((cause) => new Attachment.AttachmentStorageError({ operation: "create.key", cause }))
+            Effect.catchTag("PlatformError", (cause) => {
+              return Effect.fail(new Attachment.AttachmentStorageError({ operation: "create.key", cause }))
+            })
           )
           key = AttachmentStorage.ObjectKey.make(uuid.replaceAll("-", ""))
         }

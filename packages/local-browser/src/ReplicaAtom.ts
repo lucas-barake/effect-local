@@ -8,6 +8,7 @@ import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import type * as Query from "@lucas-barake/effect-local/Query"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
@@ -57,48 +58,63 @@ export const make = <E,>(
     E,
     AtomRegistry.AtomRegistry | Reactivity.Reactivity
   >,
-  options?: {
+  options: {
+    readonly maximumWholeAttachmentBytes: number
     readonly factory?: Atom.RuntimeFactory
     readonly idleTTL?: Duration.Input
   }
 ) => {
-  const factory = options?.factory ?? Atom.runtime
+  const factory = options.factory ?? Atom.runtime
   const runtime = factory(layer)
-  const idleTTL = Duration.toMillis(options?.idleTTL ?? Duration.seconds(30))
+  const idleTTL = Duration.toMillis(options.idleTTL ?? Duration.seconds(30))
+  const maximumWholeAttachmentBytes = options.maximumWholeAttachmentBytes
+  let maximumWholeAttachmentBytesError: ReplicaError.InvalidConfiguration | undefined
+  if (!Number.isSafeInteger(maximumWholeAttachmentBytes) || maximumWholeAttachmentBytes <= 0) {
+    maximumWholeAttachmentBytesError = new ReplicaError.InvalidConfiguration({
+      option: "maximumWholeAttachmentBytes",
+      message: "maximumWholeAttachmentBytes must be a positive safe integer"
+    })
+  }
 
   const attachmentFamily = Atom.family((key: AttachmentKey) =>
     runtime.atom(
-      Replica.Replica.use((replica) =>
-        replica.space(key.spaceId).pipe(
-          Effect.flatMap(
-            Effect.fnUntraced(function*(space) {
-              const bytes = new Uint8Array(key.reference.bytes)
-              const actual = yield* space.readAttachment(key.reference).pipe(
-                Stream.runFoldEffect(() => 0, (offset, chunk) => {
-                  const nextOffset = offset + chunk.length
-                  if (nextOffset > key.reference.bytes) {
-                    return Effect.fail(
-                      new Attachment.AttachmentLengthMismatch({
-                        expected: key.reference.bytes,
-                        actual: nextOffset
-                      })
-                    )
-                  }
-                  bytes.set(chunk, offset)
-                  return Effect.succeed(nextOffset)
-                })
-              )
-              if (actual !== key.reference.bytes) {
-                return yield* new Attachment.AttachmentLengthMismatch({
-                  expected: key.reference.bytes,
-                  actual
-                })
-              }
-              return bytes
-            })
+      Effect.suspend(() => {
+        if (maximumWholeAttachmentBytesError !== undefined) return Effect.fail(maximumWholeAttachmentBytesError)
+        if (key.reference.bytes > maximumWholeAttachmentBytes) {
+          return Effect.fail(new Attachment.AttachmentTooLarge({ limit: maximumWholeAttachmentBytes }))
+        }
+        return Replica.Replica.use((replica) =>
+          replica.space(key.spaceId).pipe(
+            Effect.flatMap(
+              Effect.fnUntraced(function*(space) {
+                const bytes = new Uint8Array(key.reference.bytes)
+                const actual = yield* space.readAttachment(key.reference).pipe(
+                  Stream.runFoldEffect(() => 0, (offset, chunk) => {
+                    const nextOffset = offset + chunk.length
+                    if (nextOffset > key.reference.bytes) {
+                      return Effect.fail(
+                        new Attachment.AttachmentLengthMismatch({
+                          expected: key.reference.bytes,
+                          actual: nextOffset
+                        })
+                      )
+                    }
+                    bytes.set(chunk, offset)
+                    return Effect.succeed(nextOffset)
+                  })
+                )
+                if (actual !== key.reference.bytes) {
+                  return yield* new Attachment.AttachmentLengthMismatch({
+                    expected: key.reference.bytes,
+                    actual
+                  })
+                }
+                return bytes
+              })
+            )
           )
         )
-      )
+      })
     ).pipe(Atom.setIdleTTL(idleTTL))
   )
   const attachment = (spaceId: Identity.SpaceId, reference: Attachment.Reference) =>
