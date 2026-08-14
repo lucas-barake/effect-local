@@ -1628,11 +1628,30 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             ) {
               continue
             }
+            const deferFinalizing = sql`UPDATE effect_local_server_attachment_attempts
+              SET last_accessed_at = ${now}
+              WHERE attempt_id = ${selected.attempt_id}
+                AND state = 'Finalizing'
+                AND provider_namespace = ${selected.provider_namespace}
+                AND provider_upload_id = ${selected.provider_upload_id}
+                AND finalization_token = ${selected.finalization_token}
+                AND finalization_expires_at = ${selected.finalization_expires_at}
+                AND finalization_expires_at <= ${now}
+                AND last_accessed_at <= ${now - stagingLifetime}
+                AND NOT EXISTS (
+                  SELECT 1 FROM effect_local_server_attachment_upload_grants
+                  WHERE attempt_id = ${selected.attempt_id} AND expires_at > ${now}
+                )`.pipe(
+              Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+            )
             const adapter = yield* objectStores.resolve(selected.provider_namespace).pipe(
               Effect.map(Option.some),
               Effect.catchTag("AttachmentObjectStoreUnavailable", () => Effect.succeed(Option.none()))
             )
-            if (Option.isNone(adapter)) continue
+            if (Option.isNone(adapter)) {
+              yield* deferFinalizing
+              continue
+            }
             const upload = AttachmentObjectStore.UploadIdentity.make({
               namespace: selected.provider_namespace,
               id: AttachmentObjectStore.ProviderId.make(selected.provider_upload_id)
@@ -1667,7 +1686,10 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                   })
                 ))
             )
-            if (providerUnavailable || verified !== null) continue
+            if (providerUnavailable || verified !== null) {
+              yield* deferFinalizing
+              continue
+            }
             const outboxId = yield* newId("upload.finalizingAbortOutbox")
             const removed = yield* sql.withTransaction(Effect.gen(function*() {
               yield* sql`INSERT INTO effect_local_server_attachment_deletions

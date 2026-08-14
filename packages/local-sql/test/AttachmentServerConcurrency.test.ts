@@ -173,7 +173,10 @@ const makeProvider = () => {
   }
 }
 
-const attachmentOptions = (maximumBytesPerSpace: number): AttachmentServer.Options => ({
+const attachmentOptions = (
+  maximumBytesPerSpace: number,
+  deletionBatchSize = 8
+): AttachmentServer.Options => ({
   maximumObjectBytes: 8,
   maximumObjectsPerSpace: 4,
   maximumBytesPerSpace,
@@ -183,7 +186,7 @@ const attachmentOptions = (maximumBytesPerSpace: number): AttachmentServer.Optio
   readLeaseLifetime: "1 minute",
   stagingLifetime: "1 minute",
   garbageCollectionGracePeriod: "1 minute",
-  deletionBatchSize: 8,
+  deletionBatchSize,
   verificationChunkBytes: 5,
   maximumVerificationChunks: 8,
   deletionRetryDelay: "1 second",
@@ -192,7 +195,7 @@ const attachmentOptions = (maximumBytesPerSpace: number): AttachmentServer.Optio
   authorizeRead: () => Effect.void
 })
 
-const makeHarness = Effect.fnUntraced(function*(maximumBytesPerSpace = 32) {
+const makeHarness = Effect.fnUntraced(function*(maximumBytesPerSpace = 32, deletionBatchSize = 8) {
   const fs = yield* FileSystem.FileSystem
   const root = yield* fs.makeTempDirectoryScoped({ prefix: "effect-local-attachment-outbox-" })
   const layerDatabase = SqliteClient.layer({ filename: `${root}/server.sqlite`, disableWAL: true }).pipe(
@@ -204,7 +207,7 @@ const makeHarness = Effect.fnUntraced(function*(maximumBytesPerSpace = 32) {
     adapters: [provider.adapter]
   })
   const layerInfrastructure = Layer.mergeAll(layerDatabase, layerObjectStore, NodeCrypto.layer)
-  const options = attachmentOptions(maximumBytesPerSpace)
+  const options = attachmentOptions(maximumBytesPerSpace, deletionBatchSize)
   const layerInitializationAttachments = AttachmentServer.layer(options).pipe(
     Layer.provide(layerInfrastructure)
   )
@@ -716,7 +719,7 @@ describe("delegated attachment deletion concurrency", () => {
     "retries abandoned Finalizing inspection when the provider is unavailable",
     Effect.fnUntraced(
       function*() {
-        const { first, provider, sql } = yield* makeHarness()
+        const { first, provider, sql } = yield* makeHarness(32, 1)
         const prepared = yield* first.prepareUpload(identity)
         assert.strictEqual(prepared._tag, "UploadPart")
         if (prepared._tag !== "UploadPart") return
@@ -735,16 +738,28 @@ describe("delegated attachment deletion concurrency", () => {
           attemptId: prepared.attemptId
         }).pipe(Effect.result)
         assert.isTrue(Result.isFailure(failed))
+        yield* sql`INSERT INTO effect_local_server_attachment_attempts
+          (attempt_id, space_id, digest, bytes, client_id, membership_incarnation,
+            provider_namespace, physical_key, provider_upload_id, part_size, state,
+            created_at, last_accessed_at)
+          VALUES ('ordinary-stale', ${spaceId}, ${deletionDigest}, 1, ${clientId},
+            ${membershipIncarnation}, ${namespace}, ${"2".repeat(32)}, 'ordinary-upload', 1,
+            'Uploading', 1, 1)`
         yield* TestClock.adjust("2 minutes")
 
         assert.strictEqual(yield* first.sweepSpace(spaceId), 0)
         assert.strictEqual(inspectCalls, 2)
-        const attempts = yield* sql<{ readonly state: string }>`SELECT state
+        const attempts = yield* sql<{ readonly last_accessed_at: number; readonly state: string }>`
+          SELECT last_accessed_at, state
           FROM effect_local_server_attachment_attempts WHERE attempt_id = ${prepared.attemptId}`
-        assert.deepStrictEqual(attempts, [{ state: "Finalizing" }])
+        assert.deepStrictEqual(attempts, [{ last_accessed_at: 120_000, state: "Finalizing" }])
         const aborts = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
           FROM effect_local_server_attachment_deletions WHERE operation = 'AbortUpload'`
         assert.deepStrictEqual(aborts, [{ count: 0 }])
+        assert.strictEqual(yield* first.sweepSpace(spaceId), 1)
+        const ordinary = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+          FROM effect_local_server_attachment_attempts WHERE attempt_id = 'ordinary-stale'`
+        assert.deepStrictEqual(ordinary, [{ count: 0 }])
       },
       providePlatform,
       Effect.scoped
