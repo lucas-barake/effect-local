@@ -1,6 +1,7 @@
 import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
+import type * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
@@ -8,11 +9,12 @@ import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import type * as Query from "@lucas-barake/effect-local/Query"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as Cause from "effect/Cause"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Hash from "effect/Hash"
-import * as HashMap from "effect/HashMap"
 import type * as Layer from "effect/Layer"
 import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
@@ -35,121 +37,67 @@ class QueryKey<P,> implements Equal.Equal {
   }
 }
 
-class EphemeralJoinKey implements Equal.Equal {
+class EphemeralSessionKey implements Equal.Equal {
   readonly value: string
-  readonly request: EphemeralClient.JoinRequest
-  constructor(request: EphemeralClient.JoinRequest) {
-    this.value = `${request.spaceId}:${request.member.clientId}:${request.member.membershipIncarnation}:${
-      Canonical.hash(request)
-    }`
-    this.request = request
+  readonly profile: Ephemeral.AnyMember
+  readonly options: EphemeralClient.SessionOptions<Ephemeral.AnyMember>
+  constructor(profile: Ephemeral.AnyMember, options: EphemeralClient.SessionOptions<Ephemeral.AnyMember>) {
+    this.profile = profile
+    this.options = options
+    this.value = `${options.spaceId}:${options.member.clientId}:${options.member.membershipIncarnation}:${
+      Duration.toMillis(options.ttl)
+    }:${Canonical.hash(options.value)}`
   }
   [Equal.symbol](that: unknown): boolean {
-    return that instanceof EphemeralJoinKey && this.value === that.value
+    return that instanceof EphemeralSessionKey && this.value === that.value && this.profile === that.profile
   }
   [Hash.symbol](): number {
     return Hash.string(this.value)
   }
 }
 
-export interface EphemeralView {
-  readonly spaceId: Identity.SpaceId
-  readonly revision: Identity.EphemeralRevision
-  readonly members: ReadonlyArray<Protocol.EphemeralMemberEntry>
-  readonly states: HashMap.HashMap<string, Protocol.EphemeralStateEntry>
-  readonly events: ReadonlyArray<Protocol.EphemeralEventEntry>
+class EphemeralEventKey implements Equal.Equal {
+  readonly session: object
+  readonly definition: Ephemeral.AnyEvent
+  constructor(session: object, definition: Ephemeral.AnyEvent) {
+    this.session = session
+    this.definition = definition
+  }
+  [Equal.symbol](that: unknown): boolean {
+    return that instanceof EphemeralEventKey && this.session === that.session &&
+      this.definition === that.definition
+  }
+  [Hash.symbol](): number {
+    return Hash.hash(this.session) ^ Hash.hash(this.definition)
+  }
 }
 
-const sameMember = (left: Protocol.EphemeralMember, right: Protocol.EphemeralMember) =>
-  left.clientId === right.clientId && left.membershipIncarnation === right.membershipIncarnation
+class EphemeralStateKey implements Equal.Equal {
+  readonly session: object
+  readonly definition: Ephemeral.AnyState
+  constructor(session: object, definition: Ephemeral.AnyState) {
+    this.session = session
+    this.definition = definition
+  }
+  [Equal.symbol](that: unknown): boolean {
+    return that instanceof EphemeralStateKey && this.session === that.session &&
+      this.definition === that.definition
+  }
+  [Hash.symbol](): number {
+    return Hash.hash(this.session) ^ Hash.hash(this.definition)
+  }
+}
 
-const stateIdentity = (
-  member: Protocol.EphemeralMember,
-  channel: Protocol.EphemeralChannel,
-  key: Protocol.EphemeralKey
-) =>
-  [member.clientId, member.membershipIncarnation, channel, key]
-    .map((component) => `${component.length}:${component}`)
-    .join("")
-
-const stateRecord = (
-  entry: Protocol.EphemeralStateEntry
-): readonly [string, Protocol.EphemeralStateEntry] => [
-  stateIdentity(entry.member, entry.channel, entry.key),
-  entry
-]
-
-const reduceEphemeral = (
-  current: EphemeralView | undefined,
-  message: Protocol.EphemeralMessage
-): EphemeralView | undefined => {
-  if (message._tag === "Snapshot") {
-    return {
-      spaceId: message.spaceId,
-      revision: message.revision,
-      members: message.members,
-      states: HashMap.fromIterable(message.states.map(stateRecord)),
-      events: []
-    }
+class EphemeralMembersKey implements Equal.Equal {
+  readonly session: object
+  constructor(session: object) {
+    this.session = session
   }
-  if (current === undefined) return undefined
-  if (message._tag === "MemberUpserted") {
-    return {
-      ...current,
-      revision: message.revision,
-      members: [
-        ...current.members.filter((entry) => !sameMember(entry.member, message.entry.member)),
-        message.entry
-      ]
-    }
+  [Equal.symbol](that: unknown): boolean {
+    return that instanceof EphemeralMembersKey && this.session === that.session
   }
-  if (message._tag === "MemberLeft") {
-    return {
-      ...current,
-      revision: message.revision,
-      members: current.members.filter((entry) => !sameMember(entry.member, message.member)),
-      events: current.events.filter((entry) => !sameMember(entry.member, message.member))
-    }
-  }
-  if (message._tag === "StateSet") {
-    return {
-      ...current,
-      revision: message.revision,
-      states: HashMap.set(
-        current.states,
-        stateIdentity(message.entry.member, message.entry.channel, message.entry.key),
-        message.entry
-      )
-    }
-  }
-  if (message._tag === "StateRemoved") {
-    return {
-      ...current,
-      revision: message.revision,
-      states: HashMap.remove(
-        current.states,
-        stateIdentity(message.member, message.channel, message.key)
-      )
-    }
-  }
-  if (message._tag === "Event") {
-    return {
-      ...current,
-      revision: message.revision,
-      events: [
-        ...current.events.filter((entry) =>
-          !sameMember(entry.member, message.entry.member) || entry.channel !== message.entry.channel
-        ),
-        message.entry
-      ]
-    }
-  }
-  return {
-    ...current,
-    revision: message.revision,
-    events: current.events.filter((entry) =>
-      !sameMember(entry.member, message.member) || entry.channel !== message.channel
-    )
+  [Hash.symbol](): number {
+    return Hash.hash(this.session)
   }
 }
 
@@ -168,29 +116,139 @@ export const make = <E,>(
   const runtime = factory(layer)
   const idleTTL = Duration.toMillis(options?.idleTTL ?? Duration.seconds(30))
 
-  const ephemeral = Atom.family((key: EphemeralJoinKey) => {
-    const stream = Stream.unwrap(
-      Effect.gen(function*() {
-        const client = yield* EphemeralClient.EphemeralClient
-        return client.join(key.request).pipe(
-          Stream.mapAccum(
-            (): EphemeralView | undefined => undefined,
-            (current, message) => {
-              const next = reduceEphemeral(current, message)
-              if (next === undefined) return [current, []] as const
-              return [next, [next]] as const
-            }
-          )
-        )
-      })
-    )
-    return runtime.atom(stream).pipe(Atom.setIdleTTL(idleTTL))
-  })
-  const ephemeralView = (request: EphemeralClient.JoinRequest) => ephemeral(new EphemeralJoinKey(request))
-  const publishEphemeral = runtime.fn<EphemeralClient.PublishRequest>()(
-    (request) => EphemeralClient.EphemeralClient.use((client) => client.publishEncoded(request)),
-    { concurrent: true }
+  type SessionError = ReplicaError.ReplicaError | Ephemeral.EncodeError | E
+  type SessionAtom<M extends Ephemeral.AnyMember,> = Atom.Atom<
+    AsyncResult.AsyncResult<EphemeralClient.Session<M>, SessionError>
+  >
+  type SessionSource = Atom.Atom<
+    AsyncResult.AsyncResult<
+      EphemeralClient.Session<Ephemeral.AnyMember>,
+      ReplicaError.ReplicaError | Ephemeral.EncodeError
+    >
+  >
+  type ProjectionError = Ephemeral.DecodeError | SessionError | Cause.NoSuchElementError
+
+  const ephemeralSessions = Atom.family((key: EphemeralSessionKey) =>
+    runtime.atom(
+      EphemeralClient.EphemeralClient.use((client) => client.session(key.profile, key.options))
+    ).pipe(Atom.setIdleTTL(idleTTL))
   )
+  const ephemeral = <M extends Ephemeral.AnyMember,>(
+    profile: M,
+    request: EphemeralClient.SessionOptions<M>
+  ): SessionAtom<M> =>
+    // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The session family erases the member schema type; the atom for this key was built from this exact profile, so the runtime values already match M.
+    ephemeralSessions(new EphemeralSessionKey(profile, request)) as unknown as SessionAtom<M>
+
+  const ephemeralEventsFamily = Atom.family((key: EphemeralEventKey) => {
+    // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- Projection keys erase the session atom type; only session atoms from this graph construct these keys.
+    const source = key.session as SessionSource
+    return runtime.atom((get) =>
+      Stream.unwrap(
+        get.result(source).pipe(Effect.map((session) => session.events(key.definition)))
+      )
+    ).pipe(Atom.setIdleTTL(idleTTL))
+  })
+  const ephemeralEvents = <M extends Ephemeral.AnyMember, D extends Ephemeral.AnyEvent,>(
+    session: SessionAtom<M>,
+    definition: D
+  ): Atom.Atom<AsyncResult.AsyncResult<EphemeralClient.EventEnvelope<D>, ProjectionError>> =>
+    // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The projection family erases the definition type; the atom for this key decodes with this exact definition, so the runtime values already match D.
+    ephemeralEventsFamily(new EphemeralEventKey(session, definition)) as unknown as Atom.Atom<
+      AsyncResult.AsyncResult<EphemeralClient.EventEnvelope<D>, ProjectionError>
+    >
+
+  const ephemeralStateFamily = Atom.family((key: EphemeralStateKey) => {
+    // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- Projection keys erase the session atom type; only session atoms from this graph construct these keys.
+    const source = key.session as SessionSource
+    return runtime.atom((get) =>
+      Stream.unwrap(
+        get.result(source).pipe(Effect.map((session) => session.state(key.definition)))
+      )
+    ).pipe(Atom.setIdleTTL(idleTTL))
+  })
+  const ephemeralState = <M extends Ephemeral.AnyMember, D extends Ephemeral.AnyState,>(
+    session: SessionAtom<M>,
+    definition: D
+  ): Atom.Atom<
+    AsyncResult.AsyncResult<ReadonlyArray<EphemeralClient.StateEntry<D>>, ProjectionError>
+  > =>
+    // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The projection family erases the definition type; the atom for this key decodes with this exact definition, so the runtime values already match D.
+    ephemeralStateFamily(new EphemeralStateKey(session, definition)) as unknown as Atom.Atom<
+      AsyncResult.AsyncResult<ReadonlyArray<EphemeralClient.StateEntry<D>>, ProjectionError>
+    >
+
+  const ephemeralMembersFamily = Atom.family((key: EphemeralMembersKey) => {
+    // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- Projection keys erase the session atom type; only session atoms from this graph construct these keys.
+    const source = key.session as SessionSource
+    return runtime.atom((get) => Stream.unwrap(get.result(source).pipe(Effect.map((session) => session.members)))).pipe(
+      Atom.setIdleTTL(idleTTL)
+    )
+  })
+  const ephemeralMembers = <M extends Ephemeral.AnyMember,>(
+    session: SessionAtom<M>
+  ): Atom.Atom<
+    AsyncResult.AsyncResult<ReadonlyArray<EphemeralClient.MemberEntry<M>>, ProjectionError>
+  > =>
+    // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The members family erases the member schema type; the atom for this key decodes with the session's profile, so the runtime values already match M.
+    ephemeralMembersFamily(new EphemeralMembersKey(session)) as unknown as Atom.Atom<
+      AsyncResult.AsyncResult<ReadonlyArray<EphemeralClient.MemberEntry<M>>, ProjectionError>
+    >
+
+  function publishEphemeral<D extends Ephemeral.AnyEvent,>(
+    definition: D,
+    target: EphemeralClient.PublishTarget
+  ): Atom.AtomResultFn<
+    Omit<EphemeralClient.EventPublishOptions<D>, "spaceId" | "member">,
+    void,
+    ReplicaError.ReplicaError | Ephemeral.EncodeError | E
+  >
+  function publishEphemeral<D extends Ephemeral.AnyState,>(
+    definition: D,
+    target: EphemeralClient.PublishTarget
+  ): Atom.AtomResultFn<
+    Omit<EphemeralClient.StatePublishOptions<D>, "spaceId" | "member">,
+    void,
+    ReplicaError.ReplicaError | Ephemeral.EncodeError | E
+  >
+  function publishEphemeral(
+    definition: Ephemeral.Any,
+    target: EphemeralClient.PublishTarget
+  ): Atom.AtomResultFn<
+    {
+      readonly payload?: unknown
+      readonly ttl: Duration.Input
+      readonly key?: unknown
+    },
+    void,
+    ReplicaError.ReplicaError | Ephemeral.EncodeError | E
+  > {
+    return runtime.fn<{
+      readonly payload?: unknown
+      readonly ttl: Duration.Input
+      readonly key?: unknown
+    }>()(
+      (input) =>
+        Effect.yieldNow.pipe(Effect.andThen(EphemeralClient.EphemeralClient.use((client) => {
+          if (definition.kind === "event") {
+            return client.publish(definition, {
+              spaceId: target.spaceId,
+              member: target.member,
+              payload: input.payload,
+              ttl: input.ttl
+            })
+          }
+          return client.publish(definition, {
+            spaceId: target.spaceId,
+            member: target.member,
+            key: input.key,
+            payload: input.payload,
+            ttl: input.ttl
+          })
+        }))),
+      { concurrent: true }
+    )
+  }
 
   const entity = <M extends Model.Any,>(spaceId: Identity.SpaceId, model: M) =>
     Atom.family((key: Model.Key<M>) =>
@@ -375,7 +433,10 @@ export const make = <E,>(
     aggregateStatus,
     join,
     leave,
-    ephemeral: ephemeralView,
+    ephemeral,
+    ephemeralEvents,
+    ephemeralState,
+    ephemeralMembers,
     publishEphemeral
   } as const
 }
