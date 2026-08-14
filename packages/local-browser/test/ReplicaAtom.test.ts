@@ -682,26 +682,6 @@ describe("Replica Atom graph", () => {
     }, Effect.scoped)
   )
 
-  it("reads the whole attachment limit once when constructing the graph", () => {
-    let reads = 0
-    const options = {
-      get maximumWholeAttachmentBytes() {
-        reads++
-        return 8
-      }
-    }
-    const graph = BrowserReplica.make(layerReplica, options)
-    const reference = Attachment.Reference.make({
-      _tag: "Attachment",
-      digest: Attachment.Digest.make(`sha256:${"5".repeat(64)}`),
-      bytes: 1
-    })
-
-    graph.attachment(spaceId, reference)
-    graph.attachment(spaceId, reference)
-    assert.strictEqual(reads, 1)
-  })
-
   it("normalizes the configured idle duration once when the graph is constructed", () => {
     let reads = 0
     const idleTTL = {

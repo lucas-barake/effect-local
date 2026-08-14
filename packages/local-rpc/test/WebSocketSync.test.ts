@@ -21,6 +21,7 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Encoding from "effect/Encoding"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as MutableRef from "effect/MutableRef"
@@ -844,7 +845,17 @@ describe("WebSocket synchronization", () => {
       MutableRef.set(serverWebSocketFrames, [])
       const transfer = yield* AttachmentTransferService.AttachmentTransfer
       const mediaText = "upload-and-download-media-byte-sentinel"
-      const bytes = new TextEncoder().encode(mediaText)
+      const mediaPrefix = new TextEncoder().encode(mediaText)
+      const bytes = new Uint8Array(AttachmentTransfer.maximumControlBytes + 1_024)
+      bytes.set(mediaPrefix)
+      for (let index = mediaPrefix.byteLength; index < bytes.byteLength; index++) {
+        bytes[index] = index % 251
+      }
+      const representativePrefix = bytes.subarray(0, 24)
+      const byteArray = Schema.Array(Schema.Int)
+      const byteArrayJson = Schema.fromJsonString(byteArray)
+      const jsonNumericPrefix = yield* Schema.encodeEffect(byteArrayJson)(Array.from(representativePrefix))
+      const base64Prefix = Encoding.encodeBase64(representativePrefix)
       const reference = Attachment.Reference.make({
         _tag: "Attachment",
         digest: Attachment.Digest.make(`sha256:${"4".repeat(64)}`),
@@ -869,6 +880,7 @@ describe("WebSocket synchronization", () => {
 
       assert.deepStrictEqual(MutableRef.get(attachmentProviderBytes), Array.from(bytes))
       assert.deepStrictEqual(Array.from(downloaded).flatMap((chunk) => Array.from(chunk)), Array.from(bytes))
+      assert.isAbove(bytes.byteLength, AttachmentTransfer.maximumControlBytes)
       assert.strictEqual(MutableRef.get(attachmentDownloadStarts), 1)
       assert.isTrue(MutableRef.get(attachmentFinalized))
       assert.deepStrictEqual(MutableRef.get(attachmentPrincipals), [
@@ -884,7 +896,10 @@ describe("WebSocket synchronization", () => {
       for (const frame of [...clientFrames, ...serverFrames]) {
         assert.isAtMost(frame.byteLength, AttachmentTransfer.maximumControlBytes)
         if (frame.bytes === undefined) assert.fail("expected the JSON RPC transport to use text frames")
-        assert.notInclude(new TextDecoder().decode(frame.bytes), mediaText)
+        const encodedFrame = new TextDecoder().decode(frame.bytes)
+        assert.notInclude(encodedFrame, mediaText)
+        assert.notInclude(encodedFrame, jsonNumericPrefix)
+        assert.notInclude(encodedFrame, base64Prefix)
       }
     }, provideLive)
   )
