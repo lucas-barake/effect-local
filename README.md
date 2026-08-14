@@ -437,12 +437,12 @@ tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and s
 reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
 
 The facade uses five space entities. `SpaceAdmissionEntity` serializes Submit and Discard.
-`SpaceReadEntity` forks Pull and Bootstrap. A Layer wide fail fast allowance bounds Bootstrap assertion verification
+`SpaceReadEntity` serves Pull and Bootstrap concurrently. A Layer wide fail fast allowance bounds Bootstrap assertion verification
 and preparation. A separate per space allowance bounds immutable page reads. `SpaceWatchEntity` owns long lived sync
 watches. `SpaceEphemeralJoinEntity` owns joined streams, while `SpaceEphemeralCommandEntity` owns publish and
 heartbeat. The Hub applies its watcher bound after authorization. Separate command and stream lanes keep a paused
-Bootstrap page or full join population from blocking mutation admission. Saturated Bootstrap
-work fails with typed `CapacityExceeded` resource `bootstrap authorizations` or `bootstrap pages`.
+Bootstrap page or full join population from blocking mutation admission. Saturated work fails with typed
+`CapacityExceeded` resource `bootstrap authorizations`, `bootstrap pages`, or `ephemeral join verifications`.
 
 `ServerStore.maximumWatchersPerSpace` and `EphemeralHub.maximumWatchersPerSpace` independently cap active streams.
 The ephemeral channel has bounded sliding history and per-subscriber revision-gap detection. Only a lagging client

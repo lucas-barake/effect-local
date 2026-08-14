@@ -112,8 +112,8 @@ Workflow payload contains only definition, space, client, membership incarnation
 idempotent reconciliation operation as the in memory scheduler.
 
 The server front door is an authenticated WebSocket RPC facade. It routes every operation by space through five Effect
-Cluster entity types. `SpaceAdmissionEntity` runs Submit and Discard sequentially. `SpaceReadEntity` forks Pull and
-immutable snapshot Bootstrap pages. `SpaceWatchEntity` forks long lived sync watches. `SpaceEphemeralJoinEntity` runs
+Cluster entity types. `SpaceAdmissionEntity` runs Submit and Discard sequentially. `SpaceReadEntity` serves Pull and
+immutable snapshot Bootstrap pages concurrently. `SpaceWatchEntity` owns long lived sync watches. `SpaceEphemeralJoinEntity` runs
 joined ephemeral streams. `SpaceEphemeralCommandEntity` runs publications and heartbeats. Join authorization precedes
 the Hub watcher bound. Separate command and stream lanes prevent a full join population from occupying command or
 mutation admission.

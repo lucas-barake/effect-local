@@ -10,10 +10,10 @@ facade and routes space operations through `SpaceEntity.Client`. `SyncClient.lay
 ## Space ownership
 
 `SpaceEntity` uses five volatile Cluster entity types. `SpaceAdmissionEntity` serializes Submit and Discard.
-`SpaceReadEntity` forks Pull and immutable Bootstrap pages. `SpaceWatchEntity` owns long lived sync watches.
-`SpaceEphemeralJoinEntity` owns joined streams. `SpaceEphemeralCommandEntity` owns publish and heartbeat. The join
-entity admits authorization without a preauthorization occupancy cap, then `EphemeralHub.maximumWatchersPerSpace`
-applies the required bound. A full join lane cannot starve commands or mutation admission.
+`SpaceReadEntity` serves Pull and immutable Bootstrap pages concurrently. `SpaceWatchEntity` owns long lived sync
+watches. `SpaceEphemeralJoinEntity` owns joined streams with finite mailbox and verification admission.
+`SpaceEphemeralCommandEntity` owns publish and heartbeat. The Hub applies its watcher bound after authorization. A full
+join lane cannot starve commands or mutation admission.
 
 ```ts
 import * as EphemeralHub from "@lucas-barake/effect-local-rpc/EphemeralHub"
@@ -149,7 +149,7 @@ export const layerClientRpc = Layer.merge(
 )
 ```
 
-The actual heartbeat interval is no longer than half the requested member TTL. Negotiation selects the highest shared
+The actual heartbeat interval is no longer than half the server-accepted member lease. Negotiation selects the highest shared
 version. A peer rejection causes one renegotiation and retry. No common version returns terminal `UpgradeRequired`.
 
 `sessionAcquisitionTimeout` and `rpcTimeout` accept `Duration.Input` and default to 10 seconds. They bound negotiation,
