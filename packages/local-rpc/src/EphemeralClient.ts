@@ -25,24 +25,9 @@ import { invalidConfiguration } from "./internal/errors.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSession from "./ProtocolSession.js"
 
-export type JoinRequest = Omit<Protocol.EphemeralJoinRequest, "ttlMillis"> & {
+type JoinInput = Omit<Protocol.EphemeralJoinRequest, "ttlMillis"> & {
   readonly ttl: Duration.Input
 }
-
-export type EventRequest = Omit<Protocol.EphemeralEventRequest, "ttlMillis"> & {
-  readonly ttl: Duration.Input
-}
-
-export type SetStateRequest = Omit<Protocol.EphemeralSetStateRequest, "ttlMillis"> & {
-  readonly ttl: Duration.Input
-}
-
-export type PublishRequest =
-  | EventRequest
-  | SetStateRequest
-  | Protocol.EphemeralClearEventRequest
-  | Protocol.EphemeralRemoveStateRequest
-  | Protocol.EphemeralUpdateMemberRequest
 
 export interface PublishTarget {
   readonly spaceId: Identity.SpaceId
@@ -128,15 +113,6 @@ export interface Service {
     definition: D,
     options: StateRemoveOptions<D>
   ) => Effect.Effect<void, ReplicaError.ReplicaError | Ephemeral.EncodeError>
-  readonly join: (
-    request: JoinRequest
-  ) => Stream.Stream<Protocol.EphemeralMessage, ReplicaError.ReplicaError>
-  readonly publishEncoded: (
-    request: PublishRequest
-  ) => Effect.Effect<void, ReplicaError.ReplicaError>
-  readonly heartbeat: (
-    request: Protocol.EphemeralHeartbeatRequest
-  ) => Effect.Effect<void, ReplicaError.ReplicaError>
 }
 
 export class EphemeralClient extends Context.Service<EphemeralClient, Service>()(
@@ -161,7 +137,7 @@ const boundedTtlMillis = Effect.fnUntraced(function*(
   )
 })
 
-const normalizeJoinRequest = Effect.fnUntraced(function*(request: JoinRequest) {
+const normalizeJoinRequest = Effect.fnUntraced(function*(request: JoinInput) {
   const ttlMillis = yield* boundedTtlMillis(
     request.ttl,
     Protocol.minimumEphemeralMemberTtlMillis,
@@ -281,31 +257,6 @@ const changedSlice = <A,>(previous: string | undefined, slice: A) => {
   if (fingerprint === previous) return [previous, []] as const
   return [fingerprint, [slice]] as const
 }
-
-const normalizePublishRequest = Effect.fnUntraced(function*(request: PublishRequest) {
-  if (request._tag === "Event") {
-    const ttlMillis = yield* boundedTtlMillis(request.ttl, 1, Protocol.maximumEphemeralEventTtlMillis)
-    return Protocol.EphemeralEventRequest.make({
-      spaceId: request.spaceId,
-      member: request.member,
-      channel: request.channel,
-      value: request.value,
-      ttlMillis
-    })
-  }
-  if (request._tag === "SetState") {
-    const ttlMillis = yield* boundedTtlMillis(request.ttl, 1, Protocol.maximumEphemeralStateTtlMillis)
-    return Protocol.EphemeralSetStateRequest.make({
-      spaceId: request.spaceId,
-      member: request.member,
-      channel: request.channel,
-      key: request.key,
-      value: request.value,
-      ttlMillis
-    })
-  }
-  return request
-})
 
 export const layerFromSession = (
   options?: Pick<Options, "rpcTimeout" | "heartbeatInterval">
@@ -798,10 +749,7 @@ export const layerFromSession = (
         session: openSession,
         publish,
         clear,
-        remove,
-        publishEncoded: (request) => normalizePublishRequest(request).pipe(Effect.flatMap(publishWire)),
-        heartbeat,
-        join: (request) => Stream.unwrap(normalizeJoinRequest(request).pipe(Effect.map(joinWire)))
+        remove
       })
     })
   )

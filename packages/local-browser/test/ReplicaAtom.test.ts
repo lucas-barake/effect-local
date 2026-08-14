@@ -161,13 +161,10 @@ const layerSync = Effect.gen(function*() {
   Layer.provide(layerServer)
 )
 const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
-  session: () => Effect.die(new Error("unused")),
-  publish: () => Effect.die(new Error("unused")),
-  clear: () => Effect.die(new Error("unused")),
-  remove: () => Effect.die(new Error("unused")),
-  join: () => Stream.never,
-  publishEncoded: () => Effect.void,
-  heartbeat: () => Effect.void
+  session: () => Effect.never,
+  publish: () => Effect.void,
+  clear: () => Effect.void,
+  remove: () => Effect.void
 })
 const layerReplica = Layer.merge(
   SqlReplica.layer({
