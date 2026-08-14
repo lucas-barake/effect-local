@@ -92,9 +92,20 @@ const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
       return requireVersion(protocolVersion).pipe(
         Effect.andThen(
           AttachmentTransfer.encodeControl(SyncRpc.VersionedAttachmentAuthorizationRequest, request).pipe(
-            Effect.mapError(() =>
-              new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
-            )
+            Effect.catchTags({
+              SchemaError: () =>
+                Effect.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+                ),
+              CanonicalEncodeError: () =>
+                Effect.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+                ),
+              AttachmentControlTooLarge: () =>
+                Effect.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+                )
+            })
           )
         ),
         Effect.andThen(issueAssertion),
@@ -106,9 +117,20 @@ const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
       return requireVersion(protocolVersion).pipe(
         Effect.andThen(
           AttachmentTransfer.encodeControl(SyncRpc.VersionedFinalizeAttachmentUploadRequest, request).pipe(
-            Effect.mapError(() =>
-              new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
-            )
+            Effect.catchTags({
+              SchemaError: () =>
+                Effect.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+                ),
+              CanonicalEncodeError: () =>
+                Effect.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+                ),
+              AttachmentControlTooLarge: () =>
+                Effect.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+                )
+            })
           )
         ),
         Effect.andThen(issueAssertion),
@@ -120,9 +142,20 @@ const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
       return requireVersion(protocolVersion).pipe(
         Effect.andThen(
           AttachmentTransfer.encodeControl(SyncRpc.VersionedPrepareAttachmentDownloadRequest, request).pipe(
-            Effect.mapError(() =>
-              new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
-            )
+            Effect.catchTags({
+              SchemaError: () =>
+                Effect.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+                ),
+              CanonicalEncodeError: () =>
+                Effect.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+                ),
+              AttachmentControlTooLarge: () =>
+                Effect.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The attachment control request is too large" })
+                )
+            })
           )
         ),
         Effect.andThen(issueAssertion),

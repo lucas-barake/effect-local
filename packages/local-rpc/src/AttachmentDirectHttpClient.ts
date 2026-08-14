@@ -327,8 +327,8 @@ const makeService = Effect.fnUntraced(function*(options: Options) {
   )
 
   const download: Service["download"] = (input) => {
-    let actual = 0
     return Stream.unwrap(Effect.gen(function*() {
+      let actual = 0
       const grant = yield* Schema.decodeUnknownEffect(AttachmentTransfer.DownloadGrant)(input).pipe(
         Effect.catchTag(
           "SchemaError",

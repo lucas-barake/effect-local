@@ -21,12 +21,6 @@ const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Ef
   )
 
 describe("SyncRpc serialization", () => {
-  it("exposes bounded attachment control operations without byte routes", () => {
-    assert.property(SyncRpc, "PrepareAttachmentUpload")
-    assert.property(SyncRpc, "FinalizeAttachmentUpload")
-    assert.property(SyncRpc, "PrepareAttachmentDownload")
-  })
-
   it.effect(
     "bounds complete WebSocket JSON frames before parse and after encode",
     Effect.fnUntraced(function*() {

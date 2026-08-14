@@ -33,6 +33,7 @@ import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as TestClock from "effect/testing/TestClock"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
+import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient"
 import * as HttpRouter from "effect/unstable/http/HttpRouter"
 import * as HttpServer from "effect/unstable/http/HttpServer"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -257,6 +258,7 @@ const attachmentFailAfterUpload = MutableRef.make(false)
 const attachmentExpireUploadGrant = MutableRef.make(false)
 const attachmentDownloadStarts = MutableRef.make(0)
 const attachmentPrepareEntries = MutableRef.make(0)
+const attachmentPrepareEntered = MutableRef.make<Deferred.Deferred<void> | undefined>(undefined)
 const attachmentPrepareGate = MutableRef.make<Deferred.Deferred<void> | undefined>(undefined)
 const attachmentGrantOffset = MutableRef.make(0)
 const attachmentGrantBytes = MutableRef.make<number | undefined>(undefined)
@@ -276,9 +278,12 @@ const layerAttachmentServer = Layer.succeed(
         Effect.tap(() =>
           Effect.suspend(() => {
             MutableRef.update(attachmentPrepareEntries, (count) => count + 1)
+            const entered = MutableRef.get(attachmentPrepareEntered)
             const gate = MutableRef.get(attachmentPrepareGate)
-            if (gate === undefined) return Effect.void
-            return Deferred.await(gate)
+            let wait = Effect.void
+            if (gate !== undefined) wait = Deferred.await(gate)
+            if (entered === undefined) return wait
+            return Deferred.succeed(entered, undefined).pipe(Effect.andThen(wait))
           })
         ),
         Effect.map(() => {
@@ -286,12 +291,17 @@ const layerAttachmentServer = Layer.succeed(
           if (MutableRef.get(attachmentUploaded)) {
             return AttachmentTransfer.UploadReady.make({ attemptId: attachmentAttemptId })
           }
+          let expiresAt = Number.MAX_SAFE_INTEGER
+          if (MutableRef.get(attachmentExpireUploadGrant)) {
+            MutableRef.set(attachmentExpireUploadGrant, false)
+            expiresAt = 0
+          }
           return AttachmentTransfer.UploadPart.make({
             attemptId: attachmentAttemptId,
             partNumber: 1,
             offset: MutableRef.get(attachmentGrantOffset),
             bytes: MutableRef.get(attachmentGrantBytes) ?? input.reference.bytes,
-            expiresAt: Number.MAX_SAFE_INTEGER,
+            expiresAt,
             request: AttachmentTransfer.DirectUploadRequest.make({
               method: "PUT",
               url: AttachmentTransfer.GrantUrl.make("https://provider.example/upload?secret=sentinel"),
@@ -331,55 +341,43 @@ const layerAttachmentServer = Layer.succeed(
       )),
     replaceEntityReferences: () => Effect.void,
     activateGeneration: () => Effect.void,
+    expireGrants: Effect.void,
     sweepSpace: () => Effect.succeed(0),
     drainOutbox: Effect.succeed(0),
     maintain: () => Effect.succeed(0)
   })
 )
-const layerDirectAttachmentClient = Layer.succeed(
-  AttachmentDirectHttpClient.AttachmentDirectHttpClient,
-  AttachmentDirectHttpClient.AttachmentDirectHttpClient.of({
-    upload: (_grant, bytes) => {
-      if (MutableRef.get(attachmentExpireUploadGrant)) {
-        MutableRef.set(attachmentExpireUploadGrant, false)
-        return Effect.fail(new AttachmentDirectHttpClient.AttachmentGrantExpired({ operation: "Upload" }))
+const providerFetch: typeof globalThis.fetch = (input, init) => {
+  const request = new Request(input, init)
+  if (request.method === "PUT") {
+    return request.arrayBuffer().then((buffer) => {
+      MutableRef.set(attachmentProviderBytes, Array.from(new Uint8Array(buffer)))
+      MutableRef.set(attachmentUploaded, true)
+      if (MutableRef.get(attachmentFailAfterUpload)) {
+        MutableRef.set(attachmentFailAfterUpload, false)
+        // oxlint-disable-next-line effect/noNewPromise -- Fetch is the native provider boundary and must reject with a Promise.
+        return Promise.reject("provider upload interrupted")
       }
-      return bytes.pipe(
-        Stream.runForEach((chunk) =>
-          Effect.sync(() => {
-            MutableRef.update(attachmentProviderBytes, (values) => [...values, ...chunk])
-          })
-        ),
-        Effect.catch(() =>
-          Effect.fail(new AttachmentDirectHttpClient.AttachmentTransferUnavailable({ operation: "Upload" }))
-        ),
-        Effect.tap(() => Effect.sync(() => MutableRef.set(attachmentUploaded, true))),
-        Effect.flatMap(() => {
-          if (!MutableRef.get(attachmentFailAfterUpload)) return Effect.void
-          MutableRef.set(attachmentFailAfterUpload, false)
-          return Effect.fail(new AttachmentDirectHttpClient.AttachmentTransferUnavailable({ operation: "Upload" }))
-        })
-      )
-    },
-    download: () => {
-      let consumed = false
-      return Stream.suspend(() => {
-        if (consumed) {
-          return Stream.fail(
-            new AttachmentDirectHttpClient.AttachmentTransferLengthMismatch({
-              operation: "Download",
-              expected: 3,
-              actual: 6
-            })
-          )
-        }
-        consumed = true
-        MutableRef.update(attachmentDownloadStarts, (count) => count + 1)
-        const providerBytes = MutableRef.get(attachmentProviderBytes)
-        return Stream.make(Uint8Array.from(providerBytes))
-      })
-    }
-  })
+      return new Response(null, { status: 200 })
+    })
+  }
+  MutableRef.update(attachmentDownloadStarts, (count) => count + 1)
+  const bytes = Uint8Array.from(MutableRef.get(attachmentProviderBytes))
+  // oxlint-disable-next-line effect/noNewPromise -- Fetch is the native provider boundary and must return a Promise.
+  return Promise.resolve(
+    new Response(bytes, {
+      status: 200,
+      headers: { "content-length": String(bytes.byteLength) }
+    })
+  )
+}
+const layerDirectAttachmentClient = AttachmentDirectHttpClient.layer({
+  uploadOrigins: ["https://provider.example"],
+  downloadOrigins: ["https://provider.example"],
+  insecureDevelopmentOrigins: []
+}).pipe(
+  Layer.provide(FetchHttpClient.layer),
+  Layer.provide(Layer.succeed(FetchHttpClient.Fetch, providerFetch))
 )
 const revokedAuthenticationClientProvider = Authentication.CredentialProvider.of({
   acquire: Effect.succeed({ generation: 0, bearer: Redacted.make("revoked") }),
@@ -418,12 +416,49 @@ const layerWebsocketServer = SyncServer.layer.pipe(
 )
 const webSocketConstructions = MutableRef.make(0)
 const liveWebSockets = MutableRef.make(0)
+interface ObservedWebSocketFrame {
+  readonly bytes: Uint8Array | undefined
+  readonly byteLength: number
+}
+const clientWebSocketFrames = MutableRef.make<Array<ObservedWebSocketFrame>>([])
+const serverWebSocketFrames = MutableRef.make<Array<ObservedWebSocketFrame>>([])
+const observeWebSocketFrame = (frames: MutableRef.MutableRef<Array<ObservedWebSocketFrame>>, data: unknown) => {
+  if (typeof data === "string") {
+    const bytes = new TextEncoder().encode(data)
+    MutableRef.update(frames, (observed) => [...observed, { bytes, byteLength: bytes.byteLength }])
+    return
+  }
+  if (data instanceof ArrayBuffer) {
+    const bytes = Uint8Array.from(new Uint8Array(data))
+    MutableRef.update(frames, (observed) => [...observed, { bytes, byteLength: bytes.byteLength }])
+    return
+  }
+  if (ArrayBuffer.isView(data)) {
+    const bytes = Uint8Array.from(new Uint8Array(data.buffer, data.byteOffset, data.byteLength))
+    MutableRef.update(frames, (observed) => [...observed, { bytes, byteLength: bytes.byteLength }])
+    return
+  }
+  if (data instanceof Blob) {
+    MutableRef.update(frames, (observed) => [...observed, { bytes: undefined, byteLength: data.size }])
+    return
+  }
+  MutableRef.update(frames, (observed) => [...observed, { bytes: undefined, byteLength: 0 }])
+}
 const countedWebSocketConstructor = Effect.gen(function*() {
   const makeWebSocket = yield* Socket.WebSocketConstructor
   return (url: string, protocols?: string | Array<string>) => {
     MutableRef.update(webSocketConstructions, (count) => count + 1)
     MutableRef.update(liveWebSockets, (count) => count + 1)
     const webSocket = makeWebSocket(url, protocols)
+    const send = webSocket.send.bind(webSocket)
+    webSocket.send = (data) => {
+      observeWebSocketFrame(clientWebSocketFrames, data)
+      send(data)
+    }
+    webSocket.binaryType = "arraybuffer"
+    webSocket.addEventListener("message", (event) => {
+      observeWebSocketFrame(serverWebSocketFrames, event.data)
+    })
     webSocket.addEventListener("close", () => {
       MutableRef.update(liveWebSockets, (count) => count - 1)
     }, { once: true })
@@ -794,42 +829,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
 
 describe("WebSocket synchronization", () => {
   it.effect(
-    "routes bounded attachment control through authenticated space ownership without media bytes",
-    Effect.fnUntraced(function*() {
-      MutableRef.set(attachmentPrincipals, [])
-      const session = yield* ProtocolSession.ProtocolSession
-      const protocolVersion = yield* session.version
-      const reference = Attachment.Reference.make({
-        _tag: "Attachment",
-        digest: Attachment.Digest.make(`sha256:${"4".repeat(64)}`),
-        bytes: 3
-      })
-      const request = {
-        spaceId,
-        clientId,
-        membershipIncarnation: Identity.legacyMembershipIncarnation,
-        reference,
-        protocolVersion
-      }
-
-      const result = yield* session.client.PrepareAttachmentUpload(request)
-
-      assert.strictEqual(result._tag, "UploadPart")
-      assert.deepStrictEqual(MutableRef.get(attachmentPrincipals), [{ subject: "test" }])
-      assert.isAtMost(
-        new TextEncoder().encode(
-          yield* AttachmentTransfer.encodeControl(
-            SyncRpc.VersionedAttachmentAuthorizationRequest,
-            request
-          )
-        ).byteLength,
-        AttachmentTransfer.maximumControlBytes
-      )
-    }, provideLive)
-  )
-
-  it.effect(
-    "uploads provider bytes directly before authenticated finalization",
+    "keeps upload and lazy download media bytes off actual application WebSocket frames",
     Effect.fnUntraced(function*() {
       MutableRef.set(attachmentPrincipals, [])
       MutableRef.set(attachmentUploaded, false)
@@ -839,11 +839,15 @@ describe("WebSocket synchronization", () => {
       MutableRef.set(attachmentExpireUploadGrant, false)
       MutableRef.set(attachmentGrantOffset, 0)
       MutableRef.set(attachmentGrantBytes, undefined)
+      MutableRef.set(attachmentDownloadStarts, 0)
+      MutableRef.set(clientWebSocketFrames, [])
+      MutableRef.set(serverWebSocketFrames, [])
       const transfer = yield* AttachmentTransferService.AttachmentTransfer
-      const bytes = Uint8Array.from([7, 8, 9])
+      const mediaText = "upload-and-download-media-byte-sentinel"
+      const bytes = new TextEncoder().encode(mediaText)
       const reference = Attachment.Reference.make({
         _tag: "Attachment",
-        digest: Attachment.Digest.make(`sha256:${"5".repeat(64)}`),
+        digest: Attachment.Digest.make(`sha256:${"4".repeat(64)}`),
         bytes: bytes.byteLength
       })
 
@@ -854,14 +858,34 @@ describe("WebSocket synchronization", () => {
         reference,
         bytes: (offset) => Stream.make(bytes.subarray(offset))
       })
+      const prepared = yield* transfer.download({
+        spaceId,
+        clientId,
+        membershipIncarnation: Identity.legacyMembershipIncarnation,
+        reference
+      })
+      assert.strictEqual(MutableRef.get(attachmentDownloadStarts), 0)
+      const downloaded = yield* Stream.runCollect(prepared.bytes)
 
-      assert.deepStrictEqual(MutableRef.get(attachmentProviderBytes), [...bytes])
+      assert.deepStrictEqual(MutableRef.get(attachmentProviderBytes), Array.from(bytes))
+      assert.deepStrictEqual(Array.from(downloaded).flatMap((chunk) => Array.from(chunk)), Array.from(bytes))
+      assert.strictEqual(MutableRef.get(attachmentDownloadStarts), 1)
       assert.isTrue(MutableRef.get(attachmentFinalized))
       assert.deepStrictEqual(MutableRef.get(attachmentPrincipals), [
         { subject: "test" },
         { subject: "test" },
+        { subject: "test" },
         { subject: "test" }
       ])
+      const clientFrames = MutableRef.get(clientWebSocketFrames)
+      const serverFrames = MutableRef.get(serverWebSocketFrames)
+      assert.isNotEmpty(clientFrames)
+      assert.isNotEmpty(serverFrames)
+      for (const frame of [...clientFrames, ...serverFrames]) {
+        assert.isAtMost(frame.byteLength, AttachmentTransfer.maximumControlBytes)
+        if (frame.bytes === undefined) assert.fail("expected the JSON RPC transport to use text frames")
+        assert.notInclude(new TextDecoder().decode(frame.bytes), mediaText)
+      }
     }, provideLive)
   )
 
@@ -901,7 +925,9 @@ describe("WebSocket synchronization", () => {
     "bounds attachment control concurrency and rejects mailbox overflow per space",
     Effect.fnUntraced(function*() {
       MutableRef.set(attachmentPrepareEntries, 0)
+      const entered = yield* Deferred.make<void>()
       const gate = yield* Deferred.make<void>()
+      MutableRef.set(attachmentPrepareEntered, entered)
       MutableRef.set(attachmentPrepareGate, gate)
       const results = yield* Queue.unbounded<Result.Result<AttachmentTransfer.PrepareUploadResult, unknown>>()
       const session = yield* ProtocolSession.ProtocolSession
@@ -927,21 +953,18 @@ describe("WebSocket synchronization", () => {
           ),
         { concurrency: "unbounded", discard: true }
       ).pipe(Effect.forkChild({ startImmediately: true }))
-      while (MutableRef.get(attachmentPrepareEntries) === 0) yield* Effect.yieldNow
-      for (let index = 0; index < 100; index++) yield* Effect.yieldNow
-      const entered = MutableRef.get(attachmentPrepareEntries)
-      const overflow = yield* Queue.poll(results)
+      yield* Deferred.await(entered)
+      const overflow = yield* Queue.take(results)
+      const enteredCount = MutableRef.get(attachmentPrepareEntries)
       yield* Deferred.succeed(gate, undefined)
+      MutableRef.set(attachmentPrepareEntered, undefined)
       MutableRef.set(attachmentPrepareGate, undefined)
       yield* Fiber.join(calls)
 
-      assert.strictEqual(entered, 1)
-      assert.isTrue(Option.isSome(overflow))
-      if (Option.isSome(overflow)) {
-        assert.isTrue(Result.isFailure(overflow.value))
-        if (Result.isFailure(overflow.value)) {
-          assert.deepInclude(overflow.value.failure, { _tag: "ServerUnavailable" })
-        }
+      assert.strictEqual(enteredCount, 1)
+      assert.isTrue(Result.isFailure(overflow))
+      if (Result.isFailure(overflow)) {
+        assert.deepInclude(overflow.failure, { _tag: "ServerUnavailable" })
       }
     }, provideLive)
   )

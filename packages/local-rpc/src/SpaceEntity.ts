@@ -586,11 +586,26 @@ export const layerHandlers = (options: HandlerOptions) =>
                   attachmentService.prepareUpload({ ...payload.request, principal }).pipe(
                     Effect.flatMap((result) =>
                       AttachmentTransfer.encodeControl(AttachmentTransfer.PrepareUploadResult, result).pipe(
-                        Effect.mapError(() =>
-                          new ReplicaError.ProtocolInvalid({
-                            message: "The attachment control response is too large"
-                          })
-                        ),
+                        Effect.catchTags({
+                          SchemaError: () =>
+                            Effect.fail(
+                              new ReplicaError.ProtocolInvalid({
+                                message: "The attachment control response is too large"
+                              })
+                            ),
+                          CanonicalEncodeError: () =>
+                            Effect.fail(
+                              new ReplicaError.ProtocolInvalid({
+                                message: "The attachment control response is too large"
+                              })
+                            ),
+                          AttachmentControlTooLarge: () =>
+                            Effect.fail(
+                              new ReplicaError.ProtocolInvalid({
+                                message: "The attachment control response is too large"
+                              })
+                            )
+                        }),
                         Effect.as(result)
                       )
                     )
@@ -604,11 +619,26 @@ export const layerHandlers = (options: HandlerOptions) =>
                   attachmentService.finalizeUpload({ ...payload.request, principal }).pipe(
                     Effect.flatMap((result) =>
                       AttachmentTransfer.encodeControl(AttachmentTransfer.UploadComplete, result).pipe(
-                        Effect.mapError(() =>
-                          new ReplicaError.ProtocolInvalid({
-                            message: "The attachment control response is too large"
-                          })
-                        ),
+                        Effect.catchTags({
+                          SchemaError: () =>
+                            Effect.fail(
+                              new ReplicaError.ProtocolInvalid({
+                                message: "The attachment control response is too large"
+                              })
+                            ),
+                          CanonicalEncodeError: () =>
+                            Effect.fail(
+                              new ReplicaError.ProtocolInvalid({
+                                message: "The attachment control response is too large"
+                              })
+                            ),
+                          AttachmentControlTooLarge: () =>
+                            Effect.fail(
+                              new ReplicaError.ProtocolInvalid({
+                                message: "The attachment control response is too large"
+                              })
+                            )
+                        }),
                         Effect.as(result)
                       )
                     )
@@ -622,11 +652,26 @@ export const layerHandlers = (options: HandlerOptions) =>
                   attachmentService.prepareDownload({ ...payload.request, principal }).pipe(
                     Effect.flatMap((result) =>
                       AttachmentTransfer.encodeControl(AttachmentTransfer.DownloadGrant, result).pipe(
-                        Effect.mapError(() =>
-                          new ReplicaError.ProtocolInvalid({
-                            message: "The attachment control response is too large"
-                          })
-                        ),
+                        Effect.catchTags({
+                          SchemaError: () =>
+                            Effect.fail(
+                              new ReplicaError.ProtocolInvalid({
+                                message: "The attachment control response is too large"
+                              })
+                            ),
+                          CanonicalEncodeError: () =>
+                            Effect.fail(
+                              new ReplicaError.ProtocolInvalid({
+                                message: "The attachment control response is too large"
+                              })
+                            ),
+                          AttachmentControlTooLarge: () =>
+                            Effect.fail(
+                              new ReplicaError.ProtocolInvalid({
+                                message: "The attachment control response is too large"
+                              })
+                            )
+                        }),
                         Effect.as(result)
                       )
                     )

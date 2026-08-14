@@ -2,6 +2,7 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Attachment from "@lucas-barake/effect-local/Attachment"
 import * as AttachmentTransfer from "@lucas-barake/effect-local/AttachmentTransfer"
 import * as Cause from "effect/Cause"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
@@ -214,6 +215,74 @@ describe("AttachmentDirectHttpClient", () => {
         assert.strictEqual(call.init.referrerPolicy, "no-referrer")
         assert.strictEqual(call.init.cache, "no-store")
       }
+    }))
+
+  it.effect("reuses the same download stream with fresh byte accounting", () =>
+    Effect.gen(function*() {
+      let calls = 0
+      const fetch = (async () => {
+        calls++
+        return new Response(Uint8Array.of(1, 2, 3), {
+          status: 200,
+          headers: { "content-length": "3" }
+        })
+      }) as typeof globalThis.fetch
+      const client = yield* AttachmentDirectHttpClient.AttachmentDirectHttpClient.pipe(Effect.provide(layer(fetch)))
+      const download = client.download(downloadGrant())
+
+      const first = yield* Stream.runCollect(download)
+      const second = yield* Stream.runCollect(download)
+
+      assert.deepStrictEqual(bytesFrom(first), Uint8Array.of(1, 2, 3))
+      assert.deepStrictEqual(bytesFrom(second), Uint8Array.of(1, 2, 3))
+      assert.strictEqual(calls, 2)
+    }))
+
+  it.effect("does not carry interrupted download accounting into reuse", () =>
+    Effect.gen(function*() {
+      let calls = 0
+      const fetch = (async () => {
+        calls++
+        if (calls > 1) {
+          return new Response(Uint8Array.of(1, 2, 3), {
+            status: 200,
+            headers: { "content-length": "3" }
+          })
+        }
+        let emitted = false
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (!emitted) {
+                emitted = true
+                controller.enqueue(Uint8Array.of(1))
+                return undefined
+              }
+              return new Promise<void>(() => {
+              })
+            }
+          }),
+          {
+            status: 200,
+            headers: { "content-length": "3" }
+          }
+        )
+      }) as typeof globalThis.fetch
+      const client = yield* AttachmentDirectHttpClient.AttachmentDirectHttpClient.pipe(Effect.provide(layer(fetch)))
+      const download = client.download(downloadGrant())
+      const consumed = yield* Deferred.make<void>()
+      const first = yield* download.pipe(
+        Stream.tap(() => Deferred.succeed(consumed, undefined)),
+        Stream.runDrain,
+        Effect.forkChild
+      )
+
+      yield* Deferred.await(consumed)
+      yield* Fiber.interrupt(first)
+      const retried = yield* Stream.runCollect(download)
+
+      assert.deepStrictEqual(bytesFrom(retried), Uint8Array.of(1, 2, 3))
+      assert.strictEqual(calls, 2)
     }))
 
   it.effect("refuses redirects without following them and cleans up the body", () =>
