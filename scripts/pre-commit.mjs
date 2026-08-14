@@ -1,6 +1,10 @@
+import * as Schema from "effect/Schema"
 import { spawn } from "node:child_process"
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from "node:fs"
 import { dirname, join, relative, resolve, sep } from "node:path"
+
+// oxlint-disable-next-line effect-local/noManualEffectBoundary -- The git hook must synchronously decode output after the Oxlint subprocess exits.
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))
 
 const run = (command, args, options = {}) =>
   new Promise((resolveRun, reject) => {
@@ -61,7 +65,7 @@ const createSnapshots = async (repository) => {
 const parseOxlint = (result, snapshot) => {
   let output
   try {
-    output = JSON.parse(result.stdout)
+    output = decodeJson(result.stdout)
   } catch {
     throw new Error(`Oxlint did not return JSON\n${result.stderr || result.stdout}`)
   }

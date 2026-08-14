@@ -221,31 +221,33 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
         if (type !== undefined) typeByExpression.set(functionLikes[index], type)
       }
 
-      const effectErrorByType = new Map()
-      const getEffectError = (type, expression) => {
-        if (effectErrorByType.has(type.id)) return effectErrorByType.get(type.id)
+      const effectChannelByType = new Map()
+      const getEffectChannel = (type, expression, channel) => {
+        const cacheKey = `${type.id}:${channel}`
+        if (effectChannelByType.has(cacheKey)) return effectChannelByType.get(cacheKey)
         const markerSymbol = checker.getPropertyOfType(type, effectMarker)
         if (markerSymbol === undefined) {
-          effectErrorByType.set(type.id, undefined)
+          effectChannelByType.set(cacheKey, undefined)
           return undefined
         }
         const markerType = checker.getTypeOfSymbolAtLocation(markerSymbol, expression)
-        const errorSymbol = checker.getPropertyOfType(markerType, "_E")
-        if (errorSymbol === undefined) {
-          throw new Error(`The Effect marker on ${absoluteFilename} has no _E channel`)
+        const channelSymbol = checker.getPropertyOfType(markerType, channel)
+        if (channelSymbol === undefined) {
+          throw new Error(`The Effect marker on ${absoluteFilename} has no ${channel} channel`)
         }
-        const errorAccessor = checker.getTypeOfSymbolAtLocation(errorSymbol, expression)
-        const signatures = checker.getSignaturesOfType(errorAccessor, SignatureKind.Call)
+        const channelAccessor = checker.getTypeOfSymbolAtLocation(channelSymbol, expression)
+        const signatures = checker.getSignaturesOfType(channelAccessor, SignatureKind.Call)
         if (signatures.length !== 1) {
-          throw new Error(`The Effect _E marker on ${absoluteFilename} is not a single callable signature`)
+          throw new Error(`The Effect ${channel} marker on ${absoluteFilename} is not a single callable signature`)
         }
-        const errorType = checker.getReturnTypeOfSignature(signatures[0])
-        if (errorType === undefined) {
-          throw new Error(`TypeScript could not resolve an Effect error channel in ${absoluteFilename}`)
+        const channelType = checker.getReturnTypeOfSignature(signatures[0])
+        if (channelType === undefined) {
+          throw new Error(`TypeScript could not resolve an Effect ${channel} channel in ${absoluteFilename}`)
         }
-        effectErrorByType.set(type.id, errorType)
-        return errorType
+        effectChannelByType.set(cacheKey, channelType)
+        return channelType
       }
+      const getEffectError = (type, expression) => getEffectChannel(type, expression, "_E")
 
       const untaggedByType = new Map()
       const isEffectUnhandled = (type) => {
@@ -273,7 +275,7 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
         seen.add(type.id)
 
         let untagged
-        if ((type.flags & TypeFlags.Never) !== 0 || isEffectUnhandled(type)) {
+        if ((type.flags & (TypeFlags.Never | TypeFlags.Unknown)) !== 0 || isEffectUnhandled(type)) {
           untagged = []
         } else if ((type.flags & TypeFlags.Union) !== 0) {
           untagged = []
@@ -338,6 +340,48 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
         return subtreeMemberIds
       }
       collectViolationMemberIds(sourceFile)
+
+      const unknownChannelByExpression = new Map()
+      for (const expression of expressions) {
+        const type = typeByExpression.get(expression)
+        if (type === undefined) continue
+        const errorType = getEffectChannel(type, expression, "_E")
+        if (errorType === undefined) continue
+        const requirementsType = getEffectChannel(type, expression, "_R")
+        if (requirementsType === undefined) continue
+        let mask = 0
+        if ((errorType.flags & TypeFlags.Unknown) !== 0) mask |= 1
+        if ((requirementsType.flags & TypeFlags.Unknown) !== 0) mask |= 2
+        if (mask !== 0) unknownChannelByExpression.set(expression, mask)
+      }
+      const descendantUnknownMaskByExpression = new Map()
+      const collectUnknownChannelMask = (node) => {
+        let descendantMask = 0
+        node.forEachChild((child) => {
+          descendantMask |= collectUnknownChannelMask(child)
+        })
+        const mask = unknownChannelByExpression.get(node) ?? 0
+        if (mask !== 0 && descendantMask !== 0) {
+          descendantUnknownMaskByExpression.set(node, descendantMask)
+        }
+        return mask | descendantMask
+      }
+      collectUnknownChannelMask(sourceFile)
+
+      const unknownEffectChannels = []
+      for (const expression of expressions) {
+        const mask = unknownChannelByExpression.get(expression) ?? 0
+        const innermostMask = mask & ~(descendantUnknownMaskByExpression.get(expression) ?? 0)
+        if (innermostMask === 0) continue
+        const channels = []
+        if ((innermostMask & 1) !== 0) channels.push("error")
+        if ((innermostMask & 2) !== 0) channels.push("requirements")
+        unknownEffectChannels.push({
+          start: expression.getStart(sourceFile),
+          end: expression.getEnd(),
+          channels
+        })
+      }
 
       const taggedEffectErrors = []
       for (const expression of expressions) {
@@ -1183,7 +1227,8 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
         schemaTaggedErrorViolations,
         serviceTagMaps,
         taggedEffectErrors,
-        taggedErrorInstanceof
+        taggedErrorInstanceof,
+        unknownEffectChannels
       }
       analysisCache.set(filename, { sourceText, result })
       return result

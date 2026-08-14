@@ -175,15 +175,14 @@ describe("multi space Replica", () => {
       const engine = Context.get(engineContext, WorkflowEngine.WorkflowEngine)
       const firstRegistration = yield* Deferred.make<void>()
       let blockRegistration = true
+      const register: typeof engine.register = (workflow, execute) => {
+        if (!blockRegistration) return engine.register(workflow, execute)
+        blockRegistration = false
+        return Deferred.succeed(firstRegistration, undefined).pipe(Effect.andThen(Effect.never))
+      }
       const interruptedEngine = new Proxy(engine, {
         get: (target, property, receiver) => {
-          if (property === "register") {
-            return (...args: Parameters<typeof engine.register>) => {
-              if (!blockRegistration) return target.register(...args)
-              blockRegistration = false
-              return Deferred.succeed(firstRegistration, undefined).pipe(Effect.andThen(Effect.never))
-            }
-          }
+          if (property === "register") return register
           return Reflect.get(target, property, receiver)
         }
       })

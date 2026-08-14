@@ -1,9 +1,13 @@
 import * as Effect from "effect/Effect"
 import { pipe } from "effect/Function"
+import * as Schema from "effect/Schema"
 import { readFileSync } from "node:fs"
 import { dirname, relative, resolve, sep } from "node:path"
 import { Diagnostic, Plugin, Rule, RuleContext } from "oxlint-plugin-effect/rule-bindings"
 import { makeEffectTypePolicyChecker } from "./tagged-effect-errors.mjs"
+
+// oxlint-disable-next-line effect-local/noManualEffectBoundary -- Oxlint loads plugin configuration synchronously before any Effect runtime exists.
+const decodeJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown))
 
 const findVariable = (context, node) => {
   let scope = context.sourceCode.getScope(node)
@@ -60,6 +64,84 @@ const importedVariable = (context, node, localName) =>
   context.sourceCode.getDeclaredVariables(node).find((variable) => variable.name === localName)
 
 const reportDiagnostic = (context, node, message) => context.report(Diagnostic.make({ node, message }))
+
+const isUnshadowedGlobal = (context, node, name) => {
+  const expression = unwrapExpression(node)
+  if (expression.type !== "Identifier" || expression.name !== name) return false
+  const variable = findVariable(context, expression)
+  return variable === undefined || variable.defs.length === 0
+}
+
+export const jsonParseStringifyMessage =
+  "Do not use JSON.parse or JSON.stringify. Define a JSON codec with Schema.fromJsonString and decode or encode through Effect Schema."
+
+export const noJsonParseStringify = Rule.define({
+  name: "no-json-parse-stringify",
+  meta: Rule.meta({
+    type: "problem",
+    description: "Require Effect Schema codecs for JSON parsing and serialization."
+  }),
+  create: function*() {
+    const context = yield* RuleContext
+    const jsonAliases = new Set()
+    const isJsonObject = (node) => {
+      const expression = unwrapExpression(node)
+      if (expression.type === "Identifier") {
+        return isUnshadowedGlobal(context, expression, "JSON") ||
+          jsonAliases.has(findVariable(context, expression))
+      }
+      const member = getStaticMember(expression)
+      if (member?.name !== "JSON") return false
+      const root = unwrapExpression(member.expression.object)
+      if (root.type !== "Identifier") return false
+      if (root.name !== "globalThis" && root.name !== "window" && root.name !== "self") return false
+      return isUnshadowedGlobal(context, root, root.name)
+    }
+    const forbiddenMember = (node) => {
+      const member = getStaticMember(node)
+      if (member === undefined || !isJsonObject(member.expression.object)) return undefined
+      if (member.name !== "parse" && member.name !== "stringify") return undefined
+      return member.expression
+    }
+    return {
+      VariableDeclarator: (node) => {
+        const declaration = context.sourceCode.getAncestors(node).findLast(
+          (ancestor) => ancestor.type === "VariableDeclaration"
+        )
+        if (declaration?.kind !== "const" || node.init === null || !isJsonObject(node.init)) {
+          return Effect.void
+        }
+        if (node.id.type === "Identifier") {
+          const variable = context.sourceCode.getDeclaredVariables(node).find(
+            (candidate) => candidate.name === node.id.name
+          )
+          if (variable !== undefined) jsonAliases.add(variable)
+          return Effect.void
+        }
+        if (node.id.type !== "ObjectPattern") return Effect.void
+        const forbiddenProperties = []
+        for (const property of node.id.properties) {
+          if (property.type !== "Property") continue
+          let name
+          if (property.computed && property.key.type === "Literal") name = property.key.value
+          if (!property.computed && property.key.type === "Identifier") name = property.key.name
+          if (!property.computed && property.key.type !== "Identifier") name = property.key.value
+          if (name === "parse" || name === "stringify") forbiddenProperties.push(property)
+        }
+        return Effect.forEach(
+          forbiddenProperties,
+          (property) => reportDiagnostic(context, property, jsonParseStringifyMessage),
+          { discard: true }
+        )
+      },
+      MemberExpression: (node) => {
+        const member = forbiddenMember(node)
+        if (member === undefined) return Effect.void
+        return reportDiagnostic(context, member, jsonParseStringifyMessage)
+      }
+    }
+  }
+})
 
 const rootEffectModuleNames = new Map([
   ["Data", "effect/Data"],
@@ -230,7 +312,7 @@ const getPackageExports = (packageRoot) => {
   let exports
   try {
     const packagePath = resolve(packageRoot, "package.json")
-    exports = JSON.parse(readFileSync(packagePath, "utf8")).exports
+    exports = decodeJson(readFileSync(packagePath, "utf8")).exports
   } catch {
     exports = undefined
   }
@@ -1533,7 +1615,7 @@ export const noManualEffectBoundary = Rule.define({
 
 const taggedEffectErrorMessage = (errorTypes) => {
   const displayedTypes = errorTypes.join(" | ")
-  return `Effect error channel contains an untagged type: ${displayedTypes}. Every non never Effect error must have a required _tag. Define library errors with Schema.TaggedErrorClass and propagate or handle them by _tag. Do not hide the error with a cast, unknown, any, or an unconstrained generic.`
+  return `Effect error channel contains an untagged type: ${displayedTypes}. Every non never Effect error must have a required _tag. Define library errors with Schema.TaggedErrorClass and propagate or handle them by _tag. Do not hide the error with a cast, any, or an unconstrained generic.`
 }
 
 const layerNameMessage = (name) =>
@@ -1586,6 +1668,20 @@ export const requireTaggedEffectError = makeTypePolicyRule({
   failure: "Could not verify Effect error tags. The type aware rule must run successfully",
   select: (analysis) => analysis.taggedEffectErrors,
   message: (violation) => taggedEffectErrorMessage(violation.errorTypes)
+})
+
+export const noUnknownEffectChannelsMessage = (channels) => {
+  let channelLabel = "channel"
+  if (channels.length !== 1) channelLabel = "channels"
+  return `Effect ${
+    channels.join(" and ")
+  } ${channelLabel} must not be unknown. Use a specific tagged error type and explicit Context services. The success channel may be unknown.`
+}
+export const noUnknownEffectChannels = makeTypePolicyRule({
+  description: "Reject unknown Effect error and requirements channels.",
+  failure: "Could not verify Effect error and requirements channels",
+  select: (analysis) => analysis.unknownEffectChannels,
+  message: (violation) => noUnknownEffectChannelsMessage(violation.channels)
 })
 
 export const requireLayerName = makeTypePolicyRule({
@@ -1683,6 +1779,7 @@ export default Plugin.define({
     noYieldEffectSync,
     noSemaphoreEffectSync,
     noNestedCalls,
+    noJsonParseStringify,
     noUnnecessaryEffectForwarding,
     noFunctionEffectGen,
     noImplicitDefectConversion,
@@ -1700,6 +1797,7 @@ export default Plugin.define({
     durationInputAtConfigBoundary,
     noModuleErrorHelper,
     requireTaggedEffectError,
+    noUnknownEffectChannels,
     requireLayerName,
     noServiceTagMap
   }
