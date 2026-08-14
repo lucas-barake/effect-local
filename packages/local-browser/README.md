@@ -37,7 +37,7 @@ interface EphemeralView {
   readonly spaceId: Identity.SpaceId
   readonly revision: Identity.EphemeralRevision
   readonly members: ReadonlyArray<Protocol.EphemeralMemberEntry>
-  readonly states: ReadonlyArray<Protocol.EphemeralStateEntry>
+  readonly states: HashMap.HashMap<string, Protocol.EphemeralStateEntry>
   readonly events: ReadonlyArray<Protocol.EphemeralEventEntry>
 }
 ```
@@ -45,7 +45,9 @@ interface EphemeralView {
 The first server snapshot replaces the roster and retained state and clears all live events. Later deltas upsert and
 remove entries by member, channel, and key. `MemberLeft` removes that member and their current events while leaving
 their retained state until its own server TTL. `EventCleared` and `StateRemoved` clear the matching entry. The browser
-does not run a second TTL store. Server expiry messages are the source of truth.
+stores retained state in Effect `HashMap` so one position update does not scan the full collection. Iterate it with
+`HashMap.values(view.states)`. The browser does not run a second TTL store. Server expiry messages are the source of
+truth.
 
 Set `graph.publishEphemeral` with any `Protocol.EphemeralPublishRequest`:
 

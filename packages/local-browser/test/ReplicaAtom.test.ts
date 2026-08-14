@@ -24,6 +24,7 @@ import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
+import * as HashMap from "effect/HashMap"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
@@ -341,7 +342,9 @@ describe("Replica Atom graph", () => {
       )
 
       const stateVisible = yield* AtomRegistry.toStreamResult(registry, view).pipe(
-        Stream.filter((current) => current.states.some((entry) => entry.key === "conversation-1")),
+        Stream.filter((current) =>
+          Array.from(HashMap.values(current.states)).some((entry) => entry.key === "conversation-1")
+        ),
         Stream.runHead,
         Effect.forkScoped({ startImmediately: true })
       )
@@ -370,9 +373,10 @@ describe("Replica Atom graph", () => {
       yield* Effect.addFinalizer(() => Effect.sync(unmountLate))
       const late = yield* AtomRegistry.getResult(registry, lateView)
       assert.deepStrictEqual(late.events, [])
-      assert.deepStrictEqual(late.states.map((entry) => entry.value), [{ message: 42 }])
+      const lateStateValues = Array.from(HashMap.values(late.states), (entry) => entry.value)
+      assert.deepStrictEqual(lateStateValues, [{ message: 42 }])
       const lateSettled = yield* AtomRegistry.toStreamResult(registry, lateView).pipe(
-        Stream.filter((current) => current.states.some((entry) => entry.key === "sentinel")),
+        Stream.filter((current) => HashMap.some(current.states, (entry) => entry.key === "sentinel")),
         Stream.runHead,
         Effect.forkScoped({ startImmediately: true })
       )
@@ -390,7 +394,7 @@ describe("Replica Atom graph", () => {
       const departed = yield* AtomRegistry.toStreamResult(registry, view).pipe(
         Stream.filter((current) =>
           current.members.every((entry) => entry.member.clientId !== memberB.clientId) &&
-          current.events.length === 0 && current.states.length === 2
+          current.events.length === 0 && HashMap.size(current.states) === 2
         ),
         Stream.runHead,
         Effect.forkScoped({ startImmediately: true })
@@ -487,7 +491,13 @@ describe("Replica Atom graph", () => {
           spaceId,
           revision: Identity.EphemeralRevision.make(1),
           members: [{ member: memberA, value: null, expiresAtMillis: 10_000 }],
-          states: []
+          states: [{
+            member: memberA,
+            channel: "read",
+            key: "conversation-1",
+            value: 1,
+            expiresAtMillis: 10_000
+          }]
         })
       )
       yield* Queue.offer(
@@ -508,6 +518,7 @@ describe("Replica Atom graph", () => {
         Stream.runHead
       )
       assert.strictEqual(Option.getOrThrow(withEvent).events.length, 1)
+      assert.strictEqual(HashMap.size(Option.getOrThrow(withEvent).states), 1)
 
       yield* Queue.offer(
         messages,
@@ -525,7 +536,7 @@ describe("Replica Atom graph", () => {
       )
       assert.deepStrictEqual(replaced.members.map((entry) => entry.member), [memberB])
       assert.deepStrictEqual(replaced.events, [])
-      assert.deepStrictEqual(replaced.states, [])
+      assert.isTrue(HashMap.isEmpty(replaced.states))
     }, Effect.scoped)
   )
 

@@ -148,11 +148,13 @@ dispatcher with independent watches and turns. Workflow generations coalesce dur
 publications carry only notifications.
 
 `SpaceEntity.HandlerOptions` requires positive finite `admissionMailboxCapacity`, `readMailboxCapacity`,
-`watchMailboxCapacity`, and `ephemeralCommandMailboxCapacity` values. It also requires
-`maximumConcurrentBootstrapAuthorizations`, `maximumConcurrentBootstrapPagesPerSpace`, and
-`maximumConcurrentEphemeralRequestsPerSpace`. Bootstrap assertion verification and preparation share one fail fast
-Layer wide allowance. Published page reads use a separate per space allowance. Saturation reports `CapacityExceeded`
-with resource `bootstrap authorizations` or `bootstrap pages`.
+`watchMailboxCapacity`, `ephemeralJoinMailboxCapacity`, and `ephemeralCommandMailboxCapacity` values. It also requires
+`maximumConcurrentBootstrapAuthorizations`, `maximumConcurrentBootstrapPagesPerSpace`,
+`maximumConcurrentEphemeralJoinVerificationsPerSpace`, and `maximumConcurrentEphemeralRequestsPerSpace`. Join
+mailboxes bound active watchers plus pending verification. Join verification and command work use separate per space
+allowances. Bootstrap assertion verification and preparation share one fail fast Layer wide allowance. Published page
+reads use a separate per space allowance. Saturation reports `CapacityExceeded` with resource
+`bootstrap authorizations` or `bootstrap pages`.
 
 `ServerStore.maximumWatchersPerSpace` is the active sync watcher allowance. `EphemeralHub.maximumWatchersPerSpace` is a
 separate joined-stream allowance. `ServerStore.wakeCapacity` is the sliding sync hint depth. `EphemeralHub.capacity`

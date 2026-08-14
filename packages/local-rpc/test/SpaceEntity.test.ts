@@ -108,9 +108,11 @@ const handlerOptions = {
   admissionMailboxCapacity: 32,
   readMailboxCapacity: 32,
   watchMailboxCapacity: 32,
+  ephemeralJoinMailboxCapacity: 32,
   ephemeralCommandMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 4,
   maximumConcurrentBootstrapPagesPerSpace: 1,
+  maximumConcurrentEphemeralJoinVerificationsPerSpace: 4,
   maximumConcurrentEphemeralRequestsPerSpace: 4
 } satisfies SpaceEntity.HandlerOptions
 
@@ -323,6 +325,60 @@ describe("SpaceEntity", () => {
       })
       assert.strictEqual((yield* Deferred.await(event)).entry.value, true)
       yield* Fiber.interrupt(joined)
+    })).pipe(
+      Effect.provide(layerShardingConfig),
+      Effect.provide(NodeCrypto.layer)
+    ))
+
+  it.effect("bounds concurrent ephemeral join verification", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const entered = yield* Queue.unbounded<void>()
+      const release = yield* Deferred.make<void>()
+      const layerBlockingVerifier = PrincipalAssertion.layerVerifier(() =>
+        Queue.offer(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(release)),
+          Effect.as(null)
+        )
+      )
+      const layerEntityHandlers = SpaceEntity.layerHandlers({
+        ...handlerOptions,
+        ephemeralJoinMailboxCapacity: 2,
+        maximumConcurrentEphemeralJoinVerificationsPerSpace: 1
+      }).pipe(
+        Layer.provide(layerBlockingVerifier),
+        Layer.provide(layerStore),
+        Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 8 }))
+      )
+      const makeJoinClient = yield* Entity.makeTestClient(
+        SpaceEntity.SpaceEphemeralJoinEntity,
+        layerEntityHandlers
+      )
+      const joinClient = yield* makeJoinClient(spaceA)
+      const assertion = yield* assertionOf(null)
+      const firstReady = yield* Deferred.make<void>()
+      const secondReady = yield* Deferred.make<void>()
+      const start = (joinMember: Protocol.EphemeralMember, ready: Deferred.Deferred<void>) =>
+        joinClient.JoinEphemeral({
+          request: { spaceId: spaceA, member: joinMember, value: null, ttlMillis: 5_000 },
+          assertion
+        }).pipe(
+          Stream.tap((message) => {
+            if (message._tag === "Snapshot") return Deferred.succeed(ready, undefined)
+            return Effect.void
+          }),
+          Stream.runDrain,
+          Effect.forkChild({ startImmediately: true })
+        )
+      const first = yield* start(member, firstReady)
+      yield* Queue.take(entered)
+      const second = yield* start(secondMember, secondReady)
+      yield* Effect.yieldNow
+      yield* Effect.yieldNow
+      assert.strictEqual(Queue.sizeUnsafe(entered), 0)
+      yield* Deferred.succeed(release, undefined)
+      yield* Deferred.await(firstReady)
+      yield* Deferred.await(secondReady)
+      yield* Fiber.interruptAll([first, second])
     })).pipe(
       Effect.provide(layerShardingConfig),
       Effect.provide(NodeCrypto.layer)

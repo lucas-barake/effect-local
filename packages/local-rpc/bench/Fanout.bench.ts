@@ -94,9 +94,11 @@ const layerCluster = SpaceEntity.layer({
   admissionMailboxCapacity: 32,
   readMailboxCapacity: 32,
   watchMailboxCapacity: 1_024,
+  ephemeralJoinMailboxCapacity: 1_280,
   ephemeralCommandMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
+  maximumConcurrentEphemeralJoinVerificationsPerSpace: 16,
   maximumConcurrentEphemeralRequestsPerSpace: 16
 }).pipe(
   Layer.provide(layerStore),

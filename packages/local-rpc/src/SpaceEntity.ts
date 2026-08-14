@@ -242,9 +242,11 @@ export interface HandlerOptions {
   readonly admissionMailboxCapacity: number
   readonly readMailboxCapacity: number
   readonly watchMailboxCapacity: number
+  readonly ephemeralJoinMailboxCapacity: number
   readonly ephemeralCommandMailboxCapacity: number
   readonly maximumConcurrentBootstrapAuthorizations: number
   readonly maximumConcurrentBootstrapPagesPerSpace: number
+  readonly maximumConcurrentEphemeralJoinVerificationsPerSpace: number
   readonly maximumConcurrentEphemeralRequestsPerSpace: number
   readonly maxIdleTime?: Duration.Input
   readonly disableFatalDefects?: boolean
@@ -281,6 +283,15 @@ export const layerHandlers = (options: HandlerOptions) =>
         )
       }
       if (
+        !Number.isSafeInteger(options.ephemeralJoinMailboxCapacity) ||
+        options.ephemeralJoinMailboxCapacity <= 0
+      ) {
+        return yield* invalidConfiguration(
+          "ephemeralJoinMailboxCapacity",
+          "ephemeralJoinMailboxCapacity must be a positive safe integer"
+        )
+      }
+      if (
         !Number.isSafeInteger(options.ephemeralCommandMailboxCapacity) ||
         options.ephemeralCommandMailboxCapacity <= 0
       ) {
@@ -305,6 +316,15 @@ export const layerHandlers = (options: HandlerOptions) =>
         return yield* invalidConfiguration(
           "maximumConcurrentBootstrapPagesPerSpace",
           "maximumConcurrentBootstrapPagesPerSpace must be a positive safe integer"
+        )
+      }
+      if (
+        !Number.isSafeInteger(options.maximumConcurrentEphemeralJoinVerificationsPerSpace) ||
+        options.maximumConcurrentEphemeralJoinVerificationsPerSpace <= 0
+      ) {
+        return yield* invalidConfiguration(
+          "maximumConcurrentEphemeralJoinVerificationsPerSpace",
+          "maximumConcurrentEphemeralJoinVerificationsPerSpace must be a positive safe integer"
         )
       }
       if (
@@ -442,6 +462,9 @@ export const layerHandlers = (options: HandlerOptions) =>
         const address = yield* Entity.CurrentAddress
         const ephemeral = yield* EphemeralHub.EphemeralHub
         const verifier = yield* PrincipalAssertion.Verifier
+        const joinVerifications = yield* Semaphore.make(
+          options.maximumConcurrentEphemeralJoinVerificationsPerSpace
+        )
         let spaceId: Identity.SpaceId | undefined
         if (Schema.is(Identity.SpaceId)(address.entityId)) spaceId = address.entityId
 
@@ -462,11 +485,13 @@ export const layerHandlers = (options: HandlerOptions) =>
                 )
               )
             }
-            return Rpc.fork(Stream.unwrap(
+            const verified = Semaphore.withPermit(
+              joinVerifications,
               verifier.verify(payload.assertion).pipe(
                 Effect.map((principal) => ephemeral.join(payload.request, principal))
               )
-            ))
+            )
+            return Rpc.fork(Stream.unwrap(verified))
           },
           PublishEphemeral: ({ payload }: {
             readonly payload: {
@@ -523,7 +548,7 @@ export const layerHandlers = (options: HandlerOptions) =>
             JoinEphemeral: handlers.JoinEphemeral
           })
         )),
-        { ...common, concurrency: 1, mailboxCapacity: "unbounded" }
+        { ...common, concurrency: 1, mailboxCapacity: options.ephemeralJoinMailboxCapacity }
       )
 
       const layerEphemeralCommandHandlers = SpaceEphemeralCommandEntity.toLayer(

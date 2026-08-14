@@ -12,6 +12,7 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Hash from "effect/Hash"
+import * as HashMap from "effect/HashMap"
 import type * as Layer from "effect/Layer"
 import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
@@ -55,12 +56,28 @@ export interface EphemeralView {
   readonly spaceId: Identity.SpaceId
   readonly revision: Identity.EphemeralRevision
   readonly members: ReadonlyArray<Protocol.EphemeralMemberEntry>
-  readonly states: ReadonlyArray<Protocol.EphemeralStateEntry>
+  readonly states: HashMap.HashMap<string, Protocol.EphemeralStateEntry>
   readonly events: ReadonlyArray<Protocol.EphemeralEventEntry>
 }
 
 const sameMember = (left: Protocol.EphemeralMember, right: Protocol.EphemeralMember) =>
   left.clientId === right.clientId && left.membershipIncarnation === right.membershipIncarnation
+
+const stateIdentity = (
+  member: Protocol.EphemeralMember,
+  channel: Protocol.EphemeralChannel,
+  key: Protocol.EphemeralKey
+) =>
+  [member.clientId, member.membershipIncarnation, channel, key]
+    .map((component) => `${component.length}:${component}`)
+    .join("")
+
+const stateRecord = (
+  entry: Protocol.EphemeralStateEntry
+): readonly [string, Protocol.EphemeralStateEntry] => [
+  stateIdentity(entry.member, entry.channel, entry.key),
+  entry
+]
 
 const reduceEphemeral = (
   current: EphemeralView | undefined,
@@ -71,7 +88,7 @@ const reduceEphemeral = (
       spaceId: message.spaceId,
       revision: message.revision,
       members: message.members,
-      states: message.states,
+      states: HashMap.fromIterable(message.states.map(stateRecord)),
       events: []
     }
   }
@@ -98,21 +115,20 @@ const reduceEphemeral = (
     return {
       ...current,
       revision: message.revision,
-      states: [
-        ...current.states.filter((entry) =>
-          !sameMember(entry.member, message.entry.member) ||
-          entry.channel !== message.entry.channel || entry.key !== message.entry.key
-        ),
+      states: HashMap.set(
+        current.states,
+        stateIdentity(message.entry.member, message.entry.channel, message.entry.key),
         message.entry
-      ]
+      )
     }
   }
   if (message._tag === "StateRemoved") {
     return {
       ...current,
       revision: message.revision,
-      states: current.states.filter((entry) =>
-        !sameMember(entry.member, message.member) || entry.channel !== message.channel || entry.key !== message.key
+      states: HashMap.remove(
+        current.states,
+        stateIdentity(message.member, message.channel, message.key)
       )
     }
   }

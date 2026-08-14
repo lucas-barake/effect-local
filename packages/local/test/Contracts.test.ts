@@ -608,7 +608,7 @@ describe("domain contracts", () => {
             membershipIncarnation: envelope.membershipIncarnation
           },
           value: null,
-          ttlMillis: 1
+          ttlMillis: 2
         }],
         [Protocol.VersionedEphemeralPublishRequest, {
           sessionToken: "eps_00000000-0000-4000-8000-000000000001",
@@ -652,8 +652,19 @@ describe("domain contracts", () => {
           membershipIncarnation: envelope.membershipIncarnation
         },
         sessionToken: "eps_00000000-0000-4000-8000-000000000001",
-        leaseMillis: 1
+        leaseMillis: 2
       })
+
+      const tooShortLease = yield* Schema.decodeUnknownEffect(Protocol.EphemeralJoinRequest)({
+        spaceId,
+        member: {
+          clientId: envelope.clientId,
+          membershipIncarnation: envelope.membershipIncarnation
+        },
+        value: null,
+        ttlMillis: 1
+      }).pipe(Effect.result)
+      assert.strictEqual(tooShortLease._tag, "Failure")
     })
   )
 })

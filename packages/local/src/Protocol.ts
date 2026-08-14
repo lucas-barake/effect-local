@@ -10,7 +10,7 @@ export const maximumMutationBytes = 256 * 1024
 export const maximumBatchEntries = 1_000
 export const maximumBatchBytes = 4 * 1024 * 1024
 export const maximumRpcFrameBytes = maximumBatchBytes + 64 * 1024
-export const maximumEphemeralSnapshotBytes = maximumBatchBytes
+export const minimumEphemeralMemberTtlMillis = 2
 export const maximumReceiptBytes = 4 * 1024 * 1024
 export const maximumEphemeralPayloadBytes = 16 * 1024
 export const maximumEphemeralChannelLength = 256
@@ -558,7 +558,7 @@ export const EphemeralJoinRequest = Schema.Struct({
   ...EphemeralRequestIdentity,
   value: Schema.Json,
   ttlMillis: Schema.Int.check(
-    Schema.isGreaterThan(0),
+    Schema.isGreaterThanOrEqualTo(minimumEphemeralMemberTtlMillis),
     Schema.isLessThanOrEqualTo(maximumEphemeralMemberTtlMillis)
   )
 })
@@ -719,7 +719,7 @@ export const EphemeralSessionStarted = Schema.TaggedStruct("SessionStarted", {
   spaceId: Identity.SpaceId,
   member: EphemeralMember,
   sessionToken: Identity.EphemeralSessionToken,
-  leaseMillis: Schema.Int.check(Schema.isGreaterThan(0))
+  leaseMillis: Schema.Int.check(Schema.isGreaterThanOrEqualTo(minimumEphemeralMemberTtlMillis))
 })
 export type EphemeralSessionStarted = typeof EphemeralSessionStarted.Type
 

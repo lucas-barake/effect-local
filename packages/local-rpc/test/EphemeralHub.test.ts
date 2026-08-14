@@ -92,6 +92,18 @@ const startJoin = Effect.fnUntraced(function*(
 
 describe("EphemeralHub", () => {
   it.effect(
+    "rejects a member lease that cannot renew before expiry",
+    Effect.fnUntraced(function*() {
+      const failure = yield* Layer.build(EphemeralHub.layerTrusted({
+        maximumWatchersPerSpace: 8,
+        memberTtl: "1 millis"
+      })).pipe(Effect.provide(NodeCrypto.layer), failureOf)
+      assert.strictEqual(failure._tag, "InvalidConfiguration")
+      if (failure._tag === "InvalidConfiguration") assert.strictEqual(failure.option, "memberTtl")
+    })
+  )
+
+  it.effect(
     "replays the roster and emits departure when a joined stream closes",
     Effect.fnUntraced(function*() {
       return yield* Effect.gen(function*() {
@@ -121,7 +133,7 @@ describe("EphemeralHub", () => {
   )
 
   it.effect(
-    "resnapshots only the subscriber that falls behind",
+    "ends only the subscriber that falls behind",
     Effect.fnUntraced(function*() {
       return yield* Effect.gen(function*() {
         const hub = yield* EphemeralHub.EphemeralHub
@@ -163,6 +175,55 @@ describe("EphemeralHub", () => {
         yield* Fiber.interrupt(fast.fiber)
         yield* Fiber.interrupt(late.fiber)
       }).pipe(Effect.provide(layerTrusted({ ...options, capacity: 4 })))
+    })
+  )
+
+  it.effect(
+    "terminates a replaced session and clears its live event quota",
+    Effect.fnUntraced(function*() {
+      return yield* Effect.gen(function*() {
+        const hub = yield* EphemeralHub.EphemeralHub
+        const cleared = yield* Deferred.make<Protocol.EphemeralEventCleared>()
+        const observer = yield* startJoin(hub, joinRequest(spaceA, memberB), (message) => {
+          if (message._tag === "EventCleared" && message.member.clientId === memberA.clientId) {
+            return Deferred.succeed(cleared, message)
+          }
+          return Effect.void
+        })
+        const first = yield* startJoin(hub, joinRequest(spaceA, memberA))
+        yield* hub.publish(
+          Protocol.EphemeralEventRequest.make({
+            spaceId: spaceA,
+            member: memberA,
+            channel: "typing",
+            value: true,
+            ttlMillis: 10_000
+          }),
+          first.session.sessionToken,
+          null
+        )
+
+        const replacement = yield* startJoin(hub, joinRequest(spaceA, memberA))
+        const replaced = yield* Fiber.join(first.fiber).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(replaced))
+        if (Result.isFailure(replaced)) assert.strictEqual(replaced.failure._tag, "EphemeralSessionUnavailable")
+        yield* Deferred.await(cleared)
+        yield* hub.publish(
+          Protocol.EphemeralEventRequest.make({
+            spaceId: spaceA,
+            member: memberA,
+            channel: "recording",
+            value: true,
+            ttlMillis: 10_000
+          }),
+          replacement.session.sessionToken,
+          null
+        )
+        yield* Fiber.interruptAll([observer.fiber, replacement.fiber])
+      }).pipe(Effect.provide(layerTrusted({
+        ...options,
+        maximumEventKeysPerMember: 1
+      })))
     })
   )
 

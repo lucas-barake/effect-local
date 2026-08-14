@@ -112,7 +112,7 @@ interface MemberRecord {
   readonly entryBytes: number
   readonly token: object
   readonly sessionToken: Identity.EphemeralSessionToken
-  readonly departed: Deferred.Deferred<void>
+  readonly departed: Deferred.Deferred<void, ReplicaError.EphemeralSessionUnavailable>
   readonly leaseMillis: number
 }
 
@@ -188,7 +188,7 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
     maximumStateKeysPerSpace: options.maximumStateKeysPerSpace ?? 16_384,
     maximumBytesPerMember: options.maximumBytesPerMember ?? 1024 * 1024,
     maximumBytesPerSpace: options.maximumBytesPerSpace ?? 16 * 1024 * 1024,
-    maximumSnapshotBytes: options.maximumSnapshotBytes ?? Protocol.maximumEphemeralSnapshotBytes
+    maximumSnapshotBytes: options.maximumSnapshotBytes ?? Protocol.maximumBatchBytes
   }
   for (const [option, value] of Object.entries(counts)) {
     yield* positiveSafeInteger(option, value)
@@ -217,6 +217,12 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
       options.spaceIdleTtl ?? Protocol.maximumEphemeralStateTtlMillis
     )
   } satisfies ResolvedOptions
+  if (resolved.memberTtlMillis < Protocol.minimumEphemeralMemberTtlMillis) {
+    return yield* invalidConfiguration(
+      "memberTtl",
+      `memberTtl must be at least ${Protocol.minimumEphemeralMemberTtlMillis} milliseconds`
+    )
+  }
   if (resolved.memberTtlMillis > Protocol.maximumEphemeralMemberTtlMillis) {
     return yield* invalidConfiguration(
       "memberTtl",
@@ -229,10 +235,10 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
       "authorizationRefreshInterval must not exceed memberTtl"
     )
   }
-  if (resolved.maximumSnapshotBytes > Protocol.maximumEphemeralSnapshotBytes) {
+  if (resolved.maximumSnapshotBytes > Protocol.maximumBatchBytes) {
     return yield* invalidConfiguration(
       "maximumSnapshotBytes",
-      `maximumSnapshotBytes must not exceed ${Protocol.maximumEphemeralSnapshotBytes}`
+      `maximumSnapshotBytes must not exceed ${Protocol.maximumBatchBytes}`
     )
   }
   if (resolved.maximumEventTtlMillis > Protocol.maximumEphemeralEventTtlMillis) {
@@ -307,6 +313,31 @@ const withGate = <A, E extends { readonly _tag: string }, R,>(
   effect: Effect.Effect<A, E, R>
 ) => Semaphore.withPermit(runtime.gate, Effect.uninterruptible(effect))
 
+const removeMemberEvents = Effect.fnUntraced(function*(
+  runtime: SpaceRuntime,
+  member: Protocol.EphemeralMember,
+  publishClears: boolean
+) {
+  const owner = memberKey(member)
+  for (const [identity, event] of runtime.events) {
+    if (memberKey(event.member) !== owner) continue
+    runtime.events.delete(identity)
+    yield* FiberMap.remove(runtime.eventTimers, identity)
+    if (publishClears) {
+      yield* publishDelta(
+        runtime,
+        Protocol.EphemeralEventCleared.make({
+          spaceId: runtime.spaceId,
+          revision: nextRevision(runtime),
+          member,
+          channel: event.channel
+        })
+      )
+    }
+  }
+  runtime.memberEventKeys.set(owner, 0)
+})
+
 const removeMember = (
   runtime: SpaceRuntime,
   member: Protocol.EphemeralMember,
@@ -324,12 +355,7 @@ const removeMember = (
       runtime.snapshotEntriesBytes -= current.entryBytes
       runtime.memberBytes.set(key, (runtime.memberBytes.get(key) ?? 0) - current.bytes)
       if (cancelTimer) yield* FiberMap.remove(runtime.memberTimers, key)
-      for (const [identity, event] of runtime.events) {
-        if (memberKey(event.member) !== key) continue
-        runtime.events.delete(identity)
-        yield* FiberMap.remove(runtime.eventTimers, identity)
-      }
-      runtime.memberEventKeys.set(key, 0)
+      yield* removeMemberEvents(runtime, member, false)
       cleanupOwnerAccounting(runtime, key)
       yield* Deferred.succeed(current.departed, undefined)
       yield* publishDelta(
@@ -498,7 +524,7 @@ export const layer = <R = never,>(
               Effect.map((uuid) => Identity.EphemeralSessionToken.make(`eps_${uuid}`)),
               Effect.catch(() => Effect.fail(new ReplicaError.ServerUnavailable()))
             )
-            const departed = yield* Deferred.make<void>()
+            const departed = yield* Deferred.make<void, ReplicaError.EphemeralSessionUnavailable>()
             const acquireJoin = withGate(
               runtime,
               Effect.gen(function*() {
@@ -531,7 +557,17 @@ export const layer = <R = never,>(
                 let nextEntryCount = runtime.members.size + runtime.states.size
                 if (previous === undefined) nextEntryCount += 1
                 yield* ensureSnapshotSize(resolved, nextSnapshotEntriesBytes, nextEntryCount)
-                if (previous !== undefined) yield* Deferred.succeed(previous.departed, undefined)
+                if (previous !== undefined) {
+                  yield* removeMemberEvents(runtime, request.member, true)
+                  yield* Deferred.fail(
+                    previous.departed,
+                    new ReplicaError.EphemeralSessionUnavailable({
+                      spaceId: request.spaceId,
+                      clientId: request.member.clientId,
+                      membershipIncarnation: request.member.membershipIncarnation
+                    })
+                  )
+                }
                 runtime.members.set(key, {
                   entry,
                   bytes,

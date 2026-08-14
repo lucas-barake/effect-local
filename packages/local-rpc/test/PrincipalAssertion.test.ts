@@ -88,9 +88,11 @@ describe("principal assertions", () => {
           admissionMailboxCapacity: 32,
           readMailboxCapacity: 32,
           watchMailboxCapacity: 32,
+          ephemeralJoinMailboxCapacity: 32,
           ephemeralCommandMailboxCapacity: 32,
           maximumConcurrentBootstrapAuthorizations: 16,
           maximumConcurrentBootstrapPagesPerSpace: 4,
+          maximumConcurrentEphemeralJoinVerificationsPerSpace: 16,
           maximumConcurrentEphemeralRequestsPerSpace: 16
         })
         const layerLiveHandlers = layerHandlers.pipe(

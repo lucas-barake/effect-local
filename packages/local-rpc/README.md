@@ -44,9 +44,11 @@ const layerSpace = SpaceEntity.layer({
   admissionMailboxCapacity: 64,
   readMailboxCapacity: 64,
   watchMailboxCapacity: 2_048,
+  ephemeralJoinMailboxCapacity: 1_280,
   ephemeralCommandMailboxCapacity: 256,
   maximumConcurrentBootstrapAuthorizations: 64,
   maximumConcurrentBootstrapPagesPerSpace: 8,
+  maximumConcurrentEphemeralJoinVerificationsPerSpace: 64,
   maximumConcurrentEphemeralRequestsPerSpace: 64
 }).pipe(
   Layer.provide(layerStore),
@@ -55,9 +57,10 @@ const layerSpace = SpaceEntity.layer({
 )
 ```
 
-All seven numeric `SpaceEntity` options are required positive safe integers. A full entity mailbox maps to
-`ServerUnavailable`. Bootstrap concurrency is fail fast. Saturation reports typed `CapacityExceeded` with resource
-`bootstrap authorizations` or `bootstrap pages`.
+All nine numeric `SpaceEntity` options are required positive safe integers. Size `ephemeralJoinMailboxCapacity` for
+active watchers plus bounded pending verification. Join verification and command work have separate concurrency
+limits. A full entity mailbox maps to `ServerUnavailable`. Bootstrap concurrency is fail fast. Saturation reports
+typed `CapacityExceeded` with resource `bootstrap authorizations` or `bootstrap pages`.
 
 For one process, provide `SingleRunner.layer` with the selected runner storage. A multi-runner deployment provides
 Effect Cluster runner transport, storage, health, serialization, and sharding Layers. This package does not choose
@@ -74,6 +77,8 @@ A join identifies a member by `(clientId, membershipIncarnation)` and returns on
   removal. Read positions and delivery positions fit this shape.
 - Member liveness is server leased. `EphemeralClient` heartbeats while its joined stream is scoped. Stream teardown or
   lease expiry removes the roster entry and emits `MemberLeft`.
+- A new join for the same member identity replaces the old session. The old stream terminates without reconnecting,
+  and its live events are cleared before the replacement becomes current.
 - Retained state survives member departure until its own server-enforced TTL. This lets a later member observe the
   latest position after a brief disconnect.
 
