@@ -41,7 +41,10 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000000
 const membershipIncarnation = Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const clientHistory = {
+  defaultScope: Protocol.ReplicationScope.make({ models: ["Todo"] }),
   scope: Protocol.ReplicationScope.make({ models: ["Todo"] }),
+  maximumActiveSpaces: 4,
+  foregroundActiveSpaces: 2,
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,

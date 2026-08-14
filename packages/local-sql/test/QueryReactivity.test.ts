@@ -5,14 +5,16 @@ import type * as IndexStore from "../src/IndexStore.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
+const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 
 const footprint = (options: {
   readonly lower: string
   readonly upper: string
   readonly boundary?: ReadonlyArray<string | number>
   readonly full?: boolean
+  readonly spaceId?: Identity.SpaceId
 }): IndexStore.Footprint => ({
-  spaceId,
+  spaceId: options.spaceId ?? spaceId,
   descriptor: "todo-by-title",
   model: "Todo",
   index: "byTitle",
@@ -118,6 +120,30 @@ describe("query range reactivity", () => {
 
       assert.deepStrictEqual(yield* registry.affected(changes(unrelated)), [])
       assert.isAtMost(comparisons, 2_000)
+    }, provideQueryReactivity)
+  )
+
+  it.effect(
+    "isolates retained reads by space",
+    Effect.fnUntraced(function*() {
+      const registry = yield* QueryReactivity.QueryReactivity
+      const releases: Array<Effect.Effect<void>> = []
+      for (let index = 0; index < 1_000; index++) {
+        const key = `other-space-query-${index}`
+        releases.push(yield* registry.retain(key))
+        yield* registry.record(key, [{
+          _tag: "Index",
+          footprint: footprint({ lower: "a", upper: "z", spaceId: secondSpaceId })
+        }])
+      }
+      const targetKey = "target-space-query"
+      releases.push(yield* registry.retain(targetKey))
+      yield* registry.record(targetKey, [{
+        _tag: "Index",
+        footprint: footprint({ lower: "a", upper: "z" })
+      }])
+      yield* Effect.addFinalizer(() => Effect.all(releases, { discard: true }))
+      assert.deepStrictEqual(yield* registry.affected(changes([point("middle", "\"1\"")])), [targetKey])
     }, provideQueryReactivity)
   )
 })

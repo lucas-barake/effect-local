@@ -103,7 +103,10 @@ const migration = {
   maximumAttempts: 8
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const clientHistory = {
+  defaultScope: Protocol.ReplicationScope.make({ models: [Todo.name, Numbered.name] }),
   scope: Protocol.ReplicationScope.make({ models: [Todo.name, Numbered.name] }),
+  maximumActiveSpaces: 4,
+  foregroundActiveSpaces: 2,
   settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 10_000,
@@ -363,6 +366,100 @@ describe("Replica Atom graph", () => {
     })
   )
 
+  it.effect(
+    "does not refresh membership or another space status for an addressed write",
+    Effect.fnUntraced(function*() {
+      let spacesReads = 0
+      let secondStatusReads = 0
+      const layerObserved = Effect.gen(function*() {
+        const service = yield* Replica.Replica
+        return Replica.Replica.of({
+          ...service,
+          spaces: Effect.suspend(() => {
+            spacesReads++
+            return service.spaces
+          }),
+          space: (address) =>
+            service.space(address).pipe(Effect.map((space) => {
+              if (address !== secondSpaceId) return space
+              return {
+                ...space,
+                status: Effect.suspend(() => {
+                  secondStatusReads++
+                  return space.status
+                })
+              }
+            }))
+        })
+      }).pipe(
+        Layer.effect(Replica.Replica),
+        Layer.provideMerge(layerReplica)
+      )
+      const graph = BrowserReplica.make(layerObserved)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const membership = graph.spaces
+      const unrelatedStatus = graph.status(secondSpaceId)
+      const mutation = graph.mutation(spaceId, PutTodo)
+      const mounted = [
+        registry.mount(membership),
+        registry.mount(unrelatedStatus),
+        registry.mount(mutation)
+      ]
+      yield* Effect.addFinalizer(() => Effect.sync(() => mounted.forEach((unmount) => unmount())))
+      assert.lengthOf(yield* AtomRegistry.getResult(registry, membership), 2)
+      assert.strictEqual((yield* AtomRegistry.getResult(registry, unrelatedStatus)).spaceId, secondSpaceId)
+      const spacesBefore = spacesReads
+      const secondStatusBefore = secondStatusReads
+
+      registry.set(mutation, { id: "addressed-write", title: "first" })
+      yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      yield* Effect.yieldNow
+
+      assert.strictEqual(spacesReads, spacesBefore)
+      assert.strictEqual(secondStatusReads, secondStatusBefore)
+    })
+  )
+
+  it.effect(
+    "reacts to per-space scope and activation commands",
+    Effect.fnUntraced(function*() {
+      const graph = BrowserReplica.make(layerReplica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const scopeAtom = graph.scope(spaceId)
+      const activationAtom = graph.activation(spaceId)
+      const setScope = graph.setScope(spaceId)
+      const activate = graph.activate(spaceId)
+      const deactivate = graph.deactivate(spaceId)
+      const mounted = [
+        registry.mount(scopeAtom),
+        registry.mount(activationAtom),
+        registry.mount(setScope),
+        registry.mount(activate),
+        registry.mount(deactivate)
+      ]
+      yield* Effect.addFinalizer(() => Effect.sync(() => mounted.forEach((unmount) => unmount())))
+
+      registry.set(deactivate, undefined)
+      yield* AtomRegistry.getResult(registry, deactivate, { suspendOnWaiting: true })
+      assert.strictEqual(yield* AtomRegistry.getResult(registry, activationAtom), "Inactive")
+
+      const empty = Protocol.ReplicationScope.make({ models: [] })
+      registry.set(setScope, empty)
+      yield* AtomRegistry.getResult(registry, setScope, { suspendOnWaiting: true })
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, scopeAtom), empty)
+      assert.strictEqual(yield* AtomRegistry.getResult(registry, activationAtom), "Active")
+
+      registry.set(deactivate, undefined)
+      yield* AtomRegistry.getResult(registry, deactivate, { suspendOnWaiting: true })
+      registry.set(activate, undefined)
+      yield* AtomRegistry.getResult(registry, activate, { suspendOnWaiting: true })
+      assert.strictEqual(yield* AtomRegistry.getResult(registry, activationAtom), "Active")
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, scopeAtom), empty)
+    }, Effect.scoped)
+  )
+
   it("uses the shared runtime factory by default and preserves an explicit factory", () => {
     const graph = BrowserReplica.make(layerReplica)
     assert.strictEqual(graph.factory, Atom.runtime)
@@ -482,11 +579,18 @@ describe("Replica Atom graph", () => {
         AtomRegistry.getResult(registry, firstMutation, { suspendOnWaiting: true }),
         AtomRegistry.getResult(registry, secondMutation, { suspendOnWaiting: true })
       ])
-      yield* Effect.yieldNow
-      assert.strictEqual(Option.getOrThrow(yield* AtomRegistry.getResult(registry, firstEntity)).title, "first")
-      assert.strictEqual(Option.getOrThrow(yield* AtomRegistry.getResult(registry, secondEntity)).title, "second")
+      const firstValue = Option.getOrThrow(
+        yield* AtomRegistry.getResult(registry, firstEntity, { suspendOnWaiting: true })
+      )
+      const secondValue = Option.getOrThrow(
+        yield* AtomRegistry.getResult(registry, secondEntity, { suspendOnWaiting: true })
+      )
+      assert.strictEqual(firstValue.title, "first")
+      assert.strictEqual(secondValue.title, "second")
       pipe(
-        (yield* AtomRegistry.getResult(registry, firstQuery)).filter((todo) => todo.id === "shared"),
+        (yield* AtomRegistry.getResult(registry, firstQuery, { suspendOnWaiting: true })).filter((todo) =>
+          todo.id === "shared"
+        ),
         (todos) =>
           assert.deepStrictEqual(todos, [{
             id: "shared",
@@ -494,7 +598,9 @@ describe("Replica Atom graph", () => {
           }])
       )
       pipe(
-        (yield* AtomRegistry.getResult(registry, secondQuery)).filter((todo) => todo.id === "shared"),
+        (yield* AtomRegistry.getResult(registry, secondQuery, { suspendOnWaiting: true })).filter((todo) =>
+          todo.id === "shared"
+        ),
         (todos) =>
           assert.deepStrictEqual(todos, [{
             id: "shared",
@@ -517,12 +623,7 @@ describe("Replica Atom graph", () => {
       assert.strictEqual(secondReceipt.spaceId, secondSpaceId)
       const status = yield* AtomRegistry.getResult(registry, graph.status(spaceId))
       assert.strictEqual(status.spaceId, spaceId)
-      pipe(
-        (yield* AtomRegistry.getResult(registry, graph.aggregateStatus)).spaces.map((spaceStatus) =>
-          spaceStatus.spaceId
-        ),
-        (spaceIds) => assert.deepStrictEqual(spaceIds, [spaceId, secondSpaceId])
-      )
+      assert.strictEqual((yield* AtomRegistry.getResult(registry, graph.aggregateStatus)).spaces, 2)
 
       registry.set(graph.join, thirdSpaceId)
       const joinedSpaces = Option.getOrThrow(

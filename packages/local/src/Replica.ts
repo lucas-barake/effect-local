@@ -1,7 +1,7 @@
 import * as Context from "effect/Context"
 import type * as Effect from "effect/Effect"
 import type * as Option from "effect/Option"
-import type * as Schema from "effect/Schema"
+import * as Schema from "effect/Schema"
 import type * as Stream from "effect/Stream"
 import type * as Identity from "./Identity.js"
 import type * as Model from "./Model.js"
@@ -59,8 +59,16 @@ export type MutationSettlement<M extends Mutation.Any = Mutation.Any,> =
     readonly receipt: Protocol.LegacyReceipt
   }
 
+export const Activation = Schema.Literals(["Inactive", "Activating", "Active", "Deactivating"])
+export type Activation = typeof Activation.Type
+
 export interface Space {
   readonly spaceId: Identity.SpaceId
+  readonly scope: Effect.Effect<Protocol.ReplicationScope, ReplicaError.ReplicaError>
+  readonly setScope: (scope: Protocol.ReplicationScope) => Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly activation: Effect.Effect<Activation, ReplicaError.ReplicaError>
+  readonly activate: Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly deactivate: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly mutate: <M extends Mutation.Any,>(
     mutation: M,
     payload: Mutation.Payload<M>
@@ -81,7 +89,7 @@ export interface Space {
   readonly pendingFor: <M extends Mutation.Any,>(
     mutation: M
   ) => Effect.Effect<ReadonlyArray<PendingMutation<M>>, ReplicaError.ReplicaError>
-  readonly settlements: Stream.Stream<MutationSettlement>
+  readonly settlements: Stream.Stream<MutationSettlement, ReplicaError.ReplicaError>
   readonly settlementsFor: <M extends Mutation.Any,>(
     mutation: M
   ) => Stream.Stream<MutationSettlement<M>, ReplicaError.ReplicaError>

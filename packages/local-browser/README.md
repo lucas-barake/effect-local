@@ -4,9 +4,10 @@ Browser SQLite, Effect Atom, and best effort presence for Effect Local.
 
 `BrowserSqlite.layerMessagePort` adapts an application owned SQLite WASM worker port. `BrowserReplica.make` creates one
 Atom runtime with space addressed entity families, query families, concurrent mutation functions, receipts, and
-per space status. It also exposes `spaces`, `join`, `leave`, and `aggregateStatus`. It uses Effect `Reactivity`, so
-committed local writes and installed server entries refresh only matching space and model dependencies. Leaving a
-space invalidates retained atoms for that address.
+per space status. It exposes `scope`, `setScope`, `activation`, `activate`, and `deactivate` families beside `spaces`,
+`join`, `leave`, and the constant size `aggregateStatus`. It uses Effect `Reactivity`, so committed local writes and
+installed server entries refresh only matching space and model dependencies. Membership, aggregate, scope, activation,
+and addressed status have separate keys. Leaving a space invalidates retained atoms for that address.
 
 Pass either `SqlReplica.layer` or `SqlReplica.layerWorkflow` to the graph. The Workflow composition can run in an
 application owned dedicated Worker or SharedWorker with SQL backed `SingleRunner` and `ClusterWorkflowEngine`.

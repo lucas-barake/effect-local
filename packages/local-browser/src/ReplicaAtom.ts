@@ -3,6 +3,7 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
+import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import type * as Query from "@lucas-barake/effect-local/Query"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
@@ -46,13 +47,12 @@ export const make = <E,>(
   const runtime = factory(layer)
   const idleTTL = Duration.toMillis(options?.idleTTL ?? Duration.seconds(30))
 
-  const spaceKey = (spaceId: Identity.SpaceId) => `effect-local:space:${spaceId}`
   const entity = <M extends Model.Any,>(spaceId: Identity.SpaceId, model: M) =>
     Atom.family((key: Model.Key<M>) =>
       runtime.atom(
         Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.get(model, key))))
       ).pipe(
-        factory.withReactivity([spaceKey(spaceId), ReactivityKey.entity(spaceId, model.name, key)]),
+        factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.entity(spaceId, model.name, key)]),
         Atom.setIdleTTL(idleTTL)
       )
     )
@@ -73,7 +73,7 @@ export const make = <E,>(
           replica.space(spaceId).pipe(Effect.flatMap((space) => space.query(definition, key.payload)))
         )
       ).pipe(
-        factory.withReactivity([spaceKey(spaceId), token])
+        factory.withReactivity([ReactivityKey.membership(spaceId), token])
       )
       return Atom.transform(target, (get, atom) => {
         if (!AsyncResult.isSuccess(get(retention))) return AsyncResult.initial(true)
@@ -110,8 +110,8 @@ export const make = <E,>(
       )
     ).pipe(
       factory.withReactivity([
-        spaceKey(spaceId),
-        `${spaceKey(spaceId)}:receipt:${mutationId}`
+        ReactivityKey.membership(spaceId),
+        ReactivityKey.receipt(spaceId, mutationId)
       ]),
       Atom.setIdleTTL(idleTTL)
     )
@@ -120,7 +120,7 @@ export const make = <E,>(
     runtime.atom(
       Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.pending)))
     ).pipe(
-      factory.withReactivity([spaceKey(spaceId), ReactivityKey.pending(spaceId)]),
+      factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.pending(spaceId)]),
       Atom.setIdleTTL(idleTTL)
     )
   )
@@ -131,7 +131,7 @@ export const make = <E,>(
         replica.space(spaceId).pipe(Effect.flatMap((space) => space.pendingFor(definition)))
       )
     ).pipe(
-      factory.withReactivity([spaceKey(spaceId), ReactivityKey.pending(spaceId)]),
+      factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.pending(spaceId)]),
       Atom.setIdleTTL(idleTTL)
     )
 
@@ -139,7 +139,7 @@ export const make = <E,>(
     runtime.atom(
       Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.map((space) => space.settlements)))
     ).pipe(
-      factory.withReactivity([spaceKey(spaceId)]),
+      factory.withReactivity([ReactivityKey.membership(spaceId)]),
       Atom.setIdleTTL(idleTTL)
     )
   )
@@ -150,20 +150,55 @@ export const make = <E,>(
         replica.space(spaceId).pipe(Effect.map((space) => space.settlementsFor(definition)))
       )
     ).pipe(
-      factory.withReactivity([spaceKey(spaceId)]),
+      factory.withReactivity([ReactivityKey.membership(spaceId)]),
       Atom.setIdleTTL(idleTTL)
     )
 
   const status = Atom.family((spaceId: Identity.SpaceId) =>
     runtime.atom(
       Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.status)))
-    ).pipe(factory.withReactivity([spaceKey(spaceId), `${spaceKey(spaceId)}:status`]))
+    ).pipe(factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.status(spaceId)]))
+  )
+  const scope = Atom.family((spaceId: Identity.SpaceId) =>
+    runtime.atom(
+      Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.scope)))
+    ).pipe(
+      factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.scope(spaceId)])
+    )
+  )
+  const activation = Atom.family((spaceId: Identity.SpaceId) =>
+    runtime.atom(
+      Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.activation)))
+    ).pipe(
+      factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.activation(spaceId)])
+    )
+  )
+  const setScope = Atom.family((spaceId: Identity.SpaceId) =>
+    runtime.fn<Protocol.ReplicationScope>()(
+      (nextScope) =>
+        Replica.Replica.use((replica) =>
+          replica.space(spaceId).pipe(Effect.flatMap((space) => space.setScope(nextScope)))
+        ),
+      { concurrent: true }
+    )
+  )
+  const activate = Atom.family((spaceId: Identity.SpaceId) =>
+    runtime.fn(
+      () => Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.activate))),
+      { concurrent: true }
+    )
+  )
+  const deactivate = Atom.family((spaceId: Identity.SpaceId) =>
+    runtime.fn(
+      () => Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.deactivate))),
+      { concurrent: true }
+    )
   )
   const spaces = runtime.atom(Replica.Replica.use((replica) => replica.spaces)).pipe(
-    factory.withReactivity(["effect-local:status"])
+    factory.withReactivity([ReactivityKey.spaces])
   )
   const aggregateStatus = runtime.atom(Replica.Replica.use((replica) => replica.status)).pipe(
-    factory.withReactivity(["effect-local:status"])
+    factory.withReactivity([ReactivityKey.aggregateStatus])
   )
   const join = runtime.fn<Identity.SpaceId>()(
     (spaceId) => Replica.Replica.use((replica) => replica.join(spaceId)),
@@ -185,6 +220,11 @@ export const make = <E,>(
     pendingFor,
     settlements,
     settlementsFor,
+    scope,
+    setScope,
+    activation,
+    activate,
+    deactivate,
     status,
     spaces,
     aggregateStatus,

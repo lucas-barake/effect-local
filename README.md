@@ -227,9 +227,12 @@ const history = {
 export const layerReplica = SqlReplica.layer({
   definition,
   clientId,
-  scope,
+  defaultScope: scope,
   initialSpaces: [spaceId],
+  maximumActiveSpaces: 8,
+  foregroundActiveSpaces: 4,
   reconciliationConcurrency: 8,
+  foregroundReconciliationConcurrency: 2,
   ...history
 }).pipe(
   Layer.provide(layerDomain),
@@ -253,16 +256,22 @@ const program = Replica.Replica.use((replica) =>
 ).pipe(Effect.provide(layerReplica), Effect.scoped)
 ```
 
-Call `replica.join(spaceId)` to add membership, `replica.leave(spaceId)` to evict that space, and `replica.spaces` to
-list the current handles. Each handle scopes mutation, entity, query, pending, settlement, receipt, cursor, and status
-state to its space.
+Call `replica.join(spaceId)` to remember membership, `replica.leave(spaceId)` to evict that space, and `replica.spaces`
+to list remembered handles. A remembered space starts inactive. `space.activate` opens its local runtime and watch,
+while `space.deactivate` releases them without deleting local data. Entity, query, mutation, pending, receipt, and
+settlement operations activate the addressed space as foreground work. Each handle also exposes reactive `scope`,
+`setScope`, `activation`, and `status` operations.
 Leaving cascades through every client table without changing the durable client identity or any other space. A stale
 handle returns `SpaceUnavailable`, including after the same space is joined again with a fresh membership incarnation.
 
 `layerSync` can be the RPC client Layer from the next section or any implementation of `SyncEngine`. Local commits do
-not wait for it. One dispatcher owns keyed watches and reconciliation turns for every joined space. A failed or busy
-space does not block another space, while all requests still share the one `SyncEngine` and its one RPC WebSocket.
-Per space status is available on each handle. `replica.status` returns the sorted aggregate with total pending work.
+not wait for it. `maximumActiveSpaces` bounds all live per space runtimes. `foregroundActiveSpaces` reserves an LRU
+resident subset for addressed work. Reconciliation reserves `foregroundReconciliationConcurrency` from the total
+`reconciliationConcurrency`, so an open chat progresses while background spaces are saturated. The remaining slots
+drain pending mutations with short lived background runtimes, including for otherwise inactive spaces. Active watches
+remain separate logical streams over the shared `SyncEngine` and RPC WebSocket, but their count is bounded by the
+active space budget. `replica.status` is a constant size summary with a space count, total pending count, and counts by
+state. Read individual `space.status` values only for rows the UI displays.
 The explicit Workflow composition persists only reconciliation execution control. Application data stays in the same
 SQLite tables used by the in memory composition.
 
@@ -283,13 +292,30 @@ Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect W
 `layerWorkflow` to bound one execution's exponential retry history. A later local mutation or server wake creates a
 new generation after a terminal failure. `SqlReplica.layer` remains the explicit lightweight in memory choice.
 
+The production composition benchmark compares eager runtimes at `e999e1c` with inactive remembered spaces. It seeds
+the same durable memberships, measures the median of three cold Replica restores, and runs full V8 garbage collection
+before each retained heap sample:
+
+| Spaces | Eager fibers | Lazy fibers | Eager watches | Lazy watches | Eager heap MiB | Lazy heap MiB | Eager restore ms | Lazy restore ms |
+| -----: | -----------: | ----------: | ------------: | -----------: | -------------: | ------------: | ---------------: | --------------: |
+|      1 |           11 |           6 |             1 |            0 |           0.28 |          0.13 |            24.17 |           14.59 |
+|     64 |          144 |           6 |            64 |            0 |           3.04 |          0.49 |           371.21 |           27.90 |
+|    256 |          528 |           6 |           256 |            0 |           9.63 |          0.49 |         1,031.43 |           32.45 |
+|  1,000 |        2,016 |           6 |         1,000 |            0 |          34.73 |          0.17 |         4,090.48 |           98.84 |
+
+```sh
+for spaces in 1 64 256 1000; do
+  EFFECT_LOCAL_BENCH_SPACES=$spaces pnpm bench packages/local-sql/bench/ReplicaScale.bench.ts
+done
+```
+
 ## Replication scope and read authorization
 
-`scope` is the replication subscription for the replica. It applies to every joined space. A scope names fully
-replicated models and, separately, windowed models. An empty scope is valid. When a replica starts with a changed
-configured scope, it advances a durable scope generation. Widening backfills newly selected entities through ordinary
-pull pages. Narrowing sends `Retract` changes so excluded entities disappear locally without replacing the database or
-doing a full bootstrap.
+A replication scope belongs to one remembered space. `defaultScope` initializes only a newly joined membership.
+`space.scope` reads the durable value and `space.setScope(next)` changes only that space. An empty scope is valid.
+Changing scope advances its durable generation, restarts its active watch, and schedules foreground reconciliation.
+Widening backfills newly selected entities through ordinary pull pages. Narrowing sends `Retract` changes so excluded
+entities disappear locally without replacing the database or doing a full bootstrap.
 
 A window bounds a model to the newest `count` entities per partition of one of its secondary indexes, ordered by the
 index sort descending. Per-partition overrides raise the count or add a leading-sort-component range, which is how a
@@ -441,6 +467,11 @@ export const putTaskAtom = graph.mutation(spaceId, PutTask)
 export const pendingTasksAtom = graph.pendingFor(spaceId, PutTask)
 export const taskSettlementsAtom = graph.settlementsFor(spaceId, PutTask)
 export const spaceStatusAtom = graph.status(spaceId)
+export const spaceScopeAtom = graph.scope(spaceId)
+export const setSpaceScopeAtom = graph.setScope(spaceId)
+export const activationAtom = graph.activation(spaceId)
+export const activateAtom = graph.activate(spaceId)
+export const deactivateAtom = graph.deactivate(spaceId)
 export const replicaStatusAtom = graph.aggregateStatus
 export const spacesAtom = graph.spaces
 export const joinAtom = graph.join
@@ -450,9 +481,10 @@ export const leaveAtom = graph.leave
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
 atoms register exact space addressed keys. Query atoms also retain the entity keys and index ranges their handler
 actually read. Local commits and reconciliation batches refresh only affected mounted reads. Mutation, pending,
-receipt, and status atoms also require a space address. A settlement atom resolves to the lazy live Stream. Mounting
+receipt, scope, activation, and status atoms also require a space address. A settlement atom resolves to the lazy live Stream. Mounting
 the atom does not consume or replay events. Materializing that Stream owns one scoped subscription. The membership and
-aggregate atoms share the same runtime. Mutation atoms are concurrent and preserve their typed result. Pass an
+aggregate atoms use separate keys, so a write does not rebuild the membership list or unrelated statuses. Mutation
+and lifecycle command atoms are concurrent and preserve their typed result. Pass an
 application factory with `options.factory` when the application already owns a deliberate custom runtime.
 
 ## Selective field semantics

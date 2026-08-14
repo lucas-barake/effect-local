@@ -72,7 +72,10 @@ const layerRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(layerS
 
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } as const
 const clientHistory = {
+  defaultScope: Protocol.ReplicationScope.make({ models: [Todo.name] }),
   scope: Protocol.ReplicationScope.make({ models: [Todo.name] }),
+  maximumActiveSpaces: 4,
+  foregroundActiveSpaces: 2,
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,

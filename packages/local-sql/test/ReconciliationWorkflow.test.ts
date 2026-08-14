@@ -71,7 +71,10 @@ const migration = {
   maximumAttempts: 8
 } satisfies { readonly retryDelay: Duration.Input; readonly maximumAttempts: number }
 const clientHistory = {
+  defaultScope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
   scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
+  maximumActiveSpaces: 4,
+  foregroundActiveSpaces: 2,
   retainedReceipts: 256,
   settlementCapacity: 64,
   maximumReceipts: 10_000,
@@ -295,6 +298,7 @@ describe("reconciliation workflow", () => {
       const context = yield* Layer.build(layerReplica)
       const replica = Context.get(context, Replica.Replica)
       const space = yield* replica.space(spaceId)
+      yield* space.activate
       yield* Deferred.await(pullEntered)
       yield* space.mutate(Domain.PutTodo, Domain.todo("next-generation"))
 
@@ -302,6 +306,62 @@ describe("reconciliation workflow", () => {
 
       assert.isTrue(yield* Deferred.isDone(pullInterrupted))
     })
+  )
+
+  it.effect(
+    "lets an active workflow turn finish when its foreground runtime is deactivated",
+    Effect.fnUntraced(function*() {
+      const pullEntered = yield* Deferred.make<void>()
+      const releasePull = yield* Deferred.make<void>()
+      const pullInterrupted = yield* Deferred.make<void>()
+      const activeWatches = yield* Ref.make(0)
+      const layerBlockedSync = pipe(
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
+          discard: () => Effect.die("unexpected discard"),
+          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          pull: () =>
+            Deferred.succeed(pullEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releasePull)),
+              Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable())),
+              Effect.onInterrupt(() => Deferred.succeed(pullInterrupted, undefined))
+            ),
+          bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          watch: () =>
+            Effect.acquireRelease(
+              Ref.update(activeWatches, (count) => count + 1).pipe(Effect.as(Stream.never)),
+              () => Ref.update(activeWatches, (count) => count - 1)
+            ).pipe(Stream.unwrap)
+        }),
+        Layer.succeed(SyncEngine.SyncEngine)
+      )
+      const layerReplica = SqlReplica.layerWorkflow({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId,
+        retryDelay: "1 hour",
+        maximumRetryDelay: "1 hour"
+      }).pipe(
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(database()),
+        Layer.provide(layerBlockedSync),
+        Layer.provideMerge(WorkflowEngine.layerMemory)
+      )
+      const context = yield* Layer.build(layerReplica)
+      const replica = Context.get(context, Replica.Replica)
+      const space = yield* replica.space(spaceId)
+      yield* space.activate
+      yield* Deferred.await(pullEntered)
+      assert.strictEqual(yield* Ref.get(activeWatches), 1)
+
+      const deactivation = yield* Effect.forkChild(space.deactivate, { startImmediately: true })
+      yield* Effect.yieldNow
+      assert.isFalse(yield* Deferred.isDone(pullInterrupted))
+      yield* Deferred.succeed(releasePull, undefined)
+      yield* Fiber.join(deactivation)
+      assert.strictEqual(yield* Ref.get(activeWatches), 0)
+    }, Effect.scoped)
   )
 
   it.effect(
@@ -350,6 +410,7 @@ describe("reconciliation workflow", () => {
       )
       const context = yield* Layer.build(layerReplica)
       const space = yield* Context.get(context, Replica.Replica).space(spaceId)
+      yield* space.activate
       yield* Deferred.await(watchSubscribed)
       yield* Deferred.await(credentialWaitStarted)
       assert.strictEqual((yield* space.status)._tag, "NeedsAuthentication")
@@ -440,6 +501,7 @@ describe("reconciliation workflow", () => {
       )
       const context = yield* Layer.merge(layerReplica, layerReplicaDatabase).pipe(Layer.build)
       const space = yield* Context.get(context, Replica.Replica).space(spaceId)
+      yield* space.activate
       const reactivity = Context.get(context, Reactivity.Reactivity)
       const online = yield* reactivity.stream([`effect-local:space:${spaceId}:status`], space.status).pipe(
         Stream.filter((status) => status._tag === "Online"),
@@ -502,7 +564,10 @@ describe("reconciliation workflow", () => {
       const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
 
-      const layerRunner = SingleRunner.layer({ runnerStorage: "sql" }).pipe(
+      const layerRunner = SingleRunner.layer({
+        runnerStorage: "sql",
+        shardingConfig: { entityTerminationTimeout: 0 }
+      }).pipe(
         Layer.provide(database())
       )
       const layerWorkflowEngine = ClusterWorkflowEngine.layer.pipe(

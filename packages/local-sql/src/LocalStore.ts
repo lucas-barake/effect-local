@@ -1084,16 +1084,16 @@ export const layer = (
           points: boundedPoints,
           broadModels: new Set(boundedBroadModels)
         })
-        const spaceKey = `effect-local:space:${options.spaceId}`
         const keys = [
           ...entityKeys,
-          ...Array.from(new Set(receiptIds), (mutationId) => `${spaceKey}:receipt:${mutationId}`),
-          ...queryKeys,
-          `${spaceKey}:status`,
-          "effect-local:status"
+          ...Array.from(new Set(receiptIds), (mutationId) => ReactivityKey.receipt(options.spaceId, mutationId)),
+          ...queryKeys
         ]
         if (pendingChanged) {
-          keys.push(ReactivityKey.pending(options.spaceId))
+          keys.push(
+            ReactivityKey.pending(options.spaceId),
+            ReactivityKey.status(options.spaceId)
+          )
         }
         return Array.from(new Set(keys))
       })
@@ -1923,7 +1923,13 @@ export const layer = (
       ) {
         const deletedSettlements = yield* deleteSettledPending(prepared.settlements)
         let keys = prepared.invalidationKeys
-        if (deletedSettlements.length > 0) keys = [...keys, ReactivityKey.pending(options.spaceId)]
+        if (deletedSettlements.length > 0) {
+          keys = [
+            ...keys,
+            ReactivityKey.pending(options.spaceId),
+            ReactivityKey.status(options.spaceId)
+          ]
+        }
         if (keys.length > 0) {
           const uniqueKeys = Array.from(new Set(keys))
           yield* reactivity.withBatch(reactivity.invalidate(uniqueKeys))
@@ -3267,10 +3273,7 @@ export const layer = (
         prepareBootstrap,
         stageBootstrapPage,
         installBootstrap,
-        invalidateStatus: reactivity.invalidate([
-          `effect-local:space:${options.spaceId}:status`,
-          "effect-local:status"
-        ])
+        invalidateStatus: reactivity.invalidate([ReactivityKey.status(options.spaceId)])
       }
       return Store.of(service)
     })

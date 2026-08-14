@@ -5,7 +5,9 @@ Schema defined domain and protocol primitives for Effect Local.
 Define models with `Model.make`, mutations with `Mutation.make`, queries with `Query.make`, and collect them with
 `Definition.make`. Mutation and query handlers use Effect Layers and a constrained transaction capability. The package
 also exports stable identities, accepted, rejected, and expired terminal receipts, immutable snapshot and bootstrap
-contracts, tagged `ReplicaError` failures, replica status, canonical encoding, and opt in `Field.Semantics`.
+contracts, tagged `ReplicaError` failures, replica status, canonical encoding, and opt in `Field.Semantics`. A public
+`Replica.Space` addresses data, pending work, receipts, replication scope, activation, and status for one durable
+membership. Root aggregate status is a constant size count summary rather than a list of every space status.
 
 `Model.make` accepts local secondary index declarations with ordered partition and sort components. The typed
 `Transaction.Query.from` builder exposes index checked bounds, ordering, limits, opaque keyset cursors, pages, and
