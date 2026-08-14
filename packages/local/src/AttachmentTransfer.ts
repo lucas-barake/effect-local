@@ -21,6 +21,11 @@ export const GrantId = OpaqueId.pipe(
 )
 export type GrantId = typeof GrantId.Type
 
+export const ObjectVersion = OpaqueId.pipe(
+  Schema.brand("@lucas-barake/effect-local/AttachmentObjectVersion")
+)
+export type ObjectVersion = typeof ObjectVersion.Type
+
 export const GrantUrl = Schema.NonEmptyString.check(Schema.isMaxLength(maximumGrantUrlLength)).pipe(
   Schema.brand("@lucas-barake/effect-local/AttachmentGrantUrl")
 )
@@ -128,6 +133,7 @@ export type VerifiedChunk = typeof VerifiedChunk.Type
 const DownloadGrantFields = Schema.Struct({
   _tag: Schema.tag("DownloadGrant"),
   grantId: GrantId,
+  objectVersion: ObjectVersion,
   expiresAt: ExpiresAt,
   chunk: VerifiedChunk,
   slice: Schema.Struct({

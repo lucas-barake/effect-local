@@ -91,6 +91,7 @@ describe("attachment transfer protocol", () => {
       const decoded = yield* Schema.decodeUnknownEffect(AttachmentTransfer.DownloadGrant)({
         _tag: "DownloadGrant",
         grantId: "grant-1",
+        objectVersion: "object-version-1",
         expiresAt: 1_900_000_000_000,
         chunk: {
           index: 2,
@@ -106,7 +107,27 @@ describe("attachment transfer protocol", () => {
         }
       })
       assert.strictEqual(decoded.chunk.digest, digest)
+      assert.strictEqual(decoded.objectVersion, "object-version-1")
       assert.deepStrictEqual(decoded.slice, { offset: 1, length: 3 })
+    })
+  )
+
+  it.effect(
+    "requires the immutable object version that fences a cached chunk",
+    Effect.fnUntraced(function*() {
+      const result = yield* Schema.decodeUnknownEffect(AttachmentTransfer.DownloadGrant)({
+        _tag: "DownloadGrant",
+        grantId: "grant-1",
+        expiresAt: 1_900_000_000_000,
+        chunk: { index: 0, offset: 0, bytes: 5, digest },
+        slice: { offset: 0, length: 5 },
+        request: {
+          method: "GET",
+          url: "https://cdn.example/object?signature=secret",
+          headers: []
+        }
+      }).pipe(Effect.result)
+      assert.isTrue(Result.isFailure(result))
     })
   )
 })
