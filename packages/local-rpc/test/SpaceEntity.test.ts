@@ -108,7 +108,7 @@ const handlerOptions = {
   admissionMailboxCapacity: 32,
   readMailboxCapacity: 32,
   watchMailboxCapacity: 32,
-  ephemeralMailboxCapacity: 32,
+  ephemeralCommandMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 4,
   maximumConcurrentBootstrapPagesPerSpace: 1,
   maximumConcurrentEphemeralRequestsPerSpace: 4
@@ -157,7 +157,7 @@ describe("SpaceEntity", () => {
       const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerEntityHandlers)
       const makeWatchClient = yield* Entity.makeTestClient(SpaceEntity.SpaceWatchEntity, layerEntityHandlers)
       const makeEphemeralClient = yield* Entity.makeTestClient(
-        SpaceEntity.SpaceEphemeralEntity,
+        SpaceEntity.SpaceEphemeralJoinEntity,
         layerEntityHandlers
       )
       const admissionClient = yield* makeAdmissionClient(spaceA)
@@ -269,6 +269,65 @@ describe("SpaceEntity", () => {
       Effect.provide(NodeCrypto.layer)
     ))
 
+  it.effect("keeps ephemeral commands available while a joined stream is active", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const actualEphemeral = yield* Layer.build(
+        EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 8 })
+      ).pipe(Effect.map(Context.get(EphemeralHub.EphemeralHub)))
+      const layerEntityHandlers = SpaceEntity.layerHandlers({
+        ...handlerOptions,
+        ephemeralCommandMailboxCapacity: 1
+      }).pipe(
+        Layer.provide(layerAssertionVerifier),
+        Layer.provide(layerStore),
+        Layer.provide(Layer.succeed(EphemeralHub.EphemeralHub, actualEphemeral))
+      )
+      const makeJoinClient = yield* Entity.makeTestClient(
+        SpaceEntity.SpaceEphemeralJoinEntity,
+        layerEntityHandlers
+      )
+      const makeCommandClient = yield* Entity.makeTestClient(
+        SpaceEntity.SpaceEphemeralCommandEntity,
+        layerEntityHandlers
+      )
+      const joinClient = yield* makeJoinClient(spaceA)
+      const commandClient = yield* makeCommandClient(spaceA)
+      const session = yield* Deferred.make<Protocol.EphemeralSessionStarted>()
+      const event = yield* Deferred.make<Protocol.EphemeralEvent>()
+      const assertion = yield* assertionOf(null)
+      const joined = yield* joinClient.JoinEphemeral({
+        request: { spaceId: spaceA, member, value: null, ttlMillis: 5_000 },
+        assertion
+      }).pipe(
+        Stream.tap((message) => {
+          if (message._tag === "SessionStarted") return Deferred.succeed(session, message)
+          if (message._tag === "Event") return Deferred.succeed(event, message)
+          return Effect.void
+        }),
+        Stream.runDrain,
+        Effect.forkChild({ startImmediately: true })
+      )
+      const accepted = yield* Deferred.await(session)
+      const publishAssertion = yield* assertionOf(null)
+      yield* commandClient.PublishEphemeral({
+        request: {
+          _tag: "Event",
+          spaceId: spaceA,
+          member,
+          channel: "typing",
+          value: true,
+          ttlMillis: 1_000
+        },
+        sessionToken: accepted.sessionToken,
+        assertion: publishAssertion
+      })
+      assert.strictEqual((yield* Deferred.await(event)).entry.value, true)
+      yield* Fiber.interrupt(joined)
+    })).pipe(
+      Effect.provide(layerShardingConfig),
+      Effect.provide(NodeCrypto.layer)
+    ))
+
   it.effect(
     "rejects payloads addressed through a different space owner",
     Effect.fnUntraced(
@@ -281,7 +340,7 @@ describe("SpaceEntity", () => {
         const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, layerEntityHandlers)
         const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerEntityHandlers)
         const makeEphemeralClient = yield* Entity.makeTestClient(
-          SpaceEntity.SpaceEphemeralEntity,
+          SpaceEntity.SpaceEphemeralCommandEntity,
           layerEntityHandlers
         )
         const admissionClient = yield* makeAdmissionClient(spaceA)
@@ -347,6 +406,9 @@ describe("SpaceEntity", () => {
             value: null,
             ttlMillis: 5_000
           },
+          sessionToken: Identity.EphemeralSessionToken.make(
+            "eps_00000000-0000-4000-8000-000000000001"
+          ),
           assertion: ephemeralAssertion
         }).pipe(Effect.result)
         if (!Result.isFailure(ephemeralResult)) assert.fail("expected ephemeral protocol failure")

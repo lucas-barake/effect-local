@@ -16,6 +16,7 @@ import * as Entity from "effect/unstable/cluster/Entity"
 import type * as Sharding from "effect/unstable/cluster/Sharding"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as EphemeralHub from "./EphemeralHub.js"
+import { capacityExceeded, invalidConfiguration } from "./internal/errors.js"
 import * as PrincipalAssertion from "./PrincipalAssertion.js"
 
 const volatileAnnotations = Context.make(ClusterSchema.Persisted, false).pipe(
@@ -71,7 +72,7 @@ export class JoinEphemeral extends Rpc.make("JoinEphemeral", {
     request: Protocol.EphemeralJoinRequest,
     assertion: PrincipalAssertion.PrincipalAssertion
   },
-  success: Protocol.EphemeralMessage,
+  success: Protocol.EphemeralJoinMessage,
   error: ReplicaError.ReplicaError,
   stream: true
 }).annotateMerge(volatileAnnotations) {}
@@ -79,6 +80,7 @@ export class JoinEphemeral extends Rpc.make("JoinEphemeral", {
 export class PublishEphemeral extends Rpc.make("PublishEphemeral", {
   payload: {
     request: Protocol.EphemeralPublishRequest,
+    sessionToken: Identity.EphemeralSessionToken,
     assertion: PrincipalAssertion.PrincipalAssertion
   },
   error: ReplicaError.ReplicaError
@@ -87,6 +89,7 @@ export class PublishEphemeral extends Rpc.make("PublishEphemeral", {
 export class HeartbeatEphemeral extends Rpc.make("HeartbeatEphemeral", {
   payload: {
     request: Protocol.EphemeralHeartbeatRequest,
+    sessionToken: Identity.EphemeralSessionToken,
     assertion: PrincipalAssertion.PrincipalAssertion
   },
   error: ReplicaError.ReplicaError
@@ -104,8 +107,11 @@ export const SpaceReadEntity = Entity.make("EffectLocal/SpaceRead", [
 
 export const SpaceWatchEntity = Entity.make("EffectLocal/SpaceWatch", [Watch])
 
-export const SpaceEphemeralEntity = Entity.make("EffectLocal/SpaceEphemeral", [
-  JoinEphemeral,
+export const SpaceEphemeralJoinEntity = Entity.make("EffectLocal/SpaceEphemeralJoin", [
+  JoinEphemeral
+])
+
+export const SpaceEphemeralCommandEntity = Entity.make("EffectLocal/SpaceEphemeralCommand", [
   PublishEphemeral,
   HeartbeatEphemeral
 ])
@@ -140,15 +146,17 @@ export interface ClientService {
     spaceId: Identity.SpaceId,
     request: Protocol.EphemeralJoinRequest,
     assertion: PrincipalAssertion.PrincipalAssertion
-  ) => Stream.Stream<Protocol.EphemeralMessage, ReplicaError.ReplicaError>
+  ) => Stream.Stream<Protocol.EphemeralJoinMessage, ReplicaError.ReplicaError>
   readonly publishEphemeral: (
     spaceId: Identity.SpaceId,
     request: Protocol.EphemeralPublishRequest,
+    sessionToken: Identity.EphemeralSessionToken,
     assertion: PrincipalAssertion.PrincipalAssertion
   ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly heartbeatEphemeral: (
     spaceId: Identity.SpaceId,
     request: Protocol.EphemeralHeartbeatRequest,
+    sessionToken: Identity.EphemeralSessionToken,
     assertion: PrincipalAssertion.PrincipalAssertion
   ) => Effect.Effect<void, ReplicaError.ReplicaError>
 }
@@ -161,7 +169,8 @@ const mapClient = (
   makeAdmissionClient: Effect.Success<typeof SpaceAdmissionEntity.client>,
   makeReadClient: Effect.Success<typeof SpaceReadEntity.client>,
   makeWatchClient: Effect.Success<typeof SpaceWatchEntity.client>,
-  makeEphemeralClient: Effect.Success<typeof SpaceEphemeralEntity.client>
+  makeEphemeralJoinClient: Effect.Success<typeof SpaceEphemeralJoinEntity.client>,
+  makeEphemeralCommandClient: Effect.Success<typeof SpaceEphemeralCommandEntity.client>
 ): ClientService => ({
   submit: (spaceId, request, assertion) =>
     makeAdmissionClient(spaceId).Submit({ request, assertion }).pipe(
@@ -204,23 +213,23 @@ const mapClient = (
       })
     ),
   joinEphemeral: (spaceId, request, assertion) =>
-    makeEphemeralClient(spaceId).JoinEphemeral({ request, assertion }).pipe(
+    makeEphemeralJoinClient(spaceId).JoinEphemeral({ request, assertion }).pipe(
       Stream.catchTags({
         MailboxFull: () => Stream.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Stream.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Stream.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
-  publishEphemeral: (spaceId, request, assertion) =>
-    makeEphemeralClient(spaceId).PublishEphemeral({ request, assertion }).pipe(
+  publishEphemeral: (spaceId, request, sessionToken, assertion) =>
+    makeEphemeralCommandClient(spaceId).PublishEphemeral({ request, sessionToken, assertion }).pipe(
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
-  heartbeatEphemeral: (spaceId, request, assertion) =>
-    makeEphemeralClient(spaceId).HeartbeatEphemeral({ request, assertion }).pipe(
+  heartbeatEphemeral: (spaceId, request, sessionToken, assertion) =>
+    makeEphemeralCommandClient(spaceId).HeartbeatEphemeral({ request, sessionToken, assertion }).pipe(
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -233,7 +242,7 @@ export interface HandlerOptions {
   readonly admissionMailboxCapacity: number
   readonly readMailboxCapacity: number
   readonly watchMailboxCapacity: number
-  readonly ephemeralMailboxCapacity: number
+  readonly ephemeralCommandMailboxCapacity: number
   readonly maximumConcurrentBootstrapAuthorizations: number
   readonly maximumConcurrentBootstrapPagesPerSpace: number
   readonly maximumConcurrentEphemeralRequestsPerSpace: number
@@ -254,58 +263,58 @@ export const layerHandlers = (options: HandlerOptions) =>
   Layer.unwrap(
     Effect.gen(function*() {
       if (!Number.isSafeInteger(options.admissionMailboxCapacity) || options.admissionMailboxCapacity <= 0) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "admissionMailboxCapacity",
-          message: "admissionMailboxCapacity must be a positive safe integer"
-        })
+        return yield* invalidConfiguration(
+          "admissionMailboxCapacity",
+          "admissionMailboxCapacity must be a positive safe integer"
+        )
       }
       if (!Number.isSafeInteger(options.readMailboxCapacity) || options.readMailboxCapacity <= 0) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "readMailboxCapacity",
-          message: "readMailboxCapacity must be a positive safe integer"
-        })
+        return yield* invalidConfiguration(
+          "readMailboxCapacity",
+          "readMailboxCapacity must be a positive safe integer"
+        )
       }
       if (!Number.isSafeInteger(options.watchMailboxCapacity) || options.watchMailboxCapacity <= 0) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "watchMailboxCapacity",
-          message: "watchMailboxCapacity must be a positive safe integer"
-        })
+        return yield* invalidConfiguration(
+          "watchMailboxCapacity",
+          "watchMailboxCapacity must be a positive safe integer"
+        )
       }
       if (
-        !Number.isSafeInteger(options.ephemeralMailboxCapacity) ||
-        options.ephemeralMailboxCapacity <= 0
+        !Number.isSafeInteger(options.ephemeralCommandMailboxCapacity) ||
+        options.ephemeralCommandMailboxCapacity <= 0
       ) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "ephemeralMailboxCapacity",
-          message: "ephemeralMailboxCapacity must be a positive safe integer"
-        })
+        return yield* invalidConfiguration(
+          "ephemeralCommandMailboxCapacity",
+          "ephemeralCommandMailboxCapacity must be a positive safe integer"
+        )
       }
       if (
         !Number.isSafeInteger(options.maximumConcurrentBootstrapAuthorizations) ||
         options.maximumConcurrentBootstrapAuthorizations <= 0
       ) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "maximumConcurrentBootstrapAuthorizations",
-          message: "maximumConcurrentBootstrapAuthorizations must be a positive safe integer"
-        })
+        return yield* invalidConfiguration(
+          "maximumConcurrentBootstrapAuthorizations",
+          "maximumConcurrentBootstrapAuthorizations must be a positive safe integer"
+        )
       }
       if (
         !Number.isSafeInteger(options.maximumConcurrentBootstrapPagesPerSpace) ||
         options.maximumConcurrentBootstrapPagesPerSpace <= 0
       ) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "maximumConcurrentBootstrapPagesPerSpace",
-          message: "maximumConcurrentBootstrapPagesPerSpace must be a positive safe integer"
-        })
+        return yield* invalidConfiguration(
+          "maximumConcurrentBootstrapPagesPerSpace",
+          "maximumConcurrentBootstrapPagesPerSpace must be a positive safe integer"
+        )
       }
       if (
         !Number.isSafeInteger(options.maximumConcurrentEphemeralRequestsPerSpace) ||
         options.maximumConcurrentEphemeralRequestsPerSpace <= 0
       ) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "maximumConcurrentEphemeralRequestsPerSpace",
-          message: "maximumConcurrentEphemeralRequestsPerSpace must be a positive safe integer"
-        })
+        return yield* invalidConfiguration(
+          "maximumConcurrentEphemeralRequestsPerSpace",
+          "maximumConcurrentEphemeralRequestsPerSpace must be a positive safe integer"
+        )
       }
 
       const common = commonHandlerOptions(options)
@@ -381,10 +390,10 @@ export const layerHandlers = (options: HandlerOptions) =>
                     )
                   )
                   if (Option.isNone(prepared)) {
-                    return yield* new ReplicaError.CapacityExceeded({
-                      resource: "bootstrap authorizations",
-                      limit: options.maximumConcurrentBootstrapAuthorizations
-                    })
+                    return yield* capacityExceeded(
+                      "bootstrap authorizations",
+                      options.maximumConcurrentBootstrapAuthorizations
+                    )
                   }
                   const result = yield* Semaphore.withPermitsIfAvailable(
                     bootstrapPages,
@@ -392,10 +401,10 @@ export const layerHandlers = (options: HandlerOptions) =>
                     prepared.value
                   )
                   if (Option.isSome(result)) return result.value
-                  return yield* new ReplicaError.CapacityExceeded({
-                    resource: "bootstrap pages",
-                    limit: options.maximumConcurrentBootstrapPagesPerSpace
-                  })
+                  return yield* capacityExceeded(
+                    "bootstrap pages",
+                    options.maximumConcurrentBootstrapPagesPerSpace
+                  )
                 })
               )
           })
@@ -429,60 +438,105 @@ export const layerHandlers = (options: HandlerOptions) =>
         { ...common, concurrency: 1, mailboxCapacity: options.watchMailboxCapacity }
       )
 
-      const layerEphemeralHandlers = SpaceEphemeralEntity.toLayer(
-        Effect.gen(function*() {
-          const address = yield* Entity.CurrentAddress
-          const ephemeral = yield* EphemeralHub.EphemeralHub
-          const verifier = yield* PrincipalAssertion.Verifier
-          let spaceId: Identity.SpaceId | undefined
-          if (Schema.is(Identity.SpaceId)(address.entityId)) spaceId = address.entityId
+      const ephemeralHandlers = Effect.gen(function*() {
+        const address = yield* Entity.CurrentAddress
+        const ephemeral = yield* EphemeralHub.EphemeralHub
+        const verifier = yield* PrincipalAssertion.Verifier
+        let spaceId: Identity.SpaceId | undefined
+        if (Schema.is(Identity.SpaceId)(address.entityId)) spaceId = address.entityId
 
-          const routed = (request: { readonly spaceId: Identity.SpaceId }) =>
-            spaceId !== undefined && request.spaceId === spaceId
+        const routed = (request: { readonly spaceId: Identity.SpaceId }) =>
+          spaceId !== undefined && request.spaceId === spaceId
 
-          return SpaceEphemeralEntity.of({
-            JoinEphemeral: ({ payload }) => {
+        return {
+          JoinEphemeral: ({ payload }: {
+            readonly payload: {
+              readonly request: Protocol.EphemeralJoinRequest
+              readonly assertion: PrincipalAssertion.PrincipalAssertion
+            }
+          }) => {
+            if (!routed(payload.request)) {
+              return Rpc.fork(
+                Stream.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
+                )
+              )
+            }
+            return Rpc.fork(Stream.unwrap(
+              verifier.verify(payload.assertion).pipe(
+                Effect.map((principal) => ephemeral.join(payload.request, principal))
+              )
+            ))
+          },
+          PublishEphemeral: ({ payload }: {
+            readonly payload: {
+              readonly request: Protocol.EphemeralPublishRequest
+              readonly sessionToken: Identity.EphemeralSessionToken
+              readonly assertion: PrincipalAssertion.PrincipalAssertion
+            }
+          }) =>
+            Effect.suspend(() => {
               if (!routed(payload.request)) {
-                return Rpc.fork(
-                  Stream.fail(
-                    new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
-                  )
+                return Effect.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
                 )
               }
-              return Rpc.fork(Stream.unwrap(
-                verifier.verify(payload.assertion).pipe(
-                  Effect.map((principal) => ephemeral.join(payload.request, principal))
-                )
-              ))
-            },
-            PublishEphemeral: ({ payload }) =>
-              Effect.suspend(() => {
-                if (!routed(payload.request)) {
-                  return Effect.fail(
-                    new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
+              return verifier.verify(payload.assertion).pipe(
+                Effect.flatMap((principal) =>
+                  ephemeral.publish(
+                    payload.request,
+                    payload.sessionToken,
+                    principal
                   )
-                }
-                return verifier.verify(payload.assertion).pipe(
-                  Effect.flatMap((principal) => ephemeral.publish(payload.request, principal))
                 )
-              }),
-            HeartbeatEphemeral: ({ payload }) =>
-              Effect.suspend(() => {
-                if (!routed(payload.request)) {
-                  return Effect.fail(
-                    new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
+              )
+            }),
+          HeartbeatEphemeral: ({ payload }: {
+            readonly payload: {
+              readonly request: Protocol.EphemeralHeartbeatRequest
+              readonly sessionToken: Identity.EphemeralSessionToken
+              readonly assertion: PrincipalAssertion.PrincipalAssertion
+            }
+          }) =>
+            Effect.suspend(() => {
+              if (!routed(payload.request)) {
+                return Effect.fail(
+                  new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
+                )
+              }
+              return verifier.verify(payload.assertion).pipe(
+                Effect.flatMap((principal) =>
+                  ephemeral.heartbeat(
+                    payload.request,
+                    payload.sessionToken,
+                    principal
                   )
-                }
-                return verifier.verify(payload.assertion).pipe(
-                  Effect.flatMap((principal) => ephemeral.heartbeat(payload.request, principal))
                 )
-              })
+              )
+            })
+        }
+      })
+
+      const layerEphemeralJoinHandlers = SpaceEphemeralJoinEntity.toLayer(
+        ephemeralHandlers.pipe(Effect.map((handlers) =>
+          SpaceEphemeralJoinEntity.of({
+            JoinEphemeral: handlers.JoinEphemeral
           })
-        }),
+        )),
+        { ...common, concurrency: 1, mailboxCapacity: "unbounded" }
+      )
+
+      const layerEphemeralCommandHandlers = SpaceEphemeralCommandEntity.toLayer(
+        ephemeralHandlers.pipe(Effect.map((handlers) =>
+          SpaceEphemeralCommandEntity.of({
+            PublishEphemeral: handlers.PublishEphemeral,
+            HeartbeatEphemeral: handlers.HeartbeatEphemeral
+          })
+        )),
         {
           ...common,
           concurrency: options.maximumConcurrentEphemeralRequestsPerSpace,
-          mailboxCapacity: options.ephemeralMailboxCapacity
+          mailboxCapacity: options.ephemeralCommandMailboxCapacity
         }
       )
 
@@ -490,7 +544,8 @@ export const layerHandlers = (options: HandlerOptions) =>
         layerAdmissionHandlers,
         layerReadHandlers,
         layerWatchHandlers,
-        layerEphemeralHandlers
+        layerEphemeralJoinHandlers,
+        layerEphemeralCommandHandlers
       )
     })
   )
@@ -501,8 +556,9 @@ export const layerClient: Layer.Layer<Client, never, Sharding.Sharding> = Layer.
     const admission = yield* SpaceAdmissionEntity.client
     const read = yield* SpaceReadEntity.client
     const watch = yield* SpaceWatchEntity.client
-    const ephemeral = yield* SpaceEphemeralEntity.client
-    return mapClient(admission, read, watch, ephemeral)
+    const ephemeralJoin = yield* SpaceEphemeralJoinEntity.client
+    const ephemeralCommand = yield* SpaceEphemeralCommandEntity.client
+    return mapClient(admission, read, watch, ephemeralJoin, ephemeralCommand)
   })
 )
 

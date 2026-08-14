@@ -1,10 +1,13 @@
+import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Result from "effect/Result"
 import * as Schedule from "effect/Schedule"
 import * as Stream from "effect/Stream"
 import type * as RpcClient from "effect/unstable/rpc/RpcClient"
@@ -51,106 +54,156 @@ export const layerFromSession = (
       )
       const session = yield* ProtocolSession.ProtocolSession
       const client = session.client
+      interface ActiveSession {
+        readonly owner: object
+        readonly sessionToken: Identity.EphemeralSessionToken
+      }
+      const sessions = new Map<string, ActiveSession>()
+      const sessionKey = (request: Protocol.EphemeralHeartbeatRequest) =>
+        `${request.spaceId}:${request.member.clientId}:${request.member.membershipIncarnation}`
+      const requireSession = (
+        request: Protocol.EphemeralHeartbeatRequest
+      ): Effect.Effect<ActiveSession, ReplicaError.EphemeralSessionUnavailable> => {
+        const active = sessions.get(sessionKey(request))
+        if (active !== undefined) return Effect.succeed(active)
+        return Effect.fail(
+          new ReplicaError.EphemeralSessionUnavailable({
+            spaceId: request.spaceId,
+            clientId: request.member.clientId,
+            membershipIncarnation: request.member.membershipIncarnation
+          })
+        )
+      }
 
       const publish = (request: Protocol.EphemeralPublishRequest) =>
-        ProtocolSessionRetry.run(
-          session,
-          (version) =>
-            client.PublishEphemeral({ request, protocolVersion: version }).pipe(
-              Effect.catchReasons(
-                "RpcClientError",
-                {
-                  WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  HttpError: (reason, error) => {
-                    if (reason.kind === "TransportError") {
-                      return Effect.fail(new ReplicaError.ServerUnavailable())
-                    }
-                    return Effect.fail(
-                      new ReplicaError.ProtocolInvalid({
-                        message: "The PublishEphemeral RPC failed",
-                        cause: error
-                      })
-                    )
-                  },
-                  RpcClientDefect: (_, error) =>
-                    Effect.fail(
-                      new ReplicaError.ProtocolInvalid({
-                        message: "The PublishEphemeral RPC failed",
-                        cause: error
-                      })
-                    )
-                },
-                (_, error) => Effect.die(error)
-              ),
-              Effect.timeoutOrElse({
-                duration: rpcTimeoutMillis,
-                orElse: () =>
-                  Effect.fail(
-                    new ReplicaError.OperationTimeout({
-                      operation: "PublishEphemeral",
-                      timeoutMillis: rpcTimeoutMillis
-                    })
-                  )
-              })
+        requireSession(request).pipe(
+          Effect.flatMap((active) =>
+            ProtocolSessionRetry.run(
+              session,
+              (version) =>
+                client.PublishEphemeral({
+                  request,
+                  sessionToken: active.sessionToken,
+                  protocolVersion: version
+                }).pipe(
+                  Effect.catchReasons(
+                    "RpcClientError",
+                    {
+                      WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      HttpError: (reason, error) => {
+                        if (reason.kind === "TransportError") {
+                          return Effect.fail(new ReplicaError.ServerUnavailable())
+                        }
+                        return Effect.fail(
+                          new ReplicaError.ProtocolInvalid({
+                            message: "The PublishEphemeral RPC failed",
+                            cause: error
+                          })
+                        )
+                      },
+                      RpcClientDefect: (_, error) =>
+                        Effect.fail(
+                          new ReplicaError.ProtocolInvalid({
+                            message: "The PublishEphemeral RPC failed",
+                            cause: error
+                          })
+                        )
+                    },
+                    (_, error) => Effect.die(error)
+                  ),
+                  Effect.timeoutOrElse({
+                    duration: rpcTimeoutMillis,
+                    orElse: () =>
+                      Effect.fail(
+                        new ReplicaError.OperationTimeout({
+                          operation: "PublishEphemeral",
+                          timeoutMillis: rpcTimeoutMillis
+                        })
+                      )
+                  })
+                )
             )
-        ).pipe(Effect.asVoid)
+          ),
+          Effect.asVoid,
+          Effect.withSpan("EphemeralClient.publish", {
+            attributes: {
+              "space.id": request.spaceId,
+              "client.id": request.member.clientId
+            }
+          })
+        )
 
       const heartbeat = (request: Protocol.EphemeralHeartbeatRequest) =>
-        ProtocolSessionRetry.run(
-          session,
-          (version) =>
-            client.HeartbeatEphemeral({ ...request, protocolVersion: version }).pipe(
-              Effect.catchReasons(
-                "RpcClientError",
-                {
-                  WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  HttpError: (reason, error) => {
-                    if (reason.kind === "TransportError") {
-                      return Effect.fail(new ReplicaError.ServerUnavailable())
-                    }
-                    return Effect.fail(
-                      new ReplicaError.ProtocolInvalid({
-                        message: "The HeartbeatEphemeral RPC failed",
-                        cause: error
-                      })
-                    )
-                  },
-                  RpcClientDefect: (_, error) =>
-                    Effect.fail(
-                      new ReplicaError.ProtocolInvalid({
-                        message: "The HeartbeatEphemeral RPC failed",
-                        cause: error
-                      })
-                    )
-                },
-                (_, error) => Effect.die(error)
-              ),
-              Effect.timeoutOrElse({
-                duration: rpcTimeoutMillis,
-                orElse: () =>
-                  Effect.fail(
-                    new ReplicaError.OperationTimeout({
-                      operation: "HeartbeatEphemeral",
-                      timeoutMillis: rpcTimeoutMillis
-                    })
-                  )
-              })
+        requireSession(request).pipe(
+          Effect.flatMap((active) =>
+            ProtocolSessionRetry.run(
+              session,
+              (version) =>
+                client.HeartbeatEphemeral({
+                  ...request,
+                  sessionToken: active.sessionToken,
+                  protocolVersion: version
+                }).pipe(
+                  Effect.catchReasons(
+                    "RpcClientError",
+                    {
+                      WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      HttpError: (reason, error) => {
+                        if (reason.kind === "TransportError") {
+                          return Effect.fail(new ReplicaError.ServerUnavailable())
+                        }
+                        return Effect.fail(
+                          new ReplicaError.ProtocolInvalid({
+                            message: "The HeartbeatEphemeral RPC failed",
+                            cause: error
+                          })
+                        )
+                      },
+                      RpcClientDefect: (_, error) =>
+                        Effect.fail(
+                          new ReplicaError.ProtocolInvalid({
+                            message: "The HeartbeatEphemeral RPC failed",
+                            cause: error
+                          })
+                        )
+                    },
+                    (_, error) => Effect.die(error)
+                  ),
+                  Effect.timeoutOrElse({
+                    duration: rpcTimeoutMillis,
+                    orElse: () =>
+                      Effect.fail(
+                        new ReplicaError.OperationTimeout({
+                          operation: "HeartbeatEphemeral",
+                          timeoutMillis: rpcTimeoutMillis
+                        })
+                      )
+                  })
+                )
             )
-        ).pipe(Effect.asVoid)
+          ),
+          Effect.asVoid,
+          Effect.withSpan("EphemeralClient.heartbeat", {
+            attributes: {
+              "space.id": request.spaceId,
+              "client.id": request.member.clientId
+            }
+          })
+        )
 
       return EphemeralClient.of({
         publish,
@@ -160,6 +213,8 @@ export const layerFromSession = (
             session,
             (version) =>
               Stream.unwrap(Effect.gen(function*() {
+                const owner = {}
+                const started = yield* Deferred.make<Protocol.EphemeralSessionStarted>()
                 const acquisition = yield* client.JoinEphemeral(
                   { ...request, protocolVersion: version },
                   { asQueue: true }
@@ -211,13 +266,35 @@ export const layerFromSession = (
                     (_, error) => Stream.die(error)
                   )
                 )
-                const requestedInterval = Math.floor(request.ttlMillis / 2)
-                const interval = Math.max(1, Math.min(heartbeatIntervalMillis, requestedInterval))
-                const heartbeatLoop = Effect.sleep(interval).pipe(
-                  Effect.andThen(heartbeat({ spaceId: request.spaceId, member: request.member })),
-                  Effect.forever
+                const visible = messages.pipe(
+                  Stream.tap((message) => {
+                    if (message._tag !== "SessionStarted") return Effect.void
+                    sessions.set(sessionKey(request), { owner, sessionToken: message.sessionToken })
+                    return Deferred.succeed(started, message)
+                  }),
+                  Stream.filterMap((message) => {
+                    if (message._tag === "SessionStarted") return Result.fail(message)
+                    return Result.succeed(message)
+                  })
                 )
-                return messages.pipe(Stream.mergeEffect(heartbeatLoop))
+                const heartbeatLoop = Deferred.await(started).pipe(
+                  Effect.flatMap((accepted) => {
+                    const halfLeaseMillis = Math.floor(accepted.leaseMillis / 2)
+                    const interval = Math.max(1, Math.min(heartbeatIntervalMillis, halfLeaseMillis))
+                    return Effect.sleep(interval).pipe(
+                      Effect.andThen(heartbeat({ spaceId: request.spaceId, member: request.member })),
+                      Effect.forever
+                    )
+                  })
+                )
+                return visible.pipe(
+                  Stream.mergeEffect(heartbeatLoop),
+                  Stream.ensuring(Effect.sync(() => {
+                    if (sessions.get(sessionKey(request))?.owner === owner) {
+                      sessions.delete(sessionKey(request))
+                    }
+                  }))
+                )
               })).pipe(Stream.repeat(Schedule.forever))
           ).pipe(
             Stream.withSpan("EphemeralClient.join", {

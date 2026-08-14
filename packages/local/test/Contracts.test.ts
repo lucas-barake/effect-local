@@ -611,6 +611,7 @@ describe("domain contracts", () => {
           ttlMillis: 1
         }],
         [Protocol.VersionedEphemeralPublishRequest, {
+          sessionToken: "eps_00000000-0000-4000-8000-000000000001",
           request: {
             _tag: "Event",
             spaceId,
@@ -628,7 +629,8 @@ describe("domain contracts", () => {
           member: {
             clientId: envelope.clientId,
             membershipIncarnation: envelope.membershipIncarnation
-          }
+          },
+          sessionToken: "eps_00000000-0000-4000-8000-000000000001"
         }]
       ] as const
 
@@ -641,6 +643,17 @@ describe("domain contracts", () => {
           protocolVersion: Protocol.currentProtocolVersion
         })
       }
+
+      yield* Schema.decodeUnknownEffect(Protocol.EphemeralJoinMessage)({
+        _tag: "SessionStarted",
+        spaceId,
+        member: {
+          clientId: envelope.clientId,
+          membershipIncarnation: envelope.membershipIncarnation
+        },
+        sessionToken: "eps_00000000-0000-4000-8000-000000000001",
+        leaseMillis: 1
+      })
     })
   )
 })

@@ -17,6 +17,7 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
@@ -25,6 +26,8 @@ import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { Atom, AtomRegistry } from "effect/unstable/reactivity"
@@ -202,15 +205,53 @@ const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) 
 
 describe("Replica Atom graph", () => {
   it.effect(
-    "joins ephemera through atoms and applies snapshot replacement and live deltas",
+    "joins ephemera through atoms and applies live deltas",
     Effect.fnUntraced(function*() {
-      const hub = yield* Layer.build(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 16 })).pipe(
+      const hub = yield* Layer.build(
+        EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 16 }).pipe(
+          Layer.provide(NodeCrypto.layer)
+        )
+      ).pipe(
         Effect.map(Context.get(EphemeralHub.EphemeralHub))
       )
+      const sessions = new Map<string, Identity.EphemeralSessionToken>()
+      const sessionKey = (request: Protocol.EphemeralHeartbeatRequest) =>
+        `${request.spaceId}:${request.member.clientId}:${request.member.membershipIncarnation}`
+      const sessionToken = (request: {
+        readonly spaceId: Identity.SpaceId
+        readonly member: Protocol.EphemeralMember
+      }): Effect.Effect<Identity.EphemeralSessionToken, ReplicaError.EphemeralSessionUnavailable> => {
+        const token = sessions.get(sessionKey(request))
+        if (token !== undefined) return Effect.succeed(token)
+        return Effect.fail(
+          new ReplicaError.EphemeralSessionUnavailable({
+            spaceId: request.spaceId,
+            clientId: request.member.clientId,
+            membershipIncarnation: request.member.membershipIncarnation
+          })
+        )
+      }
       const client = EphemeralClient.EphemeralClient.of({
-        join: (request) => hub.join(request, null),
-        publish: (request) => hub.publish(request, null),
-        heartbeat: (request) => hub.heartbeat(request, null)
+        join: (request) =>
+          hub.join(request, null).pipe(
+            Stream.tap((message) => {
+              if (message._tag !== "SessionStarted") return Effect.void
+              sessions.set(sessionKey(request), message.sessionToken)
+              return Effect.void
+            }),
+            Stream.filterMap((message) => {
+              if (message._tag === "SessionStarted") return Result.fail(message)
+              return Result.succeed(message)
+            })
+          ),
+        publish: (request) =>
+          sessionToken(request).pipe(
+            Effect.flatMap((token) => hub.publish(request, token, null))
+          ),
+        heartbeat: (request) =>
+          sessionToken(request).pipe(
+            Effect.flatMap((token) => hub.heartbeat(request, token, null))
+          )
       })
       const memberA = Protocol.EphemeralMember.make({
         clientId,
@@ -258,6 +299,7 @@ describe("Replica Atom graph", () => {
         Effect.forkScoped({ startImmediately: true })
       )
       const secondSnapshot = yield* Deferred.make<void>()
+      const secondSession = yield* Deferred.make<Protocol.EphemeralSessionStarted>()
       const second = yield* hub.join({
         spaceId,
         member: memberB,
@@ -265,12 +307,14 @@ describe("Replica Atom graph", () => {
         ttlMillis: 10_000
       }, null).pipe(
         Stream.tap((message) => {
+          if (message._tag === "SessionStarted") return Deferred.succeed(secondSession, message)
           if (message._tag === "Snapshot") return Deferred.succeed(secondSnapshot, undefined)
           return Effect.void
         }),
         Stream.runDrain,
         Effect.forkChild({ startImmediately: true })
       )
+      const acceptedSecondSession = yield* Deferred.await(secondSession)
       yield* Deferred.await(secondSnapshot)
       yield* Fiber.join(memberVisible)
 
@@ -279,14 +323,18 @@ describe("Replica Atom graph", () => {
         Stream.runHead,
         Effect.forkScoped({ startImmediately: true })
       )
-      yield* hub.publish({
-        _tag: "Event",
-        spaceId,
-        member: memberB,
-        channel: "typing",
-        value: { active: true },
-        ttlMillis: 5_000
-      }, null)
+      yield* hub.publish(
+        {
+          _tag: "Event",
+          spaceId,
+          member: memberB,
+          channel: "typing",
+          value: { active: true },
+          ttlMillis: 5_000
+        },
+        acceptedSecondSession.sessionToken,
+        null
+      )
       assert.deepStrictEqual(
         Option.getOrThrow(yield* Fiber.join(eventVisible)).events.map((entry) => entry.value),
         [{ active: true }]
@@ -297,15 +345,19 @@ describe("Replica Atom graph", () => {
         Stream.runHead,
         Effect.forkScoped({ startImmediately: true })
       )
-      yield* hub.publish({
-        _tag: "SetState",
-        spaceId,
-        member: memberB,
-        channel: "read",
-        key: "conversation-1",
-        value: { message: 42 },
-        ttlMillis: 30_000
-      }, null)
+      yield* hub.publish(
+        {
+          _tag: "SetState",
+          spaceId,
+          member: memberB,
+          channel: "read",
+          key: "conversation-1",
+          value: { message: 42 },
+          ttlMillis: 30_000
+        },
+        acceptedSecondSession.sessionToken,
+        null
+      )
       yield* Fiber.join(stateVisible)
 
       const lateView = graph.ephemeral({
@@ -319,11 +371,26 @@ describe("Replica Atom graph", () => {
       const late = yield* AtomRegistry.getResult(registry, lateView)
       assert.deepStrictEqual(late.events, [])
       assert.deepStrictEqual(late.states.map((entry) => entry.value), [{ message: 42 }])
+      const lateSettled = yield* AtomRegistry.toStreamResult(registry, lateView).pipe(
+        Stream.filter((current) => current.states.some((entry) => entry.key === "sentinel")),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* client.publish({
+        _tag: "SetState",
+        spaceId,
+        member: memberA,
+        channel: "read",
+        key: "sentinel",
+        value: true,
+        ttlMillis: 30_000
+      })
+      assert.deepStrictEqual(Option.getOrThrow(yield* Fiber.join(lateSettled)).events, [])
 
       const departed = yield* AtomRegistry.toStreamResult(registry, view).pipe(
         Stream.filter((current) =>
           current.members.every((entry) => entry.member.clientId !== memberB.clientId) &&
-          current.events.length === 0 && current.states.length === 1
+          current.events.length === 0 && current.states.length === 2
         ),
         Stream.runHead,
         Effect.forkScoped({ startImmediately: true })
@@ -331,6 +398,13 @@ describe("Replica Atom graph", () => {
       yield* Fiber.interrupt(second)
       yield* Fiber.join(departed)
 
+      const publishedEventVisible = yield* AtomRegistry.toStreamResult(registry, view).pipe(
+        Stream.filter((current) =>
+          current.events.some((entry) => entry.channel === "typing" && sameMemberForTest(entry.member, memberA))
+        ),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
       registry.set(graph.publishEphemeral, {
         _tag: "Event",
         spaceId,
@@ -340,6 +414,12 @@ describe("Replica Atom graph", () => {
         ttlMillis: 1_000
       })
       yield* AtomRegistry.getResult(registry, graph.publishEphemeral, { suspendOnWaiting: true })
+      assert.deepStrictEqual(
+        Option.getOrThrow(yield* Fiber.join(publishedEventVisible)).events
+          .filter((entry) => sameMemberForTest(entry.member, memberA))
+          .map((entry) => entry.value),
+        [true]
+      )
 
       const atomMemberLeft = yield* Deferred.make<void>()
       const observerReady = yield* Deferred.make<void>()
@@ -363,6 +443,89 @@ describe("Replica Atom graph", () => {
       registry.dispose()
       yield* Deferred.await(atomMemberLeft)
       yield* Fiber.interrupt(observer)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "replaces one mounted ephemeral view when its client resnapshots",
+    Effect.fnUntraced(function*() {
+      const memberA = Protocol.EphemeralMember.make({
+        clientId,
+        membershipIncarnation: Identity.MembershipIncarnation.make(
+          "inc_00000000-0000-4000-8000-000000000001"
+        )
+      })
+      const memberB = Protocol.EphemeralMember.make({
+        clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+        membershipIncarnation: Identity.MembershipIncarnation.make(
+          "inc_00000000-0000-4000-8000-000000000002"
+        )
+      })
+      const messages = yield* Queue.unbounded<Protocol.EphemeralMessage>()
+      yield* Effect.addFinalizer(() => Queue.shutdown(messages))
+      const client = EphemeralClient.EphemeralClient.of({
+        join: () => Stream.fromQueue(messages),
+        publish: () => Effect.void,
+        heartbeat: () => Effect.void
+      })
+      const layerEphemeralClient = Layer.succeed(EphemeralClient.EphemeralClient, client)
+      const graph = BrowserReplica.make(Layer.merge(layerReplica, layerEphemeralClient))
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const view = graph.ephemeral({
+        spaceId,
+        member: memberA,
+        value: null,
+        ttlMillis: 10_000
+      })
+      const unmount = registry.mount(view)
+      yield* Effect.addFinalizer(() => Effect.sync(unmount))
+
+      yield* Queue.offer(
+        messages,
+        Protocol.EphemeralSnapshot.make({
+          spaceId,
+          revision: Identity.EphemeralRevision.make(1),
+          members: [{ member: memberA, value: null, expiresAtMillis: 10_000 }],
+          states: []
+        })
+      )
+      yield* Queue.offer(
+        messages,
+        Protocol.EphemeralEvent.make({
+          spaceId,
+          revision: Identity.EphemeralRevision.make(2),
+          entry: {
+            member: memberA,
+            channel: "typing",
+            value: true,
+            expiresAtMillis: 1_000
+          }
+        })
+      )
+      const withEvent = yield* AtomRegistry.toStreamResult(registry, view).pipe(
+        Stream.filter((current) => current.events.length === 1),
+        Stream.runHead
+      )
+      assert.strictEqual(Option.getOrThrow(withEvent).events.length, 1)
+
+      yield* Queue.offer(
+        messages,
+        Protocol.EphemeralSnapshot.make({
+          spaceId,
+          revision: Identity.EphemeralRevision.make(3),
+          members: [{ member: memberB, value: null, expiresAtMillis: 10_000 }],
+          states: []
+        })
+      )
+      const replaced = yield* AtomRegistry.toStreamResult(registry, view).pipe(
+        Stream.filter((current) => current.revision === 3),
+        Stream.runHead,
+        Effect.map(Option.getOrThrow)
+      )
+      assert.deepStrictEqual(replaced.members.map((entry) => entry.member), [memberB])
+      assert.deepStrictEqual(replaced.events, [])
+      assert.deepStrictEqual(replaced.states, [])
     }, Effect.scoped)
   )
 

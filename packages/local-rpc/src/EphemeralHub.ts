@@ -4,6 +4,8 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
+import * as Crypto from "effect/Crypto"
+import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as FiberMap from "effect/FiberMap"
@@ -15,7 +17,7 @@ import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
-import { failCapacityExceeded, failInvalidConfiguration } from "./internal/errors.js"
+import { capacityExceeded, invalidConfiguration } from "./internal/errors.js"
 
 export const JoinAuthorization = Schema.TaggedStruct("Join", {
   spaceId: Identity.SpaceId,
@@ -26,6 +28,9 @@ export const JoinAuthorization = Schema.TaggedStruct("Join", {
 export const PublishAuthorization = Schema.TaggedStruct("Publish", {
   spaceId: Identity.SpaceId,
   member: Protocol.EphemeralMember,
+  operation: Schema.Literals(["Event", "ClearEvent", "SetState", "RemoveState", "UpdateMember"]),
+  channel: Schema.NullOr(Protocol.EphemeralChannel),
+  key: Schema.NullOr(Protocol.EphemeralKey),
   principal: Schema.Json
 })
 
@@ -46,13 +51,15 @@ export interface Service {
   readonly join: (
     request: Protocol.EphemeralJoinRequest,
     principal: typeof Schema.Json.Type
-  ) => Stream.Stream<Protocol.EphemeralMessage, ReplicaError.ReplicaError>
+  ) => Stream.Stream<Protocol.EphemeralJoinMessage, ReplicaError.ReplicaError>
   readonly publish: (
     request: Protocol.EphemeralPublishRequest,
+    sessionToken: Identity.EphemeralSessionToken,
     principal: typeof Schema.Json.Type
   ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly heartbeat: (
     request: Protocol.EphemeralHeartbeatRequest,
+    sessionToken: Identity.EphemeralSessionToken,
     principal: typeof Schema.Json.Type
   ) => Effect.Effect<void, ReplicaError.ReplicaError>
 }
@@ -72,7 +79,9 @@ export interface Options {
   readonly maximumStateKeysPerSpace?: number
   readonly maximumBytesPerMember?: number
   readonly maximumBytesPerSpace?: number
+  readonly maximumSnapshotBytes?: number
   readonly memberTtl?: Duration.Input
+  readonly authorizationRefreshInterval?: Duration.Input
   readonly maximumEventTtl?: Duration.Input
   readonly maximumStateTtl?: Duration.Input
   readonly spaceIdleTtl?: Duration.Input
@@ -89,7 +98,9 @@ interface ResolvedOptions {
   readonly maximumStateKeysPerSpace: number
   readonly maximumBytesPerMember: number
   readonly maximumBytesPerSpace: number
+  readonly maximumSnapshotBytes: number
   readonly memberTtlMillis: number
+  readonly authorizationRefreshIntervalMillis: number
   readonly maximumEventTtlMillis: number
   readonly maximumStateTtlMillis: number
   readonly spaceIdleTtlMillis: number
@@ -98,12 +109,17 @@ interface ResolvedOptions {
 interface MemberRecord {
   readonly entry: Protocol.EphemeralMemberEntry
   readonly bytes: number
+  readonly entryBytes: number
   readonly token: object
+  readonly sessionToken: Identity.EphemeralSessionToken
+  readonly departed: Deferred.Deferred<void>
+  readonly leaseMillis: number
 }
 
 interface StateRecord {
   readonly entry: Protocol.EphemeralStateEntry
   readonly bytes: number
+  readonly entryBytes: number
   readonly token: object
 }
 
@@ -126,9 +142,10 @@ interface SpaceRuntime {
   readonly memberTimers: FiberMap.FiberMap<string>
   readonly stateTimers: FiberMap.FiberMap<string>
   readonly eventTimers: FiberMap.FiberMap<string>
-  channel: PubSub.PubSub<Protocol.EphemeralMessage>
+  readonly channel: PubSub.PubSub<Protocol.EphemeralMessage>
   revision: number
   spaceBytes: number
+  snapshotEntriesBytes: number
 }
 
 const memberKey = (member: Protocol.EphemeralMember): string => `${member.clientId}:${member.membershipIncarnation}`
@@ -154,7 +171,7 @@ const nextRevision = (runtime: SpaceRuntime): Identity.EphemeralRevision => {
 
 const positiveSafeInteger = Effect.fnUntraced(function*(option: string, value: number) {
   if (!Number.isSafeInteger(value) || value <= 0) {
-    return yield* failInvalidConfiguration(option, `${option} must be a positive safe integer`)
+    return yield* invalidConfiguration(option, `${option} must be a positive safe integer`)
   }
   return value
 })
@@ -170,16 +187,22 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
     maximumStateKeysPerMember: options.maximumStateKeysPerMember ?? 256,
     maximumStateKeysPerSpace: options.maximumStateKeysPerSpace ?? 16_384,
     maximumBytesPerMember: options.maximumBytesPerMember ?? 1024 * 1024,
-    maximumBytesPerSpace: options.maximumBytesPerSpace ?? 16 * 1024 * 1024
+    maximumBytesPerSpace: options.maximumBytesPerSpace ?? 16 * 1024 * 1024,
+    maximumSnapshotBytes: options.maximumSnapshotBytes ?? Protocol.maximumEphemeralSnapshotBytes
   }
   for (const [option, value] of Object.entries(counts)) {
     yield* positiveSafeInteger(option, value)
   }
+  const memberTtlMillis = yield* positiveFiniteDurationMillis(
+    "memberTtl",
+    options.memberTtl ?? Protocol.maximumEphemeralMemberTtlMillis
+  )
   const resolved = {
     ...counts,
-    memberTtlMillis: yield* positiveFiniteDurationMillis(
-      "memberTtl",
-      options.memberTtl ?? Protocol.maximumEphemeralMemberTtlMillis
+    memberTtlMillis,
+    authorizationRefreshIntervalMillis: yield* positiveFiniteDurationMillis(
+      "authorizationRefreshInterval",
+      options.authorizationRefreshInterval ?? Math.max(1, Math.floor(memberTtlMillis / 2))
     ),
     maximumEventTtlMillis: yield* positiveFiniteDurationMillis(
       "maximumEventTtl",
@@ -195,25 +218,37 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
     )
   } satisfies ResolvedOptions
   if (resolved.memberTtlMillis > Protocol.maximumEphemeralMemberTtlMillis) {
-    return yield* failInvalidConfiguration(
+    return yield* invalidConfiguration(
       "memberTtl",
       `memberTtl must not exceed ${Protocol.maximumEphemeralMemberTtlMillis} milliseconds`
     )
   }
+  if (resolved.authorizationRefreshIntervalMillis > resolved.memberTtlMillis) {
+    return yield* invalidConfiguration(
+      "authorizationRefreshInterval",
+      "authorizationRefreshInterval must not exceed memberTtl"
+    )
+  }
+  if (resolved.maximumSnapshotBytes > Protocol.maximumEphemeralSnapshotBytes) {
+    return yield* invalidConfiguration(
+      "maximumSnapshotBytes",
+      `maximumSnapshotBytes must not exceed ${Protocol.maximumEphemeralSnapshotBytes}`
+    )
+  }
   if (resolved.maximumEventTtlMillis > Protocol.maximumEphemeralEventTtlMillis) {
-    return yield* failInvalidConfiguration(
+    return yield* invalidConfiguration(
       "maximumEventTtl",
       `maximumEventTtl must not exceed ${Protocol.maximumEphemeralEventTtlMillis} milliseconds`
     )
   }
   if (resolved.maximumStateTtlMillis > Protocol.maximumEphemeralStateTtlMillis) {
-    return yield* failInvalidConfiguration(
+    return yield* invalidConfiguration(
       "maximumStateTtl",
       `maximumStateTtl must not exceed ${Protocol.maximumEphemeralStateTtlMillis} milliseconds`
     )
   }
   if (resolved.spaceIdleTtlMillis < resolved.maximumStateTtlMillis) {
-    return yield* failInvalidConfiguration(
+    return yield* invalidConfiguration(
       "spaceIdleTtl",
       "spaceIdleTtl must be at least maximumStateTtl"
     )
@@ -223,12 +258,16 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
 
 const ensurePayloadSize = Effect.fnUntraced(function*(value: unknown) {
   if ((yield* Protocol.encodedBytesEffect(value)) > Protocol.maximumEphemeralPayloadBytes) {
-    yield* failCapacityExceeded("ephemeral payload bytes", Protocol.maximumEphemeralPayloadBytes)
+    yield* capacityExceeded("ephemeral payload bytes", Protocol.maximumEphemeralPayloadBytes)
   }
 })
 
-const ensureSession = (runtime: SpaceRuntime, member: Protocol.EphemeralMember) => {
-  if (runtime.members.has(memberKey(member))) return Effect.void
+const ensureSession = (
+  runtime: SpaceRuntime,
+  member: Protocol.EphemeralMember,
+  sessionToken: Identity.EphemeralSessionToken
+) => {
+  if (runtime.members.get(memberKey(member))?.sessionToken === sessionToken) return Effect.void
   return Effect.fail(
     new ReplicaError.EphemeralSessionUnavailable({
       spaceId: runtime.spaceId,
@@ -238,17 +277,30 @@ const ensureSession = (runtime: SpaceRuntime, member: Protocol.EphemeralMember) 
   )
 }
 
-const publishDelta = Effect.fnUntraced(function*(
-  runtime: SpaceRuntime,
+const publishDelta = (runtime: SpaceRuntime, message: Protocol.EphemeralMessage) =>
+  PubSub.publish(runtime.channel, message).pipe(Effect.asVoid)
+
+const snapshotBaseBytes = 256
+
+const ensureSnapshotSize = (
   options: ResolvedOptions,
-  message: Protocol.EphemeralMessage
-) {
-  if (!(yield* PubSub.publish(runtime.channel, message))) {
-    const previous = runtime.channel
-    runtime.channel = yield* PubSub.dropping<Protocol.EphemeralMessage>(options.capacity)
-    yield* PubSub.shutdown(previous)
-  }
-})
+  nextEntriesBytes: number,
+  nextEntryCount: number
+) => {
+  const bytes = snapshotBaseBytes + nextEntriesBytes + Math.max(0, nextEntryCount - 1)
+  if (bytes <= options.maximumSnapshotBytes) return Effect.void
+  return Effect.fail(capacityExceeded("ephemeral snapshot bytes", options.maximumSnapshotBytes))
+}
+
+const cleanupOwnerAccounting = (runtime: SpaceRuntime, owner: string) => {
+  if (runtime.members.has(owner)) return
+  if ((runtime.memberBytes.get(owner) ?? 0) !== 0) return
+  if ((runtime.memberStateKeys.get(owner) ?? 0) !== 0) return
+  if ((runtime.memberEventKeys.get(owner) ?? 0) !== 0) return
+  runtime.memberBytes.delete(owner)
+  runtime.memberStateKeys.delete(owner)
+  runtime.memberEventKeys.delete(owner)
+}
 
 const withGate = <A, E extends { readonly _tag: string }, R,>(
   runtime: SpaceRuntime,
@@ -257,7 +309,6 @@ const withGate = <A, E extends { readonly _tag: string }, R,>(
 
 const removeMember = (
   runtime: SpaceRuntime,
-  options: ResolvedOptions,
   member: Protocol.EphemeralMember,
   token: object,
   cancelTimer: boolean
@@ -270,11 +321,19 @@ const removeMember = (
       if (current?.token !== token) return
       runtime.members.delete(key)
       runtime.spaceBytes -= current.bytes
+      runtime.snapshotEntriesBytes -= current.entryBytes
       runtime.memberBytes.set(key, (runtime.memberBytes.get(key) ?? 0) - current.bytes)
       if (cancelTimer) yield* FiberMap.remove(runtime.memberTimers, key)
+      for (const [identity, event] of runtime.events) {
+        if (memberKey(event.member) !== key) continue
+        runtime.events.delete(identity)
+        yield* FiberMap.remove(runtime.eventTimers, identity)
+      }
+      runtime.memberEventKeys.set(key, 0)
+      cleanupOwnerAccounting(runtime, key)
+      yield* Deferred.succeed(current.departed, undefined)
       yield* publishDelta(
         runtime,
-        options,
         Protocol.EphemeralMemberLeft.make({
           spaceId: runtime.spaceId,
           revision: nextRevision(runtime),
@@ -286,30 +345,30 @@ const removeMember = (
 
 const removeState = (
   runtime: SpaceRuntime,
-  options: ResolvedOptions,
   member: Protocol.EphemeralMember,
   channel: Protocol.EphemeralChannel,
   key: Protocol.EphemeralKey,
   token: object | undefined,
   cancelTimer: boolean,
-  requireSession: boolean
+  sessionToken?: Identity.EphemeralSessionToken
 ) =>
   withGate(
     runtime,
     Effect.gen(function*() {
-      if (requireSession) yield* ensureSession(runtime, member)
+      if (sessionToken !== undefined) yield* ensureSession(runtime, member, sessionToken)
       const identity = stateKey(member, channel, key)
       const current = runtime.states.get(identity)
       if (current === undefined || (token !== undefined && current.token !== token)) return
       runtime.states.delete(identity)
       runtime.spaceBytes -= current.bytes
+      runtime.snapshotEntriesBytes -= current.entryBytes
       const owner = memberKey(member)
       runtime.memberBytes.set(owner, (runtime.memberBytes.get(owner) ?? 0) - current.bytes)
       runtime.memberStateKeys.set(owner, (runtime.memberStateKeys.get(owner) ?? 1) - 1)
+      cleanupOwnerAccounting(runtime, owner)
       if (cancelTimer) yield* FiberMap.remove(runtime.stateTimers, identity)
       yield* publishDelta(
         runtime,
-        options,
         Protocol.EphemeralStateRemoved.make({
           spaceId: runtime.spaceId,
           revision: nextRevision(runtime),
@@ -323,27 +382,26 @@ const removeState = (
 
 const clearEvent = (
   runtime: SpaceRuntime,
-  options: ResolvedOptions,
   member: Protocol.EphemeralMember,
   channel: Protocol.EphemeralChannel,
   token: object | undefined,
   cancelTimer: boolean,
-  requireSession: boolean
+  sessionToken?: Identity.EphemeralSessionToken
 ) =>
   withGate(
     runtime,
     Effect.gen(function*() {
-      if (requireSession) yield* ensureSession(runtime, member)
+      if (sessionToken !== undefined) yield* ensureSession(runtime, member, sessionToken)
       const identity = eventKey(member, channel)
       const current = runtime.events.get(identity)
       if (current === undefined || (token !== undefined && current.token !== token)) return
       runtime.events.delete(identity)
       const owner = memberKey(member)
       runtime.memberEventKeys.set(owner, (runtime.memberEventKeys.get(owner) ?? 1) - 1)
+      cleanupOwnerAccounting(runtime, owner)
       if (cancelTimer) yield* FiberMap.remove(runtime.eventTimers, identity)
       yield* publishDelta(
         runtime,
-        options,
         Protocol.EphemeralEventCleared.make({
           spaceId: runtime.spaceId,
           revision: nextRevision(runtime),
@@ -357,7 +415,7 @@ const clearEvent = (
 const makeRuntime = (spaceId: Identity.SpaceId, options: ResolvedOptions) =>
   Effect.acquireRelease(
     Effect.gen(function*() {
-      const channel = yield* PubSub.dropping<Protocol.EphemeralMessage>(options.capacity)
+      const channel = yield* PubSub.sliding<Protocol.EphemeralMessage>(options.capacity)
       return {
         spaceId,
         gate: yield* Semaphore.make(1),
@@ -373,7 +431,8 @@ const makeRuntime = (spaceId: Identity.SpaceId, options: ResolvedOptions) =>
         eventTimers: yield* FiberMap.make<string>(),
         channel,
         revision: 0,
-        spaceBytes: 0
+        spaceBytes: 0,
+        snapshotEntriesBytes: 0
       } satisfies SpaceRuntime
     }),
     (runtime) => PubSub.shutdown(runtime.channel)
@@ -383,7 +442,7 @@ const acquireWatcher = (runtime: SpaceRuntime, options: ResolvedOptions) =>
   Effect.acquireRelease(
     Effect.gen(function*() {
       if (!(yield* Semaphore.takeIfAvailable(runtime.watcherPermits, 1))) {
-        yield* failCapacityExceeded("ephemeral watchers", options.maximumWatchersPerSpace)
+        yield* capacityExceeded("ephemeral watchers", options.maximumWatchersPerSpace)
       }
     }),
     () => Semaphore.release(runtime.watcherPermits, 1)
@@ -395,11 +454,12 @@ export const layer = <R = never,>(
       input: AuthorizationInput
     ) => Effect.Effect<void, ReplicaError.AuthorizationDenied, R>
   }
-): Layer.Layer<EphemeralHub, ReplicaError.InvalidConfiguration, R> =>
+): Layer.Layer<EphemeralHub, ReplicaError.InvalidConfiguration, R | Crypto.Crypto> =>
   Layer.effect(
     EphemeralHub,
     Effect.gen(function*() {
       const context = yield* Effect.context<R>()
+      const crypto = yield* Crypto.Crypto
       const resolved = yield* resolveOptions(options)
       const watcherCount = Metric.gauge("effect_local_server_ephemeral_watcher_count")
       const spaces = yield* RcMap.make({
@@ -411,10 +471,7 @@ export const layer = <R = never,>(
         RcMap.get(spaces, spaceId).pipe(
           Effect.mapError((error) => {
             if (Cause.isExceededCapacityError(error)) {
-              return new ReplicaError.CapacityExceeded({
-                resource: "ephemeral spaces",
-                limit: resolved.maximumSpaces
-              })
+              return capacityExceeded("ephemeral spaces", resolved.maximumSpaces)
             }
             return error
           })
@@ -437,23 +494,28 @@ export const layer = <R = never,>(
               () => Metric.modify(watcherCount, -1)
             )
             const token = {}
+            const sessionToken = yield* crypto.randomUUIDv4.pipe(
+              Effect.map((uuid) => Identity.EphemeralSessionToken.make(`eps_${uuid}`)),
+              Effect.catch(() => Effect.fail(new ReplicaError.ServerUnavailable()))
+            )
+            const departed = yield* Deferred.make<void>()
             const acquireJoin = withGate(
               runtime,
               Effect.gen(function*() {
                 const key = memberKey(request.member)
                 const previous = runtime.members.get(key)
                 if (previous === undefined && runtime.members.size >= resolved.maximumMembersPerSpace) {
-                  return yield* failCapacityExceeded("ephemeral members", resolved.maximumMembersPerSpace)
+                  return yield* capacityExceeded("ephemeral members", resolved.maximumMembersPerSpace)
                 }
                 const bytes = yield* Protocol.encodedBytesEffect(request.value)
                 const previousBytes = previous?.bytes ?? 0
                 const memberBytes = (runtime.memberBytes.get(key) ?? 0) - previousBytes + bytes
                 if (memberBytes > resolved.maximumBytesPerMember) {
-                  return yield* failCapacityExceeded("ephemeral bytes per member", resolved.maximumBytesPerMember)
+                  return yield* capacityExceeded("ephemeral bytes per member", resolved.maximumBytesPerMember)
                 }
                 const spaceBytes = runtime.spaceBytes - previousBytes + bytes
                 if (spaceBytes > resolved.maximumBytesPerSpace) {
-                  return yield* failCapacityExceeded("ephemeral bytes per space", resolved.maximumBytesPerSpace)
+                  return yield* capacityExceeded("ephemeral bytes per space", resolved.maximumBytesPerSpace)
                 }
                 const subscription = yield* PubSub.subscribe(runtime.channel)
                 const now = yield* Clock.currentTimeMillis
@@ -463,11 +525,27 @@ export const layer = <R = never,>(
                   value: request.value,
                   expiresAtMillis: now + ttlMillis
                 })
-                runtime.members.set(key, { entry, bytes, token })
+                const entryBytes = yield* Protocol.encodedBytesEffect(entry)
+                const previousEntryBytes = previous?.entryBytes ?? 0
+                const nextSnapshotEntriesBytes = runtime.snapshotEntriesBytes - previousEntryBytes + entryBytes
+                let nextEntryCount = runtime.members.size + runtime.states.size
+                if (previous === undefined) nextEntryCount += 1
+                yield* ensureSnapshotSize(resolved, nextSnapshotEntriesBytes, nextEntryCount)
+                if (previous !== undefined) yield* Deferred.succeed(previous.departed, undefined)
+                runtime.members.set(key, {
+                  entry,
+                  bytes,
+                  entryBytes,
+                  token,
+                  sessionToken,
+                  departed,
+                  leaseMillis: ttlMillis
+                })
                 runtime.memberBytes.set(key, memberBytes)
                 runtime.spaceBytes = spaceBytes
+                runtime.snapshotEntriesBytes = nextSnapshotEntriesBytes
                 const revision = nextRevision(runtime)
-                const expireMember = removeMember(runtime, resolved, request.member, token, false)
+                const expireMember = removeMember(runtime, request.member, token, false)
                 yield* FiberMap.run(
                   runtime.memberTimers,
                   key,
@@ -475,7 +553,6 @@ export const layer = <R = never,>(
                 )
                 yield* publishDelta(
                   runtime,
-                  resolved,
                   Protocol.EphemeralMemberUpserted.make({
                     spaceId: request.spaceId,
                     revision,
@@ -483,6 +560,12 @@ export const layer = <R = never,>(
                   })
                 )
                 return {
+                  started: Protocol.EphemeralSessionStarted.make({
+                    spaceId: request.spaceId,
+                    member: request.member,
+                    sessionToken,
+                    leaseMillis: ttlMillis
+                  }),
                   snapshot: Protocol.EphemeralSnapshot.make({
                     spaceId: request.spaceId,
                     revision,
@@ -495,12 +578,35 @@ export const layer = <R = never,>(
             )
             const acquired = yield* Effect.acquireRelease(
               acquireJoin,
-              () => removeMember(runtime, resolved, request.member, token, true)
+              () => removeMember(runtime, request.member, token, true)
             )
+            const refreshAuthorization = authorize(JoinAuthorization.make({
+              spaceId: request.spaceId,
+              member: request.member,
+              principal
+            }))
             return Stream.concat(
-              Stream.make(acquired.snapshot),
+              Stream.make(acquired.started, acquired.snapshot),
               Stream.fromSubscription(acquired.subscription).pipe(
-                Stream.filter((message) => message.revision > acquired.snapshot.revision)
+                Stream.filter((message) => message.revision > acquired.snapshot.revision),
+                Stream.mapAccum(
+                  () => acquired.snapshot.revision,
+                  (revision: Identity.EphemeralRevision, message: Protocol.EphemeralMessage) =>
+                    [message.revision, [{
+                      contiguous: message.revision === revision + 1,
+                      message
+                    }]] as const
+                ),
+                Stream.takeUntil(({ contiguous }) => !contiguous, { excludeLast: true }),
+                Stream.map(({ message }) => message)
+              )
+            ).pipe(
+              Stream.interruptWhen(Deferred.await(departed)),
+              Stream.mergeEffect(
+                Effect.sleep(resolved.authorizationRefreshIntervalMillis).pipe(
+                  Effect.andThen(refreshAuthorization),
+                  Effect.forever
+                )
               )
             )
           })).pipe(
@@ -508,10 +614,17 @@ export const layer = <R = never,>(
               attributes: { "ephemeral.space_id": request.spaceId }
             })
           ),
-        publish: Effect.fn("EphemeralHub.publish")(function*(request, principal) {
+        publish: Effect.fn("EphemeralHub.publish")(function*(request, sessionToken, principal) {
+          let channel: Protocol.EphemeralChannel | null = null
+          if (request._tag !== "UpdateMember") channel = request.channel
+          let key: Protocol.EphemeralKey | null = null
+          if (request._tag === "SetState" || request._tag === "RemoveState") key = request.key
           yield* authorize(PublishAuthorization.make({
             spaceId: request.spaceId,
             member: request.member,
+            operation: request._tag,
+            channel,
+            key,
             principal
           }))
           yield* ensurePayloadSize(request)
@@ -524,48 +637,54 @@ export const layer = <R = never,>(
           }
           yield* Effect.scoped(Effect.gen(function*() {
             const runtime = yield* acquireSpace(request.spaceId)
-            yield* ensureSession(runtime, request.member)
+            yield* ensureSession(runtime, request.member, sessionToken)
             if (request._tag === "ClearEvent") {
-              yield* clearEvent(runtime, resolved, request.member, request.channel, undefined, true, true)
+              yield* clearEvent(runtime, request.member, request.channel, undefined, true, sessionToken)
             } else if (request._tag === "RemoveState") {
               yield* removeState(
                 runtime,
-                resolved,
                 request.member,
                 request.channel,
                 request.key,
                 undefined,
                 true,
-                true
+                sessionToken
               )
             } else {
               yield* withGate(
                 runtime,
                 Effect.gen(function*() {
-                  yield* ensureSession(runtime, request.member)
+                  yield* ensureSession(runtime, request.member, sessionToken)
                   const owner = memberKey(request.member)
                   if (request._tag === "UpdateMember") {
                     const current = runtime.members.get(owner)
-                    if (current === undefined) return yield* ensureSession(runtime, request.member)
+                    if (current === undefined) return yield* ensureSession(runtime, request.member, sessionToken)
                     const bytes = yield* Protocol.encodedBytesEffect(request.value)
                     const ownerBytes = (runtime.memberBytes.get(owner) ?? 0) - current.bytes + bytes
                     if (ownerBytes > resolved.maximumBytesPerMember) {
-                      return yield* failCapacityExceeded("ephemeral bytes per member", resolved.maximumBytesPerMember)
+                      return yield* capacityExceeded("ephemeral bytes per member", resolved.maximumBytesPerMember)
                     }
                     const spaceBytes = runtime.spaceBytes - current.bytes + bytes
                     if (spaceBytes > resolved.maximumBytesPerSpace) {
-                      return yield* failCapacityExceeded("ephemeral bytes per space", resolved.maximumBytesPerSpace)
+                      return yield* capacityExceeded("ephemeral bytes per space", resolved.maximumBytesPerSpace)
                     }
                     const entry = Protocol.EphemeralMemberEntry.make({
                       ...current.entry,
                       value: request.value
                     })
-                    runtime.members.set(owner, { ...current, entry, bytes })
+                    const entryBytes = yield* Protocol.encodedBytesEffect(entry)
+                    const nextSnapshotEntriesBytes = runtime.snapshotEntriesBytes - current.entryBytes + entryBytes
+                    yield* ensureSnapshotSize(
+                      resolved,
+                      nextSnapshotEntriesBytes,
+                      runtime.members.size + runtime.states.size
+                    )
+                    runtime.members.set(owner, { ...current, entry, bytes, entryBytes })
                     runtime.memberBytes.set(owner, ownerBytes)
                     runtime.spaceBytes = spaceBytes
+                    runtime.snapshotEntriesBytes = nextSnapshotEntriesBytes
                     return yield* publishDelta(
                       runtime,
-                      resolved,
                       Protocol.EphemeralMemberUpserted.make({
                         spaceId: request.spaceId,
                         revision: nextRevision(runtime),
@@ -581,13 +700,13 @@ export const layer = <R = never,>(
                     const previous = runtime.events.get(identity)
                     const ownerEventKeys = runtime.memberEventKeys.get(owner) ?? 0
                     if (previous === undefined && ownerEventKeys >= resolved.maximumEventKeysPerMember) {
-                      return yield* failCapacityExceeded(
+                      return yield* capacityExceeded(
                         "ephemeral event keys per member",
                         resolved.maximumEventKeysPerMember
                       )
                     }
                     if (previous === undefined && runtime.events.size >= resolved.maximumEventKeysPerSpace) {
-                      return yield* failCapacityExceeded(
+                      return yield* capacityExceeded(
                         "ephemeral event keys per space",
                         resolved.maximumEventKeysPerSpace
                       )
@@ -598,11 +717,9 @@ export const layer = <R = never,>(
                     runtime.memberEventKeys.set(owner, nextOwnerEventKeys)
                     const expireEvent = clearEvent(
                       runtime,
-                      resolved,
                       request.member,
                       request.channel,
                       token,
-                      false,
                       false
                     )
                     yield* FiberMap.run(
@@ -612,7 +729,6 @@ export const layer = <R = never,>(
                     )
                     return yield* publishDelta(
                       runtime,
-                      resolved,
                       Protocol.EphemeralEvent.make({
                         spaceId: request.spaceId,
                         revision: nextRevision(runtime),
@@ -629,13 +745,13 @@ export const layer = <R = never,>(
                   const previous = runtime.states.get(identity)
                   const ownerStateKeys = runtime.memberStateKeys.get(owner) ?? 0
                   if (previous === undefined && ownerStateKeys >= resolved.maximumStateKeysPerMember) {
-                    return yield* failCapacityExceeded(
+                    return yield* capacityExceeded(
                       "ephemeral state keys per member",
                       resolved.maximumStateKeysPerMember
                     )
                   }
                   if (previous === undefined && runtime.states.size >= resolved.maximumStateKeysPerSpace) {
-                    return yield* failCapacityExceeded(
+                    return yield* capacityExceeded(
                       "ephemeral state keys per space",
                       resolved.maximumStateKeysPerSpace
                     )
@@ -644,11 +760,11 @@ export const layer = <R = never,>(
                   const previousBytes = previous?.bytes ?? 0
                   const ownerBytes = (runtime.memberBytes.get(owner) ?? 0) - previousBytes + bytes
                   if (ownerBytes > resolved.maximumBytesPerMember) {
-                    return yield* failCapacityExceeded("ephemeral bytes per member", resolved.maximumBytesPerMember)
+                    return yield* capacityExceeded("ephemeral bytes per member", resolved.maximumBytesPerMember)
                   }
                   const spaceBytes = runtime.spaceBytes - previousBytes + bytes
                   if (spaceBytes > resolved.maximumBytesPerSpace) {
-                    return yield* failCapacityExceeded("ephemeral bytes per space", resolved.maximumBytesPerSpace)
+                    return yield* capacityExceeded("ephemeral bytes per space", resolved.maximumBytesPerSpace)
                   }
                   const now = yield* Clock.currentTimeMillis
                   const ttlMillis = Math.min(request.ttlMillis, resolved.maximumStateTtlMillis)
@@ -660,20 +776,25 @@ export const layer = <R = never,>(
                     value: request.value,
                     expiresAtMillis: now + ttlMillis
                   })
-                  runtime.states.set(identity, { entry, bytes, token })
+                  const entryBytes = yield* Protocol.encodedBytesEffect(entry)
+                  const nextSnapshotEntriesBytes = runtime.snapshotEntriesBytes - (previous?.entryBytes ?? 0) +
+                    entryBytes
+                  let nextEntryCount = runtime.members.size + runtime.states.size
+                  if (previous === undefined) nextEntryCount += 1
+                  yield* ensureSnapshotSize(resolved, nextSnapshotEntriesBytes, nextEntryCount)
+                  runtime.states.set(identity, { entry, bytes, entryBytes, token })
                   runtime.memberBytes.set(owner, ownerBytes)
                   let nextOwnerStateKeys = ownerStateKeys
                   if (previous === undefined) nextOwnerStateKeys += 1
                   runtime.memberStateKeys.set(owner, nextOwnerStateKeys)
                   runtime.spaceBytes = spaceBytes
+                  runtime.snapshotEntriesBytes = nextSnapshotEntriesBytes
                   const expireState = removeState(
                     runtime,
-                    resolved,
                     request.member,
                     request.channel,
                     request.key,
                     token,
-                    false,
                     false
                   )
                   yield* FiberMap.run(
@@ -683,7 +804,6 @@ export const layer = <R = never,>(
                   )
                   yield* publishDelta(
                     runtime,
-                    resolved,
                     Protocol.EphemeralStateSet.make({
                       spaceId: request.spaceId,
                       revision: nextRevision(runtime),
@@ -696,7 +816,7 @@ export const layer = <R = never,>(
             }
           }))
         }),
-        heartbeat: Effect.fn("EphemeralHub.heartbeat")(function*(request, principal) {
+        heartbeat: Effect.fn("EphemeralHub.heartbeat")(function*(request, sessionToken, principal) {
           yield* authorize(HeartbeatAuthorization.make({
             spaceId: request.spaceId,
             member: request.member,
@@ -716,21 +836,38 @@ export const layer = <R = never,>(
               Effect.gen(function*() {
                 const key = memberKey(request.member)
                 const current = runtime.members.get(key)
-                if (current === undefined) return yield* ensureSession(runtime, request.member)
+                if (current?.sessionToken !== sessionToken) {
+                  return yield* ensureSession(runtime, request.member, sessionToken)
+                }
                 const now = yield* Clock.currentTimeMillis
                 const entry = Protocol.EphemeralMemberEntry.make({
                   ...current.entry,
-                  expiresAtMillis: now + resolved.memberTtlMillis
+                  expiresAtMillis: now + current.leaseMillis
                 })
-                runtime.members.set(key, { ...current, entry })
+                const entryBytes = yield* Protocol.encodedBytesEffect(entry)
+                const nextSnapshotEntriesBytes = runtime.snapshotEntriesBytes + entryBytes - current.entryBytes
+                yield* ensureSnapshotSize(
+                  resolved,
+                  nextSnapshotEntriesBytes,
+                  runtime.members.size + runtime.states.size
+                )
+                runtime.snapshotEntriesBytes = nextSnapshotEntriesBytes
+                runtime.members.set(key, { ...current, entry, entryBytes })
                 yield* FiberMap.run(
                   runtime.memberTimers,
                   key,
-                  Effect.sleep(resolved.memberTtlMillis).pipe(
-                    Effect.andThen(removeMember(runtime, resolved, request.member, current.token, false))
+                  Effect.sleep(current.leaseMillis).pipe(
+                    Effect.andThen(removeMember(runtime, request.member, current.token, false))
                   )
                 )
-                return yield* Effect.void
+                return yield* publishDelta(
+                  runtime,
+                  Protocol.EphemeralMemberUpserted.make({
+                    spaceId: request.spaceId,
+                    revision: nextRevision(runtime),
+                    entry
+                  })
+                )
               })
             )
           }))
@@ -740,5 +877,7 @@ export const layer = <R = never,>(
     })
   )
 
-export const layerTrusted = (options: Options): Layer.Layer<EphemeralHub, ReplicaError.InvalidConfiguration> =>
+export const layerTrusted = (
+  options: Options
+): Layer.Layer<EphemeralHub, ReplicaError.InvalidConfiguration, Crypto.Crypto> =>
   layer({ ...options, authorize: () => Effect.void })

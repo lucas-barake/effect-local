@@ -9,10 +9,11 @@ facade and routes space operations through `SpaceEntity.Client`. `SyncClient.lay
 
 ## Space ownership
 
-`SpaceEntity` uses four volatile Cluster entity types. `SpaceAdmissionEntity` serializes Submit and Discard.
+`SpaceEntity` uses five volatile Cluster entity types. `SpaceAdmissionEntity` serializes Submit and Discard.
 `SpaceReadEntity` forks Pull and immutable Bootstrap pages. `SpaceWatchEntity` owns long lived sync watches.
-`SpaceEphemeralEntity` owns join, publish, and heartbeat for one space. Separate finite mailboxes keep a paused page or
-stream from blocking mutation admission.
+`SpaceEphemeralJoinEntity` owns joined streams. `SpaceEphemeralCommandEntity` owns publish and heartbeat. The join
+entity admits authorization without a preauthorization occupancy cap, then `EphemeralHub.maximumWatchersPerSpace`
+applies the required bound. A full join lane cannot starve commands or mutation admission.
 
 ```ts
 import * as EphemeralHub from "@lucas-barake/effect-local-rpc/EphemeralHub"
@@ -30,7 +31,9 @@ const layerEphemeral = EphemeralHub.layer({
   maximumStateKeysPerSpace: 16_384,
   maximumBytesPerMember: 1024 * 1024,
   maximumBytesPerSpace: 16 * 1024 * 1024,
+  maximumSnapshotBytes: 4 * 1024 * 1024,
   memberTtl: "1 minute",
+  authorizationRefreshInterval: "30 seconds",
   maximumEventTtl: "1 minute",
   maximumStateTtl: "7 days",
   spaceIdleTtl: "7 days",
@@ -41,7 +44,7 @@ const layerSpace = SpaceEntity.layer({
   admissionMailboxCapacity: 64,
   readMailboxCapacity: 64,
   watchMailboxCapacity: 2_048,
-  ephemeralMailboxCapacity: 256,
+  ephemeralCommandMailboxCapacity: 256,
   maximumConcurrentBootstrapAuthorizations: 64,
   maximumConcurrentBootstrapPagesPerSpace: 8,
   maximumConcurrentEphemeralRequestsPerSpace: 64
@@ -74,14 +77,20 @@ A join identifies a member by `(clientId, membershipIncarnation)` and returns on
 - Retained state survives member departure until its own server-enforced TTL. This lets a later member observe the
   latest position after a brief disconnect.
 
-Every message carries its space and an ephemeral revision. Spaces never share roster, state, events, capacity, or
-revisions. Snapshot construction and subscription acquisition use the same per-space critical section as mutation, so
-there is no snapshot-to-live gap.
+Every public message carries its space and an ephemeral revision. Spaces never share roster, state, events, or
+revisions. `maximumSpaces` is one hub-wide active-space bound. Other limits apply independently within each space.
+Snapshot construction and subscription acquisition use the same per-space critical section as mutation, so there is
+no snapshot-to-live gap.
 
-The shared fan-out generation is bounded and dropping. If any subscriber falls behind far enough to overflow it, the
-server closes that generation. `EphemeralClient` automatically rejoins and receives a replacement snapshot. Live
-events remain best effort and may be lost. Roster and retained state recover without leaving a successful subscriber
-silently stale.
+The shared fan-out is bounded and sliding. Each subscriber verifies consecutive revisions. Only a subscriber that
+misses a revision closes and rejoins for a replacement snapshot. Other subscribers continue without a snapshot herd.
+Live events remain best effort and may be lost. Roster and retained state recover without leaving a successful
+subscriber silently stale.
+
+The join RPC privately gives `EphemeralClient` a server-generated session capability and the accepted lease. The
+client does not expose the capability in roster or atom state. Publish and heartbeat require it, so a public
+`(clientId, membershipIncarnation)` pair is not authority. Expiry, replacement, teardown, or failed periodic
+authorization closes the stream and invalidates the capability.
 
 Ephemera never calls `ServerStore`, writes SQL, enters the authoritative mutation log, or requests durable Cluster
 mailbox persistence. Server restart may discard it. Applications that need a read or delivery position to survive
@@ -100,7 +109,8 @@ and its configured maximum. Member values and retained state count toward per-me
 state, member, watcher, and active-space counts have independent limits. Capacity rejection is typed and authorization
 runs before capacity disclosure.
 
-`capacity` bounds the shared per-space delta generation, not the number of subscribers. Excess joins fail with
+`maximumSnapshotBytes` bounds the complete roster and retained-state snapshot below the shared RPC frame limit.
+`capacity` bounds the shared per-space delta history, not the number of subscribers. Excess joins fail with
 `CapacityExceeded { resource: "ephemeral watchers", limit }` and release their allowance on every stream exit. Active
 watchers are exported as `effect_local_server_ephemeral_watcher_count`.
 

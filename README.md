@@ -436,16 +436,18 @@ It also remains responsible for its HTTP server, WebSocket path, TLS, Origin pol
 tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. A
 reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
 
-The facade uses four space entities with required finite limits. `SpaceAdmissionEntity` serializes Submit and Discard.
+The facade uses five space entities. `SpaceAdmissionEntity` serializes Submit and Discard.
 `SpaceReadEntity` forks Pull and Bootstrap. A Layer wide fail fast allowance bounds Bootstrap assertion verification
 and preparation. A separate per space allowance bounds immutable page reads. `SpaceWatchEntity` owns long lived sync
-watches. `SpaceEphemeralEntity` owns join, publish, and heartbeat for the volatile per space channel. Their separate
-mailboxes keep a paused Bootstrap page or a full stream lane from blocking mutation admission. Saturated Bootstrap
+watches. `SpaceEphemeralJoinEntity` owns joined streams, while `SpaceEphemeralCommandEntity` owns publish and
+heartbeat. The Hub applies its watcher bound after authorization. Separate command and stream lanes keep a paused
+Bootstrap page or full join population from blocking mutation admission. Saturated Bootstrap
 work fails with typed `CapacityExceeded` resource `bootstrap authorizations` or `bootstrap pages`.
 
 `ServerStore.maximumWatchersPerSpace` and `EphemeralHub.maximumWatchersPerSpace` independently cap active streams.
-The ephemeral dropping channel has a bounded shared generation. Overflow closes that generation, and joined clients
-resubscribe to a fresh roster and retained-state snapshot instead of remaining silently stale. Sync authorization successes
+The ephemeral channel has bounded sliding history and per-subscriber revision-gap detection. Only a lagging client
+resubscribes to a fresh roster and retained-state snapshot. Join establishes a private server capability for publish
+and heartbeat, and periodic authorization revocation closes the established stream. Sync authorization successes
 are cached by the complete normalized space, client, scope, and principal input. The refresh interval is the fail closed
 revocation bound. Executing policy calls, live authorization callers and owner lookups, completed successes, and active
 watchers have separate required limits. The same pending allowance also bounds per-wake visibility work. Pending overflow fails with typed

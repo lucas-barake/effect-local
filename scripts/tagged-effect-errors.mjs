@@ -847,7 +847,7 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
 
       const durationInputViolations = []
       const normalizedFilename = resolve(absoluteFilename).split(sep).join("/")
-      const serializedShape = new Set(["Protocol.ts", "ReplicaError.ts", "Presence.ts"]).has(
+      const serializedShape = new Set(["Protocol.ts", "ReplicaError.ts"]).has(
         basename(absoluteFilename)
       )
       if (packageSource && !serializedShape) {

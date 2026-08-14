@@ -226,8 +226,10 @@ first message snapshots the complete roster and retained state for that space. E
 last writer wins per member, channel, and key and replays to later joiners. The server enforces member, event, and state
 TTLs and emits departure, clear, and removal deltas.
 
-`EphemeralHub` bounds active spaces, joined streams, members, event keys, state keys, and retained bytes. Its shared
-dropping fan-out generation closes on overflow. `EphemeralClient` then rejoins and replaces roster and retained state
-from a fresh snapshot. A scoped heartbeat maintains the member lease, while stream teardown emits `MemberLeft`.
+`EphemeralHub` bounds active spaces, joined streams, members, event keys, state keys, retained bytes, and complete
+snapshot bytes. Shared sliding fan-out retains only bounded recent deltas. A subscriber that misses a revision rejoins
+and replaces roster and retained state from a fresh snapshot without reconnecting healthy subscribers. The join
+privately establishes a server capability and accepted lease. Scoped heartbeat maintains that lease, while expiry,
+teardown, replacement, or periodic authorization revocation emits `MemberLeft` and closes the joined stream.
 Retained state remains until its own TTL after departure. Applications persist read or delivery positions with a
 normal mutation when those positions must survive server restart or the configured state TTL.

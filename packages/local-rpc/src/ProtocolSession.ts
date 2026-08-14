@@ -11,6 +11,7 @@ import type * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import type * as Authentication from "./Authentication.js"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
+import { invalidConfiguration } from "./internal/errors.js"
 import * as SyncRpc from "./SyncRpc.js"
 
 type Client = Effect.Success<typeof SyncRpc.makeRpcClient>
@@ -49,10 +50,10 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
         supportedVersions: configured
       }).pipe(
         Effect.mapError(() =>
-          new ReplicaError.InvalidConfiguration({
-            option: "supportedProtocolVersions",
-            message: "supportedProtocolVersions must be a nonempty list of positive safe integers"
-          })
+          invalidConfiguration(
+            "supportedProtocolVersions",
+            "supportedProtocolVersions must be a nonempty list of positive safe integers"
+          )
         )
       )
       const client = yield* SyncRpc.makeRpcClient

@@ -17,8 +17,9 @@ import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as Authentication from "./Authentication.js"
+import { invalidConfiguration } from "./internal/errors.js"
 
-export const maximumFrameBytes = Protocol.maximumBatchBytes + 64 * 1024
+export const maximumFrameBytes = Protocol.maximumRpcFrameBytes
 
 const RemoteDefect = Schema.Struct({
   _tag: Schema.Literal("RemoteDefect")
@@ -70,10 +71,10 @@ export const layerJson = (options?: {
     Effect.gen(function*() {
       const limit = options?.maximumFrameBytes ?? maximumFrameBytes
       if (!Number.isSafeInteger(limit) || limit <= 0) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "maximumFrameBytes",
-          message: "maximumFrameBytes must be a positive safe integer"
-        })
+        return yield* invalidConfiguration(
+          "maximumFrameBytes",
+          "maximumFrameBytes must be a positive safe integer"
+        )
       }
       return RpcSerialization.RpcSerialization.of({
         contentType: "application/json",
@@ -159,7 +160,7 @@ export class Watch extends Rpc.make("Watch", {
 
 export class JoinEphemeral extends Rpc.make("JoinEphemeral", {
   payload: Protocol.VersionedEphemeralJoinRequest.fields,
-  success: Protocol.EphemeralMessage,
+  success: Protocol.EphemeralJoinMessage,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect,
   stream: true

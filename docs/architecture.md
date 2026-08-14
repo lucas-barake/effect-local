@@ -111,11 +111,12 @@ in Effects. Callers select either the lightweight in memory reconciliation Layer
 Workflow payload contains only definition, space, client, membership incarnation, and generation identity. Activities call the same
 idempotent reconciliation operation as the in memory scheduler.
 
-The server front door is an authenticated WebSocket RPC facade. It routes every operation by space through four Effect
+The server front door is an authenticated WebSocket RPC facade. It routes every operation by space through five Effect
 Cluster entity types. `SpaceAdmissionEntity` runs Submit and Discard sequentially. `SpaceReadEntity` forks Pull and
-immutable snapshot Bootstrap pages. `SpaceWatchEntity` forks long lived sync watches. `SpaceEphemeralEntity` runs
-joined ephemeral streams, publications, and heartbeats. Each entity has its own required finite mailbox, so a paused
-Bootstrap page or a full stream lane cannot occupy mutation admission.
+immutable snapshot Bootstrap pages. `SpaceWatchEntity` forks long lived sync watches. `SpaceEphemeralJoinEntity` runs
+joined ephemeral streams. `SpaceEphemeralCommandEntity` runs publications and heartbeats. Join authorization precedes
+the Hub watcher bound. Separate command and stream lanes prevent a full join population from occupying command or
+mutation admission.
 
 An accepted admission publishes a shared in memory wake after its SQL transaction commits. Subscribers read that
 publication from the per space hub. Fanout does not acquire a SQLite transaction or write a space row for each watcher.
@@ -147,7 +148,7 @@ dispatcher with independent watches and turns. Workflow generations coalesce dur
 publications carry only notifications.
 
 `SpaceEntity.HandlerOptions` requires positive finite `admissionMailboxCapacity`, `readMailboxCapacity`,
-`watchMailboxCapacity`, and `ephemeralMailboxCapacity` values. It also requires
+`watchMailboxCapacity`, and `ephemeralCommandMailboxCapacity` values. It also requires
 `maximumConcurrentBootstrapAuthorizations`, `maximumConcurrentBootstrapPagesPerSpace`, and
 `maximumConcurrentEphemeralRequestsPerSpace`. Bootstrap assertion verification and preparation share one fail fast
 Layer wide allowance. Published page reads use a separate per space allowance. Saturation reports `CapacityExceeded`
@@ -155,8 +156,8 @@ with resource `bootstrap authorizations` or `bootstrap pages`.
 
 `ServerStore.maximumWatchersPerSpace` is the active sync watcher allowance. `EphemeralHub.maximumWatchersPerSpace` is a
 separate joined-stream allowance. `ServerStore.wakeCapacity` is the sliding sync hint depth. `EphemeralHub.capacity`
-bounds one shared dropping delta generation. Overflow closes that generation so clients rejoin from a fresh roster and
-retained-state snapshot. Excess watchers fail with typed `CapacityExceeded` resources `sync watchers` or `ephemeral
+bounds shared sliding delta history. A subscriber that observes a revision gap rejoins from a fresh roster and
+retained-state snapshot without reconnecting healthy subscribers. Excess watchers fail with typed `CapacityExceeded` resources `sync watchers` or `ephemeral
 watchers`. Interrupted, denied, and revoked streams release their watcher allowance.
 
 Sync watch authorization successes share one structural `(spaceId, clientId, normalized scope, principal)` lookup and expire after

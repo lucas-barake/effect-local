@@ -58,6 +58,9 @@ export type ReplicationScopeGeneration = typeof ReplicationScopeGeneration.Type
 export const EphemeralRevision = sequence("EphemeralRevision", 0)
 export type EphemeralRevision = typeof EphemeralRevision.Type
 
+export const EphemeralSessionToken = identifier("EphemeralSessionToken", "eps")
+export type EphemeralSessionToken = typeof EphemeralSessionToken.Type
+
 export const SchemaVersion = sequence("SchemaVersion", 1)
 export type SchemaVersion = typeof SchemaVersion.Type
 
@@ -82,3 +85,4 @@ export const makeMutationId = makeIdentifier(MutationId, "mut")
 export const makeSnapshotId = makeIdentifier(SnapshotId, "snp")
 export const makeReplicationViewId = makeIdentifier(ReplicationViewId, "viw")
 export const makeWakeId = makeIdentifier(WakeId, "wak")
+export const makeEphemeralSessionToken = makeIdentifier(EphemeralSessionToken, "eps")

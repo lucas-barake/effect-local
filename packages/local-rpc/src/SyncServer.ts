@@ -8,6 +8,7 @@ import type * as HttpRouter from "effect/unstable/http/HttpRouter"
 import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import * as Authentication from "./Authentication.js"
+import { invalidConfiguration } from "./internal/errors.js"
 import * as PrincipalAssertion from "./PrincipalAssertion.js"
 import * as SpaceEntity from "./SpaceEntity.js"
 import * as SyncRpc from "./SyncRpc.js"
@@ -22,10 +23,10 @@ const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
     supportedVersions: configured
   }).pipe(
     Effect.mapError(() =>
-      new ReplicaError.InvalidConfiguration({
-        option: "supportedProtocolVersions",
-        message: "supportedProtocolVersions must be a nonempty list of positive safe integers"
-      })
+      invalidConfiguration(
+        "supportedProtocolVersions",
+        "supportedProtocolVersions must be a nonempty list of positive safe integers"
+      )
     )
   )
   const supportedVersions = [...decoded.supportedVersions].toSorted((left, right) => right - left)
@@ -80,18 +81,32 @@ const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
         )
       )
     },
-    PublishEphemeral: ({ request, protocolVersion }) => {
+    PublishEphemeral: ({ request, sessionToken, protocolVersion }) => {
       return requireVersion(protocolVersion).pipe(
         Effect.andThen(issueAssertion),
-        Effect.flatMap((assertion) => client.publishEphemeral(request.spaceId, request, assertion)),
+        Effect.flatMap((assertion) =>
+          client.publishEphemeral(
+            request.spaceId,
+            request,
+            sessionToken,
+            assertion
+          )
+        ),
         Effect.as(null)
       )
     },
     HeartbeatEphemeral: (request) => {
-      const { protocolVersion, ...heartbeat } = request
+      const { protocolVersion, sessionToken, ...heartbeat } = request
       return requireVersion(protocolVersion).pipe(
         Effect.andThen(issueAssertion),
-        Effect.flatMap((assertion) => client.heartbeatEphemeral(request.spaceId, heartbeat, assertion)),
+        Effect.flatMap((assertion) =>
+          client.heartbeatEphemeral(
+            request.spaceId,
+            heartbeat,
+            sessionToken,
+            assertion
+          )
+        ),
         Effect.as(null)
       )
     }

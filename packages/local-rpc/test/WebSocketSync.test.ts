@@ -160,7 +160,7 @@ const entityOptions = {
   admissionMailboxCapacity: 64,
   readMailboxCapacity: 64,
   watchMailboxCapacity: 64,
-  ephemeralMailboxCapacity: 64,
+  ephemeralCommandMailboxCapacity: 64,
   maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
   maximumConcurrentEphemeralRequestsPerSpace: 16
@@ -258,7 +258,9 @@ const layerRevokedAuthenticationClient = Layer.fresh(Authentication.layerClient)
 const layerCluster = SpaceEntity.layer(entityOptions).pipe(
   Layer.provide(layerAssertionVerifier),
   Layer.provide(layerStore),
-  Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+  Layer.provide(
+    EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
+  ),
   Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
 )
 
@@ -530,7 +532,9 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const layerLifecycleCluster = SpaceEntity.layer(entityOptions).pipe(
     Layer.provide(layerAssertionVerifier),
     Layer.provide(layerLifecycleStore),
-    Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+    Layer.provide(
+      EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
+    ),
     Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
   )
   const layerLifecycleWebSocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(

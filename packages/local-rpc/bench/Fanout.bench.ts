@@ -85,14 +85,16 @@ const layerStore = ServerStore.layerTrusted({
   Layer.provide(layerMutationRuntime),
   Layer.provide(layerDatabase)
 )
-const layerEphemeralHub = EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })
+const layerEphemeralHub = EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(
+  Layer.provide(NodeCrypto.layer)
+)
 const assertion = PrincipalAssertion.PrincipalAssertion.make("fanout-benchmark")
 const layerAssertionVerifier = PrincipalAssertion.layerVerifier(() => Effect.succeed(null))
 const layerCluster = SpaceEntity.layer({
   admissionMailboxCapacity: 32,
   readMailboxCapacity: 32,
   watchMailboxCapacity: 1_024,
-  ephemeralMailboxCapacity: 32,
+  ephemeralCommandMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
   maximumConcurrentEphemeralRequestsPerSpace: 16

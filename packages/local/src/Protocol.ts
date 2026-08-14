@@ -9,6 +9,8 @@ import type * as SecondaryIndex from "./SecondaryIndex.js"
 export const maximumMutationBytes = 256 * 1024
 export const maximumBatchEntries = 1_000
 export const maximumBatchBytes = 4 * 1024 * 1024
+export const maximumRpcFrameBytes = maximumBatchBytes + 64 * 1024
+export const maximumEphemeralSnapshotBytes = maximumBatchBytes
 export const maximumReceiptBytes = 4 * 1024 * 1024
 export const maximumEphemeralPayloadBytes = 16 * 1024
 export const maximumEphemeralChannelLength = 256
@@ -614,12 +616,16 @@ export const EphemeralPublishRequest = Schema.Union([
 ])
 export type EphemeralPublishRequest = typeof EphemeralPublishRequest.Type
 export const VersionedEphemeralPublishRequest = Schema.Struct({
-  request: EphemeralPublishRequest
+  request: EphemeralPublishRequest,
+  sessionToken: Identity.EphemeralSessionToken
 }).pipe(withProtocolVersion)
 
 export const EphemeralHeartbeatRequest = Schema.Struct(EphemeralRequestIdentity)
 export type EphemeralHeartbeatRequest = typeof EphemeralHeartbeatRequest.Type
-export const VersionedEphemeralHeartbeatRequest = EphemeralHeartbeatRequest.pipe(withProtocolVersion)
+export const VersionedEphemeralHeartbeatRequest = Schema.Struct({
+  ...EphemeralRequestIdentity,
+  sessionToken: Identity.EphemeralSessionToken
+}).pipe(withProtocolVersion)
 
 const EphemeralEntryIdentity = {
   member: EphemeralMember,
@@ -708,6 +714,17 @@ export const EphemeralMessage = Schema.Union([
   EphemeralEventCleared
 ])
 export type EphemeralMessage = typeof EphemeralMessage.Type
+
+export const EphemeralSessionStarted = Schema.TaggedStruct("SessionStarted", {
+  spaceId: Identity.SpaceId,
+  member: EphemeralMember,
+  sessionToken: Identity.EphemeralSessionToken,
+  leaseMillis: Schema.Int.check(Schema.isGreaterThan(0))
+})
+export type EphemeralSessionStarted = typeof EphemeralSessionStarted.Type
+
+export const EphemeralJoinMessage = Schema.Union([EphemeralSessionStarted, EphemeralMessage])
+export type EphemeralJoinMessage = typeof EphemeralJoinMessage.Type
 
 export const SubmissionState = Schema.Literals([
   "Queued",

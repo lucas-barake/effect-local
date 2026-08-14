@@ -71,8 +71,9 @@ registry.set(graph.publishEphemeral, {
 ```
 
 Events reach current subscribers only. Retained state and the roster replay to later joiners. Every request includes a
-space, so one atom cannot observe another space. The scoped client maintains heartbeats and rejoins with a replacement
-snapshot after server fan-out overflow. Disposing the registry or evicting the idle atom closes the joined stream and
+space, so one atom cannot observe another space. The scoped client keeps the private server session capability out of
+atom state, schedules heartbeats from the accepted lease, and rejoins with a replacement snapshot only when that
+subscriber misses a revision. Disposing the registry or evicting the idle atom closes the joined stream and
 lets the server emit member departure.
 
 Ephemera never enters browser SQLite or the durable mutation log. Persist a read or delivery position with an ordinary

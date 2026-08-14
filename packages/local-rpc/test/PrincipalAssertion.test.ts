@@ -88,7 +88,7 @@ describe("principal assertions", () => {
           admissionMailboxCapacity: 32,
           readMailboxCapacity: 32,
           watchMailboxCapacity: 32,
-          ephemeralMailboxCapacity: 32,
+          ephemeralCommandMailboxCapacity: 32,
           maximumConcurrentBootstrapAuthorizations: 16,
           maximumConcurrentBootstrapPagesPerSpace: 4,
           maximumConcurrentEphemeralRequestsPerSpace: 16
