@@ -12,6 +12,7 @@ import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Hash from "effect/Hash"
 import * as Layer from "effect/Layer"
+import * as Order from "effect/Order"
 import * as PubSub from "effect/PubSub"
 import * as RcMap from "effect/RcMap"
 import * as Schedule from "effect/Schedule"
@@ -250,46 +251,35 @@ const reduceView = (
   return { view: { ...current, states }, scope: { kind: "state", channel: message.channel } }
 }
 
-const stateSlice = (view: RawView, channel: string): ReadonlyArray<Protocol.EphemeralStateEntry> => {
-  const identities = [...view.states.entries()]
+const byIdentity = <A,>(left: readonly [string, A], right: readonly [string, A]) => Order.String(left[0], right[0])
+
+const stateSlice = (view: RawView, channel: string): ReadonlyArray<Protocol.EphemeralStateEntry> =>
+  [...view.states]
     .filter(([, entry]) => entry.channel === channel)
-    .map(([identity]) => identity)
-    .toSorted()
-  return identities.flatMap((identity) => {
-    const entry = view.states.get(identity)
-    if (entry === undefined) return []
-    return [entry]
-  })
-}
+    .toSorted(byIdentity)
+    .map(([, entry]) => entry)
 
-const memberSlice = (view: RawView): ReadonlyArray<Protocol.EphemeralMemberEntry> => {
-  const keyed = new Map(
-    view.members.map((entry) => [`${entry.member.clientId}:${entry.member.membershipIncarnation}`, entry])
-  )
-  return [...keyed.keys()].toSorted().flatMap((key) => {
-    const entry = keyed.get(key)
-    if (entry === undefined) return []
-    return [entry]
-  })
-}
+const memberSlice = (view: RawView): ReadonlyArray<Protocol.EphemeralMemberEntry> =>
+  [
+    ...new Map(
+      view.members.map((entry) => [`${entry.member.clientId}:${entry.member.membershipIncarnation}`, entry])
+    )
+  ]
+    .toSorted(byIdentity)
+    .map(([, entry]) => entry)
 
-interface ProjectionState {
-  readonly emitted: boolean
-  readonly fingerprint: string | undefined
-}
-
-const initialProjection = (): ProjectionState => ({ emitted: false, fingerprint: undefined })
+const noProjection = (): string | undefined => undefined
 
 const projectSlice = <A,>(
   affects: (scope: ViewScope) => boolean,
   slice: (view: RawView) => A
 ) =>
-(state: ProjectionState, emission: ViewEmission) => {
-  if (state.emitted && !affects(emission.scope)) return [state, []] as const
+(fingerprint: string | undefined, emission: ViewEmission) => {
+  if (fingerprint !== undefined && !affects(emission.scope)) return [fingerprint, []] as const
   const next = slice(emission.view)
-  const fingerprint = Canonical.hash(next)
-  if (state.emitted && fingerprint === state.fingerprint) return [state, []] as const
-  return [{ emitted: true, fingerprint }, [next]] as const
+  const nextFingerprint = Canonical.hash(next)
+  if (nextFingerprint === fingerprint) return [fingerprint, []] as const
+  return [nextFingerprint, [next]] as const
 }
 
 export const layerFromSession = (
@@ -633,7 +623,7 @@ export const layerFromSession = (
         const state = (definition: Ephemeral.AnyState) =>
           Stream.fromPubSub(runtime.views).pipe(
             Stream.mapAccum(
-              initialProjection,
+              noProjection,
               projectSlice(
                 (scope) =>
                   scope.kind === "all" || (scope.kind === "state" && scope.channel === definition.name),
@@ -659,7 +649,7 @@ export const layerFromSession = (
           )
         const members = Stream.fromPubSub(runtime.views).pipe(
           Stream.mapAccum(
-            initialProjection,
+            noProjection,
             projectSlice((scope) =>
               scope.kind === "all" || scope.kind === "members", memberSlice)
           ),

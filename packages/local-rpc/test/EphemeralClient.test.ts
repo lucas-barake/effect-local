@@ -26,27 +26,34 @@ const member = Protocol.EphemeralMember.make({
   membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
 })
 
+const layerFromFakeClient = (
+  client: unknown,
+  options?: Parameters<typeof EphemeralClient.layerFromSession>[0]
+) => {
+  const session = ProtocolSession.ProtocolSession.of({
+    // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. Each fake implements only the three ephemera calls its test exercises.
+    client: client as ProtocolSession.Service["client"],
+    version: Effect.succeed(Protocol.currentProtocolVersion),
+    rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
+  })
+  return EphemeralClient.layerFromSession(options).pipe(
+    Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
+  )
+}
+
 describe("EphemeralClient", () => {
   it.effect(
     "normalizes duration inputs before the RPC boundary",
     Effect.fnUntraced(function*() {
       const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
       const joinedTtlMillis = yield* Deferred.make<number>()
-      // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
       const fakeClient = {
         JoinEphemeral: (request: typeof Protocol.VersionedEphemeralJoinRequest.Type) =>
           Deferred.succeed(joinedTtlMillis, request.ttlMillis).pipe(Effect.as(messages)),
         HeartbeatEphemeral: () => Effect.succeed(null),
         PublishEphemeral: () => Effect.succeed(null)
-      } as unknown as ProtocolSession.Service["client"]
-      const session = ProtocolSession.ProtocolSession.of({
-        client: fakeClient,
-        version: Effect.succeed(Protocol.currentProtocolVersion),
-        rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
-      })
-      const layerClient = EphemeralClient.layerFromSession().pipe(
-        Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
-      )
+      }
+      const layerClient = layerFromFakeClient(fakeClient)
       const program = Effect.gen(function*() {
         const client = yield* EphemeralClient.EphemeralClient
         yield* Queue.offer(
@@ -81,20 +88,12 @@ describe("EphemeralClient", () => {
     Effect.fnUntraced(function*() {
       const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
       const heartbeated = yield* Deferred.make<void>()
-      // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
       const fakeClient = {
         JoinEphemeral: () => Effect.succeed(messages),
         HeartbeatEphemeral: () => Deferred.succeed(heartbeated, undefined).pipe(Effect.as(null)),
         PublishEphemeral: () => Effect.succeed(null)
-      } as unknown as ProtocolSession.Service["client"]
-      const session = ProtocolSession.ProtocolSession.of({
-        client: fakeClient,
-        version: Effect.succeed(Protocol.currentProtocolVersion),
-        rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
-      })
-      const layerClient = EphemeralClient.layerFromSession({ heartbeatInterval: "20 seconds" }).pipe(
-        Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
-      )
+      }
+      const layerClient = layerFromFakeClient(fakeClient, { heartbeatInterval: "20 seconds" })
       const program = Effect.gen(function*() {
         const client = yield* EphemeralClient.EphemeralClient
         yield* Queue.offer(
@@ -129,7 +128,6 @@ describe("EphemeralClient", () => {
     "rejoins after a normal stream completion and exposes the replacement snapshot",
     Effect.fnUntraced(function*() {
       const joins = yield* Ref.make(0)
-      // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
       const fakeClient = {
         JoinEphemeral: Effect.fnUntraced(function*() {
           const join = yield* Ref.updateAndGet(joins, (count) => count + 1)
@@ -167,15 +165,8 @@ describe("EphemeralClient", () => {
         }),
         HeartbeatEphemeral: () => Effect.succeed(null),
         PublishEphemeral: () => Effect.succeed(null)
-      } as unknown as ProtocolSession.Service["client"]
-      const session = ProtocolSession.ProtocolSession.of({
-        client: fakeClient,
-        version: Effect.succeed(Protocol.currentProtocolVersion),
-        rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
-      })
-      const layerClient = EphemeralClient.layerFromSession().pipe(
-        Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
-      )
+      }
+      const layerClient = layerFromFakeClient(fakeClient)
       const program = Effect.gen(function*() {
         const client = yield* EphemeralClient.EphemeralClient
         const opened = yield* client.session(Anonymous, {
@@ -200,7 +191,6 @@ describe("EphemeralClient", () => {
     "does not rejoin after the server rejects a replaced session",
     Effect.fnUntraced(function*() {
       const joins = yield* Ref.make(0)
-      // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
       const fakeClient = {
         JoinEphemeral: Effect.fnUntraced(function*() {
           yield* Ref.update(joins, (count) => count + 1)
@@ -240,15 +230,8 @@ describe("EphemeralClient", () => {
         }),
         HeartbeatEphemeral: () => Effect.succeed(null),
         PublishEphemeral: () => Effect.succeed(null)
-      } as unknown as ProtocolSession.Service["client"]
-      const session = ProtocolSession.ProtocolSession.of({
-        client: fakeClient,
-        version: Effect.succeed(Protocol.currentProtocolVersion),
-        rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
-      })
-      const layerClient = EphemeralClient.layerFromSession().pipe(
-        Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
-      )
+      }
+      const layerClient = layerFromFakeClient(fakeClient)
       const result = yield* EphemeralClient.EphemeralClient.use((client) =>
         client.session(Anonymous, { spaceId, member, value: undefined, ttl: "10 seconds" }).pipe(
           Effect.flatMap((opened) => opened.members.pipe(Stream.runDrain))
@@ -359,22 +342,14 @@ const makeTypedHarness = Effect.fnUntraced(function*() {
     if (request.spaceId === spaceB) return messagesB
     return messagesA
   }
-  // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
   const fakeClient = {
     JoinEphemeral: (request: typeof Protocol.VersionedEphemeralJoinRequest.Type) =>
       Ref.update(joins, (count) => count + 1).pipe(Effect.as(queueFor(request))),
     HeartbeatEphemeral: () => Effect.succeed(null),
     PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) =>
       Queue.offer(published, request).pipe(Effect.as(null))
-  } as unknown as ProtocolSession.Service["client"]
-  const session = ProtocolSession.ProtocolSession.of({
-    client: fakeClient,
-    version: Effect.succeed(Protocol.currentProtocolVersion),
-    rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
-  })
-  const layerClient = EphemeralClient.layerFromSession().pipe(
-    Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
-  )
+  }
+  const layerClient = layerFromFakeClient(fakeClient)
   return { messagesA, messagesB, published, joins, layerClient }
 })
 
@@ -822,7 +797,6 @@ describe("EphemeralClient projection work", () => {
       const published = yield* Queue.unbounded<typeof Protocol.VersionedEphemeralPublishRequest.Type>()
       const firstQueue = yield* Deferred.make<Queue.Queue<Protocol.EphemeralJoinMessage, Cause.Done>>()
       const joins = yield* Ref.make(0)
-      // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
       const fakeClient = {
         JoinEphemeral: Effect.fnUntraced(function*(
           request: typeof Protocol.VersionedEphemeralJoinRequest.Type
@@ -843,15 +817,8 @@ describe("EphemeralClient projection work", () => {
         HeartbeatEphemeral: () => Effect.succeed(null),
         PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) =>
           Queue.offer(published, request).pipe(Effect.as(null))
-      } as unknown as ProtocolSession.Service["client"]
-      const session = ProtocolSession.ProtocolSession.of({
-        client: fakeClient,
-        version: Effect.succeed(Protocol.currentProtocolVersion),
-        rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
-      })
-      const layerClient = EphemeralClient.layerFromSession().pipe(
-        Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
-      )
+      }
+      const layerClient = layerFromFakeClient(fakeClient)
       const program = Effect.gen(function*() {
         const client = yield* EphemeralClient.EphemeralClient
         const opened = yield* client.session(Profile, sessionOptions)
