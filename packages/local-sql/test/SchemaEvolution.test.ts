@@ -46,7 +46,6 @@ const clientHistory = {
   maximumActiveSpaces: 4,
   foregroundActiveSpaces: 2,
   retainedReceipts: 256,
-  settlementCapacity: 64,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
   maximumBootstrapEntities: 10_000,
@@ -611,6 +610,43 @@ describe("client schema evolution", () => {
   )
 
   it.effect(
+    "replays a settlement recorded before schema promotion",
+    Effect.fnUntraced(
+      function*() {
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const pending = yield* v1.mutate(PutTodoV1, { id: "95", title: "settled before promotion" })
+        const encodedRejection = yield* Schema.encodeEffect(SchemaPolicyRejectedError)(
+          new SchemaPolicyRejectedError({ reason: "rejected before promotion" })
+        )
+        yield* v1.applyReceipt(Protocol.RejectedReceipt.make({
+          spaceId,
+          clientId,
+          membershipIncarnation: pending.envelope.membershipIncarnation,
+          mutationId: pending.envelope.mutationId,
+          localSequence: pending.envelope.localSequence,
+          name: PutTodoV1.name,
+          sourceSchema: definitionV1.schemaIdentity,
+          mutationVersion: PutTodoV1.version,
+          origin: "Mutation" as const,
+          rejection: encodedRejection
+        }))
+        assert.deepStrictEqual(yield* v1.pending, [])
+
+        const v2 = yield* buildStore(definitionV2, layerHandlersV2, evolution)
+        const replayed = yield* v2.settlements({ from: 0 }).pipe(
+          Stream.runHead,
+          Effect.map(Option.getOrThrow)
+        )
+        assert.strictEqual(replayed.sequence, 1)
+        assert.strictEqual(replayed.settlement.pending.envelope.mutationId, pending.envelope.mutationId)
+        assert.strictEqual(replayed.settlement.receipt._tag, "Rejected")
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect(
     "preserves AwaitingReceipt across promotion without replaying its optimistic changes",
     Effect.fnUntraced(
       function*() {
@@ -705,18 +741,18 @@ describe("client schema evolution", () => {
           assert.strictEqual(promotedReceipt.mutationVersion, PutTodoV2.version)
         }
 
-        const settlementFiber = yield* rejectingV2.settlements.pipe(
+        const settlementFiber = yield* rejectingV2.settlements({ from: 0 }).pipe(
           Stream.runHead,
           Effect.forkScoped({ startImmediately: true })
         )
         yield* rejectingV2.settleReceipts
         const delivered = Option.getOrThrow(yield* Fiber.join(settlementFiber))
-        assert.strictEqual(delivered.pending.envelope.mutationId, pending.envelope.mutationId)
+        assert.strictEqual(delivered.settlement.pending.envelope.mutationId, pending.envelope.mutationId)
         assert.deepStrictEqual(yield* rejectingV2.pending, [])
         assert.deepStrictEqual(yield* rejectingV2.quarantine, [])
         const promotedReceiptIsPresent = Option.isSome(yield* rejectingV2.receipt(pending.envelope.mutationId))
         assert.isTrue(promotedReceiptIsPresent)
-        const duplicate = yield* rejectingV2.settlements.pipe(
+        const duplicate = yield* rejectingV2.settlements({ from: "live" }).pipe(
           Stream.runHead,
           Effect.timeoutOption("1 second"),
           Effect.forkScoped({ startImmediately: true })

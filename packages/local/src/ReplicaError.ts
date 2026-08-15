@@ -106,6 +106,10 @@ export class CursorGap extends Schema.TaggedErrorClass<CursorGap>(
   "@lucas-barake/effect-local/CursorGap"
 )("CursorGap", { expected: Schema.Number, actual: Schema.Number }) {}
 
+export class SettlementReplayTruncated extends Schema.TaggedErrorClass<SettlementReplayTruncated>(
+  "@lucas-barake/effect-local/SettlementReplayTruncated"
+)("SettlementReplayTruncated", { requested: Schema.Number, oldestAvailable: Schema.Number }) {}
+
 export class StaleReplicationScope extends Schema.TaggedErrorClass<StaleReplicationScope>(
   "@lucas-barake/effect-local/StaleReplicationScope"
 )("StaleReplicationScope", { expected: Schema.Number, actual: Schema.Number }) {}
@@ -192,6 +196,7 @@ export const ReplicaError = Schema.Union([
   QuarantineResubmissionConflict,
   OutOfOrderMutation,
   CursorGap,
+  SettlementReplayTruncated,
   StaleReplicationScope,
   SnapshotUnavailable,
   CapacityExceeded,

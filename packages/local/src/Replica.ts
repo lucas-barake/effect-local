@@ -59,6 +59,17 @@ export type MutationSettlement<M extends Mutation.Any = Mutation.Any,> =
     readonly receipt: Protocol.LegacyReceipt
   }
 
+export type SettledMutation<M extends Mutation.Any = Mutation.Any,> = {
+  readonly sequence: Identity.SettlementSequence
+  readonly settlement: MutationSettlement<M>
+}
+
+export type SettlementStart = "live" | "acknowledged" | number
+
+export interface SettlementOptions {
+  readonly from?: SettlementStart | undefined
+}
+
 export const Activation = Schema.Literals(["Inactive", "Activating", "Active", "Deactivating"])
 export type Activation = typeof Activation.Type
 
@@ -89,10 +100,16 @@ export interface Space {
   readonly pendingFor: <M extends Mutation.Any,>(
     mutation: M
   ) => Effect.Effect<ReadonlyArray<PendingMutation<M>>, ReplicaError.ReplicaError>
-  readonly settlements: Stream.Stream<MutationSettlement, ReplicaError.ReplicaError>
+  readonly settlements: (
+    options?: SettlementOptions
+  ) => Stream.Stream<SettledMutation, ReplicaError.ReplicaError>
   readonly settlementsFor: <M extends Mutation.Any,>(
-    mutation: M
-  ) => Stream.Stream<MutationSettlement<M>, ReplicaError.ReplicaError>
+    mutation: M,
+    options?: SettlementOptions
+  ) => Stream.Stream<SettledMutation<M>, ReplicaError.ReplicaError>
+  readonly acknowledgeSettlements: (
+    sequence: number
+  ) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly quarantine: Effect.Effect<ReadonlyArray<Quarantine.QuarantinedMutation>, ReplicaError.ReplicaError>
   readonly discardQuarantined: (
     mutationId: Identity.MutationId

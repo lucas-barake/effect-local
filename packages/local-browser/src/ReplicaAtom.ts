@@ -364,7 +364,7 @@ export const make = <E,>(
 
   const settlements = Atom.family((spaceId: Identity.SpaceId) =>
     runtime.atom(
-      Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.map((space) => space.settlements)))
+      Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.map((space) => space.settlements())))
     ).pipe(
       factory.withReactivity([ReactivityKey.membership(spaceId)]),
       Atom.setIdleTTL(idleTTL)

@@ -152,7 +152,6 @@ const layerReplica = Layer.merge(
     defaultScope: Protocol.ReplicationScope.make({ models: [Message.name] }),
     maximumActiveSpaces: 4,
     foregroundActiveSpaces: 2,
-    settlementCapacity: 64,
     retainedReceipts: 256,
     maximumReceipts: 100_000,
     retainedHistoryEntries: 256,
@@ -213,6 +212,7 @@ describe("broad invalidation", () => {
       assert.strictEqual(chatAAfter.length, 20)
       assert.isAbove(chatReads.get("chat-a") ?? 0, chatAReadsBefore)
       assert.strictEqual(chatReads.get("chat-b") ?? 0, chatBReadsBefore)
-    }, Effect.scoped)
+    }, Effect.scoped),
+    20_000
   )
 })

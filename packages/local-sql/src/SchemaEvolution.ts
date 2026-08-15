@@ -91,7 +91,10 @@ const ReceiptBatchRow = Schema.Struct({
   source_schema_hash: NullableSchemaHash,
   mutation_version: NullableSchemaVersion,
   mutation_name: Schema.NullOr(Schema.String),
-  rejection_origin: Schema.NullOr(Protocol.RejectionOrigin)
+  rejection_origin: Schema.NullOr(Protocol.RejectionOrigin),
+  settled_pending_json: Schema.NullOr(Schema.String),
+  settled_sequence: Schema.NullOr(Identity.SettlementSequence),
+  pending_name: Schema.NullOr(Schema.String)
 })
 
 const PendingBatchRow = Schema.Struct({
@@ -366,7 +369,7 @@ const currentOrLegacyEntry = Effect.fnUntraced(function*(
 })
 
 const currentOrLegacyReceipt = Effect.fnUntraced(function*(
-  row: typeof ReceiptBatchRow.Type,
+  row: typeof ServerReceiptBatchRow.Type,
   source: Identity.SchemaIdentity
 ) {
   const parsed = yield* Codec.parse(row.receipt_json)
@@ -756,7 +759,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
     Result: ReceiptBatchRow,
     execute: ({ generation, after, limit }) =>
       sql`SELECT mutation_id, local_sequence, receipt_json,
-        source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin
+        source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin,
+        settled_pending_json, settled_sequence, pending_name
         FROM effect_local_client_receipts_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND local_sequence > ${after} ORDER BY local_sequence LIMIT ${limit}`
@@ -1047,12 +1051,14 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
           const protocolMetadata = protocolReceiptMetadata(receipt)
           yield* sql`INSERT INTO effect_local_client_receipts_data
               (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, receipt_json,
-                source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin)
+                source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin,
+                settled_pending_json, settled_sequence, pending_name)
               VALUES (${options.spaceId}, ${state.generation}, ${receipt.membershipIncarnation},
                 ${receipt.mutationId}, ${receipt.localSequence},
                 ${yield* Codec.stringify(receipt)}, ${receipt.sourceSchema.version}, ${receipt.sourceSchema.hash},
                 ${protocolMetadata.mutationVersion}, ${protocolMetadata.mutationName},
-                ${protocolMetadata.rejectionOrigin})`
+                ${protocolMetadata.rejectionOrigin}, ${row.settled_pending_json}, ${row.settled_sequence},
+                ${row.pending_name})`
         }
         if (rows.length === 0) {
           yield* sql`UPDATE effect_local_client_evolution SET phase = 'Pending', cursor_sequence = 0

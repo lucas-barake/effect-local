@@ -80,7 +80,6 @@ const layerReplica = (onWatchCount: (change: number) => void, layerServices: Lay
     maximumActiveSpaces: 8,
     foregroundActiveSpaces: 4,
     retainedReceipts: 256,
-    settlementCapacity: 64,
     maximumReceipts: 10_000,
     retainedHistoryEntries: 256,
     maximumBootstrapEntities: 10_000,

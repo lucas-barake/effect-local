@@ -1323,6 +1323,22 @@ const clientV13 = makeMigration({
   ]
 })
 
+const clientV14 = makeMigration({
+  id: 14,
+  name: "durable-settlements",
+  statements: [
+    "ALTER TABLE effect_local_client_receipts_data ADD COLUMN settled_pending_json TEXT",
+    "ALTER TABLE effect_local_client_receipts_data ADD COLUMN settled_sequence INTEGER",
+    "ALTER TABLE effect_local_client_receipts_data ADD COLUMN pending_name TEXT",
+    `CREATE UNIQUE INDEX effect_local_client_receipts_settled
+      ON effect_local_client_receipts_data (space_id, schema_generation, settled_sequence)
+      WHERE settled_sequence IS NOT NULL`,
+    "ALTER TABLE effect_local_client_spaces ADD COLUMN next_settled_sequence INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE effect_local_client_spaces ADD COLUMN settlement_floor INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_client_spaces ADD COLUMN settlement_prune_sequence INTEGER NOT NULL DEFAULT 0"
+  ]
+})
+
 export const clientCatalog = Object.freeze([
   clientV1,
   clientV2,
@@ -1336,7 +1352,8 @@ export const clientCatalog = Object.freeze([
   clientV10,
   clientV11,
   clientV12,
-  clientV13
+  clientV13,
+  clientV14
 ])
 
 const serverV6 = makeMigration({

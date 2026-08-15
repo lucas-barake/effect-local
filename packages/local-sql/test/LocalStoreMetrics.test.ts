@@ -28,7 +28,6 @@ const secondClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } satisfies Migrations.Options
 const options = {
   scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
-  settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,

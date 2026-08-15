@@ -130,7 +130,6 @@ const clientHistory = {
   scope: Protocol.ReplicationScope.make({ models: [Message.name] }),
   maximumActiveSpaces: 4,
   foregroundActiveSpaces: 2,
-  settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
