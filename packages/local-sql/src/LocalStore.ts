@@ -593,13 +593,15 @@ export const layer = (
       const PrunableReceiptRow = Schema.Struct({
         mutation_id: Identity.MutationId,
         settled_sequence: Schema.NullOr(Identity.SettlementSequence),
-        pending_name: Schema.NullOr(Schema.String)
+        pending_name: Schema.NullOr(Schema.String),
+        replayable: Schema.Literals([0, 1])
       })
       const findPrunableUnsettled = SqlSchema.findAll({
         Request: Schema.Int,
         Result: PrunableReceiptRow,
         execute: (limit) =>
-          sql`SELECT r.mutation_id, r.settled_sequence, r.pending_name
+          sql`SELECT r.mutation_id, r.settled_sequence, r.pending_name,
+            (r.settled_pending_json IS NOT NULL) AS replayable
           FROM effect_local_client_receipts_data AS r
           WHERE r.space_id = ${options.spaceId} AND r.schema_generation = (
             SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
@@ -615,7 +617,8 @@ export const layer = (
         Request: Schema.Struct({ limit: Schema.Int, floor: Schema.Int }),
         Result: PrunableReceiptRow,
         execute: ({ floor, limit }) =>
-          sql`SELECT r.mutation_id, r.settled_sequence, r.pending_name
+          sql`SELECT r.mutation_id, r.settled_sequence, r.pending_name,
+            (r.settled_pending_json IS NOT NULL) AS replayable
           FROM effect_local_client_receipts_data AS r
           WHERE r.space_id = ${options.spaceId} AND r.schema_generation = (
             SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
@@ -631,7 +634,8 @@ export const layer = (
         Request: Schema.Struct({ limit: Schema.Int, floor: Schema.Int }),
         Result: PrunableReceiptRow,
         execute: ({ floor, limit }) =>
-          sql`SELECT r.mutation_id, r.settled_sequence, r.pending_name
+          sql`SELECT r.mutation_id, r.settled_sequence, r.pending_name,
+            (r.settled_pending_json IS NOT NULL) AS replayable
           FROM effect_local_client_receipts_data AS r
           WHERE r.space_id = ${options.spaceId} AND r.schema_generation = (
             SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
@@ -1951,7 +1955,7 @@ export const layer = (
         let prunedThrough = 0
         const prunedByName = new Map<string, number>()
         for (const row of rows) {
-          if (row.settled_sequence === null) continue
+          if (row.settled_sequence === null || row.replayable === 0) continue
           if (row.settled_sequence > prunedThrough) prunedThrough = row.settled_sequence
           if (row.pending_name === null) continue
           const current = prunedByName.get(row.pending_name)

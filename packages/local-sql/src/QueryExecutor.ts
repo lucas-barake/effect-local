@@ -94,7 +94,11 @@ export const layer = <D extends Definition.Any,>(
               model,
               index,
               Effect.fnUntraced(function*(initial) {
-                const partitionKey = initial.partition.map(String).join("\u0000")
+                let partitionKey = ""
+                for (const value of initial.partition) {
+                  const text = String(value)
+                  partitionKey += `${text.length}:${text}`
+                }
                 if (collapsed.has(partitionKey)) {
                   return () => Effect.void
                 }

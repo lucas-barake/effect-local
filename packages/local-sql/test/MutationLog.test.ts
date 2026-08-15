@@ -4555,6 +4555,53 @@ describe("server reconciled mutation log", () => {
   )
 
   it.effect(
+    "replays surviving settlements after pruning a settlement whose snapshot was dropped",
+    pipe(Effect.fnUntraced(function*() {
+      const layerClientDatabase = database()
+      const layerLive = LocalStore.layer({
+        ...clientHistory,
+        retainedReceipts: 3,
+        definition: Domain.definition,
+        spaceId,
+        clientId
+      }).pipe(
+        Layer.provide(layerRuntime),
+        Layer.provide(layerClientDatabase)
+      )
+      const context = yield* Layer.build(Layer.merge(layerLive, layerClientDatabase))
+      const local = Context.get(context, LocalStore.Store)
+      const sql = Context.get(context, SqlClient.SqlClient)
+      const settle = Effect.fnUntraced(function*(id: string) {
+        const pending = yield* local.mutate(Domain.PutTodo, Domain.todo(id))
+        yield* local.applyReceipt(legacyRejection(pending))
+        return pending
+      })
+
+      yield* settle("dropped")
+      const second = yield* settle("second")
+      const third = yield* settle("third")
+      yield* sql`UPDATE effect_local_client_receipts_data SET settled_pending_json = NULL
+        WHERE space_id = ${spaceId} AND settled_sequence = 1`
+      const fourth = yield* settle("fourth")
+
+      const observed: Array<Replica.SettledMutation> = []
+      const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
+      while (observed.length < 3) observed.push(...(yield* pull))
+      assert.deepStrictEqual(
+        observed.map((settled) => settled.settlement.pending.envelope.mutationId),
+        [second.envelope.mutationId, third.envelope.mutationId, fourth.envelope.mutationId]
+      )
+
+      const named: Array<Replica.SettledMutation> = []
+      const namedPull = yield* Stream.toPull(
+        local.settlements({ from: 0, mutationName: Domain.PutTodo.name })
+      )
+      while (named.length < 3) named.push(...(yield* namedPull))
+      assert.deepStrictEqual(named.map((settled) => settled.sequence), [2, 3, 4])
+    }, Effect.scoped))
+  )
+
+  it.effect(
     "allocates unique settlement sequences under concurrent settlement paths",
     pipe(Effect.fnUntraced(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
