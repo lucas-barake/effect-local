@@ -1062,12 +1062,6 @@ export const layer = (
         const uniqueEntities = Array.from(
           new Map(entities.map((entity) => [SqlTransaction.entityKey(entity), entity])).values()
         )
-        let boundedPoints = indexPoints
-        let boundedBroadModels: ReadonlyArray<string> = []
-        if (indexPoints.length > 2_048) {
-          boundedPoints = []
-          boundedBroadModels = Array.from(new Set(uniqueEntities.map((entity) => entity.model)))
-        }
         const entityKeys = yield* Effect.forEach(uniqueEntities, (entity) => {
           const model = options.definition.modelByName.get(entity.model)
           if (model === undefined) {
@@ -1081,8 +1075,7 @@ export const layer = (
         const queryKeys = yield* queryReactivity.affected({
           spaceId: options.spaceId,
           entityKeys: new Set(entityKeys),
-          points: boundedPoints,
-          broadModels: new Set(boundedBroadModels)
+          points: indexPoints
         })
         const keys = [
           ...entityKeys,

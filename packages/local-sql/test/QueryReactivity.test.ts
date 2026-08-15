@@ -43,9 +43,41 @@ const point = (title: string, entityKey: string): IndexStore.Point => ({
 const changes = (points: ReadonlyArray<IndexStore.Point>): QueryReactivity.Changes => ({
   spaceId,
   entityKeys: new Set(),
-  points,
-  broadModels: new Set()
+  points
 })
+const chatFootprint = (chat: string, options: {
+  readonly lower?: number
+  readonly upper?: number
+  readonly boundary?: ReadonlyArray<string | number>
+  readonly hasMore?: boolean
+  readonly direction?: "asc" | "desc"
+}): IndexStore.Footprint => ({
+  spaceId,
+  descriptor: "message-by-chat",
+  model: "Message",
+  index: "byChat",
+  partition: [chat],
+  lower: options.lower,
+  lowerInclusive: true,
+  upper: options.upper,
+  upperInclusive: true,
+  direction: options.direction ?? "asc",
+  cursor: undefined,
+  boundary: options.boundary,
+  hasMore: options.hasMore ?? false,
+  full: false
+})
+
+const chatPoint = (chat: string, sentAt: number): IndexStore.Point => ({
+  spaceId,
+  descriptor: "message-by-chat",
+  model: "Message",
+  index: "byChat",
+  partition: [chat],
+  sort: [sentAt],
+  entityKey: `message-${sentAt}`
+})
+
 const provideQueryReactivity = Effect.provide(QueryReactivity.layer)
 
 describe("query range reactivity", () => {
@@ -144,6 +176,45 @@ describe("query range reactivity", () => {
       }])
       yield* Effect.addFinalizer(() => Effect.all(releases, { discard: true }))
       assert.deepStrictEqual(yield* registry.affected(changes([point("middle", "\"1\"")])), [targetKey])
+    }, provideQueryReactivity)
+  )
+
+  it.effect(
+    "collapses an oversized batch to partition extremes without leaving the partition",
+    Effect.fnUntraced(function*() {
+      const registry = yield* QueryReactivity.QueryReactivity
+      const releaseSame = yield* registry.retain("same-chat")
+      const releaseOther = yield* registry.retain("other-chat")
+      yield* Effect.addFinalizer(() => releaseOther.pipe(Effect.andThen(releaseSame)))
+      yield* registry.record("same-chat", [
+        { _tag: "Index", footprint: chatFootprint("chat-a", { lower: 0, upper: 10_000 }) }
+      ])
+      yield* registry.record("other-chat", [
+        { _tag: "Index", footprint: chatFootprint("chat-b", { lower: 0, upper: 10_000 }) }
+      ])
+      const batch = Array.from({ length: 400 }, (_, position) => chatPoint("chat-a", position + 100))
+      assert.deepStrictEqual(yield* registry.affected(changes(batch)), ["same-chat"])
+    }, provideQueryReactivity)
+  )
+
+  it.effect(
+    "keeps boundary exclusion when an oversized batch collapses to extremes",
+    Effect.fnUntraced(function*() {
+      const registry = yield* QueryReactivity.QueryReactivity
+      const release = yield* registry.retain("newest-window")
+      yield* Effect.addFinalizer(() => release)
+      yield* registry.record("newest-window", [{
+        _tag: "Index",
+        footprint: chatFootprint("chat-a", {
+          boundary: [9_000, "message-9000"],
+          hasMore: true,
+          direction: "desc"
+        })
+      }])
+      const backlog = Array.from({ length: 400 }, (_, position) => chatPoint("chat-a", position + 100))
+      assert.deepStrictEqual(yield* registry.affected(changes(backlog)), [])
+      const live = [...backlog, chatPoint("chat-a", 9_500)]
+      assert.deepStrictEqual(yield* registry.affected(changes(live)), ["newest-window"])
     }, provideQueryReactivity)
   )
 })

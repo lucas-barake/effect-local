@@ -12,7 +12,6 @@ export interface Changes {
   readonly spaceId: Identity.SpaceId
   readonly entityKeys: ReadonlySet<string>
   readonly points: ReadonlyArray<IndexStore.Point>
-  readonly broadModels: ReadonlySet<string>
 }
 
 export interface Service {
@@ -50,6 +49,80 @@ const sameTuple = (
   left: ReadonlyArray<string | number>,
   right: ReadonlyArray<string | number>
 ): boolean => compareTuple(left, right) === 0
+
+const maximumExactPointsPerGroup = 256
+
+interface PointGroup {
+  points: Array<IndexStore.Point> | undefined
+  sortMin: string | number | undefined
+  sortMax: string | number | undefined
+  rangeAlways: boolean
+  tupleMin: ReadonlyArray<string | number>
+  tupleMax: ReadonlyArray<string | number>
+}
+
+const groupKey = (
+  spaceId: Identity.SpaceId,
+  descriptor: string,
+  partition: ReadonlyArray<string | number>
+): string => {
+  let key = `${spaceId.length}:${spaceId}${descriptor.length}:${descriptor}`
+  for (const value of partition) {
+    const text = String(value)
+    key += `${text.length}:${text}`
+  }
+  return key
+}
+
+const widenGroup = (group: PointGroup, point: IndexStore.Point): void => {
+  const ranged = point.sort[0]
+  if (ranged === undefined) group.rangeAlways = true
+  else {
+    if (group.sortMin === undefined || compareValue(ranged, group.sortMin) < 0) group.sortMin = ranged
+    if (group.sortMax === undefined || compareValue(ranged, group.sortMax) > 0) group.sortMax = ranged
+  }
+  const tuple = [...point.sort, point.entityKey]
+  if (group.tupleMin.length === 0 || compareTuple(tuple, group.tupleMin) < 0) group.tupleMin = tuple
+  if (group.tupleMax.length === 0 || compareTuple(tuple, group.tupleMax) > 0) group.tupleMax = tuple
+}
+
+const addToGroup = (group: PointGroup, point: IndexStore.Point): void => {
+  if (group.points === undefined) {
+    widenGroup(group, point)
+    return
+  }
+  if (group.points.length < maximumExactPointsPerGroup) {
+    group.points.push(point)
+    return
+  }
+  for (const existing of group.points) {
+    widenGroup(group, existing)
+  }
+  group.points = undefined
+  widenGroup(group, point)
+}
+
+const groupMatches = (footprint: IndexStore.Footprint, group: PointGroup): boolean => {
+  if (!group.rangeAlways) {
+    if (footprint.lower !== undefined && group.sortMax !== undefined) {
+      const compared = compareValue(group.sortMax, footprint.lower)
+      if (compared < 0 || (compared === 0 && !footprint.lowerInclusive)) return false
+    }
+    if (footprint.upper !== undefined && group.sortMin !== undefined) {
+      const compared = compareValue(group.sortMin, footprint.upper)
+      if (compared > 0 || (compared === 0 && !footprint.upperInclusive)) return false
+    }
+  }
+  if (footprint.cursor !== undefined) {
+    if (footprint.direction === "asc" && compareTuple(group.tupleMax, footprint.cursor) <= 0) return false
+    if (footprint.direction === "desc" && compareTuple(group.tupleMin, footprint.cursor) >= 0) return false
+  }
+  if (footprint.boundary !== undefined && (footprint.hasMore || footprint.full)) {
+    if (footprint.direction === "asc" && compareTuple(group.tupleMin, footprint.boundary) > 0) return false
+    if (footprint.direction === "desc" && compareTuple(group.tupleMax, footprint.boundary) < 0) return false
+  }
+  return true
+}
 
 const pointMatches = (footprint: IndexStore.Footprint, point: IndexStore.Point): boolean => {
   if (point.spaceId !== footprint.spaceId) return false
@@ -129,14 +202,21 @@ const make = (): Service => {
       }),
     affected: (changes) =>
       Effect.sync(() => {
-        if (
-          changes.entityKeys.size === 0 && changes.points.length === 0 && changes.broadModels.size === 0
-        ) return []
-        const pointsByDescriptor = new Map<string, Array<IndexStore.Point>>()
+        if (changes.entityKeys.size === 0 && changes.points.length === 0) return []
+        const groups = new Map<string, PointGroup>()
         for (const point of changes.points) {
-          const points = pointsByDescriptor.get(point.descriptor)
-          if (points === undefined) pointsByDescriptor.set(point.descriptor, [point])
-          else points.push(point)
+          const key = groupKey(point.spaceId, point.descriptor, point.partition)
+          const group = groups.get(key)
+          if (group === undefined) {
+            groups.set(key, {
+              points: [point],
+              sortMin: undefined,
+              sortMax: undefined,
+              rangeAlways: false,
+              tupleMin: [],
+              tupleMax: []
+            })
+          } else addToGroup(group, point)
         }
         const affected: Array<string> = []
         const keys = keysBySpace.get(changes.spaceId)
@@ -146,10 +226,12 @@ const make = (): Service => {
           if (reads === undefined) continue
           const matches = reads.some((read) => {
             if (read._tag === "Entity") return changes.entityKeys.has(read.key)
-            if (changes.broadModels.has(read.footprint.model)) return true
-            return pointsByDescriptor.get(read.footprint.descriptor)?.some((point) =>
-              pointMatches(read.footprint, point)
-            ) ?? false
+            const group = groups.get(
+              groupKey(read.footprint.spaceId, read.footprint.descriptor, read.footprint.partition)
+            )
+            if (group === undefined) return false
+            if (group.points === undefined) return groupMatches(read.footprint, group)
+            return group.points.some((point) => pointMatches(read.footprint, point))
           })
           if (matches) affected.push(key)
         }
