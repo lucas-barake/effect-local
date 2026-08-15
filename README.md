@@ -191,7 +191,8 @@ maintain the active index generation. Index declarations are client local derive
 local layout without changing the wire definition or model schema identity.
 
 Reactive query atoms retain the exact entity and index ranges read by the handler. A write publishes old and new index
-points after commit. Only mounted queries whose recorded ranges can change rerun. Reads through `query.get` use exact
+points after commit, grouped by index partition, so even a very large batch invalidates only queries over the touched
+partitions. Only mounted queries whose recorded ranges can change rerun. Reads through `query.get` use exact
 space, model, and decoded key tokens. `Query.make` has no static dependency list because runtime reads are the source
 of truth.
 
@@ -221,7 +222,6 @@ const layerDatabase = Layer.mergeAll(
 )
 
 const history = {
-  settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 1_024,
   retainedHistoryEntries: 256,
@@ -285,13 +285,18 @@ SQLite tables used by the in memory composition.
 `space.mutate` still completes at the local optimistic commit. It never waits for the server and its error channel
 contains only failures from that local run. Use `space.pending` to inspect every in flight mutation, including its
 decoded payload, submission state, and attempt count. Use `space.pendingFor(PutTask)` when the mutation specific type
-matters. `space.settlements` is a bounded live Stream of terminal `{ pending, receipt }` values. A current subscriber
-receives each terminal settlement once after rollback and pending replay have completed. The Stream has no
-history. Durable recovery remains `space.receipt(PutTask, mutationId)`. Mutation rejections from either surface are
-decoded through `PutTask.rejectionSchema`; authorization, capacity, legacy, and quarantine rejections remain distinct
-origin tagged JSON branches. `settlementCapacity` bounds each space's live feed. A subscriber that does not keep up
-backpressures settlement delivery and reconciliation, but never the local `mutate` commit. Leaving the space or closing
-the replica scope shuts down its settlement Stream.
+matters. `space.settlements()` is a durable Stream of `{ sequence, settlement }` values, where each settlement holds
+the terminal `{ pending, receipt }` pair, delivered only after rollback and pending replay have completed. The default
+`from: "live"` starts at the current tail; `from: "acknowledged"` resumes from the durable acknowledgement floor, and
+`from: n` replays everything after sequence `n`, so a settlement recorded while no subscriber was attached, or before
+an app restart, is still observed. `space.settlementsFor(PutTask)` filters by mutation in the durable read and includes
+legacy receipts. `space.acknowledgeSettlements(sequence)` advances the retention floor: pruning prefers acknowledged
+settlements, but the retained receipt budget is always enforced, so an app that never subscribes or never acknowledges
+keeps syncing. A replay that falls behind the prune horizon fails with `SettlementReplayTruncated` carrying the oldest
+available sequence instead of silently skipping. Consumers read at their own pace from SQLite and can never
+backpressure reconciliation or the local `mutate` commit. Mutation rejections from either surface are decoded through
+`PutTask.rejectionSchema`; authorization, capacity, legacy, and quarantine rejections remain distinct origin tagged
+JSON branches.
 
 Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect Workflow. Supply
 `ClusterWorkflowEngine.layer` and the official runner Layer separately. For one SQLite owner this is normally
@@ -525,8 +530,10 @@ export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId, membe
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
 atoms register exact space addressed keys. Query atoms also retain the entity keys and index ranges their handler
 actually read. Local commits and reconciliation batches refresh only affected mounted reads. Mutation, pending,
-receipt, scope, activation, and status atoms also require a space address. A settlement atom resolves to the lazy live Stream. Mounting
-the atom does not consume or replay events. Materializing that Stream owns one scoped subscription. The membership and
+receipt, scope, activation, and status atoms also require a space address. A settlement atom resolves to the lazy
+durable Stream at its live tail. Mounting the atom does not consume events. Materializing that Stream owns one scoped
+subscription that pages the durable settlement log; use `space.settlements({ from })` directly for replay from a
+cursor or the acknowledgement floor. The membership and
 aggregate atoms use separate keys, so a write does not rebuild the membership list or unrelated statuses. Mutation
 and lifecycle command atoms are concurrent and preserve their typed result. Ephemeral channels are declared once with
 `Ephemeral.make` (an explicit event or state kind) and drive typed publish commands and typed projections. All typed
