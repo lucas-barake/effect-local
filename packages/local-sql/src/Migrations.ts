@@ -1339,6 +1339,23 @@ const clientV14 = makeMigration({
   ]
 })
 
+const clientV15 = makeMigration({
+  id: 15,
+  name: "settlement-prune-watermarks",
+  statements: [
+    `CREATE TABLE effect_local_client_settlement_prune (
+      space_id TEXT NOT NULL,
+      pending_name TEXT NOT NULL,
+      pruned_sequence INTEGER NOT NULL CHECK (pruned_sequence > 0),
+      PRIMARY KEY (space_id, pending_name),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    `CREATE INDEX effect_local_client_receipts_unsettled
+      ON effect_local_client_receipts_data (space_id, schema_generation, local_sequence)
+      WHERE settled_sequence IS NULL`
+  ]
+})
+
 export const clientCatalog = Object.freeze([
   clientV1,
   clientV2,
@@ -1353,7 +1370,8 @@ export const clientCatalog = Object.freeze([
   clientV11,
   clientV12,
   clientV13,
-  clientV14
+  clientV14,
+  clientV15
 ])
 
 const serverV6 = makeMigration({

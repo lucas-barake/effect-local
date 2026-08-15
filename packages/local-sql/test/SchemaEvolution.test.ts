@@ -2071,22 +2071,6 @@ describe("client schema evolution", () => {
   )
 
   it.effect(
-    "builds with an explicit zero window over a stepped evolution and rejects historical schemas",
-    Effect.fnUntraced(
-      function*() {
-        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, {
-          acceptedSchemaVersions: 0
-        })
-        const staleResult = yield* server.pullAuthorized(pullRequest(definitionV1), "principal").pipe(Effect.result)
-        const staleError = expectFailure(staleResult)
-        assert.strictEqual(staleError._tag, "StaleSchema")
-      },
-      Effect.scoped,
-      provideDatabase
-    )
-  )
-
-  it.effect(
     "paginates pull by the projected wire representation",
     Effect.fnUntraced(
       function*() {

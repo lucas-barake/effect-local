@@ -159,6 +159,14 @@ const make = (): Service => {
     reads?: ReadonlyArray<Read>
   }>()
   const keysBySpace = new Map<Identity.SpaceId, Set<string>>()
+  const keyByFootprint = new WeakMap<IndexStore.Footprint, string>()
+  const footprintGroupKey = (footprint: IndexStore.Footprint): string => {
+    const cached = keyByFootprint.get(footprint)
+    if (cached !== undefined) return cached
+    const key = groupKey(footprint.spaceId, footprint.descriptor, footprint.partition)
+    keyByFootprint.set(footprint, key)
+    return key
+  }
   return {
     retain: (key) => {
       const cleanup = Effect.sync(() => {
@@ -226,9 +234,7 @@ const make = (): Service => {
           if (reads === undefined) continue
           const matches = reads.some((read) => {
             if (read._tag === "Entity") return changes.entityKeys.has(read.key)
-            const group = groups.get(
-              groupKey(read.footprint.spaceId, read.footprint.descriptor, read.footprint.partition)
-            )
+            const group = groups.get(footprintGroupKey(read.footprint))
             if (group === undefined) return false
             if (group.points === undefined) return groupMatches(read.footprint, group)
             return group.points.some((point) => pointMatches(read.footprint, point))

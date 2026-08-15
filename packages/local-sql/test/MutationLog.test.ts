@@ -4476,6 +4476,104 @@ describe("server reconciled mutation log", () => {
   )
 
   it.effect(
+    "elides the change list from an oversized settlement snapshot but still delivers the outcome",
+    pipe(Effect.fnUntraced(function*() {
+      const local = yield* service(
+        LocalStore.Store,
+        LocalStore.layer({
+          ...clientHistory,
+          maximumSettlementSnapshotBytes: 1_000,
+          definition: Domain.definition,
+          spaceId,
+          clientId
+        }).pipe(Layer.provide(layerRuntime), Layer.provide(database()))
+      )
+      const small = yield* local.mutate(Domain.PutTodo, Domain.todo("small-snapshot"))
+      yield* local.applyReceipt(legacyRejection(small))
+      const bulk = yield* local.mutate(Domain.PutManyMessages, { count: 40, chats: 2 })
+      yield* local.applyReceipt(legacyRejection(bulk))
+
+      const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
+      const observed: Array<Replica.SettledMutation> = []
+      while (observed.length < 2) observed.push(...(yield* pull))
+      assert.strictEqual(observed[0].settlement.pending.envelope.mutationId, small.envelope.mutationId)
+      assert.isAbove(observed[0].settlement.pending.changes.length, 0)
+      assert.strictEqual(observed[1].settlement.pending.envelope.mutationId, bulk.envelope.mutationId)
+      assert.deepStrictEqual(observed[1].settlement.pending.changes, [])
+      assert.strictEqual(observed[1].settlement.receipt._tag, "Rejected")
+    }, Effect.scoped))
+  )
+
+  it.effect(
+    "keeps a caught-up named settlement subscriber alive while unrelated settlements are pruned",
+    pipe(Effect.fnUntraced(function*() {
+      const local = yield* service(
+        LocalStore.Store,
+        LocalStore.layer({
+          ...clientHistory,
+          retainedReceipts: 2,
+          maximumReceipts: 8,
+          maximumPendingMutations: 8,
+          definition: Domain.definition,
+          spaceId,
+          clientId
+        }).pipe(Layer.provide(layerRuntime), Layer.provide(database()))
+      )
+      const settleTodo = Effect.fnUntraced(function*(id: string) {
+        const pending = yield* local.mutate(Domain.PutTodo, Domain.todo(id))
+        yield* local.applyReceipt(legacyRejection(pending))
+        return pending
+      })
+      const settleMessage = Effect.fnUntraced(function*(id: string) {
+        const pending = yield* local.mutate(Domain.PutMessage, {
+          id,
+          chatId: "chat",
+          sentAt: 1,
+          body: "hello"
+        })
+        yield* local.applyReceipt(legacyRejection(pending))
+        return pending
+      })
+
+      const first = yield* settleTodo("named-first")
+      const pull = yield* Stream.toPull(
+        local.settlements({ from: 0, mutationName: Domain.PutTodo.name })
+      )
+      const observed: Array<Replica.SettledMutation> = []
+      while (observed.length < 1) observed.push(...(yield* pull))
+      assert.strictEqual(observed[0].settlement.pending.envelope.mutationId, first.envelope.mutationId)
+
+      for (let index = 0; index < 8; index++) yield* settleMessage(`unrelated-${index}`)
+      const second = yield* settleTodo("named-second")
+
+      const next = yield* pull
+      assert.deepStrictEqual(
+        next.map((settled) => settled.settlement.pending.envelope.mutationId),
+        [second.envelope.mutationId]
+      )
+    }, Effect.scoped))
+  )
+
+  it.effect(
+    "allocates unique settlement sequences under concurrent settlement paths",
+    pipe(Effect.fnUntraced(function*() {
+      const local = yield* service(LocalStore.Store, localLayer())
+      const pendings: Array<Protocol.PendingMutation> = []
+      for (let index = 0; index < 6; index++) {
+        pendings.push(yield* local.mutate(Domain.PutTodo, Domain.todo(`concurrent-${index}`)))
+      }
+      yield* Effect.forEach(pendings, (item) => local.applyReceipt(legacyRejection(item)), {
+        concurrency: "unbounded"
+      })
+      assert.strictEqual(yield* local.pendingCount, 0)
+      const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
+      const observed: Array<Replica.SettledMutation> = []
+      while (observed.length < 6) observed.push(...(yield* pull))
+      assert.deepStrictEqual(observed.map((settled) => settled.sequence), [1, 2, 3, 4, 5, 6])
+    }, Effect.scoped))
+  )
+
+  it.effect(
     "filters a named settlement replay in the durable backlog and keeps legacy receipts",
     pipe(Effect.fnUntraced(function*() {
       const local = yield* service(LocalStore.Store, localLayer())

@@ -1049,6 +1049,16 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
           const decoded = yield* currentOrLegacyReceipt(row, source)
           const receipt = yield* migrateReceipt(decoded, options.evolution)
           const protocolMetadata = protocolReceiptMetadata(receipt)
+          let snapshotJson = row.settled_pending_json
+          if (
+            snapshotJson !== null && receipt._tag !== "Legacy" && row.pending_name !== null &&
+            !options.definition.mutationByName.has(row.pending_name)
+          ) {
+            snapshotJson = null
+            yield* Effect.logWarning("Dropped a settled mutation snapshot naming a removed mutation").pipe(
+              Effect.annotateLogs({ mutation: row.pending_name, sequence: row.settled_sequence })
+            )
+          }
           yield* sql`INSERT INTO effect_local_client_receipts_data
               (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, receipt_json,
                 source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin,
@@ -1057,7 +1067,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
                 ${receipt.mutationId}, ${receipt.localSequence},
                 ${yield* Codec.stringify(receipt)}, ${receipt.sourceSchema.version}, ${receipt.sourceSchema.hash},
                 ${protocolMetadata.mutationVersion}, ${protocolMetadata.mutationName},
-                ${protocolMetadata.rejectionOrigin}, ${row.settled_pending_json}, ${row.settled_sequence},
+                ${protocolMetadata.rejectionOrigin}, ${snapshotJson}, ${row.settled_sequence},
                 ${row.pending_name})`
         }
         if (rows.length === 0) {

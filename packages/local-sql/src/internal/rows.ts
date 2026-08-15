@@ -384,7 +384,6 @@ export const TerminalReceiptIdentityRow = Schema.Struct({
   local_sequence: Identity.LocalSequence
 })
 export const SnapshotIdRow = Schema.Struct({ snapshot_id: Identity.SnapshotId })
-export const MutationIdRow = Schema.Struct({ mutation_id: Identity.MutationId })
 export const EntityIdentityRow = Schema.Struct({
   model: Schema.String,
   model_version: Identity.SchemaVersion,

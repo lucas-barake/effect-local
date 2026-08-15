@@ -67,6 +67,7 @@ export const layer = <D extends Definition.Any,>(
           target_schema_version, target_schema_hash, migration_hash
           FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
       })
+      const maximumPageReadsPerScan = 64
       const queryCapability = (
         address: IndexStore.Address,
         queryToken: string,
@@ -84,13 +85,33 @@ export const layer = <D extends Definition.Any,>(
             record({ _tag: "Entity", spaceId, key: ReactivityKey.entity(spaceId, model.name, key) }).pipe(
               Effect.andThen(transaction.get(model, key))
             ),
-          from: (model, index) =>
-            IndexStore.query(
+          from: (model, index) => {
+            let pageReads = 0
+            const collapsed = new Map<string, number>()
+            return IndexStore.query(
               sql,
               address,
               model,
               index,
               Effect.fnUntraced(function*(initial) {
+                const partitionKey = initial.partition.map(String).join("\u0000")
+                if (collapsed.has(partitionKey)) {
+                  return () => Effect.void
+                }
+                if (pageReads >= maximumPageReadsPerScan) {
+                  const covering: IndexStore.Footprint = {
+                    ...initial,
+                    lower: undefined,
+                    upper: undefined,
+                    cursor: undefined,
+                    boundary: undefined,
+                    hasMore: false,
+                    full: true
+                  }
+                  collapsed.set(partitionKey, yield* record({ _tag: "Index", footprint: covering }))
+                  return () => Effect.void
+                }
+                pageReads++
                 const position = yield* record({ _tag: "Index", footprint: initial })
                 return Effect.fnUntraced(function*(complete) {
                   reads[position] = { _tag: "Index", footprint: complete }
@@ -98,6 +119,7 @@ export const layer = <D extends Definition.Any,>(
                 })
               })
             )
+          }
         }
       }
       const execute = <Q extends Query.Any,>(

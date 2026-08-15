@@ -1,5 +1,6 @@
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
 import { assert, beforeAll, bench, describe } from "vitest"
 import type * as IndexStore from "../src/IndexStore.js"
@@ -47,12 +48,14 @@ const spreadPoints = (count: number, chats: number): ReadonlyArray<IndexStore.Po
   )
 
 const layerReactivity = QueryReactivity.makeLayer()
+const layerFreshReactivity = Layer.fresh(layerReactivity)
 const runtime = ManagedRuntime.make(layerReactivity)
 
 const services = new Map<number, QueryReactivity.Service>()
 const batches = new Map<number, ReadonlyArray<IndexStore.Point>>()
 const spreadBatch = spreadPoints(8_192, 1_024)
 const querySizes = [100, 1_000] as const
+const smallSizes = [1, 4] as const
 const pointSizes = [512, 2_048, 8_192] as const
 
 const buildService = Effect.fnUntraced(
@@ -66,7 +69,7 @@ const buildService = Effect.fnUntraced(
     }
     return service
   },
-  Effect.provide(layerReactivity)
+  Effect.provide(layerFreshReactivity)
 )
 
 const affected = (queries: number, points: ReadonlyArray<IndexStore.Point>) =>
@@ -85,12 +88,24 @@ beforeAll(async () => {
   for (const size of pointSizes) {
     batches.set(size, singleChatPoints(size))
   }
+  for (const size of smallSizes) {
+    batches.set(size, singleChatPoints(size))
+  }
   assert.deepStrictEqual(affected(1_000, [point("chat-7", 9_500, "message-live")]), ["query-7"])
   assert.deepStrictEqual(affected(1_000, [point("chat-7", 5_000, "message-old")]), [])
+  const collapsedBatch = singleChatPoints(300)
+  const collapsedLive = [...collapsedBatch, point("chat-0", 9_500, "message-live")]
+  assert.deepStrictEqual(affected(1_000, collapsedLive), ["query-0"])
+  assert.deepStrictEqual(affected(1_000, collapsedBatch), [])
 })
 
 describe("invalidation cost", () => {
   for (const queries of querySizes) {
+    for (const points of smallSizes) {
+      bench(`affected ${points} single-chat points against ${queries} retained queries`, () => {
+        affected(queries, batches.get(points)!)
+      })
+    }
     for (const points of pointSizes) {
       bench(`affected ${points} single-chat points against ${queries} retained queries`, () => {
         affected(queries, batches.get(points)!)

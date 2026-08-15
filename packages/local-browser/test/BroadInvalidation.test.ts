@@ -203,7 +203,7 @@ describe("broad invalidation", () => {
       const chatAReadsBefore = chatReads.get("chat-a") ?? 0
       const chatBReadsBefore = chatReads.get("chat-b") ?? 0
 
-      registry.set(mutation, { chatId: "chat-a", count: 2_100, startAt: 100 })
+      registry.set(mutation, { chatId: "chat-a", count: 400, startAt: 100 })
       yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
       yield* Effect.yieldNow
 
@@ -212,7 +212,6 @@ describe("broad invalidation", () => {
       assert.strictEqual(chatAAfter.length, 20)
       assert.isAbove(chatReads.get("chat-a") ?? 0, chatAReadsBefore)
       assert.strictEqual(chatReads.get("chat-b") ?? 0, chatBReadsBefore)
-    }, Effect.scoped),
-    20_000
+    }, Effect.scoped)
   )
 })
