@@ -87,7 +87,7 @@ export const layer = <D extends Definition.Any,>(
             ),
           from: (model, index) => {
             let pageReads = 0
-            const collapsed = new Map<string, number>()
+            const collapsed = new Set<string>()
             return IndexStore.query(
               sql,
               address,
@@ -112,7 +112,8 @@ export const layer = <D extends Definition.Any,>(
                     hasMore: false,
                     full: true
                   }
-                  collapsed.set(partitionKey, yield* record({ _tag: "Index", footprint: covering }))
+                  collapsed.add(partitionKey)
+                  yield* record({ _tag: "Index", footprint: covering })
                   return () => Effect.void
                 }
                 pageReads++

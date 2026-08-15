@@ -83,7 +83,7 @@ const LogBatchRow = Schema.Struct({
   source_schema_hash: NullableSchemaHash
 })
 
-const ReceiptBatchRow = Schema.Struct({
+const ServerReceiptBatchRow = Schema.Struct({
   mutation_id: Identity.MutationId,
   local_sequence: Identity.LocalSequence,
   receipt_json: Schema.String,
@@ -91,7 +91,11 @@ const ReceiptBatchRow = Schema.Struct({
   source_schema_hash: NullableSchemaHash,
   mutation_version: NullableSchemaVersion,
   mutation_name: Schema.NullOr(Schema.String),
-  rejection_origin: Schema.NullOr(Protocol.RejectionOrigin),
+  rejection_origin: Schema.NullOr(Protocol.RejectionOrigin)
+})
+
+const ReceiptBatchRow = Schema.Struct({
+  ...ServerReceiptBatchRow.fields,
   settled_pending_json: Schema.NullOr(Schema.String),
   settled_sequence: Schema.NullOr(Identity.SettlementSequence),
   pending_name: Schema.NullOr(Schema.String)
@@ -1451,17 +1455,6 @@ const ServerProgressRow = Schema.Struct({
   cursor_model: Schema.NullOr(Schema.String),
   cursor_key: Schema.NullOr(Schema.String),
   cursor_sequence: Schema.NullOr(NonNegativeInt)
-})
-
-const ServerReceiptBatchRow = Schema.Struct({
-  mutation_id: Identity.MutationId,
-  local_sequence: Identity.LocalSequence,
-  receipt_json: Schema.String,
-  source_schema_version: NullableSchemaVersion,
-  source_schema_hash: NullableSchemaHash,
-  mutation_version: NullableSchemaVersion,
-  mutation_name: Schema.NullOr(Schema.String),
-  rejection_origin: Schema.NullOr(Protocol.RejectionOrigin)
 })
 
 export interface ServerOptions {

@@ -180,8 +180,7 @@ describe("broad invalidation", () => {
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const mutation = graph.mutation(spaceId, PutManyMessages)
-      const unmountMutation = registry.mount(mutation)
-      yield* Effect.addFinalizer(() => Effect.sync(unmountMutation))
+      yield* AtomRegistry.mount(registry, mutation)
       registry.set(mutation, { chatId: "chat-b", count: 5, startAt: 0 })
       yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
       yield* Effect.yieldNow
@@ -189,14 +188,8 @@ describe("broad invalidation", () => {
       const queries = graph.query(spaceId, LatestMessages)
       const chatA = queries({ chatId: "chat-a" })
       const chatB = queries({ chatId: "chat-b" })
-      const unmountChatA = registry.mount(chatA)
-      const unmountChatB = registry.mount(chatB)
-      yield* Effect.addFinalizer(() =>
-        Effect.sync(() => {
-          unmountChatB()
-          unmountChatA()
-        })
-      )
+      yield* AtomRegistry.mount(registry, chatA)
+      yield* AtomRegistry.mount(registry, chatB)
       yield* AtomRegistry.getResult(registry, chatA, { suspendOnWaiting: true })
       const chatBBefore = yield* AtomRegistry.getResult(registry, chatB, { suspendOnWaiting: true })
       assert.strictEqual(chatBBefore.length, 5)

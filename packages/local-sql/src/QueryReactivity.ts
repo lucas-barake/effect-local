@@ -54,9 +54,6 @@ const maximumExactPointsPerGroup = 256
 
 interface PointGroup {
   points: Array<IndexStore.Point> | undefined
-  sortMin: string | number | undefined
-  sortMax: string | number | undefined
-  rangeAlways: boolean
   tupleMin: ReadonlyArray<string | number>
   tupleMax: ReadonlyArray<string | number>
 }
@@ -75,12 +72,6 @@ const groupKey = (
 }
 
 const widenGroup = (group: PointGroup, point: IndexStore.Point): void => {
-  const ranged = point.sort[0]
-  if (ranged === undefined) group.rangeAlways = true
-  else {
-    if (group.sortMin === undefined || compareValue(ranged, group.sortMin) < 0) group.sortMin = ranged
-    if (group.sortMax === undefined || compareValue(ranged, group.sortMax) > 0) group.sortMax = ranged
-  }
   const tuple = [...point.sort, point.entityKey]
   if (group.tupleMin.length === 0 || compareTuple(tuple, group.tupleMin) < 0) group.tupleMin = tuple
   if (group.tupleMax.length === 0 || compareTuple(tuple, group.tupleMax) > 0) group.tupleMax = tuple
@@ -103,15 +94,13 @@ const addToGroup = (group: PointGroup, point: IndexStore.Point): void => {
 }
 
 const groupMatches = (footprint: IndexStore.Footprint, group: PointGroup): boolean => {
-  if (!group.rangeAlways) {
-    if (footprint.lower !== undefined && group.sortMax !== undefined) {
-      const compared = compareValue(group.sortMax, footprint.lower)
-      if (compared < 0 || (compared === 0 && !footprint.lowerInclusive)) return false
-    }
-    if (footprint.upper !== undefined && group.sortMin !== undefined) {
-      const compared = compareValue(group.sortMin, footprint.upper)
-      if (compared > 0 || (compared === 0 && !footprint.upperInclusive)) return false
-    }
+  if (footprint.lower !== undefined) {
+    const compared = compareValue(group.tupleMax[0], footprint.lower)
+    if (compared < 0 || (compared === 0 && !footprint.lowerInclusive)) return false
+  }
+  if (footprint.upper !== undefined) {
+    const compared = compareValue(group.tupleMin[0], footprint.upper)
+    if (compared > 0 || (compared === 0 && !footprint.upperInclusive)) return false
   }
   if (footprint.cursor !== undefined) {
     if (footprint.direction === "asc" && compareTuple(group.tupleMax, footprint.cursor) <= 0) return false
@@ -214,17 +203,12 @@ const make = (): Service => {
         const groups = new Map<string, PointGroup>()
         for (const point of changes.points) {
           const key = groupKey(point.spaceId, point.descriptor, point.partition)
-          const group = groups.get(key)
+          let group = groups.get(key)
           if (group === undefined) {
-            groups.set(key, {
-              points: [point],
-              sortMin: undefined,
-              sortMax: undefined,
-              rangeAlways: false,
-              tupleMin: [],
-              tupleMax: []
-            })
-          } else addToGroup(group, point)
+            group = { points: [], tupleMin: [], tupleMax: [] }
+            groups.set(key, group)
+          }
+          addToGroup(group, point)
         }
         const affected: Array<string> = []
         const keys = keysBySpace.get(changes.spaceId)

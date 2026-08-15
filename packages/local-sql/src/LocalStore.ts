@@ -424,9 +424,7 @@ export const layer = (
           sql`DELETE FROM effect_local_client_pending_data
             WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
               AND mutation_id IN ${sql.in(mutationIds)}
-            RETURNING membership_incarnation, mutation_id, local_sequence, basis, name, payload_json, digest,
-              digest_version, source_schema_version, source_schema_hash, mutation_version, optimistic_result_json,
-              changes_json, submission_state, attempt_count`
+            RETURNING ${pendingColumns}`
       })
       const findSettlementState = SqlSchema.findOne({
         Request: Schema.Void,
@@ -438,23 +436,8 @@ export const layer = (
       const findSettledReceipts = SqlSchema.findAll({
         Request: Schema.Struct({
           after: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-          limit: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))
-        }),
-        Result: Rows.SettledReceiptRow,
-        execute: ({ after, limit }) =>
-          sql`SELECT receipt_json, settled_pending_json, settled_sequence
-          FROM effect_local_client_receipts_data
-          WHERE space_id = ${options.spaceId} AND schema_generation = (
-            SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
-            AND settled_sequence IS NOT NULL AND settled_pending_json IS NOT NULL
-            AND settled_sequence > ${after}
-          ORDER BY settled_sequence LIMIT ${limit}`
-      })
-      const findSettledReceiptsNamed = SqlSchema.findAll({
-        Request: Schema.Struct({
-          after: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
           limit: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
-          name: Schema.String
+          name: Schema.NullOr(Schema.String)
         }),
         Result: Rows.SettledReceiptRow,
         execute: ({ after, limit, name }) =>
@@ -463,7 +446,7 @@ export const layer = (
           WHERE space_id = ${options.spaceId} AND schema_generation = (
             SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
             AND settled_sequence IS NOT NULL AND settled_pending_json IS NOT NULL
-            AND settled_sequence > ${after} AND pending_name = ${name}
+            AND settled_sequence > ${after} AND (${name} IS NULL OR pending_name = ${name})
           ORDER BY settled_sequence LIMIT ${limit}`
       })
       const findNamedPruneMark = SqlSchema.findOneOption({
@@ -1009,20 +992,22 @@ export const layer = (
             Effect.mapError(StorageUnavailable.make)
           )
           const rowByMutation = new Map(deletedRows.map((row) => [row.mutation_id, row]))
-          const deletedSettlements: Array<Replica.MutationSettlement> = []
+          const deleted: Array<{
+            readonly settlement: Replica.MutationSettlement
+            readonly row: typeof Rows.PendingRow.Type
+          }> = []
           for (const settlement of settlements) {
-            if (rowByMutation.has(settlement.pending.envelope.mutationId)) deletedSettlements.push(settlement)
+            const row = rowByMutation.get(settlement.pending.envelope.mutationId)
+            if (row !== undefined) deleted.push({ row, settlement })
           }
-          if (rowByMutation.size > deletedSettlements.length) {
+          if (rowByMutation.size > deleted.length) {
             return yield* new ReplicaError.StorageCorrupt({
               message: "Deleted settlement rows did not match the requested pending mutations"
             })
           }
           const state = yield* findSettlementState(undefined).pipe(Effect.mapError(StorageUnavailable.make))
           let sequence = state.next_settled_sequence
-          for (const settlement of deletedSettlements) {
-            const row = rowByMutation.get(settlement.pending.envelope.mutationId)
-            if (row === undefined) continue
+          for (const { row } of deleted) {
             yield* persistSettledSnapshot(row, sequence)
             sequence++
           }
@@ -1030,7 +1015,7 @@ export const layer = (
             yield* sql`UPDATE effect_local_client_spaces SET next_settled_sequence = ${sequence}
                 WHERE space_id = ${options.spaceId}`
           }
-          return deletedSettlements
+          return deleted.map(({ settlement }) => settlement)
         })).pipe(
           Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
           Effect.tap((deletedSettlements) => updatePendingMetric(-deletedSettlements.length))
@@ -1048,20 +1033,11 @@ export const layer = (
         const pending = yield* Codec.parse(row.settled_pending_json).pipe(
           Effect.flatMap((value) => Codec.decode(Protocol.PendingMutation, value))
         )
-        const expectedDigest = yield* Protocol.mutationDigest({
-          spaceId: pending.envelope.spaceId,
-          clientId: pending.envelope.clientId,
-          mutationId: pending.envelope.mutationId,
-          localSequence: pending.envelope.localSequence,
-          basis: pending.envelope.basis,
-          name: pending.envelope.name,
-          payload: pending.envelope.payload,
-          digestVersion: pending.envelope.digestVersion,
-          membershipIncarnation: pending.envelope.membershipIncarnation,
-          sourceSchema: pending.envelope.sourceSchema,
-          mutationVersion: pending.envelope.mutationVersion
-        }).pipe(Effect.provideService(Crypto.Crypto, crypto))
-        if (expectedDigest !== pending.envelope.digest) {
+        const { digest, ...identity } = pending.envelope
+        const expectedDigest = yield* Protocol.mutationDigest(identity).pipe(
+          Effect.provideService(Crypto.Crypto, crypto)
+        )
+        if (expectedDigest !== digest) {
           return yield* new ReplicaError.StorageCorrupt({
             message: `Settled mutation ${pending.envelope.mutationId} digest does not match its durable identity`
           })
@@ -1089,79 +1065,55 @@ export const layer = (
         )
       }
 
-      const resolveSettlementStart = Effect.fnUntraced(function*(
-        from: Replica.SettlementStart,
-        mutationName: string | undefined
-      ) {
+      const resolveSettlementStart = Effect.fnUntraced(function*(from: Replica.SettlementStart) {
         const state = yield* findSettlementState(undefined).pipe(Effect.mapError(StorageUnavailable.make))
-        let start: number
-        if (from === "live") start = state.next_settled_sequence - 1
-        else if (from === "acknowledged") start = state.settlement_floor
-        else {
-          if (!Number.isSafeInteger(from) || from < 0) {
-            return yield* new ReplicaError.ProtocolInvalid({
-              message: "Settlement replay position must be a nonnegative safe integer"
-            })
-          }
-          start = from
-        }
-        const mark = yield* readPruneMark(mutationName)
-        if (start < mark) {
-          return yield* new ReplicaError.SettlementReplayTruncated({
-            requested: start,
-            oldestAvailable: mark
+        if (from === "live") return state.next_settled_sequence - 1
+        if (from === "acknowledged") return state.settlement_floor
+        if (!Number.isSafeInteger(from) || from < 0) {
+          return yield* new ReplicaError.ProtocolInvalid({
+            message: "Settlement replay position must be a nonnegative safe integer"
           })
         }
-        return start
+        return from
       })
 
       const settlementsStream = (readOptions: {
         readonly from: Replica.SettlementStart
         readonly mutationName?: string | undefined
       }): Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError> => {
-        const readPage = (after: number) => {
-          if (readOptions.mutationName === undefined) {
-            return findSettledReceipts({ after, limit: settlementPageSize })
-          }
-          return findSettledReceiptsNamed({ after, limit: settlementPageSize, name: readOptions.mutationName })
-        }
-        const acquire = Effect.gen(function*() {
-          const subscription = yield* PubSub.subscribe(settlementSignal)
-          const start = yield* resolveSettlementStart(readOptions.from, readOptions.mutationName)
-          return { subscription, start }
-        })
         const readStep = (cursor: number) =>
           sql.withTransaction(Effect.gen(function*() {
             const mark = yield* readPruneMark(readOptions.mutationName)
-            const rows = yield* readPage(cursor).pipe(Effect.mapError(StorageUnavailable.make))
-            return { mark, rows }
+            if (cursor < mark) {
+              return yield* new ReplicaError.SettlementReplayTruncated({
+                requested: cursor,
+                oldestAvailable: mark
+              })
+            }
+            return yield* findSettledReceipts({
+              after: cursor,
+              limit: settlementPageSize,
+              name: readOptions.mutationName ?? null
+            }).pipe(Effect.mapError(StorageUnavailable.make))
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-        return Stream.scoped(
-          Stream.fromEffect(acquire).pipe(
-            Stream.flatMap(({ start, subscription }) =>
-              Stream.paginate(
-                start,
-                Effect.fnUntraced(function*(cursor: number) {
-                  while (true) {
-                    const { mark, rows } = yield* readStep(cursor)
-                    if (cursor < mark) {
-                      return yield* new ReplicaError.SettlementReplayTruncated({
-                        requested: cursor,
-                        oldestAvailable: mark
-                      })
-                    }
-                    if (rows.length > 0) {
-                      const settled = yield* Effect.forEach(rows, decodeSettledRow)
-                      const last = rows[rows.length - 1].settled_sequence
-                      return [settled, Option.some<number>(last)] as const
-                    }
-                    yield* PubSub.take(subscription)
-                  }
-                })
-              )
-            )
+        return Stream.unwrap(Effect.gen(function*() {
+          const subscription = yield* PubSub.subscribe(settlementSignal)
+          const start = yield* resolveSettlementStart(readOptions.from)
+          return Stream.paginate(
+            start,
+            Effect.fnUntraced(function*(cursor: number) {
+              while (true) {
+                const rows = yield* readStep(cursor)
+                if (rows.length > 0) {
+                  const settled = yield* Effect.forEach(rows, decodeSettledRow)
+                  const last = rows[rows.length - 1].settled_sequence
+                  return [settled, Option.some<number>(last)] as const
+                }
+                yield* PubSub.take(subscription)
+              }
+            })
           )
-        )
+        }))
       }
 
       const acknowledgeSettlements = (sequence: number) => {

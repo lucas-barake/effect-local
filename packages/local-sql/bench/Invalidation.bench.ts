@@ -55,8 +55,7 @@ const services = new Map<number, QueryReactivity.Service>()
 const batches = new Map<number, ReadonlyArray<IndexStore.Point>>()
 const spreadBatch = spreadPoints(8_192, 1_024)
 const querySizes = [100, 1_000] as const
-const smallSizes = [1, 4] as const
-const pointSizes = [512, 2_048, 8_192] as const
+const pointSizes = [1, 4, 512, 2_048, 8_192] as const
 
 const buildService = Effect.fnUntraced(
   function*(queries: number) {
@@ -88,9 +87,6 @@ beforeAll(async () => {
   for (const size of pointSizes) {
     batches.set(size, singleChatPoints(size))
   }
-  for (const size of smallSizes) {
-    batches.set(size, singleChatPoints(size))
-  }
   assert.deepStrictEqual(affected(1_000, [point("chat-7", 9_500, "message-live")]), ["query-7"])
   assert.deepStrictEqual(affected(1_000, [point("chat-7", 5_000, "message-old")]), [])
   const collapsedBatch = singleChatPoints(300)
@@ -101,11 +97,6 @@ beforeAll(async () => {
 
 describe("invalidation cost", () => {
   for (const queries of querySizes) {
-    for (const points of smallSizes) {
-      bench(`affected ${points} single-chat points against ${queries} retained queries`, () => {
-        affected(queries, batches.get(points)!)
-      })
-    }
     for (const points of pointSizes) {
       bench(`affected ${points} single-chat points against ${queries} retained queries`, () => {
         affected(queries, batches.get(points)!)

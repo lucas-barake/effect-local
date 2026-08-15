@@ -205,8 +205,7 @@ describe("query pagination", () => {
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const mutation = graph.mutation(spaceId, PutMessage)
-      const unmountMutation = registry.mount(mutation)
-      yield* Effect.addFinalizer(() => Effect.sync(unmountMutation))
+      yield* AtomRegistry.mount(registry, mutation)
       for (let n = 1; n <= 4; n++) {
         registry.set(mutation, { id: `s${n}`, createdAt: n, text: `message ${n}` })
         yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
@@ -214,8 +213,7 @@ describe("query pagination", () => {
       yield* Effect.yieldNow
 
       const twoPages = graph.query(spaceId, TwoPages)(undefined)
-      const unmountTwoPages = registry.mount(twoPages)
-      yield* Effect.addFinalizer(() => Effect.sync(unmountTwoPages))
+      yield* AtomRegistry.mount(registry, twoPages)
       const value = yield* AtomRegistry.getResult(registry, twoPages, { suspendOnWaiting: true })
       assert.deepStrictEqual(value, { first: ["s1", "s2"], second: ["s3", "s4"] })
       const readsBefore = twoPageReads
@@ -237,8 +235,7 @@ describe("query pagination", () => {
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const mutation = graph.mutation(spaceId, PutMessage)
-      const unmountMutation = registry.mount(mutation)
-      yield* Effect.addFinalizer(() => Effect.sync(unmountMutation))
+      yield* AtomRegistry.mount(registry, mutation)
       for (let n = 1; n <= 6; n++) {
         registry.set(mutation, { id: `m${n}`, createdAt: n, text: `message ${n}` })
         yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
@@ -247,20 +244,17 @@ describe("query pagination", () => {
 
       const pages = graph.query(spaceId, PageMessages)
       const head = pages({ cursor: null, limit: 2 })
-      const unmountHead = registry.mount(head)
-      yield* Effect.addFinalizer(() => Effect.sync(unmountHead))
+      yield* AtomRegistry.mount(registry, head)
       const first = yield* AtomRegistry.getResult(registry, head, { suspendOnWaiting: true })
       assert.deepStrictEqual(first.items.map((message) => message.id), ["m6", "m5"])
       const olderCursor = first.next!
       const older = pages({ cursor: olderCursor, limit: 2 })
-      const unmountOlder = registry.mount(older)
-      yield* Effect.addFinalizer(() => Effect.sync(unmountOlder))
+      yield* AtomRegistry.mount(registry, older)
       const olderValue = yield* AtomRegistry.getResult(registry, older, { suspendOnWaiting: true })
       assert.deepStrictEqual(olderValue.items.map((message) => message.id), ["m4", "m3"])
 
       const window = pages({ cursor: null, limit: 4 })
-      const unmountWindow = registry.mount(window)
-      yield* Effect.addFinalizer(() => Effect.sync(unmountWindow))
+      yield* AtomRegistry.mount(registry, window)
       const windowBefore = yield* AtomRegistry.getResult(registry, window, { suspendOnWaiting: true })
       assert.deepStrictEqual(windowBefore.items.map((message) => message.id), ["m6", "m5", "m4", "m3"])
 
@@ -293,8 +287,7 @@ describe("query pagination", () => {
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const mutation = graph.mutation(spaceId, PutMessage)
-      const unmountMutation = registry.mount(mutation)
-      yield* Effect.addFinalizer(() => Effect.sync(unmountMutation))
+      yield* AtomRegistry.mount(registry, mutation)
       for (let n = 1; n <= 3; n++) {
         registry.set(mutation, { id: `a${n}`, createdAt: n, text: `message ${n}` })
         yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
@@ -303,14 +296,12 @@ describe("query pagination", () => {
 
       const pages = graph.query(spaceId, PageAscending)
       const head = pages({ cursor: null, limit: 2 })
-      const unmountHead = registry.mount(head)
-      yield* Effect.addFinalizer(() => Effect.sync(unmountHead))
+      yield* AtomRegistry.mount(registry, head)
       const first = yield* AtomRegistry.getResult(registry, head, { suspendOnWaiting: true })
       assert.deepStrictEqual(first.items.map((message) => message.id), ["a1", "a2"])
       const tailCursor = first.next!
       const tail = pages({ cursor: tailCursor, limit: 2 })
-      const unmountTail = registry.mount(tail)
-      yield* Effect.addFinalizer(() => Effect.sync(unmountTail))
+      yield* AtomRegistry.mount(registry, tail)
       const second = yield* AtomRegistry.getResult(registry, tail, { suspendOnWaiting: true })
       assert.deepStrictEqual(second.items.map((message) => message.id), ["a3"])
       assert.isNull(second.next)

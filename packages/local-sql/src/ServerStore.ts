@@ -2154,20 +2154,9 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
     })
   )
 
-export interface TrustedOptions<R = never,> extends HistoryOptions {
-  readonly definition: Definition.Any
-  readonly evolution?: Evolution.Evolution
-  readonly acceptedSchemaVersions?: number
-  readonly schemaEvolutionBatchSize?: number
-  readonly schemaEvolutionBatchBytes?: number
-  readonly readAuthorizationRefreshInterval: Duration.Input
-  readonly wakeCapacity?: number
-  readonly maximumWatchersPerSpace: number
-  readonly maximumConcurrentReadAuthorizations: number
-  readonly maximumPendingReadAuthorizations: number
-  readonly readAuthorizationCacheCapacity: number
-  readonly offlineWake?: OfflineWake.Options<R>
-}
+export interface TrustedOptions<R = never,>
+  extends Omit<Options<R>, "authorizeAccess" | "authorizeMutation" | "authorizeRead">
+{}
 
 export const layerTrusted = <R = never,>(
   options: TrustedOptions<R>
