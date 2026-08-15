@@ -189,6 +189,7 @@ const layerStore = ServerStore.layer({
   ...serverHistory,
   definition,
   evolution,
+  acceptedSchemaVersions: 0,
   authorizeAccess: ({ principal, spaceId: requestedSpaceId }) => {
     if (
       principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
@@ -519,6 +520,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     ...serverHistory,
     definition,
     evolution,
+    acceptedSchemaVersions: 0,
     authorizeAccess: ({ principal, spaceId: requestedSpaceId }) => {
       if (
         principal !== null && typeof principal === "object" && !Array.isArray(principal) &&

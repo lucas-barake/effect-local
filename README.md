@@ -615,8 +615,10 @@ local state and pending mutations. The server uses it to admit old callers and p
 ### Open the server schema window
 
 `acceptedSchemaVersions` counts immediately preceding definitions in the evolution chain. A value of `1` accepts the
-current definition and version N minus 1. Server layer construction fails with `InvalidConfiguration` if the requested
-window is missing a required downgrade transform.
+current definition and version N minus 1. Once the evolution catalog has steps the option is required. Omitting it
+fails server layer construction with `InvalidConfiguration`, so a deployment cannot silently ship with the window
+closed. Without an evolution catalog the window is implicitly zero. Construction also fails with
+`InvalidConfiguration` if the requested window is missing a required downgrade transform.
 
 ```ts
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"

@@ -230,6 +230,13 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
       const crypto = yield* Crypto.Crypto
       const runtime = yield* MutationRuntime.MutationRuntime
       const evolution = options.evolution ?? Evolution.make({ current: options.definition })
+      if (options.acceptedSchemaVersions === undefined && evolution.steps.length > 0) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "acceptedSchemaVersions",
+          message:
+            "acceptedSchemaVersions must be chosen explicitly when the evolution catalog has steps; pass 0 to serve only the current schema or N to accept the previous N versions"
+        })
+      }
       const acceptedSchemaVersions = options.acceptedSchemaVersions ?? 0
       if (!Number.isSafeInteger(acceptedSchemaVersions) || acceptedSchemaVersions < 0) {
         return yield* new ReplicaError.InvalidConfiguration({
@@ -2150,6 +2157,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
 export interface TrustedOptions<R = never,> extends HistoryOptions {
   readonly definition: Definition.Any
   readonly evolution?: Evolution.Evolution
+  readonly acceptedSchemaVersions?: number
   readonly schemaEvolutionBatchSize?: number
   readonly schemaEvolutionBatchBytes?: number
   readonly readAuthorizationRefreshInterval: Duration.Input
