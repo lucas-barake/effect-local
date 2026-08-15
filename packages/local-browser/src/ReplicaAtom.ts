@@ -16,6 +16,7 @@ import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Hash from "effect/Hash"
 import type * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
@@ -44,9 +45,11 @@ class EphemeralSessionKey implements Equal.Equal {
   constructor(profile: Ephemeral.AnyMember, options: EphemeralClient.SessionOptions<Ephemeral.AnyMember>) {
     this.profile = profile
     this.options = options
+    // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Atom family keys are built synchronously; the session effect re-encodes the value through the Effect codec, so this encode only derives the cache identity.
+    const encoded = Schema.encodeSync(profile.payloadSchema)(options.value)
     this.value = `${options.spaceId}:${options.member.clientId}:${options.member.membershipIncarnation}:${
       Duration.toMillis(options.ttl)
-    }:${Canonical.hash(options.value)}`
+    }:${Canonical.hash(encoded)}`
   }
   [Equal.symbol](that: unknown): boolean {
     return that instanceof EphemeralSessionKey && this.value === that.value && this.profile === that.profile
@@ -85,6 +88,24 @@ class EphemeralStateKey implements Equal.Equal {
   }
   [Hash.symbol](): number {
     return Hash.hash(this.session) ^ Hash.hash(this.definition)
+  }
+}
+
+class EphemeralPublishKey implements Equal.Equal {
+  readonly value: string
+  readonly definition: Ephemeral.Any
+  readonly target: EphemeralClient.PublishTarget
+  constructor(definition: Ephemeral.Any, target: EphemeralClient.PublishTarget) {
+    this.definition = definition
+    this.target = target
+    this.value = `${target.spaceId}:${target.member.clientId}:${target.member.membershipIncarnation}`
+  }
+  [Equal.symbol](that: unknown): boolean {
+    return that instanceof EphemeralPublishKey && this.value === that.value &&
+      this.definition === that.definition
+  }
+  [Hash.symbol](): number {
+    return Hash.string(this.value) ^ Hash.hash(this.definition)
   }
 }
 
@@ -195,6 +216,33 @@ export const make = <E,>(
       AsyncResult.AsyncResult<ReadonlyArray<EphemeralClient.MemberEntry<M>>, ProjectionError>
     >
 
+  const ephemeralPublishFamily = Atom.family((key: EphemeralPublishKey) =>
+    runtime.fn<{
+      readonly payload?: unknown
+      readonly ttl: Duration.Input
+      readonly key?: unknown
+    }>()(
+      (input) =>
+        Effect.yieldNow.pipe(Effect.andThen(EphemeralClient.EphemeralClient.use((client) => {
+          if (key.definition.kind === "event") {
+            return client.publish(key.definition, {
+              spaceId: key.target.spaceId,
+              member: key.target.member,
+              payload: input.payload,
+              ttl: input.ttl
+            })
+          }
+          return client.publish(key.definition, {
+            spaceId: key.target.spaceId,
+            member: key.target.member,
+            key: input.key,
+            payload: input.payload,
+            ttl: input.ttl
+          })
+        }))),
+      { concurrent: true }
+    )
+  )
   function publishEphemeral<D extends Ephemeral.AnyEvent,>(
     definition: D,
     target: EphemeralClient.PublishTarget
@@ -223,31 +271,7 @@ export const make = <E,>(
     void,
     ReplicaError.ReplicaError | Ephemeral.EncodeError | E
   > {
-    return runtime.fn<{
-      readonly payload?: unknown
-      readonly ttl: Duration.Input
-      readonly key?: unknown
-    }>()(
-      (input) =>
-        Effect.yieldNow.pipe(Effect.andThen(EphemeralClient.EphemeralClient.use((client) => {
-          if (definition.kind === "event") {
-            return client.publish(definition, {
-              spaceId: target.spaceId,
-              member: target.member,
-              payload: input.payload,
-              ttl: input.ttl
-            })
-          }
-          return client.publish(definition, {
-            spaceId: target.spaceId,
-            member: target.member,
-            key: input.key,
-            payload: input.payload,
-            ttl: input.ttl
-          })
-        }))),
-      { concurrent: true }
-    )
+    return ephemeralPublishFamily(new EphemeralPublishKey(definition, target))
   }
 
   const entity = <M extends Model.Any,>(spaceId: Identity.SpaceId, model: M) =>

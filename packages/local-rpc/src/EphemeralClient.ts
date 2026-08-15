@@ -8,6 +8,7 @@ import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Hash from "effect/Hash"
 import * as Layer from "effect/Layer"
@@ -15,7 +16,7 @@ import * as PubSub from "effect/PubSub"
 import * as RcMap from "effect/RcMap"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
-import type * as Scope from "effect/Scope"
+import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import type * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
@@ -171,12 +172,23 @@ interface RawView {
   readonly states: ReadonlyMap<string, Protocol.EphemeralStateEntry>
 }
 
+type ViewScope =
+  | { readonly kind: "all" }
+  | { readonly kind: "members" }
+  | { readonly kind: "state"; readonly channel: string }
+
+interface ViewEmission {
+  readonly view: RawView
+  readonly scope: ViewScope
+}
+
 interface SessionRuntime {
   readonly requestHash: string
-  readonly views: PubSub.PubSub<RawView>
+  readonly views: PubSub.PubSub<ViewEmission>
   readonly events: PubSub.PubSub<Protocol.EphemeralEventEntry>
   readonly ready: Deferred.Deferred<void, ReplicaError.ReplicaError>
   readonly failure: Deferred.Deferred<never, ReplicaError.ReplicaError>
+  readonly recordMemberValue: (value: typeof Schema.Json.Type) => void
 }
 
 const sameMember = (left: Protocol.EphemeralMember, right: Protocol.EphemeralMember) =>
@@ -194,39 +206,48 @@ const stateIdentity = (
 const reduceView = (
   current: RawView | undefined,
   message: Exclude<Protocol.EphemeralMessage, Protocol.EphemeralEvent | Protocol.EphemeralEventCleared>
-): RawView | undefined => {
+): ViewEmission | undefined => {
   if (message._tag === "Snapshot") {
     return {
-      members: message.members,
-      states: new Map(
-        message.states.map((entry) => [stateIdentity(entry.member, entry.channel, entry.key), entry])
-      )
+      view: {
+        members: message.members,
+        states: new Map(
+          message.states.map((entry) => [stateIdentity(entry.member, entry.channel, entry.key), entry])
+        )
+      },
+      scope: { kind: "all" }
     }
   }
   if (current === undefined) return undefined
   if (message._tag === "MemberUpserted") {
     return {
-      ...current,
-      members: [
-        ...current.members.filter((entry) => !sameMember(entry.member, message.entry.member)),
-        message.entry
-      ]
+      view: {
+        ...current,
+        members: [
+          ...current.members.filter((entry) => !sameMember(entry.member, message.entry.member)),
+          message.entry
+        ]
+      },
+      scope: { kind: "members" }
     }
   }
   if (message._tag === "MemberLeft") {
     return {
-      ...current,
-      members: current.members.filter((entry) => !sameMember(entry.member, message.member))
+      view: {
+        ...current,
+        members: current.members.filter((entry) => !sameMember(entry.member, message.member))
+      },
+      scope: { kind: "members" }
     }
   }
   if (message._tag === "StateSet") {
     const states = new Map(current.states)
     states.set(stateIdentity(message.entry.member, message.entry.channel, message.entry.key), message.entry)
-    return { ...current, states }
+    return { view: { ...current, states }, scope: { kind: "state", channel: message.entry.channel } }
   }
   const states = new Map(current.states)
   states.delete(stateIdentity(message.member, message.channel, message.key))
-  return { ...current, states }
+  return { view: { ...current, states }, scope: { kind: "state", channel: message.channel } }
 }
 
 const stateSlice = (view: RawView, channel: string): ReadonlyArray<Protocol.EphemeralStateEntry> => {
@@ -252,10 +273,23 @@ const memberSlice = (view: RawView): ReadonlyArray<Protocol.EphemeralMemberEntry
   })
 }
 
-const changedSlice = <A,>(previous: string | undefined, slice: A) => {
-  const fingerprint = Canonical.hash(slice)
-  if (fingerprint === previous) return [previous, []] as const
-  return [fingerprint, [slice]] as const
+interface ProjectionState {
+  readonly emitted: boolean
+  readonly fingerprint: string | undefined
+}
+
+const initialProjection = (): ProjectionState => ({ emitted: false, fingerprint: undefined })
+
+const projectSlice = <A,>(
+  affects: (scope: ViewScope) => boolean,
+  slice: (view: RawView) => A
+) =>
+(state: ProjectionState, emission: ViewEmission) => {
+  if (state.emitted && !affects(emission.scope)) return [state, []] as const
+  const next = slice(emission.view)
+  const fingerprint = Canonical.hash(next)
+  if (state.emitted && fingerprint === state.fingerprint) return [state, []] as const
+  return [{ emitted: true, fingerprint }, [next]] as const
 }
 
 export const layerFromSession = (
@@ -425,7 +459,10 @@ export const layerFromSession = (
           })
         )
 
-      const joinWire = (request: Protocol.EphemeralJoinRequest) =>
+      const joinWire = (
+        request: Protocol.EphemeralJoinRequest,
+        memberValue: () => typeof Schema.Json.Type
+      ) =>
         ProtocolSessionRetry.runStream(
           session,
           (version) =>
@@ -433,7 +470,7 @@ export const layerFromSession = (
               const owner = {}
               const started = yield* Deferred.make<Protocol.EphemeralSessionStarted>()
               const acquisition = yield* client.JoinEphemeral(
-                { ...request, protocolVersion: version },
+                { ...request, value: memberValue(), protocolVersion: version },
                 { asQueue: true }
               ).pipe(Effect.forkScoped({ startImmediately: true }))
               const queue = yield* Fiber.join(acquisition).pipe(
@@ -523,23 +560,24 @@ export const layerFromSession = (
 
       const runtimes = yield* RcMap.make({
         lookup: Effect.fnUntraced(function*(identity: SessionIdentity) {
-          const views = yield* PubSub.unbounded<RawView>({ replay: 1 })
+          const views = yield* PubSub.unbounded<ViewEmission>({ replay: 1 })
           const events = yield* PubSub.unbounded<Protocol.EphemeralEventEntry>()
           const ready = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           const failure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
           let view: RawView | undefined
+          let memberValue = identity.request.value
           const consume = (message: Protocol.EphemeralMessage) => {
             if (message._tag === "Event") return PubSub.publish(events, message.entry).pipe(Effect.asVoid)
             if (message._tag === "EventCleared") return Effect.void
             const next = reduceView(view, message)
             if (next === undefined) return Effect.void
-            view = next
+            view = next.view
             return PubSub.publish(views, next).pipe(
               Effect.andThen(Deferred.succeed(ready, undefined)),
               Effect.asVoid
             )
           }
-          yield* joinWire(identity.request).pipe(
+          yield* joinWire(identity.request, () => memberValue).pipe(
             Stream.runForEach(consume),
             Effect.catchCause((cause) =>
               Deferred.failCause(ready, cause).pipe(
@@ -565,17 +603,14 @@ export const layerFromSession = (
             views,
             events,
             ready,
-            failure
+            failure,
+            recordMemberValue: (value) => {
+              memberValue = value
+            }
           }
           return runtime
         })
       })
-
-      const decodeFailure = (definition: string) => (cause: Schema.SchemaError) =>
-        Effect.fail(new Ephemeral.DecodeError({ definition, cause }))
-
-      const encodeFailure = (definition: string) => (cause: Schema.SchemaError) =>
-        Effect.fail(new Ephemeral.EncodeError({ definition, cause }))
 
       const makeSession = <M extends Ephemeral.AnyMember,>(
         profile: M,
@@ -588,7 +623,8 @@ export const layerFromSession = (
             Stream.filter((entry) => entry.channel === definition.name),
             Stream.mapEffect((entry) =>
               Schema.decodeUnknownEffect(definition.payloadSchema)(entry.value).pipe(
-                Effect.catchTag("SchemaError", decodeFailure(definition.name)),
+                Effect.catchTag("SchemaError", (cause) =>
+                  Effect.fail(new Ephemeral.DecodeError({ definition: definition.name, cause }))),
                 Effect.map((payload) => ({ member: entry.member, payload }))
               )
             ),
@@ -596,14 +632,21 @@ export const layerFromSession = (
           )
         const state = (definition: Ephemeral.AnyState) =>
           Stream.fromPubSub(runtime.views).pipe(
-            Stream.map((current) => stateSlice(current, definition.name)),
-            Stream.mapAccum((): string | undefined => undefined, changedSlice),
+            Stream.mapAccum(
+              initialProjection,
+              projectSlice(
+                (scope) =>
+                  scope.kind === "all" || (scope.kind === "state" && scope.channel === definition.name),
+                (view) => stateSlice(view, definition.name)
+              )
+            ),
             Stream.mapEffect(Effect.forEach((entry) =>
               Effect.all({
                 key: Schema.decodeUnknownEffect(definition.keySchema)(entry.key),
                 value: Schema.decodeUnknownEffect(definition.payloadSchema)(entry.value)
               }).pipe(
-                Effect.catchTag("SchemaError", decodeFailure(definition.name)),
+                Effect.catchTag("SchemaError", (cause) =>
+                  Effect.fail(new Ephemeral.DecodeError({ definition: definition.name, cause }))),
                 Effect.map(({ key, value }) => ({
                   member: entry.member,
                   key,
@@ -615,11 +658,15 @@ export const layerFromSession = (
             Stream.merge(failureStream)
           )
         const members = Stream.fromPubSub(runtime.views).pipe(
-          Stream.map(memberSlice),
-          Stream.mapAccum((): string | undefined => undefined, changedSlice),
+          Stream.mapAccum(
+            initialProjection,
+            projectSlice((scope) =>
+              scope.kind === "all" || scope.kind === "members", memberSlice)
+          ),
           Stream.mapEffect(Effect.forEach((entry) =>
             Schema.decodeUnknownEffect(profile.payloadSchema)(entry.value).pipe(
-              Effect.catchTag("SchemaError", decodeFailure("member")),
+              Effect.catchTag("SchemaError", (cause) =>
+                Effect.fail(new Ephemeral.DecodeError({ definition: "member", cause }))),
               Effect.map((value) => ({
                 member: entry.member,
                 value,
@@ -631,13 +678,19 @@ export const layerFromSession = (
         )
         const updateMember = (value: Ephemeral.Payload<M>) =>
           Schema.encodeEffect(profile.payloadSchema)(value).pipe(
-            Effect.catchTag("SchemaError", encodeFailure("member")),
+            Effect.flatMap((encoded) =>
+              Schema.decodeUnknownEffect(Schema.Json)(encoded)
+            ),
+            Effect.catchTag(
+              "SchemaError",
+              (cause) => Effect.fail(new Ephemeral.EncodeError({ definition: "member", cause }))
+            ),
             Effect.flatMap((encoded) =>
               publishWire(Protocol.EphemeralUpdateMemberRequest.make({
                 spaceId: target.spaceId,
                 member: target.member,
                 value: encoded
-              }))
+              })).pipe(Effect.andThen(Effect.sync(() => runtime.recordMemberValue(encoded))))
             )
           )
         return {
@@ -653,7 +706,9 @@ export const layerFromSession = (
       const openSession = Effect.fnUntraced(
         function*<M extends Ephemeral.AnyMember,>(profile: M, input: SessionOptions<M>) {
           const value = yield* Schema.encodeEffect(profile.payloadSchema)(input.value).pipe(
-            Effect.catchTag("SchemaError", encodeFailure("member"))
+            Effect.flatMap((encoded) => Schema.decodeUnknownEffect(Schema.Json)(encoded)),
+            Effect.catchTag("SchemaError", (cause) =>
+              Effect.fail(new Ephemeral.EncodeError({ definition: "member", cause })))
           )
           const joinRequest = yield* normalizeJoinRequest({
             spaceId: input.spaceId,
@@ -661,15 +716,22 @@ export const layerFromSession = (
             value,
             ttl: input.ttl
           })
-          const runtime = yield* RcMap.get(runtimes, new SessionIdentity(joinRequest))
-          if (runtime.requestHash !== Canonical.hash(joinRequest)) {
-            return yield* invalidConfiguration(
-              "session",
-              "An ephemeral session for this member is already active with a different value or ttl"
+          const holder = yield* Scope.fork(yield* Effect.scope)
+          return yield* Effect.gen(function*() {
+            const runtime = yield* RcMap.get(runtimes, new SessionIdentity(joinRequest)).pipe(
+              Scope.provide(holder)
             )
-          }
-          yield* Deferred.await(runtime.ready)
-          return makeSession(profile, { spaceId: input.spaceId, member: input.member }, runtime)
+            if (runtime.requestHash !== Canonical.hash(joinRequest)) {
+              return yield* invalidConfiguration(
+                "session",
+                "An ephemeral session for this member is already active with a different value or ttl"
+              )
+            }
+            yield* Deferred.await(runtime.ready)
+            return makeSession(profile, { spaceId: input.spaceId, member: input.member }, runtime)
+          }).pipe(Effect.onError((cause) =>
+            Scope.close(holder, Exit.failCause(cause))
+          ))
         }
       )
 
@@ -683,7 +745,9 @@ export const layerFromSession = (
           }
         ) {
           const value = yield* Schema.encodeEffect(definition.payloadSchema)(input.payload).pipe(
-            Effect.catchTag("SchemaError", encodeFailure(definition.name))
+            Effect.flatMap((encoded) => Schema.decodeUnknownEffect(Schema.Json)(encoded)),
+            Effect.catchTag("SchemaError", (cause) =>
+              Effect.fail(new Ephemeral.EncodeError({ definition: definition.name, cause })))
           )
           if (definition.kind === "event") {
             const ttlMillis = yield* boundedTtlMillis(
@@ -718,10 +782,12 @@ export const layerFromSession = (
 
       const encodeStateKey = (definition: Ephemeral.AnyState, key: unknown) =>
         Schema.encodeEffect(definition.keySchema)(key).pipe(
-          Effect.catchTag("SchemaError", encodeFailure(definition.name)),
+          Effect.catchTag("SchemaError", (cause) =>
+            Effect.fail(new Ephemeral.EncodeError({ definition: definition.name, cause }))),
           Effect.flatMap((encoded) =>
             Schema.decodeUnknownEffect(Protocol.EphemeralKey)(encoded).pipe(
-              Effect.catchTag("SchemaError", encodeFailure(definition.name))
+              Effect.catchTag("SchemaError", (cause) =>
+                Effect.fail(new Ephemeral.EncodeError({ definition: definition.name, cause })))
             )
           )
         )

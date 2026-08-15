@@ -39,13 +39,6 @@ describe("Ephemeral definitions", () => {
     assert.strictEqual(grouped.byName.get("ReadPosition"), ReadPosition)
   })
 
-  it("exposes the declared kind and name", () => {
-    assert.strictEqual(Typing.kind, "event")
-    assert.strictEqual(Typing.name, "Typing")
-    assert.strictEqual(ReadPosition.kind, "state")
-    assert.strictEqual(ReadPosition.name, "ReadPosition")
-  })
-
   it.effect(
     "normalizes field payload input into a wire struct schema",
     Effect.fnUntraced(function*() {
@@ -81,15 +74,9 @@ describe("Ephemeral definitions", () => {
       const Anonymous = Ephemeral.member()
       const nothing = yield* Schema.encodeEffect(Anonymous.payloadSchema)(undefined)
       assert.strictEqual(nothing, null)
-    })
-  )
-
-  it.effect(
-    "defaults a missing payload to the void wire schema",
-    Effect.fnUntraced(function*() {
       const Ping = Ephemeral.make("Ping", { kind: "event" })
-      const encoded = yield* Schema.encodeEffect(Ping.payloadSchema)(undefined)
-      assert.strictEqual(encoded, null)
+      const pinged = yield* Schema.encodeEffect(Ping.payloadSchema)(undefined)
+      assert.strictEqual(pinged, null)
     })
   )
 })

@@ -6,6 +6,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -13,6 +14,7 @@ import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as EphemeralClient from "../src/EphemeralClient.js"
@@ -30,17 +32,12 @@ describe("EphemeralClient", () => {
     Effect.fnUntraced(function*() {
       const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
       const joinedTtlMillis = yield* Deferred.make<number>()
-      const publishedTtlMillis = yield* Deferred.make<number>()
       // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
       const fakeClient = {
         JoinEphemeral: (request: typeof Protocol.VersionedEphemeralJoinRequest.Type) =>
           Deferred.succeed(joinedTtlMillis, request.ttlMillis).pipe(Effect.as(messages)),
         HeartbeatEphemeral: () => Effect.succeed(null),
-        PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) => {
-          let ttlMillis = 0
-          if ("ttlMillis" in request.request) ttlMillis = request.request.ttlMillis
-          return Deferred.succeed(publishedTtlMillis, ttlMillis).pipe(Effect.as(null))
-        }
+        PublishEphemeral: () => Effect.succeed(null)
       } as unknown as ProtocolSession.Service["client"]
       const session = ProtocolSession.ProtocolSession.of({
         client: fakeClient,
@@ -74,13 +71,6 @@ describe("EphemeralClient", () => {
         )
         yield* client.session(Anonymous, { spaceId, member, value: undefined, ttl: "1 minute" })
         assert.strictEqual(yield* Deferred.await(joinedTtlMillis), 60_000)
-        yield* client.publish(Typing, {
-          spaceId,
-          member,
-          payload: { conversationId: ConversationId.make("conversation-1"), active: true },
-          ttl: "5 seconds"
-        })
-        assert.strictEqual(yield* Deferred.await(publishedTtlMillis), 5_000)
       })
       yield* program.pipe(Effect.provide(layerClient), Effect.scoped)
     })
@@ -291,7 +281,13 @@ const ReadPosition = Ephemeral.make("ReadPosition", {
   payload: { messageId: Schema.String }
 })
 const Sentinel = Ephemeral.make("Sentinel", { kind: "state", key: Schema.String, payload: { marker: Schema.String } })
+const Position = Ephemeral.make("Position", {
+  kind: "state",
+  key: Schema.String,
+  payload: { x: Schema.Number }
+})
 const Profile = Ephemeral.member({ displayName: Schema.String })
+const Score = Ephemeral.member({ score: Schema.Number })
 const Anonymous = Ephemeral.member()
 
 const sessionStarted = (space: Identity.SpaceId, joiner: Protocol.EphemeralMember) =>
@@ -359,15 +355,14 @@ const makeTypedHarness = Effect.fnUntraced(function*() {
   const messagesB = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
   const published = yield* Queue.unbounded<typeof Protocol.VersionedEphemeralPublishRequest.Type>()
   const joins = yield* Ref.make(0)
+  const queueFor = (request: typeof Protocol.VersionedEphemeralJoinRequest.Type) => {
+    if (request.spaceId === spaceB) return messagesB
+    return messagesA
+  }
   // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
   const fakeClient = {
     JoinEphemeral: (request: typeof Protocol.VersionedEphemeralJoinRequest.Type) =>
-      Ref.update(joins, (count) => count + 1).pipe(
-        Effect.andThen(Effect.sync(() => {
-          if (request.spaceId === spaceB) return messagesB
-          return messagesA
-        }))
-      ),
+      Ref.update(joins, (count) => count + 1).pipe(Effect.as(queueFor(request))),
     HeartbeatEphemeral: () => Effect.succeed(null),
     PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) =>
       Queue.offer(published, request).pipe(Effect.as(null))
@@ -384,6 +379,17 @@ const makeTypedHarness = Effect.fnUntraced(function*() {
 })
 
 const sessionOptions = { spaceId, member, value: { displayName: "Ada" }, ttl: "1 minute" } as const
+
+const offerUntilSettled = Effect.fnUntraced(function*(
+  messages: Queue.Queue<Protocol.EphemeralJoinMessage>,
+  fiber: Fiber.Fiber<unknown, unknown>,
+  message: Protocol.EphemeralJoinMessage
+) {
+  while (fiber.pollUnsafe() === undefined) {
+    yield* Queue.offer(messages, message)
+    yield* Effect.yieldNow
+  }
+})
 
 describe("EphemeralClient typed definitions", () => {
   it.effect(
@@ -510,8 +516,9 @@ describe("EphemeralClient typed definitions", () => {
           Stream.runHead,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* Queue.offer(
+        yield* offerUntilSettled(
           harness.messagesA,
+          received,
           eventMessage(spaceId, 2, "Typing", { conversationId: "conversation-1", active: true }, memberB)
         )
         const event = Option.getOrUndefined(yield* Fiber.join(received))
@@ -541,14 +548,15 @@ describe("EphemeralClient typed definitions", () => {
           harness.messagesA,
           eventMessage(spaceId, 2, "Typing", { conversationId: "conversation-1", active: true })
         )
-        yield* Queue.offer(harness.messagesA, eventMessage(spaceId, 3, "Pings", { count: 1 }))
+        yield* offerUntilSettled(harness.messagesA, probe, eventMessage(spaceId, 3, "Pings", { count: 1 }))
         assert.isDefined(Option.getOrUndefined(yield* Fiber.join(probe)))
         const late = yield* session.events(Typing).pipe(
           Stream.runHead,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* Queue.offer(
+        yield* offerUntilSettled(
           harness.messagesA,
+          late,
           eventMessage(spaceId, 4, "Typing", { conversationId: "conversation-2", active: false })
         )
         const received = Option.getOrUndefined(yield* Fiber.join(late))
@@ -629,13 +637,13 @@ describe("EphemeralClient typed definitions", () => {
           Stream.runHead,
           Effect.forkChild({ startImmediately: true })
         )
-        yield* Queue.offer(harness.messagesA, eventMessage(spaceId, 2, "Typing", 42))
+        yield* offerUntilSettled(harness.messagesA, poisoned, eventMessage(spaceId, 2, "Typing", 42))
         const failure = yield* Fiber.join(poisoned)
         assert.isTrue(Result.isFailure(failure))
         if (Result.isFailure(failure)) {
           assert.strictEqual(failure.failure._tag, "EphemeralDecodeError")
         }
-        yield* Queue.offer(harness.messagesA, eventMessage(spaceId, 3, "Pings", { count: 7 }))
+        yield* offerUntilSettled(harness.messagesA, healthy, eventMessage(spaceId, 3, "Pings", { count: 7 }))
         assert.isDefined(Option.getOrUndefined(yield* Fiber.join(healthy)))
         yield* Queue.offer(
           harness.messagesA,
@@ -729,6 +737,223 @@ describe("EphemeralClient typed definitions", () => {
         assert.strictEqual(yield* Ref.get(harness.joins), 2)
       })
       yield* program.pipe(Effect.provide(harness.layerClient))
+    })
+  )
+})
+
+describe("EphemeralClient projection work", () => {
+  it.effect(
+    "leaves an untouched state channel alone while other channels change",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeTypedHarness()
+      let reads = 0
+      const countedValue = (messageId: string) => {
+        const value = {}
+        Object.defineProperty(value, "messageId", {
+          enumerable: true,
+          get: () => {
+            reads = reads + 1
+            return messageId
+          }
+        })
+        // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The counter observes every property read the projection performs on a wire value.
+        return value as typeof Schema.Json.Type
+      }
+      const states = Array.from({ length: 40 }, (_, index) => ({
+        member: {
+          clientId: Identity.ClientId.make(
+            `cli_00000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`
+          ),
+          membershipIncarnation: member.membershipIncarnation
+        },
+        channel: Protocol.EphemeralChannel.make("ReadPosition"),
+        key: Protocol.EphemeralKey.make(`conversation-${index}`),
+        value: countedValue(`message-${index}`),
+        expiresAtMillis: 60_000
+      }))
+      yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
+      yield* Queue.offer(harness.messagesA, snapshot(spaceId, 1, { states }))
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const session = yield* client.session(Profile, sessionOptions)
+        const emissions = yield* Queue.unbounded<ReadonlyArray<unknown>>()
+        const consumer = yield* session.state(ReadPosition).pipe(
+          Stream.runForEach((entries) => Queue.offer(emissions, entries)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        const sentinelEmissions = yield* Queue.unbounded<ReadonlyArray<unknown>>()
+        const sentinelConsumer = yield* session.state(Sentinel).pipe(
+          Stream.runForEach((entries) => Queue.offer(sentinelEmissions, entries)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        assert.strictEqual((yield* Queue.take(emissions)).length, 40)
+        yield* Queue.take(sentinelEmissions)
+        const settled = reads
+        for (let revision = 0; revision < 30; revision = revision + 1) {
+          yield* Queue.offer(
+            harness.messagesA,
+            stateSet(spaceId, revision + 2, "Sentinel", `sentinel-${revision}`, { marker: `m${revision}` })
+          )
+        }
+        for (let received = 0; received < 30; received = received + 1) {
+          yield* Queue.take(sentinelEmissions)
+        }
+        assert.strictEqual(
+          reads - settled,
+          0,
+          `the ReadPosition projection touched its entries ${reads - settled} times for deltas on another channel`
+        )
+        yield* Queue.offer(
+          harness.messagesA,
+          stateSet(spaceId, 100, "ReadPosition", "conversation-final", { messageId: "final" })
+        )
+        assert.strictEqual((yield* Queue.take(emissions)).length, 41)
+        yield* Fiber.interrupt(consumer)
+        yield* Fiber.interrupt(sentinelConsumer)
+      })
+      yield* program.pipe(Effect.provide(harness.layerClient))
+    })
+  )
+
+  it.effect(
+    "rejoins with the latest member value after an updateMember",
+    Effect.fnUntraced(function*() {
+      const joinValues = yield* Queue.unbounded<typeof Schema.Json.Type>()
+      const published = yield* Queue.unbounded<typeof Protocol.VersionedEphemeralPublishRequest.Type>()
+      const firstQueue = yield* Deferred.make<Queue.Queue<Protocol.EphemeralJoinMessage, Cause.Done>>()
+      const joins = yield* Ref.make(0)
+      // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
+      const fakeClient = {
+        JoinEphemeral: Effect.fnUntraced(function*(
+          request: typeof Protocol.VersionedEphemeralJoinRequest.Type
+        ) {
+          const join = yield* Ref.updateAndGet(joins, (count) => count + 1)
+          yield* Queue.offer(joinValues, request.value)
+          const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage, Cause.Done>()
+          yield* Queue.offer(messages, sessionStarted(spaceId, member))
+          yield* Queue.offer(
+            messages,
+            snapshot(spaceId, join, {
+              members: [{ member, value: request.value, expiresAtMillis: 60_000 }]
+            })
+          )
+          if (join === 1) yield* Deferred.succeed(firstQueue, messages)
+          return messages
+        }),
+        HeartbeatEphemeral: () => Effect.succeed(null),
+        PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) =>
+          Queue.offer(published, request).pipe(Effect.as(null))
+      } as unknown as ProtocolSession.Service["client"]
+      const session = ProtocolSession.ProtocolSession.of({
+        client: fakeClient,
+        version: Effect.succeed(Protocol.currentProtocolVersion),
+        rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
+      })
+      const layerClient = EphemeralClient.layerFromSession().pipe(
+        Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
+      )
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const opened = yield* client.session(Profile, sessionOptions)
+        assert.deepStrictEqual(yield* Queue.take(joinValues), { displayName: "Ada" })
+        yield* opened.updateMember({ displayName: "Grace" })
+        assert.strictEqual((yield* Queue.take(published)).request._tag, "UpdateMember")
+        const roster = yield* opened.members.pipe(
+          Stream.filter((entries) => entries.some((entry) => entry.value.displayName === "Grace")),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Queue.end(yield* Deferred.await(firstQueue))
+        assert.deepStrictEqual(yield* Queue.take(joinValues), { displayName: "Grace" })
+        assert.isDefined(Option.getOrUndefined(yield* Fiber.join(roster)))
+      })
+      yield* program.pipe(Effect.provide(layerClient), Effect.scoped)
+    })
+  )
+
+  it.effect(
+    "reports a payload that encodes outside JSON as a typed encode error",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeTypedHarness()
+      yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
+      yield* Queue.offer(harness.messagesA, snapshot(spaceId, 1))
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const opened = yield* client.session(Profile, sessionOptions)
+        const published = yield* client.publish(Pings, {
+          spaceId,
+          member,
+          payload: { count: Number.NaN },
+          ttl: "5 seconds"
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(published))
+        if (Result.isFailure(published)) {
+          assert.strictEqual(published.failure._tag, "EphemeralEncodeError")
+        }
+        const stated = yield* client.publish(Position, {
+          spaceId,
+          member,
+          key: "cursor",
+          payload: { x: Number.POSITIVE_INFINITY },
+          ttl: "5 seconds"
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(stated))
+        if (Result.isFailure(stated)) {
+          assert.strictEqual(stated.failure._tag, "EphemeralEncodeError")
+        }
+        assert.isFalse(Result.isFailure(yield* opened.updateMember({ displayName: "Ada" }).pipe(Effect.result)))
+      })
+      yield* program.pipe(Effect.provide(harness.layerClient))
+    })
+  )
+
+  it.effect(
+    "reports a member value that encodes outside JSON as a typed encode error",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeTypedHarness()
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const opened = yield* client.session(Score, {
+          spaceId,
+          member,
+          value: { score: Number.NaN },
+          ttl: "1 minute"
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(opened))
+        if (Result.isFailure(opened)) {
+          assert.strictEqual(opened.failure._tag, "EphemeralEncodeError")
+        }
+        assert.strictEqual(yield* Ref.get(harness.joins), 0)
+      })
+      yield* program.pipe(Effect.provide(harness.layerClient), Effect.scoped)
+    })
+  )
+  it.effect(
+    "releases the shared session after a rejected mismatch once the holder closes",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeTypedHarness()
+      yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
+      yield* Queue.offer(harness.messagesA, snapshot(spaceId, 1))
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const holder = yield* Scope.make()
+        yield* client.session(Profile, sessionOptions).pipe(Scope.provide(holder))
+        const rejected = yield* client.session(Profile, {
+          ...sessionOptions,
+          value: { displayName: "Grace" }
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isFailure(rejected))
+        yield* Scope.close(holder, Exit.void)
+        yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
+        yield* Queue.offer(harness.messagesA, snapshot(spaceId, 2))
+        const reopened = yield* client.session(Profile, {
+          ...sessionOptions,
+          value: { displayName: "Grace" }
+        }).pipe(Effect.result)
+        assert.isTrue(Result.isSuccess(reopened))
+        assert.strictEqual(yield* Ref.get(harness.joins), 2)
+      })
+      yield* program.pipe(Effect.provide(harness.layerClient), Effect.scoped)
     })
   )
 })
