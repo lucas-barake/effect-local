@@ -6,6 +6,7 @@ import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
 import * as Definition from "@lucas-barake/effect-local/Definition"
+import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
@@ -48,8 +49,8 @@ class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationEr
 )("TestAuthorizationError", { reason: Schema.String }) {}
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "../src/Authentication.js"
-import * as PresenceClient from "../src/PresenceClient.js"
-import * as PresenceHub from "../src/PresenceHub.js"
+import * as EphemeralClient from "../src/EphemeralClient.js"
+import * as EphemeralHub from "../src/EphemeralHub.js"
 import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as ProtocolSession from "../src/ProtocolSession.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
@@ -61,7 +62,14 @@ const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001"
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const forbiddenSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const ephemeralMember = Protocol.EphemeralMember.make({
+  clientId,
+  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
+})
 const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
+const TypingChannel = Ephemeral.make("typing", { kind: "event", payload: { active: Schema.Boolean } })
+const AnonymousProfile = Ephemeral.member()
+const StatusProfile = Ephemeral.member({ status: Schema.String })
 
 const Todo = Model.make("Todo", {
   version: 1,
@@ -156,10 +164,12 @@ const entityOptions = {
   admissionMailboxCapacity: 64,
   readMailboxCapacity: 64,
   watchMailboxCapacity: 64,
-  presencePublicationMailboxCapacity: 64,
+  ephemeralJoinMailboxCapacity: 64,
+  ephemeralCommandMailboxCapacity: 64,
   maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
-  maximumConcurrentPresencePublicationsPerSpace: 16
+  maximumConcurrentEphemeralJoinVerificationsPerSpace: 16,
+  maximumConcurrentEphemeralRequestsPerSpace: 16
 } satisfies SpaceEntity.HandlerOptions
 const clientHistory = {
   defaultScope: scope,
@@ -254,7 +264,9 @@ const layerRevokedAuthenticationClient = Layer.fresh(Authentication.layerClient)
 const layerCluster = SpaceEntity.layer(entityOptions).pipe(
   Layer.provide(layerAssertionVerifier),
   Layer.provide(layerStore),
-  Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+  Layer.provide(
+    EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
+  ),
   Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
 )
 
@@ -295,7 +307,7 @@ const layerSocket = Effect.gen(function*() {
   return yield* Socket.makeWebSocket(`http://127.0.0.1:${address.port}/sync`)
 }).pipe(Layer.effect(Socket.Socket), Layer.provide(layerCountedConstructor))
 const layerClientProtocol = SyncClient.layerProtocolSocket().pipe(Layer.provide(layerSocket))
-const layerClient = Layer.merge(SyncClient.layer, PresenceClient.layer).pipe(
+const layerClient = Layer.merge(SyncClient.layer, EphemeralClient.layer).pipe(
   Layer.provide(layerClientProtocol),
   Layer.provide(layerAuthenticationClient)
 )
@@ -343,7 +355,7 @@ const layerInvalidProtocolLive = layerInvalidProtocolClient.pipe(
 type ProtocolObservation =
   | { readonly _tag: "Negotiate" }
   | { readonly _tag: "Pull"; readonly version: Protocol.ProtocolVersion }
-  | { readonly _tag: "PublishPresence"; readonly version: Protocol.ProtocolVersion }
+  | { readonly _tag: "PublishEphemeral"; readonly version: Protocol.ProtocolVersion }
 
 const protocolObservations = MutableRef.make<Array<ProtocolObservation>>([])
 const observingAuthentication = Effect.gen(function*() {
@@ -362,11 +374,11 @@ const observingAuthentication = Effect.gen(function*() {
           { _tag: "Pull" as const, version: payload.protocolVersion }
         ])
       } else if (
-        options.rpc._tag === "PublishPresence" && Schema.is(Protocol.VersionedPresenceUpdate)(payload)
+        options.rpc._tag === "PublishEphemeral" && Schema.is(Protocol.VersionedEphemeralPublishRequest)(payload)
       ) {
         MutableRef.update(protocolObservations, (observations) => [
           ...observations,
-          { _tag: "PublishPresence" as const, version: payload.protocolVersion }
+          { _tag: "PublishEphemeral" as const, version: payload.protocolVersion }
         ])
       }
     }).pipe(Effect.andThen(authenticate(effect, options)))
@@ -386,7 +398,7 @@ const layerProtocol2Server = SyncServer.layerWithOptions({ supportedProtocolVers
   Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const layerConfigurableProtocolSession = ProtocolSession.layerWithOptions({ supportedProtocolVersions: [1, 2] })
-const layerConfigurableClient = Layer.merge(SyncClient.layerFromSession(), PresenceClient.layerFromSession()).pipe(
+const layerConfigurableClient = Layer.merge(SyncClient.layerFromSession(), EphemeralClient.layerFromSession()).pipe(
   Layer.provide(layerConfigurableProtocolSession),
   Layer.provide(layerClientProtocol),
   Layer.provide(layerAuthenticationClient)
@@ -526,7 +538,9 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const layerLifecycleCluster = SpaceEntity.layer(entityOptions).pipe(
     Layer.provide(layerAssertionVerifier),
     Layer.provide(layerLifecycleStore),
-    Layer.provide(PresenceHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+    Layer.provide(
+      EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
+    ),
     Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
   )
   const layerLifecycleWebSocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(
@@ -829,24 +843,30 @@ describe("WebSocket synchronization", () => {
   )
 
   it.effect(
-    "shares one negotiated protocol version across configurable sync and presence clients",
+    "shares one negotiated protocol version across configurable sync and ephemeral clients",
     Effect.fnUntraced(function*() {
       MutableRef.set(protocolObservations, [])
       const remote = yield* SyncEngine.SyncEngine
-      const presence = yield* PresenceClient.PresenceClient
+      const ephemeral = yield* EphemeralClient.EphemeralClient
 
       yield* remote.pull(pullRequest())
-      yield* presence.publish({
+      yield* ephemeral.session(AnonymousProfile, {
         spaceId,
-        clientId,
-        value: { cursor: 3 },
-        ttlMillis: 5_000
+        member: ephemeralMember,
+        value: undefined,
+        ttl: "5 seconds"
+      })
+      yield* ephemeral.publish(TypingChannel, {
+        spaceId,
+        member: ephemeralMember,
+        payload: { active: true },
+        ttl: "5 seconds"
       })
 
       assert.deepStrictEqual(MutableRef.get(protocolObservations), [
         { _tag: "Negotiate" },
         { _tag: "Pull", version: Protocol.ProtocolVersion.make(2) },
-        { _tag: "PublishPresence", version: Protocol.ProtocolVersion.make(2) }
+        { _tag: "PublishEphemeral", version: Protocol.ProtocolVersion.make(2) }
       ])
     }, provideConfigurableLive)
   )
@@ -1062,26 +1082,37 @@ describe("WebSocket synchronization", () => {
   )
 
   it.effect(
-    "multiplexes bounded ephemeral presence over the same WebSocket protocol",
+    "multiplexes bounded ephemeral events over the same WebSocket protocol",
     Effect.fnUntraced(
       function*() {
-        const presence = yield* PresenceClient.PresenceClient
-        const received = yield* presence.watch(spaceId).pipe(
+        const ephemeral = yield* EphemeralClient.EphemeralClient
+        const sql = yield* SqlClient.SqlClient
+        const before = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM effect_local_authoritative_log`
+        const session = yield* ephemeral.session(StatusProfile, {
+          spaceId,
+          member: ephemeralMember,
+          value: { status: "online" },
+          ttl: "5 seconds"
+        })
+        const received = yield* session.events(TypingChannel).pipe(
           Stream.runHead,
           Effect.forkChild({ startImmediately: true })
         )
-        const update: Protocol.PresenceUpdate = {
+        yield* ephemeral.publish(TypingChannel, {
           spaceId,
-          clientId,
-          value: { cursor: 3 },
-          ttlMillis: 5_000
-        }
-        yield* presence.publish(update)
-        const value = yield* Fiber.join(received)
-        assert.deepStrictEqual(Option.getOrUndefined(value), update)
+          member: ephemeralMember,
+          payload: { active: true },
+          ttl: "5 seconds"
+        })
+        assert.deepStrictEqual(
+          Option.getOrUndefined(yield* Fiber.join(received))?.payload,
+          { active: true }
+        )
+        const after = yield* sql<{ count: number }>`SELECT COUNT(*) AS count FROM effect_local_authoritative_log`
+        assert.strictEqual(after[0]?.count, before[0]?.count)
       },
       TestClock.withLive,
-      provideLive
+      provideRetryDependencies
     )
   )
 

@@ -3,5 +3,5 @@
   "extends": "../../tsconfig.base.json",
   "include": ["src"],
   "compilerOptions": { "lib": ["ES2023", "DOM", "WebWorker"] },
-  "references": [{ "path": "../local" }, { "path": "../local-sql" }]
+  "references": [{ "path": "../local" }, { "path": "../local-sql" }, { "path": "../local-rpc" }]
 }

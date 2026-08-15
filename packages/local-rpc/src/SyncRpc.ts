@@ -17,8 +17,9 @@ import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as Authentication from "./Authentication.js"
+import { invalidConfiguration } from "./internal/errors.js"
 
-export const maximumFrameBytes = Protocol.maximumBatchBytes + 64 * 1024
+export const maximumFrameBytes = Protocol.maximumRpcFrameBytes
 
 const RemoteDefect = Schema.Struct({
   _tag: Schema.Literal("RemoteDefect")
@@ -70,10 +71,10 @@ export const layerJson = (options?: {
     Effect.gen(function*() {
       const limit = options?.maximumFrameBytes ?? maximumFrameBytes
       if (!Number.isSafeInteger(limit) || limit <= 0) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "maximumFrameBytes",
-          message: "maximumFrameBytes must be a positive safe integer"
-        })
+        return yield* invalidConfiguration(
+          "maximumFrameBytes",
+          "maximumFrameBytes must be a positive safe integer"
+        )
       }
       return RpcSerialization.RpcSerialization.of({
         contentType: "application/json",
@@ -157,19 +158,26 @@ export class Watch extends Rpc.make("Watch", {
   stream: true
 }) {}
 
-export class PublishPresence extends Rpc.make("PublishPresence", {
-  payload: Protocol.VersionedPresenceUpdate.fields,
+export class JoinEphemeral extends Rpc.make("JoinEphemeral", {
+  payload: Protocol.VersionedEphemeralJoinRequest.fields,
+  success: Protocol.EphemeralJoinMessage,
+  error: ReplicaError.ReplicaError,
+  defect: RemoteDefect,
+  stream: true
+}) {}
+
+export class PublishEphemeral extends Rpc.make("PublishEphemeral", {
+  payload: Protocol.VersionedEphemeralPublishRequest.fields,
   success: Schema.Null,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect
 }) {}
 
-export class WatchPresence extends Rpc.make("WatchPresence", {
-  payload: Protocol.VersionedWatchPresenceRequest.fields,
-  success: Protocol.PresenceUpdate,
+export class HeartbeatEphemeral extends Rpc.make("HeartbeatEphemeral", {
+  payload: Protocol.VersionedEphemeralHeartbeatRequest.fields,
+  success: Schema.Null,
   error: ReplicaError.ReplicaError,
-  defect: RemoteDefect,
-  stream: true
+  defect: RemoteDefect
 }) {}
 
 export const Rpcs = RpcGroup.make(
@@ -179,8 +187,9 @@ export const Rpcs = RpcGroup.make(
   Pull,
   Bootstrap,
   Watch,
-  PublishPresence,
-  WatchPresence
+  JoinEphemeral,
+  PublishEphemeral,
+  HeartbeatEphemeral
 ).middleware(
   Authentication.Authentication
 )

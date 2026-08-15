@@ -6,6 +6,7 @@ import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Headers from "effect/unstable/http/Headers"
 import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
+import { invalidConfiguration } from "./internal/errors.js"
 
 export class Principal extends Context.Service<Principal, typeof Schema.Json.Type>()(
   "@lucas-barake/effect-local-rpc/Principal"
@@ -87,10 +88,10 @@ const layerClientMiddleware = RpcMiddleware.layerClient(
       if (
         !Number.isSafeInteger(credential.generation) || credential.generation < 0
       ) {
-        return yield* new ReplicaError.InvalidConfiguration({
-          option: "credentialProvider.generation",
-          message: "credential generation must be a nonnegative safe integer"
-        })
+        return yield* invalidConfiguration(
+          "credentialProvider.generation",
+          "credential generation must be a nonnegative safe integer"
+        )
       }
       return yield* next({
         ...request,

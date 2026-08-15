@@ -3,7 +3,10 @@
 Schema defined domain and protocol primitives for Effect Local.
 
 Define models with `Model.make`, mutations with `Mutation.make`, queries with `Query.make`, and collect them with
-`Definition.make`. Mutation and query handlers use Effect Layers and a constrained transaction capability. The package
+`Definition.make`. Declare ephemeral channels with `Ephemeral.make` (an explicit `kind: "event"` or `kind: "state"`
+with a typed payload, plus a typed key codec for state) and the roster value schema with `Ephemeral.member`;
+`Ephemeral.group` rejects duplicate channel names. Ephemeral definitions drive the typed transport in
+`@lucas-barake/effect-local-rpc` and never participate in durable schema identity or the mutation log. Mutation and query handlers use Effect Layers and a constrained transaction capability. The package
 also exports stable identities, accepted, rejected, and expired terminal receipts, immutable snapshot and bootstrap
 contracts, tagged `ReplicaError` failures, replica status, canonical encoding, and opt in `Field.Semantics`. A public
 `Replica.Space` addresses data, pending work, receipts, replication scope, activation, and status for one durable

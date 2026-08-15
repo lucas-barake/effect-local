@@ -21,6 +21,7 @@ flowchart LR
   W["WebSocket RPC"]
   W --> E["Cluster space entity"]
   E --> S["Server admission"]
+  E --> X["Bounded ephemeral state"]
   S --> O["Authoritative total order"]
   O --> W
   W --> L
@@ -35,12 +36,13 @@ The submitting client's result remains in its private receipt. Replication sends
 for that client. The client applies those view changes to canonical state and then replays its remaining pending
 mutations over that state.
 
-Effect Cluster owns deployment neutral routing and live ownership. One entity per space serializes mutation admission,
-holds wake and presence recipients, and routes them across runners. The actor does not retain mutation payloads or
-replies in Cluster message history. Server SQL stores authoritative entities, bounded mutation history and receipts,
-and a materialized replication view per client. Clients retain pending mutations, a dense view cursor, the global
-mutation watermark, durable retractions, and resumable scoped bootstrap staging in SQLite. Effect Workflow owns
-durable client scheduling through finite reconciliation generations.
+Effect Cluster owns deployment neutral routing and live ownership. Separate entities per space isolate mutation
+admission, reads, watches, and bounded ephemera while routing them across runners. The actors do not retain mutation
+payloads or replies in Cluster message history. Server SQL stores authoritative entities, bounded mutation history and
+receipts, and a materialized replication view per client. Ephemeral roster, event, and state data stays in memory.
+Clients retain pending mutations, a dense view cursor, the global mutation watermark, durable retractions, and
+resumable scoped bootstrap staging in SQLite. Effect Workflow owns durable client scheduling through finite
+reconciliation generations.
 
 Ordinary fields store ordinary values. Applications that need concurrent intent for a specific field can use an
 explicit `Field.Semantics` such as a counter or grow only set. Every other model avoids causal metadata.
@@ -54,8 +56,8 @@ invariants and failure model.
 | ------------------------------------ | ----------------------------------------------------------------- |
 | `@lucas-barake/effect-local`         | Models, mutations, queries, field semantics, protocol, and errors |
 | `@lucas-barake/effect-local-sql`     | SQLite state, server log, and Workflow reconciliation             |
-| `@lucas-barake/effect-local-rpc`     | WebSocket RPC, Cluster space routing, and presence                |
-| `@lucas-barake/effect-local-browser` | Browser SQLite ports, Effect Atom graph, and local presence       |
+| `@lucas-barake/effect-local-rpc`     | WebSocket RPC, Cluster space routing, and bounded ephemera        |
+| `@lucas-barake/effect-local-browser` | Browser SQLite ports and the joined Effect Atom graph             |
 | `@lucas-barake/effect-local-test`    | Production shaped test layers and deterministic network faults    |
 
 All packages are ESM. Public modules are available as subpaths such as
@@ -412,7 +414,7 @@ before retry receipt lookup. Mutation admission rejection consumes the client's 
 retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted` is the explicit allow all Layer for
 tests and already trusted processes.
 
-`SyncRpc.Rpcs` multiplexes submit, pull, bootstrap, watch, and presence on one Effect RPC WebSocket. The server uses
+`SyncRpc.Rpcs` multiplexes submit, pull, bootstrap, watch, and ephemera on one Effect RPC WebSocket. The server uses
 `Authentication.layerServer`. The client uses `Authentication.layerClient` with an application supplied
 `CredentialProvider`. Its `acquire` Effect runs for every RPC and returns a redacted bearer credential plus its
 nonnegative generation. `awaitChange(rejectedGeneration)` signals when `acquire` can return a different generation.
@@ -434,22 +436,25 @@ It also remains responsible for its HTTP server, WebSocket path, TLS, Origin pol
 tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. A
 reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
 
-The facade uses four space entities with required finite limits. `SpaceAdmissionEntity` serializes Submit and Discard.
-`SpaceReadEntity` forks Pull and Bootstrap. A Layer wide fail fast allowance bounds Bootstrap assertion verification
+The facade uses five space entities. `SpaceAdmissionEntity` serializes Submit and Discard.
+`SpaceReadEntity` serves Pull and Bootstrap concurrently. A Layer wide fail fast allowance bounds Bootstrap assertion verification
 and preparation. A separate per space allowance bounds immutable page reads. `SpaceWatchEntity` owns long lived sync
-and presence streams. `SpacePresencePublishEntity` bounds presence publication. Their separate mailboxes keep a paused
-Bootstrap page or a full watch lane from blocking mutation admission. Saturated Bootstrap work fails with typed
-`CapacityExceeded` resource `bootstrap authorizations` or `bootstrap pages`.
+watches. `SpaceEphemeralJoinEntity` owns joined streams, while `SpaceEphemeralCommandEntity` owns publish and
+heartbeat. The Hub applies its watcher bound after authorization. Separate command and stream lanes keep a paused
+Bootstrap page or full join population from blocking mutation admission. Saturated work fails with typed
+`CapacityExceeded` resource `bootstrap authorizations`, `bootstrap pages`, or `ephemeral join verifications`.
 
-`ServerStore.maximumWatchersPerSpace` and `PresenceHub.maximumWatchersPerSpace` independently cap active streams.
-Their sliding queue capacities bound queued hints per subscriber, not subscriber count. Sync authorization successes
+`ServerStore.maximumWatchersPerSpace` and `EphemeralHub.maximumWatchersPerSpace` independently cap active streams.
+The ephemeral channel has bounded sliding history and per-subscriber revision-gap detection. Only a lagging client
+resubscribes to a fresh roster and retained-state snapshot. Join establishes a private server capability for publish
+and heartbeat, and periodic authorization revocation closes the established stream. Sync authorization successes
 are cached by the complete normalized space, client, scope, and principal input. The refresh interval is the fail closed
 revocation bound. Executing policy calls, live authorization callers and owner lookups, completed successes, and active
 watchers have separate required limits. The same pending allowance also bounds per-wake visibility work. Pending overflow fails with typed
 `CapacityExceeded { resource: "read authorizations", limit }`. Accepted mutations publish one shared postcommit wake.
 Delivery performs no SQLite transaction or space row write per watcher.
 
-Effect metrics cover admission and rejection classes, history and receipt depth beside their limits, sync and presence
+Effect metrics cover admission and rejection classes, history and receipt depth beside their limits, sync and ephemeral
 watcher populations, wake fanout duration, durable bootstrap installs, maintenance and prune volume, and client pending
 depth. Labels use bounded categories and never include space or principal identifiers. The production composition
 benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1,024 watchers.
@@ -458,8 +463,14 @@ benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1
 
 ```ts
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
+import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
+import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
+import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Layer from "effect/Layer"
+import * as Schema from "effect/Schema"
 
-export const graph = BrowserReplica.make(layerReplica)
+export const graph = BrowserReplica.make(Layer.merge(layerReplica, EphemeralClient.layer))
 
 export const taskAtom = graph.entity(spaceId, Task)("task-1")
 export const tasksAtom = graph.query(spaceId, ListTasks)({ completed: false })
@@ -476,6 +487,34 @@ export const replicaStatusAtom = graph.aggregateStatus
 export const spacesAtom = graph.spaces
 export const joinAtom = graph.join
 export const leaveAtom = graph.leave
+
+const member = Protocol.EphemeralMember.make({
+  clientId,
+  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
+})
+
+const ConversationId = Schema.String.pipe(Schema.brand("ConversationId"))
+const Typing = Ephemeral.make("Typing", {
+  kind: "event",
+  payload: { conversationId: ConversationId, active: Schema.Boolean }
+})
+const ReadPosition = Ephemeral.make("ReadPosition", {
+  kind: "state",
+  key: ConversationId,
+  payload: { messageId: Schema.String }
+})
+const Presence = Ephemeral.member({ status: Schema.String })
+
+export const sessionAtom = graph.ephemeral(Presence, {
+  spaceId,
+  member,
+  value: { status: "online" },
+  ttl: "30 seconds"
+})
+export const typingAtom = graph.ephemeralEvents(sessionAtom, Typing)
+export const positionsAtom = graph.ephemeralState(sessionAtom, ReadPosition)
+export const rosterAtom = graph.ephemeralMembers(sessionAtom)
+export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId, member })
 ```
 
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
@@ -484,8 +523,13 @@ actually read. Local commits and reconciliation batches refresh only affected mo
 receipt, scope, activation, and status atoms also require a space address. A settlement atom resolves to the lazy live Stream. Mounting
 the atom does not consume or replay events. Materializing that Stream owns one scoped subscription. The membership and
 aggregate atoms use separate keys, so a write does not rebuild the membership list or unrelated statuses. Mutation
-and lifecycle command atoms are concurrent and preserve their typed result. Pass an
-application factory with `options.factory` when the application already owns a deliberate custom runtime.
+and lifecycle command atoms are concurrent and preserve their typed result. Ephemeral channels are declared once with
+`Ephemeral.make` (an explicit event or state kind) and drive typed publish commands and typed projections. All typed
+projections for one member share the session atom's single joined stream: events are live only, state and the roster
+replay their current decoded view to late subscribers, and a malformed remote value fails only the projection for its
+own definition with a typed decode error. Set `publishTypingAtom` with `{ payload, ttl }` and observe the command's
+`AsyncResult`. Pass an application factory with `options.factory` when the application already owns a deliberate
+custom runtime.
 
 ## Selective field semantics
 
@@ -635,13 +679,13 @@ work. Configure the same `offlineWake` adapter on every runtime that shares the 
 each runtime publishes its live presence. See [synchronization](docs/sync.md#offline-wake-delivery) for the full
 delivery and recovery contract.
 
-### Negotiate one protocol for sync and presence
+### Negotiate one protocol for sync and ephemera
 
 During a protocol rollout, advertise the overlap on the server and share one client `ProtocolSession` between sync and
-presence. Sharing the session gives both services one selected version and one renegotiation gate.
+ephemera. Sharing the session gives both services one selected version and one renegotiation gate.
 
 ```ts
-import * as PresenceClient from "@lucas-barake/effect-local-rpc/PresenceClient"
+import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import * as ProtocolSession from "@lucas-barake/effect-local-rpc/ProtocolSession"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as SyncServer from "@lucas-barake/effect-local-rpc/SyncServer"
@@ -658,7 +702,7 @@ const layerSession = ProtocolSession.layerWithOptions({
 
 export const layerClientRpc = Layer.merge(
   SyncClient.layerFromSession({ rpcTimeout: "10 seconds" }),
-  PresenceClient.layerFromSession({ rpcTimeout: "10 seconds" })
+  EphemeralClient.layerFromSession({ rpcTimeout: "10 seconds", heartbeatInterval: "20 seconds" })
 ).pipe(
   Layer.provide(layerSession),
   Layer.provide(layerRpcProtocol),
@@ -745,9 +789,11 @@ The complete deployment sequence is:
   and settlements apply incrementally on the client; the full projection rebuild remains for bootstrap, revocation,
   schema evolution, and crash recovery.
 - A terminal rejection rolls back its optimistic write set and replays remaining pending mutations.
-- Queues, mutation payloads, presence payloads, pull pages, bootstrap pages, snapshots, receipts, and retained history
+- Queues, mutation payloads, ephemeral payloads and state, pull pages, bootstrap pages, snapshots, receipts, and retained history
   are bounded by explicit configuration.
-- Presence is best effort, bounded, TTL based, and never enters the durable mutation log.
+- Ephemeral roster, live events, and retained state are best effort, server expired, multi-space isolated, and never
+  enter the durable mutation log. Persist read or delivery positions with a normal application mutation when they must
+  survive server restart or the configured state TTL.
 - Cluster routes each space to one live owner across runners. Entity operations are volatile. A failed submit remains
   in the client's pending SQLite outbox until exact resubmission returns the SQL backed terminal receipt. Pull and watch
   recover from the durable server sequence.

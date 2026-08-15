@@ -82,6 +82,14 @@ export class SpaceUnavailable extends Schema.TaggedErrorClass<SpaceUnavailable>(
   "@lucas-barake/effect-local/SpaceUnavailable"
 )("SpaceUnavailable", { spaceId: Schema.String }) {}
 
+export class EphemeralSessionUnavailable extends Schema.TaggedErrorClass<EphemeralSessionUnavailable>(
+  "@lucas-barake/effect-local/EphemeralSessionUnavailable"
+)("EphemeralSessionUnavailable", {
+  spaceId: Schema.String,
+  clientId: Schema.String,
+  membershipIncarnation: Schema.String
+}) {}
+
 export class MutationIdentityConflict extends Schema.TaggedErrorClass<MutationIdentityConflict>(
   "@lucas-barake/effect-local/MutationIdentityConflict"
 )("MutationIdentityConflict", { mutationId: Schema.String }) {}
@@ -179,6 +187,7 @@ export const ReplicaError = Schema.Union([
   ReplicaIdentityMismatch,
   SpaceNotJoined,
   SpaceUnavailable,
+  EphemeralSessionUnavailable,
   MutationIdentityConflict,
   QuarantineResubmissionConflict,
   OutOfOrderMutation,

@@ -102,22 +102,22 @@ full private result was reclaimed.
 
 ## WebSocket RPC
 
-`SyncRpc.Rpcs` uses one Effect RPC group for negotiation, submit, discard, pull, bootstrap, watch, presence publish,
-and presence watch. Effect's RPC
+`SyncRpc.Rpcs` uses one Effect RPC group for negotiation, submit, discard, pull, bootstrap, watch, ephemeral join,
+publish, and heartbeat. Effect's RPC
 Schema codecs define the external contract. `SyncServer.layer` is the authenticated facade. It routes each operation
 through the Effect Cluster entity named by the request's space. The entity validates that embedded space identity
-matches its Cluster address, then calls `ServerStore` or `PresenceHub`. `SyncClient.layer` maps the generated client
-to `SyncEngine` while preserving typed replica failures.
+matches its Cluster address, then calls `ServerStore` or `EphemeralHub`. `SyncClient.layer` maps the generated client
+to `SyncEngine`, while `EphemeralClient.layer` exposes the joined ephemeral channel.
 
 Authentication is RPC middleware. `CredentialProvider.acquire` is evaluated for every request and returns a redacted
 bearer credential with a nonnegative generation. The server authenticates it into a JSON principal for that request.
 The authenticated facade issues an opaque principal assertion for the internal Cluster hop. The space entity verifies
-that assertion before deriving a principal and calling storage or presence services. Raw caller supplied JSON never
+that assertion before deriving a principal and calling storage or ephemeral services. Raw caller supplied JSON never
 confers authority inside the cluster. `ServerStore.layer` applies access, mutation admission, and read policies. Read
 policy receives a tagged scope check before schema or space disclosure, then a separate check for every candidate
 entity. Pull and every bootstrap page recheck entity visibility before sending data. Receipt retries recheck current
-access before reading durable state. `PresenceHub.layer` requires a tagged publish or watch policy that can bind the
-claimed presence client ID to the principal. The explicit `layerTrusted` constructors are reserved for tests and
+access before reading durable state. `EphemeralHub.layer` requires a tagged join, publish, or heartbeat policy with the
+claimed member and space. The explicit `layerTrusted` constructors are reserved for tests and
 already trusted processes.
 
 The generation identifies the credential used for a request. When the server returns `CredentialRejected`, the client
@@ -136,8 +136,8 @@ Authentication and authorization failures remain distinct:
 | `OperationTimeout`         | Session acquisition or an RPC exceeded its configured bound     | `Offline`. Retry with capped exponential backoff |
 | `ServerUnavailable`        | The RPC transport or server is unavailable                      | `Offline`. Retry with capped exponential backoff |
 
-Other terminal protocol, schema, capacity, and storage failures report `Failed`. Presence operations expose the same
-typed failures directly, but presence is outside reconciliation and does not change replica status.
+Other terminal protocol, schema, capacity, and storage failures report `Failed`. Ephemeral operations expose the same
+typed failures directly, but ephemera is outside reconciliation and does not change replica status.
 
 The space entity is the single live owner and relay for a space. Its operations are deliberately volatile. A live wire
 wake contains only the space ID. Entity changes wake a connected client only when they are currently in scope and
@@ -156,7 +156,7 @@ recipient streams.
 
 The application can route a `ServerStore` service by `spaceId`, use one shared database, or colocate a database with a
 runner whose placement policy keeps the data reachable. Pull recovers from the authoritative sequence. Wake and
-presence streams reconnect to the current space owner.
+ephemeral streams reconnect to the current space owner.
 
 `SyncRpc.layerJson` is the WebSocket serializer. WebSocket messages are already framed, so it keeps no cumulative
 buffer. It rejects an inbound UTF-8 frame before JSON parsing and rejects an outbound frame after encoding when it
@@ -172,12 +172,12 @@ not replace an ingress payload limit.
 ## Reconnect and retry
 
 The first operation on a logical client session negotiates the highest shared protocol version. Every later sync and
-presence operation must carry that selected version. There is no implicit protocol version for an omitted field. An
+ephemeral operation must carry that selected version. There is no implicit protocol version for an omitted field. An
 operation rejected after reconnect clears the cached selection, negotiates against the new peer, and retries once. No
 shared version returns typed `UpgradeRequired`. Reconciliation treats it as terminal. Transport loss and
 `ServerUnavailable` remain retryable. A malformed frame remains `ProtocolInvalid`. It is not used as a version signal.
 
-`sessionAcquisitionTimeout` bounds negotiation and renegotiation. `rpcTimeout` bounds every unary sync and presence
+`sessionAcquisitionTimeout` bounds negotiation and renegotiation. `rpcTimeout` bounds every unary sync and ephemeral
 RPC plus stream acquisition. Both accept `Duration.Input` and default to 10 seconds. Expiry interrupts the operation
 and returns `OperationTimeout` with the operation name and configured `timeoutMillis`. An established watch may remain
 idle indefinitely. Socket ping and reconnect behavior detect a dead connection without treating healthy inactivity as
@@ -219,10 +219,17 @@ original envelope and typed rejection. `discardQuarantined` asks the server to c
 handler execution. `resubmitQuarantined` first proves that nonexecution, then creates a corrected mutation at the tail.
 An already accepted or expired server receipt suppresses replacement.
 
-## Presence
+## Ephemera
 
-Presence is intentionally outside reconciliation. It is Schema decoded, size bounded, published through scoped
-per-space sliding hubs on the Cluster space owner, and expires by TTL. Effect `RcMap` releases a space hub after its
-last subscriber closes. A slow subscriber may miss updates. Browser presence assigns an arrival token before decode
-so a slow older value cannot overwrite a newer valid value or survive an explicit remove. Invalid values do not
-suppress valid in flight values.
+Ephemera is intentionally outside reconciliation and the durable mutation log. A join returns one ordered stream whose
+first message snapshots the complete roster and retained state for that space. Events are live only. Retained state is
+last writer wins per member, channel, and key and replays to later joiners. The server enforces member, event, and state
+TTLs and emits departure, clear, and removal deltas.
+
+`EphemeralHub` bounds active spaces, joined streams, members, event keys, state keys, retained bytes, and complete
+snapshot bytes. Shared sliding fan-out retains only bounded recent deltas. A subscriber that misses a revision rejoins
+and replaces roster and retained state from a fresh snapshot without reconnecting healthy subscribers. The join
+privately establishes a server capability and accepted lease. Scoped heartbeat maintains that lease, while expiry,
+teardown, replacement, or periodic authorization revocation emits `MemberLeft` and closes the joined stream.
+Retained state remains until its own TTL after departure. Applications persist read or delivery positions with a
+normal mutation when those positions must survive server restart or the configured state TTL.

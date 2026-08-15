@@ -601,13 +601,37 @@ describe("domain contracts", () => {
           afterOrdinal: -1,
           limit: 1
         }],
-        [Protocol.VersionedPresenceUpdate, {
+        [Protocol.VersionedEphemeralJoinRequest, {
           spaceId,
-          clientId: envelope.clientId,
+          member: {
+            clientId: envelope.clientId,
+            membershipIncarnation: envelope.membershipIncarnation
+          },
           value: null,
-          ttlMillis: 1
+          ttlMillis: 2
         }],
-        [Protocol.VersionedWatchPresenceRequest, { spaceId }]
+        [Protocol.VersionedEphemeralPublishRequest, {
+          sessionToken: "eps_00000000-0000-4000-8000-000000000001",
+          request: {
+            _tag: "Event",
+            spaceId,
+            member: {
+              clientId: envelope.clientId,
+              membershipIncarnation: envelope.membershipIncarnation
+            },
+            channel: "typing",
+            value: null,
+            ttlMillis: 1
+          }
+        }],
+        [Protocol.VersionedEphemeralHeartbeatRequest, {
+          spaceId,
+          member: {
+            clientId: envelope.clientId,
+            membershipIncarnation: envelope.membershipIncarnation
+          },
+          sessionToken: "eps_00000000-0000-4000-8000-000000000001"
+        }]
       ] as const
 
       for (const [contract, operation] of operations) {
@@ -619,6 +643,28 @@ describe("domain contracts", () => {
           protocolVersion: Protocol.currentProtocolVersion
         })
       }
+
+      yield* Schema.decodeUnknownEffect(Protocol.EphemeralJoinMessage)({
+        _tag: "SessionStarted",
+        spaceId,
+        member: {
+          clientId: envelope.clientId,
+          membershipIncarnation: envelope.membershipIncarnation
+        },
+        sessionToken: "eps_00000000-0000-4000-8000-000000000001",
+        leaseMillis: 2
+      })
+
+      const tooShortLease = yield* Schema.decodeUnknownEffect(Protocol.EphemeralJoinRequest)({
+        spaceId,
+        member: {
+          clientId: envelope.clientId,
+          membershipIncarnation: envelope.membershipIncarnation
+        },
+        value: null,
+        ttlMillis: 1
+      }).pipe(Effect.result)
+      assert.strictEqual(tooShortLease._tag, "Failure")
     })
   )
 })

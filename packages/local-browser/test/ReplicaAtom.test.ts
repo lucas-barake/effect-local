@@ -1,6 +1,8 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
+import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
+import * as ProtocolSession from "@lucas-barake/effect-local-rpc/ProtocolSession"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -8,7 +10,9 @@ import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
 import * as FaultInjection from "@lucas-barake/effect-local-test/FaultInjection"
 import * as TestReplica from "@lucas-barake/effect-local-test/TestReplica"
 import * as TestServer from "@lucas-barake/effect-local-test/TestServer"
+import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Definition from "@lucas-barake/effect-local/Definition"
+import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
@@ -23,6 +27,9 @@ import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
+import * as Ref from "effect/Ref"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { Atom, AtomRegistry } from "effect/unstable/reactivity"
@@ -153,16 +160,25 @@ const layerSync = Effect.gen(function*() {
   Layer.effect(SyncEngine.SyncEngine),
   Layer.provide(layerServer)
 )
-const layerReplica = SqlReplica.layer({
-  ...clientHistory,
-  definition,
-  initialSpaces: [spaceId, secondSpaceId],
-  clientId,
-  retryDelay: "10 millis"
-}).pipe(
-  Layer.provide(layerSync),
-  Layer.provide(layerDatabase),
-  Layer.provide(layerHandlers)
+const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
+  session: () => Effect.never,
+  publish: () => Effect.void,
+  clear: () => Effect.void,
+  remove: () => Effect.void
+})
+const layerReplica = Layer.merge(
+  SqlReplica.layer({
+    ...clientHistory,
+    definition,
+    initialSpaces: [spaceId, secondSpaceId],
+    clientId,
+    retryDelay: "10 millis"
+  }).pipe(
+    Layer.provide(layerSync),
+    Layer.provide(layerDatabase),
+    Layer.provide(layerHandlers)
+  ),
+  layerEphemeralInactive
 )
 
 const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) => {
@@ -174,7 +190,7 @@ const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) 
     Layer.provide(layerFaults),
     Layer.provide(NodeCrypto.layer)
   )
-  return TestReplica.layer({
+  const layerFaultedReplica = TestReplica.layer({
     ...clientHistory,
     definition,
     initialSpaces: [spaceId],
@@ -185,9 +201,329 @@ const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) 
     Layer.provide(layerDatabase),
     Layer.provide(layerHandlers)
   )
+  return Layer.merge(layerFaultedReplica, layerEphemeralInactive)
 }
 
+const memberA = Protocol.EphemeralMember.make({
+  clientId,
+  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
+})
+const memberB = Protocol.EphemeralMember.make({
+  clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000002")
+})
+const TypingChannel = Ephemeral.make("typing", { kind: "event", payload: { active: Schema.Boolean } })
+const ReadChannel = Ephemeral.make("read", { kind: "state", key: Schema.String, payload: { message: Schema.Number } })
+const StatusProfile = Ephemeral.member({ status: Schema.String })
+
+const ephemeralStarted = Protocol.EphemeralSessionStarted.make({
+  spaceId,
+  member: memberA,
+  sessionToken: Identity.EphemeralSessionToken.make("eps_00000000-0000-4000-8000-000000000001"),
+  leaseMillis: 60_000
+})
+
+const ephemeralSnapshot = (
+  revision: number,
+  options?: {
+    readonly members?: ReadonlyArray<Protocol.EphemeralMemberEntry>
+    readonly states?: ReadonlyArray<Protocol.EphemeralStateEntry>
+  }
+) =>
+  Protocol.EphemeralSnapshot.make({
+    spaceId,
+    revision: Identity.EphemeralRevision.make(revision),
+    members: options?.members ?? [{ member: memberA, value: { status: "online" }, expiresAtMillis: 10_000 }],
+    states: options?.states ?? []
+  })
+
+const typingEvent = (revision: number, value: typeof Schema.Json.Type, sender: Protocol.EphemeralMember) =>
+  Protocol.EphemeralEvent.make({
+    spaceId,
+    revision: Identity.EphemeralRevision.make(revision),
+    entry: { member: sender, channel: Protocol.EphemeralChannel.make("typing"), value, expiresAtMillis: 5_000 }
+  })
+
+const readStateSet = (revision: number, key: string, value: typeof Schema.Json.Type) =>
+  Protocol.EphemeralStateSet.make({
+    spaceId,
+    revision: Identity.EphemeralRevision.make(revision),
+    entry: {
+      member: memberA,
+      channel: Protocol.EphemeralChannel.make("read"),
+      key: Protocol.EphemeralKey.make(key),
+      value,
+      expiresAtMillis: 10_000
+    }
+  })
+
+const makeEphemeralHarness = Effect.fnUntraced(function*(options?: {
+  readonly gatePublishes?: number
+}) {
+  const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
+  const published = yield* Queue.unbounded<typeof Protocol.VersionedEphemeralPublishRequest.Type>()
+  const joins = yield* Ref.make(0)
+  const publishGate = yield* Deferred.make<void>()
+  const publishCalls = yield* Ref.make(0)
+  const gated = options?.gatePublishes ?? 0
+  // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
+  const fakeRpc = {
+    JoinEphemeral: () => Ref.update(joins, (count) => count + 1).pipe(Effect.as(messages)),
+    HeartbeatEphemeral: () => Effect.succeed(null),
+    PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) =>
+      Ref.updateAndGet(publishCalls, (count) => count + 1).pipe(
+        Effect.flatMap((call) => {
+          if (call <= gated) return Deferred.await(publishGate)
+          return Effect.void
+        }),
+        Effect.andThen(Queue.offer(published, request)),
+        Effect.as(null)
+      )
+  } as unknown as ProtocolSession.Service["client"]
+  const protocolSession = ProtocolSession.ProtocolSession.of({
+    client: fakeRpc,
+    version: Effect.succeed(Protocol.currentProtocolVersion),
+    rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
+  })
+  const layerEphemeralClient = EphemeralClient.layerFromSession().pipe(
+    Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, protocolSession))
+  )
+  return { messages, published, joins, publishGate, layerEphemeralClient }
+})
+
+const statusSessionOptions = {
+  spaceId,
+  member: memberA,
+  value: { status: "online" },
+  ttl: "10 seconds"
+} as const
+
 describe("Replica Atom graph", () => {
+  it.effect(
+    "projects typed ephemera through one shared session atom",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeEphemeralHarness()
+      yield* Queue.offer(harness.messages, ephemeralStarted)
+      yield* Queue.offer(
+        harness.messages,
+        ephemeralSnapshot(1, {
+          states: [{
+            member: memberA,
+            channel: Protocol.EphemeralChannel.make("read"),
+            key: Protocol.EphemeralKey.make("conversation-1"),
+            value: { message: 42 },
+            expiresAtMillis: 10_000
+          }]
+        })
+      )
+      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const session = graph.ephemeral(StatusProfile, statusSessionOptions)
+      assert.strictEqual(graph.ephemeral(StatusProfile, statusSessionOptions), session)
+      const membersAtom = graph.ephemeralMembers(session)
+      const stateAtom = graph.ephemeralState(session, ReadChannel)
+      const eventsAtom = graph.ephemeralEvents(session, TypingChannel)
+      const unmountMembers = registry.mount(membersAtom)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountMembers))
+      const unmountState = registry.mount(stateAtom)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountState))
+      const unmountEvents = registry.mount(eventsAtom)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountEvents))
+      const roster = yield* AtomRegistry.getResult(registry, membersAtom)
+      assert.deepStrictEqual(roster, [
+        { member: memberA, value: { status: "online" }, expiresAtMillis: 10_000 }
+      ])
+      const entries = yield* AtomRegistry.getResult(registry, stateAtom)
+      assert.deepStrictEqual(entries, [
+        { member: memberA, key: "conversation-1", value: { message: 42 }, expiresAtMillis: 10_000 }
+      ])
+      const memberVisible = yield* AtomRegistry.toStreamResult(registry, membersAtom).pipe(
+        Stream.filter((current) => current.some((entry) => entry.member.clientId === memberB.clientId)),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Queue.offer(
+        harness.messages,
+        Protocol.EphemeralMemberUpserted.make({
+          spaceId,
+          revision: Identity.EphemeralRevision.make(2),
+          entry: { member: memberB, value: { status: "away" }, expiresAtMillis: 10_000 }
+        })
+      )
+      yield* Fiber.join(memberVisible)
+      const eventVisible = yield* AtomRegistry.toStreamResult(registry, eventsAtom).pipe(
+        Stream.filter((envelope) => envelope.payload.active),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Queue.offer(harness.messages, typingEvent(3, { active: true }, memberB))
+      const envelope = Option.getOrThrow(yield* Fiber.join(eventVisible))
+      assert.deepStrictEqual(envelope, { member: memberB, payload: { active: true } })
+      const stateVisible = yield* AtomRegistry.toStreamResult(registry, stateAtom).pipe(
+        Stream.filter((current) => current.some((entry) => entry.key === "conversation-2")),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Queue.offer(harness.messages, readStateSet(4, "conversation-2", { message: 7 }))
+      yield* Fiber.join(stateVisible)
+      assert.strictEqual(yield* Ref.get(harness.joins), 1)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "publishes typed commands with observable async results",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeEphemeralHarness({ gatePublishes: 1 })
+      yield* Queue.offer(harness.messages, ephemeralStarted)
+      yield* Queue.offer(harness.messages, ephemeralSnapshot(1))
+      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const session = graph.ephemeral(StatusProfile, statusSessionOptions)
+      const membersAtom = graph.ephemeralMembers(session)
+      const unmount = registry.mount(membersAtom)
+      yield* Effect.addFinalizer(() => Effect.sync(unmount))
+      yield* AtomRegistry.getResult(registry, membersAtom)
+      const publishTyping = graph.publishEphemeral(TypingChannel, { spaceId, member: memberA })
+      assert.strictEqual(graph.publishEphemeral(TypingChannel, { spaceId, member: memberA }), publishTyping)
+      const unmountPublish = registry.mount(publishTyping)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountPublish))
+      registry.set(publishTyping, { payload: { active: true }, ttl: "1 second" })
+      registry.set(publishTyping, { payload: { active: false }, ttl: "1 second" })
+      const first = yield* Queue.take(harness.published)
+      yield* Deferred.succeed(harness.publishGate, undefined)
+      yield* AtomRegistry.getResult(registry, publishTyping, { suspendOnWaiting: true })
+      const second = yield* Queue.take(harness.published)
+      const values = [first, second].map((request) => {
+        assert.strictEqual(request.request._tag, "Event")
+        if (request.request._tag !== "Event") return undefined
+        assert.strictEqual(request.request.channel, "typing")
+        assert.strictEqual(request.request.ttlMillis, 1_000)
+        return request.request.value
+      })
+      const sortedValues = values.map((value) => Canonical.hash(value)).toSorted()
+      assert.deepStrictEqual(
+        sortedValues,
+        [Canonical.hash({ active: false }), Canonical.hash({ active: true })].toSorted()
+      )
+      const publishRead = graph.publishEphemeral(ReadChannel, { spaceId, member: memberA })
+      const unmountRead = registry.mount(publishRead)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountRead))
+      registry.set(publishRead, {
+        key: "conversation-1",
+        payload: { message: 9 },
+        ttl: "30 seconds"
+      })
+      yield* AtomRegistry.getResult(registry, publishRead, { suspendOnWaiting: true })
+      const state = yield* Queue.take(harness.published)
+      assert.strictEqual(state.request._tag, "SetState")
+      if (state.request._tag === "SetState") {
+        assert.strictEqual(state.request.channel, "read")
+        assert.strictEqual(state.request.key, "conversation-1")
+        assert.deepStrictEqual(state.request.value, { message: 9 })
+        assert.strictEqual(state.request.ttlMillis, 30_000)
+      }
+      registry.set(publishRead, Atom.Reset)
+      registry.set(publishRead, {
+        key: "x".repeat(300),
+        payload: { message: 9 },
+        ttl: "30 seconds"
+      })
+      const failed = yield* AtomRegistry.getResult(registry, publishRead, { suspendOnWaiting: true }).pipe(
+        Effect.result
+      )
+      assert.isTrue(Result.isFailure(failed))
+      if (Result.isFailure(failed)) {
+        assert.strictEqual(failed.failure._tag, "EphemeralEncodeError")
+      }
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "isolates a malformed typed payload to its projection atom",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeEphemeralHarness()
+      yield* Queue.offer(harness.messages, ephemeralStarted)
+      yield* Queue.offer(harness.messages, ephemeralSnapshot(1))
+      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const session = graph.ephemeral(StatusProfile, statusSessionOptions)
+      const eventsAtom = graph.ephemeralEvents(session, TypingChannel)
+      const stateAtom = graph.ephemeralState(session, ReadChannel)
+      const unmountEvents = registry.mount(eventsAtom)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountEvents))
+      const unmountState = registry.mount(stateAtom)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountState))
+      yield* AtomRegistry.getResult(registry, stateAtom)
+      yield* Queue.offer(harness.messages, typingEvent(2, 42, memberB))
+      const poisoned = yield* AtomRegistry.getResult(registry, eventsAtom).pipe(Effect.result)
+      assert.isTrue(Result.isFailure(poisoned))
+      if (Result.isFailure(poisoned)) {
+        assert.strictEqual(poisoned.failure._tag, "EphemeralDecodeError")
+      }
+      const stateVisible = yield* AtomRegistry.toStreamResult(registry, stateAtom).pipe(
+        Stream.filter((current) => current.some((entry) => entry.key === "conversation-1")),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Queue.offer(harness.messages, readStateSet(3, "conversation-1", { message: 1 }))
+      yield* Fiber.join(stateVisible)
+      assert.strictEqual(yield* Ref.get(harness.joins), 1)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "replaces typed state and roster when the session resnapshots",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeEphemeralHarness()
+      yield* Queue.offer(harness.messages, ephemeralStarted)
+      yield* Queue.offer(
+        harness.messages,
+        ephemeralSnapshot(1, {
+          states: [{
+            member: memberA,
+            channel: Protocol.EphemeralChannel.make("read"),
+            key: Protocol.EphemeralKey.make("conversation-1"),
+            value: { message: 1 },
+            expiresAtMillis: 10_000
+          }]
+        })
+      )
+      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const session = graph.ephemeral(StatusProfile, statusSessionOptions)
+      const membersAtom = graph.ephemeralMembers(session)
+      const stateAtom = graph.ephemeralState(session, ReadChannel)
+      const unmountMembers = registry.mount(membersAtom)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountMembers))
+      const unmountState = registry.mount(stateAtom)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountState))
+      const entries = yield* AtomRegistry.getResult(registry, stateAtom)
+      assert.strictEqual(entries.length, 1)
+      const replacedMembers = yield* AtomRegistry.toStreamResult(registry, membersAtom).pipe(
+        Stream.filter((current) => current.length === 1 && current[0]?.member.clientId === memberB.clientId),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      const clearedState = yield* AtomRegistry.toStreamResult(registry, stateAtom).pipe(
+        Stream.filter((current) => current.length === 0),
+        Stream.runHead,
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Queue.offer(
+        harness.messages,
+        ephemeralSnapshot(2, {
+          members: [{ member: memberB, value: { status: "away" }, expiresAtMillis: 10_000 }]
+        })
+      )
+      yield* Fiber.join(replacedMembers)
+      yield* Fiber.join(clearedState)
+    }, Effect.scoped)
+  )
+
   it.effect(
     "reacts to pending mutation submission and settlement",
     Effect.fnUntraced(function*() {

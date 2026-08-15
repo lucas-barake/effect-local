@@ -1,7 +1,8 @@
-import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
+import { invalidConfiguration } from "./errors.js"
 
 export const positiveFiniteDurationMillis = (
   option: string,
@@ -10,10 +11,7 @@ export const positiveFiniteDurationMillis = (
   Option.match(Duration.fromInput(input), {
     onNone: () =>
       Effect.fail(
-        new ReplicaError.InvalidConfiguration({
-          option,
-          message: `${option} must be a valid positive finite duration`
-        })
+        invalidConfiguration(option, `${option} must be a valid positive finite duration`)
       ),
     onSome: (duration) => {
       if (Duration.isPositive(duration) && Duration.isFinite(duration)) {
@@ -21,10 +19,7 @@ export const positiveFiniteDurationMillis = (
         if (Number.isSafeInteger(millis)) return Effect.succeed(millis)
       }
       return Effect.fail(
-        new ReplicaError.InvalidConfiguration({
-          option,
-          message: `${option} must be a valid positive finite duration`
-        })
+        invalidConfiguration(option, `${option} must be a valid positive finite duration`)
       )
     }
   })
