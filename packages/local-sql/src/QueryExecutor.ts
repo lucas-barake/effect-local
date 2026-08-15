@@ -84,27 +84,20 @@ export const layer = <D extends Definition.Any,>(
             record({ _tag: "Entity", spaceId, key: ReactivityKey.entity(spaceId, model.name, key) }).pipe(
               Effect.andThen(transaction.get(model, key))
             ),
-          from: (model, index) => {
-            let position: number | undefined
-            return IndexStore.query(
+          from: (model, index) =>
+            IndexStore.query(
               sql,
               address,
               model,
               index,
               Effect.fnUntraced(function*(initial) {
-                if (position === undefined) position = yield* record({ _tag: "Index", footprint: initial })
-                else {
-                  reads[position] = { _tag: "Index", footprint: initial }
-                  yield* queryReactivity.record(queryToken, reads)
-                }
+                const position = yield* record({ _tag: "Index", footprint: initial })
                 return Effect.fnUntraced(function*(complete) {
-                  if (position === undefined) return
                   reads[position] = { _tag: "Index", footprint: complete }
                   yield* queryReactivity.record(queryToken, reads)
                 })
               })
             )
-          }
         }
       }
       const execute = <Q extends Query.Any,>(

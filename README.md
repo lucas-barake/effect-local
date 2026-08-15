@@ -176,6 +176,11 @@ const first = yield * tasks.page()
 const second = first.next === undefined ? undefined : yield * tasks.after(first.next).page()
 ```
 
+`after()` also accepts the bare `next.token` string. A paginating query can take a `Schema.NullOr(Schema.String)`
+cursor in its payload and return `page.next?.token ?? null` in its success value without remodeling the cursor object.
+The token is validated against the exact query shape, so a cursor minted by a different query, direction, or limit
+fails with `StorageCorrupt`.
+
 Use `stream()` when a handler must consume every matching row without materializing the result set first. It advances
 through the same bounded keyset pages and decodes only selected entities. The named query still returns a value
 accepted by its success Schema, so a live Stream cannot escape through `Replica.query`.
@@ -530,6 +535,41 @@ replay their current decoded view to late subscribers, and a malformed remote va
 own definition with a typed decode error. Set `publishTypingAtom` with `{ payload, ttl }` and observe the command's
 `AsyncResult`. Pass an application factory with `options.factory` when the application already owns a deliberate
 custom runtime.
+
+### Infinite scroll
+
+Express a live scrolling list as one query whose payload carries the window size, and grow the size to load more. One
+`page()` over the whole window registers one footprint, so every refresh is one atomically consistent read and stays
+precise: an insert at the head reruns the window, a write past its last row does not.
+
+```ts
+const MessageWindow = Query.make("MessageWindow", {
+  payload: { limit: Schema.Number },
+  success: Schema.Struct({ items: Schema.Array(Message.schema), hasMore: Schema.Boolean })
+})
+
+const layerMessageWindow = MessageWindow.toLayer(({ payload, query }) =>
+  query.from(Message, "byCreatedAt").order("desc").limit(payload.limit).page().pipe(
+    Effect.map((page) => ({ items: page.items, hasMore: page.next !== undefined }))
+  )
+)
+
+const windows = graph.query(spaceId, MessageWindow)
+const sizeAtom = Atom.make(50)
+export const windowAtom = Atom.readable((get) => get(windows({ limit: get(sizeAtom) })))
+export const loadMoreAtom = Atom.writable(
+  (get) => get(sizeAtom),
+  (ctx) => ctx.set(sizeAtom, Math.min(ctx.get(sizeAtom) + 50, 1_000))
+)
+```
+
+Do not stitch a scrolling list from per page keyset atoms. Page boundaries derive from data, so a head insert shifts
+the first page's cursor while later pages correctly do not rerun, and the concatenation silently drops the row that
+moved across the boundary. The growing window has no boundary between reads and cannot tear.
+
+A query limit is capped at 1,000 rows. Past that, split the list at application chosen anchor values instead of keyset
+cursors: one live head query bounded by `gte` on the anchor and one frozen query per older segment bounded by `lt` and
+`gte`. Constant bounds cannot shift, so each segment invalidates independently and precisely.
 
 ## Selective field semantics
 

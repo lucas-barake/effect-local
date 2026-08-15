@@ -1083,7 +1083,10 @@ export const query = <M extends Model.Any, Name extends keyof Model.Indexes<M> &
     where: (where) => build({ ...state, where }),
     order: (direction) => build({ ...state, direction }),
     limit: (limit) => build({ ...state, limit }),
-    after: (cursor) => build({ ...state, cursor: cursor.token }),
+    after: (cursor) => {
+      if (typeof cursor === "string") return build({ ...state, cursor })
+      return build({ ...state, cursor: cursor.token })
+    },
     page: () => runPage(sql, address, model, indexName, descriptor, state, onRead),
     stream: () => {
       let registered = false

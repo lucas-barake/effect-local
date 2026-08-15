@@ -106,7 +106,7 @@ export interface Builder<ModelName extends string, IndexName extends string, Val
   readonly where: (where: Where<I>) => Builder<ModelName, IndexName, Value, I>
   readonly order: (direction: Direction) => Builder<ModelName, IndexName, Value, I>
   readonly limit: (limit: number) => Builder<ModelName, IndexName, Value, I>
-  readonly after: (cursor: Cursor<ModelName, IndexName>) => Builder<ModelName, IndexName, Value, I>
+  readonly after: (cursor: Cursor<ModelName, IndexName> | string) => Builder<ModelName, IndexName, Value, I>
   readonly page: () => Effect.Effect<Page<Value, Cursor<ModelName, IndexName>>, ReplicaError.StorageError>
   readonly stream: () => Stream.Stream<Value, ReplicaError.StorageError>
 }
