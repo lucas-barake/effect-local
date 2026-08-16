@@ -202,6 +202,77 @@ describe("MultiTab", () => {
   )
 
   it.effect(
+    "rejects a corrupt durable client identity with a storage error",
+    Effect.fnUntraced(function*() {
+      const kit = yield* testKit.makeMemoryPlatform
+      const layerPlatform = Layer.mergeAll(
+        Layer.succeed(platform.TabChannel, kit.tabChannel),
+        Layer.succeed(platform.WebLocks, kit.webLocks),
+        Layer.succeed(platform.EpochStore, kit.epochStore),
+        Layer.succeed(platform.ClientIdentityStore, {
+          load: () => Effect.succeed("not-a-client-id"),
+          store: () => Effect.void
+        })
+      )
+      let error: MultiTab.BrowserStorageError | undefined
+      yield* Layer.build(
+        multiTab({
+          name: "invalid-client-identity",
+          definition,
+          owner: () => layerOwner,
+          requestPersistence: false
+        }, layerPlatform).pipe(Layer.provide(Reactivity.layer))
+      ).pipe(
+        Effect.asVoid,
+        Effect.catchTag("BrowserStorageError", (failure) =>
+          Effect.sync(() => {
+            error = failure
+          }))
+      )
+      assert.strictEqual(error?._tag, "BrowserStorageError")
+      assert.strictEqual(error?.operation, "decode")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "reports denied local storage through the typed error channel",
+    Effect.fnUntraced(function*() {
+      const descriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage")
+      Object.defineProperty(globalThis, "localStorage", {
+        configurable: true,
+        value: {
+          getItem: () => {
+            // oxlint-disable-next-line effect/noThrowStatement, effect/noNewError -- The fake native storage boundary must reproduce a synchronous browser API exception.
+            throw new Error("storage denied")
+          },
+          setItem: () => {}
+        }
+      })
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (descriptor === undefined) {
+            Reflect.deleteProperty(globalThis, "localStorage")
+          } else {
+            Object.defineProperty(globalThis, "localStorage", descriptor)
+          }
+        })
+      )
+      const context = yield* Layer.build(platform.layerClientIdentityStoreLocalStorage)
+      const identities = Context.get(context, platform.ClientIdentityStore)
+      let error: MultiTab.BrowserStorageError | undefined
+      yield* identities.load("client-id").pipe(
+        Effect.asVoid,
+        Effect.catchTag("BrowserStorageError", (failure) =>
+          Effect.sync(() => {
+            error = failure
+          }))
+      )
+      assert.strictEqual(error?._tag, "BrowserStorageError")
+      assert.strictEqual(error?.operation, "read")
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "moves active query retains to the local backend after promotion",
     Effect.fnUntraced(function*() {
       const kit = yield* testKit.makeMemoryPlatform

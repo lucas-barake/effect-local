@@ -11,12 +11,14 @@ import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as EffectLayer from "effect/Layer"
+import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
+import { BrowserStorageError } from "./BrowserStorageError.js"
 import * as broadcastRpc from "./internal/broadcastRpc.js"
 import * as leadership from "./internal/leadership.js"
 import * as Wire from "./internal/multiTabWire.js"
@@ -28,6 +30,8 @@ import * as replicaWire from "./internal/replicaWire.js"
 export interface OwnerContext {
   readonly clientId: Identity.ClientId
 }
+
+export { BrowserStorageError } from "./BrowserStorageError.js"
 
 export interface Options<E extends { readonly _tag: string },> {
   readonly name: string
@@ -71,8 +75,7 @@ export const storageEstimate: Effect.Effect<StorageEstimate> = Effect.suspend(()
     return Effect.succeed({ usage: undefined, quota: undefined })
   }
   return Effect.promise(() => navigator.storage.estimate()).pipe(
-    Effect.map((estimate) => ({ usage: estimate.usage, quota: estimate.quota })),
-    Effect.catchCause(() => Effect.succeed({ usage: undefined, quota: undefined }))
+    Effect.map((estimate) => ({ usage: estimate.usage, quota: estimate.quota }))
   )
 })
 
@@ -81,8 +84,7 @@ const requestPersistence = Effect.suspend(() => {
   return Effect.promise(() => navigator.storage.persist()).pipe(
     Effect.flatMap((persisted) =>
       Effect.logDebug("storage persistence request").pipe(Effect.annotateLogs({ persisted }))
-    ),
-    Effect.catchCause(() => Effect.void)
+    )
   )
 })
 
@@ -105,7 +107,7 @@ const makeUuid = Effect.sync(() => crypto.randomUUID())
 
 export const layer = <E extends { readonly _tag: string },>(options: Options<E>): EffectLayer.Layer<
   Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient,
-  never,
+  BrowserStorageError,
   Reactivity.Reactivity
 > =>
   EffectLayer.effectContext(Effect.gen(function*() {
@@ -136,7 +138,17 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
     const clientId = yield* Effect.scoped(Effect.gen(function*() {
       yield* locks.acquire(`${leadership.lockName(options.name)}:client-identity`)
       const storedClientId = yield* identities.load(clientIdKey(options.name))
-      if (storedClientId !== undefined) return Identity.ClientId.make(storedClientId)
+      if (storedClientId !== undefined) {
+        return yield* Schema.decodeUnknownEffect(Identity.ClientId)(storedClientId).pipe(
+          Effect.mapError((cause) =>
+            new BrowserStorageError({
+              operation: "decode",
+              key: clientIdKey(options.name),
+              cause
+            })
+          )
+        )
+      }
       const generated = Identity.ClientId.make(`cli_${yield* makeUuid}`)
       yield* identities.store(clientIdKey(options.name), generated)
       return generated

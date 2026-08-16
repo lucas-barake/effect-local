@@ -3,7 +3,16 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as EffectLayer from "effect/Layer"
 import * as Queue from "effect/Queue"
+import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
+import { BrowserStorageError } from "../BrowserStorageError.js"
+
+export { BrowserStorageError }
+
+const StoredEpoch = Schema.NumberFromString.check(
+  Schema.isInt(),
+  Schema.isGreaterThanOrEqualTo(0)
+)
 
 export interface WebLockHold {
   readonly lost: Effect.Effect<void>
@@ -113,7 +122,7 @@ export const layerTabChannelBroadcast: EffectLayer.Layer<TabChannel> = EffectLay
 )
 
 export interface EpochStoreService {
-  readonly bump: (key: string) => Effect.Effect<number>
+  readonly bump: (key: string) => Effect.Effect<number, BrowserStorageError>
 }
 
 export class EpochStore extends Context.Service<EpochStore, EpochStoreService>()(
@@ -123,26 +132,36 @@ export class EpochStore extends Context.Service<EpochStore, EpochStoreService>()
 export const layerEpochStoreLocalStorage: EffectLayer.Layer<EpochStore> = EffectLayer.succeed(
   EpochStore,
   {
-    bump: (key) =>
-      Effect.sync(() => {
-        // oxlint-disable-next-line effect/noGlobals -- This layer is the browser platform adapter for epoch storage; the epoch must be readable synchronously before any database is open.
-        const raw = localStorage.getItem(key)
-        let previous = 0
-        if (raw !== null) {
-          const parsed = Number(raw)
-          if (Number.isSafeInteger(parsed) && parsed >= 0) previous = parsed
-        }
-        const next = previous + 1
-        // oxlint-disable-next-line effect/noGlobals -- Same platform adapter boundary as the read above.
-        localStorage.setItem(key, String(next))
-        return next
+    bump: Effect.fnUntraced(function*(key) {
+      const raw = yield* Effect.try({
+        try: () => {
+          // oxlint-disable-next-line effect/noGlobals -- This layer is the browser platform adapter for epoch storage; the epoch must be readable synchronously before any database is open.
+          return localStorage.getItem(key)
+        },
+        catch: (cause) => new BrowserStorageError({ operation: "read", key, cause })
       })
+      let previous = 0
+      if (raw !== null) {
+        previous = yield* Schema.decodeUnknownEffect(StoredEpoch)(raw).pipe(
+          Effect.mapError((cause) => new BrowserStorageError({ operation: "decode", key, cause }))
+        )
+      }
+      const next = previous + 1
+      yield* Effect.try({
+        try: () => {
+          // oxlint-disable-next-line effect/noGlobals -- Same platform adapter boundary as the read above.
+          localStorage.setItem(key, String(next))
+        },
+        catch: (cause) => new BrowserStorageError({ operation: "write", key, cause })
+      })
+      return next
+    })
   }
 )
 
 export interface ClientIdentityStoreService {
-  readonly load: (key: string) => Effect.Effect<string | undefined>
-  readonly store: (key: string, value: string) => Effect.Effect<void>
+  readonly load: (key: string) => Effect.Effect<string | undefined, BrowserStorageError>
+  readonly store: (key: string, value: string) => Effect.Effect<void, BrowserStorageError>
 }
 
 export class ClientIdentityStore extends Context.Service<ClientIdentityStore, ClientIdentityStoreService>()(
@@ -153,16 +172,22 @@ export const layerClientIdentityStoreLocalStorage: EffectLayer.Layer<ClientIdent
   ClientIdentityStore,
   {
     load: (key) =>
-      Effect.sync(() => {
-        // oxlint-disable-next-line effect/noGlobals -- This layer is the browser platform adapter for client identity storage.
-        const raw = localStorage.getItem(key)
-        if (raw === null) return undefined
-        return raw
+      Effect.try({
+        try: () => {
+          // oxlint-disable-next-line effect/noGlobals -- This layer is the browser platform adapter for client identity storage.
+          const raw = localStorage.getItem(key)
+          if (raw === null) return undefined
+          return raw
+        },
+        catch: (cause) => new BrowserStorageError({ operation: "read", key, cause })
       }),
     store: (key, value) =>
-      Effect.sync(() => {
-        // oxlint-disable-next-line effect/noGlobals -- Same platform adapter boundary as the read above.
-        localStorage.setItem(key, value)
+      Effect.try({
+        try: () => {
+          // oxlint-disable-next-line effect/noGlobals -- Same platform adapter boundary as the read above.
+          localStorage.setItem(key, value)
+        },
+        catch: (cause) => new BrowserStorageError({ operation: "write", key, cause })
       })
   }
 )
