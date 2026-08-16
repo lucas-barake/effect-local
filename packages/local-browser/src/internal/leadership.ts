@@ -32,7 +32,7 @@ export const makeLeadership = Effect.fnUntraced(function*(
   const key = epochKey(options.name)
   let steal = yield* Deferred.make<void>()
 
-  const lead = Effect.scoped(Effect.gen(function*() {
+  const attempt = Effect.scoped(Effect.gen(function*() {
     const stealNow = yield* Deferred.isDone(steal)
     let hold: platform.WebLockHold
     if (stealNow) {
@@ -48,17 +48,17 @@ export const makeLeadership = Effect.fnUntraced(function*(
     steal = yield* Deferred.make<void>()
     const epoch = Wire.Epoch.make(yield* epochs.bump(key))
     yield* postFrame(options.connection, Wire.Elected.make({ epoch, leaderId: options.tabId }))
-    yield* options.whileLeader(epoch)
+    const built = yield* options.whileLeader(epoch)
+    if (!built) return false
     yield* hold.lost
+    return true
   }))
 
-  yield* lead.pipe(
-    Effect.catchCause((cause) =>
-      Effect.logWarning("leadership attempt ended abnormally").pipe(
-        Effect.annotateLogs({ cause: String(cause) }),
-        Effect.andThen(Effect.sleep(retryMillis))
-      )
-    ),
+  yield* attempt.pipe(
+    Effect.flatMap((built) => {
+      if (built) return Effect.void
+      return Effect.sleep(retryMillis)
+    }),
     Effect.forever,
     Effect.forkScoped
   )
