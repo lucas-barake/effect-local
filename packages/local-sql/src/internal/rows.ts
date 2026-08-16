@@ -93,6 +93,18 @@ const PendingRowFields = {
 
 export const PendingRow = Schema.Struct(PendingRowFields)
 
+export const SettledReceiptRow = Schema.Struct({
+  receipt_json: Schema.String,
+  settled_pending_json: Schema.String,
+  settled_sequence: Identity.SettlementSequence
+})
+
+export const SettlementStateRow = Schema.Struct({
+  next_settled_sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+  settlement_floor: NonNegativeInt,
+  settlement_prune_sequence: NonNegativeInt
+})
+
 export const QuarantineRow = Schema.Struct({
   space_id: Identity.SpaceId,
   ...MutationRowFields,
@@ -372,7 +384,6 @@ export const TerminalReceiptIdentityRow = Schema.Struct({
   local_sequence: Identity.LocalSequence
 })
 export const SnapshotIdRow = Schema.Struct({ snapshot_id: Identity.SnapshotId })
-export const MutationIdRow = Schema.Struct({ mutation_id: Identity.MutationId })
 export const EntityIdentityRow = Schema.Struct({
   model: Schema.String,
   model_version: Identity.SchemaVersion,

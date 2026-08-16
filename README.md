@@ -176,6 +176,11 @@ const first = yield * tasks.page()
 const second = first.next === undefined ? undefined : yield * tasks.after(first.next).page()
 ```
 
+`after()` also accepts the bare `next.token` string. A paginating query can take a `Schema.NullOr(Schema.String)`
+cursor in its payload and return `page.next?.token ?? null` in its success value without remodeling the cursor object.
+The token is validated against the exact query shape, so a cursor minted by a different query, direction, or limit
+fails with `StorageCorrupt`.
+
 Use `stream()` when a handler must consume every matching row without materializing the result set first. It advances
 through the same bounded keyset pages and decodes only selected entities. The named query still returns a value
 accepted by its success Schema, so a live Stream cannot escape through `Replica.query`.
@@ -186,7 +191,8 @@ maintain the active index generation. Index declarations are client local derive
 local layout without changing the wire definition or model schema identity.
 
 Reactive query atoms retain the exact entity and index ranges read by the handler. A write publishes old and new index
-points after commit. Only mounted queries whose recorded ranges can change rerun. Reads through `query.get` use exact
+points after commit, grouped by index partition, so even a very large batch invalidates only queries over the touched
+partitions. Only mounted queries whose recorded ranges can change rerun. Reads through `query.get` use exact
 space, model, and decoded key tokens. `Query.make` has no static dependency list because runtime reads are the source
 of truth.
 
@@ -216,7 +222,6 @@ const layerDatabase = Layer.mergeAll(
 )
 
 const history = {
-  settlementCapacity: 64,
   retainedReceipts: 256,
   maximumReceipts: 1_024,
   retainedHistoryEntries: 256,
@@ -280,13 +285,18 @@ SQLite tables used by the in memory composition.
 `space.mutate` still completes at the local optimistic commit. It never waits for the server and its error channel
 contains only failures from that local run. Use `space.pending` to inspect every in flight mutation, including its
 decoded payload, submission state, and attempt count. Use `space.pendingFor(PutTask)` when the mutation specific type
-matters. `space.settlements` is a bounded live Stream of terminal `{ pending, receipt }` values. A current subscriber
-receives each terminal settlement once after rollback and pending replay have completed. The Stream has no
-history. Durable recovery remains `space.receipt(PutTask, mutationId)`. Mutation rejections from either surface are
-decoded through `PutTask.rejectionSchema`; authorization, capacity, legacy, and quarantine rejections remain distinct
-origin tagged JSON branches. `settlementCapacity` bounds each space's live feed. A subscriber that does not keep up
-backpressures settlement delivery and reconciliation, but never the local `mutate` commit. Leaving the space or closing
-the replica scope shuts down its settlement Stream.
+matters. `space.settlements()` is a durable Stream of `{ sequence, settlement }` values, where each settlement holds
+the terminal `{ pending, receipt }` pair, delivered only after rollback and pending replay have completed. The default
+`from: "live"` starts at the current tail; `from: "acknowledged"` resumes from the durable acknowledgement floor, and
+`from: n` replays everything after sequence `n`, so a settlement recorded while no subscriber was attached, or before
+an app restart, is still observed. `space.settlementsFor(PutTask)` filters by mutation in the durable read and includes
+legacy receipts. `space.acknowledgeSettlements(sequence)` advances the retention floor: pruning prefers acknowledged
+settlements, but the retained receipt budget is always enforced, so an app that never subscribes or never acknowledges
+keeps syncing. A replay that falls behind the prune horizon fails with `SettlementReplayTruncated` carrying the oldest
+available sequence instead of silently skipping. Consumers read at their own pace from SQLite and can never
+backpressure reconciliation or the local `mutate` commit. Mutation rejections from either surface are decoded through
+`PutTask.rejectionSchema`; authorization, capacity, legacy, and quarantine rejections remain distinct origin tagged
+JSON branches.
 
 Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect Workflow. Supply
 `ClusterWorkflowEngine.layer` and the official runner Layer separately. For one SQLite owner this is normally
@@ -520,8 +530,10 @@ export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId, membe
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
 atoms register exact space addressed keys. Query atoms also retain the entity keys and index ranges their handler
 actually read. Local commits and reconciliation batches refresh only affected mounted reads. Mutation, pending,
-receipt, scope, activation, and status atoms also require a space address. A settlement atom resolves to the lazy live Stream. Mounting
-the atom does not consume or replay events. Materializing that Stream owns one scoped subscription. The membership and
+receipt, scope, activation, and status atoms also require a space address. A settlement atom resolves to the lazy
+durable Stream at its live tail. Mounting the atom does not consume events. Materializing that Stream owns one scoped
+subscription that pages the durable settlement log; use `space.settlements({ from })` directly for replay from a
+cursor or the acknowledgement floor. The membership and
 aggregate atoms use separate keys, so a write does not rebuild the membership list or unrelated statuses. Mutation
 and lifecycle command atoms are concurrent and preserve their typed result. Ephemeral channels are declared once with
 `Ephemeral.make` (an explicit event or state kind) and drive typed publish commands and typed projections. All typed
@@ -530,6 +542,41 @@ replay their current decoded view to late subscribers, and a malformed remote va
 own definition with a typed decode error. Set `publishTypingAtom` with `{ payload, ttl }` and observe the command's
 `AsyncResult`. Pass an application factory with `options.factory` when the application already owns a deliberate
 custom runtime.
+
+### Infinite scroll
+
+Express a live scrolling list as one query whose payload carries the window size, and grow the size to load more. One
+`page()` over the whole window registers one footprint, so every refresh is one atomically consistent read and stays
+precise: an insert at the head reruns the window, a write past its last row does not.
+
+```ts
+const MessageWindow = Query.make("MessageWindow", {
+  payload: { limit: Schema.Number },
+  success: Schema.Struct({ items: Schema.Array(Message.schema), hasMore: Schema.Boolean })
+})
+
+const layerMessageWindow = MessageWindow.toLayer(({ payload, query }) =>
+  query.from(Message, "byCreatedAt").order("desc").limit(payload.limit).page().pipe(
+    Effect.map((page) => ({ items: page.items, hasMore: page.next !== undefined }))
+  )
+)
+
+const windows = graph.query(spaceId, MessageWindow)
+const sizeAtom = Atom.make(50)
+export const windowAtom = Atom.readable((get) => get(windows({ limit: get(sizeAtom) })))
+export const loadMoreAtom = Atom.writable(
+  (get) => get(sizeAtom),
+  (ctx) => ctx.set(sizeAtom, Math.min(ctx.get(sizeAtom) + 50, 1_000))
+)
+```
+
+Do not stitch a scrolling list from per page keyset atoms. Page boundaries derive from data, so a head insert shifts
+the first page's cursor while later pages correctly do not rerun, and the concatenation silently drops the row that
+moved across the boundary. The growing window has no boundary between reads and cannot tear.
+
+A query limit is capped at 1,000 rows. Past that, split the list at application chosen anchor values instead of keyset
+cursors: one live head query bounded by `gte` on the anchor and one frozen query per older segment bounded by `lt` and
+`gte`. Constant bounds cannot shift, so each segment invalidates independently and precisely.
 
 ## Selective field semantics
 
@@ -615,8 +662,10 @@ local state and pending mutations. The server uses it to admit old callers and p
 ### Open the server schema window
 
 `acceptedSchemaVersions` counts immediately preceding definitions in the evolution chain. A value of `1` accepts the
-current definition and version N minus 1. Server layer construction fails with `InvalidConfiguration` if the requested
-window is missing a required downgrade transform.
+current definition and version N minus 1. Once the evolution catalog has steps the option is required. Omitting it
+fails server layer construction with `InvalidConfiguration`, so a deployment cannot silently ship with the window
+closed. Without an evolution catalog the window is implicitly zero. Construction also fails with
+`InvalidConfiguration` if the requested window is missing a required downgrade transform.
 
 ```ts
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"

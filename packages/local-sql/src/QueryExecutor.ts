@@ -67,6 +67,7 @@ export const layer = <D extends Definition.Any,>(
           target_schema_version, target_schema_hash, migration_hash
           FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
       })
+      const maximumPageReadsPerScan = 64
       const queryCapability = (
         address: IndexStore.Address,
         queryToken: string,
@@ -85,20 +86,39 @@ export const layer = <D extends Definition.Any,>(
               Effect.andThen(transaction.get(model, key))
             ),
           from: (model, index) => {
-            let position: number | undefined
+            let pageReads = 0
+            const collapsed = new Set<string>()
             return IndexStore.query(
               sql,
               address,
               model,
               index,
               Effect.fnUntraced(function*(initial) {
-                if (position === undefined) position = yield* record({ _tag: "Index", footprint: initial })
-                else {
-                  reads[position] = { _tag: "Index", footprint: initial }
-                  yield* queryReactivity.record(queryToken, reads)
+                let partitionKey = ""
+                for (const value of initial.partition) {
+                  const text = String(value)
+                  partitionKey += `${text.length}:${text}`
                 }
+                if (collapsed.has(partitionKey)) {
+                  return () => Effect.void
+                }
+                if (pageReads >= maximumPageReadsPerScan) {
+                  const covering: IndexStore.Footprint = {
+                    ...initial,
+                    lower: undefined,
+                    upper: undefined,
+                    cursor: undefined,
+                    boundary: undefined,
+                    hasMore: false,
+                    full: true
+                  }
+                  collapsed.add(partitionKey)
+                  yield* record({ _tag: "Index", footprint: covering })
+                  return () => Effect.void
+                }
+                pageReads++
+                const position = yield* record({ _tag: "Index", footprint: initial })
                 return Effect.fnUntraced(function*(complete) {
-                  if (position === undefined) return
                   reads[position] = { _tag: "Index", footprint: complete }
                   yield* queryReactivity.record(queryToken, reads)
                 })

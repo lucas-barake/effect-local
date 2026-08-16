@@ -76,7 +76,6 @@ const clientHistory = {
   maximumActiveSpaces: 4,
   foregroundActiveSpaces: 2,
   retainedReceipts: 256,
-  settlementCapacity: 64,
   maximumReceipts: 10_000,
   retainedHistoryEntries: 256,
   maximumBootstrapEntities: 10_000,

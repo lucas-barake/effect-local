@@ -203,6 +203,8 @@ When a watch ends, its finalizer requests another reconciliation generation. The
 independently. The durable view cursor, scope generation, global mutation watermark, pending queue, retractions, and
 reconciliation generation counters contain everything required to resume.
 
+## Schema deployment
+
 Servers accept their current application schema plus `acceptedSchemaVersions` immediately preceding definitions from
 the configured Evolution chain. Inbound old envelopes migrate forward. Receipts, pulls, and snapshots project back to
 the caller with explicit downgrade transforms. Responses also identify the server schema. A compatible old replica
@@ -210,8 +212,19 @@ keeps syncing and reports `SchemaUpdateAvailable` so the application can prompt 
 the configured horizon is the explicit deprecation action. Requests outside the horizon receive terminal
 `StaleSchema`.
 
+The window is an explicit operational choice. Server layer construction fails with `InvalidConfiguration` when the
+evolution catalog has steps and `acceptedSchemaVersions` is omitted. Pass `0` to serve only the current schema or `N`
+to accept the previous `N` versions. A nonzero window additionally requires a complete downgrade transform for every
+accepted version, validated at construction. Without an evolution catalog there is nothing to accept and the window is
+implicitly zero.
+
 Deploy a server that accepts both schema and protocol generations before deploying a new client bundle. Keep the
 window open through the client rollout, then reduce it only after the operator's deprecation horizon has passed.
+
+Two restrictions survive any window setting. A replication scope that declares windows requires the exact current
+schema and rejects historical callers with `ProtocolInvalid`. And a space that is mid promotion returns `StaleSchema`
+to every caller until promotion completes, so a `StaleSchema` observed during a deploy does not always mean the
+caller's bundle is outside the window.
 
 If a current handler rejects an old pending envelope during local schema promotion, its savepoint rolls back and the
 envelope moves to durable quarantine. Promotion still completes and the app starts. `Replica.quarantine` exposes the

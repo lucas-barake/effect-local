@@ -60,7 +60,7 @@ export interface Options<D extends Definition.Any,> {
   readonly maximumBootstrapEntities: number
   readonly maximumBootstrapBytes: number
   readonly maximumBootstrapPageBytes: number
-  readonly settlementCapacity: number
+  readonly maximumSettlementSnapshotBytes?: number
   readonly migration: Migrations.Options
   readonly pageSize?: number
   readonly reconciliationConcurrency?: number
@@ -158,6 +158,10 @@ const aggregateStatus = (
   else if (counts.connecting > 0) state = "Connecting"
   return { state, spaces, totalPending, counts }
 }
+
+const settledFor =
+  <M extends Mutation.Any,>(mutation: M) => (settled: Replica.SettledMutation): settled is Replica.SettledMutation<M> =>
+    settled.settlement.pending.envelope.name === mutation.name
 
 const makeLayer = <D extends Definition.Any, R,>(
   options: Options<D>,
@@ -636,11 +640,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           yield* invalidateActivation(entry.spaceId)
           const shutdown = Scope.close(runtime.scope, Exit.void)
           const result = yield* restore(
-            runtime.local.shutdownSettlements.pipe(
-              Effect.andThen(
-                runtime.operationGate.withPermit(shutdown)
-              )
-            )
+            runtime.operationGate.withPermit(shutdown)
           ).pipe(Effect.exit)
           entry.runtime = undefined
           entry.activation = "Inactive"
@@ -880,21 +880,26 @@ const makeLayer = <D extends Definition.Any, R,>(
                   })
                 )
               )),
-          settlements: Stream.scoped(
-            Stream.fromEffect(runtimeLease).pipe(Stream.flatMap((runtime) => runtime.local.settlements))
-          ),
-          settlementsFor: (mutation) =>
+          settlements: (settlementOptions) =>
+            Stream.scoped(
+              Stream.fromEffect(runtimeLease).pipe(
+                Stream.flatMap((runtime) => runtime.local.settlements({ from: settlementOptions?.from ?? "live" }))
+              )
+            ),
+          settlementsFor: (mutation, settlementOptions) =>
             Stream.scoped(
               Stream.fromEffect(runtimeLease).pipe(
                 Stream.tap(() => MutationDescriptor.validate(options.definition, mutation)),
                 Stream.flatMap((runtime) =>
-                  Stream.filter(
-                    runtime.local.settlements,
-                    (settlement) => settlement.pending.envelope.name === mutation.name
-                  )
+                  runtime.local.settlements({
+                    from: settlementOptions?.from ?? "live",
+                    mutationName: mutation.name
+                  }).pipe(Stream.filter(settledFor(mutation)))
                 )
               )
             ),
+          acknowledgeSettlements: (sequence) =>
+            withActive(entry, (runtime) => runtime.local.acknowledgeSettlements(sequence)),
           quarantine: withActive(entry, (runtime) => runtime.local.quarantine),
           discardQuarantined: (mutationId) =>
             withActive(entry, (runtime) =>

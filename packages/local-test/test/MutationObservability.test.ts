@@ -82,7 +82,6 @@ const clientHistory = {
   maximumBootstrapEntities: 10_000,
   maximumBootstrapBytes: 64 * 1024 * 1024,
   maximumBootstrapPageBytes: 4 * 1024 * 1024,
-  settlementCapacity: 16,
   migration
 }
 const serverHistory = {
@@ -167,7 +166,7 @@ describe("mutation observability", () => {
       const settlementFiber = yield* subscribe(space.settlementsFor(RejectTodo))
 
       const pending = yield* space.mutate(RejectTodo, { id: "typed", title: "optimistic" })
-      const settlement = Option.getOrThrow(yield* Fiber.join(settlementFiber))
+      const settlement = Option.getOrThrow(yield* Fiber.join(settlementFiber)).settlement
 
       assert.strictEqual(settlement.receipt._tag, "Rejected")
       if (settlement.receipt._tag !== "Rejected") return
@@ -219,11 +218,11 @@ describe("mutation observability", () => {
       yield* faults.awaitPullCompletedAfterReceipt(spaceId)
 
       const collectThroughBarrier = Effect.fnUntraced(function*(collector: typeof firstCollector) {
-        const settlements: Array<Replica.MutationSettlement<typeof PutTodo>> = []
+        const settlements: Array<Replica.SettledMutation<typeof PutTodo>> = []
         while (true) {
-          const settlement = yield* Queue.take(collector)
-          settlements.push(settlement)
-          if (settlement.pending.envelope.mutationId === barrier.envelope.mutationId) return settlements
+          const settled = yield* Queue.take(collector)
+          settlements.push(settled)
+          if (settled.settlement.pending.envelope.mutationId === barrier.envelope.mutationId) return settlements
         }
       })
       const received = yield* Effect.all([
@@ -233,7 +232,7 @@ describe("mutation observability", () => {
       for (const settlements of received) {
         assert.lengthOf(
           settlements.filter(
-            (settlement) => settlement.pending.envelope.mutationId === pending.envelope.mutationId
+            (settled) => settled.settlement.pending.envelope.mutationId === pending.envelope.mutationId
           ),
           1
         )

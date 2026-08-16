@@ -71,12 +71,14 @@ application data authority.
 
 The local commit and server settlement contracts are separate. `mutate` returns after the optimistic SQLite commit and
 never widens its error channel with a later server outcome. Durable pending inspection exposes the decoded payload,
-submission state, and attempt count. Settlement notifications use a bounded, replay free PubSub per space, exposed as
-a Stream. The space scope owns and shuts down that PubSub. Its configured capacity bounds the live feed, so a slow
-subscriber backpressures settlement publication and reconciliation completion without delaying the local mutation
-commit. Publication occurs after durable pending removal, projection rebuild, and reactive invalidation. Duplicate
-receipt delivery cannot publish twice because only the transition that removes an existing pending row creates a
-settlement. A process crash may lose the live notification. Retained receipts remain the durable lookup path.
+submission state, and attempt count. Settlement is durable: the transaction that removes a settled pending row also
+stamps its receipt with a pending snapshot and a monotonic settlement sequence, so the receipts table is the
+settlement log. Subscribers page that log from a cursor and wait on a per space coalescing wake signal that carries no
+data, so a slow or absent consumer can never backpressure settlement recording or reconciliation, and a settlement
+recorded across a process restart is replayable. Duplicate receipt delivery cannot record twice because only the
+transition that removes an existing pending row creates a settlement. Acknowledging a sequence sets the retention
+floor; pruning prefers acknowledged settlements but always enforces the retained receipt budget, and a replay behind
+the prune horizon fails with a typed truncation error.
 
 ## Handler contract
 

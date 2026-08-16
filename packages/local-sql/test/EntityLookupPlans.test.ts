@@ -195,7 +195,6 @@ const layers = () => {
   })
   const layerRemote = Layer.effect(SyncEngine.SyncEngine, remoteEffect).pipe(Layer.provide(layerServer))
   const layerLocal = LocalStore.layer({
-    settlementCapacity: 64,
     retainedReceipts: 256,
     maximumReceipts: 100_000,
     retainedHistoryEntries: 1_024,

@@ -1323,6 +1323,39 @@ const clientV13 = makeMigration({
   ]
 })
 
+const clientV14 = makeMigration({
+  id: 14,
+  name: "durable-settlements",
+  statements: [
+    "ALTER TABLE effect_local_client_receipts_data ADD COLUMN settled_pending_json TEXT",
+    "ALTER TABLE effect_local_client_receipts_data ADD COLUMN settled_sequence INTEGER",
+    "ALTER TABLE effect_local_client_receipts_data ADD COLUMN pending_name TEXT",
+    `CREATE UNIQUE INDEX effect_local_client_receipts_settled
+      ON effect_local_client_receipts_data (space_id, schema_generation, settled_sequence)
+      WHERE settled_sequence IS NOT NULL`,
+    "ALTER TABLE effect_local_client_spaces ADD COLUMN next_settled_sequence INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE effect_local_client_spaces ADD COLUMN settlement_floor INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE effect_local_client_spaces ADD COLUMN settlement_prune_sequence INTEGER NOT NULL DEFAULT 0"
+  ]
+})
+
+const clientV15 = makeMigration({
+  id: 15,
+  name: "settlement-prune-watermarks",
+  statements: [
+    `CREATE TABLE effect_local_client_settlement_prune (
+      space_id TEXT NOT NULL,
+      pending_name TEXT NOT NULL,
+      pruned_sequence INTEGER NOT NULL CHECK (pruned_sequence > 0),
+      PRIMARY KEY (space_id, pending_name),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    `CREATE INDEX effect_local_client_receipts_unsettled
+      ON effect_local_client_receipts_data (space_id, schema_generation, local_sequence)
+      WHERE settled_sequence IS NULL`
+  ]
+})
+
 export const clientCatalog = Object.freeze([
   clientV1,
   clientV2,
@@ -1336,7 +1369,9 @@ export const clientCatalog = Object.freeze([
   clientV10,
   clientV11,
   clientV12,
-  clientV13
+  clientV13,
+  clientV14,
+  clientV15
 ])
 
 const serverV6 = makeMigration({

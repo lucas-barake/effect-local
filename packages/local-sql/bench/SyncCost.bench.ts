@@ -105,7 +105,6 @@ const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
     })
   }).pipe(Layer.effect(SyncEngine.SyncEngine), Layer.provide(layerServer))
   const layerLocal = LocalStore.layer({
-    settlementCapacity: 64,
     retainedReceipts: 256,
     maximumReceipts: 1_000_000,
     retainedHistoryEntries: 1_024,

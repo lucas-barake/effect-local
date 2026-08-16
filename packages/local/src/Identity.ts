@@ -43,6 +43,9 @@ export type LocalSequence = typeof LocalSequence.Type
 export const ServerSequence = sequence("ServerSequence", 0)
 export type ServerSequence = typeof ServerSequence.Type
 
+export const SettlementSequence = sequence("SettlementSequence", 0)
+export type SettlementSequence = typeof SettlementSequence.Type
+
 export const TerminalSequence = sequence("TerminalSequence", 0)
 export type TerminalSequence = typeof TerminalSequence.Type
 
