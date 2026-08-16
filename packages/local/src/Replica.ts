@@ -91,7 +91,10 @@ export interface Space {
   readonly query: <Q extends Query.Any,>(
     query: Q,
     payload: Q["payloadSchema"]["Type"]
-  ) => Effect.Effect<Q["successSchema"]["Type"], ReplicaError.ReplicaError | Q["errorSchema"]["Type"]>
+  ) => Effect.Effect<
+    Q["successSchema"]["Type"],
+    ReplicaError.ReplicaError | ReplicaError.QueryFailed | Q["errorSchema"]["Type"]
+  >
   readonly receipt: <M extends Mutation.Any,>(
     mutation: M,
     mutationId: Identity.MutationId

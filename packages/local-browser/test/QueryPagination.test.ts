@@ -12,11 +12,13 @@ import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
+import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import { AtomRegistry } from "effect/unstable/reactivity"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as BrowserReplica from "../src/BrowserReplica.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
@@ -50,17 +52,17 @@ const PutMessage = Mutation.make("PutMessage", {
   success: Message.schema
 })
 const PageMessages = Query.make("PageMessages", {
-  payload: { cursor: Schema.NullOr(Schema.String), limit: Schema.Number },
+  payload: { cursor: Schema.NullOr(Schema.Number), limit: Schema.Number },
   success: Schema.Struct({
     items: Schema.Array(Message.schema),
-    next: Schema.NullOr(Schema.String)
+    next: Schema.NullOr(Schema.Number)
   })
 })
 const PageAscending = Query.make("PageAscending", {
-  payload: { cursor: Schema.NullOr(Schema.String), limit: Schema.Number },
+  payload: { cursor: Schema.NullOr(Schema.Number), limit: Schema.Number },
   success: Schema.Struct({
     items: Schema.Array(Message.schema),
-    next: Schema.NullOr(Schema.String)
+    next: Schema.NullOr(Schema.Number)
   })
 })
 const TwoPages = Query.make("TwoPages", {
@@ -78,13 +80,41 @@ const definition = Definition.make({
   mutations: [PutMessage],
   queries: [PageMessages, PageAscending, TwoPages]
 })
+const MessageRows = Schema.Struct({ value: Schema.fromJsonString(MessageSchema) })
+const messagePage = (
+  query: Transaction.Query,
+  options: { readonly cursor: number | null; readonly limit: number; readonly direction: "asc" | "desc" }
+) =>
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: MessageRows,
+    execute: () =>
+      query.sql([Message], (sql) => {
+        if (options.direction === "desc") {
+          const bound = options.cursor ?? Number.MAX_VALUE
+          return sql`SELECT "value" FROM "Message" WHERE "createdAt" < ${bound}
+            ORDER BY "createdAt" DESC LIMIT ${options.limit}`
+        }
+        const bound = options.cursor ?? -1
+        return sql`SELECT "value" FROM "Message" WHERE "createdAt" > ${bound}
+          ORDER BY "createdAt" ASC LIMIT ${options.limit}`
+      })
+  })(undefined).pipe(
+    Effect.map((rows) => {
+      const items = rows.map((row) => row.value)
+      if (items.length < options.limit) return { items, next: null }
+      return { items, next: items[items.length - 1]?.createdAt ?? null }
+    }),
+    Effect.catchTag("SchemaError", (cause) => Effect.die(cause))
+  )
 const layerTwoPages = TwoPages.toLayer(
   Effect.fnUntraced(function*({ query }) {
     twoPageReads++
-    const builder = query.from(Message, "byCreatedAt").order("asc").limit(2)
-    const first = yield* builder.page()
+    const first = yield* messagePage(query, { cursor: null, limit: 2, direction: "asc" })
     let second: ReadonlyArray<typeof Message.schema.Type> = []
-    if (first.next !== undefined) second = (yield* builder.after(first.next).page()).items
+    if (first.next !== null) {
+      second = (yield* messagePage(query, { cursor: first.next, limit: 2, direction: "asc" })).items
+    }
     return {
       first: first.items.map((message) => message.id),
       second: second.map((message) => message.id)
@@ -98,20 +128,12 @@ const layerHandlers = Layer.mergeAll(
   PageMessages.toLayer(({ payload, query }) => {
     const key = `${payload.cursor ?? "head"}:${payload.limit}`
     pageReads.set(key, (pageReads.get(key) ?? 0) + 1)
-    let builder = query.from(Message, "byCreatedAt").order("desc").limit(payload.limit)
-    if (payload.cursor !== null) builder = builder.after(payload.cursor)
-    return builder.page().pipe(
-      Effect.map((page) => ({ items: page.items, next: page.next?.token ?? null }))
-    )
+    return messagePage(query, { cursor: payload.cursor, limit: payload.limit, direction: "desc" })
   }),
   PageAscending.toLayer(({ payload, query }) => {
     const key = `${payload.cursor ?? "head"}:${payload.limit}`
     ascendingReads.set(key, (ascendingReads.get(key) ?? 0) + 1)
-    let builder = query.from(Message, "byCreatedAt").order("asc").limit(payload.limit)
-    if (payload.cursor !== null) builder = builder.after(payload.cursor)
-    return builder.page().pipe(
-      Effect.map((page) => ({ items: page.items, next: page.next?.token ?? null }))
-    )
+    return messagePage(query, { cursor: payload.cursor, limit: payload.limit, direction: "asc" })
   }),
   layerTwoPages
 )
@@ -198,7 +220,7 @@ const layerReplica = Layer.merge(
 
 describe("query pagination", () => {
   it.effect(
-    "retains every executed page footprint from one builder",
+    "keyset pages stay correct and re-run when their model changes",
     Effect.fnUntraced(function*() {
       twoPageReads = 0
       const graph = BrowserReplica.make(layerReplica)
@@ -228,7 +250,7 @@ describe("query pagination", () => {
   )
 
   it.effect(
-    "a windowed query refreshes exactly on head insert and ignores writes past its boundary",
+    "keyset windows refresh on model writes and keep stable contents",
     Effect.fnUntraced(function*() {
       pageReads.clear()
       const graph = BrowserReplica.make(layerReplica)
@@ -265,17 +287,12 @@ describe("query pagination", () => {
       yield* Effect.yieldNow
 
       const windowAfter = yield* AtomRegistry.getResult(registry, window, { suspendOnWaiting: true })
-      yield* AtomRegistry.getResult(registry, older, { suspendOnWaiting: true })
+      const olderAfter = yield* AtomRegistry.getResult(registry, older, { suspendOnWaiting: true })
       assert.deepStrictEqual(windowAfter.items.map((message) => message.id), ["m7", "m6", "m5", "m4"])
       assert.isAbove(pageReads.get("head:4") ?? 0, windowReadsBefore)
-      assert.strictEqual(pageReads.get(`${olderCursor}:2`) ?? 0, olderReadsBefore)
-
-      const windowReadsAfterInsert = pageReads.get("head:4") ?? 0
-      registry.set(mutation, { id: "m1", createdAt: 1, text: "edited beyond the boundary" })
-      yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
-      yield* Effect.yieldNow
-      yield* AtomRegistry.getResult(registry, window, { suspendOnWaiting: true })
-      assert.strictEqual(pageReads.get("head:4") ?? 0, windowReadsAfterInsert)
+      // Model-granular reactivity re-runs the older page too; its keyset predicate keeps it stable.
+      assert.isAtLeast(pageReads.get(`${olderCursor}:2`) ?? 0, olderReadsBefore)
+      assert.deepStrictEqual(olderAfter.items.map((message) => message.id), ["m4", "m3"])
     }, Effect.scoped)
   )
 
@@ -312,10 +329,12 @@ describe("query pagination", () => {
       yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
       yield* Effect.yieldNow
       const secondAfter = yield* AtomRegistry.getResult(registry, tail, { suspendOnWaiting: true })
-      yield* AtomRegistry.getResult(registry, head, { suspendOnWaiting: true })
+      const headAfter = yield* AtomRegistry.getResult(registry, head, { suspendOnWaiting: true })
       assert.deepStrictEqual(secondAfter.items.map((message) => message.id), ["a3", "a4"])
       assert.isAbove(ascendingReads.get(`${tailCursor}:2`) ?? 0, tailReadsBefore)
-      assert.strictEqual(ascendingReads.get("head:2") ?? 0, headReadsBefore)
+      // The head page re-runs under model granularity but its window stays the same rows.
+      assert.isAtLeast(ascendingReads.get("head:2") ?? 0, headReadsBefore)
+      assert.deepStrictEqual(headAfter.items.map((message) => message.id), ["a1", "a2"])
     }, Effect.scoped)
   )
 })

@@ -167,7 +167,7 @@ describe("storage migration catalogs", () => {
 
       pipe(
         (yield* clientLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
       )
       pipe(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
@@ -190,8 +190,6 @@ describe("storage migration catalogs", () => {
         "effect_local_client_pending_data",
         "effect_local_client_receipts_data",
         "effect_local_client_visible_entities_data",
-        "effect_local_client_index_catalog",
-        "effect_local_client_index_state",
         "effect_local_server_evolution",
         "effect_local_server_key_lineage",
         "effect_local_server_key_lineage_groups",

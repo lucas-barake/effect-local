@@ -17,6 +17,16 @@ export class StorageCorrupt extends Schema.TaggedErrorClass<StorageCorrupt>(
   "@lucas-barake/effect-local/StorageCorrupt"
 )("StorageCorrupt", { message: Schema.String, cause: optionalDefect }) {}
 
+/**
+ * The consumer's own query statement failed: bad SQL, a missing table or column, or an unbindable
+ * argument. Distinct from `StorageUnavailable` because retrying cannot help - the statement, not
+ * the database, is wrong. Transient engine failures (busy, locked, connection) stay
+ * `StorageUnavailable`.
+ */
+export class QueryFailed extends Schema.TaggedErrorClass<QueryFailed>(
+  "@lucas-barake/effect-local/QueryFailed"
+)("QueryFailed", { message: Schema.String, cause: optionalDefect }) {}
+
 export class DefinitionMismatch extends Schema.TaggedErrorClass<DefinitionMismatch>(
   "@lucas-barake/effect-local/DefinitionMismatch"
 )("DefinitionMismatch", { expected: Schema.String, actual: Schema.String }) {}
@@ -175,6 +185,9 @@ export class AuthorizationDenied extends Schema.TaggedErrorClass<AuthorizationDe
 
 export const StorageError = Schema.Union([StorageUnavailable, StorageCorrupt, CanonicalEncodeError])
 export type StorageError = typeof StorageError.Type
+
+export const QueryError = Schema.Union([StorageUnavailable, StorageCorrupt, CanonicalEncodeError, QueryFailed])
+export type QueryError = typeof QueryError.Type
 
 export const ReplicaError = Schema.Union([
   StorageUnavailable,

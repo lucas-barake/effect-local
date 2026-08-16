@@ -19,6 +19,7 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
@@ -33,6 +34,7 @@ import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { Atom, AtomRegistry } from "effect/unstable/reactivity"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as BrowserReplica from "../src/BrowserReplica.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
@@ -76,6 +78,20 @@ const RangeTodos = Query.make("RangeTodos", {
   success: Schema.Array(Todo.schema)
 })
 const rangeReads = new Map<string, number>()
+const TodoRows = Schema.Struct({ value: Schema.fromJsonString(TodoSchema) })
+const todosVia = (
+  query: Transaction.Query,
+  statement: Parameters<Transaction.Query["sql"]>[1]
+) =>
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: TodoRows,
+    execute: () => query.sql([Todo], statement)
+  })(undefined).pipe(
+    Effect.map((rows) => rows.map((row) => row.value)),
+    Effect.catchTag("SchemaError", (cause) => Effect.die(cause))
+  )
+
 const definition = Definition.make({
   version: 1,
   models: [Todo, Numbered],
@@ -88,16 +104,15 @@ const layerHandlers = Layer.mergeAll(
     transaction.set(Numbered, payload.id, payload).pipe(Effect.as(payload))
   ),
   ListTodos.toLayer(({ query }) =>
-    query.from(Todo, "byTitle").limit(100).page().pipe(Effect.map((page) => page.items))
+    todosVia(query, (sql) => sql`SELECT "value" FROM "Todo" ORDER BY "title" ASC LIMIT 100`)
   ),
   RangeTodos.toLayer(({ payload, query }) => {
     const key = `${payload.lower}:${payload.upper}`
     rangeReads.set(key, (rangeReads.get(key) ?? 0) + 1)
-    return query.from(Todo, "byTitle")
-      .where({ title: { gte: payload.lower, lt: payload.upper } })
-      .limit(20)
-      .page()
-      .pipe(Effect.map((page) => page.items))
+    return todosVia(query, (sql) =>
+      sql`SELECT "value" FROM "Todo"
+        WHERE "title" >= ${payload.lower} AND "title" < ${payload.upper}
+        ORDER BY "title" ASC LIMIT 20`)
   })
 )
 const layerDatabase = Layer.mergeAll(
@@ -574,7 +589,7 @@ describe("Replica Atom graph", () => {
   )
 
   it.effect(
-    "reruns only an indexed query whose result range can change",
+    "reruns raw-SQL queries of the written model and keeps every window correct",
     Effect.fnUntraced(function*() {
       rangeReads.clear()
       const graph = BrowserReplica.make(layerReplica)
@@ -601,13 +616,14 @@ describe("Replica Atom graph", () => {
       registry.set(mutation, { id: "range", title: "beta" })
       yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
       yield* Effect.yieldNow
+      // Reactivity is model-granular: both Todo readers re-run, and each window stays correct.
       assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, related), [{ id: "range", title: "beta" }])
       assert.deepStrictEqual(
         yield* AtomRegistry.getResult(registry, unrelated, { suspendOnWaiting: true }),
         []
       )
       assert.isAtLeast(rangeReads.get("a:m") ?? 0, 2)
-      assert.strictEqual(rangeReads.get("n:z"), 1)
+      assert.isAtLeast(rangeReads.get("n:z") ?? 0, 2)
     })
   )
 

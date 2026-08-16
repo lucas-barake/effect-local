@@ -4,13 +4,15 @@ import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Effect from "effect/Effect"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as SchemaGetter from "effect/SchemaGetter"
-import * as Stream from "effect/Stream"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 
 const TodoSchema = Schema.Struct({
   id: Schema.String,
@@ -259,26 +261,71 @@ const layerPutHugeTodoHandler = PutHugeTodo.toLayer(({ payload, transaction }) =
   return transaction.set(Todo, payload.id, value).pipe(Effect.as(value))
 })
 const layerReturnHugeResultHandler = ReturnHugeResult.toLayer(() => Effect.succeed(hugeTitle))
+const decodeTodoRows = (query: Transaction.Query) =>
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: Schema.Struct({ value: Schema.fromJsonString(TodoSchema) }),
+    execute: () => query.sql([Todo], (sql) => sql`SELECT "value" FROM "Todo" ORDER BY "count" ASC, "key" ASC`)
+  })
+
 const layerListTodosHandler = ListTodos.toLayer(({ query }) =>
-  query.from(Todo, "byCount").stream().pipe(
-    Stream.runCollect,
-    Effect.map((items) => Array.from(items))
+  decodeTodoRows(query)(undefined).pipe(
+    Effect.map((rows) => rows.map((row) => row.value)),
+    Effect.catchTag("SchemaError", (cause) =>
+      Effect.fail(new ReplicaError.StorageCorrupt({ message: "Todo rows are undecodable", cause })))
   )
 )
 const layerReadCountIndexHandler = ReadCountIndex.toLayer(
   Effect.fnUntraced(function*({ payload, query }) {
-    const builder = query.from(Todo, "byCount")
-      .where({ count: { gte: payload.minimum } })
-      .order(payload.direction)
-      .limit(2)
-    const first = yield* builder.page()
-    let second: ReadonlyArray<typeof Todo.schema.Type> = []
-    if (first.next !== undefined) second = (yield* builder.after(first.next).page()).items
-    const streamed = yield* builder.stream().pipe(Stream.runCollect)
+    const ids = SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: Schema.Struct({ id: Schema.String, count: Schema.Number }),
+      execute: () =>
+        query.sql([Todo], (sql) => {
+          if (payload.direction === "asc") {
+            return sql`SELECT "id", "count" FROM "Todo" WHERE "count" >= ${payload.minimum}
+              ORDER BY "count" ASC, "id" ASC`
+          }
+          return sql`SELECT "id", "count" FROM "Todo" WHERE "count" >= ${payload.minimum}
+            ORDER BY "count" DESC, "id" DESC`
+        })
+    })
+    const all = yield* ids(undefined).pipe(
+      Effect.catchTag(
+        "SchemaError",
+        (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Todo id rows are undecodable", cause }))
+      )
+    )
+    const first = all.slice(0, 2)
+    const boundary = first[first.length - 1]
+    // Keyset continuation in plain SQL: strictly after the last (count, id) tuple of the first page.
+    let secondPage: ReadonlyArray<{ readonly id: string }> = []
+    if (boundary !== undefined) {
+      secondPage = yield* SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Schema.Struct({ id: Schema.String }),
+        execute: () =>
+          query.sql([Todo], (sql) => {
+            if (payload.direction === "asc") {
+              return sql`SELECT "id" FROM "Todo" WHERE "count" >= ${payload.minimum}
+              AND ("count", "id") > (${boundary.count}, ${boundary.id})
+              ORDER BY "count" ASC, "id" ASC LIMIT 2`
+            }
+            return sql`SELECT "id" FROM "Todo" WHERE "count" >= ${payload.minimum}
+            AND ("count", "id") < (${boundary.count}, ${boundary.id})
+            ORDER BY "count" DESC, "id" DESC LIMIT 2`
+          })
+      })(undefined).pipe(
+        Effect.catchTag(
+          "SchemaError",
+          (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Todo id rows are undecodable", cause }))
+        )
+      )
+    }
     return {
-      first: first.items.map((todo) => todo.id),
-      second: second.map((todo) => todo.id),
-      streamed: Array.from(streamed, (todo) => todo.id)
+      first: first.map((row) => row.id),
+      second: secondPage.map((row) => row.id),
+      streamed: all.map((row) => row.id)
     }
   })
 )

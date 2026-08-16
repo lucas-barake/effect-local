@@ -1273,43 +1273,6 @@ const clientV11 = makeMigration({
 
 const clientV12 = makeMigration({
   id: 12,
-  name: "secondary-index-catalog",
-  statements: [
-    `CREATE TABLE effect_local_client_index_catalog (
-      model TEXT NOT NULL,
-      index_name TEXT NOT NULL,
-      descriptor_hash TEXT NOT NULL,
-      layout_hash TEXT NOT NULL,
-      table_name TEXT NOT NULL UNIQUE,
-      table_checksum TEXT NOT NULL,
-      scan_index_name TEXT NOT NULL UNIQUE,
-      scan_index_checksum TEXT NOT NULL,
-      PRIMARY KEY (model, index_name, descriptor_hash)
-    )`,
-    `CREATE TABLE effect_local_client_index_state (
-      space_id TEXT NOT NULL,
-      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
-      projection_generation INTEGER NOT NULL CHECK (projection_generation >= 0),
-      model TEXT NOT NULL,
-      index_name TEXT NOT NULL,
-      descriptor_hash TEXT NOT NULL,
-      backfill_after_key TEXT,
-      backfill_visible_revision INTEGER CHECK (
-        backfill_visible_revision IS NULL OR backfill_visible_revision >= 0
-      ),
-      ready INTEGER NOT NULL DEFAULT 0 CHECK (ready IN (0, 1)),
-      PRIMARY KEY (
-        space_id, schema_generation, projection_generation, model, index_name, descriptor_hash
-      ),
-      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE,
-      FOREIGN KEY (model, index_name, descriptor_hash)
-        REFERENCES effect_local_client_index_catalog(model, index_name, descriptor_hash) ON DELETE CASCADE
-    )`
-  ]
-})
-
-const clientV13 = makeMigration({
-  id: 13,
   name: "projection-dirty-entities",
   statements: [
     `CREATE TABLE effect_local_client_projection_dirty (
@@ -1323,8 +1286,8 @@ const clientV13 = makeMigration({
   ]
 })
 
-const clientV14 = makeMigration({
-  id: 14,
+const clientV13 = makeMigration({
+  id: 13,
   name: "durable-settlements",
   statements: [
     "ALTER TABLE effect_local_client_receipts_data ADD COLUMN settled_pending_json TEXT",
@@ -1339,8 +1302,8 @@ const clientV14 = makeMigration({
   ]
 })
 
-const clientV15 = makeMigration({
-  id: 15,
+const clientV14 = makeMigration({
+  id: 14,
   name: "settlement-prune-watermarks",
   statements: [
     `CREATE TABLE effect_local_client_settlement_prune (
@@ -1370,8 +1333,7 @@ export const clientCatalog = Object.freeze([
   clientV11,
   clientV12,
   clientV13,
-  clientV14,
-  clientV15
+  clientV14
 ])
 
 const serverV6 = makeMigration({

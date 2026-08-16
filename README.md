@@ -70,10 +70,12 @@ import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Query from "@lucas-barake/effect-local/Query"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 
 export const Task = Model.make("Task", {
   version: 1,
@@ -136,15 +138,21 @@ export const layerDomain = Layer.mergeAll(
     )
   ),
   ListTasks.toLayer(({ payload, query }) =>
-    query.from(Task, "byCompletedTitle")
-      .where({
-        completed: payload.completed,
-        title: payload.titleFrom === undefined ? undefined : { gte: payload.titleFrom }
-      })
-      .order("asc")
-      .limit(50)
-      .page()
-      .pipe(Effect.map((page) => page.items))
+    SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: Schema.Struct({ value: Schema.fromJsonString(Task.schema) }),
+      execute: () =>
+        query.sql([Task], (sql) => {
+          const from = payload.titleFrom ?? ""
+          return sql`SELECT "value" FROM "Task"
+            WHERE "completed" = ${payload.completed ? 1 : 0} AND "title" >= ${from}
+            ORDER BY "title" ASC LIMIT 50`
+        })
+    })(undefined).pipe(
+      Effect.map((rows) => rows.map((row) => row.value)),
+      Effect.catchTag("SchemaError", (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Task rows are undecodable", cause })))
+    )
   )
 )
 ```
@@ -156,45 +164,41 @@ authorization, and identity failures use the tagged classes in `ReplicaError`.
 Handlers must be deterministic. Put timestamps, random values, generated identifiers, and other nondeterministic
 inputs in the mutation payload before committing it.
 
-### Indexed queries
+### Raw SQL queries
 
-Every multi row query names an index declared on its model. Partition components require exact values. The first sort
-component accepts `gt`, `gte`, `lt`, and `lte` bounds. Ordering applies to the complete sort tuple, and the encoded
-entity key is the stable final tie breaker. Unknown indexes, missing partition fields, extra filter fields, and cursors
-from another model or index are type errors.
-
-`page()` fetches at most the configured limit and returns `{ items, next }`. Pass `next` to `after()` for the following
-keyset page:
+A query handler reads with the full power of SQLite. `query.sql(models, statement)` runs one raw statement - joins,
+subqueries, aggregates, window functions, recursive CTE continuations - over the models it declares. Each declared
+model becomes a CTE named after the model, scoped inside the same transaction to the space and its active schema and
+projection generations, with a `key` column (the canonical entity key), a `value` column (the encoded entity JSON),
+and one column per top-level field of the model schema extracted from the JSON. A model field named `key` or `value`
+keeps only the entity columns and stays reachable through `value`.
 
 ```ts
-const tasks = query.from(Task, "byCompletedTitle")
-  .where({ completed: false, title: { gte: "A", lt: "N" } })
-  .order("asc")
-  .limit(25)
-
-const first = yield * tasks.page()
-const second = first.next === undefined ? undefined : yield * tasks.after(first.next).page()
+const rows = yield * query.sql([Task], (sql) =>
+  sql`SELECT "title", COUNT(*) AS repeats FROM "Task"
+    WHERE "completed" = 0
+    GROUP BY "title" HAVING repeats > 1
+    ORDER BY repeats DESC`)
 ```
 
-`after()` also accepts the bare `next.token` string. A paginating query can take a `Schema.NullOr(Schema.String)`
-cursor in its payload and return `page.next?.token ?? null` in its success value without remodeling the cursor object.
-The token is validated against the exact query shape, so a cursor minted by a different query, direction, or limit
-fails with `StorageCorrupt`.
+The statement begins with the query body (`SELECT`/`VALUES`) or continues the generated CTE list with a leading
+`, name AS (...)` - including `UNION ALL` recursion, since the generated list opens with `WITH RECURSIVE`. A statement
+that opens its own `WITH` fails with `QueryFailed`. Rows come back raw (`Array<unknown>`); decode them with
+`SqlSchema` request and result schemas at the call site, or through the query's declared success schema. Pagination is
+plain SQL: `LIMIT`/`OFFSET`, or keyset predicates such as `("count", "id") > (?, ?)` carried in the query payload.
 
-Use `stream()` when a handler must consume every matching row without materializing the result set first. It advances
-through the same bounded keyset pages and decodes only selected entities. The named query still returns a value
-accepted by its success Schema, so a live Stream cannot escape through `Replica.query`.
+A failing statement surfaces as `QueryFailed` in the typed error channel; transient engine failures (busy, locked,
+connection) stay `StorageUnavailable`, so bad SQL is never mistaken for a storage outage. The CTEs are a convenience
+projection over the fenced generations, not an enforcement boundary: query handlers are trusted in-process
+application code and can name base tables directly, but everything under `effect_local_` is private storage whose
+layout changes without notice.
 
-SQLite stores each declared index in an owner qualified shadow table. The migration catalog checks its DDL checksum
-and resumes bounded backfills. Local mutations, accepted sync changes, projection replay, and snapshot installation
-maintain the active index generation. Index declarations are client local derived storage. Changing one rebuilds the
-local layout without changing the wire definition or model schema identity.
-
-Reactive query atoms retain the exact entity and index ranges read by the handler. A write publishes old and new index
-points after commit, grouped by index partition, so even a very large batch invalidates only queries over the touched
-partitions. Only mounted queries whose recorded ranges can change rerun. Reads through `query.get` use exact
-space, model, and decoded key tokens. `Query.make` has no static dependency list because runtime reads are the source
-of truth.
+`models` also drives reactivity. Every write carries the models it touched, and a mounted query re-runs when any
+entity of a model it declared changes. The granularity is the model, not the row range: a write to one `Task` re-runs
+every mounted query that declared `Task`, and re-runs coalesce while one is in flight. A model the statement reads
+but `models` omits yields stale results without an error, so the list must be complete - an empty list is rejected as
+a defect. Reads through `query.get` stay exact: they use space, model, and decoded key tokens and re-run only for
+their own entity. `Query.make` has no static dependency list because the runtime reads are the source of truth.
 
 ## SQLite replica
 
@@ -528,8 +532,8 @@ export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId, membe
 ```
 
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
-atoms register exact space addressed keys. Query atoms also retain the entity keys and index ranges their handler
-actually read. Local commits and reconciliation batches refresh only affected mounted reads. Mutation, pending,
+atoms register exact space addressed keys. Query atoms retain the entity keys and models their handler actually read.
+Local commits and reconciliation batches refresh the mounted reads whose entities or models they touched. Mutation, pending,
 receipt, scope, activation, and status atoms also require a space address. A settlement atom resolves to the lazy
 durable Stream at its live tail. Mounting the atom does not consume events. Materializing that Stream owns one scoped
 subscription that pages the durable settlement log; use `space.settlements({ from })` directly for replay from a
@@ -546,8 +550,8 @@ custom runtime.
 ### Infinite scroll
 
 Express a live scrolling list as one query whose payload carries the window size, and grow the size to load more. One
-`page()` over the whole window registers one footprint, so every refresh is one atomically consistent read and stays
-precise: an insert at the head reruns the window, a write past its last row does not.
+`LIMIT` over the whole window is one atomically consistent read: a head insert and a tail append both land in the same
+refresh, and there is no page boundary to tear across.
 
 ```ts
 const MessageWindow = Query.make("MessageWindow", {
@@ -556,8 +560,20 @@ const MessageWindow = Query.make("MessageWindow", {
 })
 
 const layerMessageWindow = MessageWindow.toLayer(({ payload, query }) =>
-  query.from(Message, "byCreatedAt").order("desc").limit(payload.limit).page().pipe(
-    Effect.map((page) => ({ items: page.items, hasMore: page.next !== undefined }))
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: Schema.Struct({ value: Schema.fromJsonString(Message.schema) }),
+    execute: () =>
+      query.sql([Message], (sql) =>
+        sql`SELECT "value" FROM "Message" ORDER BY "createdAt" DESC LIMIT ${payload.limit + 1}`)
+  })(undefined).pipe(
+    Effect.map((rows) => ({
+      items: rows.slice(0, payload.limit).map((row) =>
+        row.value
+      ),
+      hasMore: rows.length > payload.limit
+    })),
+    Effect.catchTag("SchemaError", (cause) => Effect.die(cause))
   )
 )
 
@@ -571,12 +587,9 @@ export const loadMoreAtom = Atom.writable(
 ```
 
 Do not stitch a scrolling list from per page keyset atoms. Page boundaries derive from data, so a head insert shifts
-the first page's cursor while later pages correctly do not rerun, and the concatenation silently drops the row that
-moved across the boundary. The growing window has no boundary between reads and cannot tear.
-
-A query limit is capped at 1,000 rows. Past that, split the list at application chosen anchor values instead of keyset
-cursors: one live head query bounded by `gte` on the anchor and one frozen query per older segment bounded by `lt` and
-`gte`. Constant bounds cannot shift, so each segment invalidates independently and precisely.
+the first page's boundary and the concatenation silently drops the row that moved across it. The growing window has
+no boundary between reads and cannot tear. Since reactivity is model granular, every mounted query over the model
+re-runs on a write anyway; one window query keeps that refresh a single consistent read.
 
 ## Selective field semantics
 

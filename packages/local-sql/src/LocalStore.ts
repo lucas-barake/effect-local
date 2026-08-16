@@ -24,7 +24,6 @@ import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import * as IndexStore from "./IndexStore.js"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as ClientMetrics from "./internal/clientMetrics.js"
 import * as Codec from "./internal/codec.js"
@@ -724,17 +723,6 @@ export const layer = (
           AND submission_state = 'Submitting'`.pipe(
         Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
       )
-      const indexAddress = (current: typeof Rows.ClientMetaRow.Type): IndexStore.Address => ({
-        spaceId: options.spaceId,
-        schemaGeneration: current.active_schema_generation,
-        projectionGeneration: current.active_projection_generation
-      })
-      const indexIdentities = Effect.forEach((entity: Protocol.EntityKey) =>
-        Codec.stringify(entity.key).pipe(
-          Effect.map((entityKey): IndexStore.EntityIdentity => ({ model: entity.model, entityKey }))
-        )
-      )
-      let indexes: IndexStore.Runtime
       const validateFence = (current: typeof Rows.ClientMetaRow.Type) => {
         if (current.membership_incarnation !== initializedMeta.membership_incarnation) {
           return Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
@@ -1217,7 +1205,7 @@ export const layer = (
             changed = true
           }
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-        if (changed) yield* invalidate([], [], [], true)
+        if (changed) yield* invalidate([], [], true)
       })
 
       const markRetrying = Effect.fnUntraced(function*(mutationId: Identity.MutationId) {
@@ -1233,7 +1221,7 @@ export const layer = (
             changed = true
           }
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-        if (changed) yield* invalidate([], [], [], true)
+        if (changed) yield* invalidate([], [], true)
       })
 
       const quarantine = sql.withTransaction(Effect.gen(function*() {
@@ -1273,7 +1261,6 @@ export const layer = (
       const prepareInvalidation = Effect.fnUntraced(function*(
         entities: ReadonlyArray<Protocol.EntityKey>,
         receiptIds: ReadonlyArray<Identity.MutationId> = [],
-        indexPoints: ReadonlyArray<IndexStore.Point> = [],
         pendingChanged = false
       ) {
         const uniqueEntities = Array.from(
@@ -1292,7 +1279,7 @@ export const layer = (
         const queryKeys = yield* queryReactivity.affected({
           spaceId: options.spaceId,
           entityKeys: new Set(entityKeys),
-          points: indexPoints
+          models: new Set(uniqueEntities.map((entity) => entity.model))
         })
         const keys = [
           ...entityKeys,
@@ -1310,16 +1297,14 @@ export const layer = (
       const invalidate = (
         entities: ReadonlyArray<Protocol.EntityKey>,
         receiptIds: ReadonlyArray<Identity.MutationId> = [],
-        indexPoints: ReadonlyArray<IndexStore.Point> = [],
         pendingChanged = false
       ) =>
-        prepareInvalidation(entities, receiptIds, indexPoints, pendingChanged).pipe(
+        prepareInvalidation(entities, receiptIds, pendingChanged).pipe(
           Effect.flatMap(reactivity.invalidate)
         )
 
       const deferredEntities = new Map<string, Protocol.EntityKey>()
       const deferredReceiptIds = new Set<Identity.MutationId>()
-      const deferredIndexPoints: Array<IndexStore.Point> = []
       const deferredSettlements: Array<Replica.MutationSettlement> = []
       let deferredPendingChanged = false
       const deferInvalidation = Effect.fnUntraced(function*(
@@ -1327,13 +1312,6 @@ export const layer = (
         receiptIds: ReadonlyArray<Identity.MutationId>,
         pendingChanged = false
       ) {
-        const unique = Array.from(
-          new Map(entities.map((entity) => [SqlTransaction.entityKey(entity), entity])).values()
-        )
-        const current = yield* meta
-        const address = indexAddress(current)
-        const identities = yield* indexIdentities(unique)
-        deferredIndexPoints.push(...yield* indexes.points(address, identities))
         for (const entity of entities) {
           deferredEntities.set(SqlTransaction.entityKey(entity), entity)
         }
@@ -1345,26 +1323,14 @@ export const layer = (
       const prepareDeferredInvalidations = Effect.fnUntraced(function*() {
         const entities = Array.from(deferredEntities.values())
         const receiptIds = Array.from(deferredReceiptIds)
-        if (
-          entities.length === 0 && receiptIds.length === 0 && deferredIndexPoints.length === 0 &&
-          !deferredPendingChanged
-        ) {
+        if (entities.length === 0 && receiptIds.length === 0 && !deferredPendingChanged) {
           return yield* Effect.succeed(Option.none<{
             readonly entities: ReadonlyArray<Protocol.EntityKey>
             readonly receiptIds: ReadonlyArray<Identity.MutationId>
             readonly keys: ReadonlyArray<unknown>
           }>())
         }
-        const current = yield* meta
-        const address = indexAddress(current)
-        yield* indexes.ensure(address)
-        const currentPoints = yield* indexes.points(address, yield* indexIdentities(entities))
-        const keys = yield* prepareInvalidation(
-          entities,
-          receiptIds,
-          [...deferredIndexPoints, ...currentPoints],
-          deferredPendingChanged
-        )
+        const keys = yield* prepareInvalidation(entities, receiptIds, deferredPendingChanged)
         return Option.some({ entities, receiptIds, keys })
       })()
       const notifyDeferredInvalidations = Effect.fnUntraced(function*(
@@ -1382,7 +1348,6 @@ export const layer = (
         for (const mutationId of prepared.value.receiptIds) {
           deferredReceiptIds.delete(mutationId)
         }
-        deferredIndexPoints.length = 0
         deferredPendingChanged = false
         return yield* Effect.void
       })
@@ -1711,17 +1676,6 @@ export const layer = (
           then
         )
 
-      const rebuildWithIndexPoints = Effect.fnUntraced(function*(entities: ReadonlyArray<Protocol.EntityKey>) {
-        const identities = yield* indexIdentities(entities)
-        const before = indexAddress(yield* meta)
-        const points = [...yield* indexes.points(before, identities)]
-        yield* rebuildProjection
-        const after = indexAddress(yield* meta)
-        yield* indexes.ensure(after)
-        points.push(...yield* indexes.points(after, identities))
-        return points
-      })
-
       const findDirtyEntities = SqlSchema.findAll({
         Request: Schema.Void,
         Result: Schema.Struct({
@@ -1761,13 +1715,12 @@ export const layer = (
         if (current.projection_replay_generation !== null) {
           return Option.none<{
             readonly entities: ReadonlyArray<Protocol.EntityKey>
-            readonly points: ReadonlyArray<IndexStore.Point>
           }>()
         }
         const replaySchemaGeneration = current.active_schema_generation
         const projectionGeneration = current.active_projection_generation
         const dirtyRows = yield* findDirtyEntities(undefined).pipe(Effect.mapError(StorageUnavailable.make))
-        const touched = new Map<string, IndexStore.EntityIdentity>()
+        const touched = new Map<string, { readonly model: string; readonly entityKey: string }>()
         const entities = new Map<string, Protocol.EntityKey>()
         const record = (entity: Protocol.EntityKey, entityKey: string) => {
           const identity = `${entity.model}\u0000${entityKey}`
@@ -1865,13 +1818,12 @@ export const layer = (
                   AND r.entity_key = effect_local_client_visible_entities_data.entity_key
               )`
         }
-        const points = yield* indexes.replace(indexAddress(current), allIdentities)
         yield* sql`DELETE FROM effect_local_client_projection_dirty
           WHERE space_id = ${options.spaceId} AND schema_generation = ${replaySchemaGeneration}`
         yield* sql`UPDATE effect_local_client_spaces SET visible_revision = visible_revision + 1
           WHERE space_id = ${options.spaceId}`
         const dirtyEntities: ReadonlyArray<Protocol.EntityKey> = [...entities.values()]
-        return Option.some({ entities: dirtyEntities, points })
+        return Option.some({ entities: dirtyEntities })
       })).pipe(
         Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
       )
@@ -2059,7 +2011,7 @@ export const layer = (
         if (inserted || pruned.length > 0) {
           let receiptIds = pruned
           if (inserted) receiptIds = [receipt.mutationId, ...pruned]
-          yield* invalidate([], receiptIds, [], inserted)
+          yield* invalidate([], receiptIds, inserted)
         }
         return yield* Effect.void
       })
@@ -2150,19 +2102,17 @@ export const layer = (
           return yield* Effect.void
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         let entities = Array.from(touched.values())
-        let indexPoints: ReadonlyArray<IndexStore.Point> = []
         if (entities.length > 0) {
           const delta = yield* applyProjectionDeltaInGate
           if (Option.isSome(delta)) {
             entities = [...delta.value.entities]
-            indexPoints = delta.value.points
           } else {
-            indexPoints = yield* rebuildWithIndexPoints(entities)
+            yield* rebuildProjection
           }
         }
         let invalidationKeys: ReadonlyArray<unknown> = []
         if (entities.length > 0 || prunedReceiptIds.length > 0 || settlements.length > 0) {
-          invalidationKeys = yield* prepareInvalidation(entities, prunedReceiptIds, indexPoints)
+          invalidationKeys = yield* prepareInvalidation(entities, prunedReceiptIds)
         }
         return { invalidationKeys, settlements }
       })
@@ -2892,10 +2842,10 @@ export const layer = (
         ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         yield* recordBootstrapInstallMetric
         const entities = Array.from(dirty.values())
-        const indexPoints = yield* rebuildWithIndexPoints(entities)
+        yield* rebuildProjection
         const deletedSettlements = yield* deleteSettledPending(settlements)
         yield* reactivity.withBatch(
-          invalidate(entities, prunedReceiptIds, indexPoints, pendingChanged || deletedSettlements.length > 0)
+          invalidate(entities, prunedReceiptIds, pendingChanged || deletedSettlements.length > 0)
         )
         return deletedSettlements
       }, Effect.uninterruptible)
@@ -2968,7 +2918,7 @@ export const layer = (
         let viewInvalidations: ReadonlyArray<unknown>
         if (Option.isSome(delta)) {
           yield* flushDeferredInvalidations
-          viewInvalidations = yield* prepareInvalidation(delta.value.entities, [], delta.value.points)
+          viewInvalidations = yield* prepareInvalidation(delta.value.entities)
         } else {
           yield* rebuildProjection
           yield* flushDeferredInvalidations
@@ -3135,8 +3085,6 @@ export const layer = (
           })
         }
         const changes: Array<Protocol.EntityChange> = []
-        const indexPoints: Array<IndexStore.Point> = []
-        const address = indexAddress(storedMeta)
         const mutationName = mutation.name
         const executionPayload = payloadJsonValue
         const transaction = SqlTransaction.local({
@@ -3145,12 +3093,7 @@ export const layer = (
           spaceId: options.spaceId,
           schemaGeneration: storedMeta.active_schema_generation,
           projectionGeneration: storedMeta.active_projection_generation,
-          changes,
-          onVisibleChange: (model, entityKey) =>
-            indexes.replace(address, [{ model, entityKey }]).pipe(
-              Effect.tap((points) => Effect.sync(() => indexPoints.push(...points))),
-              Effect.asVoid
-            )
+          changes
         })
         const executed = yield* runtime.execute(mutationName, executionPayload, transaction, changes)
         if (Result.isFailure(executed)) {
@@ -3178,7 +3121,7 @@ export const layer = (
                 visible_revision = visible_revision + 1,
                 requested_generation = requested_generation + 1
             WHERE space_id = ${options.spaceId}`
-        return { pendingMutation, indexPoints }
+        return { pendingMutation }
       })
 
       const ensureQuarantineResubmission = <M extends Mutation.Any,>(
@@ -3241,7 +3184,7 @@ export const layer = (
                 const rejection = yield* Codec.decode(mutation.rejectionSchema, replacement.rejection)
                 return yield* Effect.fail(rejection)
               }
-              return { pendingMutation: replacement, indexPoints: [], pendingDelta: 0 }
+              return { pendingMutation: replacement, pendingDelta: 0 }
             }
             const mutationResult = yield* mutateInTransaction(mutation, payload, true)
             yield* sql`INSERT INTO effect_local_client_quarantine_resubmissions
@@ -3251,7 +3194,7 @@ export const layer = (
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
           yield* updatePendingMetric(result.pendingDelta)
           const entities = result.pendingMutation.changes.map((change) => change.entity)
-          yield* reactivity.withBatch(invalidate(entities, [], result.indexPoints, true))
+          yield* reactivity.withBatch(invalidate(entities, [], true))
           return result.pendingMutation
         })).pipe(Effect.withSpan("LocalStore.ensureQuarantineResubmission", {
           attributes: { "mutation.id": mutationId, "mutation.name": mutation.name }
@@ -3269,10 +3212,6 @@ export const layer = (
         Effect.andThen(rebuildProjection)
       )
       yield* projectionGate.withPermit(restoreProjection)
-      const indexSql = sql
-      const indexDefinition = options.definition
-      const installAddress = indexAddress(yield* meta)
-      indexes = yield* IndexStore.install(indexSql, indexDefinition, installAddress)
       yield* initializePendingMetric(yield* readPendingCount)
 
       const receipt = (mutationId: Identity.MutationId) =>
@@ -3297,7 +3236,7 @@ export const layer = (
             )
             yield* updatePendingMetric(1)
             const entities = result.pendingMutation.changes.map((change) => change.entity)
-            yield* reactivity.withBatch(invalidate(entities, [], result.indexPoints, true))
+            yield* reactivity.withBatch(invalidate(entities, [], true))
             return result.pendingMutation
           })).pipe(Effect.withSpan("LocalStore.mutate", {
             attributes: {
