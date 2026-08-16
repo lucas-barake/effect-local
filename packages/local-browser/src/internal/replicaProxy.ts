@@ -33,6 +33,7 @@ export interface ProxyOptions {
   readonly profileNames: ReadonlyMap<Ephemeral.AnyMember, string>
   readonly client: WireClient
   readonly makeHandle: Effect.Effect<string>
+  readonly reconnectDelay: Duration.Input
 }
 
 export interface ProxyRegistrations {
@@ -132,6 +133,7 @@ export const decodeSettlement = Effect.fnUntraced(function*(
 
 export const makeProxy = (options: ProxyOptions): ReplicaProxy => {
   const definition = options.definition
+  const reconnectMillis = Duration.toMillis(options.reconnectDelay)
   const client = options.client
   const knownSpaces = new Set<Identity.SpaceId>()
   const retainCounts = new Map<string, number>()
@@ -173,7 +175,10 @@ export const makeProxy = (options: ProxyOptions): ReplicaProxy => {
         if (cursor === undefined) return page(streamOptions?.from)
         return page(cursor)
       }).pipe(
-        Stream.catchTag("RpcClientError", () => resume())
+        Stream.catchTag("RpcClientError", () =>
+          Stream.fromEffect(Effect.sleep(reconnectMillis)).pipe(
+            Stream.flatMap(() => resume())
+          ))
       )
     return resume()
   }
@@ -339,7 +344,16 @@ export const makeProxy = (options: ProxyOptions): ReplicaProxy => {
     profile: Ephemeral.AnyMember,
     request: OpenSession["request"]
   ): EphemeralClient.Session<Ephemeral.AnyMember> => {
-    const reopen = Effect.ignore(client.EphemeralOpen(request))
+    const reopen = (): Effect.Effect<void, ReplicaError.ReplicaError> =>
+      client.EphemeralOpen(request).pipe(
+        Effect.catchTag("WireUnknownDefinition", (error) => Effect.die(error)),
+        Effect.catchTag("WireUnknownSession", (error) => Effect.die(error)),
+        Effect.catchTag("WireEphemeralEncodeError", (error) => Effect.die(error)),
+        Effect.catchTag("RpcClientError", () =>
+          Effect.sleep(reconnectMillis).pipe(
+            Effect.andThen(reopen())
+          ))
+      )
     const withReconnect = <A, E,>(
       make: () => Stream.Stream<
         A,
@@ -347,12 +361,16 @@ export const makeProxy = (options: ProxyOptions): ReplicaProxy => {
         | replicaWire.WireUnknownSession
         | RpcClientError.RpcClientError
       >
-    ): Stream.Stream<A, E> =>
+    ): Stream.Stream<A, E | ReplicaError.ReplicaError> =>
       make().pipe(
         Stream.catchTag("WireUnknownSession", () =>
-          Stream.fromEffect(reopen).pipe(Stream.flatMap(() => withReconnect(make)))),
+          Stream.fromEffect(reopen()).pipe(Stream.flatMap(() => withReconnect(make)))),
         Stream.catchTag("RpcClientError", () =>
-          Stream.fromEffect(reopen).pipe(Stream.flatMap(() => withReconnect(make))))
+          Stream.fromEffect(
+            Effect.sleep(reconnectMillis).pipe(Effect.andThen(reopen()))
+          ).pipe(Stream.flatMap(() =>
+            withReconnect(make)
+          )))
       )
 
     return {

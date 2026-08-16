@@ -243,7 +243,8 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
       definition,
       profileNames,
       client: wireClient,
-      makeHandle: makeUuid
+      makeHandle: makeUuid,
+      reconnectDelay: retryDelay
     })
 
     const remoteBackend: Backend = {
