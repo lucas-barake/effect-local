@@ -20,14 +20,17 @@ const decodeVersion = Schema.decodeUnknownEffect(Wire.VersionProbe)
 export const postFrame = (
   connection: platform.TabChannelConnection,
   frame: Wire.WireFrame
-): Effect.Effect<void> => connection.post({ v: Wire.protocolVersion, frame })
+): Effect.Effect<void> =>
+  connection.post({ v: Wire.protocolVersion, frame }).pipe(
+    Effect.withSpan("localBrowser.broadcastRpc.postFrame", { attributes: { frame: frame._tag } })
+  )
 
 export interface SubscribeOptions {
   readonly onFrame: (frame: Wire.WireFrame) => Effect.Effect<void>
   readonly onVersionSkew?: (version: number) => Effect.Effect<void>
 }
 
-export const subscribeFrames = Effect.fnUntraced(function*(
+export const subscribeFrames = Effect.fn("localBrowser.broadcastRpc.subscribeFrames")(function*(
   connection: platform.TabChannelConnection,
   options: SubscribeOptions
 ) {
@@ -285,7 +288,7 @@ export const makeClientProtocol = (
       supportsAck: true,
       supportsTransferables: false
     }
-  }))
+  })).pipe(Effect.withSpan("localBrowser.broadcastRpc.clientProtocol"))
 
 export interface ServerProtocolOptions {
   readonly epoch: Wire.Epoch
@@ -304,7 +307,7 @@ export interface ServerProtocol {
   readonly tabDisconnects: Queue.Dequeue<Wire.TabId>
 }
 
-export const makeServerProtocol = Effect.fnUntraced(function*(
+export const makeServerProtocol = Effect.fn("localBrowser.broadcastRpc.serverProtocol")(function*(
   options: ServerProtocolOptions
 ) {
   const clientTimeoutMillis = Duration.toMillis(options.clientTimeout)

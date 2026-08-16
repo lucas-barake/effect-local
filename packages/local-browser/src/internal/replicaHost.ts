@@ -94,7 +94,7 @@ export const encodeSettlement = Effect.fnUntraced(function*(
   return settlement
 })
 
-export const makeHost = Effect.fnUntraced(function*(options: HostOptions) {
+export const makeHost = Effect.fn("localBrowser.replicaHost")(function*(options: HostOptions) {
   const definition = options.definition
   const graceMillis = Duration.toMillis(options.disconnectGrace)
   const ephemeralByName = new Map<string, Ephemeral.Any>()

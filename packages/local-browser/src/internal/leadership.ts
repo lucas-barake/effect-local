@@ -22,7 +22,7 @@ export const lockName = (name: string): string => `@lucas-barake/effect-local-br
 
 export const epochKey = (name: string): string => `@lucas-barake/effect-local-browser:${name}:epoch`
 
-export const makeLeadership = Effect.fnUntraced(function*(
+export const makeLeadership = Effect.fn("localBrowser.leadership")(function*(
   options: LeadershipOptions
 ) {
   const locks = yield* platform.WebLocks
