@@ -167,7 +167,7 @@ describe("storage migration catalogs", () => {
 
       pipe(
         (yield* clientLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
       )
       pipe(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
@@ -211,8 +211,6 @@ describe("storage migration catalogs", () => {
       ])
       assert.notInclude(names, "effect_local_bootstrap")
       assert.notInclude(names, "effect_local_bootstrap_entities")
-      assert.notInclude(names, "effect_local_client_index_catalog")
-      assert.notInclude(names, "effect_local_client_index_state")
       assert.include((yield* indexNames(sql)).map((row) => row.name), "effect_local_server_watch_presence_runtime")
       yield* sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at) VALUES ('runtime', 1)`
       yield* sql`INSERT INTO effect_local_server_watch_presence
@@ -223,28 +221,6 @@ describe("storage migration catalogs", () => {
         Effect.exit
       )
       assert.isTrue(SqlError.isSqlError(expectedFailure(duplicatePresence).pipe(Option.getOrThrow)))
-    }, provideDatabase)
-  )
-
-  it.effect(
-    "drops runtime index tables through the catalog when upgrading past the secondary-index era",
-    Effect.fnUntraced(function*() {
-      const sql = yield* SqlClient.SqlClient
-      yield* Migrations.runCatalog("Client", Migrations.clientCatalog.slice(0, 15))
-      yield* sql`CREATE TABLE effect_local_idx_deadbeef (index_entity_key TEXT NOT NULL)`
-      yield* sql`CREATE INDEX effect_local_idx_deadbeef_scan ON effect_local_idx_deadbeef (index_entity_key)`
-      yield* sql`INSERT INTO effect_local_client_index_catalog
-        (model, index_name, descriptor_hash, layout_hash, table_name, table_checksum,
-          scan_index_name, scan_index_checksum)
-        VALUES ('Todo', 'byCount', 'deadbeef', 'layout', 'effect_local_idx_deadbeef', 'checksum',
-          'effect_local_idx_deadbeef_scan', 'checksum')`
-
-      yield* Migrations.runCatalog("Client", Migrations.clientCatalog)
-
-      const names = (yield* tableNames(sql)).map((row) => row.name)
-      assert.notInclude(names, "effect_local_idx_deadbeef")
-      assert.notInclude(names, "effect_local_client_index_catalog")
-      assert.notInclude(names, "effect_local_client_index_state")
     }, provideDatabase)
   )
 

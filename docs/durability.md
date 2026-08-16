@@ -4,8 +4,7 @@ SQLite is the client commit boundary. The server SQL transaction is the shared a
 
 Client queries read visible entity state directly with raw SQL inside one transaction, fenced by the space row's
 active schema and projection generations, so no derived client-side index storage exists. Secondary index
-declarations remain purely server-side inputs to replication windows. A migration drops the client index catalog,
-its per-index shadow tables, and their backfill state from databases created before the raw SQL query capability.
+declarations remain purely server-side inputs to replication windows.
 
 ## Client transactions
 

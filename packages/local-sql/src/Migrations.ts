@@ -1273,43 +1273,6 @@ const clientV11 = makeMigration({
 
 const clientV12 = makeMigration({
   id: 12,
-  name: "secondary-index-catalog",
-  statements: [
-    `CREATE TABLE effect_local_client_index_catalog (
-      model TEXT NOT NULL,
-      index_name TEXT NOT NULL,
-      descriptor_hash TEXT NOT NULL,
-      layout_hash TEXT NOT NULL,
-      table_name TEXT NOT NULL UNIQUE,
-      table_checksum TEXT NOT NULL,
-      scan_index_name TEXT NOT NULL UNIQUE,
-      scan_index_checksum TEXT NOT NULL,
-      PRIMARY KEY (model, index_name, descriptor_hash)
-    )`,
-    `CREATE TABLE effect_local_client_index_state (
-      space_id TEXT NOT NULL,
-      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
-      projection_generation INTEGER NOT NULL CHECK (projection_generation >= 0),
-      model TEXT NOT NULL,
-      index_name TEXT NOT NULL,
-      descriptor_hash TEXT NOT NULL,
-      backfill_after_key TEXT,
-      backfill_visible_revision INTEGER CHECK (
-        backfill_visible_revision IS NULL OR backfill_visible_revision >= 0
-      ),
-      ready INTEGER NOT NULL DEFAULT 0 CHECK (ready IN (0, 1)),
-      PRIMARY KEY (
-        space_id, schema_generation, projection_generation, model, index_name, descriptor_hash
-      ),
-      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE,
-      FOREIGN KEY (model, index_name, descriptor_hash)
-        REFERENCES effect_local_client_index_catalog(model, index_name, descriptor_hash) ON DELETE CASCADE
-    )`
-  ]
-})
-
-const clientV13 = makeMigration({
-  id: 13,
   name: "projection-dirty-entities",
   statements: [
     `CREATE TABLE effect_local_client_projection_dirty (
@@ -1323,8 +1286,8 @@ const clientV13 = makeMigration({
   ]
 })
 
-const clientV14 = makeMigration({
-  id: 14,
+const clientV13 = makeMigration({
+  id: 13,
   name: "durable-settlements",
   statements: [
     "ALTER TABLE effect_local_client_receipts_data ADD COLUMN settled_pending_json TEXT",
@@ -1339,8 +1302,8 @@ const clientV14 = makeMigration({
   ]
 })
 
-const clientV15 = makeMigration({
-  id: 15,
+const clientV14 = makeMigration({
+  id: 14,
   name: "settlement-prune-watermarks",
   statements: [
     `CREATE TABLE effect_local_client_settlement_prune (
@@ -1354,43 +1317,6 @@ const clientV15 = makeMigration({
       ON effect_local_client_receipts_data (space_id, schema_generation, local_sequence)
       WHERE settled_sequence IS NULL`
   ]
-})
-
-const clientV16 = makeMigration({
-  id: 16,
-  name: "drop-client-secondary-indexes",
-  // The state table goes first as a plain statement (it references the catalog through a foreign
-  // key), but every other drop must happen inside the effect: the per-index tables were created at
-  // runtime and only the catalog knows their names, and statements always run before the effect.
-  statements: ["DROP TABLE effect_local_client_index_state"],
-  effect: {
-    id: "drop-client-index-tables",
-    run: Effect.fnUntraced(
-      function*(sql: SqlClient.SqlClient) {
-        const rows = yield* SqlSchema.findAll({
-          Request: Schema.Void,
-          Result: Schema.Struct({
-            table_name: Schema.String,
-            scan_index_name: Schema.String
-          }),
-          execute: () => sql`SELECT table_name, scan_index_name FROM effect_local_client_index_catalog`
-        })(undefined)
-        for (const row of rows) {
-          yield* sql`DROP INDEX IF EXISTS ${sql(row.scan_index_name)}`
-          yield* sql`DROP TABLE IF EXISTS ${sql(row.table_name)}`
-        }
-        yield* sql`DROP TABLE effect_local_client_index_catalog`
-      },
-      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
-      Effect.catchTag("SchemaError", (cause) =>
-        Effect.fail(
-          new ReplicaError.StorageCorrupt({
-            message: "Client index catalog rows are undecodable",
-            cause
-          })
-        ))
-    )
-  }
 })
 
 export const clientCatalog = Object.freeze([
@@ -1407,9 +1333,7 @@ export const clientCatalog = Object.freeze([
   clientV11,
   clientV12,
   clientV13,
-  clientV14,
-  clientV15,
-  clientV16
+  clientV14
 ])
 
 const serverV6 = makeMigration({
