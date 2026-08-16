@@ -3,7 +3,6 @@ import * as Schema from "effect/Schema"
 import * as Model from "../src/Model.js"
 import * as Mutation from "../src/Mutation.js"
 import * as Query from "../src/Query.js"
-import type * as SecondaryIndex from "../src/SecondaryIndex.js"
 import type * as Transaction from "../src/Transaction.js"
 
 const TodoSchema = Schema.Struct({
@@ -46,32 +45,15 @@ const Todo = Model.make("Todo", {
   }
 })
 
-const typeContracts = (
-  query: Transaction.Query,
-  createdCursor: SecondaryIndex.Cursor<"Todo", "byProjectCreatedAt">,
-  priorityCursor: SecondaryIndex.Cursor<"Todo", "byPriority">
-) => {
-  const created = query.from(Todo, "byProjectCreatedAt")
-    .where({ projectId: "project-1", createdAt: { gte: 10, lt: 20 } })
-    .order("desc")
-    .limit(25)
-    .after(createdCursor)
-  created.page()
-  created.stream()
+const typeContracts = (query: Transaction.Query) => {
+  query.sql([Todo], (sql) => sql`SELECT "id" FROM "Todo" WHERE "priority" > ${1}`)
 
-  query.from(Todo, "byPriority").where({ priority: { gt: 1 } }).after(priorityCursor)
-
-  // @ts-expect-error unindexed model scans are not part of the query capability
-  query.all(Todo)
-
-  // @ts-expect-error undeclared indexes cannot be queried
-  query.from(Todo, "byTitle")
-  // @ts-expect-error where fields must belong to the declared index
-  query.from(Todo, "byProjectCreatedAt").where({ projectId: "project-1", priority: { gt: 1 } })
-  // @ts-expect-error partition values retain their declared Schema type
-  query.from(Todo, "byProjectCreatedAt").where({ projectId: 1 })
-  // @ts-expect-error cursors are scoped to their model and index
-  query.from(Todo, "byProjectCreatedAt").after(priorityCursor)
+  // @ts-expect-error the statement callback must return a statement, not raw text
+  query.sql([Todo], () => "SELECT 1")
+  // @ts-expect-error declared reads must be models
+  query.sql(["Todo"], (sql) => sql`SELECT 1`)
+  // @ts-expect-error the declared-index builder is gone; raw SQL replaced it
+  query.from(Todo, "byPriority")
 }
 
 // @ts-expect-error static dependency fallbacks are not part of query declarations

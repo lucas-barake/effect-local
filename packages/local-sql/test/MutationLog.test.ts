@@ -896,7 +896,7 @@ describe("server reconciled mutation log", () => {
   )
 
   it.effect(
-    "classifies malformed visible rows during index maintenance as storage corruption",
+    "settles past a malformed canonical row and surfaces the corruption at read time",
     pipe(Effect.fnUntraced(function*() {
       const layerClientDatabase = database()
       const layerLive = LocalStore.layer({
@@ -926,17 +926,7 @@ describe("server reconciled mutation log", () => {
       yield* sql`INSERT INTO effect_local_client_canonical_entities_data
         (space_id, schema_generation, model, model_version, entity_key, value_json)
         VALUES (${spaceId}, ${meta.active_schema_generation}, ${Domain.Todo.name}, ${Domain.Todo.version},
-          ${Canonical.stringify("corrupt-index-refresh")}, x'00')`
-      const malformed = yield* SqlSchema.findOne({
-        Request: Schema.Void,
-        Result: Schema.Struct({ value_json: Schema.Unknown }),
-        execute: () =>
-          sql`SELECT value_json FROM effect_local_client_canonical_entities_data
-          WHERE space_id = ${spaceId} AND schema_generation = ${meta.active_schema_generation}
-          AND model = ${Domain.Todo.name}
-          AND entity_key = ${Canonical.stringify("corrupt-index-refresh")}`
-      })(undefined)
-      assert.instanceOf(malformed.value_json, Uint8Array)
+          ${Canonical.stringify("corrupt-index-refresh")}, 'not json')`
       yield* local.persistReceipt(Protocol.RejectedReceipt.make({
         spaceId,
         clientId,
@@ -949,19 +939,24 @@ describe("server reconciled mutation log", () => {
         rejection: "denied"
       }))
 
-      const error = yield* local.settleReceipts.pipe(expectedFailure)
+      // Nothing decodes entity values on the settlement path anymore (the index maintenance that
+      // did is gone), so the malformed bytes settle cleanly and fail typed only when a read
+      // decodes them.
+      const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
+      yield* local.settleReceipts
+      assert.strictEqual(yield* local.pendingCount, 0)
+      const error = yield* local.get(Domain.Todo, "corrupt-index-refresh").pipe(expectedFailure)
       assert.strictEqual(error._tag, "StorageCorrupt")
-      assert.strictEqual(yield* local.pendingCount, 1)
 
+      yield* sql`DELETE FROM effect_local_client_visible_entities_data
+        WHERE space_id = ${spaceId} AND schema_generation = ${meta.active_schema_generation}
+          AND model = ${Domain.Todo.name} AND entity_key = ${Canonical.stringify("corrupt-index-refresh")}`
       yield* sql`DELETE FROM effect_local_client_canonical_entities_data
         WHERE space_id = ${spaceId} AND schema_generation = ${meta.active_schema_generation}
           AND model = ${Domain.Todo.name} AND entity_key = ${Canonical.stringify("corrupt-index-refresh")}`
-      const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
-      yield* local.settleReceipts
       assert.deepStrictEqual((yield* pull).map((settled) => settled.settlement.pending.envelope.mutationId), [
         pending.envelope.mutationId
       ])
-      assert.strictEqual(yield* local.pendingCount, 0)
     }, Effect.scoped))
   )
 
@@ -1263,7 +1258,7 @@ describe("server reconciled mutation log", () => {
   )
 
   it.effect(
-    "filters, orders, paginates, and streams through a declared secondary index",
+    "filters, orders, and paginates with raw SQL keysets",
     pipe(Effect.fnUntraced(function*() {
       const layerLocal = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
         Layer.provide(layerRuntime)

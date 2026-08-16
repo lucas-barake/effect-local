@@ -1,157 +1,59 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
-import type * as IndexStore from "../src/IndexStore.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 
-const footprint = (options: {
-  readonly lower: string
-  readonly upper: string
-  readonly boundary?: ReadonlyArray<string | number>
-  readonly full?: boolean
+const changes = (options: {
+  readonly entityKeys?: ReadonlyArray<string>
+  readonly models?: ReadonlyArray<string>
   readonly spaceId?: Identity.SpaceId
-}): IndexStore.Footprint => ({
+}): QueryReactivity.Changes => ({
   spaceId: options.spaceId ?? spaceId,
-  descriptor: "todo-by-title",
-  model: "Todo",
-  index: "byTitle",
-  partition: [],
-  lower: options.lower,
-  lowerInclusive: true,
-  upper: options.upper,
-  upperInclusive: false,
-  direction: "asc",
-  cursor: undefined,
-  boundary: options.boundary,
-  hasMore: false,
-  full: options.full ?? false
-})
-
-const point = (title: string, entityKey: string): IndexStore.Point => ({
-  spaceId,
-  descriptor: "todo-by-title",
-  model: "Todo",
-  index: "byTitle",
-  partition: [],
-  sort: [title],
-  entityKey
-})
-
-const changes = (points: ReadonlyArray<IndexStore.Point>): QueryReactivity.Changes => ({
-  spaceId,
-  entityKeys: new Set(),
-  points
-})
-const chatFootprint = (chat: string, options: {
-  readonly lower?: number
-  readonly upper?: number
-  readonly boundary?: ReadonlyArray<string | number>
-  readonly hasMore?: boolean
-  readonly direction?: "asc" | "desc"
-}): IndexStore.Footprint => ({
-  spaceId,
-  descriptor: "message-by-chat",
-  model: "Message",
-  index: "byChat",
-  partition: [chat],
-  lower: options.lower,
-  lowerInclusive: true,
-  upper: options.upper,
-  upperInclusive: true,
-  direction: options.direction ?? "asc",
-  cursor: undefined,
-  boundary: options.boundary,
-  hasMore: options.hasMore ?? false,
-  full: false
-})
-
-const chatPoint = (chat: string, sentAt: number): IndexStore.Point => ({
-  spaceId,
-  descriptor: "message-by-chat",
-  model: "Message",
-  index: "byChat",
-  partition: [chat],
-  sort: [sentAt],
-  entityKey: `message-${sentAt}`
+  entityKeys: new Set(options.entityKeys ?? []),
+  models: new Set(options.models ?? [])
 })
 
 const provideQueryReactivity = Effect.provide(QueryReactivity.layer)
 
-describe("query range reactivity", () => {
+describe("query reactivity", () => {
   it.effect(
-    "intersects old and new index points with only the result ranges they can change",
+    "matches model reads against the models a change set touches",
     Effect.fnUntraced(
       function*() {
         const registry = yield* QueryReactivity.QueryReactivity
-        const releaseRelated = yield* registry.retain("related")
-        const releaseUnrelated = yield* registry.retain("unrelated")
-        yield* Effect.addFinalizer(() => releaseUnrelated.pipe(Effect.andThen(releaseRelated)))
-        yield* registry.record("related", [{ _tag: "Index", footprint: footprint({ lower: "a", upper: "m" }) }])
-        yield* registry.record("unrelated", [{ _tag: "Index", footprint: footprint({ lower: "n", upper: "z" }) }])
+        const releaseTodos = yield* registry.retain("todos")
+        const releaseMessages = yield* registry.retain("messages")
+        yield* Effect.addFinalizer(() => releaseMessages.pipe(Effect.andThen(releaseTodos)))
+        yield* registry.record("todos", [{ _tag: "Model", spaceId, model: "Todo" }])
+        yield* registry.record("messages", [{ _tag: "Model", spaceId, model: "Message" }])
 
-        const betaChanges = changes([point("beta", "\"1\"")])
-        assert.deepStrictEqual(yield* registry.affected(betaChanges), ["related"])
-        const betaAndOmegaChanges = changes([point("beta", "\"1\""), point("omega", "\"1\"")])
+        assert.deepStrictEqual(yield* registry.affected(changes({ models: ["Todo"] })), ["todos"])
         assert.deepStrictEqual(
-          yield* registry.affected(betaAndOmegaChanges),
-          ["related", "unrelated"]
+          yield* registry.affected(changes({ models: ["Todo", "Message"] })),
+          ["todos", "messages"]
         )
+        assert.deepStrictEqual(yield* registry.affected(changes({ models: ["Other"] })), [])
       },
       provideQueryReactivity
     )
   )
 
   it.effect(
-    "does not invalidate a full limited page for a point beyond its result boundary",
-    Effect.fnUntraced(
-      function*() {
-        const registry = yield* QueryReactivity.QueryReactivity
-        const release = yield* registry.retain("page")
-        yield* Effect.addFinalizer(() => release)
-        yield* registry.record("page", [{
-          _tag: "Index",
-          footprint: footprint({ lower: "a", upper: "z", boundary: ["middle", "\"2\""], full: true })
-        }])
-
-        const omegaChanges = changes([point("omega", "\"3\"")])
-        assert.deepStrictEqual(yield* registry.affected(omegaChanges), [])
-        const betaChanges = changes([point("beta", "\"1\"")])
-        assert.deepStrictEqual(yield* registry.affected(betaChanges), ["page"])
-      },
-      provideQueryReactivity
-    )
-  )
-
-  it.effect(
-    "indexes changed points by descriptor before range intersection",
+    "keeps entity reads at exact-key precision",
     Effect.fnUntraced(function*() {
       const registry = yield* QueryReactivity.QueryReactivity
-      const releases: Array<Effect.Effect<void>> = []
-      for (let index = 0; index < 1_000; index++) {
-        const key = `query-${index}`
-        releases.push(yield* registry.retain(key))
-        yield* registry.record(key, [{ _tag: "Index", footprint: footprint({ lower: "a", upper: "z" }) }])
-      }
-      yield* Effect.addFinalizer(() => Effect.all(releases, { discard: true }))
-      let comparisons = 0
-      const unrelated = Array.from({ length: 1_000 }, (_, index): IndexStore.Point => ({
-        spaceId,
-        get descriptor() {
-          comparisons++
-          return "another-index"
-        },
-        model: "Todo",
-        index: "byTitle",
-        partition: [],
-        sort: [index],
-        entityKey: `"${index}"`
-      }))
+      const release = yield* registry.retain("one-entity")
+      yield* Effect.addFinalizer(() => release)
+      yield* registry.record("one-entity", [{ _tag: "Entity", spaceId, key: "entity-a" }])
 
-      assert.deepStrictEqual(yield* registry.affected(changes(unrelated)), [])
-      assert.isAtMost(comparisons, 2_000)
+      assert.deepStrictEqual(yield* registry.affected(changes({ entityKeys: ["entity-a"] })), ["one-entity"])
+      assert.deepStrictEqual(
+        yield* registry.affected(changes({ entityKeys: ["entity-b"], models: ["Todo"] })),
+        []
+      )
     }, provideQueryReactivity)
   )
 
@@ -163,58 +65,28 @@ describe("query range reactivity", () => {
       for (let index = 0; index < 1_000; index++) {
         const key = `other-space-query-${index}`
         releases.push(yield* registry.retain(key))
-        yield* registry.record(key, [{
-          _tag: "Index",
-          footprint: footprint({ lower: "a", upper: "z", spaceId: secondSpaceId })
-        }])
+        yield* registry.record(key, [{ _tag: "Model", spaceId: secondSpaceId, model: "Todo" }])
       }
       const targetKey = "target-space-query"
       releases.push(yield* registry.retain(targetKey))
-      yield* registry.record(targetKey, [{
-        _tag: "Index",
-        footprint: footprint({ lower: "a", upper: "z" })
-      }])
+      yield* registry.record(targetKey, [{ _tag: "Model", spaceId, model: "Todo" }])
       yield* Effect.addFinalizer(() => Effect.all(releases, { discard: true }))
-      assert.deepStrictEqual(yield* registry.affected(changes([point("middle", "\"1\"")])), [targetKey])
+      assert.deepStrictEqual(yield* registry.affected(changes({ models: ["Todo"] })), [targetKey])
     }, provideQueryReactivity)
   )
 
   it.effect(
-    "collapses an oversized batch to partition extremes without leaving the partition",
+    "ignores reads recorded for a token that was never retained and drops reads on release",
     Effect.fnUntraced(function*() {
       const registry = yield* QueryReactivity.QueryReactivity
-      const releaseSame = yield* registry.retain("same-chat")
-      const releaseOther = yield* registry.retain("other-chat")
-      yield* Effect.addFinalizer(() => releaseOther.pipe(Effect.andThen(releaseSame)))
-      yield* registry.record("same-chat", [
-        { _tag: "Index", footprint: chatFootprint("chat-a", { lower: 0, upper: 10_000 }) }
-      ])
-      yield* registry.record("other-chat", [
-        { _tag: "Index", footprint: chatFootprint("chat-b", { lower: 0, upper: 10_000 }) }
-      ])
-      const batch = Array.from({ length: 400 }, (_, position) => chatPoint("chat-a", position + 100))
-      assert.deepStrictEqual(yield* registry.affected(changes(batch)), ["same-chat"])
-    }, provideQueryReactivity)
-  )
+      yield* registry.record("never-retained", [{ _tag: "Model", spaceId, model: "Todo" }])
+      assert.deepStrictEqual(yield* registry.affected(changes({ models: ["Todo"] })), [])
 
-  it.effect(
-    "keeps boundary exclusion when an oversized batch collapses to extremes",
-    Effect.fnUntraced(function*() {
-      const registry = yield* QueryReactivity.QueryReactivity
-      const release = yield* registry.retain("newest-window")
-      yield* Effect.addFinalizer(() => release)
-      yield* registry.record("newest-window", [{
-        _tag: "Index",
-        footprint: chatFootprint("chat-a", {
-          boundary: [9_000, "message-9000"],
-          hasMore: true,
-          direction: "desc"
-        })
-      }])
-      const backlog = Array.from({ length: 400 }, (_, position) => chatPoint("chat-a", position + 100))
-      assert.deepStrictEqual(yield* registry.affected(changes(backlog)), [])
-      const live = [...backlog, chatPoint("chat-a", 9_500)]
-      assert.deepStrictEqual(yield* registry.affected(changes(live)), ["newest-window"])
+      const release = yield* registry.retain("released")
+      yield* registry.record("released", [{ _tag: "Model", spaceId, model: "Todo" }])
+      assert.deepStrictEqual(yield* registry.affected(changes({ models: ["Todo"] })), ["released"])
+      yield* release
+      assert.deepStrictEqual(yield* registry.affected(changes({ models: ["Todo"] })), [])
     }, provideQueryReactivity)
   )
 })

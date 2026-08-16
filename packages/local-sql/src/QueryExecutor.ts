@@ -1,5 +1,6 @@
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import type * as Model from "@lucas-barake/effect-local/Model"
 import type * as Query from "@lucas-barake/effect-local/Query"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -8,9 +9,10 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
+import * as SchemaAST from "effect/SchemaAST"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import * as IndexStore from "./IndexStore.js"
+import type * as Statement from "effect/unstable/sql/Statement"
 import * as Codec from "./internal/codec.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as SqlTransaction from "./internal/transaction.js"
@@ -20,7 +22,10 @@ export interface Service {
   readonly execute: <Q extends Query.Any,>(
     query: Q,
     payload: Q["payloadSchema"]["Type"]
-  ) => Effect.Effect<Q["successSchema"]["Type"], ReplicaError.ReplicaError | Q["errorSchema"]["Type"]>
+  ) => Effect.Effect<
+    Q["successSchema"]["Type"],
+    ReplicaError.ReplicaError | ReplicaError.QueryFailed | Q["errorSchema"]["Type"]
+  >
 }
 
 export class QueryExecutor extends Context.Service<QueryExecutor, Service>()(
@@ -43,6 +48,33 @@ const SchemaFenceRow = Schema.Struct({
   target_schema_hash: Schema.NullOr(Identity.SchemaHash),
   migration_hash: Schema.NullOr(Identity.SchemaHash)
 })
+
+const quoteIdentifier = (name: string): string => `"${name.replaceAll(`"`, `""`)}"`
+
+const jsonPath = (field: string): string => `$."${field.replaceAll("\\", "\\\\").replaceAll(`"`, `\\"`)}"`
+
+const modelColumns = (model: Model.Any): ReadonlyArray<string> => {
+  const encoded = SchemaAST.toEncoded(model.schema.ast)
+  if (!SchemaAST.isObjects(encoded)) return []
+  const columns: Array<string> = []
+  const seen = new Set<string>()
+  for (const signature of encoded.propertySignatures) {
+    const field = signature.name
+    // `key` and `value` are the entity columns; a colliding field stays reachable through `value`.
+    if (typeof field !== "string" || field === "key" || field === "value" || seen.has(field)) continue
+    seen.add(field)
+    columns.push(field)
+  }
+  return columns
+}
+
+const transientSqlReasons: ReadonlySet<string> = new Set([
+  "ConnectionError",
+  "LockTimeoutError",
+  "StatementTimeoutError",
+  "DeadlockError",
+  "SerializationError"
+])
 
 export const layer = <D extends Definition.Any,>(
   definition: D,
@@ -67,64 +99,75 @@ export const layer = <D extends Definition.Any,>(
           target_schema_version, target_schema_hash, migration_hash
           FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
       })
-      const maximumPageReadsPerScan = 64
+      const modelCte = (address: SqlTransaction.Address, model: Model.Any): Statement.Fragment => {
+        const projected = modelColumns(model)
+          .map((field) => `, json_extract(value_json, '${jsonPath(field)}') AS ${quoteIdentifier(field)}`)
+          .join("")
+        return sql`${sql.literal(quoteIdentifier(model.name))} AS (
+          SELECT entity_key AS "key", value_json AS "value"${sql.literal(projected)}
+          FROM effect_local_client_visible_entities_data
+          WHERE space_id = ${address.spaceId}
+            AND schema_generation = ${address.schemaGeneration}
+            AND projection_generation = ${address.projectionGeneration}
+            AND model = ${model.name})`
+      }
       const queryCapability = (
-        address: IndexStore.Address,
+        address: SqlTransaction.Address,
         queryToken: string,
         reads: Array<QueryReactivity.Read>
       ): Transaction.Query => {
         const transaction = SqlTransaction.local({ sql, table: "visible", ...address })
         const record = Effect.fnUntraced(function*(read: QueryReactivity.Read) {
-          const position = reads.length
           reads.push(read)
           yield* queryReactivity.record(queryToken, reads)
-          return position
         })
         return {
           get: (model, key) =>
             record({ _tag: "Entity", spaceId, key: ReactivityKey.entity(spaceId, model.name, key) }).pipe(
               Effect.andThen(transaction.get(model, key))
             ),
-          from: (model, index) => {
-            let pageReads = 0
-            const collapsed = new Set<string>()
-            return IndexStore.query(
-              sql,
-              address,
-              model,
-              index,
-              Effect.fnUntraced(function*(initial) {
-                let partitionKey = ""
-                for (const value of initial.partition) {
-                  const text = String(value)
-                  partitionKey += `${text.length}:${text}`
-                }
-                if (collapsed.has(partitionKey)) {
-                  return () => Effect.void
-                }
-                if (pageReads >= maximumPageReadsPerScan) {
-                  const covering: IndexStore.Footprint = {
-                    ...initial,
-                    lower: undefined,
-                    upper: undefined,
-                    cursor: undefined,
-                    boundary: undefined,
-                    hasMore: false,
-                    full: true
-                  }
-                  collapsed.add(partitionKey)
-                  yield* record({ _tag: "Index", footprint: covering })
-                  return () => Effect.void
-                }
-                pageReads++
-                const position = yield* record({ _tag: "Index", footprint: initial })
-                return Effect.fnUntraced(function*(complete) {
-                  reads[position] = { _tag: "Index", footprint: complete }
-                  yield* queryReactivity.record(queryToken, reads)
+          sql: Effect.fnUntraced(
+            function*(models, statement) {
+              if (models.length === 0) {
+                return yield* Effect.die(
+                  new Error("query.sql requires at least one model; an empty read set can never react to changes")
+                )
+              }
+              const deduped: Array<Model.Any> = []
+              const names = new Set<string>()
+              for (const model of models) {
+                if (names.has(model.name)) continue
+                names.add(model.name)
+                deduped.push(model)
+              }
+              for (const model of deduped) {
+                yield* record({ _tag: "Model", spaceId, model: model.name })
+              }
+              const user = statement(sql)
+              const [text] = user.compile()
+              if (/^\s*with\b/i.test(text)) {
+                return yield* new ReplicaError.QueryFailed({
+                  message: "The statement must begin with the query body (SELECT/VALUES) or continue the " +
+                    "generated CTE list with a leading `, name AS (...)`; it cannot open its own WITH clause"
                 })
-              })
-            )
-          }
+              }
+              let ctes = modelCte(address, deduped[0])
+              for (const model of deduped.slice(1)) {
+                ctes = sql`${ctes}, ${modelCte(address, model)}`
+              }
+              const rows: ReadonlyArray<unknown> = yield* sql`WITH RECURSIVE ${ctes} ${user}`.pipe(
+                Effect.catchTag("SqlError", (error): Effect.Effect<never, ReplicaError.QueryError> => {
+                  if (transientSqlReasons.has(error.reason._tag)) {
+                    return Effect.fail(StorageUnavailable.make(error))
+                  }
+                  return Effect.fail(
+                    new ReplicaError.QueryFailed({ message: "The query statement failed", cause: error })
+                  )
+                })
+              )
+              return [...rows]
+            }
+          )
         }
       }
       const execute = <Q extends Query.Any,>(
@@ -132,7 +175,7 @@ export const layer = <D extends Definition.Any,>(
         payload: Q["payloadSchema"]["Type"]
       ): Effect.Effect<
         Q["successSchema"]["Type"],
-        ReplicaError.ReplicaError | Q["errorSchema"]["Type"]
+        ReplicaError.ReplicaError | ReplicaError.QueryFailed | Q["errorSchema"]["Type"]
       > => {
         const key = ReactivityKey.query(spaceId, query.name, payload)
         return sql.withTransaction(Effect.gen(function*() {

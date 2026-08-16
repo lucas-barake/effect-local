@@ -19,7 +19,7 @@ export type ErrorSchema = Schema.Top & Schema.ConstraintCodec<TaggedError, typeo
 export type Handler<P, A, E extends TaggedError, R,> = (options: {
   readonly query: Transaction.Query
   readonly payload: P
-}) => Effect.Effect<A, E | ReplicaError.StorageError, R>
+}) => Effect.Effect<A, E | ReplicaError.QueryError, R>
 
 export interface HandlerService<
   Name extends string,

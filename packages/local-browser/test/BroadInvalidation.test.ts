@@ -12,11 +12,13 @@ import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
+import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import { AtomRegistry } from "effect/unstable/reactivity"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as BrowserReplica from "../src/BrowserReplica.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
@@ -58,16 +60,31 @@ const PutManyMessages = Mutation.make("PutManyMessages", {
   }),
   success: Schema.Number
 })
+const NoteSchema = Schema.Struct({ id: Schema.String, body: Schema.String })
+const Note = Model.make("Note", {
+  version: 1,
+  key: Schema.String,
+  schema: NoteSchema
+})
+const PutNote = Mutation.make("PutNote", {
+  version: 1,
+  payload: NoteSchema,
+  success: Schema.String
+})
 const LatestMessages = Query.make("LatestMessages", {
   payload: { chatId: Schema.String },
   success: Schema.Array(Message.schema)
 })
+const ListNotes = Query.make("ListNotes", {
+  success: Schema.Array(NoteSchema)
+})
 const chatReads = new Map<string, number>()
+let noteReads = 0
 const definition = Definition.make({
   version: 1,
-  models: [Message],
-  mutations: [PutManyMessages],
-  queries: [LatestMessages]
+  models: [Message, Note],
+  mutations: [PutManyMessages, PutNote],
+  queries: [LatestMessages, ListNotes]
 })
 const layerPutMany = PutManyMessages.toLayer(
   Effect.fnUntraced(function*({ payload, transaction }) {
@@ -82,16 +99,37 @@ const layerPutMany = PutManyMessages.toLayer(
     return payload.count
   })
 )
+const decodeRows = <A, I,>(
+  query: Transaction.Query,
+  model: Parameters<Transaction.Query["sql"]>[0][number],
+  row: Schema.Codec<A, I>,
+  statement: Parameters<Transaction.Query["sql"]>[1]
+) =>
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: Schema.Struct({ value: Schema.fromJsonString(row) }),
+    execute: () => query.sql([model], statement)
+  })(undefined).pipe(
+    Effect.map((rows) => rows.map((entry) => entry.value)),
+    Effect.catchTag("SchemaError", (cause) => Effect.die(cause))
+  )
 const layerHandlers = Layer.mergeAll(
   layerPutMany,
+  PutNote.toLayer(({ payload, transaction }) => transaction.set(Note, payload.id, payload).pipe(Effect.as(payload.id))),
   LatestMessages.toLayer(({ payload, query }) => {
     chatReads.set(payload.chatId, (chatReads.get(payload.chatId) ?? 0) + 1)
-    return query.from(Message, "byChat")
-      .where({ chatId: payload.chatId })
-      .order("desc")
-      .limit(20)
-      .page()
-      .pipe(Effect.map((page) => page.items))
+    return decodeRows(
+      query,
+      Message,
+      MessageSchema,
+      (sql) =>
+        sql`SELECT "value" FROM "Message" WHERE "chatId" = ${payload.chatId}
+          ORDER BY "sentAt" DESC, "key" DESC LIMIT 20`
+    )
+  }),
+  ListNotes.toLayer(({ query }) => {
+    noteReads++
+    return decodeRows(query, Note, NoteSchema, (sql) => sql`SELECT "value" FROM "Note" ORDER BY "key" ASC`)
   })
 )
 
@@ -149,7 +187,7 @@ const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
 })
 const layerReplica = Layer.merge(
   SqlReplica.layer({
-    defaultScope: Protocol.ReplicationScope.make({ models: [Message.name] }),
+    defaultScope: Protocol.ReplicationScope.make({ models: [Message.name, Note.name] }),
     maximumActiveSpaces: 4,
     foregroundActiveSpaces: 2,
     retainedReceipts: 256,
@@ -173,38 +211,45 @@ const layerReplica = Layer.merge(
 
 describe("broad invalidation", () => {
   it.effect(
-    "a large single-chat batch does not rerun queries over other chats",
+    "a large batch to one model reruns its readers but not queries over another model",
     Effect.fnUntraced(function*() {
       chatReads.clear()
+      noteReads = 0
       const graph = BrowserReplica.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const mutation = graph.mutation(spaceId, PutManyMessages)
+      const noteMutation = graph.mutation(spaceId, PutNote)
       yield* AtomRegistry.mount(registry, mutation)
+      yield* AtomRegistry.mount(registry, noteMutation)
       registry.set(mutation, { chatId: "chat-b", count: 5, startAt: 0 })
       yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      registry.set(noteMutation, { id: "note-1", body: "before" })
+      yield* AtomRegistry.getResult(registry, noteMutation, { suspendOnWaiting: true })
       yield* Effect.yieldNow
 
       const queries = graph.query(spaceId, LatestMessages)
-      const chatA = queries({ chatId: "chat-a" })
       const chatB = queries({ chatId: "chat-b" })
-      yield* AtomRegistry.mount(registry, chatA)
+      const notes = graph.query(spaceId, ListNotes)(undefined)
       yield* AtomRegistry.mount(registry, chatB)
-      yield* AtomRegistry.getResult(registry, chatA, { suspendOnWaiting: true })
+      yield* AtomRegistry.mount(registry, notes)
       const chatBBefore = yield* AtomRegistry.getResult(registry, chatB, { suspendOnWaiting: true })
+      const notesBefore = yield* AtomRegistry.getResult(registry, notes, { suspendOnWaiting: true })
       assert.strictEqual(chatBBefore.length, 5)
-      const chatAReadsBefore = chatReads.get("chat-a") ?? 0
+      assert.strictEqual(notesBefore.length, 1)
       const chatBReadsBefore = chatReads.get("chat-b") ?? 0
+      const noteReadsBefore = noteReads
 
       registry.set(mutation, { chatId: "chat-a", count: 400, startAt: 100 })
       yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
       yield* Effect.yieldNow
 
-      const chatAAfter = yield* AtomRegistry.getResult(registry, chatA, { suspendOnWaiting: true })
-      yield* AtomRegistry.getResult(registry, chatB, { suspendOnWaiting: true })
-      assert.strictEqual(chatAAfter.length, 20)
-      assert.isAbove(chatReads.get("chat-a") ?? 0, chatAReadsBefore)
-      assert.strictEqual(chatReads.get("chat-b") ?? 0, chatBReadsBefore)
+      // Model-granular reactivity: every Message reader re-runs, no Note reader does.
+      const chatBAfter = yield* AtomRegistry.getResult(registry, chatB, { suspendOnWaiting: true })
+      yield* AtomRegistry.getResult(registry, notes, { suspendOnWaiting: true })
+      assert.strictEqual(chatBAfter.length, 5)
+      assert.isAbove(chatReads.get("chat-b") ?? 0, chatBReadsBefore)
+      assert.strictEqual(noteReads, noteReadsBefore)
     }, Effect.scoped)
   )
 })

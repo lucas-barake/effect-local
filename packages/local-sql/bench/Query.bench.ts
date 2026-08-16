@@ -13,7 +13,6 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import { afterAll, assert, beforeAll, bench } from "vitest"
-import * as IndexStore from "../src/IndexStore.js"
 import * as Codec from "../src/internal/codec.js"
 import * as Migrations from "../src/Migrations.js"
 import * as QueryExecutor from "../src/QueryExecutor.js"
@@ -73,19 +72,33 @@ const definition = Definition.make({
   mutations: [],
   queries: [Indexed, MultiColumn]
 })
+const ItemRows = Schema.Struct({ value: Schema.fromJsonString(ItemSchema) })
 const layerHandlers = Indexed.toLayer(({ payload, query }) =>
-  query.from(Item, "byScore").where({ score: { gte: payload.minimum } }).limit(25).page().pipe(
-    Effect.map((page) => page.items)
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ItemRows,
+    execute: () =>
+      query.sql([Item], (sql) =>
+        sql`SELECT "value" FROM "BenchItem" WHERE "score" >= ${payload.minimum}
+          ORDER BY "score" ASC, "key" ASC LIMIT 25`)
+  })(undefined).pipe(
+    Effect.map((rows) => rows.map((row) => row.value)),
+    Effect.catchTag("SchemaError", (cause) => Effect.die(cause))
   )
 ).pipe(
   (indexed) =>
-    MultiColumn.toLayer(
-      Effect.fnUntraced(function*({ query }) {
-        const builder = query.from(Item, "byBucketScore").limit(25)
-        const first = yield* builder.page()
-        if (first.next === undefined) return []
-        return (yield* builder.after(first.next).page()).items
-      })
+    MultiColumn.toLayer(({ query }) =>
+      SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: ItemRows,
+        execute: () =>
+          query.sql([Item], (sql) =>
+            sql`SELECT "value" FROM "BenchItem"
+              ORDER BY "bucket" ASC, "score" ASC, "key" ASC LIMIT 25 OFFSET 25`)
+      })(undefined).pipe(
+        Effect.map((rows) => rows.map((row) => row.value)),
+        Effect.catchTag("SchemaError", (cause) => Effect.die(cause))
+      )
     ).pipe((multiColumn) => Layer.mergeAll(indexed, multiColumn))
 )
 const layerDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
@@ -123,11 +136,6 @@ beforeAll(async () => {
       yield* sql`INSERT INTO effect_local_client_visible_entities_data
         ${sql.insert(rows.slice(offset, offset + 500))}`
     }
-    yield* IndexStore.install(sql, definition, {
-      spaceId,
-      schemaGeneration: 0,
-      projectionGeneration: 0
-    })
   }))
   decodedRows = 0
 })
@@ -137,7 +145,7 @@ afterAll(async () => {
   await runtime.dispose()
 })
 
-bench("indexed selective page avoids decoding the complete model", async () => {
+bench("selective raw SQL page decodes only its rows", async () => {
   decodedRows = 0
   // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
   const result = await runtime.runPromise(
@@ -147,14 +155,14 @@ bench("indexed selective page avoids decoding the complete model", async () => {
   assert.strictEqual(decodedRows, 50)
 }, { iterations: 20, time: 0, warmupIterations: 3, warmupTime: 0, throws: true })
 
-bench("low cardinality multicolumn cursor returns a stable second page", async () => {
+bench("multicolumn offset pagination returns a stable second page", async () => {
   decodedRows = 0
   // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
   const result = await runtime.runPromise(
     QueryExecutor.QueryExecutor.use((service) => service.execute(MultiColumn, undefined))
   )
   assert.strictEqual(result.length, 25)
-  assert.strictEqual(decodedRows, 75)
+  assert.strictEqual(decodedRows, 50)
 }, { iterations: 20, time: 0, warmupIterations: 3, warmupTime: 0, throws: true })
 
 bench("explicit unindexed scan decodes the complete model", async () => {

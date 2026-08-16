@@ -1356,6 +1356,43 @@ const clientV15 = makeMigration({
   ]
 })
 
+const clientV16 = makeMigration({
+  id: 16,
+  name: "drop-client-secondary-indexes",
+  // The state table goes first as a plain statement (it references the catalog through a foreign
+  // key), but every other drop must happen inside the effect: the per-index tables were created at
+  // runtime and only the catalog knows their names, and statements always run before the effect.
+  statements: ["DROP TABLE effect_local_client_index_state"],
+  effect: {
+    id: "drop-client-index-tables",
+    run: Effect.fnUntraced(
+      function*(sql: SqlClient.SqlClient) {
+        const rows = yield* SqlSchema.findAll({
+          Request: Schema.Void,
+          Result: Schema.Struct({
+            table_name: Schema.String,
+            scan_index_name: Schema.String
+          }),
+          execute: () => sql`SELECT table_name, scan_index_name FROM effect_local_client_index_catalog`
+        })(undefined)
+        for (const row of rows) {
+          yield* sql`DROP INDEX IF EXISTS ${sql(row.scan_index_name)}`
+          yield* sql`DROP TABLE IF EXISTS ${sql(row.table_name)}`
+        }
+        yield* sql`DROP TABLE effect_local_client_index_catalog`
+      },
+      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+      Effect.catchTag("SchemaError", (cause) =>
+        Effect.fail(
+          new ReplicaError.StorageCorrupt({
+            message: "Client index catalog rows are undecodable",
+            cause
+          })
+        ))
+    )
+  }
+})
+
 export const clientCatalog = Object.freeze([
   clientV1,
   clientV2,
@@ -1371,7 +1408,8 @@ export const clientCatalog = Object.freeze([
   clientV12,
   clientV13,
   clientV14,
-  clientV15
+  clientV15,
+  clientV16
 ])
 
 const serverV6 = makeMigration({
