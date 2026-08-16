@@ -231,7 +231,8 @@ export const makeManager = Effect.fnUntraced(function*(options: {
           CredentialRejected: (error) => Effect.die(error),
           AuthenticatorUnavailable: (error) => Effect.die(error),
           OperationTimeout: (error) => Effect.die(error),
-          AuthorizationDenied: (error) => Effect.die(error)
+          AuthorizationDenied: (error) => Effect.die(error),
+          OwnerUnavailable: (error) => Effect.die(error)
         }),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
@@ -290,7 +291,8 @@ export const makeManager = Effect.fnUntraced(function*(options: {
           CredentialRejected: (error) => Effect.die(error),
           AuthenticatorUnavailable: (error) => Effect.die(error),
           OperationTimeout: (error) => Effect.die(error),
-          AuthorizationDenied: (error) => Effect.die(error)
+          AuthorizationDenied: (error) => Effect.die(error),
+          OwnerUnavailable: (error) => Effect.die(error)
         }),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void

@@ -183,6 +183,12 @@ export class AuthorizationDenied extends Schema.TaggedErrorClass<AuthorizationDe
   "@lucas-barake/effect-local/AuthorizationDenied"
 )("AuthorizationDenied", { reason: Schema.Json }) {}
 
+export class OwnerUnavailable extends Schema.TaggedErrorClass<OwnerUnavailable>(
+  "@lucas-barake/effect-local/OwnerUnavailable"
+)("OwnerUnavailable", {
+  reason: Schema.Literals(["transport", "takeover", "promotion-failed", "protocol-mismatch"])
+}) {}
+
 export const StorageError = Schema.Union([StorageUnavailable, StorageCorrupt, CanonicalEncodeError])
 export type StorageError = typeof StorageError.Type
 
@@ -222,6 +228,7 @@ export const ReplicaError = Schema.Union([
   CredentialRejected,
   AuthenticatorUnavailable,
   OperationTimeout,
-  AuthorizationDenied
+  AuthorizationDenied,
+  OwnerUnavailable
 ])
 export type ReplicaError = typeof ReplicaError.Type
