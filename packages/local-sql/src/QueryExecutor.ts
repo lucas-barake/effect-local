@@ -8,9 +8,11 @@ import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as SchemaAST from "effect/SchemaAST"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import type * as Statement from "effect/unstable/sql/Statement"
 import * as Codec from "./internal/codec.js"
@@ -68,14 +70,6 @@ const modelColumns = (model: Model.Any): ReadonlyArray<string> => {
   return columns
 }
 
-const transientSqlReasons: ReadonlySet<string> = new Set([
-  "ConnectionError",
-  "LockTimeoutError",
-  "StatementTimeoutError",
-  "DeadlockError",
-  "SerializationError"
-])
-
 export const layer = <D extends Definition.Any,>(
   definition: D,
   spaceId: Identity.SpaceId
@@ -100,16 +94,70 @@ export const layer = <D extends Definition.Any,>(
           FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
       })
       const modelCte = (address: SqlTransaction.Address, model: Model.Any): Statement.Fragment => {
-        const projected = modelColumns(model)
-          .map((field) => `, json_extract(value_json, '${jsonPath(field)}') AS ${quoteIdentifier(field)}`)
-          .join("")
+        // The JSON path is bound, not inlined: a field name may contain a quote, which no SQL
+        // string literal survives.
+        let projected = sql.literal("")
+        for (const field of modelColumns(model)) {
+          projected = sql`${projected}, json_extract(value_json, ${jsonPath(field)}) AS ${
+            sql.literal(quoteIdentifier(field))
+          }`
+        }
         return sql`${sql.literal(quoteIdentifier(model.name))} AS (
-          SELECT entity_key AS "key", value_json AS "value"${sql.literal(projected)}
+          SELECT entity_key AS "key", value_json AS "value"${projected}
           FROM effect_local_client_visible_entities_data
           WHERE space_id = ${address.spaceId}
             AND schema_generation = ${address.schemaGeneration}
             AND projection_generation = ${address.projectionGeneration}
             AND model = ${model.name})`
+      }
+      const findCorruptModel = SqlSchema.findOneOption({
+        Request: Schema.Struct({
+          spaceId: Schema.String,
+          schemaGeneration: Schema.Number,
+          projectionGeneration: Schema.Number,
+          models: Schema.Array(Schema.String)
+        }),
+        Result: Schema.Struct({ model: Schema.String }),
+        execute: (request) =>
+          sql`SELECT model FROM effect_local_client_visible_entities_data
+          WHERE space_id = ${request.spaceId}
+            AND schema_generation = ${request.schemaGeneration}
+            AND projection_generation = ${request.projectionGeneration}
+            AND ${sql.in("model", request.models)}
+            AND json_valid(value_json) = 0
+          LIMIT 1`
+      })
+      // A single undecodable row makes SQLite reject the whole statement with the same reason a
+      // typo does, so the storage is inspected before the failure is blamed on the statement.
+      const classifyStatementFailure = (
+        address: SqlTransaction.Address,
+        models: ReadonlyArray<Model.Any>,
+        error: SqlError.SqlError
+      ): Effect.Effect<never, ReplicaError.QueryError> => {
+        const statementFailed = new ReplicaError.QueryFailed({
+          message: "The query statement failed",
+          cause: error
+        })
+        return findCorruptModel({
+          spaceId: address.spaceId,
+          schemaGeneration: address.schemaGeneration,
+          projectionGeneration: address.projectionGeneration,
+          models: models.map((model) => model.name)
+        }).pipe(
+          Effect.matchEffect({
+            onFailure: () => Effect.fail(statementFailed),
+            onSuccess: Option.match({
+              onNone: (): Effect.Effect<never, ReplicaError.QueryError> => Effect.fail(statementFailed),
+              onSome: (corrupt): Effect.Effect<never, ReplicaError.QueryError> =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({
+                    message: `Stored ${corrupt.model} entity values are not valid JSON`,
+                    cause: error
+                  })
+                )
+            })
+          })
+        )
       }
       const queryCapability = (
         address: SqlTransaction.Address,
@@ -155,15 +203,18 @@ export const layer = <D extends Definition.Any,>(
               for (const model of deduped.slice(1)) {
                 ctes = sql`${ctes}, ${modelCte(address, model)}`
               }
+              // The transient engine reasons stay StorageUnavailable; the compiler holds this
+              // list to the SqlError reason union, so a renamed reason fails to build instead of
+              // silently reclassifying an outage as a bad statement.
               const rows: ReadonlyArray<unknown> = yield* sql`WITH RECURSIVE ${ctes} ${user}`.pipe(
-                Effect.catchTag("SqlError", (error): Effect.Effect<never, ReplicaError.QueryError> => {
-                  if (transientSqlReasons.has(error.reason._tag)) {
-                    return Effect.fail(StorageUnavailable.make(error))
-                  }
-                  return Effect.fail(
-                    new ReplicaError.QueryFailed({ message: "The query statement failed", cause: error })
-                  )
-                })
+                Effect.catchReasons("SqlError", {
+                  ConnectionError: (reason) => Effect.fail(StorageUnavailable.make(reason)),
+                  LockTimeoutError: (reason) => Effect.fail(StorageUnavailable.make(reason)),
+                  StatementTimeoutError: (reason) => Effect.fail(StorageUnavailable.make(reason)),
+                  DeadlockError: (reason) => Effect.fail(StorageUnavailable.make(reason)),
+                  SerializationError: (reason) => Effect.fail(StorageUnavailable.make(reason))
+                }),
+                Effect.catchTag("SqlError", (error) => classifyStatementFailure(address, deduped, error))
               )
               return [...rows]
             }

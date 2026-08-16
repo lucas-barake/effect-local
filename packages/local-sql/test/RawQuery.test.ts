@@ -15,6 +15,7 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
@@ -38,8 +39,13 @@ const Author = Model.make("Author", { version: 1, key: Schema.String, schema: Au
 const CollidingSchema = Schema.Struct({ id: Schema.String, key: Schema.String })
 const Colliding = Model.make("Colliding", { version: 1, key: Schema.String, schema: CollidingSchema })
 
+// A field name carrying a single quote must survive the generated json_extract path literal.
+const QuotedSchema = Schema.Struct({ id: Schema.String, "it's": Schema.Number })
+const Quoted = Model.make("Quoted", { version: 1, key: Schema.String, schema: QuotedSchema })
+
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: TodoSchema, success: Schema.String })
 const PutAuthor = Mutation.make("PutAuthor", { version: 1, payload: AuthorSchema, success: Schema.String })
+const PutQuoted = Mutation.make("PutQuoted", { version: 1, payload: QuotedSchema, success: Schema.String })
 const PutColliding = Mutation.make("PutColliding", {
   version: 1,
   payload: CollidingSchema,
@@ -59,12 +65,13 @@ const CollidingKeys = Query.make("CollidingKeys", {
   success: Schema.Array(Schema.Struct({ key: Schema.String, embedded: Schema.String }))
 })
 const EmptyModels = Query.make("EmptyModels", { success: Schema.Array(Schema.Number) })
+const QuotedIds = Query.make("QuotedIds", { success: Schema.Array(Schema.String) })
 
 const definition = Definition.make({
   version: 1,
-  models: [Todo, Author, Colliding],
-  mutations: [PutTodo, PutAuthor, PutColliding],
-  queries: [CountByAuthor, RecursiveSeries, OwnWith, MissingTable, CollidingKeys, EmptyModels]
+  models: [Todo, Author, Colliding, Quoted],
+  mutations: [PutTodo, PutAuthor, PutColliding, PutQuoted],
+  queries: [CountByAuthor, RecursiveSeries, OwnWith, MissingTable, CollidingKeys, EmptyModels, QuotedIds]
 })
 
 const layerHandlers = Layer.mergeAll(
@@ -131,6 +138,19 @@ const layerHandlers = Layer.mergeAll(
       Effect.catchTag("SchemaError", (cause) => Effect.die(cause))
     )
   ),
+  PutQuoted.toLayer(({ payload, transaction }) =>
+    transaction.set(Quoted, payload.id, payload).pipe(Effect.as(payload.id))
+  ),
+  QuotedIds.toLayer(({ query }) =>
+    SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: Schema.Struct({ id: Schema.String }),
+      execute: () => query.sql([Quoted], (sql) => sql`SELECT "id" FROM "Quoted" ORDER BY "id"`)
+    })(undefined).pipe(
+      Effect.map((rows) => rows.map((row) => row.id)),
+      Effect.catchTag("SchemaError", (cause) => Effect.die(cause))
+    )
+  ),
   EmptyModels.toLayer(({ query }) => query.sql([], (sql) => sql`SELECT 1`).pipe(Effect.map(() => [])))
 )
 
@@ -144,8 +164,8 @@ const layerDatabase = () =>
   )
 const layerRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(layerHandlers))
 const clientHistory = {
-  defaultScope: Protocol.ReplicationScope.make({ models: [Todo.name, Author.name, Colliding.name] }),
-  scope: Protocol.ReplicationScope.make({ models: [Todo.name, Author.name, Colliding.name] }),
+  defaultScope: Protocol.ReplicationScope.make({ models: [Todo.name, Author.name, Colliding.name, Quoted.name] }),
+  scope: Protocol.ReplicationScope.make({ models: [Todo.name, Author.name, Colliding.name, Quoted.name] }),
   maximumActiveSpaces: 4,
   foregroundActiveSpaces: 2,
   retainedReceipts: 256,
@@ -172,10 +192,11 @@ const harness = Effect.fnUntraced(function*() {
     Layer.provide(layerRuntime)
   )
   const layerQueries = QueryExecutor.layer(definition, spaceId).pipe(Layer.provide(layerHandlers))
-  const context = yield* Layer.build(Layer.merge(layerLocal, layerQueries).pipe(Layer.provide(layerDatabase())))
+  const context = yield* Layer.build(Layer.merge(layerLocal, layerQueries).pipe(Layer.provideMerge(layerDatabase())))
   return {
     store: Context.get(context, LocalStore.Store),
-    executor: Context.get(context, QueryExecutor.QueryExecutor)
+    executor: Context.get(context, QueryExecutor.QueryExecutor),
+    sql: Context.get(context, SqlClient.SqlClient)
   }
 })
 
@@ -237,6 +258,28 @@ describe("raw SQL queries", () => {
       assert.deepStrictEqual(yield* executor.execute(CollidingKeys, undefined), [
         { key: "\"c1\"", embedded: "embedded-value" }
       ])
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "reads a model whose field name contains a single quote",
+    Effect.fnUntraced(function*() {
+      const { executor, store } = yield* harness()
+      yield* store.mutate(PutQuoted, { id: "q1", "it's": 7 })
+      assert.deepStrictEqual(yield* executor.execute(QuotedIds, undefined), ["q1"])
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "classifies a malformed stored entity value as storage corruption, not a broken statement",
+    Effect.fnUntraced(function*() {
+      const { executor, sql, store } = yield* harness()
+      yield* store.mutate(PutAuthor, { id: "author-1", name: "Ada" })
+      yield* store.mutate(PutTodo, { id: "t1", title: "one", authorId: "author-1", count: 3 })
+      yield* sql`UPDATE effect_local_client_visible_entities_data SET value_json = 'not json'
+        WHERE space_id = ${spaceId} AND model = ${Todo.name}`
+      const error = yield* expectedFailure(executor.execute(CountByAuthor, { minimum: 0 }))
+      assert.strictEqual(error._tag, "StorageCorrupt")
     }, Effect.scoped)
   )
 
