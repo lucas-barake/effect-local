@@ -244,7 +244,7 @@ export class EphemeralOpen extends Rpc.make("EphemeralOpen", {
 export class EphemeralClose extends Rpc.make("EphemeralClose", {
   payload: { handle: Schema.String },
   success: Schema.Void,
-  error: Schema.Never
+  error: WireUnknownSession
 }) {}
 
 export class EphemeralUpdateMember extends Rpc.make("EphemeralUpdateMember", {

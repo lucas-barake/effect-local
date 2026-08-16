@@ -67,6 +67,8 @@ export interface ClientProtocolOptions {
   readonly pingTimeout: Duration.Input
   readonly onLeaderSilent?: Effect.Effect<void>
   readonly onLeaderReady?: Effect.Effect<void>
+  readonly isParked?: () => boolean
+  readonly parkInterrupt?: Effect.Effect<void>
   readonly onIncompatibleLeader?: Effect.Effect<void>
   readonly onVersionSkew?: (version: number) => Effect.Effect<void>
 }
@@ -222,11 +224,29 @@ export const makeClientProtocol = (
 
     yield* Effect.addFinalizer(() => postFrame(options.connection, Wire.ClientBye.make({ tabId: options.tabId })))
 
-    const awaitReady: Effect.Effect<Wire.Ready> = Effect.suspend(() => {
+    const awaitReadyLoop: Effect.Effect<Wire.Ready> = Effect.suspend(() => {
       const leader = current
       if (leader !== undefined) return Effect.succeed(leader)
-      return Deferred.await(ready).pipe(Effect.andThen(awaitReady))
+      return Deferred.await(ready).pipe(Effect.andThen(awaitReadyLoop))
     })
+
+    const parkedError = () =>
+      new RpcClientError({
+        reason: new RpcClientDefect({
+          message: "remote rpc is parked while this tab owns the replica",
+          cause: undefined
+        })
+      })
+
+    const awaitReady = (): Effect.Effect<Wire.Ready, RpcClientError> => {
+      if (options.isParked?.() === true) return Effect.fail(parkedError())
+      if (options.parkInterrupt === undefined) return awaitReadyLoop
+      const failParked = Effect.fail(parkedError())
+      return Effect.raceFirst(
+        options.parkInterrupt.pipe(Effect.andThen(failParked)),
+        awaitReadyLoop
+      )
+    }
 
     return {
       send(clientId, request) {
@@ -240,7 +260,7 @@ export const makeClientProtocol = (
         if (request._tag === "Request") {
           requestClientMap.set(request.id, clientId)
         }
-        return Effect.flatMap(awaitReady, (leader) =>
+        return Effect.flatMap(awaitReady(), (leader) =>
           postFrame(
             options.connection,
             Wire.RpcRequest.make({ epoch: leader.epoch, from: options.tabId, message: request })

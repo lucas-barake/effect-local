@@ -12,6 +12,7 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as EffectLayer from "effect/Layer"
 import * as Scope from "effect/Scope"
+import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
@@ -133,17 +134,57 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
     const tabId = Wire.TabId.make(yield* makeUuid)
     const connection = yield* channels.open(`@lucas-barake/effect-local-browser:${options.name}`)
 
-    const storedClientId = yield* identities.load(clientIdKey(options.name))
-    let clientId: Identity.ClientId
-    if (storedClientId === undefined) {
-      clientId = Identity.ClientId.make(`cli_${yield* makeUuid}`)
-      yield* identities.store(clientIdKey(options.name), clientId)
-    } else {
-      clientId = Identity.ClientId.make(storedClientId)
+    const layerScope = yield* Effect.scope
+    let backendChanged = yield* Deferred.make<void>()
+    let promoted = yield* Deferred.make<void>()
+    let localOwner = false
+    let currentBackend: Backend
+
+    interface Retention {
+      count: number
+      readonly leases: Map<Backend, Effect.Effect<void>>
+    }
+    const retentions = new Map<string, Retention>()
+    const retentionLock = yield* Semaphore.make(1)
+
+    const ensureRetentions = (backend: Backend): Effect.Effect<void> => {
+      const entries = retentions.entries()
+      return retentionLock.withPermit(
+        Effect.forEach(entries, ([key, retention]) => {
+          if (retention.leases.has(backend)) return Effect.void
+          return backend.queryReactivity.retain(key).pipe(
+            Effect.map((release) => {
+              retention.leases.set(backend, release)
+            })
+          )
+        }, { discard: true })
+      )
     }
 
-    let backendChanged = yield* Deferred.make<void>()
-    let currentBackend: Backend
+    const releaseBackendRetentions = (backend: Backend): Effect.Effect<void> => {
+      const entries = retentions.values()
+      return retentionLock.withPermit(
+        Effect.forEach(entries, (retention) => {
+          const release = retention.leases.get(backend)
+          if (release === undefined) return Effect.void
+          retention.leases.delete(backend)
+          return release
+        }, { discard: true })
+      )
+    }
+
+    const releaseRetention = (key: string): Effect.Effect<void> =>
+      retentionLock.withPermit(Effect.suspend(() => {
+        const retention = retentions.get(key)
+        if (retention === undefined) return Effect.void
+        retention.count -= 1
+        if (retention.count > 0) return Effect.void
+        retentions.delete(key)
+        return Effect.forEach(retention.leases.entries(), ([backend, release]) => {
+          if (backend === currentBackend) return release
+          return Effect.forkIn(release, layerScope).pipe(Effect.asVoid)
+        }, { discard: true })
+      }))
 
     const notifyBackendChanged = Effect.gen(function*() {
       const previous = backendChanged
@@ -176,7 +217,14 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
       pingInterval,
       pingTimeout,
       onLeaderSilent,
-      onLeaderReady: Effect.suspend(() => proxy.registrations.reregister.pipe(Effect.andThen(fullRefresh)))
+      isParked: () => localOwner,
+      parkInterrupt: Effect.suspend(() => Deferred.await(promoted)),
+      onLeaderReady: Effect.suspend(() =>
+        ensureRetentions(remoteBackend).pipe(
+          Effect.andThen(proxy.registrations.reregister),
+          Effect.andThen(fullRefresh)
+        )
+      )
     })
     const wireClient = yield* RpcClient.make(replicaWire.ReplicaRpcs).pipe(
       Effect.provideService(RpcClient.Protocol, clientProtocol)
@@ -227,6 +275,14 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
 
     const whileLeader = Effect.fnUntraced(function*(epoch: Wire.Epoch) {
       const grantScope = yield* Effect.scope
+      const storedClientId = yield* identities.load(clientIdKey(options.name))
+      let clientId: Identity.ClientId
+      if (storedClientId === undefined) {
+        clientId = Identity.ClientId.make(`cli_${yield* makeUuid}`)
+        yield* identities.store(clientIdKey(options.name), clientId)
+      } else {
+        clientId = Identity.ClientId.make(storedClientId)
+      }
       const invalidationSeq = { value: 0 }
       const decoratedReactivity: Reactivity.Reactivity["Service"] = {
         ...baseReactivity,
@@ -304,14 +360,21 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
         ephemeral,
         acknowledge: (spaceId, sequence) => host.acknowledgeLocal(spaceId, sequence)
       }
+      localOwner = true
+      yield* Deferred.succeed(promoted, undefined)
       currentBackend = localBackend
       yield* notifyBackendChanged
+      yield* ensureRetentions(localBackend)
       yield* fullRefresh
       yield* Scope.addFinalizer(
         grantScope,
-        Effect.suspend(() => {
+        Effect.gen(function*() {
+          yield* releaseBackendRetentions(localBackend)
+          localOwner = false
+          promoted = yield* Deferred.make<void>()
           currentBackend = remoteBackend
-          return notifyBackendChanged.pipe(Effect.andThen(fullRefresh))
+          yield* notifyBackendChanged
+          yield* fullRefresh
         })
       )
       return true
@@ -416,7 +479,18 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
     }
 
     const facadeQueryReactivity: QueryReactivity.Service = {
-      retain: (key) => Effect.suspend(() => currentBackend.queryReactivity.retain(key)),
+      retain: (key) =>
+        retentionLock.withPermit(Effect.gen(function*() {
+          const existing = retentions.get(key)
+          if (existing !== undefined) {
+            existing.count += 1
+            return releaseRetention(key)
+          }
+          const backend = currentBackend
+          const release = yield* backend.queryReactivity.retain(key)
+          retentions.set(key, { count: 1, leases: new Map([[backend, release]]) })
+          return releaseRetention(key)
+        })),
       record: (key, reads) => Effect.suspend(() => currentBackend.queryReactivity.record(key, reads)),
       affected: (changes) => Effect.suspend(() => currentBackend.queryReactivity.affected(changes))
     }

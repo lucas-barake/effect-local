@@ -107,6 +107,19 @@ export const makeHost = Effect.fnUntraced(function*(options: HostOptions) {
   const acks = new Map<Identity.SpaceId, Map<string, number>>()
   const applied = new Map<Identity.SpaceId, number>()
 
+  yield* Effect.addFinalizer(
+    Effect.fnUntraced(function*() {
+      const retainReleases = Array.from(retains.values()).flatMap((entries) => Array.from(entries.values()))
+      const sessionCloses = Array.from(sessions.values(), (entry) => entry.close)
+      retains.clear()
+      sessions.clear()
+      acks.clear()
+      applied.clear()
+      yield* Effect.forEach(retainReleases, (release) => release, { discard: true })
+      yield* Effect.forEach(sessionCloses, (close) => close, { discard: true })
+    })
+  )
+
   const mutationFor = (name: string) =>
     Effect.suspend(() => {
       const mutation = definition.mutationByName.get(name)
@@ -152,16 +165,17 @@ export const makeHost = Effect.fnUntraced(function*(options: HostOptions) {
       return Effect.succeed(profile)
     })
 
-  const sessionFor = (handle: string) =>
+  const tabFor = (clientId: number): Wire.TabId | undefined => options.server.tabIdOf(clientId)
+
+  const sessionFor = (handle: string, clientId: number) =>
     Effect.suspend(() => {
       const entry = sessions.get(handle)
-      if (entry === undefined) {
+      const tabId = tabFor(clientId)
+      if (entry === undefined || tabId === undefined || entry.tabId !== tabId) {
         return Effect.fail(new replicaWire.WireUnknownSession({ handle }))
       }
       return Effect.succeed(entry)
     })
-
-  const tabFor = (clientId: number): Wire.TabId | undefined => options.server.tabIdOf(clientId)
 
   const applyAck = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
     const perSpace = acks.get(spaceId)
@@ -504,15 +518,21 @@ export const makeHost = Effect.fnUntraced(function*(options: HostOptions) {
         })
       }
     ),
-    EphemeralClose: (request: { readonly handle: string }) =>
-      Effect.suspend(() => {
-        const entry = sessions.get(request.handle)
-        if (entry === undefined) return Effect.void
-        sessions.delete(request.handle)
-        return entry.close
-      }),
-    EphemeralUpdateMember: (request: { readonly handle: string; readonly value: unknown }) =>
-      sessionFor(request.handle).pipe(
+    EphemeralClose: (
+      request: { readonly handle: string },
+      context: { readonly client: { readonly id: number } }
+    ) =>
+      sessionFor(request.handle, context.client.id).pipe(
+        Effect.flatMap((entry) => {
+          sessions.delete(request.handle)
+          return entry.close
+        })
+      ),
+    EphemeralUpdateMember: (
+      request: { readonly handle: string; readonly value: unknown },
+      context: { readonly client: { readonly id: number } }
+    ) =>
+      sessionFor(request.handle, context.client.id).pipe(
         Effect.flatMap((entry) =>
           decodeWith(entry.profile.payloadSchema, request.value).pipe(
             Effect.flatMap((value) =>
@@ -527,9 +547,12 @@ export const makeHost = Effect.fnUntraced(function*(options: HostOptions) {
           )
         )
       ),
-    EphemeralEvents: (request: { readonly handle: string; readonly name: string }) =>
+    EphemeralEvents: (
+      request: { readonly handle: string; readonly name: string },
+      context: { readonly client: { readonly id: number } }
+    ) =>
       Stream.unwrap(
-        Effect.all([sessionFor(request.handle), ephemeralFor(request.name)]).pipe(
+        Effect.all([sessionFor(request.handle, context.client.id), ephemeralFor(request.name)]).pipe(
           Effect.map(([entry, event]) => {
             if (event.kind !== "event") {
               return Stream.fail(new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name }))
@@ -548,9 +571,12 @@ export const makeHost = Effect.fnUntraced(function*(options: HostOptions) {
           })
         )
       ),
-    EphemeralState: (request: { readonly handle: string; readonly name: string }) =>
+    EphemeralState: (
+      request: { readonly handle: string; readonly name: string },
+      context: { readonly client: { readonly id: number } }
+    ) =>
       Stream.unwrap(
-        Effect.all([sessionFor(request.handle), ephemeralFor(request.name)]).pipe(
+        Effect.all([sessionFor(request.handle, context.client.id), ephemeralFor(request.name)]).pipe(
           Effect.map(([entry, state]) => {
             if (state.kind !== "state") {
               return Stream.fail(
@@ -577,9 +603,12 @@ export const makeHost = Effect.fnUntraced(function*(options: HostOptions) {
           })
         )
       ),
-    EphemeralMembers: (request: { readonly handle: string }) =>
+    EphemeralMembers: (
+      request: { readonly handle: string },
+      context: { readonly client: { readonly id: number } }
+    ) =>
       Stream.unwrap(
-        sessionFor(request.handle).pipe(
+        sessionFor(request.handle, context.client.id).pipe(
           Effect.map((entry) =>
             entry.session.members.pipe(
               Stream.mapEffect(Effect.forEach((item) =>

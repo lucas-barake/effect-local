@@ -304,7 +304,10 @@ export const makeProxy = (options: ProxyOptions): ReplicaProxy => {
     spaces: mapTransport(client.Spaces({})).pipe(
       Effect.map((spaceIds) => spaceIds.map(makeSpace))
     ),
-    space: (spaceId) => Effect.sync(() => makeSpace(spaceId)),
+    space: (spaceId) =>
+      mapTransport(client.SpaceScope({ spaceId })).pipe(
+        Effect.as(makeSpace(spaceId))
+      ),
     status: mapTransport(client.AggregateStatus({}))
   }
 
