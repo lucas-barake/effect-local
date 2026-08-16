@@ -69,6 +69,7 @@ const startServer = Effect.fnUntraced(function*(kit: testKit.MemoryPlatform, epo
   const server = yield* broadcastRpc.makeServerProtocol({
     epoch: Wire.Epoch.make(epoch),
     leaderId: leaderTab,
+    fingerprint: "fp-test",
     connection,
     ...serverTimings
   })
@@ -99,6 +100,7 @@ const startClient = Effect.fnUntraced(function*(
   }
   const protocol = yield* broadcastRpc.makeClientProtocol({
     tabId: followerTab,
+    fingerprint: "fp-test",
     connection,
     ...clientTimings,
     ...silentOptions

@@ -26,7 +26,8 @@ export type Elected = typeof Elected.Type
 
 export const Ready = Schema.TaggedStruct("Ready", {
   epoch: Epoch,
-  leaderId: TabId
+  leaderId: TabId,
+  fingerprint: Schema.String
 })
 export type Ready = typeof Ready.Type
 

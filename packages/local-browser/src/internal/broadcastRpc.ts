@@ -60,11 +60,14 @@ export const subscribeFrames = Effect.fnUntraced(function*(
 
 export interface ClientProtocolOptions {
   readonly tabId: Wire.TabId
+  readonly fingerprint: string
   readonly connection: platform.TabChannelConnection
   readonly heartbeatInterval: Duration.Input
   readonly pingInterval: Duration.Input
   readonly pingTimeout: Duration.Input
   readonly onLeaderSilent?: Effect.Effect<void>
+  readonly onLeaderReady?: Effect.Effect<void>
+  readonly onIncompatibleLeader?: Effect.Effect<void>
   readonly onVersionSkew?: (version: number) => Effect.Effect<void>
 }
 
@@ -78,6 +81,7 @@ export const makeClientProtocol = (
     const requestClientMap = new Map<string | number, number>()
 
     let current: Wire.Ready | undefined
+    let incompatible = false
     let awaitingPong = false
     let pongDeadline = 0
     let ready = yield* Deferred.make<void>()
@@ -104,6 +108,14 @@ export const makeClientProtocol = (
 
     const adoptLeader = Effect.fnUntraced(function*(frame: Wire.Ready) {
       if (current !== undefined && frame.epoch < current.epoch) return
+      if (frame.fingerprint !== options.fingerprint) {
+        incompatible = true
+        yield* dropLeader("leader definition mismatch")
+        yield* failInflight("leader definition mismatch")
+        if (options.onIncompatibleLeader !== undefined) yield* options.onIncompatibleLeader
+        return
+      }
+      incompatible = false
       const changed = current === undefined || frame.epoch > current.epoch
       if (current !== undefined && changed) {
         yield* failInflight("leader changed")
@@ -112,6 +124,7 @@ export const makeClientProtocol = (
       if (changed) awaitingPong = false
       yield* postFrame(options.connection, Wire.ClientHello.make({ epoch: frame.epoch, tabId: options.tabId }))
       yield* Deferred.succeed(ready, undefined)
+      if (changed && options.onLeaderReady !== undefined) yield* options.onLeaderReady
     })
 
     const onFrame = (frame: Wire.WireFrame): Effect.Effect<void> => {
@@ -209,6 +222,13 @@ export const makeClientProtocol = (
 
     return {
       send(clientId, request) {
+        if (incompatible) {
+          return Effect.fail(
+            new RpcClientError({
+              reason: new RpcClientDefect({ message: "leader definition mismatch", cause: undefined })
+            })
+          )
+        }
         if (request._tag === "Request") {
           requestClientMap.set(request.id, clientId)
         }
@@ -226,6 +246,7 @@ export const makeClientProtocol = (
 export interface ServerProtocolOptions {
   readonly epoch: Wire.Epoch
   readonly leaderId: Wire.TabId
+  readonly fingerprint: string
   readonly connection: platform.TabChannelConnection
   readonly clientTimeout: Duration.Input
   readonly sweepInterval: Duration.Input
@@ -235,6 +256,7 @@ export interface ServerProtocolOptions {
 export interface ServerProtocol {
   readonly protocol: RpcServer.Protocol["Service"]
   readonly tabIdOf: (clientId: number) => Wire.TabId | undefined
+  readonly isConnected: (tabId: Wire.TabId) => boolean
   readonly tabDisconnects: Queue.Dequeue<Wire.TabId>
 }
 
@@ -254,7 +276,7 @@ export const makeServerProtocol = Effect.fnUntraced(function*(
 
   const announceReady = postFrame(
     options.connection,
-    Wire.Ready.make({ epoch: options.epoch, leaderId: options.leaderId })
+    Wire.Ready.make({ epoch: options.epoch, leaderId: options.leaderId, fingerprint: options.fingerprint })
   )
 
   const evict = (tabId: Wire.TabId) =>
@@ -361,6 +383,7 @@ export const makeServerProtocol = Effect.fnUntraced(function*(
   const result: ServerProtocol = {
     protocol,
     tabIdOf: (clientId) => byClientId.get(clientId),
+    isConnected: (tabId) => byTabId.has(tabId),
     tabDisconnects
   }
   return result
