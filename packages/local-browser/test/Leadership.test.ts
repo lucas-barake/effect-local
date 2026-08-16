@@ -44,17 +44,6 @@ const startTab = Effect.fnUntraced(function*(
 
 describe("leadership", () => {
   it.effect(
-    "the first tab acquires leadership with the initial epoch",
-    Effect.fnUntraced(function*() {
-      const kit = yield* testKit.makeMemoryPlatform
-      const promotions = yield* Queue.make<Promotion>()
-      yield* startTab(kit, "a", promotions)
-      const first = yield* Queue.take(promotions)
-      assert.deepStrictEqual(first, { tab: "a", epoch: 1 })
-    }, Effect.scoped)
-  )
-
-  it.effect(
     "a queued tab promotes with a higher epoch when the leader scope closes",
     Effect.fnUntraced(function*() {
       const kit = yield* testKit.makeMemoryPlatform

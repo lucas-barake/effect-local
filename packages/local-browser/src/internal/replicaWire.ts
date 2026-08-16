@@ -28,12 +28,6 @@ export class WireEphemeralEncodeError extends Schema.TaggedErrorClass<WireEpheme
   name: Schema.String
 }) {}
 
-export class WireEphemeralDecodeError extends Schema.TaggedErrorClass<WireEphemeralDecodeError>(
-  "@lucas-barake/effect-local-browser/WireEphemeralDecodeError"
-)("WireEphemeralDecodeError", {
-  name: Schema.String
-}) {}
-
 export class WireUnknownDefinition extends Schema.TaggedErrorClass<WireUnknownDefinition>(
   "@lucas-barake/effect-local-browser/WireUnknownDefinition"
 )("WireUnknownDefinition", {

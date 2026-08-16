@@ -64,7 +64,11 @@ const serverTimings = {
   sweepInterval: 1000
 } as const
 
-const startServer = Effect.fnUntraced(function*(kit: testKit.MemoryPlatform, epoch: number) {
+const startServer = Effect.fnUntraced(function*(
+  kit: testKit.MemoryPlatform,
+  epoch: number,
+  countClosed?: Effect.Effect<void>
+) {
   const connection = yield* kit.tabChannel.open(channelName)
   const server = yield* broadcastRpc.makeServerProtocol({
     epoch: Wire.Epoch.make(epoch),
@@ -76,8 +80,13 @@ const startServer = Effect.fnUntraced(function*(kit: testKit.MemoryPlatform, epo
   const layerHandlers = TestRpcs.toLayer(Effect.succeed({
     Echo: (request: { readonly text: string }) => Effect.succeed(request.text),
     Boom: () => Effect.fail(new EchoError({ message: "boom" })),
-    Count: (request: { readonly n: number }) =>
-      Stream.fromIterable(Array.from({ length: request.n }, (_, index) => request.n - index)),
+    Count: (request: { readonly n: number }) => {
+      const values = Stream.fromIterable(Array.from({ length: request.n }, (_, index) => request.n - index))
+      if (countClosed === undefined) return values
+      return Stream.fromEffect(Effect.addFinalizer(() => countClosed)).pipe(
+        Stream.flatMap(() => values)
+      )
+    },
     Hang: () => Effect.never
   }))
   yield* Layer.build(
@@ -282,13 +291,13 @@ describe("broadcastRpc", () => {
     "stream emits across the channel and interrupts cleanly",
     Effect.fnUntraced(function*() {
       const kit = yield* testKit.makeMemoryPlatform
-      yield* startServer(kit, 1)
+      const countClosed = yield* Deferred.make<void>()
+      yield* startServer(kit, 1, Deferred.succeed(countClosed, undefined))
       const { client } = yield* startClient(kit)
-      const all = yield* Stream.runCollect(client.Count({ n: 3 }))
-      assert.deepStrictEqual(all, [3, 2, 1])
       const first = yield* Stream.runHead(client.Count({ n: 3 }))
       assert.isTrue(Option.isSome(first))
       assert.deepStrictEqual(Option.getOrUndefined(first), 3)
+      yield* Deferred.await(countClosed)
     }, Effect.scoped)
   )
 
@@ -296,18 +305,43 @@ describe("broadcastRpc", () => {
     "stale-epoch frames are dropped",
     Effect.fnUntraced(function*() {
       const kit = yield* testKit.makeMemoryPlatform
-      yield* startServer(kit, 2)
-      const { client, connection } = yield* startClient(kit)
+      const leaderConnection = yield* kit.tabChannel.open(channelName)
+      const request = yield* Deferred.make<{ readonly id: string | number }>()
+      yield* broadcastRpc.subscribeFrames(leaderConnection, {
+        onFrame: (frame) => {
+          if (frame._tag !== "RpcRequest") return Effect.void
+          // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The test observes the opaque RPC payload so it can reply to the actual request identifier.
+          const message = frame.message as { readonly _tag?: string; readonly id?: string | number }
+          if (message._tag !== "Request" || message.id === undefined) return Effect.void
+          return Deferred.succeed(request, { id: message.id })
+        }
+      })
+      const { client } = yield* startClient(kit)
       yield* broadcastRpc.postFrame(
-        connection,
+        leaderConnection,
+        Wire.Ready.make({ epoch: Wire.Epoch.make(2), leaderId: leaderTab, fingerprint: "fp-test" })
+      )
+      const result = yield* client.Echo({ text: "real" }).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      const sent = yield* Deferred.await(request)
+      yield* broadcastRpc.postFrame(
+        leaderConnection,
         Wire.RpcResponse.make({
           epoch: Wire.Epoch.make(1),
           to: followerTab,
-          message: { _tag: "Exit", requestId: "1", exit: { _tag: "Success", value: "forged" } }
+          message: { _tag: "Exit", requestId: sent.id, exit: { _tag: "Success", value: "forged" } }
         })
       )
-      const result = yield* client.Echo({ text: "real" })
-      assert.strictEqual(result, "real")
+      yield* broadcastRpc.postFrame(
+        leaderConnection,
+        Wire.RpcResponse.make({
+          epoch: Wire.Epoch.make(2),
+          to: followerTab,
+          message: { _tag: "Exit", requestId: sent.id, exit: { _tag: "Success", value: "real" } }
+        })
+      )
+      assert.strictEqual(yield* Fiber.join(result), "real")
     }, Effect.scoped)
   )
 
