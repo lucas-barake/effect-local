@@ -113,6 +113,108 @@ const startClient = Effect.fnUntraced(function*(
 
 describe("broadcastRpc", () => {
   it.effect(
+    "sends one client hello for a ready leader epoch",
+    Effect.fnUntraced(function*() {
+      const kit = yield* testKit.makeMemoryPlatform
+      const observer = yield* kit.tabChannel.open(channelName)
+      const hellos = yield* Queue.make<Wire.ClientHello>()
+      yield* broadcastRpc.subscribeFrames(observer, {
+        onFrame: (frame) => {
+          if (frame._tag !== "ClientHello") return Effect.void
+          return Queue.offer(hellos, frame)
+        }
+      })
+      yield* startServer(kit, 1)
+      const { client } = yield* startClient(kit)
+      yield* client.Echo({ text: "ready" })
+      yield* Queue.take(hellos)
+      const extra = yield* Queue.take(hellos).pipe(
+        Effect.timeoutOption(1000),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* TestClock.adjust(1000)
+      assert.isTrue(Option.isNone(yield* Fiber.join(extra)))
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "does not adopt a ready frame below the highest elected epoch",
+    Effect.fnUntraced(function*() {
+      const kit = yield* testKit.makeMemoryPlatform
+      const connection = yield* kit.tabChannel.open(channelName)
+      const sender = yield* kit.tabChannel.open(channelName)
+      const hellos = yield* Queue.make<Wire.ClientHello>()
+      yield* broadcastRpc.subscribeFrames(sender, {
+        onFrame: (frame) => {
+          if (frame._tag !== "ClientHello") return Effect.void
+          return Queue.offer(hellos, frame)
+        }
+      })
+      yield* startClient(kit)
+      yield* broadcastRpc.postFrame(
+        connection,
+        Wire.Ready.make({ epoch: Wire.Epoch.make(1), leaderId: leaderTab, fingerprint: "fp-test" })
+      )
+      yield* Queue.take(hellos)
+      yield* broadcastRpc.postFrame(
+        connection,
+        Wire.Elected.make({ epoch: Wire.Epoch.make(2), leaderId: Wire.TabId.make("tab-next") })
+      )
+      yield* broadcastRpc.postFrame(
+        connection,
+        Wire.Ready.make({ epoch: Wire.Epoch.make(1), leaderId: leaderTab, fingerprint: "fp-test" })
+      )
+      yield* broadcastRpc.postFrame(
+        connection,
+        Wire.Ready.make({
+          epoch: Wire.Epoch.make(2),
+          leaderId: Wire.TabId.make("tab-next"),
+          fingerprint: "fp-test"
+        })
+      )
+      const hello = yield* Queue.take(hellos)
+      assert.strictEqual(hello.epoch, 2)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "keeps receiving rpc responses while the leader-ready callback runs",
+    Effect.fnUntraced(function*() {
+      const kit = yield* testKit.makeMemoryPlatform
+      const observer = yield* kit.tabChannel.open(channelName)
+      const responseSent = yield* Deferred.make<void>()
+      yield* broadcastRpc.subscribeFrames(observer, {
+        onFrame: (frame) => {
+          if (frame._tag !== "RpcResponse") return Effect.void
+          return Deferred.succeed(responseSent, undefined)
+        }
+      })
+      let readyCall: Effect.Effect<void> = Effect.void
+      const callbackDone = yield* Deferred.make<void>()
+      const connection = yield* kit.tabChannel.open(channelName)
+      const protocol = yield* broadcastRpc.makeClientProtocol({
+        tabId: followerTab,
+        fingerprint: "fp-test",
+        connection,
+        ...clientTimings,
+        onLeaderReady: Effect.suspend(() =>
+          readyCall.pipe(
+            Effect.andThen(Deferred.succeed(callbackDone, undefined))
+          )
+        )
+      })
+      const client = yield* RpcClient.make(TestRpcs).pipe(
+        Effect.provideService(RpcClient.Protocol, protocol)
+      )
+      readyCall = client.Echo({ text: "reregister" }).pipe(Effect.ignore)
+      yield* startServer(kit, 1)
+      yield* Deferred.await(responseSent)
+      yield* Effect.yieldNow
+      assert.isTrue(yield* Deferred.isDone(callbackDone))
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "request round-trips typed success",
     Effect.fnUntraced(function*() {
       const kit = yield* testKit.makeMemoryPlatform

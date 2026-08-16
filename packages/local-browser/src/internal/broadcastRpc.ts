@@ -75,12 +75,14 @@ export const makeClientProtocol = (
   options: ClientProtocolOptions
 ): Effect.Effect<RpcClient.Protocol["Service"], never, Scope.Scope> =>
   RpcClient.Protocol.make(Effect.fnUntraced(function*(writeResponse, clientIds) {
+    const protocolScope = yield* Effect.scope
     const heartbeatMillis = Duration.toMillis(options.heartbeatInterval)
     const pingMillis = Duration.toMillis(options.pingInterval)
     const pingTimeoutMillis = Duration.toMillis(options.pingTimeout)
     const requestClientMap = new Map<string | number, number>()
 
     let current: Wire.Ready | undefined
+    let highestEpoch = 0
     let incompatible = false
     let awaitingPong = false
     let pongDeadline = 0
@@ -107,7 +109,8 @@ export const makeClientProtocol = (
     })
 
     const adoptLeader = Effect.fnUntraced(function*(frame: Wire.Ready) {
-      if (current !== undefined && frame.epoch < current.epoch) return
+      if (frame.epoch < highestEpoch) return
+      highestEpoch = frame.epoch
       if (frame.fingerprint !== options.fingerprint) {
         incompatible = true
         yield* dropLeader("leader definition mismatch")
@@ -122,9 +125,13 @@ export const makeClientProtocol = (
       }
       current = frame
       if (changed) awaitingPong = false
-      yield* postFrame(options.connection, Wire.ClientHello.make({ epoch: frame.epoch, tabId: options.tabId }))
+      if (changed) {
+        yield* postFrame(options.connection, Wire.ClientHello.make({ epoch: frame.epoch, tabId: options.tabId }))
+      }
       yield* Deferred.succeed(ready, undefined)
-      if (changed && options.onLeaderReady !== undefined) yield* options.onLeaderReady
+      if (changed && options.onLeaderReady !== undefined) {
+        yield* Effect.forkIn(options.onLeaderReady, protocolScope)
+      }
     })
 
     const onFrame = (frame: Wire.WireFrame): Effect.Effect<void> => {
@@ -134,7 +141,8 @@ export const makeClientProtocol = (
         }
         case "Elected": {
           return Effect.suspend(() => {
-            if (current !== undefined && frame.epoch <= current.epoch) return Effect.void
+            if (frame.epoch <= highestEpoch) return Effect.void
+            highestEpoch = frame.epoch
             return dropLeader("leader takeover in progress")
           })
         }
