@@ -112,6 +112,7 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
     const baseReactivity = yield* Reactivity.Reactivity
     const platformContext = yield* EffectLayer.build(options.platform ?? layerPlatformBrowser)
     const channels = Context.get(platformContext, platform.TabChannel)
+    const locks = Context.get(platformContext, platform.WebLocks)
     const identities = Context.get(platformContext, platform.ClientIdentityStore)
 
     const definition = options.definition
@@ -132,6 +133,14 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
     }
 
     const tabId = Wire.TabId.make(yield* makeUuid)
+    const clientId = yield* Effect.scoped(Effect.gen(function*() {
+      yield* locks.acquire(`${leadership.lockName(options.name)}:client-identity`)
+      const storedClientId = yield* identities.load(clientIdKey(options.name))
+      if (storedClientId !== undefined) return Identity.ClientId.make(storedClientId)
+      const generated = Identity.ClientId.make(`cli_${yield* makeUuid}`)
+      yield* identities.store(clientIdKey(options.name), generated)
+      return generated
+    }))
     const connection = yield* channels.open(`@lucas-barake/effect-local-browser:${options.name}`)
 
     const layerScope = yield* Effect.scope
@@ -275,14 +284,6 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
 
     const whileLeader = Effect.fnUntraced(function*(epoch: Wire.Epoch) {
       const grantScope = yield* Effect.scope
-      const storedClientId = yield* identities.load(clientIdKey(options.name))
-      let clientId: Identity.ClientId
-      if (storedClientId === undefined) {
-        clientId = Identity.ClientId.make(`cli_${yield* makeUuid}`)
-        yield* identities.store(clientIdKey(options.name), clientId)
-      } else {
-        clientId = Identity.ClientId.make(storedClientId)
-      }
       const invalidationSeq = { value: 0 }
       const decoratedReactivity: Reactivity.Reactivity["Service"] = {
         ...baseReactivity,
@@ -360,23 +361,26 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
         ephemeral,
         acknowledge: (spaceId, sequence) => host.acknowledgeLocal(spaceId, sequence)
       }
+      yield* Scope.addFinalizer(
+        grantScope,
+        Effect.gen(function*() {
+          localOwner = false
+          currentBackend = remoteBackend
+          yield* notifyBackendChanged
+          const releaseExit = yield* Effect.exit(releaseBackendRetentions(localBackend))
+          const refreshExit = yield* Effect.exit(fullRefresh)
+          if (releaseExit._tag === "Failure") yield* Effect.failCause(releaseExit.cause)
+          if (refreshExit._tag === "Failure") yield* Effect.failCause(refreshExit.cause)
+        })
+      )
       localOwner = true
-      yield* Deferred.succeed(promoted, undefined)
+      const parking = promoted
+      promoted = yield* Deferred.make<void>()
+      yield* Deferred.succeed(parking, undefined)
       currentBackend = localBackend
       yield* notifyBackendChanged
       yield* ensureRetentions(localBackend)
       yield* fullRefresh
-      yield* Scope.addFinalizer(
-        grantScope,
-        Effect.gen(function*() {
-          yield* releaseBackendRetentions(localBackend)
-          localOwner = false
-          promoted = yield* Deferred.make<void>()
-          currentBackend = remoteBackend
-          yield* notifyBackendChanged
-          yield* fullRefresh
-        })
-      )
       return true
     })
 
@@ -404,11 +408,25 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
       return run()
     }
 
-    const facadeSpace = (spaceId: Identity.SpaceId): Replica.Space => {
+    const facadeSpace = (
+      spaceId: Identity.SpaceId,
+      initial?: { readonly backend: Backend; readonly space: Replica.Space }
+    ): Replica.Space => {
+      let cached: typeof initial
+      if (initial?.backend.local === false) cached = initial
+      const resolveSpace = (backend: Backend): Effect.Effect<Replica.Space, ReplicaError.ReplicaError> => {
+        if (cached?.backend === backend) return Effect.succeed(cached.space)
+        return backend.replica.space(spaceId).pipe(
+          Effect.map((space) => {
+            if (!backend.local) cached = { backend, space }
+            return space
+          })
+        )
+      }
       const withSpace = <A, EX extends { readonly _tag: string },>(
         use: (space: Replica.Space) => Effect.Effect<A, EX>
       ): Effect.Effect<A, EX | ReplicaError.ReplicaError> =>
-        Effect.suspend(() => currentBackend.replica.space(spaceId).pipe(Effect.flatMap(use)))
+        Effect.suspend(() => resolveSpace(currentBackend).pipe(Effect.flatMap(use)))
       const settlementCursor = (
         streamOptions: Replica.SettlementOptions | undefined,
         make: (space: Replica.Space, from: Replica.SettlementOptions | undefined) => Stream.Stream<
@@ -419,7 +437,7 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
         let cursor: number | undefined
         return backendStream((backend) =>
           Stream.unwrap(
-            backend.replica.space(spaceId).pipe(
+            resolveSpace(backend).pipe(
               Effect.map((space) => {
                 let from = streamOptions
                 if (cursor !== undefined) from = { from: cursor }
@@ -464,17 +482,26 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
 
     const facadeReplica: Replica.Service = {
       join: (spaceId) =>
-        Effect.suspend(() => currentBackend.replica.join(spaceId)).pipe(
-          Effect.map(() => facadeSpace(spaceId))
-        ),
+        Effect.suspend(() => {
+          const backend = currentBackend
+          return backend.replica.join(spaceId).pipe(
+            Effect.map((space) => facadeSpace(spaceId, { backend, space }))
+          )
+        }),
       leave: (spaceId) => Effect.suspend(() => currentBackend.replica.leave(spaceId)),
-      spaces: Effect.suspend(() => currentBackend.replica.spaces).pipe(
-        Effect.map((spaces) => spaces.map((space) => facadeSpace(space.spaceId)))
-      ),
+      spaces: Effect.suspend(() => {
+        const backend = currentBackend
+        return backend.replica.spaces.pipe(
+          Effect.map((spaces) => spaces.map((space) => facadeSpace(space.spaceId, { backend, space })))
+        )
+      }),
       space: (spaceId) =>
-        Effect.suspend(() => currentBackend.replica.space(spaceId)).pipe(
-          Effect.map(() => facadeSpace(spaceId))
-        ),
+        Effect.suspend(() => {
+          const backend = currentBackend
+          return backend.replica.space(spaceId).pipe(
+            Effect.map((space) => facadeSpace(spaceId, { backend, space }))
+          )
+        }),
       status: Effect.suspend(() => currentBackend.replica.status)
     }
 

@@ -215,6 +215,46 @@ describe("broadcastRpc", () => {
   )
 
   it.effect(
+    "fails a request already sent when remote rpc becomes parked",
+    Effect.fnUntraced(function*() {
+      const kit = yield* testKit.makeMemoryPlatform
+      const clientConnection = yield* kit.tabChannel.open(channelName)
+      const leaderConnection = yield* kit.tabChannel.open(channelName)
+      const requestSent = yield* Deferred.make<void>()
+      const parked = yield* Deferred.make<void>()
+      yield* broadcastRpc.subscribeFrames(leaderConnection, {
+        onFrame: (frame) => {
+          if (frame._tag === "RpcRequest") return Deferred.succeed(requestSent, undefined)
+          return Effect.void
+        }
+      })
+      const protocol = yield* broadcastRpc.makeClientProtocol({
+        tabId: followerTab,
+        fingerprint: "fp-test",
+        connection: clientConnection,
+        ...clientTimings,
+        parkInterrupt: Deferred.await(parked)
+      })
+      const client = yield* RpcClient.make(TestRpcs).pipe(
+        Effect.provideService(RpcClient.Protocol, protocol)
+      )
+      yield* broadcastRpc.postFrame(
+        leaderConnection,
+        Wire.Ready.make({ epoch: Wire.Epoch.make(1), leaderId: leaderTab, fingerprint: "fp-test" })
+      )
+      const completed = yield* client.Hang({}).pipe(
+        Effect.exit,
+        Effect.timeoutOption(1000),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(requestSent)
+      yield* Deferred.succeed(parked, undefined)
+      yield* TestClock.adjust(1000)
+      assert.isTrue(Option.isSome(yield* Fiber.join(completed)))
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "request round-trips typed success",
     Effect.fnUntraced(function*() {
       const kit = yield* testKit.makeMemoryPlatform

@@ -182,6 +182,14 @@ export const makeClientProtocol = (
     }
     yield* subscribeFrames(options.connection, subscribeOptions)
 
+    if (options.parkInterrupt !== undefined) {
+      yield* options.parkInterrupt.pipe(
+        Effect.andThen(dropLeader("remote rpc parked while this tab owns the replica")),
+        Effect.forever,
+        Effect.forkScoped
+      )
+    }
+
     yield* postFrame(options.connection, Wire.ProbeLeader.make({ tabId: options.tabId }))
 
     const heartbeat = Effect.suspend(() => {
@@ -230,18 +238,26 @@ export const makeClientProtocol = (
       return Deferred.await(ready).pipe(Effect.andThen(awaitReadyLoop))
     })
 
-    const parkedError = () =>
-      new RpcClientError({
-        reason: new RpcClientDefect({
-          message: "remote rpc is parked while this tab owns the replica",
-          cause: undefined
-        })
-      })
-
     const awaitReady = (): Effect.Effect<Wire.Ready, RpcClientError> => {
-      if (options.isParked?.() === true) return Effect.fail(parkedError())
+      if (options.isParked?.() === true) {
+        return Effect.fail(
+          new RpcClientError({
+            reason: new RpcClientDefect({
+              message: "remote rpc is parked while this tab owns the replica",
+              cause: undefined
+            })
+          })
+        )
+      }
       if (options.parkInterrupt === undefined) return awaitReadyLoop
-      const failParked = Effect.fail(parkedError())
+      const failParked = Effect.fail(
+        new RpcClientError({
+          reason: new RpcClientDefect({
+            message: "remote rpc is parked while this tab owns the replica",
+            cause: undefined
+          })
+        })
+      )
       return Effect.raceFirst(
         options.parkInterrupt.pipe(Effect.andThen(failParked)),
         awaitReadyLoop

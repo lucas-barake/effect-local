@@ -36,6 +36,28 @@ const inertReplica: Replica.Service = {
   status: Effect.never
 }
 
+const inertSpace = (spaceId: Identity.SpaceId): Replica.Space => ({
+  spaceId,
+  scope: Effect.succeed(Protocol.ReplicationScope.make({ models: [] })),
+  setScope: () => Effect.never,
+  activation: Effect.never,
+  activate: Effect.never,
+  deactivate: Effect.never,
+  mutate: () => Effect.never,
+  get: () => Effect.never,
+  query: () => Effect.never,
+  receipt: () => Effect.never,
+  pending: Effect.never,
+  pendingFor: () => Effect.never,
+  settlements: () => Stream.never,
+  settlementsFor: () => Stream.never,
+  acknowledgeSettlements: () => Effect.never,
+  quarantine: Effect.never,
+  discardQuarantined: () => Effect.never,
+  resubmitQuarantined: () => Effect.never,
+  status: Effect.succeed({ _tag: "Offline", spaceId, pending: 0 })
+})
+
 const inertQueryReactivity: QueryReactivity.Service = {
   retain: () => Effect.succeed(Effect.void),
   record: () => Effect.void,
@@ -73,7 +95,9 @@ describe("MultiTab", () => {
       const stored = new Map<string, string>()
       const firstStoreStarted = yield* Deferred.make<void>()
       const allowFirstStore = yield* Deferred.make<void>()
+      const secondIdentityLockStarted = yield* Deferred.make<void>()
       let stores = 0
+      let identityLockAttempts = 0
       const identities: platform.ClientIdentityStoreService = {
         load: (key) => Effect.sync(() => stored.get(key)),
         store: Effect.fnUntraced(function*(key, value) {
@@ -87,7 +111,17 @@ describe("MultiTab", () => {
       }
       const layerPlatform = Layer.mergeAll(
         Layer.succeed(platform.TabChannel, kit.tabChannel),
-        Layer.succeed(platform.WebLocks, kit.webLocks),
+        Layer.succeed(platform.WebLocks, {
+          acquire: (name, options) => {
+            if (!name.endsWith(":client-identity")) return kit.webLocks.acquire(name, options)
+            identityLockAttempts += 1
+            let started = Effect.void
+            if (identityLockAttempts === 2) {
+              started = Deferred.succeed(secondIdentityLockStarted, undefined)
+            }
+            return started.pipe(Effect.andThen(kit.webLocks.acquire(name, options)))
+          }
+        }),
         Layer.succeed(platform.EpochStore, kit.epochStore),
         Layer.succeed(platform.ClientIdentityStore, identities)
       )
@@ -123,7 +157,7 @@ describe("MultiTab", () => {
         Layer.build(layerB).pipe(Effect.provide(Reactivity.layer)),
         scopeB
       ).pipe(Effect.forkChild({ startImmediately: true }))
-      yield* Effect.yieldNow
+      yield* Deferred.await(secondIdentityLockStarted)
       yield* Deferred.succeed(allowFirstStore, undefined)
       const first = yield* Queue.take(owners)
       let firstScope = scopeB
@@ -137,6 +171,33 @@ describe("MultiTab", () => {
       assert.strictEqual(second.clientId, first.clientId)
       yield* Scope.close(secondScope, Exit.void)
       yield* Fiber.interruptAll([buildA, buildB])
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "fails layer construction when client identity storage cannot be read",
+    Effect.fnUntraced(function*() {
+      const kit = yield* testKit.makeMemoryPlatform
+      const layerPlatform = Layer.mergeAll(
+        Layer.succeed(platform.TabChannel, kit.tabChannel),
+        Layer.succeed(platform.WebLocks, kit.webLocks),
+        Layer.succeed(platform.EpochStore, kit.epochStore),
+        Layer.succeed(platform.ClientIdentityStore, {
+          load: () => Effect.die("identity storage unavailable"),
+          store: () => Effect.void
+        })
+      )
+      const exit = yield* Effect.exit(
+        Layer.build(
+          multiTab({
+            name: "identity-load-failure",
+            definition,
+            owner: () => layerOwner,
+            requestPersistence: false
+          }, layerPlatform).pipe(Layer.provide(Reactivity.layer))
+        )
+      )
+      assert.isTrue(Exit.isFailure(exit))
     }, Effect.scoped)
   )
 
@@ -227,12 +288,16 @@ describe("MultiTab", () => {
           } as EphemeralClient.Session<typeof memberProfile>
         })
       }
+      const defectiveQueryReactivity: QueryReactivity.Service = {
+        ...inertQueryReactivity,
+        retain: () => Effect.succeed(Effect.die("release failed"))
+      }
       const layerHostedOwner = Layer.mergeAll(
         Layer.succeed(Replica.Replica, inertReplica),
         Layer.succeed(EphemeralClient.EphemeralClient, hostedEphemeral),
         Layer.effect(
           QueryReactivity.QueryReactivity,
-          Deferred.succeed(ownerReady, undefined).pipe(Effect.as(inertQueryReactivity))
+          Deferred.succeed(ownerReady, undefined).pipe(Effect.as(defectiveQueryReactivity))
         )
       )
       const ownerScope = yield* Scope.make()
@@ -263,6 +328,8 @@ describe("MultiTab", () => {
         followerScope
       )
       const client = Context.get(follower, EphemeralClient.EphemeralClient)
+      const reactivity = Context.get(follower, QueryReactivity.QueryReactivity)
+      yield* reactivity.retain("query-key")
       yield* Scope.provide(
         client.session(profile, {
           spaceId,
@@ -272,7 +339,7 @@ describe("MultiTab", () => {
         }),
         followerScope
       )
-      yield* Scope.close(ownerScope, Exit.void)
+      yield* Effect.exit(Scope.close(ownerScope, Exit.void))
       assert.isTrue(yield* Deferred.isDone(sessionClosed))
       yield* Scope.close(followerScope, Exit.void)
     }, Effect.scoped)
@@ -407,10 +474,76 @@ describe("MultiTab", () => {
       )
       const facade = Context.get(followerContext, Replica.Replica)
       yield* facade.spaces
-      const exit = yield* Effect.exit(facade.space(unknown))
-      assert.isTrue(Exit.isFailure(exit))
-      yield* Scope.close(ownerScope, Exit.void)
+      let error: ReplicaError.SpaceNotJoined | undefined
+      yield* facade.space(unknown).pipe(
+        Effect.asVoid,
+        Effect.catchTag("SpaceNotJoined", (failure) =>
+          Effect.sync(() => {
+            error = failure
+          }))
+      )
+      assert.strictEqual(error?._tag, "SpaceNotJoined")
+      assert.strictEqual(error?.spaceId, unknown)
       yield* Scope.close(followerScope, Exit.void)
+      yield* Scope.close(ownerScope, Exit.void)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "reuses a validated follower space handle for later operations",
+    Effect.fnUntraced(function*() {
+      const kit = yield* testKit.makeMemoryPlatform
+      const ownerReady = yield* Deferred.make<void>()
+      const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
+      let spaceLookups = 0
+      const countingReplica: Replica.Service = {
+        ...inertReplica,
+        space: (requested) =>
+          Effect.sync(() => {
+            spaceLookups += 1
+            return inertSpace(requested)
+          })
+      }
+      const layerCountingOwner = Layer.mergeAll(
+        Layer.succeed(Replica.Replica, countingReplica),
+        Layer.succeed(EphemeralClient.EphemeralClient, inertEphemeral),
+        Layer.effect(
+          QueryReactivity.QueryReactivity,
+          Deferred.succeed(ownerReady, undefined).pipe(Effect.as(inertQueryReactivity))
+        )
+      )
+      const ownerScope = yield* Scope.make()
+      yield* Scope.provide(
+        Layer.build(
+          multiTab({
+            name: "space-handle",
+            definition,
+            requestPersistence: false,
+            owner: () => layerCountingOwner
+          }, kit.layerAll).pipe(Layer.provide(Reactivity.layer))
+        ),
+        ownerScope
+      )
+      yield* Deferred.await(ownerReady)
+      const followerScope = yield* Scope.make()
+      const follower = yield* Scope.provide(
+        Layer.build(
+          multiTab({
+            name: "space-handle",
+            definition,
+            requestPersistence: false,
+            owner: () => layerOwner
+          }, kit.layerAll).pipe(Layer.provide(Reactivity.layer))
+        ),
+        followerScope
+      )
+      const replica = Context.get(follower, Replica.Replica)
+      const space = yield* replica.space(spaceId)
+      spaceLookups = 0
+      yield* space.status
+      assert.strictEqual(spaceLookups, 1)
+      yield* Scope.close(followerScope, Exit.void)
+      yield* Scope.close(ownerScope, Exit.void)
     }, Effect.scoped)
   )
 })

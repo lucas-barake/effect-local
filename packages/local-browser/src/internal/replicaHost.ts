@@ -115,8 +115,14 @@ export const makeHost = Effect.fnUntraced(function*(options: HostOptions) {
       sessions.clear()
       acks.clear()
       applied.clear()
-      yield* Effect.forEach(retainReleases, (release) => release, { discard: true })
-      yield* Effect.forEach(sessionCloses, (close) => close, { discard: true })
+      const exits = yield* Effect.forEach(
+        [...retainReleases, ...sessionCloses],
+        (release) => Effect.exit(release)
+      )
+      const failure = exits.find((exit) => exit._tag === "Failure")
+      if (failure !== undefined && failure._tag === "Failure") {
+        yield* Effect.failCause(failure.cause)
+      }
     })
   )
 
