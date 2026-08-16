@@ -411,10 +411,11 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
 
     const facadeSpace = (
       spaceId: Identity.SpaceId,
-      initial?: { readonly backend: Backend; readonly space: Replica.Space }
+      initialBackend: Backend,
+      initialSpace: Replica.Space
     ): Replica.Space => {
-      let cached: typeof initial
-      if (initial?.backend.local === false) cached = initial
+      let cached: { readonly backend: Backend; readonly space: Replica.Space } | undefined
+      if (!initialBackend.local) cached = { backend: initialBackend, space: initialSpace }
       const resolveSpace = (backend: Backend): Effect.Effect<Replica.Space, ReplicaError.ReplicaError> => {
         if (cached?.backend === backend) return Effect.succeed(cached.space)
         return backend.replica.space(spaceId).pipe(
@@ -486,21 +487,21 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
         Effect.suspend(() => {
           const backend = currentBackend
           return backend.replica.join(spaceId).pipe(
-            Effect.map((space) => facadeSpace(spaceId, { backend, space }))
+            Effect.map((space) => facadeSpace(spaceId, backend, space))
           )
         }),
       leave: (spaceId) => Effect.suspend(() => currentBackend.replica.leave(spaceId)),
       spaces: Effect.suspend(() => {
         const backend = currentBackend
         return backend.replica.spaces.pipe(
-          Effect.map((spaces) => spaces.map((space) => facadeSpace(space.spaceId, { backend, space })))
+          Effect.map((spaces) => spaces.map((space) => facadeSpace(space.spaceId, backend, space)))
         )
       }),
       space: (spaceId) =>
         Effect.suspend(() => {
           const backend = currentBackend
           return backend.replica.space(spaceId).pipe(
-            Effect.map((space) => facadeSpace(spaceId, { backend, space }))
+            Effect.map((space) => facadeSpace(spaceId, backend, space))
           )
         }),
       status: Effect.suspend(() => currentBackend.replica.status)
