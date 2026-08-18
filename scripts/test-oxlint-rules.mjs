@@ -1320,6 +1320,21 @@ const barrelPipeDiagnostics = runOxlintFixture(
   barrelPipeSource,
   ["noFunctionEffectGen", "noNestedCalls", "noUnnecessaryEffectForwarding"]
 )
+
+const wrappedYieldSource = `import * as Effect from "effect/Effect"
+const wrapped = Effect.gen(function*() {
+  const value = yield* Effect.sync(() => 1) as Effect.Effect<number>
+  return value
+})
+void wrapped
+`
+const wrappedYieldDiagnostics = runOxlintFixture(
+  "wrapped-yield-fixture.ts",
+  wrappedYieldSource,
+  ["noYieldEffectSync"]
+)
+assert.equal(wrappedYieldDiagnostics.length, 1, encodeJson(wrappedYieldDiagnostics))
+assert.match(wrappedYieldDiagnostics[0].message, /Do not yield Effect.sync inside Effect.gen/)
 const barrelPipeCounts = new Map()
 for (const diagnostic of barrelPipeDiagnostics) {
   barrelPipeCounts.set(diagnostic.code, (barrelPipeCounts.get(diagnostic.code) ?? 0) + 1)
