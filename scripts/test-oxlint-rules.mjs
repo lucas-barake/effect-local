@@ -1188,6 +1188,7 @@ import * as EffectTest from "@effect/vitest"
 import * as timers from "node:timers/promises"
 import * as Schema from "effect/Schema"
 import { forkDetach as detach } from "effect/Effect"
+import { forkDetach } from "effect/Effect"
 
 class Tagged { readonly _tag = "Tagged" as const }
 declare const tagged: Tagged
@@ -1226,6 +1227,13 @@ import { decodeEffect as importedDecode } from "effect/Schema"
 export { importedDecode }
 export default Schema.encodeEffect(Schema.String)
 void detach(Effect.void)
+void forkDetach(Effect.void)
+declare const detachHost: { forkDetach: (value: unknown) => unknown }
+void detachHost.forkDetach(Effect.void)
+const detachFlags = { forkDetach: false }
+void detachFlags
+it("window timer", () => new Promise((resolve) => window.setTimeout(resolve, 1)))
+it("self timer", () => new Promise((resolve) => self.setTimeout(resolve, 1)))
 `
 const newPolicyDiagnostics = runOxlintFixture(
   "new-policy-fixture.ts",
@@ -1254,9 +1262,9 @@ const assertPolicyOffsets = (rule, offsets) => {
 assert.equal(policyCounts.get("effect-local(noEffectSyncReturningEffect)"), 3, encodeJson(newPolicyDiagnostics))
 assert.equal(policyCounts.get("effect-local(effectTestsUseEffect)"), 5, encodeJson(newPolicyDiagnostics))
 assert.equal(policyCounts.get("effect-local(noInstanceofTaggedError)"), 1, encodeJson(newPolicyDiagnostics))
-assert.equal(policyCounts.get("effect-local(noTestWallClockWait)"), 10, encodeJson(newPolicyDiagnostics))
+assert.equal(policyCounts.get("effect-local(noTestWallClockWait)"), 12, encodeJson(newPolicyDiagnostics))
 assert.equal(policyCounts.get("effect-local(noExportedSchemaCodecAlias)"), 4, encodeJson(newPolicyDiagnostics))
-assert.equal(policyCounts.get("effect-local(noDetachedFork)"), 1, encodeJson(newPolicyDiagnostics))
+assert.equal(policyCounts.get("effect-local(noDetachedFork)"), 2, encodeJson(newPolicyDiagnostics))
 assertPolicyOffsets("noEffectSyncReturningEffect", [
   offsetOf(newPolicySource, "Effect.sync(() => cleanup)"),
   offsetOf(newPolicySource, "suspendSync(() => cleanup)"),
@@ -1279,7 +1287,9 @@ assertPolicyOffsets("noTestWallClockWait", [
   offsetAfter(newPolicySource, "it(\"timer namespace\"", "timers.setTimeout"),
   offsetAfter(newPolicySource, "const namedTimer", "setTimeout"),
   offsetAfter(newPolicySource, "function declaredTimer", "setTimeout"),
-  offsetAfter(newPolicySource, "function declaredTimer", "setTimeout")
+  offsetAfter(newPolicySource, "function declaredTimer", "setTimeout"),
+  offsetAfter(newPolicySource, "it(\"window timer\"", "window.setTimeout"),
+  offsetAfter(newPolicySource, "it(\"self timer\"", "self.setTimeout")
 ])
 assertPolicyOffsets("noExportedSchemaCodecAlias", [
   offsetAfter(newPolicySource, "export { decode", "decode"),
@@ -1287,6 +1297,48 @@ assertPolicyOffsets("noExportedSchemaCodecAlias", [
   offsetAfter(newPolicySource, "export default", "Schema.encodeEffect"),
   offsetAfter(newPolicySource, "destructuredDecode", "destructuredDecode")
 ])
+
+const barrelPipeSource = `import { Effect, pipe } from "effect"
+declare const value: number
+declare const inner: (input: number) => number
+declare const outer: (input: number) => number
+declare const step: (input: number) => number
+const makeBarrel = () => pipe(
+  Effect.gen(function*() {
+    yield* Effect.void
+  }),
+  (self) => self
+)
+const composed = pipe(outer(inner(value)), step)
+const forwarded = pipe(value, (input) => step(input))
+void makeBarrel
+void composed
+void forwarded
+`
+const barrelPipeDiagnostics = runOxlintFixture(
+  "barrel-pipe-fixture.ts",
+  barrelPipeSource,
+  ["noFunctionEffectGen", "noNestedCalls", "noUnnecessaryEffectForwarding"]
+)
+const barrelPipeCounts = new Map()
+for (const diagnostic of barrelPipeDiagnostics) {
+  barrelPipeCounts.set(diagnostic.code, (barrelPipeCounts.get(diagnostic.code) ?? 0) + 1)
+}
+assert.equal(barrelPipeCounts.get("effect-local(noFunctionEffectGen)"), 1, encodeJson(barrelPipeDiagnostics))
+assert.equal(barrelPipeCounts.get("effect-local(noNestedCalls)"), undefined, encodeJson(barrelPipeDiagnostics))
+assert.equal(
+  barrelPipeCounts.get("effect-local(noUnnecessaryEffectForwarding)"),
+  1,
+  encodeJson(barrelPipeDiagnostics)
+)
+const barrelPipeGenDiagnostics = barrelPipeDiagnostics.filter((diagnostic) =>
+  diagnostic.code === "effect-local(noFunctionEffectGen)"
+)
+assert.deepEqual(
+  diagnosticOffsets(barrelPipeGenDiagnostics),
+  [offsetOf(barrelPipeSource, "Effect.gen(function*()")],
+  encodeJson(barrelPipeDiagnostics)
+)
 
 const packagePolicySource = `import * as Data from "effect/Data"
 import type { SqlClient } from "effect/unstable/sql/SqlClient"
