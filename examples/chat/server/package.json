@@ -1,0 +1,24 @@
+{
+  "name": "@effect-local/example-chat-server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Sync server for the chat example: authenticated WebSocket RPC over a SQLite ServerStore",
+  "exports": {
+    "./*": "./src/*.ts"
+  },
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "start": "tsx src/main.ts"
+  },
+  "dependencies": {
+    "@effect-local/example-chat-shared": "workspace:^",
+    "@effect/platform-node": "4.0.0-beta.103",
+    "@effect/sql-sqlite-node": "4.0.0-beta.103",
+    "@lucas-barake/effect-local": "workspace:^",
+    "@lucas-barake/effect-local-rpc": "workspace:^",
+    "@lucas-barake/effect-local-sql": "workspace:^",
+    "effect": "4.0.0-beta.103",
+    "tsx": "4.20.6"
+  }
+}
