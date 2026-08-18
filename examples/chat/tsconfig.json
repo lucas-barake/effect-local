@@ -1,0 +1,10 @@
+{
+  "$schema": "http://json.schemastore.org/tsconfig",
+  "files": [],
+  "references": [
+    { "path": "shared" },
+    { "path": "server" },
+    { "path": "client" },
+    { "path": "test" }
+  ]
+}

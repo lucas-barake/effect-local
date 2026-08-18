@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json.schemastore.org/tsconfig",
+  "extends": "../../../tsconfig.base.json",
+  "include": ["src"],
+  "compilerOptions": {
+    // Workspace dependencies are consumed as TypeScript source, and their
+    // sources (e.g. packages/local) use web globals such as TextEncoder -
+    // same reason packages/local sets the DOM lib.
+    "lib": ["ES2023", "DOM"]
+  },
+  "references": [{ "path": "../../../packages/local" }]
+}

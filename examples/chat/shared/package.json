@@ -1,0 +1,14 @@
+{
+  "name": "@effect-local/example-chat-shared",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Shared domain, auth contracts, and deterministic handlers for the chat example",
+  "exports": {
+    "./*": "./src/*.ts"
+  },
+  "dependencies": {
+    "@lucas-barake/effect-local": "workspace:^",
+    "effect": "4.0.0-beta.103"
+  }
+}

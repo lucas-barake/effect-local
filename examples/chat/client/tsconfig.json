@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json.schemastore.org/tsconfig",
+  "extends": "../../../tsconfig.base.json",
+  "include": ["src"],
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable", "WebWorker"],
+    "types": ["vite/client"],
+    "jsx": "react-jsx"
+  },
+  "references": [
+    { "path": "../shared" },
+    { "path": "../../../packages/local" },
+    { "path": "../../../packages/local-rpc" },
+    { "path": "../../../packages/local-sql" },
+    { "path": "../../../packages/local-browser" }
+  ]
+}
