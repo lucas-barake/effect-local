@@ -751,8 +751,10 @@ export const noYieldEffectSync = Rule.define({
       ImportDeclaration: (node) => Effect.sync(() => bindings.registerImport(node)),
       VariableDeclarator: (node) => Effect.sync(() => bindings.registerConstAlias(node)),
       YieldExpression: (node) => {
-        if (!node.delegate || node.argument?.type !== "CallExpression") return Effect.void
-        if (bindings.resolveExport(node.argument.callee)?.name !== "sync") return Effect.void
+        if (!node.delegate || node.argument === null || node.argument === undefined) return Effect.void
+        const argument = unwrapExpression(node.argument)
+        if (argument?.type !== "CallExpression") return Effect.void
+        if (bindings.resolveExport(argument.callee)?.name !== "sync") return Effect.void
         return context.report(Diagnostic.make({
           node,
           message: "Do not yield Effect.sync inside Effect.gen. Execute the synchronous code directly."
@@ -1107,7 +1109,11 @@ export const noUnnecessaryEffectForwarding = Rule.define({
       if (parameterVariable === undefined || findVariable(context, argument) !== parameterVariable) {
         return Effect.void
       }
-      if (parameterVariable.references.length !== 1 || parameterVariable.references[0].identifier !== argument) {
+      if (
+        parameterVariable.references.length !== 1 ||
+        parameterVariable.references[0].identifier.start !== argument.start ||
+        parameterVariable.references[0].identifier.end !== argument.end
+      ) {
         return Effect.void
       }
       const calleeText = context.sourceCode.getText(body.callee)
@@ -1135,7 +1141,11 @@ export const noUnnecessaryEffectForwarding = Rule.define({
         (variable) => variable.name === parameter.name
       )
       if (parameterVariable === undefined || findVariable(context, identifier) !== parameterVariable) return Effect.void
-      if (parameterVariable.references.length !== 1 || parameterVariable.references[0].identifier !== identifier) {
+      if (
+        parameterVariable.references.length !== 1 ||
+        parameterVariable.references[0].identifier.start !== identifier.start ||
+        parameterVariable.references[0].identifier.end !== identifier.end
+      ) {
         return Effect.void
       }
       const remainingArguments = body.arguments.filter((_, index) => index !== combinator.dataIndex)
@@ -1266,7 +1276,9 @@ export const noImplicitDefectConversion = Rule.define({
         (candidate) => candidate.name === parameter.name
       )
       return variable !== undefined && findVariable(context, argument) === variable &&
-        variable.references.length === 1 && variable.references[0].identifier === argument
+        variable.references.length === 1 &&
+        variable.references[0].identifier.start === argument.start &&
+        variable.references[0].identifier.end === argument.end
     }
 
     return {
