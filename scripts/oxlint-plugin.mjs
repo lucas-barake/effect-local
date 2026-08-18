@@ -65,6 +65,23 @@ const importedVariable = (context, node, localName) =>
 
 const reportDiagnostic = (context, node, message) => context.report(Diagnostic.make({ node, message }))
 
+const isNonReferencePosition = (context, node) => {
+  const parent = context.sourceCode.getAncestors(node).at(-1)
+  if (parent === undefined) return false
+  if (parent.type === "ImportSpecifier") return true
+  if (
+    parent.type === "MemberExpression" && !parent.computed &&
+    parent.property.start === node.start && parent.property.end === node.end
+  ) {
+    return true
+  }
+  return (parent.type === "Property" || parent.type === "PropertyDefinition" ||
+    parent.type === "MethodDefinition" || parent.type === "TSPropertySignature" ||
+    parent.type === "TSMethodSignature") &&
+    !parent.computed && parent.shorthand !== true &&
+    parent.key.start === node.start && parent.key.end === node.end
+}
+
 const isUnshadowedGlobal = (context, node, name) => {
   const expression = unwrapExpression(node)
   if (expression.type !== "Identifier" || expression.name !== name) return false
@@ -239,6 +256,12 @@ const makeOfficialBindingResolver = (context, configuredModules) => {
         if (moduleName !== undefined && modules.has(moduleName)) {
           if (variable === undefined) fallbackModuleBindings.set(specifier.local.name, moduleName)
           else moduleBindings.set(variable, moduleName)
+        } else if (modules.get("effect/Function")?.has(specifier.imported.name) === true) {
+          // The barrel re-exports effect/Function helpers directly:
+          // `import { pipe } from "effect"`.
+          const binding = { moduleName: "effect/Function", name: specifier.imported.name }
+          if (variable === undefined) fallbackExportBindings.set(specifier.local.name, binding)
+          else exportBindings.set(variable, binding)
         }
       }
     }
@@ -483,6 +506,7 @@ export const noDetachedFork = Rule.define({
       Identifier: (node) => {
         if (bindings.importBindingNodes.has(node) || bindings.aliasBindingNodes.has(node)) return Effect.void
         if (bindings.resolveExport(node)?.name !== "forkDetach") return Effect.void
+        if (isNonReferencePosition(context, node)) return Effect.void
         return reportDiagnostic(context, node, detachedForkMessage)
       },
       MemberExpression: (node) => {
@@ -631,16 +655,21 @@ export const noTestWallClockWait = Rule.define({
           let wallClock = false
           if (callee.type === "Identifier") {
             const variable = findVariable(context, callee)
+            // Some scope managers expose ambient globals as variables with
+            // empty defs, so undefined alone under-detects (same pattern as
+            // isUnshadowedGlobal).
             wallClock = timerBindings.has(variable) ||
-              (variable === undefined && (callee.name === "setTimeout" || callee.name === "setInterval"))
+              ((variable === undefined || variable.defs.length === 0) &&
+                (callee.name === "setTimeout" || callee.name === "setInterval"))
           }
           const member = getStaticMember(callee)
           if (member !== undefined && (member.name === "setTimeout" || member.name === "setInterval")) {
             const object = unwrapExpression(member.expression.object)
             if (object.type === "Identifier") {
-              const variable = findVariable(context, object)
-              wallClock = timerNamespaces.has(variable) ||
-                object.name === "globalThis"
+              wallClock = timerNamespaces.has(findVariable(context, object)) ||
+                isUnshadowedGlobal(context, object, "globalThis") ||
+                isUnshadowedGlobal(context, object, "window") ||
+                isUnshadowedGlobal(context, object, "self")
             }
           }
           const official = waits.resolveExport(callee)
@@ -824,10 +853,15 @@ export const noNestedCalls = Rule.define({
 
     return {
       ImportDeclaration: (node) => {
-        if (node.source.value !== "effect/Function" || node.importKind === "type") return Effect.void
+        // The barrel re-exports pipe directly: `import { pipe } from "effect"`.
+        const source = node.source.value
+        if ((source !== "effect/Function" && source !== "effect") || node.importKind === "type") {
+          return Effect.void
+        }
         return Effect.sync(() => {
           for (const specifier of node.specifiers) {
             if (specifier.type === "ImportNamespaceSpecifier") {
+              if (source !== "effect/Function") continue
               const variable = importedVariable(context, node, specifier.local.name)
               if (variable !== undefined) importedFunctionNamespaces.add(variable)
               continue
@@ -1014,6 +1048,7 @@ export const noUnnecessaryEffectForwarding = Rule.define({
         ) {
           const moduleName = rootEffectModules.get(specifier.imported.name)
           if (moduleName !== undefined) moduleNamespaces.set(variable, moduleName)
+          else if (specifier.imported.name === "pipe") importedPipeBindings.add(variable)
         }
       }
     }
@@ -1251,6 +1286,7 @@ export const noImplicitDefectConversion = Rule.define({
       Identifier: (node) => {
         if (bindings.importBindingNodes.has(node) || bindings.aliasBindingNodes.has(node)) return Effect.void
         if (bindings.resolveExport(node)?.name !== "orDie") return Effect.void
+        if (isNonReferencePosition(context, node)) return Effect.void
         return reportDiagnostic(context, node, effectOrDieMessage)
       },
       MemberExpression: (node) => {
