@@ -36,14 +36,27 @@ const checked = async (command, args, options = {}) => {
   return result.stdout
 }
 
+const SKIP_DIRECTORIES = new Set(["dist", "dist-web", "coverage", "test-results", "playwright-report"])
+
 const linkDependencies = (repository, snapshot) => {
-  symlinkSync(join(repository, "node_modules"), join(snapshot, "node_modules"), "dir")
-  const packages = join(repository, "packages")
-  for (const name of readdirSync(packages)) {
-    const source = join(packages, name, "node_modules")
-    const target = join(snapshot, "packages", name, "node_modules")
-    if (!existsSync(source) || !existsSync(dirname(target))) continue
-    symlinkSync(source, target, "dir")
+  // Every package in the workspace can have its own pnpm-linked node_modules
+  // (root, packages/*, examples/*, examples/*/*, ...), and the snapshot only
+  // contains git-tracked files - so walk the tree and link each one. Without
+  // this, nested workspaces (e.g. examples/chat/*) fail module resolution in
+  // the snapshot and drown the diff in downstream type diagnostics.
+  const pending = [repository]
+  while (pending.length > 0) {
+    const current = pending.pop()
+    const modules = join(current, "node_modules")
+    if (existsSync(modules)) {
+      const target = join(snapshot, relative(repository, current), "node_modules")
+      if (existsSync(dirname(target))) symlinkSync(modules, target, "dir")
+    }
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue
+      if (entry.name === "node_modules" || entry.name.startsWith(".") || SKIP_DIRECTORIES.has(entry.name)) continue
+      pending.push(join(current, entry.name))
+    }
   }
 }
 
