@@ -1,10 +1,12 @@
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Context from "effect/Context"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import type * as Schedule from "effect/Schedule"
+import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
@@ -356,16 +358,40 @@ export const layerWebSocket = <R = never,>(options: WebSocketOptions<R>): Layer.
   ReplicaError.InvalidConfiguration,
   Authentication.CredentialProvider | Socket.WebSocketConstructor | R
 > => {
-  // The url Effect is handed to `Socket.makeWebSocket` rather than resolved
-  // here, because the socket re-runs it on every reconnect: an address that
-  // rotates (failover host, signed url) must not be pinned to the first build.
+  // The url Effect is resolved per connection rather than once while the Layer
+  // builds, because an address that rotates (failover host, signed url) must not
+  // be pinned to the first build. `Socket.fromWebSocket` is used instead of
+  // `Socket.makeWebSocket` because the latter types the url Effect as
+  // infallible, which would let a crash while resolving the address escape the
+  // reconnect loop as a defect and stop the client dialling forever.
   const layerSocket = Layer.effect(
     Socket.Socket,
     Effect.gen(function*() {
       const url = options.url
       if (typeof url === "string") return yield* Socket.makeWebSocket(url, options.socket)
+      const construct = yield* Socket.WebSocketConstructor
       const context = yield* Effect.context<R>()
-      return yield* Socket.makeWebSocket(Effect.provideContext(url, context), options.socket)
+      // The url Effect cannot fail, so only a defect can surface here; it is
+      // mapped to an open error so the socket retry policy treats it like any
+      // other failed dial, while interruption passes through untouched.
+      const resolveUrl = Effect.flatMap(
+        Effect.scope,
+        (scope) => Effect.provideContext(url, Context.add(context, Scope.Scope, scope))
+      ).pipe(
+        Effect.catchDefect((cause) =>
+          Effect.fail(
+            new Socket.SocketError({
+              reason: new Socket.SocketOpenError({ kind: "Unknown", cause })
+            })
+          )
+        )
+      )
+      const openWebSocket = Effect.map(
+        resolveUrl,
+        (resolved) => construct(resolved, options.socket?.protocols)
+      )
+      const acquire = Effect.acquireRelease(openWebSocket, (ws) => Effect.sync(() => ws.close(1000)))
+      return yield* Socket.fromWebSocket(acquire, options.socket)
     })
   )
   const layerProtocol = layerProtocolSocket(options).pipe(

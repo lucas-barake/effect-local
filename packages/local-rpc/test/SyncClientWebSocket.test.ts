@@ -102,4 +102,33 @@ describe("SyncClient.layerWebSocket", () => {
       ])
     }, Effect.scoped)
   )
+
+  it.live(
+    "keeps reconnecting after the url Effect crashes on one attempt",
+    Effect.fnUntraced(function*() {
+      const recorder = yield* makeRecordingConstructor(4)
+      let attempt = 0
+      // A url resolved from another service can crash transiently. That must not
+      // permanently stop the socket from ever dialling again.
+      const url = Effect.suspend(() => {
+        const current = attempt++
+        if (current === 2) return Effect.die(new Error("url resolution crashed"))
+        return Effect.succeed(`ws://127.0.0.1:1/sync?attempt=${current}`)
+      })
+      const layer = SyncClient.layerWebSocket({
+        url,
+        retryPolicy: Schedule.spaced(1)
+      }).pipe(
+        Layer.provide(recorder.layer),
+        Layer.provide(layerStaticCredential)
+      )
+      yield* buildAndDial(layer, recorder.reached)
+      assert.deepStrictEqual(recorder.dialled.slice(0, 4), [
+        "ws://127.0.0.1:1/sync?attempt=0",
+        "ws://127.0.0.1:1/sync?attempt=1",
+        "ws://127.0.0.1:1/sync?attempt=3",
+        "ws://127.0.0.1:1/sync?attempt=4"
+      ])
+    }, Effect.scoped)
+  )
 })
