@@ -9,12 +9,14 @@ import * as Stream from "effect/Stream"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import type * as Socket from "effect/unstable/socket/Socket"
+import * as Socket from "effect/unstable/socket/Socket"
 import * as Authentication from "./Authentication.js"
+import * as EphemeralClient from "./EphemeralClient.js"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSocket from "./internal/protocolSocket.js"
 import * as ProtocolSession from "./ProtocolSession.js"
+import * as SyncRpc from "./SyncRpc.js"
 
 export interface Options extends ProtocolSession.Options {
   readonly rpcTimeout?: Duration.Input
@@ -331,3 +333,46 @@ export const layerProtocolSocket = (options?: {
   readonly retryPolicy?: Schedule.Schedule<any, Socket.SocketError>
 }): Layer.Layer<RpcClient.Protocol, never, Socket.Socket | RpcSerialization.RpcSerialization> =>
   Layer.effect(RpcClient.Protocol, ProtocolSocket.make(options))
+
+export interface WebSocketOptions<R = never,> extends Options, Pick<EphemeralClient.Options, "heartbeatInterval"> {
+  readonly url: string | Effect.Effect<string, never, R>
+  readonly maximumFrameBytes?: number
+  readonly retryTransientErrors?: boolean
+  readonly retryPolicy?: Schedule.Schedule<any, Socket.SocketError>
+  readonly socket?: {
+    readonly closeCodeIsError?: ((code: number) => boolean) | undefined
+    readonly openTimeout?: Duration.Input | undefined
+    readonly protocols?: string | Array<string> | undefined
+  }
+}
+
+/**
+ * One WebSocket carrying both the sync engine and the ephemeral client over a
+ * shared protocol session. The credential middleware is built fresh per call
+ * so two clients with different providers under one memo map never share it.
+ */
+export const layerWebSocket = <R = never,>(options: WebSocketOptions<R>): Layer.Layer<
+  SyncEngine.SyncEngine | EphemeralClient.EphemeralClient,
+  ReplicaError.InvalidConfiguration,
+  Authentication.CredentialProvider | Socket.WebSocketConstructor | R
+> => {
+  const layerSocket = Layer.effect(
+    Socket.Socket,
+    Effect.suspend(() => {
+      const url = options.url
+      if (typeof url === "string") return Socket.makeWebSocket(url, options.socket)
+      return Effect.flatMap(url, (resolved) => Socket.makeWebSocket(resolved, options.socket))
+    })
+  )
+  const layerProtocol = layerProtocolSocket(options).pipe(
+    Layer.provide(layerSocket),
+    Layer.provide(SyncRpc.layerJson(options))
+  )
+  const layerSession = ProtocolSession.layerWithOptions(options).pipe(
+    Layer.provide(layerProtocol),
+    Layer.provide(Layer.fresh(Authentication.layerClient))
+  )
+  return Layer.merge(layerFromSession(options), EphemeralClient.layerFromSession(options)).pipe(
+    Layer.provide(layerSession)
+  )
+}

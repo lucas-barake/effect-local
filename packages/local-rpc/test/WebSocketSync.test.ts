@@ -246,9 +246,6 @@ const revokedBearer = Redacted.make("revoked")
 const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(
   Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
 )
-const layerRevokedAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(
-  Layer.provide(Authentication.layerCredentialProviderStatic(revokedBearer))
-)
 const layerCluster = SpaceEntity.layer(entityOptions).pipe(
   Layer.provide(layerAssertionVerifier),
   Layer.provide(layerStore),
@@ -288,24 +285,33 @@ const layerCountedConstructor = Layer.effect(
 ).pipe(
   Layer.provide(NodeSocket.layerWebSocketConstructor)
 )
-const layerSocket = Effect.gen(function*() {
+const serverUrl = Effect.gen(function*() {
   const server = yield* HttpServer.HttpServer
   const address = server.address
   if (address._tag === "UnixAddress") return yield* Effect.die("Expected the test HTTP server to use a TCP address")
-  return yield* Socket.makeWebSocket(`http://127.0.0.1:${address.port}/sync`)
-}).pipe(Layer.effect(Socket.Socket), Layer.provide(layerCountedConstructor))
+  return `http://127.0.0.1:${address.port}/sync`
+})
+const layerSocket = Effect.flatMap(serverUrl, (url) => Socket.makeWebSocket(url)).pipe(
+  Layer.effect(Socket.Socket),
+  Layer.provide(layerCountedConstructor)
+)
 const layerClientProtocol = SyncClient.layerProtocolSocket().pipe(Layer.provide(layerSocket))
-const layerClient = Layer.merge(SyncClient.layer, EphemeralClient.layer).pipe(
-  Layer.provide(layerClientProtocol),
-  Layer.provide(layerAuthenticationClient)
+const layerClient = SyncClient.layerWebSocket({ url: serverUrl }).pipe(
+  Layer.provide(layerCountedConstructor),
+  Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
 )
 class RevokedSyncEngine extends Context.Service<RevokedSyncEngine, SyncEngine.Service>()(
   "@lucas-barake/effect-local-rpc/test/RevokedSyncEngine"
 ) {}
+// A second bundle with a different provider under the same memo map: proves the
+// bundle does not share the credential middleware between clients.
 const layerRevokedClient = Layer.effect(RevokedSyncEngine, SyncEngine.SyncEngine).pipe(
-  Layer.provide(Layer.fresh(SyncClient.layer)),
-  Layer.provide(Layer.fresh(layerClientProtocol)),
-  Layer.provide(layerRevokedAuthenticationClient)
+  Layer.provide(
+    SyncClient.layerWebSocket({ url: serverUrl }).pipe(
+      Layer.provide(layerCountedConstructor),
+      Layer.provide(Authentication.layerCredentialProviderStatic(revokedBearer))
+    )
+  )
 )
 const layerLive = Layer.merge(layerClient, layerRevokedClient).pipe(
   Layer.provideMerge(layerWebsocketServer),
