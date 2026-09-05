@@ -229,25 +229,13 @@ const layerAuthenticator = Layer.succeed(
   })
 )
 const layerAuthenticationServer = Authentication.layerServer.pipe(Layer.provide(layerAuthenticator))
-const assertionCodec = Schema.fromJsonString(Schema.Json)
-const layerAssertionIssuer = PrincipalAssertion.layerIssuer((principal) =>
-  Schema.encodeUnknownEffect(assertionCodec)(principal).pipe(
-    Effect.map((assertion) => PrincipalAssertion.PrincipalAssertion.make(assertion)),
-    Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "could not issue principal assertion" }))
-  )
-)
-const layerAssertionVerifier = PrincipalAssertion.layerVerifier((assertion) =>
-  Schema.decodeUnknownEffect(assertionCodec)(assertion).pipe(
-    Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" }))
-  )
-)
 const secretBearer = Redacted.make("secret")
 const revokedBearer = Redacted.make("revoked")
 const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(
   Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
 )
 const layerCluster = SpaceEntity.layer(entityOptions).pipe(
-  Layer.provide(layerAssertionVerifier),
+  Layer.provide(PrincipalAssertion.layerJson),
   Layer.provide(layerStore),
   Layer.provide(
     EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
@@ -262,7 +250,7 @@ const layerWebsocketServer = SyncServer.layer.pipe(
   Layer.provideMerge(layerWebsocketProtocol),
   Layer.provide(layerCluster),
   Layer.provide(layerAuthenticationServer),
-  Layer.provide(layerAssertionIssuer),
+  Layer.provide(PrincipalAssertion.layerJson),
   Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const webSocketConstructions = MutableRef.make(0)
@@ -326,7 +314,7 @@ const layerIncompatibleServer = SyncServer.layerWithOptions({ supportedProtocolV
   Layer.provideMerge(layerWebsocketProtocol),
   Layer.provide(layerCluster),
   Layer.provide(layerAuthenticationServer),
-  Layer.provide(layerAssertionIssuer),
+  Layer.provide(PrincipalAssertion.layerJson),
   Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const layerIncompatibleClient = SyncClient.layerWithOptions({ supportedProtocolVersions: [1] }).pipe(
@@ -388,7 +376,7 @@ const layerProtocol2Server = SyncServer.layerWithOptions({ supportedProtocolVers
   Layer.provideMerge(layerWebsocketProtocol),
   Layer.provide(layerCluster),
   Layer.provide(layerObservingAuthenticationServer),
-  Layer.provide(layerAssertionIssuer),
+  Layer.provide(PrincipalAssertion.layerJson),
   Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const layerConfigurableProtocolSession = ProtocolSession.layerWithOptions({ supportedProtocolVersions: [1, 2] })
@@ -526,7 +514,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     }
   }).pipe(Layer.provide(layerLifecycleRuntime), Layer.provide(layerDatabase))
   const layerLifecycleCluster = SpaceEntity.layer(entityOptions).pipe(
-    Layer.provide(layerAssertionVerifier),
+    Layer.provide(PrincipalAssertion.layerJson),
     Layer.provide(layerLifecycleStore),
     Layer.provide(
       EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
@@ -540,7 +528,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     Layer.provideMerge(layerLifecycleWebSocketProtocol),
     Layer.provide(layerLifecycleCluster),
     Layer.provide(layerObservedAuthenticationServer),
-    Layer.provide(layerAssertionIssuer),
+    Layer.provide(PrincipalAssertion.layerJson),
     Layer.provide(HttpRouter.serve(layerLifecycleWebSocketProtocol, {
       disableListenLog: true,
       disableLogger: true

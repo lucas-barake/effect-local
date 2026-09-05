@@ -72,8 +72,26 @@ const layerTestShardingConfig = ShardingConfig.layer({
 })
 const provideTestShardingConfig = Effect.provide(layerTestShardingConfig)
 const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
+const provideJsonAssertions = Effect.provide(PrincipalAssertion.layerJson)
 
 describe("principal assertions", () => {
+  it.effect(
+    "layerJson round trips a principal and rejects a malformed assertion",
+    Effect.fnUntraced(function*() {
+      const issuer = yield* PrincipalAssertion.Issuer
+      const verifier = yield* PrincipalAssertion.Verifier
+      const principal = { userId: "alice", roles: ["reader", "writer"] }
+      const assertion = yield* issuer.issue(principal)
+      const verified = yield* verifier.verify(assertion)
+      assert.deepStrictEqual(verified, principal)
+
+      const forged = PrincipalAssertion.PrincipalAssertion.make("{not json")
+      const malformed = yield* verifier.verify(forged).pipe(Effect.result)
+      if (!Result.isFailure(malformed)) assert.fail("expected a malformed assertion to be denied")
+      assert.strictEqual(malformed.failure._tag, "AuthorizationDenied")
+    }, provideJsonAssertions)
+  )
+
   it.effect(
     "rejects a forged internal assertion before reaching entity authorization",
     Effect.fnUntraced(
