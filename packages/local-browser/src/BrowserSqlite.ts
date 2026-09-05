@@ -1,6 +1,7 @@
 import * as SqliteClient from "@effect/sql-sqlite-wasm/SqliteClient"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import type { LazyArg } from "effect/Function"
 import * as EffectLayer from "effect/Layer"
 
 export class DatabasePort extends Context.Service<DatabasePort, MessagePort>()(
@@ -28,7 +29,7 @@ const normalizeQueryParameters = (message: unknown): unknown => {
 }
 
 // wa-sqlite 0.1.2 satisfies the driver's peer range but cannot bind booleans.
-const compatiblePort = (port: MessagePort): MessagePort =>
+const compatiblePort = <T extends Pick<MessagePort, "postMessage">,>(port: T): T =>
   new Proxy(port, {
     get(target, property) {
       if (property === "postMessage") {
@@ -70,3 +71,13 @@ export const layer = makeLayer()
 
 export const layerMessagePort = (port: MessagePort) =>
   makeLayer().pipe(EffectLayer.provide(EffectLayer.succeed(DatabasePort, port)))
+
+// Terminating on release also serves SqliteClient's restart path: a worker
+// "error" event re-acquires the worker, so the replacement is a fresh spawn.
+export const layerWorker = (spawn: LazyArg<Worker>) =>
+  SqliteClient.layer({
+    worker: Effect.acquireRelease(
+      Effect.sync(() => compatiblePort(spawn())),
+      (worker) => Effect.sync(() => worker.terminate())
+    )
+  })
