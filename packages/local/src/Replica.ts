@@ -65,8 +65,7 @@ export type LegacySettlement = Extract<MutationSettlement, { readonly receipt: P
 // tag alone does not narrow `pending`, so the refinement carries it.
 export const isLegacySettlement = <M extends Mutation.Any,>(
   settlement: MutationSettlement<M>
-): settlement is Extract<MutationSettlement<M>, { readonly receipt: Protocol.LegacyReceipt }> =>
-  settlement.receipt._tag === "Legacy"
+): settlement is LegacySettlement => settlement.receipt._tag === "Legacy"
 
 export type SettledMutation<M extends Mutation.Any = Mutation.Any,> = {
   readonly sequence: Identity.SettlementSequence
