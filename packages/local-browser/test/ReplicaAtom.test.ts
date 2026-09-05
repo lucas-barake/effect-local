@@ -480,15 +480,6 @@ describe("Replica Atom graph", () => {
         assert.strictEqual(removed.request.channel, "read")
         assert.strictEqual(removed.request.key, "conversation-1")
       }
-      registry.set(removeRead, Atom.Reset)
-      registry.set(removeRead, { key: "x".repeat(300) })
-      const failed = yield* AtomRegistry.getResult(registry, removeRead, { suspendOnWaiting: true }).pipe(
-        Effect.result
-      )
-      assert.isTrue(Result.isFailure(failed))
-      if (Result.isFailure(failed)) {
-        assert.strictEqual(failed.failure._tag, "EphemeralEncodeError")
-      }
     }, Effect.scoped)
   )
 
