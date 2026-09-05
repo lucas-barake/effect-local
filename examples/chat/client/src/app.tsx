@@ -1,3 +1,4 @@
+import type { LoginResponse } from "@effect-local/example-chat-shared/auth"
 import {
   type ChatUser,
   type Conversation,
@@ -13,7 +14,7 @@ import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import { useState } from "react"
 import { ChatView } from "./chat.js"
-import { type ChatClient, clientFor, logoutAtom, type StoredSession } from "./replica.js"
+import { type ChatClient, clientFor, logoutAtom } from "./replica.js"
 
 const latest = <A, E,>(result: AsyncResult.AsyncResult<A, E>, fallback: A): A =>
   AsyncResult.getOrElse(result, () => fallback)
@@ -176,7 +177,7 @@ const ConversationRow = ({ summary, me, online, active, onOpen }: {
   )
 }
 
-export const App = ({ session }: { readonly session: StoredSession }) => {
+export const App = ({ session }: { readonly session: LoginResponse }) => {
   const client = clientFor(session)
   useAtomMount(client.presenceAtom)
   useAtomMount(client.deliveryDaemon)
