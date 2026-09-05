@@ -1,20 +1,24 @@
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Context from "effect/Context"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import type * as Schedule from "effect/Schedule"
+import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import type * as Socket from "effect/unstable/socket/Socket"
+import * as Socket from "effect/unstable/socket/Socket"
 import * as Authentication from "./Authentication.js"
+import * as EphemeralClient from "./EphemeralClient.js"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSocket from "./internal/protocolSocket.js"
 import * as ProtocolSession from "./ProtocolSession.js"
+import * as SyncRpc from "./SyncRpc.js"
 
 export interface Options extends ProtocolSession.Options {
   readonly rpcTimeout?: Duration.Input
@@ -331,3 +335,74 @@ export const layerProtocolSocket = (options?: {
   readonly retryPolicy?: Schedule.Schedule<any, Socket.SocketError>
 }): Layer.Layer<RpcClient.Protocol, never, Socket.Socket | RpcSerialization.RpcSerialization> =>
   Layer.effect(RpcClient.Protocol, ProtocolSocket.make(options))
+
+export interface WebSocketOptions<R = never,> extends EphemeralClient.Options {
+  readonly url: string | Effect.Effect<string, never, R>
+  readonly maximumFrameBytes?: number
+  readonly retryTransientErrors?: boolean
+  readonly retryPolicy?: Schedule.Schedule<any, Socket.SocketError>
+  readonly socket?: {
+    readonly closeCodeIsError?: ((code: number) => boolean) | undefined
+    readonly openTimeout?: Duration.Input | undefined
+    readonly protocols?: string | Array<string> | undefined
+  }
+}
+
+/**
+ * One WebSocket carrying both the sync engine and the ephemeral client over a
+ * shared protocol session. The credential middleware is built fresh per call
+ * so two clients with different providers under one memo map never share it.
+ */
+export const layerWebSocket = <R = never,>(options: WebSocketOptions<R>): Layer.Layer<
+  SyncEngine.SyncEngine | EphemeralClient.EphemeralClient,
+  ReplicaError.InvalidConfiguration,
+  Authentication.CredentialProvider | Socket.WebSocketConstructor | R
+> => {
+  // The url Effect is resolved per connection rather than once while the Layer
+  // builds, because an address that rotates (failover host, signed url) must not
+  // be pinned to the first build. `Socket.fromWebSocket` is used instead of
+  // `Socket.makeWebSocket` because the latter types the url Effect as
+  // infallible, which would let a crash while resolving the address escape the
+  // reconnect loop as a defect and stop the client dialling forever.
+  const layerSocket = Layer.effect(
+    Socket.Socket,
+    Effect.gen(function*() {
+      const url = options.url
+      if (typeof url === "string") return yield* Socket.makeWebSocket(url, options.socket)
+      const construct = yield* Socket.WebSocketConstructor
+      const context = yield* Effect.context<R>()
+      // The url Effect cannot fail, so only a defect can surface here; it is
+      // mapped to an open error so the socket retry policy treats it like any
+      // other failed dial, while interruption passes through untouched.
+      const resolveUrl = Effect.flatMap(
+        Effect.scope,
+        (scope) => Effect.provideContext(url, Context.add(context, Scope.Scope, scope))
+      ).pipe(
+        Effect.catchDefect((cause) =>
+          Effect.fail(
+            new Socket.SocketError({
+              reason: new Socket.SocketOpenError({ kind: "Unknown", cause })
+            })
+          )
+        )
+      )
+      const openWebSocket = Effect.map(
+        resolveUrl,
+        (resolved) => construct(resolved, options.socket?.protocols)
+      )
+      const acquire = Effect.acquireRelease(openWebSocket, (ws) => Effect.sync(() => ws.close(1000)))
+      return yield* Socket.fromWebSocket(acquire, options.socket)
+    })
+  )
+  const layerProtocol = layerProtocolSocket(options).pipe(
+    Layer.provide(layerSocket),
+    Layer.provide(SyncRpc.layerJson(options))
+  )
+  const layerSession = ProtocolSession.layerWithOptions(options).pipe(
+    Layer.provide(layerProtocol),
+    Layer.provide(Layer.fresh(Authentication.layerClient))
+  )
+  return Layer.merge(layerFromSession(options), EphemeralClient.layerFromSession(options)).pipe(
+    Layer.provide(layerSession)
+  )
+}

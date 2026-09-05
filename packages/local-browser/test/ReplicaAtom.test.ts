@@ -455,6 +455,35 @@ describe("Replica Atom graph", () => {
   )
 
   it.effect(
+    "removes typed ephemeral state through a memoized atom fn",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeEphemeralHarness()
+      yield* Queue.offer(harness.messages, ephemeralStarted)
+      yield* Queue.offer(harness.messages, ephemeralSnapshot(1))
+      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const session = graph.ephemeral(StatusProfile, statusSessionOptions)
+      const membersAtom = graph.ephemeralMembers(session)
+      const unmount = registry.mount(membersAtom)
+      yield* Effect.addFinalizer(() => Effect.sync(unmount))
+      yield* AtomRegistry.getResult(registry, membersAtom)
+      const removeRead = graph.removeEphemeral(ReadChannel, { spaceId, member: memberA })
+      assert.strictEqual(graph.removeEphemeral(ReadChannel, { spaceId, member: memberA }), removeRead)
+      const unmountRemove = registry.mount(removeRead)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountRemove))
+      registry.set(removeRead, { key: "conversation-1" })
+      yield* AtomRegistry.getResult(registry, removeRead, { suspendOnWaiting: true })
+      const removed = yield* Queue.take(harness.published)
+      assert.strictEqual(removed.request._tag, "RemoveState")
+      if (removed.request._tag === "RemoveState") {
+        assert.strictEqual(removed.request.channel, "read")
+        assert.strictEqual(removed.request.key, "conversation-1")
+      }
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "isolates a malformed typed payload to its projection atom",
     Effect.fnUntraced(function*() {
       const harness = yield* makeEphemeralHarness()

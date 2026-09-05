@@ -9,7 +9,7 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
-import type * as Replica from "@lucas-barake/effect-local/Replica"
+import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
@@ -4565,6 +4565,25 @@ describe("server reconciled mutation log", () => {
         [todoPending.envelope.mutationId]
       )
       assert.strictEqual(named[0].settlement.receipt._tag, "Legacy")
+
+      // The refinement partitions the durable backlog: the legacy receipt exposes its outcome,
+      // every other settlement exposes the typed pending payload.
+      const allPull = yield* Stream.toPull(local.settlements({ from: 0 }))
+      const observed: Array<Replica.SettledMutation> = []
+      while (observed.length < 2) observed.push(...(yield* allPull))
+      let legacy = 0
+      let typed = 0
+      for (const settled of observed) {
+        if (Replica.isLegacySettlement(settled.settlement)) {
+          legacy += 1
+          assert.strictEqual(settled.settlement.receipt.outcome, "Rejected")
+        } else {
+          typed += 1
+          assert.isDefined(settled.settlement.pending.payload)
+        }
+      }
+      assert.strictEqual(legacy, 1)
+      assert.strictEqual(typed, 1)
     }, Effect.scoped))
   )
 })

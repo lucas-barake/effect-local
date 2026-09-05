@@ -229,6 +229,29 @@ unary RPCs, and stream acquisition. Established join and watch streams may remai
 `OperationTimeout`. Socket ping and reconnect detect dead connections without converting healthy idle streams into
 retry traffic.
 
+For the common case of one WebSocket per client, `SyncClient.layerWebSocket` composes the socket, JSON
+serialization, protocol session, credential middleware, sync engine, and ephemeral client. It requires only a
+`CredentialProvider` and a `WebSocketConstructor`, and it builds the credential middleware fresh so two clients with
+different providers under one memo map never share it:
+
+```ts
+import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
+import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
+import * as Layer from "effect/Layer"
+import * as Redacted from "effect/Redacted"
+import * as Socket from "effect/unstable/socket/Socket"
+
+export const layerSync = SyncClient.layerWebSocket({ url: "wss://example.com/sync" }).pipe(
+  Layer.provide(Socket.layerWebSocketConstructorGlobal),
+  Layer.provide(Authentication.layerCredentialProviderStatic(Redacted.make(token)))
+)
+```
+
+`url` also accepts an `Effect`, which runs again on every reconnect, so a discovered or signed address is never pinned to
+the first connection. `Authentication.layerCredentialProvider`
+takes a `SubscriptionRef` of credentials when the application rotates tokens; `awaitChange` resolves with the first
+credential whose generation differs from the rejected one.
+
 `SyncClient.layerProtocolSocket` exposes Effect's socket retry options:
 
 ```ts

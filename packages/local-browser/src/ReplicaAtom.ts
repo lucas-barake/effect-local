@@ -91,17 +91,19 @@ class EphemeralStateKey implements Equal.Equal {
   }
 }
 
-class EphemeralPublishKey implements Equal.Equal {
+// Publish and remove keep separate `Atom.family` maps, so one key class is
+// enough: the type parameter is what narrows the remove family to state.
+class EphemeralTargetKey<D extends Ephemeral.Any,> implements Equal.Equal {
   readonly value: string
-  readonly definition: Ephemeral.Any
+  readonly definition: D
   readonly target: EphemeralClient.PublishTarget
-  constructor(definition: Ephemeral.Any, target: EphemeralClient.PublishTarget) {
+  constructor(definition: D, target: EphemeralClient.PublishTarget) {
     this.definition = definition
     this.target = target
     this.value = `${target.spaceId}:${target.member.clientId}:${target.member.membershipIncarnation}`
   }
   [Equal.symbol](that: unknown): boolean {
-    return that instanceof EphemeralPublishKey && this.value === that.value &&
+    return that instanceof EphemeralTargetKey && this.value === that.value &&
       this.definition === that.definition
   }
   [Hash.symbol](): number {
@@ -216,7 +218,7 @@ export const make = <E,>(
       AsyncResult.AsyncResult<ReadonlyArray<EphemeralClient.MemberEntry<M>>, ProjectionError>
     >
 
-  const ephemeralPublishFamily = Atom.family((key: EphemeralPublishKey) =>
+  const ephemeralPublishFamily = Atom.family((key: EphemeralTargetKey<Ephemeral.Any>) =>
     runtime.fn<{
       readonly payload?: unknown
       readonly ttl: Duration.Input
@@ -271,7 +273,37 @@ export const make = <E,>(
     void,
     ReplicaError.ReplicaError | Ephemeral.EncodeError | E
   > {
-    return ephemeralPublishFamily(new EphemeralPublishKey(definition, target))
+    return ephemeralPublishFamily(new EphemeralTargetKey(definition, target))
+  }
+
+  const ephemeralRemoveFamily = Atom.family((key: EphemeralTargetKey<Ephemeral.AnyState>) =>
+    runtime.fn<{ readonly key: unknown }>()(
+      (input) =>
+        Effect.yieldNow.pipe(
+          Effect.andThen(EphemeralClient.EphemeralClient.use((client) =>
+            client.remove(key.definition, {
+              spaceId: key.target.spaceId,
+              member: key.target.member,
+              key: input.key
+            })
+          ))
+        ),
+      { concurrent: true }
+    )
+  )
+  function removeEphemeral<D extends Ephemeral.AnyState,>(
+    definition: D,
+    target: EphemeralClient.PublishTarget
+  ): Atom.AtomResultFn<
+    Omit<EphemeralClient.StateRemoveOptions<D>, "spaceId" | "member">,
+    void,
+    ReplicaError.ReplicaError | Ephemeral.EncodeError | E
+  >
+  function removeEphemeral(
+    definition: Ephemeral.AnyState,
+    target: EphemeralClient.PublishTarget
+  ): Atom.AtomResultFn<{ readonly key: unknown }, void, ReplicaError.ReplicaError | Ephemeral.EncodeError | E> {
+    return ephemeralRemoveFamily(new EphemeralTargetKey(definition, target))
   }
 
   const entity = <M extends Model.Any,>(spaceId: Identity.SpaceId, model: M) =>
@@ -461,6 +493,7 @@ export const make = <E,>(
     ephemeralEvents,
     ephemeralState,
     ephemeralMembers,
-    publishEphemeral
+    publishEphemeral,
+    removeEphemeral
   } as const
 }

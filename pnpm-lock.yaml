@@ -68,6 +68,137 @@ importers:
         specifier: 4.1.10
         version: 4.1.10(@types/node@25.9.5)(@vitest/coverage-v8@4.1.10)(vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0))
 
+  examples/chat:
+    dependencies:
+      '@effect-local/example-chat-client':
+        specifier: workspace:^
+        version: link:client
+      '@effect-local/example-chat-server':
+        specifier: workspace:^
+        version: link:server
+      '@effect-local/example-chat-shared':
+        specifier: workspace:^
+        version: link:shared
+      '@effect/platform-node':
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)
+      '@effect/sql-sqlite-node':
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
+      '@lucas-barake/effect-local':
+        specifier: workspace:^
+        version: link:../../packages/local
+      '@lucas-barake/effect-local-browser':
+        specifier: workspace:^
+        version: link:../../packages/local-browser
+      '@lucas-barake/effect-local-rpc':
+        specifier: workspace:^
+        version: link:../../packages/local-rpc
+      '@lucas-barake/effect-local-sql':
+        specifier: workspace:^
+        version: link:../../packages/local-sql
+      effect:
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103
+    devDependencies:
+      '@effect/vitest':
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(vitest@4.1.10)
+      '@types/node':
+        specifier: ^25.7.0
+        version: 25.9.5
+      vitest:
+        specifier: 4.1.10
+        version: 4.1.10(@types/node@25.9.5)(@vitest/coverage-v8@4.1.10)(vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0))
+
+  examples/chat/client:
+    dependencies:
+      '@effect-local/example-chat-shared':
+        specifier: workspace:^
+        version: link:../shared
+      '@effect/atom-react':
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(react@19.2.8)(scheduler@0.27.0)
+      '@effect/platform-browser':
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
+      '@effect/sql-sqlite-wasm':
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(@effect/wa-sqlite@0.1.2)(effect@4.0.0-beta.103)
+      '@effect/wa-sqlite':
+        specifier: 0.1.2
+        version: 0.1.2
+      '@lucas-barake/effect-local':
+        specifier: workspace:^
+        version: link:../../../packages/local
+      '@lucas-barake/effect-local-browser':
+        specifier: workspace:^
+        version: link:../../../packages/local-browser
+      '@lucas-barake/effect-local-rpc':
+        specifier: workspace:^
+        version: link:../../../packages/local-rpc
+      '@lucas-barake/effect-local-sql':
+        specifier: workspace:^
+        version: link:../../../packages/local-sql
+      effect:
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103
+      react:
+        specifier: ^19.2.4
+        version: 19.2.8
+      react-dom:
+        specifier: ^19.2.4
+        version: 19.2.8(react@19.2.8)
+    devDependencies:
+      '@types/react':
+        specifier: ^19.2.0
+        version: 19.2.18
+      '@types/react-dom':
+        specifier: ^19.2.0
+        version: 19.2.4(@types/react@19.2.18)
+      vite:
+        specifier: ^7.2.7
+        version: 7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0)
+      vite-plugin-wasm:
+        specifier: ^3.5.0
+        version: 3.6.0(vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0))
+
+  examples/chat/server:
+    dependencies:
+      '@effect-local/example-chat-shared':
+        specifier: workspace:^
+        version: link:../shared
+      '@effect/platform-node':
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)(ioredis@5.11.1)
+      '@effect/sql-sqlite-node':
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103(effect@4.0.0-beta.103)
+      '@lucas-barake/effect-local':
+        specifier: workspace:^
+        version: link:../../../packages/local
+      '@lucas-barake/effect-local-rpc':
+        specifier: workspace:^
+        version: link:../../../packages/local-rpc
+      '@lucas-barake/effect-local-sql':
+        specifier: workspace:^
+        version: link:../../../packages/local-sql
+      effect:
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103
+      tsx:
+        specifier: 4.20.6
+        version: 4.20.6
+
+  examples/chat/shared:
+    dependencies:
+      '@lucas-barake/effect-local':
+        specifier: workspace:^
+        version: link:../../../packages/local
+      effect:
+        specifier: 4.0.0-beta.103
+        version: 4.0.0-beta.103
+
   packages/local:
     devDependencies:
       effect:
@@ -335,6 +466,13 @@ packages:
     resolution: {integrity: sha512-UTiDSShHbrkx+z719/MffgwGYD8PaypdVmG4vVJVjmF5Hoin6EfugHhSoBf8+G6U9rF+uDIIl0idZq+6Bifzwg==}
     cpu: [x64]
     os: [win32]
+
+  '@effect/atom-react@4.0.0-beta.103':
+    resolution: {integrity: sha512-1HJ+Cyq4ssLnH2UZ8OVnhtMGAySabtzZo7imKC+vEfxOW3lvJYpGZeicxQX5Ii/7AdvlR+19p/6K2a5IPKYAow==}
+    peerDependencies:
+      effect: ^4.0.0-beta.103
+      react: ^19.2.4
+      scheduler: '*'
 
   '@effect/language-service@0.87.2':
     resolution: {integrity: sha512-CfiSoaVQO8pZgaMZGw5VvMvRGybsJ2LaSDoLYaqiVGvo/YYPYVR2GzUKY0h1NtIweq/+SQ5XLrvtzPIttWQ0GQ==}
@@ -1302,6 +1440,14 @@ packages:
   '@types/node@25.9.5':
     resolution: {integrity: sha512-OScDchr2fwuUmWdf4kZ9h7PcJiYDVInhJizG/biAq3cAvqwYktuy/TYGGdZNMtNTFUP7rnb0NU4TUdm82kt4Rg==}
 
+  '@types/react-dom@19.2.4':
+    resolution: {integrity: sha512-Bsc+QHgp+P/F02XDzNCY9jnZNCUuLki36KT7VKrTXXLdHf+vHMNZnW1rVu5DNW/rCK+fya3DATySbLM4yhtKUw==}
+    peerDependencies:
+      '@types/react': ^19.2.0
+
+  '@types/react@19.2.18':
+    resolution: {integrity: sha512-AnzbBERsrLKtk2XSfTbYRLjQPdy116Sty4q+T+Bp3IC4l6jNBvreVPAHmpq9qhXQM7CXZPjLVmGMw9sy+hxQ3w==}
+
   '@types/ws@8.18.1':
     resolution: {integrity: sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==}
 
@@ -1546,6 +1692,9 @@ packages:
   cross-spawn@7.0.6:
     resolution: {integrity: sha512-uV2QOWP2nWzsy2aMp8aRibhi9dlzF5Hgh5SHaB9OiTGEyDTiJJyx0uy51QXdyWbtAHNua4XJzUKca3OzKUd3vA==}
     engines: {node: '>= 8'}
+
+  csstype@3.2.3:
+    resolution: {integrity: sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ==}
 
   dataloader@1.4.0:
     resolution: {integrity: sha512-68s5jYdlvasItOJnCuI2Q9s4q98g0pCyL3HrcKJu8KNugUl8ahgmZYg38ysLTgQjjXX3H8CJLkAvWrclWfcalw==}
@@ -2189,6 +2338,15 @@ packages:
     resolution: {integrity: sha512-y3bGgqKj3QBdxLbLkomlohkvsA8gdAiUQlSBJnBhfn+BPxg4bc62d8TcBW15wavDfgexCgccckhcZvywyQYPOw==}
     hasBin: true
 
+  react-dom@19.2.8:
+    resolution: {integrity: sha512-rVprimfGBG3DR+Tq0IQG2DT5PxKth1WIGDmj5yPmlzr4YBe7uyE+Du4oVqTDXZSHGGGXRtTJEGSSePyQCMBglQ==}
+    peerDependencies:
+      react: ^19.2.8
+
+  react@19.2.8:
+    resolution: {integrity: sha512-PWaYA1L/q9u2u7xYQi+Y3L3Yfnie7XyLeaJICV1MGD6LprsBxcAqGjYyr0eY3p+QdsA+x/Irkt4Qif8D63+Sbw==}
+    engines: {node: '>=0.10.0'}
+
   read-yaml-file@1.1.0:
     resolution: {integrity: sha512-VIMnQi/Z4HT2Fxuwg5KrY174U1VdUIASQVWXXyqtNRtxSr9IYkn1rsI6Tb6HsrHCmB7gVpNwX6JxPTHcH6IoTA==}
     engines: {node: '>=6'}
@@ -2256,6 +2414,9 @@ packages:
     resolution: {integrity: sha512-GjmndmKQBtlPil79RK72L7yc5kDXZPCQeH97bP8R8DcxtXQJO6vECExb3WP/m6+cxaV9h4ZxrSRvCkPG2v/VSw==}
     engines: {node: '>=18'}
     hasBin: true
+
+  scheduler@0.27.0:
+    resolution: {integrity: sha512-eNv+WrVbKu1f3vbYJT/xtiF5syA5HPIMtf9IgY/nKg0sWqzAUEvqY/xm7OcZc/qafLx/iO9FgOmeSAp4v5ti/Q==}
 
   semver@7.8.5:
     resolution: {integrity: sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==}
@@ -2437,6 +2598,11 @@ packages:
   uuid@14.0.1:
     resolution: {integrity: sha512-6ZxzVpzDXDa3bJWaHilVayA+BH/1zmxCJoVgvmqJnid/gPoKHxUrS/aC/T6LGQtNHT+XHG9fXPJB4d+IrU30Ew==}
     hasBin: true
+
+  vite-plugin-wasm@3.6.0:
+    resolution: {integrity: sha512-mL/QPziiIA4RAA6DkaZZzOstdwbW5jO4Vz7Zenj0wieKWBlNvIvX5L5ljum9lcUX0ShNfBgCNLKTjNkRVVqcsw==}
+    peerDependencies:
+      vite: ^2 || ^3 || ^4 || ^5 || ^6 || ^7 || ^8
 
   vite@7.3.6:
     resolution: {integrity: sha512-4XP60spRGjSZFf1qYH+dJIkK2znL3zQfl9KkOV9MkkRR/3Dls0dxaBsQPTloEc5BLXWPL9vsOxopxyKoMmDueg==}
@@ -2794,6 +2960,12 @@ snapshots:
 
   '@dprint/win32-x64@0.55.2':
     optional: true
+
+  '@effect/atom-react@4.0.0-beta.103(effect@4.0.0-beta.103)(react@19.2.8)(scheduler@0.27.0)':
+    dependencies:
+      effect: 4.0.0-beta.103
+      react: 19.2.8
+      scheduler: 0.27.0
 
   '@effect/language-service@0.87.2': {}
 
@@ -3397,6 +3569,14 @@ snapshots:
     dependencies:
       undici-types: 7.24.6
 
+  '@types/react-dom@19.2.4(@types/react@19.2.18)':
+    dependencies:
+      '@types/react': 19.2.18
+
+  '@types/react@19.2.18':
+    dependencies:
+      csstype: 3.2.3
+
   '@types/ws@8.18.1':
     dependencies:
       '@types/node': 25.9.5
@@ -3650,6 +3830,8 @@ snapshots:
       shebang-command: 2.0.0
       which: 2.0.2
 
+  csstype@3.2.3: {}
+
   dataloader@1.4.0: {}
 
   debug@4.4.3:
@@ -3816,7 +3998,6 @@ snapshots:
       '@esbuild/win32-arm64': 0.25.12
       '@esbuild/win32-ia32': 0.25.12
       '@esbuild/win32-x64': 0.25.12
-    optional: true
 
   esbuild@0.28.1:
     optionalDependencies:
@@ -4413,6 +4594,13 @@ snapshots:
       minimist: 1.2.8
       strip-json-comments: 2.0.1
 
+  react-dom@19.2.8(react@19.2.8):
+    dependencies:
+      react: 19.2.8
+      scheduler: 0.27.0
+
+  react@19.2.8: {}
+
   read-yaml-file@1.1.0:
     dependencies:
       graceful-fs: 4.2.11
@@ -4502,6 +4690,8 @@ snapshots:
     dependencies:
       commander: 12.1.0
       enhanced-resolve: 5.24.3
+
+  scheduler@0.27.0: {}
 
   semver@7.8.5: {}
 
@@ -4622,7 +4812,6 @@ snapshots:
       get-tsconfig: 4.14.1
     optionalDependencies:
       fsevents: 2.3.3
-    optional: true
 
   typescript@5.9.3: {}
 
@@ -4639,6 +4828,10 @@ snapshots:
   util-deprecate@1.0.2: {}
 
   uuid@14.0.1: {}
+
+  vite-plugin-wasm@3.6.0(vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0)):
+    dependencies:
+      vite: 7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0)
 
   vite@7.3.6(@types/node@25.9.5)(jiti@2.7.0)(tsx@4.20.6)(yaml@2.9.0):
     dependencies:

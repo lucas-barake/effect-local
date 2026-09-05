@@ -229,40 +229,13 @@ const layerAuthenticator = Layer.succeed(
   })
 )
 const layerAuthenticationServer = Authentication.layerServer.pipe(Layer.provide(layerAuthenticator))
-const assertionCodec = Schema.fromJsonString(Schema.Json)
-const layerAssertionIssuer = PrincipalAssertion.layerIssuer((principal) =>
-  Schema.encodeUnknownEffect(assertionCodec)(principal).pipe(
-    Effect.map((assertion) => PrincipalAssertion.PrincipalAssertion.make(assertion)),
-    Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "could not issue principal assertion" }))
-  )
+const secretBearer = Redacted.make("secret")
+const revokedBearer = Redacted.make("revoked")
+const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(
+  Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
 )
-const layerAssertionVerifier = PrincipalAssertion.layerVerifier((assertion) =>
-  Schema.decodeUnknownEffect(assertionCodec)(assertion).pipe(
-    Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" }))
-  )
-)
-const authenticationClientProvider = Authentication.CredentialProvider.of({
-  acquire: Effect.succeed({ generation: 0, bearer: Redacted.make("secret") }),
-  awaitChange: () => Effect.never
-})
-const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
-  Layer.succeed(
-    Authentication.CredentialProvider,
-    authenticationClientProvider
-  )
-))
-const revokedAuthenticationClientProvider = Authentication.CredentialProvider.of({
-  acquire: Effect.succeed({ generation: 0, bearer: Redacted.make("revoked") }),
-  awaitChange: () => Effect.never
-})
-const layerRevokedAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
-  Layer.succeed(
-    Authentication.CredentialProvider,
-    revokedAuthenticationClientProvider
-  )
-))
 const layerCluster = SpaceEntity.layer(entityOptions).pipe(
-  Layer.provide(layerAssertionVerifier),
+  Layer.provide(PrincipalAssertion.layerJson),
   Layer.provide(layerStore),
   Layer.provide(
     EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
@@ -277,7 +250,7 @@ const layerWebsocketServer = SyncServer.layer.pipe(
   Layer.provideMerge(layerWebsocketProtocol),
   Layer.provide(layerCluster),
   Layer.provide(layerAuthenticationServer),
-  Layer.provide(layerAssertionIssuer),
+  Layer.provide(PrincipalAssertion.layerJson),
   Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const webSocketConstructions = MutableRef.make(0)
@@ -300,24 +273,33 @@ const layerCountedConstructor = Layer.effect(
 ).pipe(
   Layer.provide(NodeSocket.layerWebSocketConstructor)
 )
-const layerSocket = Effect.gen(function*() {
+const serverUrl = Effect.gen(function*() {
   const server = yield* HttpServer.HttpServer
   const address = server.address
   if (address._tag === "UnixAddress") return yield* Effect.die("Expected the test HTTP server to use a TCP address")
-  return yield* Socket.makeWebSocket(`http://127.0.0.1:${address.port}/sync`)
-}).pipe(Layer.effect(Socket.Socket), Layer.provide(layerCountedConstructor))
+  return `http://127.0.0.1:${address.port}/sync`
+})
+const layerSocket = Effect.flatMap(serverUrl, (url) => Socket.makeWebSocket(url)).pipe(
+  Layer.effect(Socket.Socket),
+  Layer.provide(layerCountedConstructor)
+)
 const layerClientProtocol = SyncClient.layerProtocolSocket().pipe(Layer.provide(layerSocket))
-const layerClient = Layer.merge(SyncClient.layer, EphemeralClient.layer).pipe(
-  Layer.provide(layerClientProtocol),
-  Layer.provide(layerAuthenticationClient)
+const layerClient = SyncClient.layerWebSocket({ url: serverUrl }).pipe(
+  Layer.provide(layerCountedConstructor),
+  Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
 )
 class RevokedSyncEngine extends Context.Service<RevokedSyncEngine, SyncEngine.Service>()(
   "@lucas-barake/effect-local-rpc/test/RevokedSyncEngine"
 ) {}
+// A second bundle with a different provider under the same memo map: proves the
+// bundle does not share the credential middleware between clients.
 const layerRevokedClient = Layer.effect(RevokedSyncEngine, SyncEngine.SyncEngine).pipe(
-  Layer.provide(Layer.fresh(SyncClient.layer)),
-  Layer.provide(Layer.fresh(layerClientProtocol)),
-  Layer.provide(layerRevokedAuthenticationClient)
+  Layer.provide(
+    SyncClient.layerWebSocket({ url: serverUrl }).pipe(
+      Layer.provide(layerCountedConstructor),
+      Layer.provide(Authentication.layerCredentialProviderStatic(revokedBearer))
+    )
+  )
 )
 const layerLive = Layer.merge(layerClient, layerRevokedClient).pipe(
   Layer.provideMerge(layerWebsocketServer),
@@ -332,7 +314,7 @@ const layerIncompatibleServer = SyncServer.layerWithOptions({ supportedProtocolV
   Layer.provideMerge(layerWebsocketProtocol),
   Layer.provide(layerCluster),
   Layer.provide(layerAuthenticationServer),
-  Layer.provide(layerAssertionIssuer),
+  Layer.provide(PrincipalAssertion.layerJson),
   Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const layerIncompatibleClient = SyncClient.layerWithOptions({ supportedProtocolVersions: [1] }).pipe(
@@ -394,7 +376,7 @@ const layerProtocol2Server = SyncServer.layerWithOptions({ supportedProtocolVers
   Layer.provideMerge(layerWebsocketProtocol),
   Layer.provide(layerCluster),
   Layer.provide(layerObservingAuthenticationServer),
-  Layer.provide(layerAssertionIssuer),
+  Layer.provide(PrincipalAssertion.layerJson),
   Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
 )
 const layerConfigurableProtocolSession = ProtocolSession.layerWithOptions({ supportedProtocolVersions: [1, 2] })
@@ -452,17 +434,12 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const blockPull = MutableRef.make(false)
   const lifecycleWebSocketConstructions = MutableRef.make(0)
 
+  const credentialProvider = Authentication.makeCredentialProvider(credentials)
   const provider = Authentication.CredentialProvider.of({
-    acquire: SubscriptionRef.get(credentials),
+    acquire: credentialProvider.acquire,
     awaitChange: (generation) =>
       Deferred.succeed(refreshWaitStarted, generation).pipe(
-        Effect.andThen(
-          SubscriptionRef.changes(credentials).pipe(
-            Stream.filter((credential) => credential.generation !== generation),
-            Stream.runHead,
-            Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
-          )
-        )
+        Effect.andThen(credentialProvider.awaitChange(generation))
       )
   })
   const layerClientAuthentication = Authentication.layerClient.pipe(
@@ -537,7 +514,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     }
   }).pipe(Layer.provide(layerLifecycleRuntime), Layer.provide(layerDatabase))
   const layerLifecycleCluster = SpaceEntity.layer(entityOptions).pipe(
-    Layer.provide(layerAssertionVerifier),
+    Layer.provide(PrincipalAssertion.layerJson),
     Layer.provide(layerLifecycleStore),
     Layer.provide(
       EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
@@ -551,7 +528,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     Layer.provideMerge(layerLifecycleWebSocketProtocol),
     Layer.provide(layerLifecycleCluster),
     Layer.provide(layerObservedAuthenticationServer),
-    Layer.provide(layerAssertionIssuer),
+    Layer.provide(PrincipalAssertion.layerJson),
     Layer.provide(HttpRouter.serve(layerLifecycleWebSocketProtocol, {
       disableListenLog: true,
       disableLogger: true

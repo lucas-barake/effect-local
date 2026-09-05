@@ -92,6 +92,18 @@
         "oxc/no-async-endpoint-handlers": "off",
         "unicorn/prefer-add-event-listener": "off"
       }
+    },
+    {
+      "files": ["examples/chat/client/**/*.tsx"],
+      "rules": { "effect/noTernary": "off" }
+    },
+    {
+      "files": ["examples/chat/client/**/*.ts", "examples/chat/test/**"],
+      "rules": { "effect/noGlobals": "off", "effect-local/noManualEffectBoundary": "off" }
+    },
+    {
+      "files": ["examples/chat/scripts/**", "examples/chat/client/vite.config.ts"],
+      "rules": { "effect/noGlobals": "off", "effect/noNodeBuiltinImport": "off", "eslint/no-console": "off" }
     }
   ]
 }
