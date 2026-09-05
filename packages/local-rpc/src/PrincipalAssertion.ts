@@ -1,6 +1,6 @@
-import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
-import type * as Effect from "effect/Effect"
+import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 
@@ -36,3 +36,24 @@ export const layerIssuer = (
 export const layerVerifier = (
   verify: VerifierService["verify"]
 ): Layer.Layer<Verifier> => Layer.succeed(Verifier, Verifier.of({ verify }))
+
+const jsonAssertion = Schema.fromJsonString(Schema.Json)
+
+/**
+ * Carries the principal as its JSON encoding with no signature. Only for
+ * deployments where the issuing facade and the verifying entities share one
+ * trusted process; a networked cluster must sign assertions instead.
+ */
+export const layerJson: Layer.Layer<Issuer | Verifier> = Layer.merge(
+  layerIssuer((principal) =>
+    Schema.encodeUnknownEffect(jsonAssertion)(principal).pipe(
+      Effect.map((assertion) => PrincipalAssertion.make(assertion)),
+      Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "could not issue principal assertion" }))
+    )
+  ),
+  layerVerifier((assertion) =>
+    Schema.decodeUnknownEffect(jsonAssertion)(assertion).pipe(
+      Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" }))
+    )
+  )
+)
