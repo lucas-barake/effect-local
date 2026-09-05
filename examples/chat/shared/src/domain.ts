@@ -229,7 +229,7 @@ export const ReadStates = Query.make("ReadStates", {
 export const Typing = Ephemeral.make("typing", {
   kind: "state",
   key: ConversationId,
-  payload: { userId: UserId, at: Schema.Number }
+  payload: { userId: UserId }
 })
 
 export const PresenceProfile = Ephemeral.member({
