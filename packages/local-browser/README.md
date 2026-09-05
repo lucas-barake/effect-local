@@ -2,7 +2,8 @@
 
 Browser SQLite ports and the joined Effect Atom graph for Effect Local.
 
-`BrowserSqlite.layerMessagePort` adapts an application-owned SQLite WASM worker port. `BrowserReplica.make` creates one
+`BrowserSqlite.layerWorker` spawns and owns a dedicated SQLite WASM worker (terminated when the Layer's scope closes),
+and `BrowserSqlite.layerMessagePort` adapts an application-owned worker port instead. `BrowserReplica.make` creates one
 Atom runtime with space-addressed entities, queries, mutations, receipts, settlements, lifecycle operations, and
 ephemera. It requires the production `Replica`, `QueryReactivity`, and `EphemeralClient` services in the supplied Layer.
 
@@ -93,6 +94,9 @@ or evicting the idle session atom closes the joined stream and lets the server e
 
 Ephemera never enters browser SQLite or the durable mutation log. Persist a read or delivery position with an ordinary
 domain mutation when it must survive server restart or the configured state TTL.
+
+`publishEphemeral` and `removeEphemeral` return memoized atom functions for one (definition, space, member) target so a
+component can publish or clear state without reaching for the `EphemeralClient` service.
 
 The remaining graph families expose `entity`, `query`, `mutation`, `pending`, `receipt`, `settlements`, `scope`,
 `setScope`, `activation`, `activate`, `deactivate`, `status`, `spaces`, `join`, `leave`, and the constant-size
