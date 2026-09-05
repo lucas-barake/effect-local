@@ -247,7 +247,8 @@ export const layerSync = SyncClient.layerWebSocket({ url: "wss://example.com/syn
 )
 ```
 
-`url` also accepts an `Effect` so the address can be resolved from another service. `Authentication.layerCredentialProvider`
+`url` also accepts an `Effect`, which runs again on every reconnect, so a discovered or signed address is never pinned to
+the first connection. `Authentication.layerCredentialProvider`
 takes a `SubscriptionRef` of credentials when the application rotates tokens; `awaitChange` resolves with the first
 credential whose generation differs from the rejected one.
 

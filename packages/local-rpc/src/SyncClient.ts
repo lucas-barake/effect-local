@@ -334,7 +334,7 @@ export const layerProtocolSocket = (options?: {
 }): Layer.Layer<RpcClient.Protocol, never, Socket.Socket | RpcSerialization.RpcSerialization> =>
   Layer.effect(RpcClient.Protocol, ProtocolSocket.make(options))
 
-export interface WebSocketOptions<R = never,> extends Options, Pick<EphemeralClient.Options, "heartbeatInterval"> {
+export interface WebSocketOptions<R = never,> extends EphemeralClient.Options {
   readonly url: string | Effect.Effect<string, never, R>
   readonly maximumFrameBytes?: number
   readonly retryTransientErrors?: boolean
@@ -356,12 +356,16 @@ export const layerWebSocket = <R = never,>(options: WebSocketOptions<R>): Layer.
   ReplicaError.InvalidConfiguration,
   Authentication.CredentialProvider | Socket.WebSocketConstructor | R
 > => {
+  // The url Effect is handed to `Socket.makeWebSocket` rather than resolved
+  // here, because the socket re-runs it on every reconnect: an address that
+  // rotates (failover host, signed url) must not be pinned to the first build.
   const layerSocket = Layer.effect(
     Socket.Socket,
-    Effect.suspend(() => {
+    Effect.gen(function*() {
       const url = options.url
-      if (typeof url === "string") return Socket.makeWebSocket(url, options.socket)
-      return Effect.flatMap(url, (resolved) => Socket.makeWebSocket(resolved, options.socket))
+      if (typeof url === "string") return yield* Socket.makeWebSocket(url, options.socket)
+      const context = yield* Effect.context<R>()
+      return yield* Socket.makeWebSocket(Effect.provideContext(url, context), options.socket)
     })
   )
   const layerProtocol = layerProtocolSocket(options).pipe(
