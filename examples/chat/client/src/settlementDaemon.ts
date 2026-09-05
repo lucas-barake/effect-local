@@ -35,7 +35,7 @@ export const makeSettlementDaemonBody = (failedMessages: FailedMessages) => (get
         const settlement = settled.settlement
         // Legacy receipts belong to pre-evolution schema versions and carry
         // no typed payload; the demo only has v1, so they never occur.
-        if (!("payload" in settlement.pending)) {
+        if (Replica.isLegacySettlement(settlement)) {
           yield* space.acknowledgeSettlements(settled.sequence)
           return
         }

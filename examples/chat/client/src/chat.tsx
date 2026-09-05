@@ -12,7 +12,7 @@ import * as Match from "effect/Match"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import { useEffect, useRef, useState } from "react"
 import { Avatar, formatTime } from "./app.js"
-import { clientFor, loadMoreAtom } from "./replica.js"
+import { type ChatClient, loadMoreAtom } from "./replica.js"
 
 const latest = <A, E,>(result: AsyncResult.AsyncResult<A, E>, fallback: A): A =>
   AsyncResult.getOrElse(result, () => fallback)
@@ -127,11 +127,11 @@ const MessageRow = ({ row, me, state, conversation, onRetry, onDiscard }: {
 // Chat view
 // ---------------------------------------------------------------------------
 
-export const ChatView = ({ me, conversationId }: {
+export const ChatView = ({ client, me, conversationId }: {
+  readonly client: ChatClient
   readonly me: UserId
   readonly conversationId: ConversationId
 }) => {
-  const client = clientFor(me)
   const summaries = latest(useAtomValue(client.summariesAtom), [])
   const members = latest(useAtomValue(client.membersAtom), [])
   const typing = latest(useAtomValue(client.typingEntries), [])
@@ -199,7 +199,7 @@ export const ChatView = ({ me, conversationId }: {
       if (
         document.visibilityState === "visible" && lastIncoming !== null && lastIncoming.createdAt > myReadUpTo
       ) {
-        markRead({ conversationId, upTo: lastIncoming.createdAt })
+        markRead({ conversationId, userId: me, upTo: lastIncoming.createdAt })
       }
     }
     advance()
@@ -221,7 +221,7 @@ export const ChatView = ({ me, conversationId }: {
     const text = draft.trim()
     if (text.length === 0) return
     setDraft("")
-    clearTyping({ conversationId })
+    clearTyping({ key: conversationId })
     void sendMessage({ conversationId, text })
   }
 
@@ -275,9 +275,11 @@ export const ChatView = ({ me, conversationId }: {
           placeholder="Type a message"
           onChange={(event) => {
             setDraft(event.target.value)
-            if (event.target.value.trim().length > 0) publishTyping({ conversationId })
+            if (event.target.value.trim().length > 0) {
+              publishTyping({ key: conversationId, payload: { userId: me }, ttl: "6 seconds" })
+            }
           }}
-          onBlur={() => clearTyping({ conversationId })}
+          onBlur={() => clearTyping({ key: conversationId })}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault()

@@ -31,7 +31,6 @@ import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
-import * as SyncRpc from "@lucas-barake/effect-local-rpc/SyncRpc"
 import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -52,7 +51,6 @@ import * as Stream from "effect/Stream"
 import * as HttpServer from "effect/unstable/http/HttpServer"
 import * as AtomRegistry from "effect/unstable/reactivity/AtomRegistry"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import * as Socket from "effect/unstable/socket/Socket"
 
 /**
  * In-process end-to-end smoke tests: the real production server composition
@@ -83,29 +81,18 @@ const memberFor = (user: ChatUser) =>
     )
   })
 
-const layerSocket = Effect.gen(function*() {
+const serverUrl = Effect.gen(function*() {
   const server = yield* HttpServer.HttpServer
   const address = server.address
   if (address._tag === "UnixAddress") return yield* Effect.die("Expected the test server to use a TCP address")
-  return yield* Socket.makeWebSocket(`http://127.0.0.1:${address.port}/sync`)
-}).pipe(Layer.effect(Socket.Socket), Layer.provide(NodeSocket.layerWebSocketConstructor))
+  return `http://127.0.0.1:${address.port}/sync`
+})
 
 const layerReplicaFor = (user: ChatUser, bearer: string = tokenFor(user.id)) => {
-  const provider = Authentication.CredentialProvider.of({
-    acquire: Effect.succeed({ generation: 0, bearer: Redacted.make(bearer) }),
-    awaitChange: () => Effect.never
-  })
-  const layerProtocol = SyncClient.layerProtocolSocket().pipe(
-    Layer.provide(Layer.fresh(layerSocket)),
-    Layer.provide(SyncRpc.layerJson())
-  )
-  const layerSync = Layer.merge(SyncClient.layer, EphemeralClient.layer).pipe(
-    Layer.provide(layerProtocol),
-    Layer.provide(
-      Layer.fresh(Authentication.layerClient).pipe(
-        Layer.provide(Layer.succeed(Authentication.CredentialProvider, provider))
-      )
-    )
+  const credential = Redacted.make(bearer)
+  const layerSync = SyncClient.layerWebSocket({ url: serverUrl }).pipe(
+    Layer.provide(NodeSocket.layerWebSocketConstructor),
+    Layer.provide(Authentication.layerCredentialProviderStatic(credential))
   )
   const layerDatabase = Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
@@ -213,7 +200,7 @@ const startConversation = Effect.fnUntraced(function*(from: BootedUser) {
     awaitHead(
       from.space.settlementsFor(StartConversation).pipe(
         Stream.filter((settled) =>
-          "payload" in settled.settlement.pending &&
+          !Replica.isLegacySettlement(settled.settlement) &&
           settled.settlement.pending.payload.id === conversationId &&
           settled.settlement.receipt._tag === "Accepted"
         )
@@ -282,7 +269,7 @@ describe("chat sync", () => {
         awaitHead(
           fromAlice.space.settlementsFor(SendMessage).pipe(
             Stream.filter((settled) =>
-              "payload" in settled.settlement.pending &&
+              !Replica.isLegacySettlement(settled.settlement) &&
               settled.settlement.pending.payload.id === message.id &&
               settled.settlement.receipt._tag === "Accepted"
             )
@@ -371,12 +358,11 @@ describe("chat sync", () => {
         awaitHead(typing.pipe(Stream.filter(bobIsTyping))),
         { startImmediately: true }
       )
-      const at = yield* Clock.currentTimeMillis
       yield* fromBob.ephemeral.publish(Typing, {
         spaceId,
         member: memberFor(bob),
         key: conversationId,
-        payload: { userId: bob.id, at },
+        payload: { userId: bob.id },
         ttl: "6 seconds"
       })
       yield* Fiber.join(seen)
@@ -427,7 +413,7 @@ describe("chat sync", () => {
         awaitHead(
           fromAlice.space.settlementsFor(SendMessage).pipe(
             Stream.filter((settled) =>
-              "payload" in settled.settlement.pending &&
+              !Replica.isLegacySettlement(settled.settlement) &&
               settled.settlement.pending.payload.id === forged.id &&
               settled.settlement.receipt._tag === "Rejected"
             )
@@ -521,7 +507,7 @@ describe("chat sync", () => {
         awaitHead(
           fromAlice.space.settlementsFor(StartConversation).pipe(
             Stream.filter((entry) =>
-              "payload" in entry.settlement.pending && entry.settlement.pending.payload.id === forged.id
+              !Replica.isLegacySettlement(entry.settlement) && entry.settlement.pending.payload.id === forged.id
             )
           )
         ),
@@ -616,7 +602,7 @@ describe("chat sync", () => {
       const probe = yield* Effect.forkChild(
         space.settlementsFor(SendMessage, { from: "acknowledged" }).pipe(
           Stream.filter((entry) =>
-            !("payload" in entry.settlement.pending) || entry.settlement.pending.payload.id !== forged.id
+            Replica.isLegacySettlement(entry.settlement) || entry.settlement.pending.payload.id !== forged.id
           ),
           awaitHead
         ),
@@ -625,7 +611,7 @@ describe("chat sync", () => {
       yield* space.mutate(SendMessage, followUp)
       const first = yield* Fiber.join(probe)
       assert.strictEqual(first.settlement.receipt._tag, "Accepted")
-      if ("payload" in first.settlement.pending) {
+      if (!Replica.isLegacySettlement(first.settlement)) {
         assert.strictEqual(first.settlement.pending.payload.id, followUp.id)
       }
     })

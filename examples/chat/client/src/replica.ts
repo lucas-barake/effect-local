@@ -1,4 +1,4 @@
-import { LoginRequest, LoginResponse } from "@effect-local/example-chat-shared/auth"
+import { type LoginRequest, LoginResponse } from "@effect-local/example-chat-shared/auth"
 import {
   AdvanceDelivery,
   AdvanceRead,
@@ -26,13 +26,12 @@ import {
 } from "@effect-local/example-chat-shared/domain"
 import { layerDomain } from "@effect-local/example-chat-shared/handlers"
 import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
+import * as BrowserKeyValueStore from "@effect/platform-browser/BrowserKeyValueStore"
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
 import * as MultiTab from "@lucas-barake/effect-local-browser/MultiTab"
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
-import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
-import * as SyncRpc from "@lucas-barake/effect-local-rpc/SyncRpc"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
@@ -41,204 +40,124 @@ import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
-import * as Stream from "effect/Stream"
-import * as SubscriptionRef from "effect/SubscriptionRef"
+import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient"
+import * as HttpClient from "effect/unstable/http/HttpClient"
+import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest"
+import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse"
+import * as KeyValueStore from "effect/unstable/persistence/KeyValueStore"
 import * as Atom from "effect/unstable/reactivity/Atom"
 import * as Socket from "effect/unstable/socket/Socket"
 import { makeFailedMessages, makeSettlementDaemonBody } from "./settlementDaemon.js"
 
 /**
- * Browser client composition: MultiTab-owned SqlReplica over OPFS SQLite,
- * WebSocket sync with credential rotation, ephemeral presence and typing, and
- * the atom graph the React UI subscribes to.
+ * Browser client composition: MultiTab-owned SqlReplica over an OPFS SQLite
+ * worker, one WebSocket carrying sync and ephemera, and the atom graph the
+ * React UI subscribes to.
  *
- * Everything replica-related is per logged-in user (`clientFor`): the OPFS
- * database, the MultiTab client identity, and the atom graph are all keyed by
- * user id so switching accounts on one browser profile never mixes local
- * state.
+ * Everything replica-related is per logged-in session (`clientFor`): the OPFS
+ * database, the MultiTab client identity, the bearer token, and the atom graph
+ * are all keyed by user id so switching accounts on one browser profile never
+ * mixes local state.
  */
 
 // ---------------------------------------------------------------------------
-// Session (stored login)
-//
-// localStorage access and the initial decode happen at module bootstrap - a
-// genuine non-Effect host boundary, covered by the scoped lint override in
-// the client package. Everything past login runs inside Effect.
+// Page runtime: services that outlive any one login (stored session, HTTP).
 // ---------------------------------------------------------------------------
+
+const pageRuntime = Atom.runtime(Layer.merge(BrowserKeyValueStore.layerLocalStorage, FetchHttpClient.layer))
 
 const StoredSession = Schema.Struct({
   token: Schema.String,
   userId: UserId,
   name: Schema.String,
-  color: Schema.String,
-  generation: Schema.Number
+  color: Schema.String
 })
 export type StoredSession = typeof StoredSession.Type
 
-const sessionCodec = Schema.fromJsonString(StoredSession)
-const sessionStorageKey = "effect-local-chat:session"
+const sessionKey = "effect-local-chat:session"
 
-// localStorage itself can throw in storage-restricted contexts (private
-// browsing, disabled cookies); every access degrades to "no stored value"
-// rather than taking down module evaluation.
-const storageGet = (key: string): string | null =>
-  Effect.runSync(
-    Effect.try(() => localStorage.getItem(key)).pipe(
-      Effect.option,
-      Effect.map(Option.getOrNull)
-    )
-  )
-
-const storageSet = (key: string, value: string): void => {
-  // On failure the session simply does not survive a reload.
-  Effect.runSync(Effect.try(() => localStorage.setItem(key, value)).pipe(Effect.option))
-}
-
-const storageRemove = (key: string): void => {
-  Effect.runSync(Effect.try(() => localStorage.removeItem(key)).pipe(Effect.option))
-}
-
-const loadSession = (): StoredSession | undefined => {
-  const raw = storageGet(sessionStorageKey)
-  if (raw === null) return undefined
-  return Effect.runSync(
-    Schema.decodeUnknownEffect(sessionCodec)(raw).pipe(
-      Effect.option,
-      Effect.map(Option.getOrUndefined)
-    )
-  )
-}
+export const sessionAtom = Atom.kvs({
+  runtime: pageRuntime,
+  key: sessionKey,
+  schema: Schema.NullOr(StoredSession),
+  defaultValue: () => null,
+  mode: "async"
+})
 
 class LoginFailed extends Schema.TaggedErrorClass<LoginFailed>(
   "@effect-local/example-chat/LoginFailed"
 )("LoginFailed", { reason: Schema.String }) {}
 
-const loginRequestCodec = Schema.fromJsonString(LoginRequest)
-
-export const loginAtom = Atom.fn<LoginRequest>()(
-  Effect.fn("chat.login")(function*(credentials: LoginRequest, get: Atom.FnContext) {
-    const body = yield* Schema.encodeUnknownEffect(loginRequestCodec)(credentials)
-    const response = yield* Effect.promise(() =>
-      fetch("/login", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body
-      })
+const login = Effect.fn("chat.login")(
+  function*(credentials: LoginRequest, get: Atom.FnContext) {
+    const client = yield* HttpClient.HttpClient
+    const request = yield* HttpClientRequest.post(`${location.origin}/login`).pipe(
+      HttpClientRequest.bodyJson(credentials)
     )
+    const response = yield* client.execute(request)
     if (response.status === 401) {
       return yield* new LoginFailed({ reason: "Invalid username or password" })
     }
-    if (!response.ok) {
-      return yield* new LoginFailed({ reason: "Login service unavailable" })
-    }
-    const raw: unknown = yield* Effect.promise(() => response.json())
-    const session = yield* Schema.decodeUnknownEffect(LoginResponse)(raw).pipe(
-      Effect.mapError(() => new LoginFailed({ reason: "Malformed login response" }))
-    )
-    const current = yield* SubscriptionRef.get(credentialRef)
-    const generation = current.generation + 1
-    const stored: StoredSession = { ...session, generation }
-    storageSet(sessionStorageKey, yield* Schema.encodeUnknownEffect(sessionCodec)(stored))
-    yield* SubscriptionRef.set(credentialRef, {
-      generation,
-      bearer: Redacted.make(session.token)
-    })
-    get.set(sessionAtom, stored)
-    return stored
+    const ok = yield* HttpClientResponse.filterStatusOk(response)
+    const session = yield* HttpClientResponse.schemaBodyJson(LoginResponse)(ok)
+    get.set(sessionAtom, session)
+    return session
+  },
+  Effect.catchTags({
+    HttpBodyError: () => new LoginFailed({ reason: "Could not encode the login request" }),
+    HttpClientError: () => new LoginFailed({ reason: "Login service unavailable" }),
+    SchemaError: () => new LoginFailed({ reason: "Malformed login response" })
   })
 )
 
-export const logoutAtom = Atom.fn<void>()(() =>
-  Effect.sync(() => {
-    storageRemove(sessionStorageKey)
-    location.reload()
-  })
+export const loginAtom = pageRuntime.fn<LoginRequest>()(login)
+
+// The stored session is removed before the reload so the next load lands on
+// the login screen instead of resuming the signed out account.
+export const logoutAtom = pageRuntime.fn<void>()(() =>
+  KeyValueStore.KeyValueStore.use((store) => store.remove(sessionKey)).pipe(
+    Effect.andThen(Effect.sync(() => location.reload()))
+  )
 )
-
-export const sessionAtom = Atom.make<StoredSession | undefined>(loadSession())
-
-const credentialRef = Effect.runSync(
-  SubscriptionRef.make<Authentication.Credential>({
-    generation: 0,
-    bearer: Redacted.make(loadSession()?.token ?? "anonymous")
-  })
-)
-
-const credentialProvider = Authentication.CredentialProvider.of({
-  acquire: SubscriptionRef.get(credentialRef),
-  awaitChange: (rejectedGeneration) =>
-    SubscriptionRef.changes(credentialRef).pipe(
-      Stream.filter((credential) => credential.generation !== rejectedGeneration),
-      Stream.runHead,
-      Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
-    )
-})
 
 // ---------------------------------------------------------------------------
 // Ephemeral identity: deliberately decoupled from the replica client id.
 // MultiTab owns the replica identity and never exposes it outside the owner
-// callback, so presence/typing use an app-minted identity instead.
+// callback, so presence/typing use an identity minted once per page load.
 // ---------------------------------------------------------------------------
 
-const mintUuid = (): string =>
-  Effect.runSync(Crypto.Crypto.use((crypto) => crypto.randomUUIDv4).pipe(Effect.provide(BrowserCrypto.layer)))
-
-const ephemeralClientId = (() => {
-  const key = "effect-local-chat:ephemeral-client-id"
-  const stored = storageGet(key)
-  if (stored !== null) return Identity.ClientId.make(stored)
-  const generated = Identity.ClientId.make(`cli_${mintUuid()}`)
-  storageSet(key, generated)
-  return generated
-})()
-
-const member = Protocol.EphemeralMember.make({
-  clientId: ephemeralClientId,
-  membershipIncarnation: Identity.MembershipIncarnation.make(`inc_${mintUuid()}`)
-})
+const member = Effect.runSync(
+  Effect.all({
+    clientId: Identity.makeClientId,
+    membershipIncarnation: Identity.makeMembershipIncarnation
+  }).pipe(
+    Effect.map((fields) => Protocol.EphemeralMember.make(fields)),
+    Effect.provide(BrowserCrypto.layer)
+  )
+)
 
 // ---------------------------------------------------------------------------
-// Replica stack (per user)
+// Replica stack (per session)
 // ---------------------------------------------------------------------------
 
-// The Worker handle must stay owned by the layer: on leadership loss the owner
-// scope closes, and without terminate() each grant would leak a live WASM worker.
-const spawnDatabaseWorker = (userId: UserId) =>
-  Effect.acquireRelease(
-    Effect.sync(() => {
-      const worker = new Worker(new URL("./sqlite.worker.ts", import.meta.url), {
-        type: "module",
-        name: userId
-      })
-      const channel = new MessageChannel()
-      worker.postMessage({ port: channel.port2 }, [channel.port2])
-      return { port: channel.port1, worker }
-    }),
-    ({ worker }) => Effect.sync(() => worker.terminate())
-  )
+const syncUrl = () => {
+  let scheme = "ws"
+  if (location.protocol === "https:") scheme = "wss"
+  return `${scheme}://${location.host}/sync`
+}
 
-const makeOwner = (userId: UserId) => (context: MultiTab.OwnerContext) => {
-  let wsScheme = "ws"
-  if (location.protocol === "https:") wsScheme = "wss"
-  const layerSocket = Socket.layerWebSocket(`${wsScheme}://${location.host}/sync`).pipe(
-    Layer.provide(Socket.layerWebSocketConstructorGlobal)
+const makeOwner = (session: StoredSession) => (context: MultiTab.OwnerContext) => {
+  // A rejected bearer parks the space at NeedsAuthentication; the banner then
+  // signs out and reloads, so the token never rotates inside one page load.
+  const bearer = Redacted.make(session.token)
+  const layerSync = SyncClient.layerWebSocket({ url: syncUrl() }).pipe(
+    Layer.provide(Socket.layerWebSocketConstructorGlobal),
+    Layer.provide(Authentication.layerCredentialProviderStatic(bearer))
   )
-  const layerProtocol = SyncClient.layerProtocolSocket().pipe(
-    Layer.provide(layerSocket),
-    Layer.provide(SyncRpc.layerJson())
-  )
-  const layerAuthentication = Layer.fresh(Authentication.layerClient).pipe(
-    Layer.provide(Layer.succeed(Authentication.CredentialProvider, credentialProvider))
-  )
-  const layerSync = Layer.merge(SyncClient.layer, EphemeralClient.layer).pipe(
-    Layer.provide(layerProtocol),
-    Layer.provide(layerAuthentication)
-  )
-  const layerDatabase = Layer.unwrap(
-    spawnDatabaseWorker(userId).pipe(Effect.map(({ port }) => BrowserSqlite.layerMessagePort(port)))
+  const layerDatabase = BrowserSqlite.layerWorker(() =>
+    new Worker(new URL("./sqlite.worker.ts", import.meta.url), { type: "module", name: session.userId })
   )
   return SqlReplica.layer({
     definition,
@@ -264,12 +183,12 @@ const makeOwner = (userId: UserId) => (context: MultiTab.OwnerContext) => {
   )
 }
 
-const makeGraph = (userId: UserId) =>
+const makeGraph = (session: StoredSession) =>
   BrowserReplica.make(
     MultiTab.layer({
-      name: `chat-${userId}`,
+      name: `chat-${session.userId}`,
       definition,
-      owner: makeOwner(userId),
+      owner: makeOwner(session),
       ephemerals,
       profiles,
       requestPersistence: true
@@ -277,7 +196,7 @@ const makeGraph = (userId: UserId) =>
   )
 
 // ---------------------------------------------------------------------------
-// Atoms (per user)
+// Atoms (per session)
 // ---------------------------------------------------------------------------
 
 export type ChatClient = ReturnType<typeof makeClient>
@@ -290,24 +209,30 @@ export const loadMoreAtom = Atom.writable(
 
 const findUserName = (userId: UserId): string => findUser(userId)?.name ?? userId
 
+const mintMessageId = Crypto.Crypto.use((crypto) => crypto.randomUUIDv4).pipe(
+  Effect.map((uuid) => MessageId.make(uuid)),
+  Effect.provide(BrowserCrypto.layer)
+)
+
 const clients = new Map<UserId, ChatClient>()
 
-export const clientFor = (userId: UserId): ChatClient => {
-  const existing = clients.get(userId)
+export const clientFor = (session: StoredSession): ChatClient => {
+  const existing = clients.get(session.userId)
   if (existing !== undefined) return existing
-  const client = makeClient(userId)
-  clients.set(userId, client)
+  const client = makeClient(session)
+  clients.set(session.userId, client)
   return client
 }
 
-const makeClient = (userId: UserId) => {
-  const graph = makeGraph(userId)
+const makeClient = (session: StoredSession) => {
+  const userId = session.userId
+  const graph = makeGraph(session)
+  const target = { spaceId, member }
 
   const failedMessages = makeFailedMessages()
 
   const presenceAtom = graph.ephemeral(PresenceProfile, {
-    spaceId,
-    member,
+    ...target,
     value: { userId, name: findUserName(userId) },
     ttl: "30 seconds"
   })
@@ -318,18 +243,11 @@ const makeClient = (userId: UserId) => {
   const pendingSendsAtom = graph.pendingFor(spaceId, SendMessage)
   const statusAtom = graph.status(spaceId)
 
-  // Memoized per conversation: a fresh Atom.readable wrapper per render would
-  // force a useSyncExternalStore resubscribe on every keystroke.
-  const makeWindowAtom = (conversationId: ConversationId) =>
+  // One atom per conversation: the window query re-keys on the shared window
+  // size, and a fresh wrapper per render would resubscribe on every keystroke.
+  const messagesWindow = Atom.family((conversationId: ConversationId) =>
     Atom.readable((get) => get(graph.query(spaceId, MessagesWindow)({ conversationId, limit: get(windowSizeAtom) })))
-  const windowAtoms = new Map<ConversationId, ReturnType<typeof makeWindowAtom>>()
-  const messagesWindow = (conversationId: ConversationId) => {
-    const cached = windowAtoms.get(conversationId)
-    if (cached !== undefined) return cached
-    const atom = makeWindowAtom(conversationId)
-    windowAtoms.set(conversationId, atom)
-    return atom
-  }
+  )
   const readStates = (conversationId: ConversationId) => graph.query(spaceId, ReadStates)({ conversationId })
 
   const sendMessage = graph.runtime.fn<{ readonly conversationId: ConversationId; readonly text: string }>()(
@@ -337,9 +255,7 @@ const makeClient = (userId: UserId) => {
       const replica = yield* Replica.Replica
       const space = yield* replica.space(spaceId)
       const createdAt = yield* Clock.currentTimeMillis
-      const id = MessageId.make(
-        yield* Crypto.Crypto.use((crypto) => crypto.randomUUIDv4).pipe(Effect.provide(BrowserCrypto.layer))
-      )
+      const id = yield* mintMessageId
       const message: Message = {
         id,
         conversationId: input.conversationId,
@@ -425,56 +341,9 @@ const makeClient = (userId: UserId) => {
     { concurrent: true }
   )
 
-  const markRead = graph.runtime.fn<{ readonly conversationId: ConversationId; readonly upTo: number }>()(
-    Effect.fn("chat.markRead")(function*(input) {
-      const replica = yield* Replica.Replica
-      const space = yield* replica.space(spaceId)
-      return yield* space.mutate(AdvanceRead, {
-        conversationId: input.conversationId,
-        userId,
-        upTo: input.upTo
-      }).pipe(
-        Effect.onError((cause) =>
-          Effect.logWarning("chat: could not advance read position").pipe(
-            Effect.annotateLogs({ conversationId: input.conversationId, cause: String(cause) })
-          )
-        )
-      )
-    }),
-    { concurrent: true }
-  )
-
-  const publishTyping = graph.runtime.fn<{ readonly conversationId: ConversationId }>()(
-    Effect.fnUntraced(function*(input) {
-      const at = yield* Clock.currentTimeMillis
-      yield* EphemeralClient.EphemeralClient.use((client) =>
-        client.publish(Typing, {
-          spaceId,
-          member,
-          key: input.conversationId,
-          payload: { userId, at },
-          ttl: "6 seconds"
-        })
-      ).pipe(
-        Effect.onError((cause) =>
-          Effect.logWarning("chat: could not publish typing state").pipe(Effect.annotateLogs({ cause: String(cause) }))
-        )
-      )
-    }),
-    { concurrent: true }
-  )
-
-  const clearTyping = graph.runtime.fn<{ readonly conversationId: ConversationId }>()(
-    (input) =>
-      EphemeralClient.EphemeralClient.use((client) =>
-        client.remove(Typing, { spaceId, member, key: input.conversationId })
-      ).pipe(
-        Effect.onError((cause) =>
-          Effect.logWarning("chat: could not clear typing state").pipe(Effect.annotateLogs({ cause: String(cause) }))
-        )
-      ),
-    { concurrent: true }
-  )
+  const markRead = graph.mutation(spaceId, AdvanceRead)
+  const publishTyping = graph.publishEphemeral(Typing, target)
+  const clearTyping = graph.removeEphemeral(Typing, target)
 
   // Delivery daemon: whenever a conversation summary shows an incoming message
   // beyond my delivered position, advance it. Monotonic-max on the server makes

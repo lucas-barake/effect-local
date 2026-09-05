@@ -7,6 +7,14 @@ authorization, ephemeral typing and presence, and durable delivery/read
 receipts — with no loading spinners anywhere, because the UI always renders
 from the local replica.
 
+The client and server are composed almost entirely from library Layers:
+`SyncClient.layerWebSocket` for the socket, serialization, protocol session,
+credential middleware, sync engine, and ephemeral client in one call;
+`Authentication.layerCredentialProviderStatic` for the bearer token;
+`BrowserSqlite.layerWorker` for the OPFS worker lifecycle; and
+`PrincipalAssertion.layerJson` on the server. The application code that remains
+is the domain, the authorization policy, and the UI.
+
 ## Quickstart
 
 ```sh
@@ -47,14 +55,17 @@ shared/   @effect-local/example-chat-shared
 server/   @effect-local/example-chat-server
           server.ts   — makeServerLayer({ port, databaseFile }): /login route,
                         authenticator, per-mutation authorization, ServerStore,
-                        EphemeralHub, SyncServer over WebSocket
+                        EphemeralHub, PrincipalAssertion.layerJson, SyncServer
+                        over WebSocket
           main.ts     — thin entrypoint reading CHAT_PORT / CHAT_DB
 client/   Vite + React app
-          replica.ts  — per-user graph: MultiTab + BrowserReplica over an OPFS
-                        SQLite worker, session persistence, login/logout atoms
+          replica.ts  — per-session graph: MultiTab + BrowserReplica over
+                        BrowserSqlite.layerWorker and SyncClient.layerWebSocket;
+                        the stored session is an Atom.kvs over localStorage and
+                        login goes through HttpClient
           chat.tsx    — conversation view: message window pagination, ticks,
                         typing publisher, failed-message overlay
-          sqlite.worker.ts — wa-sqlite OPFS worker bootstrap
+          sqlite.worker.ts — OpfsWorker.run over the worker's own port
 test/     domain.test.ts — tick-state derivation matrix, branded id invariants
           smoke.test.ts  — in-process end-to-end: real server composition plus
                            real SyncClient + SqlReplica stacks over loopback
@@ -68,10 +79,13 @@ test/     domain.test.ts — tick-state derivation matrix, branded id invariants
   server in the background. There are no loading states — queries read from
   the local SQLite replica.
 - **Authentication and authorization.** `/login` exchanges a username and
-  password for a bearer token. The server authenticates the WebSocket
+  password for a bearer token, which the client hands to the sync stack as a
+  static `CredentialProvider`. The server authenticates the WebSocket
   handshake and authorizes every mutation: you can only send as yourself,
   start conversations you belong to, and advance your own read state. A
-  spoofed `senderId` is rejected and the optimistic write rolls back.
+  spoofed `senderId` is rejected and the optimistic write rolls back. A
+  rejected token parks the space at `NeedsAuthentication`; the banner signs
+  out and reloads so the next login builds a fresh client.
 - **Delivery and read receipts.** A shared `ConversationReadState` entity per
   (conversation, user) holds two monotonic cursors, `deliveredUpTo` and
   `readUpTo`. Recipients advance them automatically (delivery on arrival, read
@@ -79,9 +93,11 @@ test/     domain.test.ts — tick-state derivation matrix, branded id invariants
   from the peer's cursors. Reads are membership-gated so senders can observe
   the peer's rows.
 - **Ephemeral typing and presence.** Typing is keyed ephemeral state with a
-  TTL, published while the draft is non-empty and cleared on send; presence is
-  an ephemeral member profile. Ephemeral identity is minted by the app and is
-  deliberately decoupled from the replica's multi-tab client id.
+  TTL, published while the draft is non-empty through `graph.publishEphemeral`
+  and cleared on send through `graph.removeEphemeral`; presence is an
+  ephemeral member profile. Ephemeral identity is minted once per page load
+  with `Identity.makeClientId` and is deliberately decoupled from the
+  replica's multi-tab client id.
 - **Multi-tab out of the box.** `MultiTab.layer` elects one leader tab per
   user; followers proxy the replica over `BroadcastChannel`. Reload or open
   another tab and everything keeps working.
@@ -105,7 +121,9 @@ The smoke tests boot the real `makeServerLayer` on an ephemeral port with
 in-memory SQLite and connect real client stacks per user — no fakes. They
 cover login (200/401), send → accepted → delivered → read tick progression,
 typing publish/clear, `NeedsAuthentication` for bad tokens, and sender
-spoofing rejection with optimistic rollback.
+spoofing rejection with optimistic rollback. The client stack in the tests is
+the same `SyncClient.layerWebSocket` composition as the browser, over Node's
+WebSocket constructor.
 
 ## Notes
 

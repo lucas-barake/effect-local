@@ -188,19 +188,6 @@ const makeLayerStore = (layerDatabase: ReturnType<typeof makeLayerDatabase>) =>
     Layer.provide(layerDatabase)
   )
 
-const assertionCodec = Schema.fromJsonString(Schema.Json)
-const layerAssertionIssuer = PrincipalAssertion.layerIssuer((principal) =>
-  Schema.encodeUnknownEffect(assertionCodec)(principal).pipe(
-    Effect.map((assertion) => PrincipalAssertion.PrincipalAssertion.make(assertion)),
-    Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "could not issue principal assertion" }))
-  )
-)
-const layerAssertionVerifier = PrincipalAssertion.layerVerifier((assertion) =>
-  Schema.decodeUnknownEffect(assertionCodec)(assertion).pipe(
-    Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" }))
-  )
-)
-
 const layerEphemeralHub = EphemeralHub.layer({
   maximumWatchersPerSpace: 1_024,
   // NOTE: the authorization input carries `{ spaceId, member, principal }` but
@@ -230,7 +217,8 @@ export const makeServerLayer = (options: ChatServerOptions) => {
     maximumConcurrentEphemeralJoinVerificationsPerSpace: 16,
     maximumConcurrentEphemeralRequestsPerSpace: 16
   }).pipe(
-    Layer.provide(layerAssertionVerifier),
+    // Single process: the facade and the entities share one trusted runtime.
+    Layer.provide(PrincipalAssertion.layerJson),
     Layer.provide(layerStore),
     Layer.provide(layerEphemeralHub),
     Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
@@ -252,7 +240,7 @@ export const makeServerLayer = (options: ChatServerOptions) => {
       Layer.provideMerge(layerApp),
       Layer.provide(layerCluster),
       Layer.provide(Authentication.layerServer.pipe(Layer.provide(layerAuthenticator))),
-      Layer.provide(layerAssertionIssuer),
+      Layer.provide(PrincipalAssertion.layerJson),
       Layer.provide(HttpRouter.serve(layerApp, { disableLogger: true }))
     ),
     layerMaintenance

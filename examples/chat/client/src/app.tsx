@@ -13,7 +13,7 @@ import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import { useState } from "react"
 import { ChatView } from "./chat.js"
-import { clientFor, logoutAtom, type StoredSession } from "./replica.js"
+import { type ChatClient, clientFor, logoutAtom, type StoredSession } from "./replica.js"
 
 const latest = <A, E,>(result: AsyncResult.AsyncResult<A, E>, fallback: A): A =>
   AsyncResult.getOrElse(result, () => fallback)
@@ -72,12 +72,12 @@ const StatusBanner = ({ status }: {
   )
 }
 
-const Sidebar = ({ me, openId, onOpen }: {
+const Sidebar = ({ client, me, openId, onOpen }: {
+  readonly client: ChatClient
   readonly me: UserId
   readonly openId: ConversationId | null
   readonly onOpen: (conversationId: ConversationId) => void
 }) => {
-  const client = clientFor(me)
   const summaries = latest(useAtomValue(client.summariesAtom), [])
   const members = latest(useAtomValue(client.membersAtom), [])
   const onlineIds = new Set(members.map((entry) => entry.value.userId))
@@ -177,7 +177,7 @@ const ConversationRow = ({ summary, me, online, active, onOpen }: {
 }
 
 export const App = ({ session }: { readonly session: StoredSession }) => {
-  const client = clientFor(session.userId)
+  const client = clientFor(session)
   useAtomMount(client.presenceAtom)
   useAtomMount(client.deliveryDaemon)
   useAtomMount(client.settlementDaemon)
@@ -208,7 +208,7 @@ export const App = ({ session }: { readonly session: StoredSession }) => {
           </button>
         </header>
         <StatusBanner status={status} />
-        <Sidebar me={me} openId={openId} onOpen={open} />
+        <Sidebar client={client} me={me} openId={openId} onOpen={open} />
       </div>
       {openId === null
         ? (
@@ -217,7 +217,7 @@ export const App = ({ session }: { readonly session: StoredSession }) => {
             <p>Pick a conversation to start messaging.</p>
           </div>
         )
-        : <ChatView key={openId} me={me} conversationId={openId} />}
+        : <ChatView key={openId} client={client} me={me} conversationId={openId} />}
     </div>
   )
 }
