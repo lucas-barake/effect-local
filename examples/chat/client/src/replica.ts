@@ -21,7 +21,7 @@ import {
   spaceId,
   StartConversation,
   Typing,
-  UserId,
+  type UserId,
   users
 } from "@effect-local/example-chat-shared/domain"
 import { layerDomain } from "@effect-local/example-chat-shared/handlers"
@@ -68,20 +68,12 @@ import { makeFailedMessages, makeSettlementDaemonBody } from "./settlementDaemon
 
 const pageRuntime = Atom.runtime(Layer.merge(BrowserKeyValueStore.layerLocalStorage, FetchHttpClient.layer))
 
-const StoredSession = Schema.Struct({
-  token: Schema.String,
-  userId: UserId,
-  name: Schema.String,
-  color: Schema.String
-})
-export type StoredSession = typeof StoredSession.Type
-
 const sessionKey = "effect-local-chat:session"
 
 export const sessionAtom = Atom.kvs({
   runtime: pageRuntime,
   key: sessionKey,
-  schema: Schema.NullOr(StoredSession),
+  schema: Schema.NullOr(LoginResponse),
   defaultValue: () => null,
   mode: "async"
 })
@@ -148,7 +140,7 @@ const syncUrl = () => {
   return `${scheme}://${location.host}/sync`
 }
 
-const makeOwner = (session: StoredSession) => (context: MultiTab.OwnerContext) => {
+const makeOwner = (session: LoginResponse) => (context: MultiTab.OwnerContext) => {
   // A rejected bearer parks the space at NeedsAuthentication; the banner then
   // signs out and reloads, so the token never rotates inside one page load.
   const bearer = Redacted.make(session.token)
@@ -183,7 +175,7 @@ const makeOwner = (session: StoredSession) => (context: MultiTab.OwnerContext) =
   )
 }
 
-const makeGraph = (session: StoredSession) =>
+const makeGraph = (session: LoginResponse) =>
   BrowserReplica.make(
     MultiTab.layer({
       name: `chat-${session.userId}`,
@@ -216,7 +208,7 @@ const mintMessageId = Crypto.Crypto.use((crypto) => crypto.randomUUIDv4).pipe(
 
 const clients = new Map<UserId, ChatClient>()
 
-export const clientFor = (session: StoredSession): ChatClient => {
+export const clientFor = (session: LoginResponse): ChatClient => {
   const existing = clients.get(session.userId)
   if (existing !== undefined) return existing
   const client = makeClient(session)
@@ -224,7 +216,7 @@ export const clientFor = (session: StoredSession): ChatClient => {
   return client
 }
 
-const makeClient = (session: StoredSession) => {
+const makeClient = (session: LoginResponse) => {
   const userId = session.userId
   const graph = makeGraph(session)
   const target = { spaceId, member }
