@@ -109,6 +109,24 @@ class EphemeralPublishKey implements Equal.Equal {
   }
 }
 
+class EphemeralRemoveKey implements Equal.Equal {
+  readonly value: string
+  readonly definition: Ephemeral.AnyState
+  readonly target: EphemeralClient.PublishTarget
+  constructor(definition: Ephemeral.AnyState, target: EphemeralClient.PublishTarget) {
+    this.definition = definition
+    this.target = target
+    this.value = `${target.spaceId}:${target.member.clientId}:${target.member.membershipIncarnation}`
+  }
+  [Equal.symbol](that: unknown): boolean {
+    return that instanceof EphemeralRemoveKey && this.value === that.value &&
+      this.definition === that.definition
+  }
+  [Hash.symbol](): number {
+    return Hash.string(this.value) ^ Hash.hash(this.definition)
+  }
+}
+
 class EphemeralMembersKey implements Equal.Equal {
   readonly session: object
   constructor(session: object) {
@@ -272,6 +290,34 @@ export const make = <E,>(
     ReplicaError.ReplicaError | Ephemeral.EncodeError | E
   > {
     return ephemeralPublishFamily(new EphemeralPublishKey(definition, target))
+  }
+
+  const ephemeralRemoveFamily = Atom.family((key: EphemeralRemoveKey) =>
+    runtime.fn<{ readonly key: unknown }>()(
+      (input) =>
+        Effect.yieldNow.pipe(Effect.andThen(EphemeralClient.EphemeralClient.use((client) =>
+          client.remove(key.definition, {
+            spaceId: key.target.spaceId,
+            member: key.target.member,
+            key: input.key
+          })
+        ))),
+      { concurrent: true }
+    )
+  )
+  function removeEphemeral<D extends Ephemeral.AnyState,>(
+    definition: D,
+    target: EphemeralClient.PublishTarget
+  ): Atom.AtomResultFn<
+    Omit<EphemeralClient.StateRemoveOptions<D>, "spaceId" | "member">,
+    void,
+    ReplicaError.ReplicaError | Ephemeral.EncodeError | E
+  >
+  function removeEphemeral(
+    definition: Ephemeral.AnyState,
+    target: EphemeralClient.PublishTarget
+  ): Atom.AtomResultFn<{ readonly key: unknown }, void, ReplicaError.ReplicaError | Ephemeral.EncodeError | E> {
+    return ephemeralRemoveFamily(new EphemeralRemoveKey(definition, target))
   }
 
   const entity = <M extends Model.Any,>(spaceId: Identity.SpaceId, model: M) =>
@@ -461,6 +507,7 @@ export const make = <E,>(
     ephemeralEvents,
     ephemeralState,
     ephemeralMembers,
-    publishEphemeral
+    publishEphemeral,
+    removeEphemeral
   } as const
 }
