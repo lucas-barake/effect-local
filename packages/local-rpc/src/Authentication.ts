@@ -2,8 +2,11 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
+import * as Stream from "effect/Stream"
+import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as Headers from "effect/unstable/http/Headers"
 import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import { invalidConfiguration } from "./internal/errors.js"
@@ -113,3 +116,31 @@ export const layerClient = Layer.merge(
   layerClientMiddleware,
   Layer.effect(CredentialProvider, CredentialProvider)
 )
+
+export const makeCredentialProvider = (
+  credential: SubscriptionRef.SubscriptionRef<Credential>
+): CredentialProvider["Service"] =>
+  CredentialProvider.of({
+    acquire: SubscriptionRef.get(credential),
+    awaitChange: (rejectedGeneration) =>
+      SubscriptionRef.changes(credential).pipe(
+        Stream.filter((next) => next.generation !== rejectedGeneration),
+        Stream.runHead,
+        Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
+      )
+  })
+
+export const layerCredentialProvider = (
+  credential: SubscriptionRef.SubscriptionRef<Credential>
+): Layer.Layer<CredentialProvider> => Layer.succeed(CredentialProvider, makeCredentialProvider(credential))
+
+// A static bearer can never be refreshed, so a rejection parks the engine at
+// NeedsAuthentication until the application replaces the whole client.
+export const layerCredentialProviderStatic = (bearer: Redacted.Redacted): Layer.Layer<CredentialProvider> =>
+  Layer.succeed(
+    CredentialProvider,
+    CredentialProvider.of({
+      acquire: Effect.succeed({ generation: 0, bearer }),
+      awaitChange: () => Effect.never
+    })
+  )

@@ -241,26 +241,14 @@ const layerAssertionVerifier = PrincipalAssertion.layerVerifier((assertion) =>
     Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" }))
   )
 )
-const authenticationClientProvider = Authentication.CredentialProvider.of({
-  acquire: Effect.succeed({ generation: 0, bearer: Redacted.make("secret") }),
-  awaitChange: () => Effect.never
-})
-const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
-  Layer.succeed(
-    Authentication.CredentialProvider,
-    authenticationClientProvider
-  )
-))
-const revokedAuthenticationClientProvider = Authentication.CredentialProvider.of({
-  acquire: Effect.succeed({ generation: 0, bearer: Redacted.make("revoked") }),
-  awaitChange: () => Effect.never
-})
-const layerRevokedAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
-  Layer.succeed(
-    Authentication.CredentialProvider,
-    revokedAuthenticationClientProvider
-  )
-))
+const secretBearer = Redacted.make("secret")
+const revokedBearer = Redacted.make("revoked")
+const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(
+  Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
+)
+const layerRevokedAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(
+  Layer.provide(Authentication.layerCredentialProviderStatic(revokedBearer))
+)
 const layerCluster = SpaceEntity.layer(entityOptions).pipe(
   Layer.provide(layerAssertionVerifier),
   Layer.provide(layerStore),
@@ -452,17 +440,12 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const blockPull = MutableRef.make(false)
   const lifecycleWebSocketConstructions = MutableRef.make(0)
 
+  const credentialProvider = Authentication.makeCredentialProvider(credentials)
   const provider = Authentication.CredentialProvider.of({
-    acquire: SubscriptionRef.get(credentials),
+    acquire: credentialProvider.acquire,
     awaitChange: (generation) =>
       Deferred.succeed(refreshWaitStarted, generation).pipe(
-        Effect.andThen(
-          SubscriptionRef.changes(credentials).pipe(
-            Stream.filter((credential) => credential.generation !== generation),
-            Stream.runHead,
-            Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
-          )
-        )
+        Effect.andThen(credentialProvider.awaitChange(generation))
       )
   })
   const layerClientAuthentication = Authentication.layerClient.pipe(
