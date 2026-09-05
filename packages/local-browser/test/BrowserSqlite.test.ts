@@ -15,7 +15,7 @@ const makeFakeWorker = Effect.fnUntraced(function*() {
   const channel = new MessageChannel()
   const closed = yield* Deferred.make<void>()
   let spawned = 0
-  let terminated = 0
+  const releases: Array<"close" | "terminate"> = []
   channel.port2.addEventListener("message", (event) => {
     const message: unknown = event.data
     if (!Array.isArray(message)) return
@@ -38,6 +38,7 @@ const makeFakeWorker = Effect.fnUntraced(function*() {
     onmessageerror: null,
     onerror: null,
     postMessage: (message: unknown, transferOrOptions?: Array<Transferable> | StructuredSerializeOptions) => {
+      if (Array.isArray(message) && message[0] === "close") releases.push("close")
       if (Array.isArray(transferOrOptions)) {
         channel.port1.postMessage(message, transferOrOptions)
       } else {
@@ -45,7 +46,7 @@ const makeFakeWorker = Effect.fnUntraced(function*() {
       }
     },
     terminate: () => {
-      terminated += 1
+      releases.push("terminate")
     },
     addEventListener: (
       type: string,
@@ -72,7 +73,7 @@ const makeFakeWorker = Effect.fnUntraced(function*() {
     spawn,
     closed,
     spawnCount: () => spawned,
-    terminateCount: () => terminated
+    releases
   }
 })
 
@@ -81,20 +82,20 @@ describe("BrowserSqlite.layerWorker", () => {
     "spawns the worker once, completes the ready handshake, and closes then terminates on release",
     Effect.fnUntraced(function*() {
       const fake = yield* makeFakeWorker()
-      const scope = yield* Effect.scope
       const built = yield* Effect.scoped(
         Effect.gen(function*() {
           const context = yield* Layer.build(BrowserSqlite.layerWorker(fake.spawn))
           assert.strictEqual(fake.spawnCount(), 1)
-          assert.strictEqual(fake.terminateCount(), 0)
+          assert.deepStrictEqual(fake.releases, [])
           return context.mapUnsafe.has(SqliteClient.SqliteClient.key)
         })
       )
       assert.isTrue(built)
       yield* Deferred.await(fake.closed)
       assert.strictEqual(fake.spawnCount(), 1)
-      assert.strictEqual(fake.terminateCount(), 1)
-      void scope
+      // The close frame must leave before the worker is killed, or the driver
+      // never gets the chance to shut the database down cleanly.
+      assert.deepStrictEqual(fake.releases, ["close", "terminate"])
     }, Effect.scoped)
   )
 })
