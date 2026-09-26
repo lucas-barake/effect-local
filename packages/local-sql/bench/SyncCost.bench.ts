@@ -100,7 +100,7 @@ const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
       discard: (request) => server.discard(request, "reader"),
-      submit: server.submit,
+      submitBatch: (request) => server.admitBatch(request, null),
       pull: (request) => server.pullAuthorized(request, "reader"),
       bootstrap: (request) => server.bootstrapAuthorized(request, "reader"),
       watch: (request) => server.watchAuthorized(request, "reader").pipe(Stream.unwrap)

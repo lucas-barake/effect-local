@@ -177,7 +177,7 @@ const layerSync = Effect.gen(function*() {
     waitForCredentialChange: () => Effect.never,
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Effect.never,
-    submit: store.submit,
+    submitBatch: (request) => store.admitBatch(request, null),
     discard: (request) => store.discard(request, null),
     pull: store.pull,
     bootstrap: store.bootstrap,

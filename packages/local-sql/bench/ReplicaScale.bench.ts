@@ -62,7 +62,7 @@ const layerReplica = (onWatchCount: (change: number) => void, layerServices: Lay
     waitForCredentialChange: () => Effect.never,
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Effect.never,
-    submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+    submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
     discard: () => Effect.fail(new ReplicaError.ServerUnavailable()),
     pull: () => Effect.never,
     bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),

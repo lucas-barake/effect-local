@@ -477,7 +477,7 @@ const unavailableSync = SyncEngine.SyncEngine.of({
   waitForCredentialChange: () => Effect.never,
   transportGeneration: Effect.succeed(0),
   waitForTransportChange: () => Effect.never,
-  submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+  submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
   discard: () => Effect.fail(new ReplicaError.ServerUnavailable()),
   pull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
   bootstrap: () => Effect.die("unexpected bootstrap"),
@@ -489,7 +489,7 @@ const serverSync = (server: ServerStore.Service) =>
     waitForCredentialChange: () => Effect.never,
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Effect.never,
-    submit: server.submit,
+    submitBatch: (request) => server.admitBatch(request, null),
     discard: (request) => server.discard(request, null),
     pull: server.pull,
     bootstrap: server.bootstrap,
@@ -712,7 +712,7 @@ describe("client schema evolution", () => {
         const sql = yield* SqlClient.SqlClient
         const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "90", title: "optimistic" })
-        yield* v1.markSubmitting(pending.envelope.mutationId)
+        yield* v1.markSubmitting([pending.envelope.mutationId])
         yield* v1.applyEntries([Protocol.AcceptedMutation.make({
           sequence: Identity.ServerSequence.make(1),
           spaceId,
@@ -757,7 +757,7 @@ describe("client schema evolution", () => {
         const sql = yield* SqlClient.SqlClient
         const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "92", title: "receipt-backed" })
-        yield* v1.markSubmitting(pending.envelope.mutationId)
+        yield* v1.markSubmitting([pending.envelope.mutationId])
         const encodedRejection = yield* Schema.encodeEffect(SchemaPolicyRejectedError)(
           new SchemaPolicyRejectedError({ reason: "server-rejected" })
         )
@@ -773,7 +773,7 @@ describe("client schema evolution", () => {
           origin: "Mutation" as const,
           rejection: encodedRejection
         })
-        yield* v1.persistReceipt(receipt)
+        yield* v1.persistReceipts([receipt])
         yield* sql`CREATE TRIGGER fail_projection_promotion BEFORE UPDATE OF visible_revision
         ON effect_local_client_spaces
         WHEN NEW.visible_revision <> OLD.visible_revision
@@ -1892,10 +1892,10 @@ describe("client schema evolution", () => {
         const failSubmit = yield* Ref.make(true)
         const failOnce = SyncEngine.SyncEngine.of({
           ...live,
-          submit: Effect.fnUntraced(function*(request) {
+          submitBatch: Effect.fnUntraced(function*(request) {
             const shouldFail = yield* Ref.get(failSubmit)
             if (shouldFail) return yield* new ReplicaError.ServerUnavailable()
-            return yield* live.submit(request)
+            return yield* live.submitBatch(request)
           })
         })
         const replica = yield* buildReplica(definitionV2, layerHandlersV2, failOnce, evolution)

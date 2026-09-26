@@ -66,7 +66,7 @@ const layerDirectSync = Layer.effect(
       waitForCredentialChange: () => Effect.never,
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
-      submit: server.submit,
+      submitBatch: (request) => server.admitBatch(request, null),
       discard: (request) => server.discard(request, null),
       pull: server.pull,
       bootstrap: server.bootstrap,

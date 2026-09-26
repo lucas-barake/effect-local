@@ -84,7 +84,7 @@ const makeRemote = Effect.fnUntraced(function*() {
     waitForCredentialChange: () => Effect.never,
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Effect.never,
-    submit: (request) => gate(server.submit(request)),
+    submitBatch: (request) => gate(server.admitBatch(request, null)),
     discard: (request) => gate(server.discard(request, null)),
     pull: (request) =>
       Effect.suspend(() => {

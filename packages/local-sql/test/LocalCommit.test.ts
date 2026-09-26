@@ -61,12 +61,13 @@ const layerServer = ServerStore.layerTrusted({
 
 const makeRemote = Effect.fnUntraced(function*() {
   const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
-  const submitted = yield* Queue.unbounded<Protocol.SubmitRequest>()
+  const submitted = yield* Queue.unbounded<Protocol.MutationEnvelope>()
   const remote = SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Effect.never,
-    submit: (request) => Queue.offer(submitted, request).pipe(Effect.andThen(server.submit(request))),
+    submitBatch: (request) =>
+      Queue.offerAll(submitted, request.envelopes).pipe(Effect.andThen(server.admitBatch(request, null))),
     discard: (request) => server.discard(request, null),
     pull: server.pull,
     bootstrap: server.bootstrap,
@@ -182,9 +183,9 @@ describe("local commit", () => {
       yield* Deferred.succeed(probe.release, undefined)
       yield* Fiber.join(interruption)
 
-      const request = yield* Queue.take(submitted)
-      assert.strictEqual(request.envelope.name, Domain.PutTodo.name)
-      assert.deepStrictEqual(request.envelope.payload, Domain.todo("interrupted-caller"))
+      const envelope = yield* Queue.take(submitted)
+      assert.strictEqual(envelope.name, Domain.PutTodo.name)
+      assert.deepStrictEqual(envelope.payload, Domain.todo("interrupted-caller"))
     })
   )
 

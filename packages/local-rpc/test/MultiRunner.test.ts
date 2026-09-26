@@ -392,6 +392,11 @@ const putTodo = Effect.fnUntraced(function*(spaceId: Identity.SpaceId, localSequ
   } satisfies Protocol.SubmitRequest
 })
 
+const submitOne = (engine: SyncEngine.Service, request: Protocol.SubmitRequest) =>
+  engine.submitBatch({ envelopes: [request.envelope], schema: request.schema }).pipe(
+    Effect.map(({ receipts }) => receipts[0])
+  )
+
 const pullRequest = (spaceId: Identity.SpaceId) =>
   Protocol.PullRequest.make({
     spaceId,
@@ -472,7 +477,7 @@ const admitsOnOwner = (
     const viaA = yield* connect(cluster.a)
     const viaB = yield* connect(cluster.b)
 
-    const receipt = yield* viaA.sync.submit(yield* putTodo(spaceId, 1, "crosses runners"))
+    const receipt = yield* submitOne(viaA.sync, yield* putTodo(spaceId, 1, "crosses runners"))
 
     assert.strictEqual(receipt._tag, "Accepted")
     assert.deepStrictEqual((yield* endedSpans(cluster, "ServerStore.submit", spaceId)).map((span) => span.runner), [
@@ -513,7 +518,7 @@ const wakesAcrossRunners = (
     )
     yield* Queue.take(wakes)
 
-    const receipt = yield* viaB.sync.submit(yield* putTodo(spaceId, 1, "written through B"))
+    const receipt = yield* submitOne(viaB.sync, yield* putTodo(spaceId, 1, "written through B"))
 
     assert.strictEqual(receipt._tag, "Accepted")
     assert.deepStrictEqual(yield* Queue.take(wakes), { spaceId })
@@ -558,8 +563,10 @@ const deniesMismatchedSecrets = (layerSerialization: Layer.Layer<RpcSerializatio
     const viaA = yield* connect(cluster.a)
     const viaB = yield* connect(cluster.b)
 
-    const local = yield* viaA.sync.submit(yield* putTodo(localSpace, 1, "same runner"))
-    const denied = yield* viaA.sync.submit(yield* putTodo(remoteSpace, 2, "forged across runners")).pipe(Effect.flip)
+    const local = yield* submitOne(viaA.sync, yield* putTodo(localSpace, 1, "same runner"))
+    const denied = yield* submitOne(viaA.sync, yield* putTodo(remoteSpace, 2, "forged across runners")).pipe(
+      Effect.flip
+    )
 
     assert.strictEqual(local._tag, "Accepted")
     assert.strictEqual(denied._tag, "AuthorizationDenied")
@@ -574,7 +581,7 @@ const maintainsOnSingletonOwner = (layerSerialization: Layer.Layer<RpcSerializat
     const spaceId = yield* spaceOwnedBy(cluster.b)
     yield* Effect.scoped(Effect.gen(function*() {
       const viaA = yield* connect(cluster.a)
-      assert.strictEqual((yield* viaA.sync.submit(yield* putTodo(spaceId, 1, "history to prune")))._tag, "Accepted")
+      assert.strictEqual((yield* submitOne(viaA.sync, yield* putTodo(spaceId, 1, "history to prune")))._tag, "Accepted")
     }))
     yield* Queue.clear(cluster.spans)
     const singletonShard = cluster.a.sharding.getShardId(EntityId.make(maintenanceSingleton), "default")
@@ -664,7 +671,10 @@ describe("multi-runner cluster with postgres server storage", () => {
         for (let localSequence = 1; localSequence <= 4; localSequence++) {
           let gateway = viaA
           if (localSequence % 2 === 0) gateway = viaB
-          const receipt = yield* gateway.sync.submit(yield* putTodo(spaceId, localSequence, `write ${localSequence}`))
+          const receipt = yield* submitOne(
+            gateway.sync,
+            yield* putTodo(spaceId, localSequence, `write ${localSequence}`)
+          )
           if (receipt._tag !== "Accepted") assert.fail(`expected an accepted receipt, got ${receipt._tag}`)
           sequences.push(receipt.serverSequence)
         }

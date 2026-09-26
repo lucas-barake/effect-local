@@ -189,7 +189,7 @@ const layers = () => {
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
       discard: (request) => store.discard(request, "reader"),
-      submit: store.submit,
+      submitBatch: (request) => store.admitBatch(request, null),
       pull: (request) => store.pullAuthorized(request, "reader"),
       bootstrap: (request) => store.bootstrapAuthorized(request, "reader"),
       watch: (request) => store.watchAuthorized(request, "reader").pipe(Stream.unwrap)

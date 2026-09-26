@@ -120,7 +120,7 @@ const directSync = (server: ServerStore.Service) =>
       waitForCredentialChange: () => Effect.never,
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
-      submit: server.submit,
+      submitBatch: (request) => server.admitBatch(request, null),
       discard: (request) => server.discard(request, null),
       pull: server.pull,
       bootstrap: server.bootstrap,
@@ -275,7 +275,7 @@ describe("reconciliation workflow", () => {
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: () =>
             Deferred.succeed(pullEntered, undefined).pipe(
               Effect.andThen(Effect.never),
@@ -324,7 +324,7 @@ describe("reconciliation workflow", () => {
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: () =>
             Deferred.succeed(pullEntered, undefined).pipe(
               Effect.andThen(Deferred.await(releasePull)),
@@ -383,7 +383,7 @@ describe("reconciliation workflow", () => {
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: () => Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 0 })),
           bootstrap: () => Effect.die("unexpected bootstrap"),
           watch: () =>
@@ -446,7 +446,7 @@ describe("reconciliation workflow", () => {
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, null),
-          submit: server.submit,
+          submitBatch: (request) => server.admitBatch(request, null),
           pull: (request) =>
             Ref.get(denied).pipe(
               Effect.flatMap((isDenied) => {
@@ -659,7 +659,7 @@ describe("reconciliation workflow", () => {
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, null),
-          submit: server.submit,
+          submitBatch: (request) => server.admitBatch(request, null),
           pull: server.pull,
           bootstrap: server.bootstrap,
           watch: server.watch
@@ -670,7 +670,7 @@ describe("reconciliation workflow", () => {
             transportGeneration: Effect.succeed(0),
             waitForTransportChange: () => Effect.never,
             discard: (request) => server.discard(request, null),
-            submit: server.submit,
+            submitBatch: (request) => server.admitBatch(request, null),
             pull: (request) => {
               if (request.cursor === null) return server.pull(request)
               const cursor = request.cursor
@@ -816,7 +816,7 @@ describe("reconciliation workflow", () => {
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: (request) =>
             Ref.update(pulls, (count) => count + 1).pipe(
               Effect.andThen(Deferred.succeed(pulled, undefined)),
@@ -904,7 +904,7 @@ describe("reconciliation workflow", () => {
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
-        submit: () =>
+        submitBatch: () =>
           Ref.update(attempts, (count) => count + 1).pipe(
             Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
           ),
@@ -990,7 +990,7 @@ describe("reconciliation workflow", () => {
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
-        submit: () => Effect.die("unexpected submit"),
+        submitBatch: () => Effect.die("unexpected submit"),
         pull: () =>
           Ref.update(attempts, (count) => count + 1).pipe(
             Effect.andThen(Deferred.succeed(attempted, undefined)),

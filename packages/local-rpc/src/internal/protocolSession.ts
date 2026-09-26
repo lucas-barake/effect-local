@@ -3,6 +3,7 @@ import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Stream from "effect/Stream"
 import type { Service } from "../ProtocolSession.js"
+import { hasRemoteDefect } from "./remoteDefect.js"
 
 export const run = Effect.fnUntraced(function*<A,>(
   self: Service,
@@ -10,6 +11,15 @@ export const run = Effect.fnUntraced(function*<A,>(
 ) {
   const version = yield* self.version
   return yield* execute(version).pipe(
+    Effect.catchCause((cause) => {
+      if (!hasRemoteDefect(cause)) return Effect.failCause(cause)
+      return self.rejected(version).pipe(
+        Effect.flatMap((renegotiated) => {
+          if (renegotiated === version) return Effect.failCause(cause)
+          return execute(renegotiated)
+        })
+      )
+    }),
     Effect.catchTag(
       "ProtocolVersionRejected",
       () => self.rejected(version).pipe(Effect.flatMap(execute)),

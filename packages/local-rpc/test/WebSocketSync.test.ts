@@ -107,6 +107,11 @@ const pullRequest = (requestedSpaceId = spaceId): Protocol.PullRequest =>
     cursor: null,
     limit: 10
   })
+const submitOne = (engine: SyncEngine.Service, request: Protocol.SubmitRequest) =>
+  engine.submitBatch({ envelopes: [request.envelope], schema: request.schema }).pipe(
+    Effect.map(({ receipts }) => receipts[0])
+  )
+
 const evolution = Evolution.make({
   current: definition,
   steps: [Evolution.step({
@@ -841,7 +846,7 @@ describe("WebSocket synchronization", () => {
             ...identity,
             digest: yield* Protocol.mutationDigest(identity)
           })
-          yield* remote.submit({ envelope: mutation, schema: definition.schemaIdentity })
+          yield* submitOne(remote, { envelope: mutation, schema: definition.schemaIdentity })
         }
         yield* (yield* ServerStore.ServerStore).maintain(spaceId)
 
@@ -909,11 +914,11 @@ describe("WebSocket synchronization", () => {
           digest: yield* Protocol.mutationDigest(identity)
         }
         const request = { envelope, schema: definition.schemaIdentity }
-        const receipt = yield* remote.submit(request)
+        const receipt = yield* submitOne(remote, request)
         assert.strictEqual(receipt._tag, "Accepted")
 
         const revoked = yield* RevokedSyncEngine
-        const revokedRetry = yield* revoked.submit(request).pipe(Effect.flip)
+        const revokedRetry = yield* submitOne(revoked, request).pipe(Effect.flip)
         assert.strictEqual(revokedRetry._tag, "AuthorizationDenied")
 
         const sql = yield* SqlClient.SqlClient
@@ -944,7 +949,7 @@ describe("WebSocket synchronization", () => {
           ...forbiddenIdentity,
           digest: yield* Protocol.mutationDigest(forbiddenIdentity)
         }
-        const forbidden = yield* remote.submit({
+        const forbidden = yield* submitOne(remote, {
           envelope: forbiddenEnvelope,
           schema: definition.schemaIdentity
         }).pipe(Effect.flip)
@@ -1010,7 +1015,7 @@ describe("WebSocket synchronization", () => {
           ...identity,
           digest: yield* Protocol.mutationDigest(identity)
         }
-        const receipt = yield* remote.submit({ envelope, schema: definition.schemaIdentity })
+        const receipt = yield* submitOne(remote, { envelope, schema: definition.schemaIdentity })
 
         assert.strictEqual(receipt._tag, "Rejected")
         if (receipt._tag === "Rejected") {
@@ -1084,8 +1089,8 @@ describe("WebSocket synchronization", () => {
           digest: yield* Protocol.mutationDigest(identity)
         }
         const request = { envelope: submitted, schema: definition.schemaIdentity }
-        const first = yield* remote.submit(request)
-        const retry = yield* remote.submit(request)
+        const first = yield* submitOne(remote, request)
+        const retry = yield* submitOne(remote, request)
 
         assert.strictEqual(first._tag, "Rejected")
         assert.deepStrictEqual(retry, first)

@@ -70,6 +70,10 @@ export interface Service {
     request: Protocol.SubmitRequest,
     principal: typeof Schema.Json.Type
   ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
+  readonly admitBatch: (
+    request: Protocol.SubmitBatchRequest,
+    principal: typeof Schema.Json.Type
+  ) => Effect.Effect<Protocol.SubmitBatchResult, ReplicaError.ReplicaError>
   readonly discard: (
     request: Protocol.DiscardRequest,
     principal: typeof Schema.Json.Type
@@ -132,6 +136,7 @@ export interface Options<R = never,> extends HistoryOptions {
   }) => Effect.Effect<void, AuthorizationRejection, R>
   readonly authorizeRead: (input: ReadAuthorizationInput) => Effect.Effect<void, AuthorizationRejection, R>
   readonly readAuthorizationRefreshInterval?: Duration.Input | undefined
+  readonly maximumSubmitBatchDuration?: Duration.Input | undefined
   readonly wakeCapacity?: number
   readonly maximumWatchersPerSpace?: number | undefined
   readonly maximumConcurrentReadAuthorizations?: number | undefined
@@ -181,6 +186,7 @@ export const defaults = {
   maintenanceConcurrency: 1,
   maintenanceSpaceBatchSize: 128,
   readAuthorizationRefreshInterval: "30 seconds",
+  maximumSubmitBatchDuration: "1 second",
   maximumWatchersPerSpace: 1_024,
   maximumConcurrentReadAuthorizations: 64,
   maximumPendingReadAuthorizations: 4_096,
@@ -208,6 +214,7 @@ const resolveOptions = <R,>(input: Options<R>): ResolvedOptions<R> => ({
   maintenanceConcurrency: input.maintenanceConcurrency ?? defaults.maintenanceConcurrency,
   maintenanceSpaceBatchSize: input.maintenanceSpaceBatchSize ?? defaults.maintenanceSpaceBatchSize,
   readAuthorizationRefreshInterval: input.readAuthorizationRefreshInterval ?? defaults.readAuthorizationRefreshInterval,
+  maximumSubmitBatchDuration: input.maximumSubmitBatchDuration ?? defaults.maximumSubmitBatchDuration,
   maximumWatchersPerSpace: input.maximumWatchersPerSpace ?? defaults.maximumWatchersPerSpace,
   maximumConcurrentReadAuthorizations: input.maximumConcurrentReadAuthorizations ??
     defaults.maximumConcurrentReadAuthorizations,
@@ -281,6 +288,10 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
       const options = resolveOptions(configured)
       yield* validateOptions(options)
       const storeScope = yield* Effect.scope
+      const maximumSubmitBatchMillis = yield* Configuration.positiveFiniteDurationMillis(
+        "maximumSubmitBatchDuration",
+        options.maximumSubmitBatchDuration
+      )
       const historyHighWater = highWater(options.retainedHistoryEntries, options.maximumHistoryEntries)
       const receiptHighWater = highWater(options.retainedReceipts, options.maximumReceipts)
       const crossesHighWater = (space: typeof Rows.ServerMetaRow.Type) =>
@@ -1672,6 +1683,44 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           })
       )
 
+      const admitBatch = Effect.fnUntraced(
+        function*(request: Protocol.SubmitBatchRequest, principal: typeof Schema.Json.Type) {
+          const receipts: Array<Protocol.Receipt> = []
+          let responseBytes = 1
+          const deadline = (yield* Clock.currentTimeMillis) + maximumSubmitBatchMillis
+          for (const envelope of request.envelopes) {
+            if (receipts.length > 0 && (yield* Clock.currentTimeMillis) >= deadline) break
+            const admitted = yield* admit({ envelope, schema: request.schema }, principal).pipe(
+              Effect.flatMap((receipt) =>
+                Protocol.encodedBytesEffect(receipt).pipe(Effect.map((bytes) => ({ receipt, bytes })))
+              ),
+              Effect.result
+            )
+            if (Result.isFailure(admitted)) {
+              if (receipts.length === 0) {
+                return yield* admitted.failure
+              }
+              break
+            }
+            responseBytes += admitted.success.bytes + 1
+            if (receipts.length > 0 && responseBytes > Protocol.maximumBatchBytes) {
+              break
+            }
+            receipts.push(admitted.success.receipt)
+          }
+          return Protocol.SubmitBatchResult.make({ receipts })
+        },
+        (effect, request) =>
+          effect.pipe(
+            Effect.withSpan("ServerStore.admitBatch", {
+              attributes: {
+                "space.id": request.envelopes[0].spaceId,
+                "batch.size": request.envelopes.length
+              }
+            })
+          )
+      )
+
       const prepareSnapshot = (spaceId: Identity.SpaceId) =>
         SqlTransaction.withServerTransaction(
           sql,
@@ -2277,6 +2326,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
       return ServerStore.of({
         submit: (request) => admit(trustedSubmitRequest(request), null),
         admit,
+        admitBatch,
         discard,
         pull: (input) => {
           const request = trustedPullRequest(input)

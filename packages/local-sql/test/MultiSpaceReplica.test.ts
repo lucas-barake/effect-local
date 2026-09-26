@@ -51,7 +51,7 @@ const remoteService = SyncEngine.SyncEngine.of({
   waitForCredentialChange: () => Effect.never,
   transportGeneration: Effect.succeed(0),
   waitForTransportChange: () => Effect.never,
-  submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+  submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
   discard: () => Effect.die("unexpected discard"),
   pull: () => Effect.never,
   bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -178,11 +178,15 @@ const viewPage = (
     Effect.provideService(Crypto.Crypto, crypto)
   )
 
-const acceptSubmission: SyncEngine.SyncEngine["Service"]["submit"] = (request) =>
-  Effect.succeed(Protocol.AcceptedReceipt.make({
-    ...request.envelope,
-    serverSequence: Identity.ServerSequence.make(1),
-    result: Domain.todo(request.envelope.mutationId, "accepted")
+const acceptSubmission: SyncEngine.SyncEngine["Service"]["submitBatch"] = (request) =>
+  Effect.succeed(Protocol.SubmitBatchResult.make({
+    receipts: request.envelopes.map((envelope) =>
+      Protocol.AcceptedReceipt.make({
+        ...envelope,
+        serverSequence: Identity.ServerSequence.make(1),
+        result: Domain.todo(envelope.mutationId, "accepted")
+      })
+    )
   }))
 
 const awaitNoPending = Effect.fnUntraced(function*(
@@ -228,7 +232,7 @@ const pinnedRemote = (pins: ReadonlyMap<Identity.SpaceId, Pin>) => {
   }
   return SyncEngine.SyncEngine.of({
     ...remoteService,
-    submit: (request) => attempt(request.envelope.spaceId),
+    submitBatch: (request) => attempt(request.envelopes[0].spaceId),
     pull: (request) => attempt(request.spaceId),
     bootstrap: (request) => attempt(request.spaceId)
   })
@@ -492,7 +496,7 @@ describe("multi space Replica", () => {
         waitForCredentialChange: () => Effect.never,
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
-        submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         discard: () => Effect.die("unexpected discard"),
         pull: () => Effect.never,
         bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -759,7 +763,7 @@ describe("multi space Replica", () => {
       }
       const retryingRemote = SyncEngine.SyncEngine.of({
         ...remoteService,
-        submit: observeAttempt,
+        submitBatch: observeAttempt,
         pull: observeAttempt,
         bootstrap: observeAttempt
       })
@@ -811,7 +815,7 @@ describe("multi space Replica", () => {
         waitForCredentialChange: () => Effect.never,
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
-        submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         discard: () => Effect.die("unexpected discard"),
         pull: () => {
           const acquire = Ref.updateAndGet(current, (count) => count + 1).pipe(
@@ -878,7 +882,7 @@ describe("multi space Replica", () => {
         waitForCredentialChange: () => Effect.never,
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
-        submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         discard: () => Effect.die("unexpected discard"),
         pull: () =>
           Effect.acquireUseRelease(
@@ -956,24 +960,32 @@ describe("multi space Replica", () => {
         waitForCredentialChange: () => Effect.never,
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
-        submit: (request) => {
-          if (request.envelope.spaceId !== foregroundSpace) {
+        submitBatch: (request) => {
+          if (request.envelopes[0].spaceId !== foregroundSpace) {
             if (!blockBackground) return Effect.fail(new ReplicaError.ServerUnavailable())
             return Ref.updateAndGet(activeBackground, (count) => count + 1).pipe(
               Effect.tap(() => Deferred.succeed(backgroundEntered, undefined)),
               Effect.andThen(Deferred.await(releaseBackground)),
-              Effect.as(Protocol.AcceptedReceipt.make({
-                ...request.envelope,
-                serverSequence: Identity.ServerSequence.make(1),
-                result: Domain.todo(request.envelope.spaceId, "background settled")
+              Effect.as(Protocol.SubmitBatchResult.make({
+                receipts: request.envelopes.map((envelope) =>
+                  Protocol.AcceptedReceipt.make({
+                    ...envelope,
+                    serverSequence: Identity.ServerSequence.make(1),
+                    result: Domain.todo(envelope.spaceId, "background settled")
+                  })
+                )
               })),
               Effect.ensuring(Ref.update(activeBackground, (count) => count - 1))
             )
           }
-          return Effect.succeed(Protocol.AcceptedReceipt.make({
-            ...request.envelope,
-            serverSequence: Identity.ServerSequence.make(1),
-            result: Domain.todo("foreground", "settled")
+          return Effect.succeed(Protocol.SubmitBatchResult.make({
+            receipts: request.envelopes.map((envelope) =>
+              Protocol.AcceptedReceipt.make({
+                ...envelope,
+                serverSequence: Identity.ServerSequence.make(1),
+                result: Domain.todo("foreground", "settled")
+              })
+            )
           }))
         },
         discard: () => Effect.die("unexpected discard"),
@@ -1114,7 +1126,7 @@ describe("multi space Replica", () => {
       }
       const failingRemote = SyncEngine.SyncEngine.of({
         ...remoteService,
-        submit: (request) => observeAttempt(request.envelope.spaceId),
+        submitBatch: (request) => observeAttempt(request.envelopes[0].spaceId),
         pull: (request) => observeAttempt(request.spaceId),
         bootstrap: (request) => observeAttempt(request.spaceId)
       })
@@ -1179,7 +1191,7 @@ describe("multi space Replica", () => {
       }
       const blockedRemote = SyncEngine.SyncEngine.of({
         ...remoteService,
-        submit: attempt,
+        submitBatch: attempt,
         pull: attempt,
         bootstrap: attempt,
         watch: () =>
@@ -1458,7 +1470,7 @@ describe("multi space Replica", () => {
       let pulls = 0
       const remote = SyncEngine.SyncEngine.of({
         ...remoteService,
-        submit: acceptSubmission,
+        submitBatch: acceptSubmission,
         pull: (request) => {
           pulls += 1
           if (pulls > 1) return viewPage(services.crypto, viewId, request, [], false)
@@ -1522,7 +1534,7 @@ describe("multi space Replica", () => {
       let pulls = 0
       const remote = SyncEngine.SyncEngine.of({
         ...remoteService,
-        submit: acceptSubmission,
+        submitBatch: acceptSubmission,
         pull: (request) => {
           pulls += 1
           if (pulls === 1) return viewPage(services.crypto, viewId, request, [remoteChange], true)
@@ -1628,16 +1640,20 @@ describe("multi space Replica", () => {
       let submissions = 0
       const remote = SyncEngine.SyncEngine.of({
         ...remoteService,
-        submit: (request) => {
+        submitBatch: (request) => {
           submissions += 1
-          const accept = Effect.suspend(() => {
-            serverSequence += 1
-            return Effect.succeed(Protocol.AcceptedReceipt.make({
-              ...request.envelope,
-              serverSequence: Identity.ServerSequence.make(serverSequence),
-              result: Domain.todo(request.envelope.mutationId, "accepted")
-            }))
-          })
+          const accept = Effect.sync(() =>
+            Protocol.SubmitBatchResult.make({
+              receipts: request.envelopes.map((envelope) => {
+                serverSequence += 1
+                return Protocol.AcceptedReceipt.make({
+                  ...envelope,
+                  serverSequence: Identity.ServerSequence.make(serverSequence),
+                  result: Domain.todo(envelope.mutationId, "accepted")
+                })
+              })
+            })
+          )
           if (submissions > 1) return accept
           return Deferred.succeed(backgroundSubmitted, undefined).pipe(
             Effect.andThen(Deferred.await(releaseBackground)),

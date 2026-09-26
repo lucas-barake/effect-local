@@ -46,7 +46,7 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
         "sessionAcquisitionTimeout",
         options?.sessionAcquisitionTimeout ?? "10 seconds"
       )
-      const configured = options?.supportedProtocolVersions ?? [Protocol.currentProtocolVersion]
+      const configured = options?.supportedProtocolVersions ?? Protocol.supportedProtocolVersions
       const request = yield* Schema.decodeUnknownEffect(Protocol.NegotiateRequest)({
         supportedVersions: configured
       }).pipe(

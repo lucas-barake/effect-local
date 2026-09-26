@@ -475,7 +475,7 @@ before retry receipt lookup. Mutation admission rejection consumes the client's 
 retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted` is the explicit allow all Layer for
 tests and already trusted processes.
 
-`SyncRpc.Rpcs` multiplexes submit, pull, bootstrap, watch, and ephemera on one Effect RPC WebSocket. The server uses
+`SyncRpc.Rpcs` multiplexes submit, batch submit, pull, bootstrap, watch, and ephemera on one Effect RPC WebSocket. The server uses
 `Authentication.layerServer`. The client uses `Authentication.layerClient` with an application supplied
 `CredentialProvider`. Its `acquire` Effect runs for every RPC and returns a redacted bearer credential plus its
 nonnegative generation. `awaitChange(rejectedGeneration)` signals when `acquire` can return a different generation.
@@ -497,7 +497,7 @@ It also remains responsible for its HTTP server, WebSocket path, TLS, Origin pol
 tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. A
 reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
 
-Each space is one entity. It serializes Submit and Discard behind one admission permit and serves Pull, Bootstrap,
+Each space is one entity. It serializes Submit, SubmitBatch, and Discard behind one admission permit and serves Pull, Bootstrap,
 Watch, and ephemeral operations concurrently, so a paused Bootstrap page or a full join population cannot block
 mutation admission. A Layer wide fail fast allowance bounds Bootstrap assertion verification and preparation, and a
 per space allowance bounds immutable page reads and ephemeral join verification. Saturated work fails with typed
@@ -666,7 +666,8 @@ the enclosing model through the same transaction. These semantics are domain too
 ## Testing
 
 `TestServer.layer` adapts the real authoritative store to a production shaped `SyncEngine`. `FaultInjection` can
-partition and heal the link, drop the next receipt after the server commits it, and duplicate the next catch up page.
+partition and heal the link, drop the next submit response after the server commits its receipts, and duplicate the
+next catch up page.
 `TestReplica.layer` is the same `SqlReplica` composition used in production.
 
 The repository runs on Node `22.22.2`, `24.15.0`, or `26+`.
@@ -835,6 +836,11 @@ Negotiation selects the highest shared version. A rolling peer that rejects a ca
 and retry. If there is no common version, the client receives terminal `UpgradeRequired` instead of retrying a decode
 failure forever.
 
+Both sides default to `Protocol.supportedProtocolVersions`, which is `[2, 1]`. Version 2 submits up to
+`Protocol.maximumSubmitBatchEntries` pending mutations of one space in one round trip. A session that selected version 1
+submits one mutation per round trip with identical receipts. A reconnect that reaches a server built before version 2
+gets a defect for the batch, renegotiates to version 1, and resubmits the same mutations one at a time.
+
 ### Prompt compatible old clients to reload
 
 An accepted old client continues syncing. Its space status changes to `SchemaUpdateAvailable`, which includes the
@@ -915,8 +921,9 @@ The complete deployment sequence is:
 - Ephemeral roster, live events, and retained state are best effort, server expired, multi-space isolated, and never
   enter the durable mutation log. Persist read or delivery positions with a normal application mutation when they must
   survive server restart or the configured state TTL.
-- Cluster routes each space to one live owner across runners. Entity operations are volatile. A failed submit remains
-  in the client's pending SQLite outbox until exact resubmission returns the SQL backed terminal receipt. Pull and watch
+- Cluster routes each space to one live owner across runners. Entity operations are volatile. A failed submit, or the
+  unacknowledged tail of a batch, remains in the client's pending SQLite outbox until exact resubmission returns the SQL
+  backed terminal receipt. Pull and watch
   recover from the durable server sequence.
 - Workflow executions are finite and generation keyed. SQLite progress repairs lost wakes and browser termination when
   a runner starts again.

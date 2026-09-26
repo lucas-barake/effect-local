@@ -33,6 +33,15 @@ export class Submit extends Rpc.make("Submit", {
   error: ReplicaError.ReplicaError
 }).annotateMerge(volatileAnnotations) {}
 
+export class SubmitBatch extends Rpc.make("SubmitBatch", {
+  payload: {
+    request: Protocol.SubmitBatchRequest,
+    assertion: PrincipalAssertion.PrincipalAssertion
+  },
+  success: Protocol.SubmitBatchResult,
+  error: ReplicaError.ReplicaError
+}).annotateMerge(volatileAnnotations) {}
+
 export class Discard extends Rpc.make("Discard", {
   payload: {
     request: Protocol.DiscardRequest,
@@ -97,6 +106,7 @@ export class HeartbeatEphemeral extends Rpc.make("HeartbeatEphemeral", {
 
 export const Space = Entity.make("EffectLocal/Space", [
   Submit,
+  SubmitBatch,
   Discard,
   Pull,
   Bootstrap,
@@ -112,6 +122,11 @@ export interface ClientService {
     request: Protocol.SubmitRequest,
     assertion: PrincipalAssertion.PrincipalAssertion
   ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
+  readonly submitBatch: (
+    spaceId: Identity.SpaceId,
+    request: Protocol.SubmitBatchRequest,
+    assertion: PrincipalAssertion.PrincipalAssertion
+  ) => Effect.Effect<Protocol.SubmitBatchResult, ReplicaError.ReplicaError>
   readonly discard: (
     spaceId: Identity.SpaceId,
     request: Protocol.DiscardRequest,
@@ -158,6 +173,15 @@ export class Client extends Context.Service<Client, ClientService>()(
 const mapClient = (makeClient: Effect.Success<typeof Space.client>): ClientService => ({
   submit: (spaceId, request, assertion) =>
     makeClient(spaceId).Submit({ request, assertion }).pipe(
+      Effect.catchTags({
+        MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        EntityNotAssignedToRunner: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
+      })
+    ),
+  submitBatch: (spaceId, request, assertion) =>
+    makeClient(spaceId).SubmitBatch({ request, assertion }).pipe(
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -302,6 +326,15 @@ export const layerHandlers = (options: HandlerOptions = {}) =>
               if (!routed(payload.request.envelope.spaceId)) return Effect.fail(misrouted)
               return verifier.verify(payload.assertion).pipe(
                 Effect.flatMap((principal) => store.admit(payload.request, principal)),
+                admission.withPermits(1)
+              )
+            },
+            SubmitBatch: ({ payload }) => {
+              if (!payload.request.envelopes.every((envelope) => routed(envelope.spaceId))) {
+                return Effect.fail(misrouted)
+              }
+              return verifier.verify(payload.assertion).pipe(
+                Effect.flatMap((principal) => store.admitBatch(payload.request, principal)),
                 admission.withPermits(1)
               )
             },

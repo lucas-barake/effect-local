@@ -671,22 +671,70 @@ export const layerOnePass = (
         }
       }).pipe(Effect.tapErrorTag("AuthorizationDenied", () => local.revokeReplication))
 
+      const takeSubmitBatch = Effect.fnUntraced(function*(
+        pending: ReadonlyArray<Protocol.PendingMutation>,
+        offset: number
+      ) {
+        const envelopes: Array<Protocol.MutationEnvelope> = []
+        let requestBytes = 1
+        for (
+          let index = offset;
+          index < pending.length && envelopes.length < Protocol.maximumSubmitBatchEntries;
+          index++
+        ) {
+          const envelope = pending[index].envelope
+          requestBytes += (yield* Protocol.encodedBytesEffect(envelope)) + 1
+          if (envelopes.length > 0 && requestBytes > Protocol.maximumBatchBytes) break
+          envelopes.push(envelope)
+        }
+        return envelopes
+      })
+
+      const validateBatchReceipts = (
+        envelopes: ReadonlyArray<Protocol.MutationEnvelope>,
+        receipts: ReadonlyArray<Protocol.Receipt>
+      ) => {
+        if (receipts.length === 0 || receipts.length > envelopes.length) {
+          return Effect.fail(
+            new ReplicaError.ProtocolInvalid({
+              message: `SubmitBatch returned ${receipts.length} receipts for ${envelopes.length} mutations`
+            })
+          )
+        }
+        for (let index = 0; index < receipts.length; index++) {
+          if (receipts[index].mutationId !== envelopes[index].mutationId) {
+            return Effect.fail(
+              new ReplicaError.ProtocolInvalid({
+                message: `SubmitBatch receipt ${index} does not belong to mutation ${envelopes[index].mutationId}`
+              })
+            )
+          }
+        }
+        return Effect.void
+      }
+
       const submitPending = Effect.gen(function*() {
         yield* local.settleReceipts
         while (true) {
           const pending = yield* local.pendingToSubmit
           let installedExpiredSnapshot = false
-          for (const mutation of pending) {
-            const receipt = yield* Effect.gen(function*() {
-              yield* local.markSubmitting(mutation.envelope.mutationId)
-              const remoteReceipt = yield* remote.submit({
-                envelope: mutation.envelope,
-                schema: options.definition.schemaIdentity
-              })
-              yield* local.persistReceipt(remoteReceipt)
-              return remoteReceipt
-            }).pipe(Effect.tapError(() => local.markRetrying(mutation.envelope.mutationId)))
-            if (receipt._tag === "Expired") {
+          let offset = 0
+          while (offset < pending.length && !installedExpiredSnapshot) {
+            const envelopes = yield* takeSubmitBatch(pending, offset)
+            const mutationIds = envelopes.map((envelope) => envelope.mutationId)
+            const receipts = yield* Effect.gen(function*() {
+              yield* local.markSubmitting(mutationIds)
+              const result = yield* remote.submitBatch({ envelopes, schema: options.definition.schemaIdentity })
+              yield* validateBatchReceipts(envelopes, result.receipts)
+              yield* local.persistReceipts(result.receipts)
+              if (result.receipts.length < mutationIds.length) {
+                yield* local.markRetrying(mutationIds.slice(result.receipts.length))
+              }
+              return result.receipts
+            }).pipe(Effect.tapError(() => local.markRetrying(mutationIds)))
+            offset += receipts.length
+            for (const receipt of receipts) {
+              if (receipt._tag !== "Expired") continue
               yield* local.settleReceipts
               const unresolved = (yield* local.pendingToSubmit).some(
                 (candidate) => candidate.envelope.mutationId === receipt.mutationId

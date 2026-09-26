@@ -2,7 +2,9 @@
 
 `SyncEngine` is the transport neutral client contract:
 
-- `submit` sends one stable mutation envelope and returns its durable terminal receipt
+- `submitBatch` sends up to `Protocol.maximumSubmitBatchEntries` stable mutation envelopes of one space in local
+  order and returns their durable terminal receipts in the same order. The result may cover only a nonempty prefix of
+  the envelopes. The caller resubmits the rest.
 - `discard` resolves one quarantined envelope without executing its mutation handler
 - `pull` advances one durable client view through bounded `Upsert`, `Delete`, and `Retract` changes, or returns the
   immutable scoped snapshot manifest required for bootstrap
@@ -17,7 +19,12 @@ without a full bootstrap.
 
 The reconciler does not trust notification delivery or ordering. A notification only requests another durable
 generation for its space. Every sync pass reads that space's SQLite cursor, catches up, submits pending mutations in
-local order, and catches up again. SQLite commits requested generation changes with local mutations and records
+local order, and catches up again. Pending mutations leave in batches of at most `Protocol.maximumSubmitBatchEntries`
+envelopes whose encoded size stays within `Protocol.maximumBatchBytes`, so N pending mutations cost
+`ceil(N / maximumSubmitBatchEntries)` round trips when nothing fails. The client marks a batch as submitting in one
+SQLite transaction and records its receipts in one transaction with a savepoint per receipt, so a receipt that fails
+validation rolls back alone and the receipts before it stay recorded. The next batch is sent only after the previous
+batch's receipts are durable. SQLite commits requested generation changes with local mutations and records
 completed generations idempotently. The in memory composition has one dispatcher, one keyed watch per joined space,
 and one keyed turn per active space. A blocked or retrying turn cannot prevent another key from starting, and all keys
 share the same RPC protocol and physical WebSocket.
@@ -103,8 +110,8 @@ full private result was reclaimed.
 
 ## WebSocket RPC
 
-`SyncRpc.Rpcs` uses one Effect RPC group for negotiation, submit, discard, pull, bootstrap, watch, ephemeral join,
-publish, and heartbeat. Effect's RPC
+`SyncRpc.Rpcs` uses one Effect RPC group for negotiation, submit, batch submit, discard, pull, bootstrap, watch,
+ephemeral join, publish, and heartbeat. Effect's RPC
 Schema codecs define the external contract. `SyncServer.layer` is the authenticated facade. It routes each operation
 through the Effect Cluster entity named by the request's space. The entity validates that embedded space identity
 matches its Cluster address, then calls `ServerStore` or `EphemeralHub`. `SyncClient.layer` maps the generated client
@@ -149,6 +156,22 @@ SQLite outbox. After admission, `ServerStore` keeps the terminal receipt and acc
 `effect_local_server_receipts` and `effect_local_authoritative_log`. If a runner fails before SQL commit, the entity call
 fails and the client resubmits. If SQL committed before the reply was lost, exact resubmission returns the stored receipt.
 
+A batch is one entity call under the same admission permit as a single submit. The entity admits its envelopes in order
+and each admission is its own SQL transaction, exactly as if the envelopes had arrived as separate submits. A terminal
+rejection is a receipt, so later envelopes in the batch are still admitted. Any other failure stops the batch. When it
+happens at the first envelope the call fails with that error. When it happens later the call returns the receipts
+admitted so far, and the client's next batch starts at the failed envelope and receives the error there. The receipts
+of one response are bounded by `Protocol.maximumBatchBytes`. An admitted envelope whose receipt would exceed that bound
+is left out of the response and returned by exact resubmission. The entity also stops starting admissions once a batch
+has run for `maximumSubmitBatchDuration`, default 1 second, so a slow database or authorization hook shortens the
+response instead of letting one call outlive the client's `rpcTimeout`. An interrupted or lost batch leaves a committed
+prefix that exact resubmission returns without executing anything twice.
+
+One SQL transaction per batch was measured and rejected. Admission issues about 25 statements per mutation, so
+commits are a small share of its cost. On PostgreSQL a single transaction was 3 to 6 percent slower for 56 mutations
+and its savepoints overflow the 64 entry subtransaction cache after 32 mutations. It would also hold the space lock,
+and on SQLite the database writer lock, for the whole batch and keep compaction from running between mutations.
+
 This is the same store backed actor pattern as the former recipient relay. Persisting Submit through Cluster
 `MessageStorage` would store every request payload and reply a second time beside the server log, and the application
 would have to clear them with `clearReplies` once the SQL receipt exists. Keeping entity calls
@@ -177,6 +200,17 @@ ephemeral operation must carry that selected version. There is no implicit proto
 operation rejected after reconnect clears the cached selection, negotiates against the new peer, and retries once. No
 shared version returns typed `UpgradeRequired`. Reconciliation treats it as terminal. Transport loss and
 `ServerUnavailable` remain retryable. A malformed frame remains `ProtocolInvalid`. It is not used as a version signal.
+
+Protocol version 2 adds `SubmitBatch`. Clients and servers support versions 2 and 1 by default. A session that selected
+version 1 submits each envelope with `Submit` and still returns batch results to the reconciler. The server rejects a
+`SubmitBatch` that carries version 1 with `ProtocolInvalid`. A server configured without version 2 rejects a cached
+version 2 with `ProtocolVersionRejected`, and the client renegotiates and falls back to `Submit`. A server binary built
+before version 2 has no `SubmitBatch` handler. It answers with a defect and executes nothing. The client keeps its
+selected version across reconnects, so a reconnect that lands on such a server during a rolling deploy or rollback
+reaches it with version 2 cached. Any remote defect makes the client renegotiate. When the peer selects a different
+version, the operation is retried once at that version, which falls back to `Submit`. When the version is unchanged, the
+defect is a server failure and every sync operation reports it as typed `ProtocolInvalid`, so reconciliation shows
+`Failed` instead of losing its worker. Remove version 1 only after every deployed peer supports version 2.
 
 `sessionAcquisitionTimeout` bounds negotiation and renegotiation. `rpcTimeout` bounds every unary sync and ephemeral
 RPC plus stream acquisition. Both accept `Duration.Input` and default to 10 seconds. Expiry interrupts the operation

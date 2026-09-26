@@ -123,6 +123,13 @@ export class Submit extends Rpc.make("Submit", {
   defect: RemoteDefect
 }) {}
 
+export class SubmitBatch extends Rpc.make("SubmitBatch", {
+  payload: Protocol.VersionedSubmitBatchRequest.fields,
+  success: Protocol.SubmitBatchResult,
+  error: ReplicaError.ReplicaError,
+  defect: RemoteDefect
+}) {}
+
 export class Discard extends Rpc.make("Discard", {
   payload: Protocol.VersionedDiscardRequest.fields,
   success: Protocol.Receipt,
@@ -184,6 +191,7 @@ export class HeartbeatEphemeral extends Rpc.make("HeartbeatEphemeral", {
 export const Rpcs = RpcGroup.make(
   Negotiate,
   Submit,
+  SubmitBatch,
   Discard,
   Pull,
   Bootstrap,

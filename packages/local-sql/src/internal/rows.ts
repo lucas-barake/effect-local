@@ -394,6 +394,7 @@ export const ChangeRow = Schema.Struct({
 
 export const CountRow = Schema.Struct({ count: integer(NonNegativeInt) })
 export const SpaceIdRow = Schema.Struct({ space_id: Identity.SpaceId })
+export const MutationIdRow = Schema.Struct({ mutation_id: Identity.MutationId })
 export const SpacePendingCountRow = Schema.Struct({
   space_id: Identity.SpaceId,
   count: integer(NonNegativeInt)

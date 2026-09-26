@@ -22,10 +22,16 @@ export const maximumEphemeralMemberTtlMillis = 60_000
 export const maximumEphemeralEventTtlMillis = 60_000
 export const maximumEphemeralStateTtlMillis = 7 * 24 * 60 * 60 * 1_000
 export const maximumBootstrapEntries = 1_000
+export const maximumSubmitBatchEntries = 64
 
 export const ProtocolVersion = Schema.Int.check(Schema.isGreaterThan(0))
 export type ProtocolVersion = typeof ProtocolVersion.Type
-export const currentProtocolVersion = ProtocolVersion.make(1)
+export const currentProtocolVersion = ProtocolVersion.make(2)
+export const submitBatchProtocolVersion = ProtocolVersion.make(2)
+export const supportedProtocolVersions: ReadonlyArray<ProtocolVersion> = [
+  currentProtocolVersion,
+  ProtocolVersion.make(1)
+]
 const withProtocolVersion = Schema.fieldsAssign({ protocolVersion: ProtocolVersion })
 export const NegotiateRequest = Schema.Struct({
   supportedVersions: Schema.Array(ProtocolVersion).check(Schema.isMinLength(1))
@@ -75,6 +81,16 @@ export const SubmitRequest = Schema.Struct({
 })
 export type SubmitRequest = typeof SubmitRequest.Type
 export const VersionedSubmitRequest = SubmitRequest.pipe(withProtocolVersion)
+
+export const SubmitBatchRequest = Schema.Struct({
+  envelopes: Schema.Array(MutationEnvelope).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(maximumSubmitBatchEntries)
+  ),
+  schema: Identity.SchemaIdentity
+})
+export type SubmitBatchRequest = typeof SubmitBatchRequest.Type
+export const VersionedSubmitBatchRequest = SubmitBatchRequest.pipe(withProtocolVersion)
 
 export const DiscardRequest = Schema.Struct({
   envelope: MutationEnvelope,
@@ -410,6 +426,14 @@ export type ExpiredReceipt = typeof ExpiredReceipt.Type
 
 export const Receipt = Schema.Union([AcceptedReceipt, RejectedReceipt, LegacyReceipt, ExpiredReceipt])
 export type Receipt = typeof Receipt.Type
+
+export const SubmitBatchResult = Schema.Struct({
+  receipts: Schema.Array(Receipt).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(maximumSubmitBatchEntries)
+  )
+})
+export type SubmitBatchResult = typeof SubmitBatchResult.Type
 
 export const AcceptedMutation = Schema.Struct({
   sequence: Identity.ServerSequence,

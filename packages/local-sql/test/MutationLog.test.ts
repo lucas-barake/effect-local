@@ -181,7 +181,7 @@ const directSync = (server: ServerStore.Service) =>
       waitForCredentialChange: () => Effect.never,
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
-      submit: server.submit,
+      submitBatch: (request) => server.admitBatch(request, null),
       discard: (request) => server.discard(request, null),
       pull: server.pull,
       bootstrap: server.bootstrap,
@@ -934,7 +934,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         (space_id, schema_generation, model, model_version, entity_key, value_json)
         VALUES (${spaceId}, ${meta.active_schema_generation}, ${Domain.Todo.name}, ${Domain.Todo.version},
           ${Canonical.stringify("corrupt-index-refresh")}, 'not json')`
-      yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+      yield* local.persistReceipts([Protocol.RejectedReceipt.make({
         spaceId,
         clientId,
         mutationId: pending.envelope.mutationId,
@@ -944,7 +944,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         origin: "Legacy",
         terminalSequence: Identity.TerminalSequence.make(1),
         rejection: "denied"
-      }))
+      })])
 
       // Nothing decodes entity values on the settlement path anymore (the index maintenance that
       // did is gone), so the malformed bytes settle cleanly and fail typed only when a read
@@ -1073,7 +1073,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       )
       const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
 
-      yield* local.persistReceipt(receipt)
+      yield* local.persistReceipts([receipt])
       yield* local.applyViewPage({ ...page, hasMore: true })
       yield* server.maintain(spaceId)
       const required = yield* server.pull(pullRequest())
@@ -1136,7 +1136,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         Effect.forkScoped({ startImmediately: true })
       )
 
-      yield* local.persistReceipt(receipt)
+      yield* local.persistReceipts([receipt])
       yield* Ref.set(failPreparation, true)
       const failed = yield* local.applyViewPage(page).pipe(Effect.exit)
 
@@ -1241,8 +1241,8 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const rejectedPending = yield* local.mutate(Domain.PutTodo, Domain.todo("rejected-covered"))
       const accepted = yield* server.submit(acceptedPending.envelope)
 
-      yield* local.persistReceipt(accepted)
-      yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+      yield* local.persistReceipts([accepted])
+      yield* local.persistReceipts([Protocol.RejectedReceipt.make({
         spaceId,
         clientId,
         mutationId: rejectedPending.envelope.mutationId,
@@ -1252,7 +1252,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         origin: "Legacy",
         terminalSequence: Identity.TerminalSequence.make(2),
         rejection: "denied"
-      }))
+      })])
       yield* local.settleReceipts
 
       assert.deepStrictEqual(
@@ -2028,7 +2028,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const expired = yield* server.submit(increment.envelope)
         assert.strictEqual(expired._tag, "Expired")
         if (expired._tag !== "Expired") assert.fail("expected expired receipt")
-        yield* local.persistReceipt(expired)
+        yield* local.persistReceipts([expired])
         yield* local.settleReceipts
 
         assert.strictEqual(yield* local.pendingCount, 1)
@@ -2243,7 +2243,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const sql = Context.get(context, SqlClient.SqlClient)
         const first = yield* local.mutate(Domain.PutTodo, Domain.todo("receipt-a"))
         const second = yield* local.mutate(Domain.PutTodo, Domain.todo("receipt-b"))
-        yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+        yield* local.persistReceipts([Protocol.RejectedReceipt.make({
           spaceId,
           clientId,
           membershipIncarnation: first.envelope.membershipIncarnation,
@@ -2253,7 +2253,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           origin: "Legacy",
           terminalSequence: Identity.TerminalSequence.make(1),
           rejection: "denied"
-        }))
+        })])
         const corrupt = Protocol.RejectedReceipt.make({
           spaceId,
           clientId,
@@ -2297,7 +2297,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
     pipe(Effect.fnUntraced(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("legacy-rejection"))
-      yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+      yield* local.persistReceipts([Protocol.RejectedReceipt.make({
         spaceId,
         clientId,
         membershipIncarnation: pending.envelope.membershipIncarnation,
@@ -2306,7 +2306,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         ...putTodoProvenance,
         origin: "Legacy",
         rejection: "Rejected"
-      }))
+      })])
       const submissions = yield* Ref.make(0)
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
@@ -2314,19 +2314,23 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
-        submit: (submitted) => {
-          const rejected = Protocol.RejectedReceipt.make({
-            spaceId,
-            clientId,
-            membershipIncarnation: submitted.envelope.membershipIncarnation,
-            mutationId: submitted.envelope.mutationId,
-            localSequence: submitted.envelope.localSequence,
-            ...putTodoProvenance,
-            origin: "Legacy",
-            terminalSequence: Identity.TerminalSequence.make(1),
-            rejection: "Rejected"
-          })
-          return Ref.update(submissions, (count) => count + 1).pipe(Effect.as(rejected))
+        submitBatch: (request) => {
+          const receipts = request.envelopes.map((submitted) =>
+            Protocol.RejectedReceipt.make({
+              spaceId,
+              clientId,
+              membershipIncarnation: submitted.membershipIncarnation,
+              mutationId: submitted.mutationId,
+              localSequence: submitted.localSequence,
+              ...putTodoProvenance,
+              origin: "Legacy",
+              terminalSequence: Identity.TerminalSequence.make(1),
+              rejection: "Rejected"
+            })
+          )
+          return Ref.update(submissions, (count) => count + 1).pipe(
+            Effect.as(Protocol.SubmitBatchResult.make({ receipts }))
+          )
         },
         pull: server.pull,
         bootstrap: server.bootstrap,
@@ -3083,11 +3087,73 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
     ))
   )
 
-  it.effect("persists each submitted receipt before submitting the next pending mutation", () =>
+  it.effect("returns the unacknowledged tail of a short batch to Retrying when the pass fails after it", () =>
     Effect.scoped(Effect.gen(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
-      const first = yield* local.mutate(Domain.PutTodo, Domain.todo("stream-1"))
-      const second = yield* local.mutate(Domain.PutTodo, Domain.todo("stream-2"))
+      const pending = yield* Effect.forEach(
+        ["tail-0", "tail-1", "tail-2"],
+        (id) => local.mutate(Domain.PutTodo, Domain.todo(id))
+      )
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      const expiredSnapshot = Identity.SnapshotId.make("snp_00000000-0000-4000-8000-0000000000ff")
+      const remote = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
+        discard: () => Effect.die("unexpected discard"),
+        submitBatch: (request) => {
+          const first = request.envelopes[0]
+          return Effect.succeed(Protocol.SubmitBatchResult.make({
+            receipts: [Protocol.ExpiredReceipt.make({
+              ...putTodoProvenance,
+              spaceId,
+              clientId,
+              membershipIncarnation: first.membershipIncarnation,
+              mutationId: first.mutationId,
+              localSequence: first.localSequence,
+              snapshotId: expiredSnapshot,
+              snapshotSequence: Identity.ServerSequence.make(1_000_000),
+              terminalSequenceThrough: Identity.TerminalSequence.make(0)
+            })]
+          }))
+        },
+        pull: server.pull,
+        bootstrap: (request) => {
+          if (request.snapshotId === expiredSnapshot) return Effect.fail(new ReplicaError.ServerUnavailable())
+          return server.bootstrap(request)
+        },
+        watch: server.watch
+      })
+      const reconciliation = yield* service(
+        Reconciler.Reconciliation,
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(Layer.succeed(LocalStore.Store, local)),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
+        )
+      )
+
+      const error = yield* expectedFailure(reconciliation.sync)
+
+      assert.strictEqual(error._tag, "ServerUnavailable")
+      const states = (yield* local.pending).map((mutation) => [
+        mutation.envelope.mutationId,
+        mutation.submissionState
+      ])
+      assert.deepStrictEqual(states, [
+        [pending[0].envelope.mutationId, "Submitted"],
+        [pending[1].envelope.mutationId, "Retrying"],
+        [pending[2].envelope.mutationId, "Retrying"]
+      ])
+    })))
+
+  it.effect("persists every receipt of a submitted batch before submitting the next batch", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const local = yield* service(LocalStore.Store, localLayer())
+      const pending = yield* Effect.forEach(
+        Array.from({ length: Protocol.maximumSubmitBatchEntries + 1 }, (_, index) => index),
+        (index) => local.mutate(Domain.PutTodo, Domain.todo(`stream-${index}`))
+      )
+      const firstBatch = pending.slice(0, Protocol.maximumSubmitBatchEntries)
       let submissions = 0
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
@@ -3095,20 +3161,28 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
-        submit: Effect.fnUntraced(function*({ envelope: submitted }) {
+        submitBatch: Effect.fnUntraced(function*(request) {
           submissions++
           if (submissions === 2) {
-            assert.isTrue(Option.isSome(yield* local.receipt(first.envelope.mutationId)))
+            const persisted = yield* Effect.forEach(
+              firstBatch,
+              (mutation) => local.receipt(mutation.envelope.mutationId)
+            )
+            assert.isTrue(persisted.every(Option.isSome))
           }
-          return Protocol.RejectedReceipt.make({
-            ...putTodoProvenance,
-            spaceId,
-            clientId,
-            membershipIncarnation: submitted.membershipIncarnation,
-            mutationId: submitted.mutationId,
-            localSequence: submitted.localSequence,
-            origin: "Authorization",
-            rejection: "denied"
+          return Protocol.SubmitBatchResult.make({
+            receipts: request.envelopes.map((submitted) =>
+              Protocol.RejectedReceipt.make({
+                ...putTodoProvenance,
+                spaceId,
+                clientId,
+                membershipIncarnation: submitted.membershipIncarnation,
+                mutationId: submitted.mutationId,
+                localSequence: submitted.localSequence,
+                origin: "Authorization",
+                rejection: "denied"
+              })
+            )
           })
         }),
         pull: server.pull,
@@ -3125,8 +3199,8 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
       yield* reconciler.sync
       assert.strictEqual(submissions, 2)
-      assert.isTrue(Option.isSome(yield* local.receipt(first.envelope.mutationId)))
-      assert.isTrue(Option.isSome(yield* local.receipt(second.envelope.mutationId)))
+      const receipts = yield* Effect.forEach(pending, (mutation) => local.receipt(mutation.envelope.mutationId))
+      assert.isTrue(receipts.every(Option.isSome))
       assert.strictEqual(yield* local.pendingCount, 0)
     })))
 
@@ -3384,7 +3458,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: server.pull,
           bootstrap: server.bootstrap,
           watch: () =>
@@ -3435,7 +3509,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: () =>
             Deferred.await(releasePull).pipe(
               Effect.andThen(Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 0 })))
@@ -3497,7 +3571,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: () =>
             Deferred.await(releasePull).pipe(
               Effect.andThen(Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 0 })))
@@ -3556,7 +3630,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
               Effect.andThen(Deferred.await(credentialChanged))
             ),
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: (request) =>
             Ref.updateAndGet(pulls, (count) => count + 1).pipe(
               Effect.flatMap((attempt) => {
@@ -3641,7 +3715,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: () => Ref.update(pulls, (count) => count + 1).pipe(Effect.andThen(Effect.fail(stale))),
           bootstrap: () => Effect.fail(stale),
           watch: () =>
@@ -3688,7 +3762,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: (request) =>
             Effect.all([server.pull(request), Ref.get(observed)]).pipe(
               Effect.map(([result, serverSchema]) => ({ ...result, serverSchema }))
@@ -3729,7 +3803,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: (request) =>
             Deferred.succeed(pullEntered, undefined).pipe(
               Effect.andThen(Deferred.await(releasePull)),
@@ -3765,7 +3839,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         transportGeneration: Effect.succeed(0),
         waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
-        submit: () => Effect.die("unexpected submit"),
+        submitBatch: () => Effect.die("unexpected submit"),
         pull: server.pull,
         bootstrap: server.bootstrap,
         watch: () => Stream.never
@@ -3797,7 +3871,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: (request) =>
             Deferred.succeed(pullEntered, undefined).pipe(
               Effect.andThen(Deferred.await(releasePull)),
@@ -3837,7 +3911,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: ({ envelope: submitted }) =>
+          submitBatch: (request) =>
             Effect.suspend(() => {
               attempts++
               if (attempts === 1) {
@@ -3846,15 +3920,19 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
                 )
               }
 
-              return Deferred.succeed(secondAttempt, undefined).pipe(Effect.as(Protocol.RejectedReceipt.make({
-                ...putTodoProvenance,
-                spaceId,
-                clientId,
-                membershipIncarnation: submitted.membershipIncarnation,
-                mutationId: submitted.mutationId,
-                localSequence: submitted.localSequence,
-                origin: "Authorization",
-                rejection: "denied"
+              return Deferred.succeed(secondAttempt, undefined).pipe(Effect.as(Protocol.SubmitBatchResult.make({
+                receipts: request.envelopes.map((submitted) =>
+                  Protocol.RejectedReceipt.make({
+                    ...putTodoProvenance,
+                    spaceId,
+                    clientId,
+                    membershipIncarnation: submitted.membershipIncarnation,
+                    mutationId: submitted.mutationId,
+                    localSequence: submitted.localSequence,
+                    origin: "Authorization",
+                    rejection: "denied"
+                  })
+                )
               })))
             }),
           pull: server.pull,
@@ -4316,7 +4394,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
       const settling = yield* local.mutate(Domain.PutTodo, Domain.todo("settling"))
       yield* local.mutate(Domain.PutTodo, Domain.todo("retracted", "local"))
-      yield* local.persistReceipt(yield* server.submit(settling.envelope))
+      yield* local.persistReceipts([yield* server.submit(settling.envelope)])
       yield* local.applyViewPage(yield* pull((yield* local.replicationState).cursor))
 
       assert.strictEqual(yield* local.pendingCount, 1)
@@ -4532,7 +4610,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const mutationId = yield* Effect.scoped(Effect.gen(function*() {
           const local = yield* service(LocalStore.Store, makeLocal())
           const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("submitting-recovery"))
-          yield* local.markSubmitting(pending.envelope.mutationId)
+          yield* local.markSubmitting([pending.envelope.mutationId])
           const submitting = (yield* local.pending)[0]
           assert.strictEqual(submitting.submissionState, "Submitting")
           assert.strictEqual(submitting.attempts, 1)
@@ -4576,14 +4654,14 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         origin: "Authorization",
         rejection: "denied"
       })
-      yield* local.persistReceipt(receipt)
+      yield* local.persistReceipts([receipt])
       yield* sql`UPDATE effect_local_client_pending_data SET submission_state = 'Retrying'
         WHERE space_id = ${spaceId} AND mutation_id = ${pending.envelope.mutationId}`
       let invalidations = 0
       const cancel = reactivity.registerUnsafe([ReactivityKey.pending(spaceId)], () => invalidations++)
       yield* Effect.addFinalizer(() => Effect.sync(cancel))
 
-      yield* local.persistReceipt(receipt)
+      yield* local.persistReceipts([receipt])
 
       const restored = (yield* local.pending)[0]
       assert.strictEqual(restored.submissionState, "Submitted")
@@ -4618,7 +4696,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       })
 
       for (const invalid of [wrongSchema, wrongVersion]) {
-        const error = yield* local.persistReceipt(invalid).pipe(expectedFailure)
+        const error = yield* local.persistReceipts([invalid]).pipe(expectedFailure)
         assert.strictEqual(error._tag, "ProtocolInvalid")
         assert.isTrue(Option.isNone(yield* local.receipt(pending.envelope.mutationId)))
         assert.strictEqual((yield* local.pending)[0].submissionState, "Queued")

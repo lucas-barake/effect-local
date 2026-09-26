@@ -184,9 +184,9 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
       waitForCredentialChange: () => Effect.never,
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
-      submit: (request) =>
+      submitBatch: (request) =>
         Effect.suspend(() => {
-          if (environmentOptions.submitAllowed?.() ?? true) return store.submit(request)
+          if (environmentOptions.submitAllowed?.() ?? true) return store.admitBatch(request, null)
           return Effect.never
         }),
       discard: (request) => store.discard(request, null),
@@ -1043,7 +1043,7 @@ describe("BrowserReplica", () => {
               waitForCredentialChange: () => Effect.never,
               transportGeneration: Effect.succeed(0),
               waitForTransportChange: () => Effect.never,
-              submit: () => Effect.never,
+              submitBatch: () => Effect.never,
               discard: () => Effect.never,
               pull: () => Effect.never,
               bootstrap: () => Effect.never,

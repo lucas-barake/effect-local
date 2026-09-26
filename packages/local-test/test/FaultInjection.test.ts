@@ -21,6 +21,7 @@ import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -133,6 +134,20 @@ const pullRequest = (state: LocalStore.ReplicationState) =>
     limit: 10
   })
 
+const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
+  effect.pipe(
+    Effect.result,
+    Effect.map((result) => {
+      if (Result.isFailure(result)) return result.failure
+      return assert.fail("expected Effect failure")
+    })
+  )
+
+const acceptedSequence = (receipt: Protocol.Receipt): number | string => {
+  if (receipt._tag === "Accepted") return receipt.serverSequence
+  return receipt._tag
+}
+
 const synchronize = (local: LocalStore.Service, sync: SyncEngine.Service) =>
   service(
     Reconciler.Reconciliation,
@@ -242,9 +257,12 @@ describe("test synchronization faults", () => {
       const { faults, local, sync } = yield* makeServices
       yield* synchronize(local, sync)
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "offline" })
-      const request = Protocol.SubmitRequest.make({ envelope: pending.envelope, schema: definition.schemaIdentity })
+      const request = Protocol.SubmitBatchRequest.make({
+        envelopes: [pending.envelope],
+        schema: definition.schemaIdentity
+      })
       yield* faults.partition(spaceId)
-      const error = yield* sync.submit(request).pipe(Effect.flip)
+      const error = yield* failureOf(sync.submitBatch(request))
       assert.strictEqual(error._tag, "ServerUnavailable")
       pipe(
         yield* local.get(Todo, "1"),
@@ -254,8 +272,8 @@ describe("test synchronization faults", () => {
       assert.strictEqual(yield* local.pendingCount, 1)
 
       yield* faults.heal(spaceId)
-      const receipt = yield* sync.submit(request)
-      yield* local.applyReceipt(receipt)
+      const { receipts } = yield* sync.submitBatch(request)
+      yield* local.applyReceipts(receipts)
       const page = yield* sync.pull(pullRequest(yield* local.replicationState))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
       yield* local.applyViewPage(page)
@@ -271,13 +289,15 @@ describe("test synchronization faults", () => {
       const { faults, local, sync } = yield* makeServices
       yield* synchronize(local, sync)
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "ambiguous" })
-      const request = Protocol.SubmitRequest.make({ envelope: pending.envelope, schema: definition.schemaIdentity })
+      const request = Protocol.SubmitBatchRequest.make({
+        envelopes: [pending.envelope],
+        schema: definition.schemaIdentity
+      })
       yield* faults.dropNextReceipt(spaceId)
-      const error = yield* sync.submit(request).pipe(Effect.flip)
+      const error = yield* failureOf(sync.submitBatch(request))
       assert.strictEqual(error._tag, "ServerUnavailable")
-      const receipt = yield* sync.submit(request)
-      assert.strictEqual(receipt._tag, "Accepted")
-      if (receipt._tag === "Accepted") assert.strictEqual(receipt.serverSequence, 1)
+      const { receipts } = yield* sync.submitBatch(request)
+      assert.deepStrictEqual(receipts.map(acceptedSequence), [1])
       const page = yield* sync.pull(pullRequest(yield* local.replicationState))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
       assert.strictEqual(page.changes.length, 1)
@@ -290,8 +310,11 @@ describe("test synchronization faults", () => {
       const { faults, local, sync } = yield* makeServices
       yield* synchronize(local, sync)
       const pending = yield* local.mutate(PutTodo, { id: "1", title: "duplicate" })
-      const receipt = yield* sync.submit({ envelope: pending.envelope, schema: definition.schemaIdentity })
-      yield* local.applyReceipt(receipt)
+      const { receipts } = yield* sync.submitBatch({
+        envelopes: [pending.envelope],
+        schema: definition.schemaIdentity
+      })
+      yield* local.applyReceipts(receipts)
       yield* faults.duplicateNextPage(spaceId)
       const page = yield* sync.pull(pullRequest(yield* local.replicationState))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
@@ -299,6 +322,36 @@ describe("test synchronization faults", () => {
       yield* local.applyViewPage(page)
       yield* local.settleReceipts
       assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual(yield* local.pendingCount, 0)
+    })
+  )
+
+  it.effect(
+    "resubmits a batch whose response was dropped after commit without applying anything twice",
+    Effect.fnUntraced(function*() {
+      const { faults, local, sync } = yield* makeServices
+      yield* synchronize(local, sync)
+      const pending = yield* Effect.forEach(
+        ["1", "2", "3"],
+        (id) => local.mutate(PutTodo, { id, title: `batch ${id}` })
+      )
+      yield* faults.dropNextReceipt(spaceId)
+
+      const error = yield* failureOf(synchronize(local, sync))
+      assert.strictEqual(error._tag, "ServerUnavailable")
+      const dropped = yield* Effect.forEach(pending, () => faults.awaitReceiptDropped(spaceId))
+      assert.deepStrictEqual(
+        dropped.map((event) => event.receipt.mutationId),
+        pending.map((mutation) => mutation.envelope.mutationId)
+      )
+      assert.strictEqual(yield* local.pendingCount, 3)
+
+      yield* synchronize(local, sync)
+
+      const receipts = yield* Effect.forEach(pending, (mutation) => local.receipt(mutation.envelope.mutationId))
+      const sequences = receipts.map(Option.map(acceptedSequence))
+      assert.deepStrictEqual(sequences, [Option.some(1), Option.some(2), Option.some(3)])
+      assert.strictEqual(yield* local.cursor, 3)
       assert.strictEqual(yield* local.pendingCount, 0)
     })
   )

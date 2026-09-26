@@ -12,7 +12,9 @@ export interface Service {
   readonly waitForTransportChange: (
     observedGeneration: number
   ) => Effect.Effect<void>
-  readonly submit: (request: Protocol.SubmitRequest) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
+  readonly submitBatch: (
+    request: Protocol.SubmitBatchRequest
+  ) => Effect.Effect<Protocol.SubmitBatchResult, ReplicaError.ReplicaError>
   readonly discard: (request: Protocol.DiscardRequest) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
   readonly pull: (request: Protocol.PullRequest) => Effect.Effect<Protocol.PullResult, ReplicaError.ReplicaError>
   readonly bootstrap: (

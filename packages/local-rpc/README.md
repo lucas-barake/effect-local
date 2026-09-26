@@ -43,7 +43,7 @@ The four authorization callbacks are required. Every limit has a default: `store
 application can call `invalidateReadAuthorization` after a permission change or `maintain` from an admin task.
 
 Each space is served by one `EffectLocal/Space` entity, so an active space costs one resident entity. The entity
-serializes Submit and Discard behind one admission permit and serves Pull, Bootstrap, Watch, and ephemeral operations
+serializes Submit, SubmitBatch, and Discard behind one admission permit and serves Pull, Bootstrap, Watch, and ephemeral operations
 concurrently. Bootstrap authorizations, bootstrap pages per space, and ephemeral join verifications have fail-fast
 bounds, and ephemeral publish and heartbeat requests queue behind their own per-space bound. Saturation reports typed `CapacityExceeded` with resource
 `bootstrap authorizations`, `bootstrap pages`, or `ephemeral join verifications`.
@@ -56,7 +56,7 @@ Run the runners' socket transport with NDJSON serialization, for example
 `NodeClusterSocket.layer({ serialization: "ndjson" })`. In Effect `4.0.0-rc.117` the default SchemaBinary runner
 serialization breaks volatile streaming entity calls between runners after their first element, which would stop
 cross-runner watches and presence. `packages/local-rpc/test/MultiRunner.test.ts` runs two real runners over sockets
-with shared SQL storage and covers submit, watch, presence, mismatched assertion secrets, and the maintenance
+with shared SQL storage and covers batch submit, watch, presence, mismatched assertion secrets, and the maintenance
 singleton.
 
 Requests reach the space entity with a principal assertion signed by HMAC-SHA256. Pass the same `assertionSecret`
@@ -222,6 +222,13 @@ export const layerClientRpc = Layer.merge(
 
 The actual heartbeat interval is no longer than half the server-accepted member lease. Negotiation selects the highest shared
 version. A peer rejection causes one renegotiation and retry. No common version returns terminal `UpgradeRequired`.
+
+`ProtocolSession` and `SyncServer` default to `Protocol.supportedProtocolVersions`, which is `[2, 1]`. Version 2 adds
+`SubmitBatch`, which carries up to `Protocol.maximumSubmitBatchEntries` envelopes of one space and returns their receipts
+in order. `SyncEngine.submitBatch` sends one `SubmitBatch` when the session selected version 2 and one `Submit` per
+envelope when it selected version 1, so the reconciler behaves the same against either server. The server admits a batch
+one SQL transaction per envelope and returns a shorter prefix when the response would exceed `Protocol.maximumBatchBytes`
+or the batch has run for the store's `maximumSubmitBatchDuration`, default 1 second. The client resubmits the rest.
 
 `sessionAcquisitionTimeout` and `rpcTimeout` accept `Duration.Input` and default to 10 seconds. They bound negotiation,
 unary RPCs, and stream acquisition. Established join and watch streams may remain idle. Expiry returns typed

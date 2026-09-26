@@ -25,7 +25,7 @@ import * as SyncRpc from "./SyncRpc.js"
 const makeHandlers = Effect.fnUntraced(function*(options: {
   readonly supportedProtocolVersions?: ReadonlyArray<number> | undefined
 }) {
-  const configured = options.supportedProtocolVersions ?? [Protocol.currentProtocolVersion]
+  const configured = options.supportedProtocolVersions ?? Protocol.supportedProtocolVersions
   const decoded = yield* Schema.decodeUnknownEffect(Protocol.NegotiateRequest)({
     supportedVersions: configured
   }).pipe(
@@ -55,6 +55,19 @@ const makeHandlers = Effect.fnUntraced(function*(options: {
         Effect.andThen(issueAssertion),
         Effect.flatMap((assertion) => client.submit(request.envelope.spaceId, request, assertion))
       ),
+    SubmitBatch: ({ protocolVersion, ...request }) => {
+      if (protocolVersion < Protocol.submitBatchProtocolVersion) {
+        return Effect.fail(
+          new ReplicaError.ProtocolInvalid({
+            message: `SubmitBatch requires protocol version ${Protocol.submitBatchProtocolVersion} or later`
+          })
+        )
+      }
+      return requireVersion(protocolVersion).pipe(
+        Effect.andThen(issueAssertion),
+        Effect.flatMap((assertion) => client.submitBatch(request.envelopes[0].spaceId, request, assertion))
+      )
+    },
     Discard: (request) =>
       requireVersion(request.protocolVersion).pipe(
         Effect.andThen(issueAssertion),
