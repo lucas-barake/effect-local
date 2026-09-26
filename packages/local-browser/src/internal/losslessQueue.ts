@@ -8,7 +8,8 @@ import * as Stream from "effect/Stream"
 
 const withoutYield = Effect.provideService(Scheduler.PreventSchedulerYield, true)
 
-export const take = <A,>(queue: Queue.Dequeue<A>): Effect.Effect<A> => withoutYield(Queue.take(queue))
+export const take = <A,>(queue: Queue.Dequeue<A>): Effect.Effect<A> =>
+  Effect.suspend(() => Queue.takeUnsafe(queue) ?? withoutYield(Queue.take(queue)))
 
 export const stream = <A, E extends Cause.Done = never,>(
   queue: Queue.Dequeue<A, E>
