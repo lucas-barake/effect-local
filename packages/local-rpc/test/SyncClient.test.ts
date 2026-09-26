@@ -15,8 +15,10 @@ import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as Socket from "effect/unstable/socket/Socket"
 import * as SyncClient from "../src/SyncClient.js"
+import * as Transport from "../src/Transport.js"
 
 const noopWriter: Socket.Writer = { write: () => Effect.void, writeAll: () => Effect.void }
+const pong = RpcSerialization.json.makeUnsafe().encode({ _tag: "Pong" })
 
 interface Frame {
   readonly message: string | Uint8Array
@@ -67,7 +69,16 @@ describe("SyncClient", () => {
           const attempt = yield* Ref.updateAndGet(count, (current) => current + 1)
           yield* Queue.offer(attempts, yield* Clock.currentTimeMillis)
           if (attempt !== connectingAttempt) return yield* Effect.fail(openError)
-          return { pull: Effect.fail(closeError), upgrade: () => Effect.void }
+          let delivered = false
+          return {
+            pull: Effect.suspend(() => {
+              if (delivered) return Effect.fail(closeError)
+              delivered = true
+              if (pong === undefined) return Effect.die("the JSON serializer did not encode a Pong frame")
+              return Effect.succeed([pong] as const)
+            }),
+            upgrade: () => Effect.void
+          }
         }),
         writer: Effect.succeed(noopWriter)
       })
@@ -100,6 +111,50 @@ describe("SyncClient", () => {
       assert.isTrue(delays.every((delay) => delay <= cap), `delays ${delays.join(",")} exceed the ${cap} ms cap`)
       assert.isAtLeast(delays[connectingAttempt - 2], cap / 2)
       assert.isAtMost(delays[connectingAttempt - 1], 250)
+    })
+  )
+
+  it.effect(
+    "keeps backing off while the server accepts the upgrade and closes before sending a frame",
+    Effect.fnUntraced(function*() {
+      const attempts = yield* Queue.unbounded<number>()
+      const disconnects = yield* Queue.unbounded<number>()
+      const closeError = new Socket.SocketError({ reason: new Socket.SocketCloseError({ code: 1013 }) })
+      const socket = Socket.make({
+        reader: Clock.currentTimeMillis.pipe(
+          Effect.flatMap((now) => Queue.offer(attempts, now)),
+          Effect.as({ pull: Effect.fail(closeError), upgrade: () => Effect.void })
+        ),
+        writer: Effect.succeed(noopWriter)
+      })
+      const hooks = RpcClient.ConnectionHooks.of({
+        onConnect: Effect.void,
+        onDisconnect: Clock.currentTimeMillis.pipe(Effect.flatMap((now) => Queue.offer(disconnects, now)))
+      })
+      const layerLive = SyncClient.layerProtocolSocket().pipe(
+        Layer.provide(Layer.succeed(Socket.Socket, socket)),
+        Layer.provide(Layer.succeed(RpcClient.ConnectionHooks, hooks)),
+        Layer.provide(RpcSerialization.layerJson)
+      )
+      const context = yield* Layer.build(layerLive)
+      const transport = Context.get(context, Transport.Transport)
+      const clock = yield* TestClock.adjust("100 millis").pipe(
+        Effect.forever,
+        Effect.forkChild({ startImmediately: true })
+      )
+
+      const delays: Array<number> = []
+      let failedAt = yield* Queue.take(disconnects)
+      yield* Queue.take(attempts)
+      for (let cycle = 0; cycle < 8; cycle++) {
+        const attemptedAt = yield* Queue.take(attempts)
+        delays.push(attemptedAt - failedAt)
+        failedAt = yield* Queue.take(disconnects)
+      }
+      yield* Fiber.interrupt(clock)
+
+      assert.isAtLeast(delays[delays.length - 1], 1_000, `delays ${delays.join(",")} never grew`)
+      assert.strictEqual(yield* transport.generation, 0)
     })
   )
 

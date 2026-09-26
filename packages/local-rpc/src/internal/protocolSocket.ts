@@ -138,12 +138,15 @@ const makeProtocol = (
     let connected = false
     const readFrames = Effect.gen(function*() {
       const { pull } = yield* socket.reader
-      connected = true
       currentError = undefined
-      yield* SubscriptionRef.update(connections, (generation) => generation + 1)
       if (Option.isSome(hooks)) yield* hooks.value.onConnect
+      yield* writer.write(parser.encode(RpcMessage.constPing)!)
       while (true) {
         const frames = yield* pull
+        if (!connected) {
+          connected = true
+          yield* SubscriptionRef.update(connections, (generation) => generation + 1)
+        }
         for (const frame of frames) yield* processFrame(frame)
       }
     })
