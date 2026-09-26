@@ -296,6 +296,7 @@ export const ChatView = ({ client, me, conversationId, onBack }: {
   const windowResult = useAtomValue(client.messagesWindow(conversationId))
   const pending = AsyncResult.value(useAtomValue(client.pendingSendsAtom))
   const failed = useAtomValue(client.failedMessages)
+  const synced = useAtomValue(client.syncedAtom)
   const discardMessage = useAtomSet(client.discardMessage)
   const loadEarlier = useAtomSet(client.loadEarlier(conversationId))
   const markRead = useAtomSet(client.markRead)
@@ -433,7 +434,9 @@ export const ChatView = ({ client, me, conversationId, onBack }: {
             />
           </div>
         ))}
-        {Option.isSome(window_) && rows.length === 0 && <p className="chat-empty">No messages yet. Say hello!</p>}
+        {synced && Option.isSome(window_) && rows.length === 0 && (
+          <p className="chat-empty">No messages yet. Say hello!</p>
+        )}
         {Option.isNone(window_) && AsyncResult.isFailure(windowResult) && (
           <p className="chat-empty" role="alert">Could not load messages.</p>
         )}

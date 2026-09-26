@@ -242,6 +242,10 @@ const makeClient = (session: LoginResponse) => {
   const summariesAtom = graph.query(spaceId, ConversationSummaries)({ userId })
   const pendingSendsAtom = graph.pendingFor(spaceId, SendMessage)
   const statusAtom = graph.status(spaceId)
+  const syncedAtom = Atom.make((get) => {
+    const status = get(statusAtom)
+    return AsyncResult.isSuccess(status) && status.value.synced
+  })
 
   const connectionAtom = Atom.make(
     (get) =>
@@ -424,6 +428,7 @@ const makeClient = (session: LoginResponse) => {
     summariesAtom,
     pendingSendsAtom,
     connectionAtom,
+    syncedAtom,
     sendMessage,
     retryMessage,
     discardMessage,

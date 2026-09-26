@@ -51,6 +51,19 @@ test("history renders from the local replica after a reload without the sync ser
   await expect(alice.getByRole("status").filter({ hasText: "Offline" })).toBeVisible({ timeout: 5_000 })
 })
 
+test("a first sign-in on a new device with history paints no false empty state", async ({ chat }) => {
+  const alice = await chat.signIn("alice")
+  await openDirectMessage(alice, "bob")
+  const text = uniqueText("first device")
+  await send(alice, text)
+  await expect(outgoing(alice, text).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible({
+    timeout: 3_000
+  })
+  const newDevice = await chat.signIn("alice")
+  await expect(newDevice.locator(".conversation", { hasText: "Bob" })).toBeVisible({ timeout: 5_000 })
+  expect(await falseStates(newDevice)).toEqual([])
+})
+
 test("a reload of an account with history paints no false empty, offline, or presence states", async ({ chat }) => {
   const alice = await chat.signIn("alice")
   await chat.signIn("bob")

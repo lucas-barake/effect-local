@@ -65,6 +65,7 @@ const Sidebar = ({ client, me, openId, onOpen }: {
   readonly onOpen: (conversationId: ConversationId) => void
 }) => {
   const summariesResult = useAtomValue(client.summariesAtom)
+  const synced = useAtomValue(client.syncedAtom)
   const members = AsyncResult.getOrElse(useAtomValue(client.membersAtom), () => [])
   const onlineIds = new Set(members.map((entry) => entry.value.userId))
 
@@ -103,9 +104,9 @@ const Sidebar = ({ client, me, openId, onOpen }: {
             onOpen={onOpen}
           />
         ))}
-        {mine.length === 0 && <p className="sidebar-empty">No conversations yet. Start one below.</p>}
+        {synced && mine.length === 0 && <p className="sidebar-empty">No conversations yet. Start one below.</p>}
       </div>
-      {(newDmUsers.length > 0 || !knownIds.has(groupConversationId)) && (
+      {synced && (newDmUsers.length > 0 || !knownIds.has(groupConversationId)) && (
         <div className="sidebar-new">
           <p className="sidebar-new-title">Start a chat</p>
           {newDmUsers.map((user) => (
