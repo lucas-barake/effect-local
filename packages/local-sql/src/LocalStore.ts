@@ -2897,15 +2897,16 @@ export const layer = (
           }),
           sql.withTransaction
         ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-        yield* reportReplicationView(true)
-        yield* recordBootstrapInstallMetric
-        const entities = Array.from(dirty.values())
-        yield* rebuildProjection
-        const deletedSettlements = yield* deleteSettledPending(settlements)
-        yield* reactivity.withBatch(
-          invalidate(entities, prunedReceiptIds, pendingChanged || deletedSettlements.length > 0)
-        )
-        return deletedSettlements
+        return yield* Effect.gen(function*() {
+          yield* recordBootstrapInstallMetric
+          const entities = Array.from(dirty.values())
+          yield* rebuildProjection
+          const deletedSettlements = yield* deleteSettledPending(settlements)
+          yield* reactivity.withBatch(
+            invalidate(entities, prunedReceiptIds, pendingChanged || deletedSettlements.length > 0)
+          )
+          return deletedSettlements
+        }).pipe(Effect.ensuring(reportReplicationView(true)))
       }, Effect.uninterruptible)
 
       const installBootstrap = (manifest: Protocol.SnapshotManifest) =>
