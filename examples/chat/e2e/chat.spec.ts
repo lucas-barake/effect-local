@@ -165,6 +165,24 @@ test("loading earlier messages keeps the first visible message in view", async (
   await expect(outgoing(bob, texts[texts.length - 1])).not.toBeInViewport()
 })
 
+test("loading earlier messages in the same frame as a scroll keeps the first visible message in view", async ({ chat }) => {
+  const bob = await chat.signIn("bob")
+  await openDirectMessage(bob, "dave")
+  const texts = Array.from({ length: 56 }, (_, index) => uniqueText(`scrolled ${index}`))
+  await sendAll(bob, texts)
+  await expect(outgoing(bob, texts[texts.length - 1])).toBeVisible()
+  await expect(bob.getByRole("button", { name: "Load earlier messages" })).toBeVisible({ timeout: 3_000 })
+  const anchorText = await bob.locator(".chat-messages").evaluate((list) => {
+    list.scrollTop = 0
+    const first = list.querySelector("[data-message-row] .bubble-text")?.textContent ?? ""
+    const loadEarlier = list.querySelector(".chat-load-more")
+    if (loadEarlier instanceof HTMLButtonElement) loadEarlier.click()
+    return first
+  })
+  await expect(outgoing(bob, texts[0])).toHaveCount(1)
+  await expect(outgoing(bob, anchorText)).toBeInViewport()
+})
+
 test("a 375 px wide viewport shows one pane at a time with a reachable composer", async ({ chat }) => {
   const dave = await chat.signIn("dave")
   await dave.setViewportSize({ width: 375, height: 740 })

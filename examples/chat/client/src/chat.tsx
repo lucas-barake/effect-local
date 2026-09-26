@@ -140,11 +140,6 @@ const MessageRow = ({ row, me, state, conversation, onRetry, onDiscard }: {
 
 const bottomSlack = 48
 
-interface ScrollAnchor {
-  readonly element: Element
-  readonly offset: number
-}
-
 const firstVisibleRow = (list: HTMLElement): Element | undefined => {
   const elements = list.querySelectorAll("[data-message-row]")
   const top = list.getBoundingClientRect().top
@@ -158,21 +153,20 @@ const firstVisibleRow = (list: HTMLElement): Element | undefined => {
   return low < elements.length ? elements.item(low) : undefined
 }
 
+const measureScroll = (list: HTMLElement) => {
+  const element = firstVisibleRow(list)
+  const listTop = list.getBoundingClientRect().top
+  return {
+    pinned: list.scrollHeight - list.scrollTop - list.clientHeight <= bottomSlack,
+    anchor: element === undefined ? null : { element, offset: element.getBoundingClientRect().top - listTop }
+  }
+}
+
 const useScrollAnchor = (rows: ReadonlyArray<Row>, me: UserId) => {
   const listRef = useRef<HTMLDivElement | null>(null)
-  const pinned = useRef(true)
-  const anchor = useRef<ScrollAnchor | null>(null)
   const edges = useRef<{ readonly first: MessageId; readonly last: MessageId } | null>(null)
-
-  const capture = () => {
-    const list = listRef.current
-    if (list === null) return
-    pinned.current = list.scrollHeight - list.scrollTop - list.clientHeight <= bottomSlack
-    const element = firstVisibleRow(list)
-    anchor.current = element === undefined
-      ? null
-      : { element, offset: element.getBoundingClientRect().top - list.getBoundingClientRect().top }
-  }
+  const mounted = listRef.current
+  const before = mounted === null ? null : measureScroll(mounted)
 
   useLayoutEffect(() => {
     const list = listRef.current
@@ -184,17 +178,15 @@ const useScrollAnchor = (rows: ReadonlyArray<Row>, me: UserId) => {
       first.id !== previous.first && last.id === previous.last
     const sentByMe = previous !== null && last !== undefined && last.id !== previous.last && last.senderId === me
     edges.current = first === undefined || last === undefined ? null : { first: first.id, last: last.id }
-    const current = anchor.current
-    if (!prepended && (pinned.current || sentByMe)) {
+    const anchor = before?.anchor ?? null
+    if (before === null || (!prepended && (before.pinned || sentByMe))) {
       list.scrollTop = list.scrollHeight
-    } else if (current !== null && current.element.isConnected) {
-      list.scrollTop += current.element.getBoundingClientRect().top - list.getBoundingClientRect().top -
-        current.offset
+    } else if (anchor !== null && anchor.element.isConnected) {
+      list.scrollTop += anchor.element.getBoundingClientRect().top - list.getBoundingClientRect().top - anchor.offset
     }
-    capture()
   })
 
-  return { listRef, onScroll: capture }
+  return listRef
 }
 
 const typingTtl = Duration.seconds(3)
@@ -294,7 +286,8 @@ export const ChatView = ({ client, me, conversationId, onBack }: {
   const readStatesAtom = client.readStates(conversationId)
   const readStates = AsyncResult.value(useAtomValue(readStatesAtom))
   const windowResult = useAtomValue(client.messagesWindow(conversationId))
-  const pending = AsyncResult.value(useAtomValue(client.pendingSendsAtom))
+  const pendingResult = useAtomValue(client.pendingSendsAtom)
+  const pending = AsyncResult.value(pendingResult)
   const failed = useAtomValue(client.failedMessages)
   const synced = useAtomValue(client.syncedAtom)
   const discardMessage = useAtomSet(client.discardMessage)
@@ -345,11 +338,18 @@ export const ChatView = ({ client, me, conversationId, onBack }: {
 
   const receiptsKnown = conversation !== undefined && Option.isSome(readStates) && Option.isSome(pending)
   const pendingIds = new Set(Option.getOrElse(pending, () => []).map((entry) => entry.payload.id))
+  const pendingFresh = Option.isSome(pending) && !pendingResult.waiting
+  const confirmedPending = useRef(new Map<MessageId, boolean>())
+  if (pendingFresh) {
+    for (const row of rows) confirmedPending.current.set(row.message.id, pendingIds.has(row.message.id))
+  }
+  const isPending = (id: MessageId): boolean =>
+    pendingIds.has(id) || (!pendingFresh && (confirmedPending.current.get(id) ?? true))
   const receiptState = (row: Row): TickState | undefined =>
     receiptsKnown
       ? tickState({
         failed: row.failed,
-        pending: pendingIds.has(row.message.id),
+        pending: isPending(row.message.id),
         message: row.message,
         senderId: row.message.senderId,
         readStates: Option.getOrElse(readStates, () => []),
@@ -386,7 +386,7 @@ export const ChatView = ({ client, me, conversationId, onBack }: {
     setAnnouncement(`${senderName(lastIncoming.senderId)}: ${lastIncoming.text}`)
   }, [summaryKnown, lastIncoming])
 
-  const { listRef, onScroll } = useScrollAnchor(rows, me)
+  const listRef = useScrollAnchor(rows, me)
 
   return (
     <main className="chat">
@@ -407,7 +407,7 @@ export const ChatView = ({ client, me, conversationId, onBack }: {
           </span>
         </div>
       </header>
-      <div className="chat-messages" ref={listRef} onScroll={onScroll}>
+      <div className="chat-messages" ref={listRef}>
         {Option.isSome(window_) && window_.value.hasMore && (
           <button
             type="button"

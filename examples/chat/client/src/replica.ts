@@ -389,7 +389,7 @@ const makeClient = (session: LoginResponse) => {
   // this converge after one write.
   const deliveryDaemon = graph.runtime.atom(
     Effect.fnUntraced(function*(get) {
-      const summaries = yield* get.result(summariesAtom)
+      const summaries = yield* get.result(summariesAtom, { suspendOnWaiting: true })
       const replica = yield* Replica.Replica
       const space = yield* replica.space(spaceId)
       yield* Effect.forEach(
