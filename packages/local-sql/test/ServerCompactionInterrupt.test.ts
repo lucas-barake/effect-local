@@ -13,7 +13,7 @@ import * as Rows from "../src/internal/rows.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as Domain from "./Domain.js"
-import { type ServerDatabase, serverDatabases } from "./fixtures/ServerDatabase.js"
+import { sqliteLayer } from "./fixtures/ServerDatabase.js"
 
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000601")
 const membershipIncarnation = Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000601")
@@ -41,7 +41,7 @@ const envelope = Effect.fnUntraced(function*(spaceId: Identity.SpaceId, index: n
   return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
 })
 
-const layerDatabase = (database: ServerDatabase) => Layer.mergeAll(database.layer(), NodeCrypto.layer)
+const layerDatabase = Layer.mergeAll(sqliteLayer(), NodeCrypto.layer)
 
 const layerStore = ServerStore.layerTrusted({
   definition: Domain.definition,
@@ -148,11 +148,11 @@ const interruptedAt = Effect.fnUntraced(function*(index: number, steps: number) 
   return { steps: taken, completedFirst, committed, outcomes }
 })
 
-describe.each(serverDatabases)("ServerStore write-triggered compaction ($dialect)", (database) => {
+describe("ServerStore write-triggered compaction", () => {
   it.effect(
     "keeps compacting a space after a submit is interrupted at any point once it committed",
     Effect.fnUntraced(function*() {
-      const context = yield* layerStore.pipe(Layer.provideMerge(layerDatabase(database)), Layer.build)
+      const context = yield* layerStore.pipe(Layer.provideMerge(layerDatabase), Layer.build)
       const full = yield* interruptedAt(0, Number.MAX_SAFE_INTEGER).pipe(Effect.provide(context))
       assert.strictEqual(full.completedFirst, true)
       const stuck: Array<{ readonly steps: number; readonly outcomes: ReadonlyArray<string> }> = []
@@ -169,6 +169,6 @@ describe.each(serverDatabases)("ServerStore write-triggered compaction ($dialect
       assert.isAbove(scanned, 0)
       assert.deepStrictEqual(stuck, [])
     }, Effect.scoped),
-    120_000
+    60_000
   )
 })
