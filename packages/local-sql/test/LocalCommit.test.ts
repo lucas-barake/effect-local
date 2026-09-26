@@ -233,7 +233,8 @@ describe("local commit", () => {
       )
       yield* Deferred.await(probe.entered)
       const second = yield* local.mutate(Domain.PutTodo, Domain.todo("second")).pipe(
-        Effect.forkChild({ startImmediately: true })
+        Effect.forkChild({ startImmediately: true }),
+        Effect.provideService(Scheduler.PreventSchedulerYield, true)
       )
       const submission = yield* local.pendingToSubmit.pipe(Effect.forkChild({ startImmediately: true }))
       yield* Deferred.succeed(probe.release, undefined)
@@ -343,7 +344,8 @@ describe("local commit", () => {
       )
       yield* Deferred.await(probe.entered)
       const before = yield* local.mutate(Domain.PutTodo, Domain.todo("before")).pipe(
-        Effect.forkChild({ startImmediately: true })
+        Effect.forkChild({ startImmediately: true }),
+        Effect.provideService(Scheduler.PreventSchedulerYield, true)
       )
       const submission = yield* local.pendingToSubmit.pipe(Effect.forkChild({ startImmediately: true }))
       const poisoned = yield* local.mutate(Domain.PutTodo, Domain.todo("poisoned"), { mutationId: poison }).pipe(
