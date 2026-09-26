@@ -23,6 +23,7 @@ import * as SqlTransaction from "./transaction.js"
 const NonNegativeInt = Schema.Natural
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 type Options<R = never,> = OfflineWake.Options<R>
+const presenceReconcileBatchSize = 256
 const DeliveryOutcome = Schema.Literals(["Delivered", "NotRecipient"])
 
 export interface Service {
@@ -786,21 +787,43 @@ export const make = Effect.fnUntraced(function*<R,>(
       ])
       yield* SqlTransaction.withServerTransaction(
         sql,
+        sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
+          VALUES (${runtimeId}, ${heartbeatAt + presenceLeaseMillis})
+          ON CONFLICT (runtime_id) DO UPDATE SET expires_at = excluded.expires_at`
+      )
+      const entries = [...presences]
+      for (let offset = 0; offset < entries.length; offset += presenceReconcileBatchSize) {
+        const batch = entries.slice(offset, offset + presenceReconcileBatchSize)
+        const batchEncoded = yield* Codec.stringify(batch.map(([watcherId, presence]) => ({
+          watcher_id: watcherId,
+          space_id: presence.spaceId,
+          client_id: presence.clientId
+        }))).pipe(Effect.mapError(StorageUnavailable.make))
+        const batchPresence = dialect.jsonRecords(batchEncoded, "local_presence", [
+          { name: "space_id", affinity: "text" },
+          { name: "client_id", affinity: "text" },
+          { name: "watcher_id", affinity: "text" }
+        ])
+        yield* SqlTransaction.withServerTransaction(
+          sql,
+          Effect.gen(function*() {
+            yield* dialect.lockPresences(batch.map(([, presence]) => presence))
+            yield* sql`INSERT INTO effect_local_server_watch_presence
+              (space_id, client_id, watcher_id, runtime_id)
+              SELECT local_presence.space_id, local_presence.client_id, local_presence.watcher_id, ${runtimeId}
+              FROM ${batchPresence}
+              WHERE NOT EXISTS (SELECT 1 FROM effect_local_server_offline_wakes AS wake
+                WHERE wake.space_id = local_presence.space_id
+                  AND wake.client_id = local_presence.client_id
+                  AND wake.claim_token IS NOT NULL AND wake.claimed_until > ${heartbeatAt})
+              ON CONFLICT (space_id, client_id, watcher_id) DO UPDATE SET
+                runtime_id = excluded.runtime_id`
+          })
+        )
+      }
+      yield* SqlTransaction.withServerTransaction(
+        sql,
         Effect.gen(function*() {
-          yield* dialect.lockPresences([...presences.values()])
-          yield* sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
-            VALUES (${runtimeId}, ${heartbeatAt + presenceLeaseMillis})
-            ON CONFLICT (runtime_id) DO UPDATE SET expires_at = excluded.expires_at`
-          yield* sql`INSERT INTO effect_local_server_watch_presence
-            (space_id, client_id, watcher_id, runtime_id)
-            SELECT local_presence.space_id, local_presence.client_id, local_presence.watcher_id, ${runtimeId}
-            FROM ${localPresence}
-            WHERE NOT EXISTS (SELECT 1 FROM effect_local_server_offline_wakes AS wake
-              WHERE wake.space_id = local_presence.space_id
-                AND wake.client_id = local_presence.client_id
-                AND wake.claim_token IS NOT NULL AND wake.claimed_until > ${heartbeatAt})
-            ON CONFLICT (space_id, client_id, watcher_id) DO UPDATE SET
-              runtime_id = excluded.runtime_id`
           yield* deferRuntimeWakes(heartbeatAt)
           yield* sql`UPDATE effect_local_server_offline_wakes SET next_attempt_at = 0
           WHERE EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS durable
