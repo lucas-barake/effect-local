@@ -19,6 +19,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
+import type * as Queue from "effect/Queue"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
@@ -26,6 +27,7 @@ import type * as ClusterError from "effect/unstable/cluster/ClusterError"
 import type * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import type * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcGroup from "effect/unstable/rpc/RpcGroup"
+import * as LosslessQueue from "./losslessQueue.js"
 import type * as replicaWire from "./replicaWire.js"
 import { decodeWith, encodeJson, type Json } from "./wireCodec.js"
 
@@ -169,6 +171,10 @@ function decodeSettlement(
   return decodeAnySettlement(definition, wire)
 }
 
+const streamFrom = <A, E extends { readonly _tag: string },>(
+  queue: Effect.Effect<Queue.Dequeue<A, E>, never, Scope.Scope>
+): Stream.Stream<A, Exclude<E, Cause.Done>> => Stream.unwrap(Effect.map(queue, LosslessQueue.stream))
+
 const failureOutsideHandover = <A, E extends Tagged,>(exit: Exit.Exit<A, E>): Cause.Cause<E> | undefined => {
   if (Exit.isSuccess(exit) || Cause.hasInterruptsOnly(exit.cause)) return undefined
   return exit.cause
@@ -256,7 +262,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
 
   const subscribed = Deferred.makeUnsafe<void>()
   let resubscribing = false
-  yield* client.Invalidations({}).pipe(
+  yield* streamFrom(client.Invalidations({}, { asQueue: true })).pipe(
     Stream.runForEach((frame) => {
       if (frame._tag === "Keys") {
         forgetInvalidatedMemberships(frame.keys)
@@ -302,7 +308,11 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       Stream.unwrap(
         resolveStart.pipe(
           Effect.map((resolved) =>
-            client.Settlements({ spaceId, consumer: options.consumer, start: resolved, after: cursor, name })
+            streamFrom(
+              client.Settlements({ spaceId, consumer: options.consumer, start: resolved, after: cursor, name }, {
+                asQueue: true
+              })
+            )
           )
         )
       ).pipe(
@@ -554,7 +564,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     const scope = Scope.forkUnsafe(proxyScope)
     leases.set(key, { count: 1, scope, acquired })
     let acquisitions = 0
-    yield* client.Retain({ key }).pipe(
+    yield* streamFrom(client.Retain({ key }, { asQueue: true })).pipe(
       Stream.runForEach(() =>
         Effect.suspend(() => {
           acquisitions += 1
@@ -644,13 +654,13 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
 
     const openRemote = Stream.suspend(() => {
       openedValue = latestValue
-      return client.EphemeralSession({
+      return streamFrom(client.EphemeralSession({
         name,
         spaceId: sessionOptions.spaceId,
         member: sessionOptions.member,
         value: openedValue,
         ttlMillis
-      })
+      }, { asQueue: true }))
     })
 
     yield* openRemote.pipe(

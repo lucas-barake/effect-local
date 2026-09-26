@@ -303,6 +303,32 @@ const liveSettlementsFailWhenTheTabCloses = Effect.fnUntraced(
   provideFileSystem
 )
 
+const followerMemberUpdatesAfterLeaderCloses = Effect.fnUntraced(
+  function*() {
+    const opens = yield* Ref.make(0)
+    const reopened = yield* Deferred.make<void>()
+    const opening = Ref.getAndUpdate(opens, (count) => count + 1).pipe(
+      Effect.flatMap((count) => {
+        if (count === 0) return Effect.void
+        return Deferred.await(reopened)
+      })
+    )
+    const updates = yield* Ref.make<ReadonlyArray<unknown>>([])
+    const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralOpening(opening, updates) })
+    const leader = yield* environment.openTab
+    const follower = yield* environment.openTab
+    const session = yield* settle(openStatusSession(follower.context).pipe(Scope.provide(yield* Effect.scope)))
+    yield* settle(Scope.close(leader.scope, Exit.void))
+    assert.strictEqual(yield* Ref.get(opens), 2)
+    const updated = yield* settle(session.updateMember({ status: "away" }).pipe(Effect.exit))
+    assert.isTrue(Exit.isSuccess(updated), String(updated))
+    yield* settle(Deferred.succeed(reopened, undefined))
+    assert.deepStrictEqual(yield* Ref.get(updates), [{ status: "away" }])
+  },
+  Effect.scoped,
+  provideFileSystem
+)
+
 describe("BrowserReplica", () => {
   it.effect(
     "reports the leader replica's first sync to a follower tab through the synced status",
@@ -861,34 +887,7 @@ describe("BrowserReplica", () => {
     )
   )
 
-  it.effect(
-    "updates a follower's ephemeral member after the leader tab closes",
-    Effect.fnUntraced(
-      function*() {
-        const opens = yield* Ref.make(0)
-        const reopened = yield* Deferred.make<void>()
-        const opening = Ref.getAndUpdate(opens, (count) => count + 1).pipe(
-          Effect.flatMap((count) => {
-            if (count === 0) return Effect.void
-            return Deferred.await(reopened)
-          })
-        )
-        const updates = yield* Ref.make<ReadonlyArray<unknown>>([])
-        const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralOpening(opening, updates) })
-        const leader = yield* environment.openTab
-        const follower = yield* environment.openTab
-        const session = yield* settle(openStatusSession(follower.context).pipe(Scope.provide(yield* Effect.scope)))
-        yield* settle(Scope.close(leader.scope, Exit.void))
-        assert.strictEqual(yield* Ref.get(opens), 2)
-        const updated = yield* settle(session.updateMember({ status: "away" }).pipe(Effect.exit))
-        assert.isTrue(Exit.isSuccess(updated), String(updated))
-        yield* settle(Deferred.succeed(reopened, undefined))
-        assert.deepStrictEqual(yield* Ref.get(updates), [{ status: "away" }])
-      },
-      Effect.scoped,
-      provideFileSystem
-    )
-  )
+  it.effect("updates a follower's ephemeral member after the leader tab closes", followerMemberUpdatesAfterLeaderCloses)
 
   it.effect(
     "stops opening an ephemeral session whose first open failed",
@@ -1121,5 +1120,9 @@ describe("BrowserReplica at small scheduler budgets", () => {
   it.effect(
     "fails a caller's live settlement stream with OwnerUnavailable when its tab's replica closes at a scheduler budget of 20 operations",
     () => liveSettlementsFailWhenTheTabCloses().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 20))
+  )
+  it.effect(
+    "updates a follower's ephemeral member after the leader tab closes at a scheduler budget of 5 operations",
+    () => followerMemberUpdatesAfterLeaderCloses().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 5))
   )
 })
