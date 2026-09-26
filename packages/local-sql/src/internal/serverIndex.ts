@@ -444,16 +444,16 @@ export const make = Effect.fn("ServerIndex.make")(
         }> = []
         const model = definition.modelByName.get(modelName)
         if (model === undefined) continue
+        const latest = new Map<string, Protocol.EntityChange>()
         for (const change of modelChanges) {
+          latest.set(yield* Codec.stringify(change.entity.key), change)
+        }
+        for (const [entityKey, change] of latest) {
           let value: unknown
           if (change._tag === "Upsert") {
             value = yield* Codec.decode(model.schema, change.value)
           }
-          prepared.push({
-            change,
-            entityKey: yield* Codec.stringify(change.entity.key),
-            value
-          })
+          prepared.push({ change, entityKey, value })
         }
         for (const descriptor of active) {
           const previousByKey = yield* readPartitions(

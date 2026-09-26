@@ -17,6 +17,7 @@ interface PresenceKey {
   readonly clientId: Identity.ClientId
 }
 
+const unpairedSurrogate = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g
 export interface Dialect {
   readonly name: "sqlite" | "pg"
   readonly text: string
@@ -103,7 +104,11 @@ const postgres = (sql: SqlClient.SqlClient): Dialect => ({
   integer: "BIGINT",
   tableOptions: "",
   indexColumn: postgresType,
-  encodeText: (value) => value.replaceAll("\u0001", "\u0001\u0002").replaceAll("\u0000", "\u0001\u0001"),
+  encodeText: (value) =>
+    value.replaceAll(unpairedSurrogate, "\ufffd").replaceAll("\u0001", "\u0001\u0002").replaceAll(
+      "\u0000",
+      "\u0001\u0001"
+    ),
   decodeText: decodeEscapedText,
   lockSchema: sql`SELECT pg_advisory_xact_lock(${schemaLockClass}, 0)`.pipe(Effect.asVoid),
   lockPresences: (keys) =>
