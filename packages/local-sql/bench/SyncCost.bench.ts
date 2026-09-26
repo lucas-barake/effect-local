@@ -9,7 +9,7 @@ import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Option from "effect/Option"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import { afterAll, assert, bench, describe } from "vitest"
+import { afterAll, assert, describe, test } from "vitest"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -203,26 +203,28 @@ afterAll(async () => {
 describe("per-message sync cost by space size", () => {
   for (const { entityCount, iterations, label, scope } of configurations) {
     const windowed = scope === windowedScope
-    bench(label, async () => {
-      let environment = environments.get(label)
-      if (environment === undefined) {
-        environment = makeEnvironment(scope)
-        environments.set(label, environment)
+    test(label, async ({ bench }) => {
+      await bench(label, async () => {
+        let environment = environments.get(label)
+        if (environment === undefined) {
+          environment = makeEnvironment(scope)
+          environments.set(label, environment)
+          if (windowed) {
+            // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
+            await environment.runtime.runPromise(seedMessages(environment, entityCount))
+          } else {
+            // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
+            await environment.runtime.runPromise(seedTodos(environment, entityCount))
+          }
+        }
         if (windowed) {
           // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
-          await environment.runtime.runPromise(seedMessages(environment, entityCount))
+          await environment.runtime.runPromise(syncOneMessage(environment))
         } else {
           // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
-          await environment.runtime.runPromise(seedTodos(environment, entityCount))
+          await environment.runtime.runPromise(syncOneTodo(environment))
         }
-      }
-      if (windowed) {
-        // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
-        await environment.runtime.runPromise(syncOneMessage(environment))
-      } else {
-        // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
-        await environment.runtime.runPromise(syncOneTodo(environment))
-      }
-    }, { iterations, time: 0, warmupIterations: 1, warmupTime: 0, throws: true })
+      }).run({ iterations, time: 0, warmupIterations: 1, warmupTime: 0, throws: true })
+    })
   }
 })

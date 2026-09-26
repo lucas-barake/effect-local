@@ -110,7 +110,7 @@ export class ServerStore extends Context.Service<ServerStore, Service>()(
   "@lucas-barake/effect-local-sql/ServerStore"
 ) {}
 
-type AuthorizationRejection = Schema.JsonObject & { readonly _tag: string }
+type AuthorizationRejection = { readonly [key: string]: Schema.Json } & { readonly _tag: string }
 
 export interface Options<R = never,> extends HistoryOptions {
   readonly definition: Definition.Any

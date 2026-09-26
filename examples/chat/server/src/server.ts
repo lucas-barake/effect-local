@@ -50,7 +50,7 @@ export interface ChatServerOptions {
   readonly databaseFile: string
 }
 
-class ChatAuthorizationError extends Schema.TaggedErrorClass<ChatAuthorizationError, Schema.JsonObject>(
+class ChatAuthorizationError extends Schema.TaggedError<ChatAuthorizationError, Schema.JsonObject>(
   "@effect-local/example-chat/ChatAuthorizationError"
 )("ChatAuthorizationError", { reason: Schema.String }) {}
 

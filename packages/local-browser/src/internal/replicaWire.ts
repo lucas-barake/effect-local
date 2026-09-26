@@ -8,34 +8,34 @@ import * as Schema from "effect/Schema"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 
-export class WireMutationRejection extends Schema.TaggedErrorClass<WireMutationRejection>(
+export class WireMutationRejection extends Schema.TaggedError<WireMutationRejection>(
   "@lucas-barake/effect-local-browser/WireMutationRejection"
 )("WireMutationRejection", {
   name: Schema.String,
   rejection: Schema.Json
 }) {}
 
-export class WireQueryError extends Schema.TaggedErrorClass<WireQueryError>(
+export class WireQueryError extends Schema.TaggedError<WireQueryError>(
   "@lucas-barake/effect-local-browser/WireQueryError"
 )("WireQueryError", {
   name: Schema.String,
   error: Schema.Json
 }) {}
 
-export class WireEphemeralEncodeError extends Schema.TaggedErrorClass<WireEphemeralEncodeError>(
+export class WireEphemeralEncodeError extends Schema.TaggedError<WireEphemeralEncodeError>(
   "@lucas-barake/effect-local-browser/WireEphemeralEncodeError"
 )("WireEphemeralEncodeError", {
   name: Schema.String
 }) {}
 
-export class WireUnknownDefinition extends Schema.TaggedErrorClass<WireUnknownDefinition>(
+export class WireUnknownDefinition extends Schema.TaggedError<WireUnknownDefinition>(
   "@lucas-barake/effect-local-browser/WireUnknownDefinition"
 )("WireUnknownDefinition", {
   kind: Schema.Literals(["model", "mutation", "query", "ephemeral"]),
   name: Schema.String
 }) {}
 
-export class WireUnknownSession extends Schema.TaggedErrorClass<WireUnknownSession>(
+export class WireUnknownSession extends Schema.TaggedError<WireUnknownSession>(
   "@lucas-barake/effect-local-browser/WireUnknownSession"
 )("WireUnknownSession", {
   handle: Schema.String

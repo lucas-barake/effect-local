@@ -48,9 +48,9 @@
     "test": "vitest --config vitest.config.ts"
   },
   "peerDependencies": {
-    "effect": ">=4.0.0-beta.103 <4.0.1"
+    "effect": ">=4.0.0-rc.117 <4.0.1"
   },
   "devDependencies": {
-    "effect": "4.0.0-beta.103"
+    "effect": "4.0.0-rc.117"
   }
 }

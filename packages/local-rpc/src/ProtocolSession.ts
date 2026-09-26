@@ -74,6 +74,7 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
               SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
               SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
               SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
               HttpError: (reason, error) => {
                 if (reason.kind === "TransportError") {
                   return Effect.fail(new ReplicaError.ServerUnavailable())

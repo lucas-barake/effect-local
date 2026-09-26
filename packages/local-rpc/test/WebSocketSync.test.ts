@@ -44,7 +44,7 @@ const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Ef
     })
   )
 
-class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationError, Schema.JsonObject>(
+class TestAuthorizationError extends Schema.TaggedError<TestAuthorizationError, Schema.JsonObject>(
   "@lucas-barake/effect-local-rpc/test/WebSocketSync/TestAuthorizationError"
 )("TestAuthorizationError", { reason: Schema.String }) {}
 import * as SqlClient from "effect/unstable/sql/SqlClient"
@@ -257,10 +257,10 @@ const webSocketConstructions = MutableRef.make(0)
 const liveWebSockets = MutableRef.make(0)
 const countedWebSocketConstructor = Effect.gen(function*() {
   const makeWebSocket = yield* Socket.WebSocketConstructor
-  return (url: string, protocols?: string | Array<string>) => {
+  return (url: string, options?: Socket.WebSocketConstructorOptions) => {
     MutableRef.update(webSocketConstructions, (count) => count + 1)
     MutableRef.update(liveWebSockets, (count) => count + 1)
-    const webSocket = makeWebSocket(url, protocols)
+    const webSocket = makeWebSocket(url, options)
     webSocket.addEventListener("close", () => {
       MutableRef.update(liveWebSockets, (count) => count - 1)
     }, { once: true })
@@ -276,7 +276,7 @@ const layerCountedConstructor = Layer.effect(
 const serverUrl = Effect.gen(function*() {
   const server = yield* HttpServer.HttpServer
   const address = server.address
-  if (address._tag === "UnixAddress") return yield* Effect.die("Expected the test HTTP server to use a TCP address")
+  if (address._tag === "UnixPathAddress") return yield* Effect.die("Expected the test HTTP server to use a TCP address")
   return `http://127.0.0.1:${address.port}/sync`
 })
 const layerSocket = Effect.flatMap(serverUrl, (url) => Socket.makeWebSocket(url)).pipe(
@@ -402,7 +402,7 @@ const restoreReadAuthorization = Effect.ensuring(Effect.sync(() => MutableRef.se
 type AuthenticatorMode = "Available" | "Rejected" | "Unavailable"
 
 const awaitStatus = (
-  reactivity: Reactivity.Reactivity["Service"],
+  reactivity: Reactivity.Reactivity,
   space: Replica.Space,
   tag: "Online" | "Offline" | "NeedsAuthentication"
 ) =>
@@ -538,10 +538,10 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     const makeWebSocket = yield* Socket.WebSocketConstructor
     return (
       url: string,
-      protocols?: string | Array<string>
+      constructorOptions?: Socket.WebSocketConstructorOptions
     ) => {
       MutableRef.update(lifecycleWebSocketConstructions, (count) => count + 1)
-      return makeWebSocket(url, protocols)
+      return makeWebSocket(url, constructorOptions)
     }
   })
   const layerLifecycleConstructor = Layer.effect(
@@ -553,7 +553,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const layerLifecycleSocket = Effect.gen(function*() {
     const server = yield* HttpServer.HttpServer
     const address = server.address
-    if (address._tag === "UnixAddress") return yield* Effect.die("Expected a TCP test server")
+    if (address._tag === "UnixPathAddress") return yield* Effect.die("Expected a TCP test server")
     return yield* Socket.makeWebSocket(`http://127.0.0.1:${address.port}/sync`)
   }).pipe(Layer.effect(Socket.Socket), Layer.provide(layerLifecycleConstructor))
   const layerLifecycleClientProtocol = SyncClient.layerProtocolSocket().pipe(Layer.provide(layerLifecycleSocket))

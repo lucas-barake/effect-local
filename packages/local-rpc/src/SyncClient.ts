@@ -56,6 +56,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                   SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   HttpError: (reason, error) => {
                     if (reason.kind === "TransportError") {
                       return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -109,6 +110,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                   SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   HttpError: (reason, error) => {
                     if (reason.kind === "TransportError") {
                       return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -162,6 +164,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                   SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   HttpError: (reason, error) => {
                     if (reason.kind === "TransportError") {
                       return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -217,6 +220,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                   SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   HttpError: (reason, error) => {
                     if (reason.kind === "TransportError") {
                       return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -289,6 +293,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                         SocketWriteError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
                         SocketOpenError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
                         SocketCloseError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                        SocketUpgradeError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
                         HttpError: (reason, error) => {
                           if (reason.kind === "TransportError") {
                             return Stream.fail(new ReplicaError.ServerUnavailable())
@@ -342,7 +347,6 @@ export interface WebSocketOptions<R = never,> extends EphemeralClient.Options {
   readonly retryTransientErrors?: boolean
   readonly retryPolicy?: Schedule.Schedule<any, Socket.SocketError>
   readonly socket?: {
-    readonly closeCodeIsError?: ((code: number) => boolean) | undefined
     readonly openTimeout?: Duration.Input | undefined
     readonly protocols?: string | Array<string> | undefined
   }

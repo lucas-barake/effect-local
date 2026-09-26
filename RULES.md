@@ -19,7 +19,7 @@ Read this file before any work. Treat these rules as required for every package.
 
 ## Errors
 
-- Define every library owned typed error with `Schema.TaggedErrorClass<Self>(identifier)("Tag", fields)`.
+- Define every library owned typed error with `Schema.TaggedError<Self>(identifier)("Tag", fields)`.
 - Give every typed failure a stable `_tag`. Do not add untagged or `Data.TaggedError` library error types.
 - Discriminate tagged errors with `_tag`. Do not use `instanceof` for error discrimination.
 - Do not define shared error transformers such as `toSomeError`, `mapErrors`, or helpers that accept `unknown` and return another error. Handle each inferred failure directly at the call site with explicit `_tag` based `Effect.catchTag`, `catchTags`, `catchReason`, or `catchReasons` branches. Use `catchCause` at the call site only when the full Cause must be preserved. Accept small duplication so error channels stay narrow and every handled failure remains explicit.

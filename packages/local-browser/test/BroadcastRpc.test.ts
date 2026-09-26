@@ -18,7 +18,7 @@ import * as broadcastRpc from "../src/internal/broadcastRpc.js"
 import * as Wire from "../src/internal/multiTabWire.js"
 import * as testKit from "./multiTabKit.js"
 
-class EchoError extends Schema.TaggedErrorClass<EchoError>(
+class EchoError extends Schema.TaggedError<EchoError>(
   "test/EchoError"
 )("EchoError", { message: Schema.String }) {}
 

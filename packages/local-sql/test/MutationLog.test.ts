@@ -56,7 +56,7 @@ const putTodoProvenance = {
   mutationVersion: Domain.PutTodo.version
 }
 
-class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationError, Schema.JsonObject>(
+class TestAuthorizationError extends Schema.TaggedError<TestAuthorizationError, Schema.JsonObject>(
   "@lucas-barake/effect-local-sql/test/TestAuthorizationError"
 )("TestAuthorizationError", { reason: Schema.String }) {
 }
@@ -3967,8 +3967,13 @@ describe("server reconciled mutation log", () => {
           )
         })
       )
-      const pairDatabase = () =>
-        Layer.mergeAll(SqliteClient.layer({ filename }), NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
+      const pairDatabase = (readonly: boolean) =>
+        Layer.mergeAll(
+          SqliteClient.layer({ filename, readonly }),
+          NodeCrypto.layer,
+          Reactivity.layer,
+          QueryReactivity.layer
+        )
       const layerPairRuntime = MutationRuntime.layer(definition).pipe(
         Layer.provide(layerHandlers),
         Layer.provide(layerGate)
@@ -3981,12 +3986,12 @@ describe("server reconciled mutation log", () => {
         clientId
       }).pipe(
         Layer.provide(layerPairRuntime),
-        Layer.provide(pairDatabase())
+        Layer.provide(pairDatabase(false))
       )
       const layerQueries = QueryExecutor.layer(definition, spaceId).pipe(
         Layer.provide(layerHandlers),
         Layer.provide(layerGate),
-        Layer.provide(pairDatabase())
+        Layer.provide(pairDatabase(true))
       )
       const context = yield* Layer.build(Layer.merge(layerLocal, layerQueries))
       const store = Context.get(context, LocalStore.Store)

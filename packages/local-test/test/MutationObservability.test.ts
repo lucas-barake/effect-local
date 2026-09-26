@@ -41,7 +41,7 @@ const PutTodo = Mutation.make("PutTodo", {
   success: Todo.schema
 })
 
-class RejectTodoError extends Schema.TaggedErrorClass<RejectTodoError>(
+class RejectTodoError extends Schema.TaggedError<RejectTodoError>(
   "@lucas-barake/effect-local-test/RejectTodoError"
 )("RejectTodoError", { code: Schema.NumberFromString }) {}
 

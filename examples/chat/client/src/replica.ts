@@ -78,7 +78,7 @@ export const sessionAtom = Atom.kvs({
   mode: "async"
 })
 
-class LoginFailed extends Schema.TaggedErrorClass<LoginFailed>(
+class LoginFailed extends Schema.TaggedError<LoginFailed>(
   "@effect-local/example-chat/LoginFailed"
 )("LoginFailed", { reason: Schema.String }) {}
 

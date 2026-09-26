@@ -298,7 +298,7 @@ export const layer = <E extends { readonly _tag: string },>(options: Options<E>)
     const whileLeader = Effect.fn("localBrowser.multiTab.owner")(function*(epoch: Wire.Epoch) {
       const grantScope = yield* Effect.scope
       const invalidationSeq = { value: 0 }
-      const decoratedReactivity: Reactivity.Reactivity["Service"] = {
+      const decoratedReactivity: Reactivity.Reactivity = {
         ...baseReactivity,
         invalidate: (keys) =>
           baseReactivity.invalidate(keys).pipe(

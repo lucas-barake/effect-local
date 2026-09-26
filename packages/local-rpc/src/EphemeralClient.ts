@@ -341,6 +341,7 @@ export const layerFromSession = (
                       SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                       SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                       SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                       HttpError: (reason, error) => {
                         if (reason.kind === "TransportError") {
                           return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -406,6 +407,7 @@ export const layerFromSession = (
                       SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                       SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                       SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                      SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                       HttpError: (reason, error) => {
                         if (reason.kind === "TransportError") {
                           return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -488,6 +490,7 @@ export const layerFromSession = (
                     SocketWriteError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
                     SocketOpenError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
                     SocketCloseError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                    SocketUpgradeError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
                     HttpError: (reason, error) => {
                       if (reason.kind === "TransportError") {
                         return Stream.fail(new ReplicaError.ServerUnavailable())

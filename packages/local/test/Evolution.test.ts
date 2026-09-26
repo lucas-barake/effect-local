@@ -15,10 +15,10 @@ const TodoV1 = Model.make("Todo", {
   key: Schema.String,
   schema: Schema.Struct({ id: Schema.String, title: Schema.String })
 })
-class Missing extends Schema.TaggedErrorClass<Missing>(
+class Missing extends Schema.TaggedError<Missing>(
   "@lucas-barake/effect-local/test/Evolution/Missing"
 )("Missing", {}) {}
-class Forbidden extends Schema.TaggedErrorClass<Forbidden>(
+class Forbidden extends Schema.TaggedError<Forbidden>(
   "@lucas-barake/effect-local/test/Evolution/Forbidden"
 )("Forbidden", {}) {}
 const PutTodoV1 = Mutation.make("PutTodo", {

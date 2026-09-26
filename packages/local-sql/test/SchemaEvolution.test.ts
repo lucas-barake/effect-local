@@ -73,7 +73,7 @@ const serverHistory = {
   migration
 }
 
-class SchemaPolicyRejectedError extends Schema.TaggedErrorClass<SchemaPolicyRejectedError>(
+class SchemaPolicyRejectedError extends Schema.TaggedError<SchemaPolicyRejectedError>(
   "@lucas-barake/effect-local-sql/test/SchemaPolicyRejectedError"
 )("SchemaPolicyRejectedError", { reason: Schema.String }) {}
 

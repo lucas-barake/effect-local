@@ -5,15 +5,15 @@ const nonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 const optionalNonNegativeInt = Schema.optionalKey(nonNegativeInt)
 const positiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 
-export class CanonicalEncodeError extends Schema.TaggedErrorClass<CanonicalEncodeError>(
+export class CanonicalEncodeError extends Schema.TaggedError<CanonicalEncodeError>(
   "@lucas-barake/effect-local/CanonicalEncodeError"
 )("CanonicalEncodeError", { cause: Schema.Defect() }) {}
 
-export class StorageUnavailable extends Schema.TaggedErrorClass<StorageUnavailable>(
+export class StorageUnavailable extends Schema.TaggedError<StorageUnavailable>(
   "@lucas-barake/effect-local/StorageUnavailable"
 )("StorageUnavailable", { cause: Schema.Defect() }) {}
 
-export class StorageCorrupt extends Schema.TaggedErrorClass<StorageCorrupt>(
+export class StorageCorrupt extends Schema.TaggedError<StorageCorrupt>(
   "@lucas-barake/effect-local/StorageCorrupt"
 )("StorageCorrupt", { message: Schema.String, cause: optionalDefect }) {}
 
@@ -23,15 +23,15 @@ export class StorageCorrupt extends Schema.TaggedErrorClass<StorageCorrupt>(
  * the database, is wrong. Transient engine failures (busy, locked, connection) stay
  * `StorageUnavailable`.
  */
-export class QueryFailed extends Schema.TaggedErrorClass<QueryFailed>(
+export class QueryFailed extends Schema.TaggedError<QueryFailed>(
   "@lucas-barake/effect-local/QueryFailed"
 )("QueryFailed", { message: Schema.String, cause: optionalDefect }) {}
 
-export class DefinitionMismatch extends Schema.TaggedErrorClass<DefinitionMismatch>(
+export class DefinitionMismatch extends Schema.TaggedError<DefinitionMismatch>(
   "@lucas-barake/effect-local/DefinitionMismatch"
 )("DefinitionMismatch", { expected: Schema.String, actual: Schema.String }) {}
 
-export class StaleSchema extends Schema.TaggedErrorClass<StaleSchema>(
+export class StaleSchema extends Schema.TaggedError<StaleSchema>(
   "@lucas-barake/effect-local/StaleSchema"
 )("StaleSchema", {
   expectedVersion: Schema.Number,
@@ -40,11 +40,11 @@ export class StaleSchema extends Schema.TaggedErrorClass<StaleSchema>(
   actualHash: Schema.String
 }) {}
 
-export class SchemaGenerationConflict extends Schema.TaggedErrorClass<SchemaGenerationConflict>(
+export class SchemaGenerationConflict extends Schema.TaggedError<SchemaGenerationConflict>(
   "@lucas-barake/effect-local/SchemaGenerationConflict"
 )("SchemaGenerationConflict", { expected: Schema.Number, actual: Schema.Number }) {}
 
-export class SchemaEvolutionUnsupported extends Schema.TaggedErrorClass<SchemaEvolutionUnsupported>(
+export class SchemaEvolutionUnsupported extends Schema.TaggedError<SchemaEvolutionUnsupported>(
   "@lucas-barake/effect-local/SchemaEvolutionUnsupported"
 )("SchemaEvolutionUnsupported", {
   sourceVersion: Schema.Number,
@@ -53,7 +53,7 @@ export class SchemaEvolutionUnsupported extends Schema.TaggedErrorClass<SchemaEv
   targetHash: Schema.String
 }) {}
 
-export class SchemaEvolutionFailed extends Schema.TaggedErrorClass<SchemaEvolutionFailed>(
+export class SchemaEvolutionFailed extends Schema.TaggedError<SchemaEvolutionFailed>(
   "@lucas-barake/effect-local/SchemaEvolutionFailed"
 )("SchemaEvolutionFailed", {
   stepId: Schema.String,
@@ -65,34 +65,34 @@ export class SchemaEvolutionFailed extends Schema.TaggedErrorClass<SchemaEvoluti
   cause: Schema.Defect()
 }) {}
 
-export class StorageMigrationMismatch extends Schema.TaggedErrorClass<StorageMigrationMismatch>(
+export class StorageMigrationMismatch extends Schema.TaggedError<StorageMigrationMismatch>(
   "@lucas-barake/effect-local/StorageMigrationMismatch"
 )("StorageMigrationMismatch", { catalog: Schema.String, message: Schema.String }) {}
 
-export class SchemaKeyCollision extends Schema.TaggedErrorClass<SchemaKeyCollision>(
+export class SchemaKeyCollision extends Schema.TaggedError<SchemaKeyCollision>(
   "@lucas-barake/effect-local/SchemaKeyCollision"
 )("SchemaKeyCollision", { model: Schema.String, key: Schema.String }) {}
 
-export class PendingMutationEvolutionRejected extends Schema.TaggedErrorClass<PendingMutationEvolutionRejected>(
+export class PendingMutationEvolutionRejected extends Schema.TaggedError<PendingMutationEvolutionRejected>(
   "@lucas-barake/effect-local/PendingMutationEvolutionRejected"
 )("PendingMutationEvolutionRejected", { mutationId: Schema.String, rejection: Schema.Json }) {}
 
-export class ReplicaIdentityMismatch extends Schema.TaggedErrorClass<ReplicaIdentityMismatch>(
+export class ReplicaIdentityMismatch extends Schema.TaggedError<ReplicaIdentityMismatch>(
   "@lucas-barake/effect-local/ReplicaIdentityMismatch"
 )("ReplicaIdentityMismatch", {
   expectedClientId: Schema.String,
   actualClientId: Schema.String
 }) {}
 
-export class SpaceNotJoined extends Schema.TaggedErrorClass<SpaceNotJoined>(
+export class SpaceNotJoined extends Schema.TaggedError<SpaceNotJoined>(
   "@lucas-barake/effect-local/SpaceNotJoined"
 )("SpaceNotJoined", { spaceId: Schema.String }) {}
 
-export class SpaceUnavailable extends Schema.TaggedErrorClass<SpaceUnavailable>(
+export class SpaceUnavailable extends Schema.TaggedError<SpaceUnavailable>(
   "@lucas-barake/effect-local/SpaceUnavailable"
 )("SpaceUnavailable", { spaceId: Schema.String }) {}
 
-export class EphemeralSessionUnavailable extends Schema.TaggedErrorClass<EphemeralSessionUnavailable>(
+export class EphemeralSessionUnavailable extends Schema.TaggedError<EphemeralSessionUnavailable>(
   "@lucas-barake/effect-local/EphemeralSessionUnavailable"
 )("EphemeralSessionUnavailable", {
   spaceId: Schema.String,
@@ -100,90 +100,90 @@ export class EphemeralSessionUnavailable extends Schema.TaggedErrorClass<Ephemer
   membershipIncarnation: Schema.String
 }) {}
 
-export class MutationIdentityConflict extends Schema.TaggedErrorClass<MutationIdentityConflict>(
+export class MutationIdentityConflict extends Schema.TaggedError<MutationIdentityConflict>(
   "@lucas-barake/effect-local/MutationIdentityConflict"
 )("MutationIdentityConflict", { mutationId: Schema.String }) {}
 
-export class QuarantineResubmissionConflict extends Schema.TaggedErrorClass<QuarantineResubmissionConflict>(
+export class QuarantineResubmissionConflict extends Schema.TaggedError<QuarantineResubmissionConflict>(
   "@lucas-barake/effect-local/QuarantineResubmissionConflict"
 )("QuarantineResubmissionConflict", { mutationId: Schema.String }) {}
 
-export class OutOfOrderMutation extends Schema.TaggedErrorClass<OutOfOrderMutation>(
+export class OutOfOrderMutation extends Schema.TaggedError<OutOfOrderMutation>(
   "@lucas-barake/effect-local/OutOfOrderMutation"
 )("OutOfOrderMutation", { expected: Schema.Number, actual: Schema.Number }) {}
 
-export class CursorGap extends Schema.TaggedErrorClass<CursorGap>(
+export class CursorGap extends Schema.TaggedError<CursorGap>(
   "@lucas-barake/effect-local/CursorGap"
 )("CursorGap", { expected: Schema.Number, actual: Schema.Number }) {}
 
-export class SettlementReplayTruncated extends Schema.TaggedErrorClass<SettlementReplayTruncated>(
+export class SettlementReplayTruncated extends Schema.TaggedError<SettlementReplayTruncated>(
   "@lucas-barake/effect-local/SettlementReplayTruncated"
 )("SettlementReplayTruncated", { requested: Schema.Number, oldestAvailable: Schema.Number }) {}
 
-export class StaleReplicationScope extends Schema.TaggedErrorClass<StaleReplicationScope>(
+export class StaleReplicationScope extends Schema.TaggedError<StaleReplicationScope>(
   "@lucas-barake/effect-local/StaleReplicationScope"
 )("StaleReplicationScope", { expected: Schema.Number, actual: Schema.Number }) {}
 
-export class SnapshotUnavailable extends Schema.TaggedErrorClass<SnapshotUnavailable>(
+export class SnapshotUnavailable extends Schema.TaggedError<SnapshotUnavailable>(
   "@lucas-barake/effect-local/SnapshotUnavailable"
 )("SnapshotUnavailable", { snapshotId: Schema.String }) {}
 
-export class CapacityExceeded extends Schema.TaggedErrorClass<CapacityExceeded>(
+export class CapacityExceeded extends Schema.TaggedError<CapacityExceeded>(
   "@lucas-barake/effect-local/CapacityExceeded"
 )("CapacityExceeded", { resource: Schema.String, limit: Schema.Number }) {}
 
-export class InvalidConfiguration extends Schema.TaggedErrorClass<InvalidConfiguration>(
+export class InvalidConfiguration extends Schema.TaggedError<InvalidConfiguration>(
   "@lucas-barake/effect-local/InvalidConfiguration"
 )("InvalidConfiguration", { option: Schema.String, message: Schema.String }) {}
 
-export class UnknownCommitOutcome extends Schema.TaggedErrorClass<UnknownCommitOutcome>(
+export class UnknownCommitOutcome extends Schema.TaggedError<UnknownCommitOutcome>(
   "@lucas-barake/effect-local/UnknownCommitOutcome"
 )("UnknownCommitOutcome", { mutationId: Schema.String, cause: Schema.Defect() }) {}
 
-export class ProtocolInvalid extends Schema.TaggedErrorClass<ProtocolInvalid>(
+export class ProtocolInvalid extends Schema.TaggedError<ProtocolInvalid>(
   "@lucas-barake/effect-local/ProtocolInvalid"
 )("ProtocolInvalid", { message: Schema.String, cause: optionalDefect }) {}
 
-export class UpgradeRequired extends Schema.TaggedErrorClass<UpgradeRequired>(
+export class UpgradeRequired extends Schema.TaggedError<UpgradeRequired>(
   "@lucas-barake/effect-local/UpgradeRequired"
 )("UpgradeRequired", {
   clientVersions: Schema.Array(Schema.Int),
   serverVersions: Schema.Array(Schema.Int)
 }) {}
 
-export class ProtocolVersionRejected extends Schema.TaggedErrorClass<ProtocolVersionRejected>(
+export class ProtocolVersionRejected extends Schema.TaggedError<ProtocolVersionRejected>(
   "@lucas-barake/effect-local/ProtocolVersionRejected"
 )("ProtocolVersionRejected", {
   version: Schema.Int,
   serverVersions: Schema.Array(Schema.Int)
 }) {}
 
-export class ServerUnavailable extends Schema.TaggedErrorClass<ServerUnavailable>(
+export class ServerUnavailable extends Schema.TaggedError<ServerUnavailable>(
   "@lucas-barake/effect-local/ServerUnavailable"
 )("ServerUnavailable", {}) {}
 
-export class CredentialRejected extends Schema.TaggedErrorClass<CredentialRejected>(
+export class CredentialRejected extends Schema.TaggedError<CredentialRejected>(
   "@lucas-barake/effect-local/CredentialRejected"
 )("CredentialRejected", {
   credentialGeneration: optionalNonNegativeInt
 }) {}
 
-export class AuthenticatorUnavailable extends Schema.TaggedErrorClass<AuthenticatorUnavailable>(
+export class AuthenticatorUnavailable extends Schema.TaggedError<AuthenticatorUnavailable>(
   "@lucas-barake/effect-local/AuthenticatorUnavailable"
 )("AuthenticatorUnavailable", {}) {}
 
-export class OperationTimeout extends Schema.TaggedErrorClass<OperationTimeout>(
+export class OperationTimeout extends Schema.TaggedError<OperationTimeout>(
   "@lucas-barake/effect-local/OperationTimeout"
 )("OperationTimeout", {
   operation: Schema.String,
   timeoutMillis: positiveInt
 }) {}
 
-export class AuthorizationDenied extends Schema.TaggedErrorClass<AuthorizationDenied>(
+export class AuthorizationDenied extends Schema.TaggedError<AuthorizationDenied>(
   "@lucas-barake/effect-local/AuthorizationDenied"
 )("AuthorizationDenied", { reason: Schema.Json }) {}
 
-export class OwnerUnavailable extends Schema.TaggedErrorClass<OwnerUnavailable>(
+export class OwnerUnavailable extends Schema.TaggedError<OwnerUnavailable>(
   "@lucas-barake/effect-local/OwnerUnavailable"
 )("OwnerUnavailable", {
   reason: Schema.Literals(["transport", "takeover", "promotion-failed", "protocol-mismatch"])

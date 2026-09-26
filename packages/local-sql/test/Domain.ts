@@ -88,7 +88,7 @@ export const PutTodo = Mutation.make("PutTodo", {
   success: Todo.schema
 })
 
-class TodoNotFoundError extends Schema.TaggedErrorClass<TodoNotFoundError>(
+class TodoNotFoundError extends Schema.TaggedError<TodoNotFoundError>(
   "@lucas-barake/effect-local-sql/test/TodoNotFoundError"
 )("TodoNotFound", {}) {}
 
@@ -137,7 +137,7 @@ export const AddLabel = Mutation.make("AddLabel", {
   success: Schema.Array(Schema.String)
 })
 
-class RejectedError extends Schema.TaggedErrorClass<RejectedError>(
+class RejectedError extends Schema.TaggedError<RejectedError>(
   "@lucas-barake/effect-local-sql/test/RejectedError"
 )("Rejected", {}) {}
 

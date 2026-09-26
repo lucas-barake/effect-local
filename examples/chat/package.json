@@ -16,17 +16,17 @@
     "@effect-local/example-chat-client": "workspace:^",
     "@effect-local/example-chat-server": "workspace:^",
     "@effect-local/example-chat-shared": "workspace:^",
-    "@effect/platform-node": "4.0.0-beta.103",
-    "@effect/sql-sqlite-node": "4.0.0-beta.103",
+    "@effect/platform-node": "4.0.0-rc.117",
+    "@effect/sql-sqlite-node": "4.0.0-rc.117",
     "@lucas-barake/effect-local": "workspace:^",
     "@lucas-barake/effect-local-browser": "workspace:^",
     "@lucas-barake/effect-local-rpc": "workspace:^",
     "@lucas-barake/effect-local-sql": "workspace:^",
-    "effect": "4.0.0-beta.103"
+    "effect": "4.0.0-rc.117"
   },
   "devDependencies": {
-    "@effect/vitest": "4.0.0-beta.103",
+    "@effect/vitest": "4.0.0-rc.117",
     "@types/node": "^25.7.0",
-    "vitest": "4.1.10"
+    "vitest": "5.0.2"
   }
 }

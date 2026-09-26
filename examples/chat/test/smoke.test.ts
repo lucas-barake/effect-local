@@ -84,7 +84,7 @@ const memberFor = (user: ChatUser) =>
 const serverUrl = Effect.gen(function*() {
   const server = yield* HttpServer.HttpServer
   const address = server.address
-  if (address._tag === "UnixAddress") return yield* Effect.die("Expected the test server to use a TCP address")
+  if (address._tag === "UnixPathAddress") return yield* Effect.die("Expected the test server to use a TCP address")
   return `http://127.0.0.1:${address.port}/sync`
 })
 
@@ -126,7 +126,7 @@ type ServerContext = Context.Context<HttpServer.HttpServer>
 
 interface BootedUser {
   readonly space: Replica.Space
-  readonly reactivity: Reactivity.Reactivity["Service"]
+  readonly reactivity: Reactivity.Reactivity
   readonly ephemeral: EphemeralClient.EphemeralClient["Service"]
   readonly queryReactivity: QueryReactivity.QueryReactivity["Service"]
 }
@@ -220,7 +220,7 @@ describe("chat server", () => {
       const serverContext = yield* bootServer
       const server = Context.get(serverContext, HttpServer.HttpServer)
       const address = server.address
-      if (address._tag === "UnixAddress") {
+      if (address._tag === "UnixPathAddress") {
         assert.fail("Expected the test server to use a TCP address")
       }
       const login = Effect.fnUntraced(function*(body: typeof LoginRequest.Type) {

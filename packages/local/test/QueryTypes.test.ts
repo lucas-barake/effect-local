@@ -59,7 +59,7 @@ const typeContracts = (query: Transaction.Query) => {
 // @ts-expect-error static dependency fallbacks are not part of query declarations
 Query.make("LegacyDependencies", { dependsOn: [Todo] })
 
-class DeclaredFailure extends Schema.TaggedErrorClass<DeclaredFailure>(
+class DeclaredFailure extends Schema.TaggedError<DeclaredFailure>(
   "@lucas-barake/effect-local/test/DeclaredFailure"
 )("DeclaredFailure", {}) {}
 

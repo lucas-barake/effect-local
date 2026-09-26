@@ -18,7 +18,7 @@ import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
 import * as Domain from "./Domain.js"
 
-class UnexpectedBootstrapInstallSuccess extends Schema.TaggedErrorClass<UnexpectedBootstrapInstallSuccess>(
+class UnexpectedBootstrapInstallSuccess extends Schema.TaggedError<UnexpectedBootstrapInstallSuccess>(
   "@lucas-barake/effect-local-sql/test/UnexpectedBootstrapInstallSuccess"
 )("UnexpectedBootstrapInstallSuccess", {}) {}
 

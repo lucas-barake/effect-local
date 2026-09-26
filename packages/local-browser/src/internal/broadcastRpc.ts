@@ -10,6 +10,7 @@ import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import { RpcClientDefect, RpcClientError } from "effect/unstable/rpc/RpcClientError"
 import type { FromClientEncoded, FromServerEncoded } from "effect/unstable/rpc/RpcMessage"
 import { constPing } from "effect/unstable/rpc/RpcMessage"
+import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import * as Wire from "./multiTabWire.js"
 import type * as platform from "./platform.js"
@@ -286,7 +287,8 @@ export const makeClientProtocol = (
           ))
       },
       supportsAck: true,
-      supportsTransferables: false
+      supportsTransferables: false,
+      codecFor: RpcSerialization.json.codecFor
     }
   })).pipe(Effect.withSpan("localBrowser.broadcastRpc.clientProtocol"))
 
@@ -420,7 +422,9 @@ export const makeServerProtocol = Effect.fn("localBrowser.broadcastRpc.serverPro
         initialMessage: Effect.succeed(Option.none()),
         supportsAck: true,
         supportsTransferables: false,
-        supportsSpanPropagation: false
+        supportsSpanPropagation: false,
+        supportsNotifications: true,
+        codecFor: RpcSerialization.json.codecFor
       }
     })
   )

@@ -18,7 +18,7 @@ import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import { afterAll, assert, beforeAll, bench } from "vitest"
+import { afterAll, assert, beforeAll, test } from "vitest"
 import * as EphemeralHub from "../src/EphemeralHub.js"
 import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
@@ -244,8 +244,10 @@ afterAll(async () => {
 }, 120_000)
 
 for (const watcherCount of watcherCounts) {
-  bench(`${watcherCount} same-space watchers observe every submitted sequence`, async () => {
-    // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
-    await runtime.runPromise(FanoutBench.use((service) => service.submitAndObserve(watcherCount)))
-  }, { iterations, time: 0, warmupIterations, warmupTime: 0, throws: true })
+  test(`${watcherCount} same-space watchers observe every submitted sequence`, async ({ bench }) => {
+    await bench(`${watcherCount} same-space watchers observe every submitted sequence`, async () => {
+      // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
+      await runtime.runPromise(FanoutBench.use((service) => service.submitAndObserve(watcherCount)))
+    }).run({ iterations, time: 0, warmupIterations, warmupTime: 0, throws: true })
+  })
 }

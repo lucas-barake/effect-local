@@ -79,6 +79,7 @@ export const layerJson = (options?: {
       return RpcSerialization.RpcSerialization.of({
         contentType: "application/json",
         includesFraming: false,
+        codecFor: RpcSerialization.json.codecFor,
         makeUnsafe: () => {
           const decoder = new TextDecoder()
           const encoder = new TextEncoder()

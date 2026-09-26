@@ -143,7 +143,7 @@ export const readStateKey = (conversationId: ConversationId, userId: UserId): st
 // Mutations
 // ---------------------------------------------------------------------------
 
-export class SendMessageRejection extends Schema.TaggedErrorClass<SendMessageRejection>(
+export class SendMessageRejection extends Schema.TaggedError<SendMessageRejection>(
   "@effect-local/example-chat/SendMessageRejection"
 )("SendMessageRejection", {
   reason: Schema.Literals(["ConversationNotFound", "NotAMember"])
@@ -156,7 +156,7 @@ export const SendMessage = Mutation.make("SendMessage", {
   rejection: SendMessageRejection
 })
 
-export class StartConversationRejection extends Schema.TaggedErrorClass<StartConversationRejection>(
+export class StartConversationRejection extends Schema.TaggedError<StartConversationRejection>(
   "@effect-local/example-chat/StartConversationRejection"
 )("StartConversationRejection", {
   reason: Schema.Literals(["UnknownMember", "IdMismatch", "InvalidGroupRoster"])

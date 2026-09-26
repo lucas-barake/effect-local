@@ -34,7 +34,7 @@ const layerDatabase = Layer.mergeAll(
   NodeCrypto.layer,
   Reactivity.layer
 )
-class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationError, Schema.JsonObject>(
+class TestAuthorizationError extends Schema.TaggedError<TestAuthorizationError, Schema.JsonObject>(
   "@lucas-barake/effect-local-rpc/test/PrincipalAssertion/TestAuthorizationError"
 )("TestAuthorizationError", { reason: Schema.String }) {}
 const layerStore = ServerStore.layer({

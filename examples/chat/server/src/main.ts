@@ -5,8 +5,8 @@ import * as Layer from "effect/Layer"
 import { makeServerLayer } from "./server.js"
 
 const config = Config.all({
-  port: Config.number("CHAT_PORT").pipe(Config.withDefault(4100)),
-  databaseFile: Config.string("CHAT_DB").pipe(Config.withDefault("chat.db"))
+  port: Config.Number("CHAT_PORT").pipe(Config.withDefault(4100)),
+  databaseFile: Config.String("CHAT_DB").pipe(Config.withDefault("chat.db"))
 })
 
 const main = Effect.gen(function*() {

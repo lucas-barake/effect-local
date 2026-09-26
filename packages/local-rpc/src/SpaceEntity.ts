@@ -177,6 +177,7 @@ const mapClient = (
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        EntityNotAssignedToRunner: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
@@ -185,6 +186,7 @@ const mapClient = (
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        EntityNotAssignedToRunner: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
@@ -193,6 +195,7 @@ const mapClient = (
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        EntityNotAssignedToRunner: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
@@ -201,6 +204,7 @@ const mapClient = (
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        EntityNotAssignedToRunner: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
@@ -209,6 +213,7 @@ const mapClient = (
       Stream.catchTags({
         MailboxFull: () => Stream.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+        EntityNotAssignedToRunner: () => Stream.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Stream.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
@@ -217,6 +222,7 @@ const mapClient = (
       Stream.catchTags({
         MailboxFull: () => Stream.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+        EntityNotAssignedToRunner: () => Stream.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Stream.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
@@ -225,6 +231,7 @@ const mapClient = (
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        EntityNotAssignedToRunner: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     ),
@@ -233,6 +240,7 @@ const mapClient = (
       Effect.catchTags({
         MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        EntityNotAssignedToRunner: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
       })
     )

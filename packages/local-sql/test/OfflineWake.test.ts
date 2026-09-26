@@ -82,7 +82,7 @@ const wakeTiming = {
   maximumRecipientsPerSpace: 1_000
 } as const
 
-class TestWakeError extends Schema.TaggedErrorClass<TestWakeError, Schema.JsonObject>("test/TestWakeError")(
+class TestWakeError extends Schema.TaggedError<TestWakeError, Schema.JsonObject>("test/TestWakeError")(
   "TestWakeError",
   { reason: Schema.String }
 ) {}

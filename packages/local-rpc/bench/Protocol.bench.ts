@@ -3,7 +3,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
-import { bench } from "vitest"
+import { test } from "vitest"
 
 const changes: ReadonlyArray<Protocol.ViewChange> = Array.from({ length: 256 }, (_, index) =>
   Protocol.Upsert.make({
@@ -42,14 +42,17 @@ const encode = Schema.encodeSync(codec)
 const decode = Schema.decodeUnknownSync(codec)
 const encoded = encode(page)
 
-bench("pull page Schema encode with 256 changes", () => {
-  encode(page)
-}, { iterations: 100, time: 0, warmupIterations: 20, warmupTime: 0 })
+test("pull page Schema encode with 256 changes", ({ bench }) =>
+  bench("pull page Schema encode with 256 changes", () => {
+    encode(page)
+  }).run({ iterations: 100, time: 0, warmupIterations: 20, warmupTime: 0 }))
 
-bench("pull page Schema decode with 256 changes", () => {
-  decode(encoded)
-}, { iterations: 100, time: 0, warmupIterations: 20, warmupTime: 0 })
+test("pull page Schema decode with 256 changes", ({ bench }) =>
+  bench("pull page Schema decode with 256 changes", () => {
+    decode(encoded)
+  }).run({ iterations: 100, time: 0, warmupIterations: 20, warmupTime: 0 }))
 
-bench("pull page encoded byte accounting with 256 changes", () => {
-  Protocol.encodedBytes(page)
-}, { iterations: 100, time: 0, warmupIterations: 20, warmupTime: 0 })
+test("pull page encoded byte accounting with 256 changes", ({ bench }) =>
+  bench("pull page encoded byte accounting with 256 changes", () => {
+    Protocol.encodedBytes(page)
+  }).run({ iterations: 100, time: 0, warmupIterations: 20, warmupTime: 0 }))

@@ -1092,13 +1092,12 @@ export const make = (options: Options) => {
     }
   )
 
-  const pull = (
+  const pullLocked = (
     request: Protocol.PullRequest,
     principal: typeof Schema.Json.Type,
     expectedGeneration: number
   ) =>
     sql.withTransaction(Effect.gen(function*() {
-      yield* options.authorization.scope(request, principal)
       const space = yield* lockSpace(request.spaceId)
       yield* validatePreparedSpace(expectedGeneration, space)
       const targetDefinition = yield* options.resolveDefinition(request.schema)
@@ -1273,15 +1272,24 @@ export const make = (options: Options) => {
             space.read_auth_epoch
           )
       )
-    })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    }))
 
-  const bootstrap = (
+  const pull = (
+    request: Protocol.PullRequest,
+    principal: typeof Schema.Json.Type,
+    expectedGeneration: number
+  ) =>
+    options.authorization.scope(request, principal).pipe(
+      Effect.andThen(pullLocked(request, principal, expectedGeneration)),
+      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+    )
+
+  const bootstrapLocked = (
     request: Protocol.BootstrapRequest,
     principal: typeof Schema.Json.Type,
     expectedGeneration: number
   ) =>
     sql.withTransaction(Effect.gen(function*() {
-      yield* options.authorization.scope(request, principal)
       const space = yield* lockSpace(request.spaceId)
       yield* validatePreparedSpace(expectedGeneration, space)
       const targetDefinition = yield* options.resolveDefinition(request.schema)
@@ -1422,7 +1430,17 @@ export const make = (options: Options) => {
         hasMore: afterOrdinal + selected.length + 1 < row.entry_count,
         serverSchema: options.definition.schemaIdentity
       })
-    })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    }))
+
+  const bootstrap = (
+    request: Protocol.BootstrapRequest,
+    principal: typeof Schema.Json.Type,
+    expectedGeneration: number
+  ) =>
+    options.authorization.scope(request, principal).pipe(
+      Effect.andThen(bootstrapLocked(request, principal, expectedGeneration)),
+      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+    )
 
   return { pull, bootstrap } as const
 }

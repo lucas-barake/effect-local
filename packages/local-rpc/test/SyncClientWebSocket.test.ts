@@ -43,10 +43,10 @@ const makeRecordingConstructor = Effect.fnUntraced(function*(expected: number) {
     Socket.WebSocketConstructor,
     Effect.gen(function*() {
       const makeWebSocket = yield* Socket.WebSocketConstructor
-      return (url: string, protocols?: string | Array<string>) => {
+      return (url: string, options?: Socket.WebSocketConstructorOptions) => {
         dialled.push(url)
         if (dialled.length === expected) Deferred.doneUnsafe(reached, Exit.void)
-        return makeWebSocket(url, protocols)
+        return makeWebSocket(url, options)
       }
     })
   ).pipe(Layer.provide(NodeSocket.layerWebSocketConstructor))
