@@ -67,9 +67,10 @@ before the client has acknowledged a later pull.
 ## History lifecycle
 
 The server retains a configurable dense accepted suffix and a configurable terminal receipt suffix. Hard caps are
-larger than retained targets and apply backpressure before mutation handlers run. `ServerStore.layerMaintenance`
-periodically publishes recovery state and reclaims bounded prefixes. Deployments that use an external scheduler call
-the same `maintainAll` operation.
+larger than retained targets and apply backpressure before mutation handlers run. A write that takes a space past the
+midpoint between its retained target and hard cap starts one background maintenance run for that space.
+`ServerStore.layerMaintenance` also sweeps every space from an Effect Cluster singleton, once at start and then every
+interval. Deployments that use an external scheduler call the same `maintainAll` operation.
 
 Maintenance snapshots the current authoritative entities at accepted sequence `S` and terminal sequence `T`. The
 manifest binds space, definition, snapshot identity, both fences, entity count, content bytes, and a chained SHA 256
@@ -148,9 +149,9 @@ SQLite outbox. After admission, `ServerStore` keeps the terminal receipt and acc
 `effect_local_server_receipts` and `effect_local_authoritative_log`. If a runner fails before SQL commit, the entity call
 fails and the client resubmits. If SQL committed before the reply was lost, exact resubmission returns the stored receipt.
 
-This is the same store backed actor pattern as the former recipient relay. Persisting Submit through Effect beta.103
-`MessageStorage` would retain every completed request payload and reply with no per-request retention control. The
-authoritative mutation would then exist permanently in both Cluster history and the server log. Keeping entity calls
+This is the same store backed actor pattern as the former recipient relay. Persisting Submit through Cluster
+`MessageStorage` would store every request payload and reply a second time beside the server log, and the application
+would have to clear them with `clearReplies` once the SQL receipt exists. Keeping entity calls
 volatile avoids that duplicate history while Cluster still supplies unique ownership, cross runner routing, and live
 recipient streams.
 

@@ -40,28 +40,21 @@ const layerWorkflowEngine = ClusterWorkflowEngine.layer.pipe(
   Layer.provideMerge(SingleRunner.layer({ runnerStorage: "sql" }))
 )
 
-const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
-
 const layerReplica = SqlReplica.layerWorkflow({
   definition,
   clientId,
-  defaultScope: scope,
-  initialSpaces: [spaceId],
-  maximumActiveSpaces: 8,
-  foregroundActiveSpaces: 4,
-  reconciliationConcurrency: 8,
-  foregroundReconciliationConcurrency: 2,
-  retainedReceipts: 256,
-  maximumReceipts: 1_024,
-  retainedHistoryEntries: 256,
-  maximumBootstrapEntities: 100_000,
-  maximumBootstrapBytes: 64 * 1024 * 1024,
-  maximumBootstrapPageBytes: 4 * 1024 * 1024,
-  migration: { retryDelay: "25 millis", maximumAttempts: 8 }
+  defaultScope: Protocol.ReplicationScope.make({ models: [Todo.name] }),
+  initialSpaces: [spaceId]
 }).pipe(
   Layer.provide(layerWorkflowEngine)
 )
 ```
+
+Only `definition` and `clientId` are required. `SqlReplica.defaults` lists the rest: 16 active spaces with 4 reserved
+for foreground work, 256 retained receipts under a cap of 10000, 256 retained history entries, bootstrap bounds of
+100000 entities, 64 MiB, and 4 MiB pages. `defaultScope` defaults to every model in the definition. A caller-minted
+`mutationId` stays idempotent while its receipt is retained, and after that for the next `retainedMutationIds` (100000)
+mutations of the space, where reusing it fails with `MutationIdentityConflict` instead of running the handler again.
 
 `initialSpaces` seeds remembered membership without opening every space. Later calls to `Replica.join` persist
 membership and restart restores every handle inactive. Data operations and `space.activate` acquire foreground
@@ -69,14 +62,14 @@ capacity. `space.deactivate` closes its runtime without deleting data. Pending w
 `Replica.leave` closes any runtime before one cascading delete removes local state. The database keeps the singleton
 `clientId`. Rejoining creates a new membership incarnation and local sequence.
 
-The required `defaultScope` initializes only new membership. Every handle exposes its durable `space.scope` and
+`defaultScope` initializes only new membership. Every handle exposes its durable `space.scope` and
 `space.setScope`. Changing one space advances its generation, restarts its active watch, and reconciles it as foreground
 work. A wider scope backfills through incremental pull. A narrower scope receives `Retract` changes without a new
 bootstrap. Scopes support complete models and bounded secondary index windows with per partition overrides.
 
 `retryDelay`, `maximumRetryDelay`, and `maximumAttempts` bound exponential retries within one Workflow execution. A
 terminal failed generation stays failed until a later mutation or server wake requests a new generation. Effect
-beta.103 does not expose per Workflow completed history retention through `WorkflowEngine`; storage lifecycle remains
+4.0.0-rc.117 does not expose per Workflow completed history retention through `WorkflowEngine`; storage lifecycle remains
 an operational responsibility of the selected engine and runner.
 
 Provide separate `SqlClient` connections to the replica and to SQL backed `SingleRunner`. They may use the same file,
@@ -87,12 +80,13 @@ ordinary shutdown because it durably cancels the reconciliation.
 
 `ServerStore.layer` requires application supplied access, mutation admission, and read callbacks. It reauthorizes
 retries, deduplicates stable mutation identities, stores terminal rejections, assigns the next dense sequence to
-accepted mutations, and materializes authoritative state in the same SQL transaction. Its required history options
-set retained targets, hard admission caps, snapshot capacity, bootstrap page capacity, prune batches, retained
-snapshots, migration retry, maintenance concurrency, and the keyset page size used to enumerate spaces. The required
-`maximumWatchersPerSpace`, `readAuthorizationRefreshInterval`, `maximumConcurrentReadAuthorizations`,
-`maximumPendingReadAuthorizations`, and `readAuthorizationCacheCapacity` options bound live sync streams and their
-policy work. `ServerStore.layerTrusted` is the explicit allow all composition.
+accepted mutations, and materializes authoritative state in the same SQL transaction. Its history options set
+retained targets, hard admission caps, snapshot capacity, bootstrap page capacity, prune batches, retained snapshots,
+migration retry, maintenance concurrency, and the keyset page size used to enumerate spaces. `maximumWatchersPerSpace`,
+`readAuthorizationRefreshInterval`, `maximumConcurrentReadAuthorizations`, `maximumPendingReadAuthorizations`, and
+`readAuthorizationCacheCapacity` bound live sync streams and their policy work. Every one of them is optional and
+`ServerStore.defaults` lists the values used. `ServerStore.layerTrusted` is the explicit allow all composition.
+`SyncServer.layer` in `@lucas-barake/effect-local-rpc` builds the store for you.
 
 Sync watch authorization shares successful structural `(spaceId, clientId, normalized scope, principal)` checks.
 `maximumConcurrentReadAuthorizations` bounds executing policy calls. `maximumPendingReadAuthorizations` independently
@@ -148,26 +142,25 @@ class ReadPolicy extends Context.Service<ReadPolicy, {
 }>()("app/ReadPolicy") {}
 
 const layerStore = ServerStore.layer({
-  ...serverHistory,
   definition,
-  readAuthorizationRefreshInterval: "30 seconds",
-  maximumConcurrentReadAuthorizations: 64,
-  maximumPendingReadAuthorizations: 4_096,
-  readAuthorizationCacheCapacity: 4_096,
   authorizeAccess,
   authorizeMutation,
   authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
 }).pipe(Layer.provide(layerReadPolicy))
 ```
 
-Provide `ServerStore.layerMaintenance({ interval, runOnStart })` beside the store, or schedule `maintainAll` through an
-application owned job runner. Maintenance publishes an immutable snapshot and logical floors before bounded physical
-deletion. Admission fails before handler execution at a hard cap until maintenance creates capacity. Old cursors use
-the authenticated bootstrap path. Snapshot pages are identity bound, Schema decoded, byte bounded, ordered, and digest
-chained. Client staging survives interruption and installs with one atomic canonical replacement.
+Maintenance publishes an immutable snapshot and logical floors before bounded physical deletion. A space compacts
+itself: a write that takes its history or receipts past the midpoint between the retained target and the hard cap
+starts one background compaction of that space, so admission only reaches the cap, where it fails before handler
+execution, if compaction cannot keep up. `ServerStore.layerMaintenance` adds a sweep over every space as an Effect
+Cluster singleton, so it runs on one runner at a time. It sweeps once when it starts and then every `interval` (one
+hour by default), and it requires `Sharding`. Old cursors use the authenticated bootstrap path. Snapshot pages are
+identity bound, Schema decoded, byte bounded, ordered, and digest chained. Client staging survives interruption and
+installs with one atomic canonical replacement.
 
 ```ts
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
+import * as Layer from "effect/Layer"
 
 const layerStore = ServerStore.layer({
   definition,
@@ -176,27 +169,13 @@ const layerStore = ServerStore.layer({
   authorizeRead,
   retainedHistoryEntries: 10_000,
   maximumHistoryEntries: 20_000,
-  retainedReceipts: 10_000,
-  maximumReceipts: 20_000,
-  maximumSnapshotEntities: 100_000,
-  maximumSnapshotBytes: 64 * 1024 * 1024,
-  maximumBootstrapPageBytes: 4 * 1024 * 1024,
-  pruneBatchSize: 1_000,
-  retainedSnapshots: 2,
-  maintenanceConcurrency: 4,
-  maintenanceSpaceBatchSize: 128,
-  maximumWatchersPerSpace: 1_024,
-  readAuthorizationRefreshInterval: "30 seconds",
-  maximumConcurrentReadAuthorizations: 64,
-  maximumPendingReadAuthorizations: 4_096,
-  readAuthorizationCacheCapacity: 4_096,
-  migration: { retryDelay: "25 millis", maximumAttempts: 8 }
+  maintenanceConcurrency: 4
 })
 
-const layerServer = ServerStore.layerMaintenance({
-  interval: "30 seconds",
-  runOnStart: true
-}).pipe(Layer.provideMerge(layerStore))
+const layerServer = ServerStore.layerMaintenance({ interval: "30 minutes" }).pipe(
+  Layer.provideMerge(layerStore),
+  Layer.provide(layerSharding)
+)
 ```
 
 Exact retries return retained receipts. Once receipt evidence has crossed the published terminal fence, an old exact

@@ -1,22 +1,54 @@
 # @lucas-barake/effect-local-browser
 
-Browser SQLite ports and the joined Effect Atom graph for Effect Local.
+Browser replicas that every open tab shares, and the Effect Atom graph over them.
 
-`BrowserSqlite.layerWorker` spawns and owns a dedicated SQLite WASM worker (terminated when the Layer's scope closes),
-and `BrowserSqlite.layerMessagePort` adapts an application-owned worker port instead. `BrowserReplica.make` creates one
-Atom runtime with space-addressed entities, queries, mutations, receipts, settlements, lifecycle operations, and
-ephemera. It requires the production `Replica`, `QueryReactivity`, and `EphemeralClient` services in the supplied Layer.
+`BrowserReplica.layer` turns the tabs of one origin into an Effect Cluster. Every tab is a runner that talks to the
+others over `BroadcastChannel`, and Web Locks decide which tab is alive and which one leads. The leader tab opens the
+SQLite database, runs the sync engine, and hosts one replica entity. Every tab, the leader included, reaches that
+entity through `Entity.client`, so reads, writes, live queries, settlements, and ephemera behave the same in each tab.
+When the leader closes, another tab takes the lock, reopens the database, and the cluster resends in-flight calls.
+Mutations carry caller-minted ids, so a resent mutation is recorded once.
 
 ```ts
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
-import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
+import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
+import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
+import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
+import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
+import * as Layer from "effect/Layer"
+import * as Socket from "effect/unstable/socket/Socket"
+
+const layerReplica = BrowserReplica.layer({
+  name: "chat",
+  definition,
+  layerDatabase: BrowserSqlite.layerWorker(() => new Worker(new URL("./sqlite.worker.ts", import.meta.url))),
+  layerSync: SyncClient.layerWebSocket({ url: "wss://example.com/sync" }).pipe(
+    Layer.provide(Socket.layerWebSocketConstructorGlobal),
+    Layer.provide(Authentication.layerCredentialProviderStatic(bearer))
+  ),
+  spaces: [spaceId],
+  ephemerals,
+  profiles: { presence: Presence }
+}).pipe(Layer.provide(layerHandlers))
+
+const graph = ReplicaAtom.make(layerReplica)
+```
+
+`name` scopes the cluster, its locks, and the durable client id, so two replicas on one origin need different names.
+Everything else is optional. `replica` forwards `SqlReplica` options, `sharding` overrides the tab cluster's
+`ShardingConfig`, and `retryDelay` (1 second) paces leader election retries. `layerPlatform` replaces the Web Locks,
+`BroadcastChannel`, and `localStorage` adapters, which is how the tests run several tabs in one process.
+`BrowserSqlite.layerWorker` spawns and owns a dedicated SQLite WASM worker that is terminated when the Layer's scope
+closes, and `BrowserSqlite.layerMessagePort` adapts an application-owned worker port instead.
+
+`ReplicaAtom.make` builds one Atom runtime from that Layer with space-addressed entities, queries, mutations, receipts,
+settlements, lifecycle operations, and ephemera.
+
+```ts
 import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
-import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
-
-const graph = BrowserReplica.make(Layer.merge(layerReplica, EphemeralClient.layer))
 
 const ConversationId = Schema.String.pipe(Schema.brand("ConversationId"))
 
@@ -103,9 +135,7 @@ The remaining graph families expose `entity`, `query`, `mutation`, `pending`, `r
 `aggregateStatus`. Effect `Reactivity` refreshes only mounted reads whose exact space, entity, or index range changed.
 Leaving a space invalidates retained atoms for that address.
 
-Pass either `SqlReplica.layer` or `SqlReplica.layerWorkflow` as the replica portion of the Layer. The Workflow
-composition can run in an application-owned dedicated Worker or SharedWorker. `BrowserReplica` does not choose the
-Worker URL, database name, credentials, runner storage, or lifecycle policy. `Atom.runtime` stays on the page side when
-the application bridges to a worker-owned replica.
+Profiles passed to `ephemeral` sessions must be registered in `BrowserReplica.layer`'s `profiles` option, and
+ephemeral definitions in `ephemerals`, because the leader decodes them by name when it relays for another tab.
 
 See the [repository guide](https://github.com/lucas-barake/effect-local#readme).
