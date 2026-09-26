@@ -3087,6 +3087,123 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
     ))
   )
 
+  const makeCompactingHarness = Effect.gen(function*() {
+    const local = yield* service(LocalStore.Store, localLayer())
+    const server = yield* service(
+      ServerStore.ServerStore,
+      ServerStore.layerTrusted({
+        ...serverHistory,
+        retainedHistoryEntries: 0,
+        maximumHistoryEntries: 8,
+        retainedReceipts: 0,
+        maximumReceipts: 8,
+        retainedSnapshots: 1,
+        definition: Domain.definition
+      }).pipe(
+        Layer.provide(layerRuntime),
+        Layer.provide(serverDatabase())
+      )
+    )
+    const faults = { withholdPull: false, failExpiredBootstrap: false }
+    const withheldPull = Effect.fnUntraced(
+      function*(request: Protocol.PullRequest) {
+        const page = yield* server.pull(request)
+        if ("_tag" in page) return page
+        const changes: ReadonlyArray<Protocol.ViewChange> = []
+        return Protocol.PullPage.make({
+          ...page,
+          serverSequence: yield* local.cursor,
+          changes,
+          contentBytes: yield* Protocol.encodedBytesEffect(changes),
+          digest: yield* Protocol.viewChangesDigest(changes),
+          hasMore: false
+        })
+      },
+      Effect.provide(NodeCrypto.layer)
+    )
+    const remote = SyncEngine.SyncEngine.of({
+      waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
+      discard: () => Effect.die("unexpected discard"),
+      submitBatch: (request) => server.admitBatch(request, null),
+      pull: (request) => {
+        if (faults.withholdPull) return withheldPull(request)
+        return server.pull(request)
+      },
+      bootstrap: (request) => {
+        if (faults.failExpiredBootstrap && request.afterOrdinal === -1) {
+          return Effect.fail(new ReplicaError.ServerUnavailable())
+        }
+        return server.bootstrap(request)
+      },
+      watch: server.watch
+    })
+    const reconciliation = yield* service(
+      Reconciler.Reconciliation,
+      Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+        Layer.provide(Layer.succeed(LocalStore.Store, local)),
+        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
+      )
+    )
+    yield* reconciliation.sync
+    return { local, server, faults, reconciliation }
+  })
+
+  it.effect("settles a stored accepted receipt that a resubmission reports as expired after compaction", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { faults, local, reconciliation, server } = yield* makeCompactingHarness
+      faults.withholdPull = true
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("accepted-then-expired"))
+      yield* reconciliation.sync
+      const stored = yield* local.receipt(pending.envelope.mutationId)
+      assert.deepStrictEqual(Option.map(stored, (receipt) => receipt._tag), Option.some("Accepted"))
+      assert.strictEqual(yield* local.pendingCount, 1)
+      yield* server.maintain(spaceId)
+
+      yield* reconciliation.sync
+
+      assert.deepStrictEqual(yield* local.receipt(pending.envelope.mutationId), stored)
+      assert.strictEqual(yield* local.pendingCount, 0)
+    })))
+
+  it.effect("keeps a stored expired receipt when a resubmission reports a newer expiry snapshot", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const { faults, local, reconciliation, server } = yield* makeCompactingHarness
+        const lost = yield* local.mutate(Domain.PutTodo, Domain.todo("lost-response"))
+        yield* server.submit(lost.envelope)
+        yield* server.maintain(spaceId)
+        faults.withholdPull = true
+        faults.failExpiredBootstrap = true
+        const firstError = yield* expectedFailure(reconciliation.sync)
+        assert.strictEqual(firstError._tag, "ServerUnavailable")
+        const stored = yield* local.receipt(lost.envelope.mutationId)
+        assert.deepStrictEqual(Option.map(stored, (receipt) => receipt._tag), Option.some("Expired"))
+        const other = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("other-client"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8020-000000000001")
+        )
+        yield* server.submit(Protocol.MutationEnvelope.make({
+          ...other,
+          clientId: Identity.ClientId.make("cli_00000000-0000-4000-8020-000000000002"),
+          digest: yield* Protocol.mutationDigest({
+            ...other,
+            clientId: Identity.ClientId.make("cli_00000000-0000-4000-8020-000000000002")
+          })
+        }))
+        yield* server.maintain(spaceId)
+        faults.failExpiredBootstrap = false
+
+        yield* reconciliation.sync
+
+        assert.deepStrictEqual(yield* local.receipt(lost.envelope.mutationId), stored)
+        assert.strictEqual(yield* local.pendingCount, 0)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
   it.effect("returns the unacknowledged tail of a short batch to Retrying when the pass fails after it", () =>
     Effect.scoped(Effect.gen(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
@@ -4188,6 +4305,40 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const error = yield* local.applyReceipt({ ...receipt, result: { conflicting: true } }).pipe(expectedFailure)
       assert.strictEqual(error._tag, "ProtocolInvalid")
       assert.strictEqual(yield* local.pendingCount, 1)
+    })))
+
+  it.effect("rejects an expired receipt that does not cover the stored outcome and keeps the stored receipt", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const local = yield* service(LocalStore.Store, localLayer())
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
+      const receipt = Protocol.AcceptedReceipt.make({
+        ...putTodoProvenance,
+        spaceId,
+        clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
+        mutationId: pending.envelope.mutationId,
+        localSequence: pending.envelope.localSequence,
+        serverSequence: Identity.ServerSequence.make(5),
+        terminalSequence: Identity.TerminalSequence.make(5),
+        result: pending.optimisticResult
+      })
+      yield* local.persistReceipts([receipt])
+      const expired = Protocol.ExpiredReceipt.make({
+        ...putTodoProvenance,
+        spaceId,
+        clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
+        mutationId: pending.envelope.mutationId,
+        localSequence: pending.envelope.localSequence,
+        snapshotId: Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000001"),
+        snapshotSequence: Identity.ServerSequence.make(4),
+        terminalSequenceThrough: Identity.TerminalSequence.make(5)
+      })
+
+      const error = yield* local.persistReceipts([expired]).pipe(expectedFailure)
+
+      assert.strictEqual(error._tag, "ProtocolInvalid")
+      assert.deepStrictEqual(yield* local.receipt(pending.envelope.mutationId), Option.some(receipt))
     })))
 
   it.effect(

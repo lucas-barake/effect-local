@@ -193,6 +193,23 @@ const maximumCommitBatch = 32
 
 const defaultRetainedMutationIds = 100_000
 
+const expiryCovers = (stored: Protocol.Receipt, expired: Protocol.ExpiredReceipt): boolean => {
+  if (
+    stored.localSequence !== expired.localSequence ||
+    stored.membershipIncarnation !== expired.membershipIncarnation
+  ) return false
+  if (stored._tag === "Legacy") {
+    return stored.serverSequence === null || stored.serverSequence <= expired.snapshotSequence
+  }
+  if (stored.name !== expired.name) return false
+  if (stored._tag === "Expired") {
+    return stored.snapshotSequence <= expired.snapshotSequence &&
+      stored.terminalSequenceThrough <= expired.terminalSequenceThrough
+  }
+  if (stored._tag === "Accepted" && stored.serverSequence > expired.snapshotSequence) return false
+  return stored.terminalSequence === undefined || stored.terminalSequence <= expired.terminalSequenceThrough
+}
+
 export const layer = (
   options: Options
 ): Layer.Layer<
@@ -2195,7 +2212,10 @@ export const layer = (
           const decoded = yield* Codec.parse(storedReceipt.value.receipt_json).pipe(
             Effect.flatMap((value) => Codec.decode(Protocol.Receipt, value))
           )
-          if ((yield* Canonical.stringifyEffect(decoded)) !== (yield* Canonical.stringifyEffect(receipt))) {
+          if (
+            (yield* Canonical.stringifyEffect(decoded)) !== (yield* Canonical.stringifyEffect(receipt)) &&
+            (receipt._tag !== "Expired" || !expiryCovers(decoded, receipt))
+          ) {
             return yield* new ReplicaError.ProtocolInvalid({
               message: `Conflicting duplicate receipt ${receipt.mutationId}`
             })
