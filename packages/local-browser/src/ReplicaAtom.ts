@@ -186,6 +186,9 @@ export const make = <E,>(
   ): Atom.Atom<AsyncResult.AsyncResult<A, EA>> =>
     Atom.transform(atom, (get) => {
       let stale = false
+      get.addFinalizer(() => {
+        if (stale) get.registry.refresh(atom)
+      })
       get.subscribe(atom, (value) => {
         get.setSelf(value)
         if (!stale || value.waiting) return
