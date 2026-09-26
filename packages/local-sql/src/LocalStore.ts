@@ -180,6 +180,7 @@ interface AppliedMutation {
 }
 
 interface QueuedMutation {
+  readonly ticket: number
   readonly apply: Effect.Effect<AppliedMutation>
   readonly fail: (cause: Cause.Cause<ReplicaError.ReplicaError>) => Effect.Effect<void>
   withdrawn: boolean
@@ -3493,8 +3494,10 @@ export const layer = (
       let admittedCommits = 0
       let releasedCommits = 0
       const commitBarriers: Array<{ readonly target: number; readonly reached: Deferred.Deferred<void> }> = []
-      const releaseCommits = (count: number) => {
-        releasedCommits += count
+      const releasedAhead = new Set<number>()
+      const releaseCommits = (ticket: number) => {
+        releasedAhead.add(ticket)
+        while (releasedAhead.delete(releasedCommits + 1)) releasedCommits += 1
         let barrier = commitBarriers.at(0)
         while (barrier !== undefined && barrier.target <= releasedCommits) {
           commitBarriers.shift()
@@ -3509,12 +3512,12 @@ export const layer = (
           commitBarriers.push({ target: admittedCommits, reached })
           return Effect.andThen(Deferred.await(reached), effect)
         })
-      const settleRequest = (effect: Effect.Effect<void>) =>
-        Effect.ensuring(effect, Effect.sync(() => releaseCommits(1)))
+      const settleRequest = (request: QueuedMutation, effect: Effect.Effect<void>) =>
+        Effect.ensuring(effect, Effect.sync(() => releaseCommits(request.ticket)))
 
       const abandon = (request: QueuedMutation) => {
         const unavailable = Cause.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
-        return settleRequest(request.fail(unavailable))
+        return settleRequest(request, request.fail(unavailable))
       }
 
       const commitQueue = yield* Effect.acquireRelease(
@@ -3529,7 +3532,7 @@ export const layer = (
       const commitBatch = Effect.fnUntraced(function*(initial: ReadonlyArray<QueuedMutation>) {
         const claimed: Array<QueuedMutation> = []
         const claim = (request: QueuedMutation) => {
-          if (request.withdrawn) releaseCommits(1)
+          if (request.withdrawn) releaseCommits(request.ticket)
           else claimed.push(request)
         }
         for (const request of initial) claim(request)
@@ -3583,15 +3586,17 @@ export const layer = (
           Effect.exit
         )
         if (Exit.isSuccess(exit)) {
-          yield* Effect.forEach(exit.value, (item) => settleRequest(item.settle), { discard: true })
+          yield* Effect.forEach(exit.value, (item, index) => settleRequest(claimed[index], item.settle), {
+            discard: true
+          })
           return []
         }
         if (aborted !== undefined) {
           const culprit = aborted
-          yield* settleRequest(culprit.outcome.settle)
+          yield* settleRequest(claimed[culprit.index], culprit.outcome.settle)
           return claimed.filter((_, index) => index !== culprit.index)
         }
-        yield* Effect.forEach(claimed, (request) => settleRequest(request.fail(exit.cause)), { discard: true })
+        yield* Effect.forEach(claimed, (request) => settleRequest(request, request.fail(exit.cause)), { discard: true })
         return []
       })
 
@@ -3626,6 +3631,7 @@ export const layer = (
         >()
         const requestedMutationId = mutateOptions?.mutationId
         const request: QueuedMutation = {
+          ticket: admittedCommits + 1,
           withdrawn: false,
           apply: sql.withTransaction(Effect.gen(function*() {
             if (requestedMutationId !== undefined) {

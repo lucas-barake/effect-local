@@ -321,4 +321,34 @@ describe("local commit", () => {
       assert.deepStrictEqual(yield* Ref.get(scheduled), [1, 1])
     }, Effect.scoped)
   )
+
+  it.effect(
+    "runs a sync step only after earlier admitted mutations commit when a later mutation aborts their batch",
+    Effect.fnUntraced(function*() {
+      const probe = yield* makeRecordingProbe(ReactivityKey.entity(spaceId, Domain.Todo.name, "running"))
+      const { local, sql } = yield* localStore(Layer.succeed(Reactivity.Reactivity, probe.service))
+      const poison = Identity.MutationId.make("mut_00000000-0000-4000-8000-00000000dead")
+      yield* sql.unsafe(`CREATE TRIGGER abort_poisoned_mutation BEFORE INSERT ON effect_local_client_pending_data
+        WHEN NEW.mutation_id = '${poison}' BEGIN SELECT RAISE(ROLLBACK, 'poisoned'); END`)
+      const running = yield* local.mutate(Domain.PutTodo, Domain.todo("running")).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(probe.entered)
+      const before = yield* local.mutate(Domain.PutTodo, Domain.todo("before")).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      const submission = yield* local.pendingToSubmit.pipe(Effect.forkChild({ startImmediately: true }))
+      const poisoned = yield* local.mutate(Domain.PutTodo, Domain.todo("poisoned"), { mutationId: poison }).pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.succeed(probe.release, undefined)
+      yield* Fiber.join(running)
+      yield* Fiber.join(before)
+      yield* Fiber.join(poisoned)
+      const pending = yield* Fiber.join(submission)
+      const payloads = pending.map((item) => item.envelope.payload)
+      assert.deepStrictEqual(payloads, [Domain.todo("running"), Domain.todo("before")])
+    }, Effect.scoped)
+  )
 })
