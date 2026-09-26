@@ -803,9 +803,9 @@ describe("BrowserReplica", () => {
         const leader = yield* environment.openTab
         const follower = yield* environment.openTab
         const space = yield* settle(follower.replica.space(spaceId))
-        const delivered = yield* Ref.make<ReadonlyArray<number>>([])
+        const delivered = yield* Queue.unbounded<number>()
         yield* space.settlements({ from: "acknowledged" }).pipe(
-          Stream.runForEach((settled) => Ref.update(delivered, (sequences) => [...sequences, settled.sequence])),
+          Stream.runForEach((settled) => Queue.offer(delivered, settled.sequence)),
           Effect.forkScoped
         )
         yield* TestClock.adjust("5 seconds")
@@ -813,7 +813,7 @@ describe("BrowserReplica", () => {
         yield* settle(space.mutate(PutTodo, { id: "b", title: "b" }))
         yield* settle(Scope.close(leader.scope, Exit.void))
         yield* settle(space.mutate(PutTodo, { id: "c", title: "c" }))
-        assert.deepStrictEqual(yield* Ref.get(delivered), [1, 2, 3])
+        assert.deepStrictEqual(yield* settle(Queue.takeN(delivered, 3)), [1, 2, 3])
       },
       Effect.scoped,
       provideFileSystem
