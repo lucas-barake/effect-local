@@ -1,4 +1,5 @@
 import { NodeClusterSocket, NodeCrypto, NodeHttpServer, NodeSocket, NodeSocketServer } from "@effect/platform-node"
+import { PgClient } from "@effect/sql-pg"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
@@ -41,12 +42,14 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as SocketServer from "effect/unstable/socket/SocketServer"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
+import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as Authentication from "../src/Authentication.js"
 import * as EphemeralClient from "../src/EphemeralClient.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
 import * as SyncClient from "../src/SyncClient.js"
 import * as SyncRpc from "../src/SyncRpc.js"
 import * as SyncServer from "../src/SyncServer.js"
+import { postgresDatabaseUrl } from "./fixtures/PostgresDatabase.js"
 
 class TestAuthorizationError extends Schema.TaggedError<TestAuthorizationError, Schema.JsonObject>(
   "@lucas-barake/effect-local-rpc/test/MultiRunner/TestAuthorizationError"
@@ -250,9 +253,12 @@ const layerClusterRunner = (options: {
     Layer.provide(options.layerSerialization)
   )
 
+type Database = Context.Context<SqlClient.SqlClient | Crypto.Crypto>
+
 const startRunner = Effect.fnUntraced(function*(options: {
   readonly name: RunnerName
-  readonly database: Context.Context<SqlClient.SqlClient | Crypto.Crypto>
+  readonly clusterDatabase: Database
+  readonly serverDatabase: Database
   readonly assertionSecret: Redacted.Redacted
   readonly spans: Queue.Queue<EndedSpan>
   readonly layerSerialization: Layer.Layer<RpcSerialization.RpcSerialization>
@@ -264,14 +270,16 @@ const startRunner = Effect.fnUntraced(function*(options: {
   const layerTracer = Layer.succeed(Tracer.Tracer, makeTracer(options.name, options.spans))
   const context = yield* Layer.buildWithScope(
     layerGateway(options.assertionSecret).pipe(
-      Layer.provideMerge(layerClusterRunner({
-        address: RunnerAddress.make(loopback, socketServer.address.port),
-        socketServer,
-        shards,
-        layerSerialization: options.layerSerialization
-      })),
+      Layer.provideMerge(
+        layerClusterRunner({
+          address: RunnerAddress.make(loopback, socketServer.address.port),
+          socketServer,
+          shards,
+          layerSerialization: options.layerSerialization
+        }).pipe(Layer.provide(Layer.succeedContext(options.clusterDatabase)))
+      ),
       Layer.provideMerge(NodeHttpServer.layerTest),
-      Layer.provide(Layer.succeedContext(options.database)),
+      Layer.provide(Layer.succeedContext(options.serverDatabase)),
       Layer.provide(layerTracer)
     ),
     options.scope
@@ -298,8 +306,10 @@ const allShards = Array.from({ length: shardsPerGroup }, (_, index) => ShardId.m
 const makeCluster = Effect.fnUntraced(function*(options: {
   readonly secrets: { readonly a: Redacted.Redacted; readonly b: Redacted.Redacted }
   readonly layerSerialization: Layer.Layer<RpcSerialization.RpcSerialization>
+  readonly serverDatabases?: { readonly a: Database; readonly b: Database } | undefined
 }) {
   const database = yield* Layer.build(layerDatabase)
+  const serverDatabases = options.serverDatabases ?? { a: database, b: database }
   const spans = yield* Queue.unbounded<EndedSpan>()
   const { secrets, layerSerialization } = options
   const parentScope = yield* Effect.scope
@@ -307,7 +317,8 @@ const makeCluster = Effect.fnUntraced(function*(options: {
   const closesFirst = yield* Scope.fork(parentScope)
   const a = yield* startRunner({
     name: "A",
-    database,
+    clusterDatabase: database,
+    serverDatabase: serverDatabases.a,
     assertionSecret: secrets.a,
     spans,
     layerSerialization,
@@ -317,7 +328,8 @@ const makeCluster = Effect.fnUntraced(function*(options: {
 
   const b = yield* startRunner({
     name: "B",
-    database,
+    clusterDatabase: database,
+    serverDatabase: serverDatabases.b,
     assertionSecret: secrets.b,
     spans,
     layerSerialization,
@@ -430,9 +442,32 @@ const nextEndedSpan = (cluster: Cluster, name: string, spaceId: Identity.SpaceId
 
 const sharedSecrets = { a: sharedSecret, b: sharedSecret }
 
-const admitsOnOwner = (layerSerialization: Layer.Layer<RpcSerialization.RpcSerialization>) =>
+type ServerDatabases = Effect.Effect<
+  { readonly a: Database; readonly b: Database } | undefined,
+  SqlError.SqlError,
+  Scope.Scope
+>
+
+const sharedServerDatabase: ServerDatabases = Effect.succeed(undefined)
+
+const postgresServerDatabases: ServerDatabases = Effect.gen(function*() {
+  const { url } = yield* postgresDatabaseUrl
+  const layerServerDatabase = Layer.mergeAll(PgClient.layer({ url, maxConnections: 4 }), NodeCrypto.layer).pipe(
+    Layer.provide(Reactivity.layer)
+  )
+  return { a: yield* Layer.build(layerServerDatabase), b: yield* Layer.build(layerServerDatabase) }
+})
+
+const admitsOnOwner = (
+  layerSerialization: Layer.Layer<RpcSerialization.RpcSerialization>,
+  serverDatabases: ServerDatabases = sharedServerDatabase
+) =>
   Effect.fnUntraced(function*() {
-    const cluster = yield* makeCluster({ secrets: sharedSecrets, layerSerialization })
+    const cluster = yield* makeCluster({
+      secrets: sharedSecrets,
+      layerSerialization,
+      serverDatabases: yield* serverDatabases
+    })
     const spaceId = yield* spaceOwnedBy(cluster.b)
     const viaA = yield* connect(cluster.a)
     const viaB = yield* connect(cluster.b)
@@ -451,9 +486,16 @@ const admitsOnOwner = (layerSerialization: Layer.Layer<RpcSerialization.RpcSeria
     ])
   }, Effect.provide(NodeCrypto.layer))
 
-const wakesAcrossRunners = (layerSerialization: Layer.Layer<RpcSerialization.RpcSerialization>) =>
+const wakesAcrossRunners = (
+  layerSerialization: Layer.Layer<RpcSerialization.RpcSerialization>,
+  serverDatabases: ServerDatabases = sharedServerDatabase
+) =>
   Effect.fnUntraced(function*() {
-    const cluster = yield* makeCluster({ secrets: sharedSecrets, layerSerialization })
+    const cluster = yield* makeCluster({
+      secrets: sharedSecrets,
+      layerSerialization,
+      serverDatabases: yield* serverDatabases
+    })
     const spaceId = yield* spaceOwnedBy(cluster.b)
     const viaA = yield* connect(cluster.a)
     const viaB = yield* connect(cluster.b)
@@ -587,5 +629,51 @@ describe("multi-runner cluster over SchemaBinary runner transport", () => {
   it.effect(
     "runs the maintenance singleton on exactly the runner that owns its shard",
     maintainsOnSingletonOwner(layerSerialization)
+  )
+})
+
+const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
+
+const todoKey = (change: Protocol.ViewChange) => {
+  if (typeof change.entity.key !== "string") return assert.fail("expected a string todo key")
+  return change.entity.key
+}
+
+describe("multi-runner cluster with postgres server storage", () => {
+  const layerSerialization = RpcSerialization.layerNdjson
+  it.effect(
+    "admits a mutation through one runner into the shared database on the owning runner",
+    admitsOnOwner(layerSerialization, postgresServerDatabases)
+  )
+  it.effect(
+    "wakes a watch through one runner when another runner writes the shared database",
+    wakesAcrossRunners(layerSerialization, postgresServerDatabases)
+  )
+  it.effect(
+    "keeps server sequences dense when both gateways write spaces owned by different runners",
+    Effect.fnUntraced(function*() {
+      const cluster = yield* makeCluster({
+        secrets: sharedSecrets,
+        layerSerialization,
+        serverDatabases: yield* postgresServerDatabases
+      })
+      const viaA = yield* connect(cluster.a)
+      const viaB = yield* connect(cluster.b)
+      for (const spaceId of [yield* spaceOwnedBy(cluster.a), yield* spaceOwnedBy(cluster.b)]) {
+        const sequences: Array<number> = []
+        for (let localSequence = 1; localSequence <= 4; localSequence++) {
+          let gateway = viaA
+          if (localSequence % 2 === 0) gateway = viaB
+          const receipt = yield* gateway.sync.submit(yield* putTodo(spaceId, localSequence, `write ${localSequence}`))
+          if (receipt._tag !== "Accepted") assert.fail(`expected an accepted receipt, got ${receipt._tag}`)
+          sequences.push(receipt.serverSequence)
+        }
+        assert.deepStrictEqual(sequences, [1, 2, 3, 4])
+        const throughA = (yield* readTodos(viaA.sync, spaceId)).map(todoKey).toSorted()
+        const throughB = (yield* readTodos(viaB.sync, spaceId)).map(todoKey).toSorted()
+        assert.deepStrictEqual(throughA, ["todo-1", "todo-2", "todo-3", "todo-4"])
+        assert.deepStrictEqual(throughB, throughA)
+      }
+    }, provideNodeCrypto)
   )
 })

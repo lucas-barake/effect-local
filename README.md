@@ -452,6 +452,24 @@ layer on several processes, and pass one `assertionSecret` to all of them. Use N
 example `NodeClusterSocket.layer({ serialization: "ndjson" })`: in Effect `4.0.0-rc.117` the default SchemaBinary
 runner serialization breaks volatile streaming entity calls between runners after their first element.
 
+### PostgreSQL server storage
+
+The server runs unchanged on PostgreSQL 16 or later. Provide a `PgClient` from `@effect/sql-pg` where the example
+above provides a SQLite client. Every runner can point at the same database, including runners on different hosts, and
+Effect Cluster's SQL runner and message storage accept the same client. Client replicas stay on SQLite.
+
+```ts
+import { PgClient } from "@effect/sql-pg"
+import * as Config from "effect/Config"
+
+const layerDatabase = PgClient.layerConfig({ url: Config.Redacted("DATABASE_URL") })
+```
+
+`Migrations.server` picks the PostgreSQL catalog from the client's dialect and fails with `InvalidConfiguration` for
+any other dialect. Pass the client without `transformResultNames` or `transformQueryNames`, because server rows are
+decoded by their snake case column names. See the
+[`effect-local-sql` guide](packages/local-sql/README.md#postgresql-server-storage) for the storage and locking details.
+
 `ServerStore.layer` requires `authorizeAccess`, `authorizeMutation`, and `authorizeRead`. Access authorization runs
 before retry receipt lookup. Mutation admission rejection consumes the client's local sequence and persists an exact
 retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted` is the explicit allow all Layer for

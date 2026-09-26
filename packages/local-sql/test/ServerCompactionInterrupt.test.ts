@@ -1,17 +1,19 @@
 import { NodeCrypto } from "@effect/platform-node"
-import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as Rows from "../src/internal/rows.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as Domain from "./Domain.js"
+import { type ServerDatabase, serverDatabases } from "./fixtures/ServerDatabase.js"
 
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000601")
 const membershipIncarnation = Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000601")
@@ -39,7 +41,7 @@ const envelope = Effect.fnUntraced(function*(spaceId: Identity.SpaceId, index: n
   return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
 })
 
-const layerDatabase = Layer.mergeAll(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer)
+const layerDatabase = (database: ServerDatabase) => Layer.mergeAll(database.layer(), NodeCrypto.layer)
 
 const layerStore = ServerStore.layerTrusted({
   definition: Domain.definition,
@@ -54,7 +56,7 @@ const historyCount = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
   const sql = yield* SqlClient.SqlClient
   const row = yield* SqlSchema.findOne({
     Request: Schema.Void,
-    Result: Schema.Struct({ count: Schema.Int }),
+    Result: Rows.CountRow,
     execute: () =>
       sql`SELECT retained_history_count AS count FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
   })(undefined)
@@ -62,7 +64,7 @@ const historyCount = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
 })
 
 const settle = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
-  for (let attempt = 0; attempt < 200; attempt++) {
+  for (let attempt = 0; attempt < 10_000; attempt++) {
     if ((yield* historyCount(spaceId)) <= 3) return
     yield* Effect.yieldNow
   }
@@ -72,7 +74,10 @@ const macrotask = Effect.yieldNow
 
 const manualScheduler = () => {
   const tasks: Array<() => void> = []
+  let released = false
+  const automatic = new Scheduler.MixedScheduler("async")
   const scheduler = new Scheduler.MixedScheduler("async", (task) => {
+    if (released) return automatic.setImmediate(task)
     let cancelled = false
     tasks.push(() => {
       if (!cancelled) task()
@@ -87,7 +92,11 @@ const manualScheduler = () => {
     task()
     return true
   }
-  return { scheduler, step }
+  const release = () => {
+    released = true
+    for (const task of tasks.splice(0)) automatic.setImmediate(task)
+  }
+  return { scheduler, step, release }
 }
 
 const submitOutcome = Effect.fnUntraced(function*(spaceId: Identity.SpaceId, index: number, localSequence: number) {
@@ -126,13 +135,8 @@ const interruptedAt = Effect.fnUntraced(function*(index: number, steps: number) 
   }
   const completedFirst = fiber.pollUnsafe() !== undefined
   fiber.interruptUnsafe()
-  for (let idle = 0; idle < 3;) {
-    if (manual.step()) idle = 0
-    else {
-      idle++
-      yield* macrotask
-    }
-  }
+  manual.release()
+  yield* Fiber.await(fiber)
   const committed = (yield* historyCount(spaceId)) !== 2
   const outcomes: Array<string> = []
   for (let sequence = 3; sequence <= 8; sequence++) {
@@ -144,11 +148,11 @@ const interruptedAt = Effect.fnUntraced(function*(index: number, steps: number) 
   return { steps: taken, completedFirst, committed, outcomes }
 })
 
-describe("ServerStore write-triggered compaction", () => {
+describe.each(serverDatabases)("ServerStore write-triggered compaction ($dialect)", (database) => {
   it.effect(
     "keeps compacting a space after a submit is interrupted at any point once it committed",
     Effect.fnUntraced(function*() {
-      const context = yield* layerStore.pipe(Layer.provideMerge(layerDatabase), Layer.build)
+      const context = yield* layerStore.pipe(Layer.provideMerge(layerDatabase(database)), Layer.build)
       const full = yield* interruptedAt(0, Number.MAX_SAFE_INTEGER).pipe(Effect.provide(context))
       assert.strictEqual(full.completedFirst, true)
       const stuck: Array<{ readonly steps: number; readonly outcomes: ReadonlyArray<string> }> = []

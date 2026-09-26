@@ -183,6 +183,53 @@ retry returns `Expired` and never executes again. The client retains an expired 
 covering snapshot, unless its durable cursor already proves that canonical state includes the snapshot sequence.
 `SyncEngine` is the transport neutral boundary used by direct tests and the RPC client.
 
+## PostgreSQL server storage
+
+`ServerStore`, `Migrations.server`, and `SchemaEvolution.server` run on SQLite and on PostgreSQL 16 or later with the
+same results. The dialect comes from the `SqlClient` in context. Every other dialect fails with `InvalidConfiguration`
+before any statement runs. Client storage (`LocalStore`, `SqlReplica`, `QueryExecutor`, and `Migrations.client`) is
+SQLite only.
+
+```ts
+import { PgClient } from "@effect/sql-pg"
+import * as Config from "effect/Config"
+import * as Layer from "effect/Layer"
+
+const layerStore = ServerStore.layer(options).pipe(
+  Layer.provide(PgClient.layerConfig({ url: Config.Redacted("DATABASE_URL") }))
+)
+```
+
+PostgreSQL has its own migration catalog. Migration 1, `postgres-baseline`, creates the current server schema
+directly. Later server migrations are appended to both catalogs. Sequences, counts, byte sizes, generations, and epoch
+milliseconds are `BIGINT`, and 0 or 1 flags are `SMALLINT`, so every integer decodes to the same JavaScript number as
+on SQLite. JSON columns stay `TEXT`, compared byte for byte. Every `TEXT` column uses `COLLATE "C"`, so ordering,
+cursors, and window membership follow UTF-8 byte order exactly like SQLite `BINARY`, whatever the database locale.
+PostgreSQL `TEXT` cannot hold U+0000, so text index components are stored with an order preserving escape (U+0001
+becomes U+0001 U+0002 and U+0000 becomes U+0001 U+0001). Queries decode it, so entity values containing control
+characters behave as on SQLite.
+
+SQLite serializes every write transaction. On PostgreSQL the same guarantees come from explicit locks, so several
+runners can share one database:
+
+- Admission, pull, bootstrap, snapshot publication, and pruning lock the space row. A pull or bootstrap therefore
+  reads one server head, and admission waits for it as it would behind SQLite's writer lock.
+- Snapshot preparation reads under `REPEATABLE READ`. Admission is not blocked, and a snapshot that went stale while
+  it was prepared is discarded when publication compares heads.
+- Each schema evolution batch locks the space row before validating its progress. A second runner working on the same
+  space fails that batch with `SchemaGenerationConflict` and never applies it twice.
+- Offline wake claims use `FOR UPDATE SKIP LOCKED` and repeat their claim conditions, so one wake is claimed by one
+  runtime. A transaction scoped advisory lock per space and client orders Watch presence registration against delivery
+  claims, so a live Watch and a delivery claim for the same client never both commit.
+- Migrations and index table creation take a transaction scoped advisory lock, so concurrent first boots create the
+  schema once.
+- A transaction that PostgreSQL aborts as a deadlock victim or as a serialization failure is retried as a whole, up
+  to 8 attempts, before the error surfaces.
+
+Pass the client without `transformResultNames` or `transformQueryNames`, because rows are decoded by their snake case
+column names. The test suite runs every server test on both dialects against a PostgreSQL container started through
+testcontainers, so running the tests requires Docker.
+
 ## Operational metrics
 
 `ServerStore` records `effect_local_server_admission` by completed attempt outcome and

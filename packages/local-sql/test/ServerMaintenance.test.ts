@@ -1,8 +1,8 @@
 import { NodeCrypto } from "@effect/platform-node"
-import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
@@ -10,9 +10,11 @@ import * as TestClock from "effect/testing/TestClock"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as Rows from "../src/internal/rows.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as Domain from "./Domain.js"
+import { type ServerDatabase, serverDatabases, sqliteLayer } from "./fixtures/ServerDatabase.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000501")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000501")
@@ -35,9 +37,11 @@ const envelope = Effect.fnUntraced(function*(localSequence: number) {
   return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
 })
 
-const layerDatabase = Layer.mergeAll(SqliteClient.layer({ filename: ":memory:", disableWAL: true }), NodeCrypto.layer)
+const layerDatabase = (database: ServerDatabase) => Layer.mergeAll(database.layer(), NodeCrypto.layer)
 
 const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
+const layerSqliteDatabase = Layer.mergeAll(sqliteLayer(), NodeCrypto.layer)
+const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
 
 const layerStore = (options: Omit<ServerStore.TrustedOptions, "definition">) =>
   ServerStore.layerTrusted({
@@ -48,13 +52,11 @@ const layerStore = (options: Omit<ServerStore.TrustedOptions, "definition">) =>
     Layer.provide(layerRuntime)
   )
 
-const HistoryCount = Schema.Struct({ count: Schema.Int })
-
 const historyCount = Effect.gen(function*() {
   const sql = yield* SqlClient.SqlClient
   const row = yield* SqlSchema.findOne({
     Request: Schema.Void,
-    Result: HistoryCount,
+    Result: Rows.CountRow,
     execute: () =>
       sql`SELECT retained_history_count AS count FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
   })(undefined)
@@ -78,7 +80,7 @@ const submitAll = Effect.fnUntraced(function*(from: number, to: number) {
   return outcomes
 })
 
-describe("ServerStore maintenance", () => {
+describe.each(serverDatabases)("ServerStore maintenance ($dialect)", (database) => {
   it.effect(
     "compacts a space without an external sweep once its writes cross the high watermark",
     Effect.fnUntraced(function*() {
@@ -87,7 +89,7 @@ describe("ServerStore maintenance", () => {
         maximumHistoryEntries: 4,
         retainedReceipts: 1,
         maximumReceipts: 4
-      }).pipe(Layer.provideMerge(layerDatabase), Layer.build)
+      }).pipe(Layer.provideMerge(layerDatabase(database)), Layer.build)
       const outcomes: Array<string> = []
       for (let sequence = 1; sequence <= 12; sequence++) {
         const submitted = yield* submitAll(sequence, sequence).pipe(Effect.provide(context))
@@ -107,13 +109,60 @@ describe("ServerStore maintenance", () => {
         retainedReceipts: 1,
         maximumReceipts: 100,
         pruneBatchSize: 10
-      }).pipe(Layer.provideMerge(layerDatabase), Layer.build)
+      }).pipe(Layer.provideMerge(layerDatabase(database)), Layer.build)
       const outcomes = yield* submitAll(1, 51).pipe(Effect.provide(context))
       assert.deepStrictEqual(outcomes, Array.from({ length: 51 }, () => "Accepted"))
       yield* awaitHistoryAtMost(1).pipe(Effect.provide(context))
     }, Effect.scoped)
   )
 
+  it.effect(
+    "admits a server sequence at the largest safe integer and rejects the next",
+    Effect.fnUntraced(
+      function*() {
+        const context = yield* layerStore({}).pipe(Layer.provideMerge(layerDatabase(database)), Layer.build)
+        const provide = Effect.provide(context)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        assert.deepStrictEqual(yield* submitAll(1, 1).pipe(provide), ["Accepted"])
+        yield* sql`UPDATE effect_local_server_spaces SET next_server_sequence = ${Number.MAX_SAFE_INTEGER - 1}
+        WHERE space_id = ${spaceId}`
+        const store = Context.get(context, ServerStore.ServerStore)
+        const accepted = yield* store.submit(yield* envelope(2))
+        assert.strictEqual(accepted._tag, "Accepted")
+        if (accepted._tag === "Accepted") assert.strictEqual(accepted.serverSequence, Number.MAX_SAFE_INTEGER - 1)
+        const stored = yield* SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: Rows.SequenceRow,
+          execute: () =>
+            sql`SELECT MAX(server_sequence) AS server_sequence FROM effect_local_authoritative_log
+            WHERE space_id = ${spaceId}`
+        })(undefined)
+        assert.strictEqual(stored.server_sequence, Number.MAX_SAFE_INTEGER - 1)
+        const rejected = yield* store.submit(yield* envelope(3)).pipe(Effect.flip)
+        assert.strictEqual(rejected._tag, "CapacityExceeded")
+      },
+      Effect.scoped,
+      provideNodeCrypto
+    )
+  )
+
+  it.effect(
+    "compacts every space in one maintenance pass",
+    Effect.fnUntraced(function*() {
+      const context = yield* layerStore({ retainedHistoryEntries: 1, maximumHistoryEntries: 10_000 }).pipe(
+        Layer.provideMerge(layerDatabase(database)),
+        Layer.build
+      )
+      const provide = Effect.provide(context)
+      assert.deepStrictEqual(yield* submitAll(1, 3).pipe(provide), ["Accepted", "Accepted", "Accepted"])
+      assert.strictEqual(yield* historyCount.pipe(provide), 3)
+      yield* ServerStore.ServerStore.pipe(Effect.flatMap((store) => store.maintainAll), provide)
+      assert.strictEqual(yield* historyCount.pipe(provide), 1)
+    }, Effect.scoped)
+  )
+})
+
+describe("ServerStore maintenance singleton", () => {
   it.effect(
     "sweeps every space from one cluster singleton on the configured interval",
     Effect.fnUntraced(function*() {
@@ -125,7 +174,7 @@ describe("ServerStore maintenance", () => {
         ServerStore.layerMaintenance({ interval: "10 minutes" }).pipe(
           Layer.provideMerge(layerStore({ retainedHistoryEntries: 1, maximumHistoryEntries: 10_000 })),
           Layer.provideMerge(layerSharding),
-          Layer.provideMerge(layerDatabase)
+          Layer.provideMerge(layerSqliteDatabase)
         )
       )
       const provide = Effect.provide(context)

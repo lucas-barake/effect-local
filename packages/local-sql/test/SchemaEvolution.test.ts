@@ -1,4 +1,5 @@
 import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
+import { PgClient } from "@effect/sql-pg"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Definition from "@lucas-barake/effect-local/Definition"
@@ -14,10 +15,10 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
-import * as FileSystem from "effect/FileSystem"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
@@ -25,8 +26,10 @@ import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Codec from "../src/internal/codec.js"
+import * as Rows from "../src/internal/rows.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -35,6 +38,8 @@ import * as SchemaEvolution from "../src/SchemaEvolution.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 import * as SyncEngine from "../src/SyncEngine.js"
+import { installSpaceUpdateProbe, postgresDatabaseUrl, serverDatabases } from "./fixtures/ServerDatabase.js"
+import { gateStatements, lockWaiters } from "./fixtures/SqlGate.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
@@ -393,6 +398,8 @@ const layerDatabase = Layer.mergeAll(
   QueryReactivity.layer
 )
 const provideDatabase = Effect.provide(layerDatabase)
+const withServices = (layerSql: Layer.Layer<SqlClient.SqlClient, SqlError.SqlError>) =>
+  Layer.mergeAll(layerSql, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
 const provideNodeFileSystem = Effect.provide(NodeFileSystem.layer)
 
 const buildStore = <D extends Definition.Any,>(
@@ -421,7 +428,9 @@ const buildServer = <D extends Definition.Any,>(
   definition: D,
   handlers: Layer.Layer<MutationRuntime.Handlers<D>>,
   configuredEvolution?: Evolution.Evolution,
-  serverOptions?: Partial<Pick<ServerStore.Options, "acceptedSchemaVersions" | "retainedHistoryEntries">>
+  serverOptions?: Partial<
+    Pick<ServerStore.Options, "acceptedSchemaVersions" | "retainedHistoryEntries" | "retainedReceipts">
+  >
 ) => {
   const layerRuntime = MutationRuntime.layer(definition, configuredEvolution).pipe(Layer.provide(handlers))
   let options: ServerStore.TrustedOptions = {
@@ -1946,6 +1955,49 @@ describe("client schema evolution", () => {
       provideDatabase
     )
   )
+})
+
+describe.each(serverDatabases)("server schema evolution ($dialect)", (database) => {
+  const layerServerDatabase = withServices(database.layer())
+  const provideServerDatabase = Effect.provide(layerServerDatabase)
+
+  it.effect(
+    "returns an expired receipt for a pruned mutation retried after server schema evolution",
+    Effect.fnUntraced(
+      function*() {
+        const retention = { retainedReceipts: 0, retainedHistoryEntries: 0 }
+        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1, undefined, retention)
+        const first = yield* v1Envelope(
+          clientId,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000170"),
+          1,
+          { id: "70", title: "first" }
+        )
+        const second = yield* v1Envelope(
+          clientId,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000171"),
+          2,
+          { id: "71", title: "second" }
+        )
+        assert.strictEqual((yield* serverV1.submit(first))._tag, "Accepted")
+        assert.strictEqual((yield* serverV1.submit(second))._tag, "Accepted")
+        yield* serverV1.maintain(spaceId)
+        assert.strictEqual((yield* serverV1.submit(first))._tag, "Expired")
+
+        const serverV2 = yield* buildServer(definitionV2, layerHandlersV2, evolution, {
+          ...retention,
+          acceptedSchemaVersions: 1
+        })
+        yield* serverV2.pull(pullRequest(definitionV2))
+        yield* serverV2.maintain(spaceId)
+        const retried = yield* serverV2.submit(first).pipe(Effect.result)
+        if (Result.isFailure(retried)) assert.fail(retried.failure._tag)
+        assert.strictEqual(retried.success._tag, "Expired")
+      },
+      Effect.scoped,
+      provideServerDatabase
+    )
+  )
 
   it.effect(
     "serves schemas inside the configured window across source schema evolution",
@@ -2015,7 +2067,7 @@ describe("client schema evolution", () => {
         )
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2040,7 +2092,7 @@ describe("client schema evolution", () => {
         if (Result.isFailure(outcome)) assert.strictEqual(outcome.failure._tag, "ProtocolInvalid")
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2056,7 +2108,7 @@ describe("client schema evolution", () => {
         if (error._tag === "InvalidConfiguration") assert.strictEqual(error.option, "acceptedSchemaVersions")
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2070,7 +2122,7 @@ describe("client schema evolution", () => {
         if (error._tag === "InvalidConfiguration") assert.strictEqual(error.option, "acceptedSchemaVersions")
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2125,7 +2177,7 @@ describe("client schema evolution", () => {
         assert.isFalse(second.hasMore)
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2168,7 +2220,7 @@ describe("client schema evolution", () => {
         assert.isAtMost(yield* Protocol.encodedBytesEffect(page), Protocol.maximumBatchBytes)
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2206,19 +2258,30 @@ describe("client schema evolution", () => {
         const pullResult = yield* pipe(pullRequest(definitionV1), server.pull, Effect.result)
         const error = expectFailure(pullResult)
         assert.strictEqual(error._tag, "SchemaKeyCollision")
-        const ProjectionCounts = Schema.Struct({ manifests: Schema.Number, entities: Schema.Number })
-        const projectionCounts = yield* SqlSchema.findOne({
+        const scopedState = yield* SqlSchema.findOne({
           Request: Schema.Void,
-          Result: ProjectionCounts,
+          Result: Rows.CountRow,
           execute: () =>
             sql`SELECT
-          (SELECT COUNT(*) FROM effect_local_server_snapshot_projections) AS manifests,
-          (SELECT COUNT(*) FROM effect_local_server_snapshot_projection_entities) AS entities`
+          (SELECT COUNT(*) FROM effect_local_server_scoped_snapshots) +
+          (SELECT COUNT(*) FROM effect_local_server_replication_views) AS count`
         })(undefined)
-        assert.deepStrictEqual(projectionCounts, { manifests: 0, entities: 0 })
+        assert.deepStrictEqual(scopedState, { count: 0 })
+        if (database.dialect === "sqlite") {
+          const ProjectionCounts = Schema.Struct({ manifests: Schema.Number, entities: Schema.Number })
+          const projectionCounts = yield* SqlSchema.findOne({
+            Request: Schema.Void,
+            Result: ProjectionCounts,
+            execute: () =>
+              sql`SELECT
+            (SELECT COUNT(*) FROM effect_local_server_snapshot_projections) AS manifests,
+            (SELECT COUNT(*) FROM effect_local_server_snapshot_projection_entities) AS entities`
+          })(undefined)
+          assert.deepStrictEqual(projectionCounts, { manifests: 0, entities: 0 })
+        }
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2236,21 +2299,32 @@ describe("client schema evolution", () => {
         )
         yield* serverV1.submit(submitted)
         const reached = yield* Deferred.make<void>()
+        const ProgressRow = Schema.Struct({
+          generation: Rows.integer(Schema.Int),
+          phase: Schema.String,
+          cursor_model: Schema.NullOr(Schema.String),
+          target_entity_count: Rows.integer(Schema.Int),
+          target_entity_bytes: Rows.integer(Schema.Int)
+        })
+        const readProgress = SqlSchema.findOneOption({
+          Request: Schema.Void,
+          Result: ProgressRow,
+          execute: () =>
+            sql`SELECT generation, phase, cursor_model, target_entity_count, target_entity_bytes
+            FROM effect_local_server_evolution WHERE space_id = ${spaceId}`
+        })
         const afterBatch = Effect.gen(function*() {
-          const progress = (yield* sql<{
-            readonly generation: number
-            readonly cursor_model: string | null
-            readonly target_entity_count: number
-            readonly target_entity_bytes: number
-          }>`SELECT generation, cursor_model, target_entity_count, target_entity_bytes
-          FROM effect_local_server_evolution WHERE space_id = ${spaceId}`)[0]
+          const progress = yield* readProgress(undefined)
           if (
-            progress === undefined || progress.cursor_model === null ||
-            progress.target_entity_count !== 1 || progress.target_entity_bytes === 0
+            Option.isNone(progress) || progress.value.cursor_model === null ||
+            progress.value.target_entity_count !== 1 || progress.value.target_entity_bytes === 0
           ) return
           yield* Deferred.succeed(reached, undefined)
           yield* Effect.never
-        }).pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
+        }).pipe(Effect.catchTags({
+          SqlError: (error) => Effect.die(error),
+          SchemaError: (error) => Effect.die(error)
+        }))
         const fiber = yield* SchemaEvolution.server({
           definition: definitionV2,
           evolution,
@@ -2261,22 +2335,19 @@ describe("client schema evolution", () => {
         yield* Deferred.await(reached)
         yield* Fiber.interrupt(fiber)
 
-        const progress = (yield* sql<{
-          readonly generation: number
-          readonly phase: string
-          readonly cursor_model: string | null
-          readonly target_entity_count: number
-          readonly target_entity_bytes: number
-        }>`SELECT generation, phase, cursor_model, target_entity_count, target_entity_bytes
-        FROM effect_local_server_evolution WHERE space_id = ${spaceId}`)[0]
+        const progress = Option.getOrThrow(yield* readProgress(undefined))
         assert.strictEqual(progress.phase, "Entities")
         assert.strictEqual(progress.cursor_model, TodoV1.name)
         assert.strictEqual(progress.target_entity_count, 1)
         assert.isAbove(progress.target_entity_bytes, 0)
-        const copied = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
-        FROM effect_local_server_entities_data
-        WHERE space_id = ${spaceId} AND generation = ${progress.generation}`
-        assert.strictEqual(copied[0].count, 1)
+        const copied = yield* SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: Rows.CountRow,
+          execute: () =>
+            sql`SELECT COUNT(*) AS count FROM effect_local_server_entities_data
+            WHERE space_id = ${spaceId} AND generation = ${progress.generation}`
+        })(undefined)
+        assert.strictEqual(copied.count, 1)
 
         const serverV2 = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 0 })
         yield* pipe(pullRequest(definitionV2), serverV2.pull)
@@ -2295,7 +2366,7 @@ describe("client schema evolution", () => {
         })
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2410,7 +2481,6 @@ describe("client schema evolution", () => {
         const cleanupPhases = yield* Ref.make<ReadonlyArray<string>>([])
         const cleanupCounts = yield* Ref.make<ReadonlyArray<number>>([])
         const Progress = Schema.Struct({ phase: Schema.String })
-        const CountRow = Schema.Struct({ count: Schema.Number })
         const readProgress = SqlSchema.findOne({
           Request: Schema.Void,
           Result: Progress,
@@ -2418,7 +2488,7 @@ describe("client schema evolution", () => {
         })
         const countScopedRows = SqlSchema.findOne({
           Request: Schema.Void,
-          Result: CountRow,
+          Result: Rows.CountRow,
           execute: () =>
             sql`SELECT
           (SELECT COUNT(*) FROM effect_local_server_replication_views WHERE space_id = ${spaceId}) +
@@ -2479,7 +2549,7 @@ describe("client schema evolution", () => {
         assert.notStrictEqual(result.manifest.cursor.viewId, outstanding.cursor.viewId)
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2487,11 +2557,8 @@ describe("client schema evolution", () => {
     "fences scoped writes after the prepared schema generation changes",
     Effect.fnUntraced(
       function*() {
-        const fs = yield* FileSystem.FileSystem
-        const directory = yield* fs.makeTempDirectoryScoped()
-        const filename = `${directory}/schema-fence.sqlite`
-        const persistentDatabase = () =>
-          Layer.mergeAll(SqliteClient.layer({ filename }), NodeCrypto.layer, Reactivity.layer)
+        const shared = yield* database.shared
+        const persistentDatabase = () => Layer.mergeAll(shared.layer(), NodeCrypto.layer, Reactivity.layer)
         const prepared = yield* Deferred.make<void>()
         const resume = yield* Deferred.make<void>()
         const scopeAuthorizations = yield* Ref.make(0)
@@ -2533,25 +2600,24 @@ describe("client schema evolution", () => {
         )
         yield* Deferred.await(prepared)
         yield* SchemaEvolution.server({ definition: definitionV2, evolution, spaceId, batchSize: 1 }).pipe(
-          Effect.provide(SqliteClient.layer({ filename }))
+          Effect.provide(shared.layer())
         )
         yield* Deferred.succeed(resume, undefined)
         const result = yield* Fiber.join(stale)
         assert.isTrue(Result.isFailure(result))
         if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, "SchemaGenerationConflict")
-        const CountRow = Schema.Struct({ count: Schema.Number })
         const staleCount = yield* Effect.gen(function*() {
           const sql = yield* SqlClient.SqlClient
           return yield* SqlSchema.findOne({
             Request: Schema.Void,
-            Result: CountRow,
+            Result: Rows.CountRow,
             execute: () =>
               sql`SELECT
               (SELECT COUNT(*) FROM effect_local_server_replication_views WHERE space_id = ${spaceId}) +
               (SELECT COUNT(*) FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId}) AS count`
           })(undefined)
         })
-          .pipe(Effect.provide(SqliteClient.layer({ filename })))
+          .pipe(Effect.provide(shared.layer()))
         assert.strictEqual(staleCount.count, 0)
       },
       Effect.scoped,
@@ -2585,17 +2651,22 @@ describe("client schema evolution", () => {
 
         const serverV2 = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 0 })
         yield* pipe(pullRequest(definitionV2), serverV2.pull)
-        const migrated = yield* sql<{
-          readonly client_id: string
-          readonly local_sequence: number
-          readonly mutation_id: string
-          readonly source_schema_version: number | null
-          readonly source_schema_hash: string | null
-          readonly mutation_version: number | null
-          readonly mutation_name: string | null
-          readonly receipt_json: string
-        }>`SELECT client_id, local_sequence, mutation_id, source_schema_version, source_schema_hash,
-        mutation_version, mutation_name, receipt_json FROM effect_local_server_receipts ORDER BY mutation_id`
+        const migrated = yield* SqlSchema.findAll({
+          Request: Schema.Void,
+          Result: Schema.Struct({
+            client_id: Schema.String,
+            local_sequence: Rows.integer(Schema.Int),
+            mutation_id: Schema.String,
+            source_schema_version: Schema.NullOr(Rows.integer(Schema.Int)),
+            source_schema_hash: Schema.NullOr(Schema.String),
+            mutation_version: Schema.NullOr(Rows.integer(Schema.Int)),
+            mutation_name: Schema.NullOr(Schema.String),
+            receipt_json: Schema.String
+          }),
+          execute: () =>
+            sql`SELECT client_id, local_sequence, mutation_id, source_schema_version, source_schema_hash,
+            mutation_version, mutation_name, receipt_json FROM effect_local_server_receipts ORDER BY mutation_id`
+        })(undefined)
         assert.deepStrictEqual(
           migrated.map((row) => ({
             clientId: row.client_id,
@@ -2667,7 +2738,7 @@ describe("client schema evolution", () => {
         )
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2709,7 +2780,7 @@ describe("client schema evolution", () => {
         assert.deepStrictEqual(yield* Ref.get(authorizedPayload), { id: 10, title: "authorized", done: false })
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2739,10 +2810,9 @@ describe("client schema evolution", () => {
         const deniedResult = yield* server.pullAuthorized(stale, "denied").pipe(Effect.result)
         const deniedError = expectFailure(deniedResult)
         assert.strictEqual(deniedError._tag, "AuthorizationDenied")
-        const CountRow = Schema.Struct({ count: Schema.Number })
         const countSpaces = SqlSchema.findOne({
           Request: Schema.Void,
-          Result: CountRow,
+          Result: Rows.CountRow,
           execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_server_spaces`
         })
         assert.strictEqual((yield* countSpaces(undefined)).count, 0)
@@ -2752,7 +2822,7 @@ describe("client schema evolution", () => {
         assert.strictEqual((yield* countSpaces(undefined)).count, 0)
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
     )
   )
 
@@ -2772,13 +2842,10 @@ describe("client schema evolution", () => {
           Layer.build,
           Effect.map(Context.get(ServerStore.ServerStore))
         )
-        yield* sql`CREATE TABLE space_update_probe (count INTEGER NOT NULL)`
-        yield* sql`CREATE TRIGGER count_space_updates AFTER UPDATE ON effect_local_server_spaces
-        BEGIN INSERT INTO space_update_probe (count) VALUES (1); END`
-        const CountRow = Schema.Struct({ count: Schema.Number })
+        yield* installSpaceUpdateProbe(sql, database.dialect)
         const countUpdates = SqlSchema.findOne({
           Request: Schema.Void,
-          Result: CountRow,
+          Result: Rows.CountRow,
           execute: () => sql`SELECT COUNT(*) AS count FROM space_update_probe`
         })
         const request = pullRequest(definitionV2)
@@ -2791,7 +2858,111 @@ describe("client schema evolution", () => {
         assert.strictEqual(afterSecond - afterFirst, 0)
       },
       Effect.scoped,
-      provideDatabase
+      provideServerDatabase
+    )
+  )
+})
+
+const provideReactivity = Effect.provide(Reactivity.layer)
+
+describe("postgres server schema evolution concurrency", () => {
+  it.effect(
+    "schema evolution batches from two runners serialize on the space",
+    Effect.fnUntraced(
+      function*() {
+        const { url } = yield* postgresDatabaseUrl
+        const observer = yield* PgClient.makeClient({ url })
+        const setup = yield* PgClient.make({ url, maxConnections: 4 })
+        const layerSetup = Layer.succeed(SqlClient.SqlClient, setup)
+        const provideSetup = Effect.provide([layerSetup, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer])
+        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1).pipe(provideSetup)
+        for (let sequence = 1; sequence <= 3; sequence++) {
+          const envelope = yield* v1Envelope(
+            clientId,
+            Identity.MutationId.make(`mut_00000000-0000-4000-8000-00000000030${sequence}`),
+            sequence,
+            { id: `${300 + sequence}`, title: `concurrent-${sequence}` }
+          ).pipe(provideSetup)
+          assert.strictEqual((yield* serverV1.submit(envelope))._tag, "Accepted")
+        }
+
+        const PhaseRow = Schema.Struct({ phase: Schema.String })
+        const reachedEntities = yield* Deferred.make<void>()
+        const readPhase = SqlSchema.findOneOption({
+          Request: Schema.Void,
+          Result: PhaseRow,
+          execute: () => setup`SELECT phase FROM effect_local_server_evolution WHERE space_id = ${spaceId}`
+        })(undefined)
+        const preparing = yield* SchemaEvolution.server({
+          definition: definitionV2,
+          evolution,
+          spaceId,
+          batchSize: 1,
+          afterBatch: readPhase.pipe(
+            Effect.flatMap((phase) => {
+              if (Option.isNone(phase) || phase.value.phase !== "Entities") return Effect.void
+              return Deferred.succeed(reachedEntities, undefined).pipe(Effect.andThen(Effect.never))
+            }),
+            Effect.catchTags({ SqlError: (error) => Effect.die(error), SchemaError: (error) => Effect.die(error) })
+          )
+        }).pipe(provideSetup, Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(reachedEntities)
+        yield* Fiber.interrupt(preparing)
+
+        const gates = yield* Effect.forEach([0, 1], () =>
+          PgClient.make({ url, maxConnections: 3 }).pipe(
+            Effect.flatMap((pool) =>
+              gateStatements(pool, (statement) => {
+                if (
+                  statement.includes("INSERT INTO effect_local_server_entities_data") &&
+                  !statement.includes("ON CONFLICT")
+                ) return ["before"]
+                return []
+              })
+            )
+          ))
+        const runners = yield* Effect.forEach(
+          gates,
+          (gate) =>
+            SchemaEvolution.server({ definition: definitionV2, evolution, spaceId, batchSize: 1 }).pipe(
+              Effect.provideService(SqlClient.SqlClient, gate.sql),
+              Effect.result,
+              Effect.forkChild({ startImmediately: true })
+            )
+        )
+        while (true) {
+          const paused = (yield* Effect.forEach(gates, (gate) => Queue.size(gate.pauses))).reduce((a, b) => a + b, 0)
+          const finished = runners.filter((runner) => runner.pollUnsafe() !== undefined).length
+          if (paused + finished + (yield* lockWaiters(observer)) >= 2) break
+        }
+        yield* Effect.forEach(
+          gates,
+          (gate) =>
+            Queue.take(gate.pauses).pipe(
+              Effect.flatMap((pause) => Deferred.succeed(pause.release, undefined)),
+              Effect.forever,
+              Effect.forkChild
+            ),
+          { discard: true }
+        )
+        const outcomes = yield* Effect.forEach(runners, Fiber.join)
+        const failures = outcomes.flatMap((outcome) => {
+          if (Result.isFailure(outcome)) return [outcome.failure._tag]
+          return []
+        })
+        assert.deepStrictEqual(failures.filter((tag) => tag !== "SchemaGenerationConflict"), [])
+        assert.isTrue(outcomes.some(Result.isSuccess) || failures.length === 1)
+
+        yield* SchemaEvolution.server({ definition: definitionV2, evolution, spaceId, batchSize: 1 }).pipe(provideSetup)
+        const active = yield* SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: Rows.CountRow,
+          execute: () => setup`SELECT COUNT(*) AS count FROM effect_local_server_entities WHERE space_id = ${spaceId}`
+        })(undefined)
+        assert.strictEqual(active.count, 3)
+      },
+      Effect.scoped,
+      provideReactivity
     )
   )
 })

@@ -61,7 +61,9 @@
   },
   "devDependencies": {
     "@effect/platform-node": "4.0.0-rc.117",
+    "@effect/sql-pg": "4.0.0-rc.117",
     "@effect/sql-sqlite-node": "4.0.0-rc.117",
+    "@testcontainers/postgresql": "^12.1.0",
     "effect": "4.0.0-rc.117"
   }
 }

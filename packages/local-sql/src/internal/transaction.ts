@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
+import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
@@ -222,3 +223,23 @@ export const applyCanonicalChange = Effect.fnUntraced(function*(
 }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const entityKey = (entity: Protocol.EntityKey) => `${entity.model}\u0000${Canonical.stringify(entity.key)}`
+
+const maximumTransactionAttempts = 8
+
+export const withServerTransaction = <A, E extends { readonly _tag: string }, R,>(
+  sql: SqlClient.SqlClient,
+  effect: Effect.Effect<A, E, R>
+): Effect.Effect<A, E | SqlError.SqlError, R> => {
+  const retry = (remaining: number, error: SqlError.SqlError): Effect.Effect<A, E | SqlError.SqlError, R> => {
+    if (remaining > 1) return attempt(remaining - 1)
+    return Effect.fail(error)
+  }
+  const attempt = (remaining: number): Effect.Effect<A, E | SqlError.SqlError, R> =>
+    sql.withTransaction(effect).pipe(
+      Effect.catchReasons("SqlError", {
+        DeadlockError: (_, error) => retry(remaining, error),
+        SerializationError: (_, error) => retry(remaining, error)
+      })
+    )
+  return attempt(maximumTransactionAttempts)
+}

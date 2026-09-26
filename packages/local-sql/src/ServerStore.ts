@@ -30,6 +30,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as AcceptedLog from "./internal/acceptedLog.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
+import * as Dialect from "./internal/dialect.js"
 import * as OfflineWakeRuntime from "./internal/offlineWake.js"
 import * as ReadAuthorization from "./internal/readAuthorization.js"
 import * as Rows from "./internal/rows.js"
@@ -378,16 +379,17 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           message: "wakeCapacity must be a positive safe integer"
         })
       }
+      const dialect = yield* Dialect.make(sql)
       yield* Migrations.server(options.migration)
       const offlineWake = yield* OfflineWakeRuntime.make(options.offlineWake, context)
-      const serverIndexes = yield* ServerIndex.make(sql, options.definition)
+      const serverIndexes = yield* ServerIndex.make(sql, dialect, options.definition)
       const metrics = ServerMetrics.make({
         history: options.maximumHistoryEntries,
         receipts: options.maximumReceipts
       })
       const readMetricDepths = SqlSchema.findOne({
         Request: Schema.Void,
-        Result: Schema.Struct({ history: Schema.Number, receipts: Schema.Number }),
+        Result: Schema.Struct({ history: Rows.integer(Schema.Int), receipts: Rows.integer(Schema.Int) }),
         execute: () =>
           sql`SELECT
           COALESCE((SELECT history_count FROM effect_local_server_space_counts
@@ -626,6 +628,13 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         contentBytes: row.content_bytes,
         digest: row.digest
       })
+      const sameSnapshotIdentity = (
+        snapshot: typeof Rows.SnapshotManifestRow.Type,
+        meta: typeof Rows.ServerMetaRow.Type
+      ) =>
+        snapshot.definition_hash === meta.definition_hash &&
+        snapshot.schema_version === meta.schema_version &&
+        snapshot.schema_hash === meta.schema_hash
       const currentManifest = Effect.fnUntraced(function*(
         spaceId: Identity.SpaceId,
         meta: typeof Rows.ServerMetaRow.Type
@@ -1152,207 +1161,65 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
             return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
           }
           const mutation = yield* runtime.prepare(envelope)
-          return yield* sql.withTransaction(Effect.gen(function*() {
-            yield* sql`INSERT INTO effect_local_server_clients
+          return yield* SqlTransaction.withServerTransaction(
+            sql,
+            Effect.gen(function*() {
+              yield* sql`INSERT INTO effect_local_server_clients
               (space_id, client_id, membership_incarnation, last_local_sequence, expired_local_sequence)
               VALUES (${envelope.spaceId}, ${envelope.clientId}, ${membershipIncarnation}, 0, 0)
               ON CONFLICT (space_id, client_id, membership_incarnation) DO NOTHING`
-            let storedSpace: typeof Rows.ServerMetaRow.Type = yield* lockSpace(envelope.spaceId).pipe(
-              Effect.mapError(StorageUnavailable.make)
-            )
-            if (storedSpace.metadata_verified === 0) {
-              storedSpace = yield* repairLockedSpace(envelope.spaceId, storedSpace)
-            }
-            const verifiedCounts = yield* findSpaceCounts(envelope.spaceId).pipe(
-              Effect.mapError(StorageUnavailable.make)
-            )
-            if (
-              storedSpace.retained_history_count !== verifiedCounts.history_count ||
-              storedSpace.retained_receipt_count !== verifiedCounts.receipt_count
-            ) {
-              return yield* new ReplicaError.StorageCorrupt({
-                message: `Space ${envelope.spaceId} retained row counters are inconsistent`
-              })
-            }
-            const client = yield* lockClient({
-              spaceId: envelope.spaceId,
-              clientId: envelope.clientId,
-              membershipIncarnation
-            }).pipe(
-              Effect.mapError(StorageUnavailable.make)
-            )
-            const committedByMutation = yield* findReceiptByMutation({
-              spaceId: envelope.spaceId,
-              mutationId: envelope.mutationId
-            }).pipe(Effect.mapError(StorageUnavailable.make))
-            if (Option.isSome(committedByMutation)) {
-              if (committedByMutation.value.digest !== envelope.digest) {
+              let storedSpace: typeof Rows.ServerMetaRow.Type = yield* lockSpace(envelope.spaceId).pipe(
+                Effect.mapError(StorageUnavailable.make)
+              )
+              if (storedSpace.metadata_verified === 0) {
+                storedSpace = yield* repairLockedSpace(envelope.spaceId, storedSpace)
+              }
+              const verifiedCounts = yield* findSpaceCounts(envelope.spaceId).pipe(
+                Effect.mapError(StorageUnavailable.make)
+              )
+              if (
+                storedSpace.retained_history_count !== verifiedCounts.history_count ||
+                storedSpace.retained_receipt_count !== verifiedCounts.receipt_count
+              ) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Space ${envelope.spaceId} retained row counters are inconsistent`
+                })
+              }
+              const client = yield* lockClient({
+                spaceId: envelope.spaceId,
+                clientId: envelope.clientId,
+                membershipIncarnation
+              }).pipe(
+                Effect.mapError(StorageUnavailable.make)
+              )
+              const committedByMutation = yield* findReceiptByMutation({
+                spaceId: envelope.spaceId,
+                mutationId: envelope.mutationId
+              }).pipe(Effect.mapError(StorageUnavailable.make))
+              if (Option.isSome(committedByMutation)) {
+                if (committedByMutation.value.digest !== envelope.digest) {
+                  return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
+                }
+                const receipt = yield* decodeStoredReceipt(committedByMutation.value, envelope)
+                wakeChanges = yield* retryWakeChanges(receipt, envelope)
+                return yield* SchemaEvolution.migrateReceipt(receipt, evolution).pipe(
+                  Effect.flatMap((migratedReceipt) => projectReceipt(migratedReceipt, callerDefinition))
+                )
+              }
+              const committedBySequence = yield* findReceiptBySequence({
+                spaceId: envelope.spaceId,
+                clientId: envelope.clientId,
+                membershipIncarnation,
+                localSequence: envelope.localSequence
+              }).pipe(Effect.mapError(StorageUnavailable.make))
+              if (Option.isSome(committedBySequence)) {
                 return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
               }
-              const receipt = yield* decodeStoredReceipt(committedByMutation.value, envelope)
-              wakeChanges = yield* retryWakeChanges(receipt, envelope)
-              return yield* SchemaEvolution.migrateReceipt(receipt, evolution).pipe(
-                Effect.flatMap((migratedReceipt) => projectReceipt(migratedReceipt, callerDefinition))
-              )
-            }
-            const committedBySequence = yield* findReceiptBySequence({
-              spaceId: envelope.spaceId,
-              clientId: envelope.clientId,
-              membershipIncarnation,
-              localSequence: envelope.localSequence
-            }).pipe(Effect.mapError(StorageUnavailable.make))
-            if (Option.isSome(committedBySequence)) {
-              return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
-            }
-            yield* validateStoredSpace(storedSpace)
-            if (envelope.localSequence <= client.expired_local_sequence) {
-              const manifest = yield* currentManifest(envelope.spaceId, storedSpace)
-              return yield* pipe(
-                Protocol.ExpiredReceipt.make({
-                  spaceId: envelope.spaceId,
-                  clientId: envelope.clientId,
-                  membershipIncarnation,
-                  mutationId: envelope.mutationId,
-                  localSequence: envelope.localSequence,
-                  name: mutation.name,
-                  sourceSchema: options.definition.schemaIdentity,
-                  mutationVersion: mutation.mutationVersion,
-                  snapshotId: manifest.snapshotId,
-                  snapshotSequence: manifest.sequence,
-                  terminalSequenceThrough: manifest.terminalSequenceThrough
-                }),
-                (receipt) => projectReceipt(receipt, callerDefinition)
-              )
-            }
-            if (envelope.localSequence <= client.last_local_sequence) {
-              return yield* new ReplicaError.StorageCorrupt({
-                message: `Client ${envelope.clientId} is missing retained receipt ${envelope.localSequence}`
-              })
-            }
-            const expected = client.last_local_sequence + 1
-            if (envelope.localSequence !== expected) {
-              return yield* new ReplicaError.OutOfOrderMutation({ expected, actual: envelope.localSequence })
-            }
-            if (storedSpace.retained_receipt_count >= options.maximumReceipts) {
-              return yield* new ReplicaError.CapacityExceeded({
-                resource: "server receipts",
-                limit: options.maximumReceipts
-              })
-            }
-            if (storedSpace.retained_history_count >= options.maximumHistoryEntries) {
-              return yield* new ReplicaError.CapacityExceeded({
-                resource: "server history",
-                limit: options.maximumHistoryEntries
-              })
-            }
-            compactAfterCommit = crossesHighWater(storedSpace)
-            if (storedSpace.next_terminal_sequence >= Number.MAX_SAFE_INTEGER) {
-              return yield* new ReplicaError.CapacityExceeded({
-                resource: "terminal sequence",
-                limit: Number.MAX_SAFE_INTEGER - 1
-              })
-            }
-            if (storedSpace.next_server_sequence >= Number.MAX_SAFE_INTEGER) {
-              return yield* new ReplicaError.CapacityExceeded({
-                resource: "server sequence",
-                limit: Number.MAX_SAFE_INTEGER - 1
-              })
-            }
-
-            const authorization = yield* options.authorizeMutation({ mutation, principal }).pipe(
-              Effect.provide(context),
-              Effect.result
-            )
-            let receipt: Protocol.AcceptedReceipt | Protocol.RejectedReceipt
-            if (Result.isFailure(authorization)) {
-              receipt = {
-                ...(yield* rejectedReceipt(envelope, mutation, { ...authorization.failure }, "Authorization")),
-                terminalSequence: Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
-              }
-            } else {
-              const changes: Array<Protocol.EntityChange> = []
-              const mutationName = mutation.name
-              const mutationPayload = mutation.payload
-              const transaction = SqlTransaction.server({
-                sql,
-                definition: options.definition,
-                spaceId: envelope.spaceId,
-                generation: storedSpace.active_schema_generation,
-                changes
-              })
-              const executedMutation = Effect.flatMap(
-                runtime.execute(
-                  mutationName,
-                  mutationPayload,
-                  transaction,
-                  changes
-                ),
-                Effect.fnUntraced(function*(result) {
-                  if (Result.isFailure(result)) {
-                    return yield* new TerminalRejection.TerminalRejection({
-                      origin: "Mutation",
-                      rejection: result.failure
-                    })
-                  }
-                  const state = yield* lockSpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-                  if (state.entity_count > options.maximumSnapshotEntities) {
-                    return yield* new TerminalRejection.TerminalRejection({
-                      origin: "Capacity",
-                      rejection: {
-                        _tag: "CapacityExceeded",
-                        resource: "snapshot entities",
-                        limit: options.maximumSnapshotEntities
-                      }
-                    })
-                  }
-                  if (state.entity_bytes > options.maximumSnapshotBytes) {
-                    return yield* new TerminalRejection.TerminalRejection({
-                      origin: "Capacity",
-                      rejection: {
-                        _tag: "CapacityExceeded",
-                        resource: "snapshot bytes",
-                        limit: options.maximumSnapshotBytes
-                      }
-                    })
-                  }
-                  const largest = yield* findLargestEntity(envelope.spaceId).pipe(
-                    Effect.mapError(StorageUnavailable.make)
-                  )
-                  if (Option.isSome(largest)) {
-                    const row = largest.value
-                    const entity = Protocol.SnapshotEntity.make({
-                      ordinal: Math.max(0, options.maximumSnapshotEntities - 1),
-                      model: row.model,
-                      modelVersion: row.model_version,
-                      key: yield* Codec.parse(row.entity_key),
-                      value: yield* Codec.parse(row.value_json),
-                      entityBytes: row.entity_bytes
-                    })
-                    if (!(yield* bootstrapEntityFits(envelope.spaceId, entity))) {
-                      return yield* new TerminalRejection.TerminalRejection({
-                        origin: "Capacity",
-                        rejection: {
-                          _tag: "CapacityExceeded",
-                          resource: "bootstrap entity bytes",
-                          limit: options.maximumBootstrapPageBytes
-                        }
-                      })
-                    }
-                  }
-                  const sequence = Identity.ServerSequence.make(storedSpace.next_server_sequence)
-                  const entry = Protocol.AcceptedMutation.make({
-                    sequence,
-                    spaceId: envelope.spaceId,
-                    clientId: envelope.clientId,
-                    membershipIncarnation,
-                    mutationId: envelope.mutationId,
-                    localSequence: envelope.localSequence,
-                    sourceSchema: options.definition.schemaIdentity,
-                    digest: envelope.digest,
-                    changes: result.success.changes
-                  })
-                  const entryBytes = yield* Protocol.encodedBytesEffect(entry)
-                  const accepted = Protocol.AcceptedReceipt.make({
+              yield* validateStoredSpace(storedSpace)
+              if (envelope.localSequence <= client.expired_local_sequence) {
+                const manifest = yield* currentManifest(envelope.spaceId, storedSpace)
+                return yield* pipe(
+                  Protocol.ExpiredReceipt.make({
                     spaceId: envelope.spaceId,
                     clientId: envelope.clientId,
                     membershipIncarnation,
@@ -1361,44 +1228,188 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                     name: mutation.name,
                     sourceSchema: options.definition.schemaIdentity,
                     mutationVersion: mutation.mutationVersion,
-                    serverSequence: sequence,
-                    terminalSequence: Identity.TerminalSequence.make(storedSpace.next_terminal_sequence),
-                    result: result.success.result
-                  })
-                  if ((yield* Protocol.encodedBytesEffect(accepted)) > Protocol.maximumReceiptBytes) {
-                    return yield* new TerminalRejection.TerminalRejection({
-                      origin: "Capacity",
-                      rejection: receiptCapacityRejection
-                    })
-                  }
-                  return {
-                    entry,
-                    entryBytes,
-                    entryJson: yield* Codec.stringify(entry),
-                    receipt: accepted
-                  }
+                    snapshotId: manifest.snapshotId,
+                    snapshotSequence: manifest.sequence,
+                    terminalSequenceThrough: manifest.terminalSequenceThrough
+                  }),
+                  (receipt) => projectReceipt(receipt, callerDefinition)
+                )
+              }
+              if (envelope.localSequence <= client.last_local_sequence) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Client ${envelope.clientId} is missing retained receipt ${envelope.localSequence}`
                 })
+              }
+              const expected = client.last_local_sequence + 1
+              if (envelope.localSequence !== expected) {
+                return yield* new ReplicaError.OutOfOrderMutation({ expected, actual: envelope.localSequence })
+              }
+              if (storedSpace.retained_receipt_count >= options.maximumReceipts) {
+                return yield* new ReplicaError.CapacityExceeded({
+                  resource: "server receipts",
+                  limit: options.maximumReceipts
+                })
+              }
+              if (storedSpace.retained_history_count >= options.maximumHistoryEntries) {
+                return yield* new ReplicaError.CapacityExceeded({
+                  resource: "server history",
+                  limit: options.maximumHistoryEntries
+                })
+              }
+              compactAfterCommit = crossesHighWater(storedSpace)
+              if (storedSpace.next_terminal_sequence >= Number.MAX_SAFE_INTEGER) {
+                return yield* new ReplicaError.CapacityExceeded({
+                  resource: "terminal sequence",
+                  limit: Number.MAX_SAFE_INTEGER - 1
+                })
+              }
+              if (storedSpace.next_server_sequence >= Number.MAX_SAFE_INTEGER) {
+                return yield* new ReplicaError.CapacityExceeded({
+                  resource: "server sequence",
+                  limit: Number.MAX_SAFE_INTEGER - 1
+                })
+              }
+
+              const authorization = yield* options.authorizeMutation({ mutation, principal }).pipe(
+                Effect.provide(context),
+                Effect.result
               )
-              const executed = yield* sql.withTransaction(executedMutation).pipe(
-                Effect.map(Result.succeed),
-                Effect.catchTag("TerminalRejection", (terminal) => Effect.succeed(Result.fail(terminal)))
-              )
-              if (Result.isFailure(executed)) {
+              let receipt: Protocol.AcceptedReceipt | Protocol.RejectedReceipt
+              if (Result.isFailure(authorization)) {
                 receipt = {
-                  ...(yield* rejectedReceipt(
-                    envelope,
-                    mutation,
-                    executed.failure.rejection,
-                    executed.failure.origin
-                  )),
+                  ...(yield* rejectedReceipt(envelope, mutation, { ...authorization.failure }, "Authorization")),
                   terminalSequence: Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
                 }
               } else {
-                const { entry, entryBytes, entryJson } = executed.success
-                yield* sql`UPDATE effect_local_server_spaces SET
+                const changes: Array<Protocol.EntityChange> = []
+                const mutationName = mutation.name
+                const mutationPayload = mutation.payload
+                const transaction = SqlTransaction.server({
+                  sql,
+                  definition: options.definition,
+                  spaceId: envelope.spaceId,
+                  generation: storedSpace.active_schema_generation,
+                  changes
+                })
+                const executedMutation = Effect.flatMap(
+                  runtime.execute(
+                    mutationName,
+                    mutationPayload,
+                    transaction,
+                    changes
+                  ),
+                  Effect.fnUntraced(function*(result) {
+                    if (Result.isFailure(result)) {
+                      return yield* new TerminalRejection.TerminalRejection({
+                        origin: "Mutation",
+                        rejection: result.failure
+                      })
+                    }
+                    const state = yield* lockSpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+                    if (state.entity_count > options.maximumSnapshotEntities) {
+                      return yield* new TerminalRejection.TerminalRejection({
+                        origin: "Capacity",
+                        rejection: {
+                          _tag: "CapacityExceeded",
+                          resource: "snapshot entities",
+                          limit: options.maximumSnapshotEntities
+                        }
+                      })
+                    }
+                    if (state.entity_bytes > options.maximumSnapshotBytes) {
+                      return yield* new TerminalRejection.TerminalRejection({
+                        origin: "Capacity",
+                        rejection: {
+                          _tag: "CapacityExceeded",
+                          resource: "snapshot bytes",
+                          limit: options.maximumSnapshotBytes
+                        }
+                      })
+                    }
+                    const largest = yield* findLargestEntity(envelope.spaceId).pipe(
+                      Effect.mapError(StorageUnavailable.make)
+                    )
+                    if (Option.isSome(largest)) {
+                      const row = largest.value
+                      const entity = Protocol.SnapshotEntity.make({
+                        ordinal: Math.max(0, options.maximumSnapshotEntities - 1),
+                        model: row.model,
+                        modelVersion: row.model_version,
+                        key: yield* Codec.parse(row.entity_key),
+                        value: yield* Codec.parse(row.value_json),
+                        entityBytes: row.entity_bytes
+                      })
+                      if (!(yield* bootstrapEntityFits(envelope.spaceId, entity))) {
+                        return yield* new TerminalRejection.TerminalRejection({
+                          origin: "Capacity",
+                          rejection: {
+                            _tag: "CapacityExceeded",
+                            resource: "bootstrap entity bytes",
+                            limit: options.maximumBootstrapPageBytes
+                          }
+                        })
+                      }
+                    }
+                    const sequence = Identity.ServerSequence.make(storedSpace.next_server_sequence)
+                    const entry = Protocol.AcceptedMutation.make({
+                      sequence,
+                      spaceId: envelope.spaceId,
+                      clientId: envelope.clientId,
+                      membershipIncarnation,
+                      mutationId: envelope.mutationId,
+                      localSequence: envelope.localSequence,
+                      sourceSchema: options.definition.schemaIdentity,
+                      digest: envelope.digest,
+                      changes: result.success.changes
+                    })
+                    const entryBytes = yield* Protocol.encodedBytesEffect(entry)
+                    const accepted = Protocol.AcceptedReceipt.make({
+                      spaceId: envelope.spaceId,
+                      clientId: envelope.clientId,
+                      membershipIncarnation,
+                      mutationId: envelope.mutationId,
+                      localSequence: envelope.localSequence,
+                      name: mutation.name,
+                      sourceSchema: options.definition.schemaIdentity,
+                      mutationVersion: mutation.mutationVersion,
+                      serverSequence: sequence,
+                      terminalSequence: Identity.TerminalSequence.make(storedSpace.next_terminal_sequence),
+                      result: result.success.result
+                    })
+                    if ((yield* Protocol.encodedBytesEffect(accepted)) > Protocol.maximumReceiptBytes) {
+                      return yield* new TerminalRejection.TerminalRejection({
+                        origin: "Capacity",
+                        rejection: receiptCapacityRejection
+                      })
+                    }
+                    return {
+                      entry,
+                      entryBytes,
+                      entryJson: yield* Codec.stringify(entry),
+                      receipt: accepted
+                    }
+                  })
+                )
+                const executed = yield* sql.withTransaction(executedMutation).pipe(
+                  Effect.map(Result.succeed),
+                  Effect.catchTag("TerminalRejection", (terminal) => Effect.succeed(Result.fail(terminal)))
+                )
+                if (Result.isFailure(executed)) {
+                  receipt = {
+                    ...(yield* rejectedReceipt(
+                      envelope,
+                      mutation,
+                      executed.failure.rejection,
+                      executed.failure.origin
+                    )),
+                    terminalSequence: Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
+                  }
+                } else {
+                  const { entry, entryBytes, entryJson } = executed.success
+                  yield* sql`UPDATE effect_local_server_spaces SET
                   next_server_sequence = next_server_sequence + 1
                   WHERE space_id = ${envelope.spaceId}`
-                yield* sql`INSERT INTO effect_local_authoritative_log
+                  yield* sql`INSERT INTO effect_local_authoritative_log
                   (space_id, server_sequence, client_id, membership_incarnation, local_sequence,
                     mutation_id, digest, entry_bytes, entry_json, source_schema_version,
                     source_schema_hash, mutation_version)
@@ -1407,22 +1418,22 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                     ${envelope.mutationId}, ${envelope.digest}, ${entryBytes}, ${entryJson},
                     ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash},
                     ${mutation.mutationVersion})`
-                yield* serverIndexes.apply(
-                  envelope.spaceId,
-                  storedSpace.active_schema_generation,
-                  entry.sequence,
-                  entry.changes
-                )
-                wakeChanges = entry.changes
-                receipt = executed.success.receipt
+                  yield* serverIndexes.apply(
+                    envelope.spaceId,
+                    storedSpace.active_schema_generation,
+                    entry.sequence,
+                    entry.changes
+                  )
+                  wakeChanges = entry.changes
+                  receipt = executed.success.receipt
+                }
               }
-            }
-            const terminalSequence = Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
-            let receiptServerSequence: Identity.ServerSequence | null = null
-            if (receipt._tag === "Accepted") receiptServerSequence = receipt.serverSequence
-            let rejectionOrigin: Protocol.RejectionOrigin | null = null
-            if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
-            yield* sql`INSERT INTO effect_local_server_receipts
+              const terminalSequence = Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
+              let receiptServerSequence: Identity.ServerSequence | null = null
+              if (receipt._tag === "Accepted") receiptServerSequence = receipt.serverSequence
+              let rejectionOrigin: Protocol.RejectionOrigin | null = null
+              if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
+              yield* sql`INSERT INTO effect_local_server_receipts
               (space_id, client_id, membership_incarnation, local_sequence, mutation_id, digest,
                 terminal_sequence, server_sequence, receipt_json, digest_version, source_schema_version,
                 source_schema_hash, mutation_version, mutation_name, rejection_origin)
@@ -1432,17 +1443,18 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                 ${yield* Codec.stringify(receipt)}, ${envelope.digestVersion},
                 ${receipt.sourceSchema.version}, ${receipt.sourceSchema.hash}, ${receipt.mutationVersion},
                 ${receipt.name}, ${rejectionOrigin})`
-            yield* sql`UPDATE effect_local_server_spaces SET
+              yield* sql`UPDATE effect_local_server_spaces SET
               next_terminal_sequence = next_terminal_sequence + 1
               WHERE space_id = ${envelope.spaceId}`
-            yield* sql`UPDATE effect_local_server_clients SET last_local_sequence = ${envelope.localSequence}
+              yield* sql`UPDATE effect_local_server_clients SET last_local_sequence = ${envelope.localSequence}
               WHERE space_id = ${envelope.spaceId} AND client_id = ${envelope.clientId}
                 AND membership_incarnation = ${membershipIncarnation}`
-            if (receipt._tag === "Accepted") {
-              yield* offlineWake.enqueue(envelope.spaceId, receipt.serverSequence)
-            }
-            return yield* projectReceipt(receipt, callerDefinition)
-          }))
+              if (receipt._tag === "Accepted") {
+                yield* offlineWake.enqueue(envelope.spaceId, receipt.serverSequence)
+              }
+              return yield* projectReceipt(receipt, callerDefinition)
+            })
+          )
         }).pipe(
           Effect.catchTag("SqlError", (cause) =>
             Effect.fail(new ReplicaError.UnknownCommitOutcome({ mutationId: submittedEnvelope.mutationId, cause }))),
@@ -1537,90 +1549,92 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           }
           const mutation = yield* runtime.prepare(envelope)
           let compactAfterCommit = false
-          const discarded = yield* sql.withTransaction(Effect.gen(function*() {
-            yield* sql`INSERT INTO effect_local_server_clients
+          const discarded = yield* SqlTransaction.withServerTransaction(
+            sql,
+            Effect.gen(function*() {
+              yield* sql`INSERT INTO effect_local_server_clients
               (space_id, client_id, membership_incarnation, last_local_sequence, expired_local_sequence)
               VALUES (${envelope.spaceId}, ${envelope.clientId}, ${membershipIncarnation}, 0, 0)
               ON CONFLICT (space_id, client_id, membership_incarnation) DO NOTHING`
-            let storedSpace = yield* lockSpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-            if (storedSpace.metadata_verified === 0) {
-              storedSpace = yield* repairLockedSpace(envelope.spaceId, storedSpace)
-            }
-            yield* validateStoredSpace(storedSpace)
-            const committed = yield* findReceiptByMutation({
-              spaceId: envelope.spaceId,
-              mutationId: envelope.mutationId
-            }).pipe(Effect.mapError(StorageUnavailable.make))
-            if (Option.isSome(committed)) {
-              if (committed.value.digest !== envelope.digest) {
-                return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
+              let storedSpace = yield* lockSpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+              if (storedSpace.metadata_verified === 0) {
+                storedSpace = yield* repairLockedSpace(envelope.spaceId, storedSpace)
               }
-              return yield* decodeStoredReceipt(committed.value, envelope).pipe(
-                Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution)),
-                Effect.flatMap((receipt) => projectReceipt(receipt, callerDefinition))
-              )
-            }
-            const client = yield* lockClient({
-              spaceId: envelope.spaceId,
-              clientId: envelope.clientId,
-              membershipIncarnation
-            }).pipe(Effect.mapError(StorageUnavailable.make))
-            if (envelope.localSequence <= client.expired_local_sequence) {
-              const manifest = yield* currentManifest(envelope.spaceId, storedSpace)
-              return yield* pipe(
-                Protocol.ExpiredReceipt.make({
-                  spaceId: envelope.spaceId,
-                  clientId: envelope.clientId,
-                  membershipIncarnation,
-                  mutationId: envelope.mutationId,
-                  localSequence: envelope.localSequence,
-                  name: mutation.name,
-                  sourceSchema: options.definition.schemaIdentity,
-                  mutationVersion: mutation.mutationVersion,
-                  snapshotId: manifest.snapshotId,
-                  snapshotSequence: manifest.sequence,
-                  terminalSequenceThrough: manifest.terminalSequenceThrough
-                }),
-                (receipt) => projectReceipt(receipt, callerDefinition)
-              )
-            }
-            if (envelope.localSequence <= client.last_local_sequence) {
-              return yield* new ReplicaError.StorageCorrupt({
-                message: `Client ${envelope.clientId} is missing retained receipt ${envelope.localSequence}`
+              yield* validateStoredSpace(storedSpace)
+              const committed = yield* findReceiptByMutation({
+                spaceId: envelope.spaceId,
+                mutationId: envelope.mutationId
+              }).pipe(Effect.mapError(StorageUnavailable.make))
+              if (Option.isSome(committed)) {
+                if (committed.value.digest !== envelope.digest) {
+                  return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
+                }
+                return yield* decodeStoredReceipt(committed.value, envelope).pipe(
+                  Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution)),
+                  Effect.flatMap((receipt) => projectReceipt(receipt, callerDefinition))
+                )
+              }
+              const client = yield* lockClient({
+                spaceId: envelope.spaceId,
+                clientId: envelope.clientId,
+                membershipIncarnation
+              }).pipe(Effect.mapError(StorageUnavailable.make))
+              if (envelope.localSequence <= client.expired_local_sequence) {
+                const manifest = yield* currentManifest(envelope.spaceId, storedSpace)
+                return yield* pipe(
+                  Protocol.ExpiredReceipt.make({
+                    spaceId: envelope.spaceId,
+                    clientId: envelope.clientId,
+                    membershipIncarnation,
+                    mutationId: envelope.mutationId,
+                    localSequence: envelope.localSequence,
+                    name: mutation.name,
+                    sourceSchema: options.definition.schemaIdentity,
+                    mutationVersion: mutation.mutationVersion,
+                    snapshotId: manifest.snapshotId,
+                    snapshotSequence: manifest.sequence,
+                    terminalSequenceThrough: manifest.terminalSequenceThrough
+                  }),
+                  (receipt) => projectReceipt(receipt, callerDefinition)
+                )
+              }
+              if (envelope.localSequence <= client.last_local_sequence) {
+                return yield* new ReplicaError.StorageCorrupt({
+                  message: `Client ${envelope.clientId} is missing retained receipt ${envelope.localSequence}`
+                })
+              }
+              const expected = client.last_local_sequence + 1
+              if (envelope.localSequence !== expected) {
+                return yield* new ReplicaError.OutOfOrderMutation({ expected, actual: envelope.localSequence })
+              }
+              if (storedSpace.retained_receipt_count >= options.maximumReceipts) {
+                return yield* new ReplicaError.CapacityExceeded({
+                  resource: "server receipts",
+                  limit: options.maximumReceipts
+                })
+              }
+              if (storedSpace.next_terminal_sequence >= Number.MAX_SAFE_INTEGER) {
+                return yield* new ReplicaError.CapacityExceeded({
+                  resource: "terminal sequence",
+                  limit: Number.MAX_SAFE_INTEGER - 1
+                })
+              }
+              compactAfterCommit = crossesHighWater(storedSpace)
+              const terminalSequence = Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
+              const receipt = Protocol.RejectedReceipt.make({
+                spaceId: envelope.spaceId,
+                clientId: envelope.clientId,
+                membershipIncarnation,
+                mutationId: envelope.mutationId,
+                localSequence: envelope.localSequence,
+                name: mutation.name,
+                sourceSchema: options.definition.schemaIdentity,
+                mutationVersion: mutation.mutationVersion,
+                origin: "Quarantine",
+                terminalSequence,
+                rejection: { _tag: "Quarantined" }
               })
-            }
-            const expected = client.last_local_sequence + 1
-            if (envelope.localSequence !== expected) {
-              return yield* new ReplicaError.OutOfOrderMutation({ expected, actual: envelope.localSequence })
-            }
-            if (storedSpace.retained_receipt_count >= options.maximumReceipts) {
-              return yield* new ReplicaError.CapacityExceeded({
-                resource: "server receipts",
-                limit: options.maximumReceipts
-              })
-            }
-            if (storedSpace.next_terminal_sequence >= Number.MAX_SAFE_INTEGER) {
-              return yield* new ReplicaError.CapacityExceeded({
-                resource: "terminal sequence",
-                limit: Number.MAX_SAFE_INTEGER - 1
-              })
-            }
-            compactAfterCommit = crossesHighWater(storedSpace)
-            const terminalSequence = Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
-            const receipt = Protocol.RejectedReceipt.make({
-              spaceId: envelope.spaceId,
-              clientId: envelope.clientId,
-              membershipIncarnation,
-              mutationId: envelope.mutationId,
-              localSequence: envelope.localSequence,
-              name: mutation.name,
-              sourceSchema: options.definition.schemaIdentity,
-              mutationVersion: mutation.mutationVersion,
-              origin: "Quarantine",
-              terminalSequence,
-              rejection: { _tag: "Quarantined" }
-            })
-            yield* sql`INSERT INTO effect_local_server_receipts
+              yield* sql`INSERT INTO effect_local_server_receipts
               (space_id, client_id, membership_incarnation, local_sequence, mutation_id, digest,
                 terminal_sequence, server_sequence, receipt_json, digest_version, source_schema_version,
                 source_schema_hash, mutation_version, mutation_name, rejection_origin)
@@ -1629,13 +1643,14 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                 ${terminalSequence}, NULL, ${yield* Codec.stringify(receipt)},
                 ${envelope.digestVersion}, ${receipt.sourceSchema.version}, ${receipt.sourceSchema.hash},
                 ${receipt.mutationVersion}, ${receipt.name}, ${receipt.origin})`
-            yield* sql`UPDATE effect_local_server_spaces SET next_terminal_sequence = next_terminal_sequence + 1
+              yield* sql`UPDATE effect_local_server_spaces SET next_terminal_sequence = next_terminal_sequence + 1
               WHERE space_id = ${envelope.spaceId}`
-            yield* sql`UPDATE effect_local_server_clients SET last_local_sequence = ${envelope.localSequence}
+              yield* sql`UPDATE effect_local_server_clients SET last_local_sequence = ${envelope.localSequence}
               WHERE space_id = ${envelope.spaceId} AND client_id = ${envelope.clientId}
                 AND membership_incarnation = ${membershipIncarnation}`
-            return yield* projectReceipt(receipt, callerDefinition)
-          }))
+              return yield* projectReceipt(receipt, callerDefinition)
+            })
+          )
           if (compactAfterCommit) yield* compact(submittedEnvelope.spaceId)
           return discarded
         },
@@ -1658,68 +1673,85 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
       )
 
       const prepareSnapshot = (spaceId: Identity.SpaceId) =>
-        sql.withTransaction(Effect.gen(function*() {
-          const stored = yield* findSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-          if (Option.isNone(stored)) return Option.none()
-          let meta: typeof Rows.ServerMetaRow.Type = stored.value
-          if (meta.metadata_verified === 0) {
-            const locked = yield* lockSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-            meta = yield* repairLockedSpace(spaceId, locked)
-          }
-          yield* validateStoredSpace(meta)
-          const rows = yield* findEntities({ spaceId, limit: options.maximumSnapshotEntities + 1 }).pipe(
-            Effect.mapError(StorageUnavailable.make)
-          )
-          const decoded = yield* decodeEntityRows(spaceId, rows)
-          if (decoded.entities.length !== meta.entity_count || decoded.contentBytes !== meta.entity_bytes) {
-            return yield* new ReplicaError.StorageCorrupt({
-              message: `Space ${spaceId} state counters do not match authoritative entities`
+        SqlTransaction.withServerTransaction(
+          sql,
+          Effect.gen(function*() {
+            yield* dialect.beginSnapshotRead
+            const stored = yield* findSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+            if (Option.isNone(stored)) return Option.none()
+            let meta: typeof Rows.ServerMetaRow.Type = stored.value
+            if (meta.metadata_verified === 0) {
+              const locked = yield* lockSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+              meta = yield* repairLockedSpace(spaceId, locked)
+            }
+            yield* validateStoredSpace(meta)
+            const rows = yield* findEntities({ spaceId, limit: options.maximumSnapshotEntities + 1 }).pipe(
+              Effect.mapError(StorageUnavailable.make)
+            )
+            const decoded = yield* decodeEntityRows(spaceId, rows)
+            if (decoded.entities.length !== meta.entity_count || decoded.contentBytes !== meta.entity_bytes) {
+              return yield* new ReplicaError.StorageCorrupt({
+                message: `Space ${spaceId} state counters do not match authoritative entities`
+              })
+            }
+            const snapshotId = yield* Identity.makeSnapshotId.pipe(
+              Effect.provideService(Crypto.Crypto, crypto),
+              Effect.mapError((cause) => new ReplicaError.StorageUnavailable({ cause }))
+            )
+            return Option.some({
+              observedNextServer: meta.next_server_sequence,
+              observedNextTerminal: meta.next_terminal_sequence,
+              observedSchemaGeneration: meta.schema_generation,
+              manifest: {
+                spaceId,
+                definitionHash: meta.definition_hash,
+                schema: Identity.SchemaIdentity.make({ version: meta.schema_version, hash: meta.schema_hash }),
+                snapshotId,
+                sequence: Identity.ServerSequence.make(meta.next_server_sequence - 1),
+                terminalSequenceThrough: Identity.TerminalSequence.make(meta.next_terminal_sequence - 1),
+                entityCount: decoded.entities.length,
+                contentBytes: decoded.contentBytes,
+                digest: decoded.digest
+              },
+              entities: decoded.entities
             })
-          }
-          const snapshotId = yield* Identity.makeSnapshotId.pipe(
-            Effect.provideService(Crypto.Crypto, crypto),
-            Effect.mapError((cause) => new ReplicaError.StorageUnavailable({ cause }))
-          )
-          return Option.some({
-            observedNextServer: meta.next_server_sequence,
-            observedNextTerminal: meta.next_terminal_sequence,
-            observedSchemaGeneration: meta.schema_generation,
-            manifest: {
-              spaceId,
-              definitionHash: meta.definition_hash,
-              schema: Identity.SchemaIdentity.make({ version: meta.schema_version, hash: meta.schema_hash }),
-              snapshotId,
-              sequence: Identity.ServerSequence.make(meta.next_server_sequence - 1),
-              terminalSequenceThrough: Identity.TerminalSequence.make(meta.next_terminal_sequence - 1),
-              entityCount: decoded.entities.length,
-              contentBytes: decoded.contentBytes,
-              digest: decoded.digest
-            },
-            entities: decoded.entities
           })
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const publish = Option.match({
         onNone: () => Effect.void,
         onSome: (
           candidate: Effect.Success<ReturnType<typeof prepareSnapshot>> extends Option.Option<infer A> ? A : never
         ) =>
-          sql.withTransaction(Effect.gen(function*() {
-            const meta = yield* lockSpace(candidate.manifest.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-            yield* validateStoredSpace(meta)
-            if (
-              meta.next_server_sequence !== candidate.observedNextServer ||
-              meta.next_terminal_sequence !== candidate.observedNextTerminal ||
-              meta.schema_generation !== candidate.observedSchemaGeneration
-            ) return
-            let snapshotId = meta.snapshot_id
-            if (
-              snapshotId === null ||
-              meta.snapshot_sequence !== candidate.manifest.sequence ||
-              meta.snapshot_terminal_sequence !== candidate.manifest.terminalSequenceThrough
-            ) {
-              snapshotId = candidate.manifest.snapshotId
-              yield* sql`INSERT INTO effect_local_server_snapshots
+          SqlTransaction.withServerTransaction(
+            sql,
+            Effect.gen(function*() {
+              const meta = yield* lockSpace(candidate.manifest.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+              yield* validateStoredSpace(meta)
+              if (
+                meta.next_server_sequence !== candidate.observedNextServer ||
+                meta.next_terminal_sequence !== candidate.observedNextTerminal ||
+                meta.schema_generation !== candidate.observedSchemaGeneration
+              ) return
+              let snapshotId = meta.snapshot_id
+              let reusable = snapshotId !== null &&
+                meta.snapshot_sequence === candidate.manifest.sequence &&
+                meta.snapshot_terminal_sequence === candidate.manifest.terminalSequenceThrough
+              if (reusable && snapshotId !== null) {
+                const stored = yield* findSnapshot({ spaceId: candidate.manifest.spaceId, snapshotId }).pipe(
+                  Effect.mapError(StorageUnavailable.make)
+                )
+                reusable = Option.isSome(stored) && sameSnapshotIdentity(stored.value, meta)
+                if (!reusable) {
+                  yield* sql`DELETE FROM effect_local_server_snapshot_entities
+                    WHERE space_id = ${candidate.manifest.spaceId} AND snapshot_id = ${snapshotId}`
+                  yield* sql`DELETE FROM effect_local_server_snapshots
+                    WHERE space_id = ${candidate.manifest.spaceId} AND snapshot_id = ${snapshotId}`
+                }
+              }
+              if (!reusable) {
+                snapshotId = candidate.manifest.snapshotId
+                yield* sql`INSERT INTO effect_local_server_snapshots
                   (space_id, snapshot_id, definition_hash, schema_version, schema_hash,
                     server_sequence, terminal_sequence,
                     entity_count, content_bytes, digest)
@@ -1727,105 +1759,114 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                     ${candidate.manifest.schema.version}, ${candidate.manifest.schema.hash},
                     ${candidate.manifest.sequence}, ${candidate.manifest.terminalSequenceThrough},
                     ${candidate.manifest.entityCount}, ${candidate.manifest.contentBytes}, ${candidate.manifest.digest})`
-              const snapshotRows = yield* Effect.forEach(
-                candidate.entities,
-                Effect.fnUntraced(function*(entity) {
-                  const wireJson = yield* Codec.stringify(entity)
-                  return {
-                    space_id: candidate.manifest.spaceId,
-                    snapshot_id: snapshotId,
-                    ordinal: entity.ordinal,
-                    model: entity.model,
-                    model_version: entity.modelVersion,
-                    entity_key: yield* Codec.stringify(entity.key),
-                    value_json: yield* Codec.stringify(entity.value),
-                    entity_bytes: entity.entityBytes,
-                    wire_json: wireJson,
-                    wire_bytes: yield* Protocol.encodedBytesEffect(entity)
-                  }
-                })
-              )
-              for (let offset = 0; offset < snapshotRows.length; offset += 100) {
-                yield* sql`INSERT INTO effect_local_server_snapshot_entities
+                const snapshotRows = yield* Effect.forEach(
+                  candidate.entities,
+                  Effect.fnUntraced(function*(entity) {
+                    const wireJson = yield* Codec.stringify(entity)
+                    return {
+                      space_id: candidate.manifest.spaceId,
+                      snapshot_id: snapshotId,
+                      ordinal: entity.ordinal,
+                      model: entity.model,
+                      model_version: entity.modelVersion,
+                      entity_key: yield* Codec.stringify(entity.key),
+                      value_json: yield* Codec.stringify(entity.value),
+                      entity_bytes: entity.entityBytes,
+                      wire_json: wireJson,
+                      wire_bytes: yield* Protocol.encodedBytesEffect(entity)
+                    }
+                  })
+                )
+                for (let offset = 0; offset < snapshotRows.length; offset += 100) {
+                  yield* sql`INSERT INTO effect_local_server_snapshot_entities
                     ${sql.insert(snapshotRows.slice(offset, offset + 100))}`
+                }
               }
-            }
-            yield* sql`UPDATE effect_local_server_spaces SET
+              yield* sql`UPDATE effect_local_server_spaces SET
                 snapshot_id = ${snapshotId},
                 snapshot_sequence = ${candidate.manifest.sequence},
                 snapshot_terminal_sequence = ${candidate.manifest.terminalSequenceThrough}
                 WHERE space_id = ${candidate.manifest.spaceId}`
-            yield* sql`DELETE FROM effect_local_server_snapshot_entities
+              yield* sql`DELETE FROM effect_local_server_snapshot_entities
                 WHERE space_id = ${candidate.manifest.spaceId} AND snapshot_id IN (
                   SELECT snapshot_id FROM effect_local_server_snapshots
                   WHERE space_id = ${candidate.manifest.spaceId}
                   ORDER BY server_sequence DESC, terminal_sequence DESC
-                  LIMIT -1 OFFSET ${options.retainedSnapshots}
+                  ${dialect.offset(options.retainedSnapshots)}
                 )`
-            yield* sql`DELETE FROM effect_local_server_snapshots
+              yield* sql`DELETE FROM effect_local_server_snapshots
                 WHERE space_id = ${candidate.manifest.spaceId} AND snapshot_id IN (
                   SELECT snapshot_id FROM effect_local_server_snapshots
                   WHERE space_id = ${candidate.manifest.spaceId}
                   ORDER BY server_sequence DESC, terminal_sequence DESC
-                  LIMIT -1 OFFSET ${options.retainedSnapshots}
+                  ${dialect.offset(options.retainedSnapshots)}
                 )`
-          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            })
+          ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
       })
 
       const pruneBatch = (spaceId: Identity.SpaceId) =>
-        sql.withTransaction(Effect.gen(function*() {
-          const meta = yield* lockSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-          yield* validateStoredSpace(meta)
-          if (meta.snapshot_id === null) return { history: 0, receipts: 0 }
-          const historyFloor = Identity.ServerSequence.make(
-            Math.max(meta.history_floor, meta.snapshot_sequence - options.retainedHistoryEntries)
-          )
-          const receiptFloor = Identity.TerminalSequence.make(
-            Math.max(meta.receipt_floor, meta.snapshot_terminal_sequence - options.retainedReceipts)
-          )
-          if (historyFloor !== meta.history_floor || receiptFloor !== meta.receipt_floor) {
-            yield* sql`UPDATE effect_local_server_spaces SET
+        SqlTransaction.withServerTransaction(
+          sql,
+          Effect.gen(function*() {
+            const meta = yield* lockSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+            yield* validateStoredSpace(meta)
+            if (meta.snapshot_id === null) return { history: 0, receipts: 0 }
+            const historyFloor = Identity.ServerSequence.make(
+              Math.max(meta.history_floor, meta.snapshot_sequence - options.retainedHistoryEntries)
+            )
+            const receiptFloor = Identity.TerminalSequence.make(
+              Math.max(meta.receipt_floor, meta.snapshot_terminal_sequence - options.retainedReceipts)
+            )
+            if (historyFloor !== meta.history_floor || receiptFloor !== meta.receipt_floor) {
+              yield* sql`UPDATE effect_local_server_spaces SET
                 history_floor = ${historyFloor},
                 receipt_floor = ${receiptFloor}
                 WHERE space_id = ${spaceId}`
-          }
-          const history = yield* findHistoryPrune({
-            spaceId: spaceId,
-            through: historyFloor,
-            limit: options.pruneBatchSize
-          }).pipe(Effect.mapError(StorageUnavailable.make))
-          if (history.length > 0) {
-            const through = history.at(-1)!.server_sequence
-            yield* sql`DELETE FROM effect_local_authoritative_log
+            }
+            const history = yield* findHistoryPrune({
+              spaceId: spaceId,
+              through: historyFloor,
+              limit: options.pruneBatchSize
+            }).pipe(Effect.mapError(StorageUnavailable.make))
+            if (history.length > 0) {
+              const through = history.at(-1)!.server_sequence
+              yield* sql`DELETE FROM effect_local_authoritative_log
                   WHERE space_id = ${spaceId} AND server_sequence <= ${through}`
-            yield* sql`DELETE FROM effect_local_server_index_partition_log
+              yield* sql`DELETE FROM effect_local_server_index_partition_log
                   WHERE space_id = ${spaceId} AND server_sequence <= ${through}`
-          }
-          const receipts = yield* findReceiptPrune({
-            spaceId: spaceId,
-            through: receiptFloor,
-            limit: options.pruneBatchSize
-          }).pipe(Effect.mapError(StorageUnavailable.make))
-          if (receipts.length > 0) {
-            const through = receipts.at(-1)!.terminal_sequence
-            yield* sql`UPDATE effect_local_server_clients AS c SET
-                  expired_local_sequence = MAX(expired_local_sequence, COALESCE((
+            }
+            const receipts = yield* findReceiptPrune({
+              spaceId: spaceId,
+              through: receiptFloor,
+              limit: options.pruneBatchSize
+            }).pipe(Effect.mapError(StorageUnavailable.make))
+            if (receipts.length > 0) {
+              const through = receipts.at(-1)!.terminal_sequence
+              yield* sql`UPDATE effect_local_server_clients AS c SET
+                  expired_local_sequence = ${
+                dialect.greatest(
+                  sql`c.expired_local_sequence`,
+                  sql`COALESCE((
                     SELECT MAX(r.local_sequence) FROM effect_local_server_receipts AS r
                     WHERE r.space_id = c.space_id AND r.client_id = c.client_id
                       AND r.membership_incarnation = c.membership_incarnation
                       AND r.terminal_sequence <= ${through}
-                  ), expired_local_sequence))
+                  ), c.expired_local_sequence)`
+                )
+              }
                   WHERE c.space_id = ${spaceId} AND EXISTS (
                     SELECT 1 FROM effect_local_server_receipts AS r
                     WHERE r.space_id = c.space_id AND r.client_id = c.client_id
                       AND r.membership_incarnation = c.membership_incarnation
                       AND r.terminal_sequence <= ${through}
                   )`
-            yield* sql`DELETE FROM effect_local_server_receipts
+              yield* sql`DELETE FROM effect_local_server_receipts
                   WHERE space_id = ${spaceId} AND terminal_sequence <= ${through}`
-          }
-          return { history: history.length, receipts: receipts.length }
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            }
+            return { history: history.length, receipts: receipts.length }
+          })
+        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const pruneToFloors = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
         const total = { history: 0, receipts: 0 }
@@ -1837,20 +1878,27 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         }
       })
 
-      const snapshotCurrent = (meta: typeof Rows.ServerMetaRow.Type) =>
-        meta.metadata_verified === 1 &&
-        meta.snapshot_id !== null &&
-        meta.snapshot_sequence === meta.next_server_sequence - 1 &&
-        meta.snapshot_terminal_sequence === meta.next_terminal_sequence - 1
-
-      const publishCurrentSnapshot = (spaceId: Identity.SpaceId) =>
-        findSpace(spaceId).pipe(
-          Effect.mapError(StorageUnavailable.make),
-          Effect.flatMap((stored) => {
-            if (Option.isSome(stored) && snapshotCurrent(stored.value)) return Effect.void
-            return prepareSnapshot(spaceId).pipe(Effect.flatMap(publish))
-          })
+      const snapshotCurrent = Effect.fnUntraced(function*(
+        spaceId: Identity.SpaceId,
+        meta: typeof Rows.ServerMetaRow.Type
+      ) {
+        if (
+          meta.metadata_verified !== 1 ||
+          meta.snapshot_id === null ||
+          meta.snapshot_sequence !== meta.next_server_sequence - 1 ||
+          meta.snapshot_terminal_sequence !== meta.next_terminal_sequence - 1
+        ) return false
+        const stored = yield* findSnapshot({ spaceId, snapshotId: meta.snapshot_id }).pipe(
+          Effect.mapError(StorageUnavailable.make)
         )
+        return Option.isSome(stored) && sameSnapshotIdentity(stored.value, meta)
+      })
+
+      const publishCurrentSnapshot = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
+        const stored = yield* findSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+        if (Option.isSome(stored) && (yield* snapshotCurrent(spaceId, stored.value))) return
+        yield* prepareSnapshot(spaceId).pipe(Effect.flatMap(publish))
+      })
 
       const maintainSpace = (spaceId: Identity.SpaceId) =>
         publishCurrentSnapshot(spaceId).pipe(
@@ -1868,15 +1916,28 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         )
       const maintain = (spaceId: Identity.SpaceId) =>
         maintainSpace(spaceId).pipe(Effect.ensuring(scheduleMetricDepthRefresh))
-      const compacting = new Set<Identity.SpaceId>()
+      const compacting = new Map<Identity.SpaceId, { rerun: boolean }>()
+      const compactPass = (spaceId: Identity.SpaceId, state: { rerun: boolean }): Effect.Effect<void> =>
+        maintain(spaceId).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Space compaction failed").pipe(Effect.annotateLogs({ spaceId, error: error._tag }))
+          ),
+          Effect.andThen(Effect.suspend(() => {
+            if (!state.rerun) return Effect.void
+            state.rerun = false
+            return compactPass(spaceId, state)
+          }))
+        )
       const compact = (spaceId: Identity.SpaceId) =>
         Effect.suspend(() => {
-          if (compacting.has(spaceId)) return Effect.void
-          compacting.add(spaceId)
-          return maintain(spaceId).pipe(
-            Effect.catch((error) =>
-              Effect.logWarning("Space compaction failed").pipe(Effect.annotateLogs({ spaceId, error: error._tag }))
-            ),
+          const running = compacting.get(spaceId)
+          if (running !== undefined) {
+            running.rerun = true
+            return Effect.void
+          }
+          const state = { rerun: false }
+          compacting.set(spaceId, state)
+          return compactPass(spaceId, state).pipe(
             Effect.ensuring(Effect.sync(() => compacting.delete(spaceId))),
             Effect.forkIn(storeScope),
             Effect.asVoid
@@ -1934,6 +1995,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
       })
       const scopedReplication = ScopedReplication.make({
         sql,
+        dialect,
         crypto,
         definition: options.definition,
         maximumSnapshotEntities: options.maximumSnapshotEntities,
@@ -1949,6 +2011,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
       })
       const preauthorizedScopedReplication = ScopedReplication.make({
         sql,
+        dialect,
         crypto,
         definition: options.definition,
         maximumSnapshotEntities: options.maximumSnapshotEntities,
@@ -1971,8 +2034,13 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         }),
         Result: Rows.CountRow,
         execute: ({ spaceId, clientId, principalDigest, entitiesJson }) =>
-          sql`SELECT EXISTS(
-            SELECT 1 FROM json_each(${entitiesJson}) AS requested
+          sql`SELECT CASE WHEN EXISTS(
+            SELECT 1 FROM ${
+            dialect.jsonRecords(entitiesJson, "requested", [
+              { name: "model", affinity: "text" },
+              { name: "key", affinity: "text" }
+            ])
+          }
             WHERE EXISTS(
               SELECT 1 FROM effect_local_server_replication_view_entities AS acknowledged
               INNER JOIN effect_local_server_replication_views AS current
@@ -1981,11 +2049,11 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                 AND current.view_id = acknowledged.view_id
               WHERE acknowledged.space_id = ${spaceId} AND acknowledged.client_id = ${clientId}
                 AND acknowledged.principal_digest = ${principalDigest}
-                AND acknowledged.model = json_extract(requested.value, '$.model')
-                AND acknowledged.entity_key = json_extract(requested.value, '$.key')
+                AND acknowledged.model = requested.model
+                AND acknowledged.entity_key = requested.key
                 AND acknowledged.disposition = 'Upsert'
             )
-          ) AS count`
+          ) THEN 1 ELSE 0 END AS count`
       })
       const mutationWakeVisible = Effect.fnUntraced(function*(
         request: Protocol.WatchRequest,

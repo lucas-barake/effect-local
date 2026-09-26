@@ -5,8 +5,6 @@ import * as Schema from "effect/Schema"
 
 export type SqlValue = string | number
 
-export const affinitySql = { text: "TEXT", real: "REAL", integer: "INTEGER" } as const
-
 export const encodeComponent = (
   component: SecondaryIndex.ComponentInput,
   value: unknown

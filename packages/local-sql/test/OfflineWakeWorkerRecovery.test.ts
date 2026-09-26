@@ -139,7 +139,8 @@ describe("offline wake worker recovery", () => {
         const fault = withSqlDefect(
           actualSql,
           (source) =>
-            source.includes("UPDATE effect_local_server_offline_wake_spaces") && source.includes("WHERE rowid IN")
+            source.includes("UPDATE effect_local_server_offline_wake_spaces") &&
+            source.includes("WHERE space_id IN (SELECT space_id FROM effect_local_server_offline_wake_spaces")
         )
         const deliveries = yield* Queue.bounded<OfflineWake.Delivery>(1).pipe(
           (acquire) => Effect.acquireRelease(acquire, Queue.shutdown)

@@ -12,6 +12,8 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as Codec from "./internal/codec.js"
+import * as Dialect from "./internal/dialect.js"
+import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as TerminalRejection from "./internal/TerminalRejection.js"
 import * as SqlTransaction from "./internal/transaction.js"
@@ -64,7 +66,7 @@ const ProgressRow = Schema.Struct({
 
 const EntityBatchRow = Schema.Struct({
   model: Schema.String,
-  model_version: NullableSchemaVersion,
+  model_version: Schema.NullOr(Rows.integer(Identity.SchemaVersion)),
   entity_key: Schema.String,
   value_json: Schema.String
 })
@@ -76,20 +78,20 @@ const RetractionBatchRow = Schema.Struct({
 })
 
 const LogBatchRow = Schema.Struct({
-  server_sequence: Identity.ServerSequence,
+  server_sequence: Rows.integer(Identity.ServerSequence),
   mutation_id: Identity.MutationId,
   entry_json: Schema.String,
-  source_schema_version: NullableSchemaVersion,
+  source_schema_version: Schema.NullOr(Rows.integer(Identity.SchemaVersion)),
   source_schema_hash: NullableSchemaHash
 })
 
 const ServerReceiptBatchRow = Schema.Struct({
   mutation_id: Identity.MutationId,
-  local_sequence: Identity.LocalSequence,
+  local_sequence: Rows.integer(Identity.LocalSequence),
   receipt_json: Schema.String,
-  source_schema_version: NullableSchemaVersion,
+  source_schema_version: Schema.NullOr(Rows.integer(Identity.SchemaVersion)),
   source_schema_hash: NullableSchemaHash,
-  mutation_version: NullableSchemaVersion,
+  mutation_version: Schema.NullOr(Rows.integer(Identity.SchemaVersion)),
   mutation_name: Schema.NullOr(Schema.String),
   rejection_origin: Schema.NullOr(Protocol.RejectionOrigin)
 })
@@ -121,8 +123,8 @@ const PendingBatchRow = Schema.Struct({
 })
 
 const SequenceBytesRow = Schema.Struct({
-  server_sequence: Identity.ServerSequence,
-  row_bytes: NonNegativeInt
+  server_sequence: Rows.integer(Identity.ServerSequence),
+  row_bytes: Rows.integer(NonNegativeInt)
 })
 const LocalSequenceBytesRow = Schema.Struct({
   local_sequence: Identity.LocalSequence,
@@ -131,13 +133,13 @@ const LocalSequenceBytesRow = Schema.Struct({
 const EntityBytesRow = Schema.Struct({
   model: Schema.String,
   entity_key: Schema.String,
-  row_bytes: NonNegativeInt
+  row_bytes: Rows.integer(NonNegativeInt)
 })
 const KeyBytesRow = Schema.Struct({
   mutation_id: Identity.MutationId,
-  row_bytes: NonNegativeInt
+  row_bytes: Rows.integer(NonNegativeInt)
 })
-const CountRow = Schema.Struct({ count: NonNegativeInt })
+const CountRow = Schema.Struct({ count: Rows.integer(NonNegativeInt) })
 
 const boundedCount = (
   rows: ReadonlyArray<{ readonly row_bytes: number }>,
@@ -1420,25 +1422,25 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
 
 const ServerMetaEvolutionRow = Schema.Struct({
   definition_hash: Schema.String,
-  schema_version: NullableSchemaVersion,
+  schema_version: Schema.NullOr(Rows.integer(Identity.SchemaVersion)),
   schema_hash: NullableSchemaHash,
-  schema_generation: NonNegativeInt,
-  active_schema_generation: NonNegativeInt,
-  target_schema_version: NullableSchemaVersion,
+  schema_generation: Rows.integer(NonNegativeInt),
+  active_schema_generation: Rows.integer(NonNegativeInt),
+  target_schema_version: Schema.NullOr(Rows.integer(Identity.SchemaVersion)),
   target_schema_hash: NullableSchemaHash,
   migration_hash: NullableSchemaHash
 })
 
 const ServerProgressRow = Schema.Struct({
-  source_schema_version: Identity.SchemaVersion,
+  source_schema_version: Rows.integer(Identity.SchemaVersion),
   source_schema_hash: Identity.SchemaHash,
-  target_schema_version: Identity.SchemaVersion,
+  target_schema_version: Rows.integer(Identity.SchemaVersion),
   target_schema_hash: Identity.SchemaHash,
   migration_hash: Identity.SchemaHash,
-  generation: Identity.SchemaVersion,
-  source_generation: NonNegativeInt,
-  target_entity_count: NonNegativeInt,
-  target_entity_bytes: NonNegativeInt,
+  generation: Rows.integer(Identity.SchemaVersion),
+  source_generation: Rows.integer(NonNegativeInt),
+  target_entity_count: Rows.integer(NonNegativeInt),
+  target_entity_bytes: Rows.integer(NonNegativeInt),
   phase: Schema.Literals([
     "Log",
     "Entities",
@@ -1454,7 +1456,7 @@ const ServerProgressRow = Schema.Struct({
   ]),
   cursor_model: Schema.NullOr(Schema.String),
   cursor_key: Schema.NullOr(Schema.String),
-  cursor_sequence: Schema.NullOr(NonNegativeInt)
+  cursor_sequence: Schema.NullOr(Rows.integer(NonNegativeInt))
 })
 
 export interface ServerOptions {
@@ -1469,8 +1471,9 @@ export interface ServerOptions {
 export const server = Effect.fn("SchemaEvolution.server")(function*(options: ServerOptions) {
   yield* Effect.annotateCurrentSpan("space.id", options.spaceId)
   const sql = yield* SqlClient.SqlClient
+  const dialect = yield* Dialect.make(sql)
   const withTransaction = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
-    sql.withTransaction(effect)
+    SqlTransaction.withServerTransaction(sql, effect)
   if (!sameIdentity(options.definition.schemaIdentity, options.evolution.current.schemaIdentity)) {
     return yield* new ReplicaError.InvalidConfiguration({
       option: "evolution",
@@ -1500,6 +1503,14 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
         target_schema_version, target_schema_hash, migration_hash FROM effect_local_server_spaces
         WHERE space_id = ${options.spaceId}`
   })
+  const lockMeta = SqlSchema.findOne({
+    Request: Schema.Void,
+    Result: ServerMetaEvolutionRow,
+    execute: () =>
+      sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
+        target_schema_version, target_schema_hash, migration_hash FROM effect_local_server_spaces
+        WHERE space_id = ${options.spaceId} ${dialect.forNoKeyUpdate}`
+  })
   const readProgress = SqlSchema.findOneOption({
     Request: Schema.Void,
     Result: ServerProgressRow,
@@ -1520,39 +1531,39 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     Request: Schema.Void,
     Result: CountRow,
     execute: () =>
-      sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_scoped_snapshot_entries
+      sql`SELECT CASE WHEN EXISTS(SELECT 1 FROM effect_local_server_scoped_snapshot_entries
         WHERE snapshot_id IN (
           SELECT snapshot_id FROM effect_local_server_scoped_snapshots
           WHERE space_id = ${options.spaceId}
-        )) AS count`
+        )) THEN 1 ELSE 0 END AS count`
   })
   const countScopedSnapshots = SqlSchema.findOne({
     Request: Schema.Void,
     Result: CountRow,
     execute: () =>
-      sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_scoped_snapshots
-        WHERE space_id = ${options.spaceId}) AS count`
+      sql`SELECT CASE WHEN EXISTS(SELECT 1 FROM effect_local_server_scoped_snapshots
+        WHERE space_id = ${options.spaceId}) THEN 1 ELSE 0 END AS count`
   })
   const countReplicationPages = SqlSchema.findOne({
     Request: Schema.Void,
     Result: CountRow,
     execute: () =>
-      sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_replication_pages AS page
-        WHERE page.space_id = ${options.spaceId}) AS count`
+      sql`SELECT CASE WHEN EXISTS(SELECT 1 FROM effect_local_server_replication_pages AS page
+        WHERE page.space_id = ${options.spaceId}) THEN 1 ELSE 0 END AS count`
   })
   const countReplicationViewEntities = SqlSchema.findOne({
     Request: Schema.Void,
     Result: CountRow,
     execute: () =>
-      sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_replication_view_entities AS entity
-        WHERE entity.space_id = ${options.spaceId}) AS count`
+      sql`SELECT CASE WHEN EXISTS(SELECT 1 FROM effect_local_server_replication_view_entities AS entity
+        WHERE entity.space_id = ${options.spaceId}) THEN 1 ELSE 0 END AS count`
   })
   const countReplicationViews = SqlSchema.findOne({
     Request: Schema.Void,
     Result: CountRow,
     execute: () =>
-      sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_replication_views
-        WHERE space_id = ${options.spaceId}) AS count`
+      sql`SELECT CASE WHEN EXISTS(SELECT 1 FROM effect_local_server_replication_views
+        WHERE space_id = ${options.spaceId}) THEN 1 ELSE 0 END AS count`
   })
   const beginPromotion = SqlSchema.findOneOption({
     Request: Schema.Struct({
@@ -1561,7 +1572,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
       sourceVersion: Identity.SchemaVersion,
       sourceHash: Identity.SchemaHash
     }),
-    Result: Schema.Struct({ schema_generation: Identity.SchemaVersion }),
+    Result: Schema.Struct({ schema_generation: Rows.integer(Identity.SchemaVersion) }),
     execute: ({ expectedGeneration, generation, sourceVersion, sourceHash }) =>
       sql`UPDATE effect_local_server_spaces SET
           schema_version = ${sourceVersion}, schema_hash = ${sourceHash},
@@ -1588,7 +1599,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     Result: EntityBytesRow,
     execute: ({ generation, limit }) =>
       sql`SELECT model, entity_key,
-          length(CAST(entity_key AS BLOB)) + length(CAST(value_json AS BLOB)) AS row_bytes
+          ${dialect.byteLength("entity_key")} + ${dialect.byteLength("value_json")} AS row_bytes
         FROM effect_local_server_entities_data WHERE space_id = ${options.spaceId}
           AND generation = ${generation} ORDER BY model, entity_key LIMIT ${limit}`
   })
@@ -1602,7 +1613,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     Result: EntityBytesRow,
     execute: ({ generation, model, key, limit }) =>
       sql`SELECT model, entity_key,
-          length(CAST(entity_key AS BLOB)) + length(CAST(value_json AS BLOB)) AS row_bytes
+          ${dialect.byteLength("entity_key")} + ${dialect.byteLength("value_json")} AS row_bytes
         FROM effect_local_server_entities_data WHERE space_id = ${options.spaceId}
           AND generation = ${generation} AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
@@ -1633,7 +1644,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     Request: Schema.Number,
     Result: KeyBytesRow,
     execute: (limit) =>
-      sql`SELECT mutation_id, length(CAST(receipt_json AS BLOB)) AS row_bytes
+      sql`SELECT mutation_id, ${dialect.byteLength("receipt_json")} AS row_bytes
         FROM effect_local_server_receipts WHERE space_id = ${options.spaceId}
         ORDER BY mutation_id LIMIT ${limit}`
   })
@@ -1641,7 +1652,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     Request: Schema.Struct({ after: Schema.String, limit: Schema.Number }),
     Result: KeyBytesRow,
     execute: ({ after, limit }) =>
-      sql`SELECT mutation_id, length(CAST(receipt_json AS BLOB)) AS row_bytes
+      sql`SELECT mutation_id, ${dialect.byteLength("receipt_json")} AS row_bytes
         FROM effect_local_server_receipts WHERE space_id = ${options.spaceId} AND mutation_id > ${after}
         ORDER BY mutation_id LIMIT ${limit}`
   })
@@ -1667,7 +1678,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     Request: Schema.Struct({ after: NonNegativeInt, limit: Schema.Number }),
     Result: SequenceBytesRow,
     execute: ({ after, limit }) =>
-      sql`SELECT server_sequence, length(CAST(entry_json AS BLOB)) AS row_bytes
+      sql`SELECT server_sequence, ${dialect.byteLength("entry_json")} AS row_bytes
         FROM effect_local_authoritative_log WHERE space_id = ${options.spaceId}
           AND server_sequence > ${after} ORDER BY server_sequence LIMIT ${limit}`
   })
@@ -1764,7 +1775,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
   })
 
   const validateBatch = Effect.fnUntraced(function*(state: typeof ServerProgressRow.Type) {
-    const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    const meta = yield* lockMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
     const progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
     let expectedActiveGeneration: number = state.generation
     if (
@@ -2049,8 +2060,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupScopedSnapshotEntries") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_scoped_snapshot_entries WHERE rowid IN (
-            SELECT entry.rowid FROM effect_local_server_scoped_snapshot_entries AS entry
+        yield* sql`DELETE FROM effect_local_server_scoped_snapshot_entries WHERE (snapshot_id, ordinal) IN (
+            SELECT entry.snapshot_id, entry.ordinal FROM effect_local_server_scoped_snapshot_entries AS entry
             INNER JOIN effect_local_server_scoped_snapshots AS snapshot
               ON snapshot.snapshot_id = entry.snapshot_id
             WHERE snapshot.space_id = ${options.spaceId}
@@ -2064,8 +2075,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupScopedSnapshots") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_scoped_snapshots WHERE rowid IN (
-            SELECT rowid FROM effect_local_server_scoped_snapshots
+        yield* sql`DELETE FROM effect_local_server_scoped_snapshots WHERE snapshot_id IN (
+            SELECT snapshot_id FROM effect_local_server_scoped_snapshots
             WHERE space_id = ${options.spaceId}
             ORDER BY snapshot_id LIMIT ${batchSize})`
         const remaining = yield* countScopedSnapshots(undefined).pipe(Effect.mapError(StorageUnavailable.make))
@@ -2077,8 +2088,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupReplicationPages") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_replication_pages WHERE rowid IN (
-            SELECT page.rowid FROM effect_local_server_replication_pages AS page
+        yield* sql`DELETE FROM effect_local_server_replication_pages WHERE (space_id, client_id) IN (
+            SELECT page.space_id, page.client_id FROM effect_local_server_replication_pages AS page
             INNER JOIN effect_local_server_replication_views AS view
               ON view.space_id = page.space_id AND view.client_id = page.client_id
             WHERE view.space_id = ${options.spaceId}
@@ -2092,8 +2103,10 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupReplicationViewEntities") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_replication_view_entities WHERE rowid IN (
-            SELECT entity.rowid FROM effect_local_server_replication_view_entities AS entity
+        yield* sql`DELETE FROM effect_local_server_replication_view_entities
+          WHERE (space_id, client_id, view_id, model, entity_key) IN (
+            SELECT entity.space_id, entity.client_id, entity.view_id, entity.model, entity.entity_key
+            FROM effect_local_server_replication_view_entities AS entity
             INNER JOIN effect_local_server_replication_views AS view
               ON view.space_id = entity.space_id AND view.client_id = entity.client_id
             WHERE view.space_id = ${options.spaceId}
@@ -2109,8 +2122,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupReplicationViews") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_replication_views WHERE rowid IN (
-            SELECT rowid FROM effect_local_server_replication_views
+        yield* sql`DELETE FROM effect_local_server_replication_views WHERE (space_id, client_id) IN (
+            SELECT space_id, client_id FROM effect_local_server_replication_views
             WHERE space_id = ${options.spaceId}
             ORDER BY client_id LIMIT ${batchSize})`
         const remaining = yield* countReplicationViews(undefined).pipe(Effect.mapError(StorageUnavailable.make))
@@ -2122,8 +2135,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupEntities") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_entities_data WHERE rowid IN (
-            SELECT rowid FROM effect_local_server_entities_data
+        yield* sql`DELETE FROM effect_local_server_entities_data WHERE (space_id, generation, model, entity_key) IN (
+            SELECT space_id, generation, model, entity_key FROM effect_local_server_entities_data
             WHERE space_id = ${options.spaceId} AND generation = ${state.source_generation}
             ORDER BY model, entity_key LIMIT ${batchSize})`
         const remaining = yield* countEntityGeneration(state.source_generation).pipe(
