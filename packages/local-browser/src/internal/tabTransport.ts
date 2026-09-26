@@ -165,7 +165,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
         end: () => Effect.void,
         clientIds: Effect.sync(() => serverClientIds),
         initialMessage: Effect.succeedNone,
-        supportsAck: true,
+        supportsAck: false,
         supportsTransferables: false,
         supportsSpanPropagation: true,
         supportsNotifications: false,
@@ -239,7 +239,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
             if (request._tag === "Interrupt") requestClients.delete(request.requestId)
             return post(target, { _tag: "ToServer", from: self, message: request })
           }),
-        supportsAck: true,
+        supportsAck: false,
         supportsTransferables: false,
         codecFor: RpcSerialization.json.codecFor
       }
