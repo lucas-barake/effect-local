@@ -34,13 +34,10 @@ import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
-import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
-import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import * as Match from "effect/Match"
 import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
@@ -53,6 +50,7 @@ import * as KeyValueStore from "effect/unstable/persistence/KeyValueStore"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import * as Atom from "effect/unstable/reactivity/Atom"
 import * as Socket from "effect/unstable/socket/Socket"
+import { connecting, connectionChanges } from "./connection.js"
 import { makeFailedMessages, makeSettlementDaemonBody } from "./settlementDaemon.js"
 
 /**
@@ -184,29 +182,6 @@ export type ChatClient = ReturnType<typeof makeClient>
 const windowPage = 50
 const windowLimit = 1_000
 
-export type Connection = "online" | "connecting" | "offline" | "needsAuthentication" | "failed"
-
-const offlineGrace = Duration.seconds(2)
-const online: Connection = "online"
-const connecting: Connection = "connecting"
-const offline: Connection = "offline"
-
-const connectionOf = (
-  status: AsyncResult.AsyncResult<ReplicaStatus.SpaceStatus, unknown>
-): Connection => {
-  if (!AsyncResult.isSuccess(status)) return connecting
-  return Match.value(status.value).pipe(
-    Match.tagsExhaustive({
-      Online: () => online,
-      SchemaUpdateAvailable: () => online,
-      NeedsAuthentication: (): Connection => "needsAuthentication",
-      Failed: (): Connection => "failed",
-      Offline: () => connecting,
-      Connecting: () => connecting
-    })
-  )
-}
-
 const findUserName = (userId: UserId): string => findUser(userId)?.name ?? userId
 
 const mintMessageId = Crypto.Crypto.use((crypto) => crypto.randomUUIDv4).pipe(
@@ -247,21 +222,7 @@ const makeClient = (session: LoginResponse) => {
     return AsyncResult.isSuccess(status) && status.value.synced
   })
 
-  const connectionAtom = Atom.make(
-    (get) =>
-      get.stream(statusAtom).pipe(
-        Stream.map(connectionOf),
-        Stream.changes,
-        Stream.switchMap((connection): Stream.Stream<Connection> => {
-          if (connection !== connecting) return Stream.succeed(connection)
-          return Stream.concat(
-            Stream.succeed(connection),
-            Stream.fromEffect(Effect.sleep(offlineGrace)).pipe(Stream.as(offline))
-          )
-        })
-      ),
-    { initialValue: connecting }
-  )
+  const connectionAtom = Atom.make((get) => connectionChanges(get.stream(statusAtom)), { initialValue: connecting })
 
   const windowSize = Atom.family((_conversationId: ConversationId) => Atom.make(windowPage))
   const loadEarlier = Atom.family((conversationId: ConversationId) =>

@@ -14,6 +14,7 @@ import * as RunnerAddress from "effect/unstable/cluster/RunnerAddress"
 import * as RunnerStorage from "effect/unstable/cluster/RunnerStorage"
 import type * as ShardId from "effect/unstable/cluster/ShardId"
 import type * as lockNames from "./lockNames.js"
+import * as LosslessQueue from "./losslessQueue.js"
 import type * as platform from "./platform.js"
 
 const machineIdCount = 1024
@@ -109,8 +110,8 @@ export const make = Effect.fnUntraced(function*(options: Options) {
 
   const awaitChange = (current: Snapshot) =>
     Effect.raceAll([
-      Queue.take(nudges).pipe(Effect.asVoid),
-      Queue.take(wakes),
+      LosslessQueue.take(nudges).pipe(Effect.asVoid),
+      LosslessQueue.take(wakes),
       Effect.sleep(runnersWaitCap),
       ...current.others.map((host) => options.locks.released(names.runner(host))),
       ...current.othersReady.map((host) => options.locks.released(names.ready(host)))

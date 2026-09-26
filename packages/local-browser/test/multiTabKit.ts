@@ -4,7 +4,7 @@ import * as EffectLayer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Scope from "effect/Scope"
-import * as Stream from "effect/Stream"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as platform from "../src/internal/platform.js"
 
 interface MemoryConnection {
@@ -53,7 +53,7 @@ export const makeMemoryVisibility = (initial: boolean) =>
     const listeners = new Set<() => void>()
     const service: platform.TabVisibilityService = {
       visible: Effect.sync(() => visible),
-      changes: Stream.callback<void>((queue) =>
+      changes: LosslessQueue.callback<void>((queue) =>
         Effect.acquireRelease(
           Effect.sync(() => {
             const listener = () => {

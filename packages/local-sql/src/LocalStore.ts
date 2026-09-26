@@ -31,6 +31,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as ClientMetrics from "./internal/clientMetrics.js"
 import * as Codec from "./internal/codec.js"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
@@ -3661,7 +3662,7 @@ export const layer = (
         )
 
       yield* Effect.uninterruptibleMask((restore) =>
-        restore(Queue.take(commitQueue)).pipe(Effect.flatMap((first) => commitAll([first])))
+        restore(LosslessQueue.take(commitQueue)).pipe(Effect.flatMap((first) => commitAll([first])))
       ).pipe(
         Effect.forever,
         Effect.forkScoped

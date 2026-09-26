@@ -572,6 +572,25 @@ describe("reconciliation workflow", () => {
     Effect.fnUntraced(function*() {
       const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
+      const submitting = yield* Deferred.make<void>()
+      const releaseSubmit = yield* Deferred.make<void>()
+      const layerGatedSync = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
+          submitBatch: (request) =>
+            Deferred.succeed(submitting, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseSubmit)),
+              Effect.andThen(server.admitBatch(request, null))
+            ),
+          discard: (request) => server.discard(request, null),
+          pull: server.pull,
+          bootstrap: server.bootstrap,
+          watch: server.watch
+        })
+      )
 
       const layerRunner = SingleRunner.layer({
         runnerStorage: "sql",
@@ -591,7 +610,7 @@ describe("reconciliation workflow", () => {
       }).pipe(
         Layer.provide(Domain.layerHandlers),
         Layer.provide(database()),
-        Layer.provide(directSync(server)),
+        Layer.provide(layerGatedSync),
         Layer.provideMerge(layerWorkflowEngine)
       )
       const context = yield* Layer.build(layerReplica)
@@ -599,17 +618,15 @@ describe("reconciliation workflow", () => {
       const space = yield* replica.space(spaceId)
 
       const mutation = yield* space.mutate(Domain.PutTodo, Domain.todo("cluster"))
-      const requested = 2
-      const payload = ReconciliationWorkflow.Payload.make({
-        scope: clientHistory.scope,
-        scopeGeneration,
-        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
-        spaceId,
-        clientId,
-        membershipIncarnation: mutation.envelope.membershipIncarnation,
-        generation: requested
-      })
-      yield* ReconciliationWorkflow.make(payload).execute(payload).pipe(Effect.provide(context))
+      yield* Deferred.await(submitting)
+      const settled = yield* space.settlementsFor(Domain.PutTodo, { from: 0 }).pipe(
+        Stream.runHead,
+        Effect.forkChild
+      )
+      yield* Deferred.succeed(releaseSubmit, undefined)
+      const settlement = Option.getOrThrow(yield* Fiber.join(settled)).settlement
+      assert.strictEqual(settlement.pending.envelope.mutationId, mutation.envelope.mutationId)
+      assert.strictEqual(settlement.receipt._tag, "Accepted")
 
       const storedReceipt = yield* space.receipt(Domain.PutTodo, mutation.envelope.mutationId)
       assert.strictEqual(Option.getOrThrow(storedReceipt)._tag, "Accepted")

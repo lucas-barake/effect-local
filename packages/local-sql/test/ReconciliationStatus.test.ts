@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -99,7 +100,108 @@ const layerReconciliation = Reconciler.layerOnePass({ definition: Domain.definit
   Layer.provide(layerDirectSync)
 )
 
+const makeControlledReconciliation = Effect.gen(function*() {
+  const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
+  let remote: "Reachable" | "Unreachable" | "Held" = "Reachable"
+  const pullsHeld = yield* Queue.unbounded<void>()
+  const releasePulls = yield* Deferred.make<void>()
+  const layerControlledSync = Layer.succeed(
+    SyncEngine.SyncEngine,
+    SyncEngine.SyncEngine.of({
+      waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
+      submitBatch: (request) => server.admitBatch(request, null),
+      discard: (request) => server.discard(request, null),
+      pull: (request) =>
+        Effect.suspend(() => {
+          if (remote === "Unreachable") return Effect.fail(new ReplicaError.ServerUnavailable())
+          if (remote === "Held") {
+            return Queue.offer(pullsHeld, undefined).pipe(
+              Effect.andThen(Deferred.await(releasePulls)),
+              Effect.andThen(server.pull(request))
+            )
+          }
+          return server.pull(request)
+        }),
+      bootstrap: server.bootstrap,
+      watch: server.watch
+    })
+  )
+  const reconciliation = Context.get(
+    yield* Layer.build(
+      Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+        Layer.provide(LocalStore.layer(localOptions).pipe(Layer.provide(layerRuntime), Layer.provide(database()))),
+        Layer.provide(layerControlledSync)
+      )
+    ),
+    Reconciler.Reconciliation
+  )
+  const holdNextTurn = Effect.gen(function*() {
+    remote = "Held"
+    const turn = yield* reconciliation.sync.pipe(Effect.forkChild({ startImmediately: true }))
+    yield* Queue.take(pullsHeld)
+    return turn
+  })
+  return {
+    reconciliation,
+    holdNextTurn,
+    releasePulls: Deferred.succeed(releasePulls, undefined),
+    unreachable: Effect.sync(() => {
+      remote = "Unreachable"
+    })
+  }
+})
+
 describe("reconciliation status", () => {
+  it.effect(
+    "keeps reporting Online while a later sync turn is in flight",
+    Effect.fnUntraced(function*() {
+      const controlled = yield* makeControlledReconciliation
+      yield* controlled.reconciliation.sync
+      assert.strictEqual((yield* controlled.reconciliation.status)._tag, "Online")
+
+      const turn = yield* controlled.holdNextTurn
+      assert.strictEqual((yield* controlled.reconciliation.status)._tag, "Online")
+      yield* controlled.releasePulls
+      yield* Fiber.join(turn)
+      assert.strictEqual((yield* controlled.reconciliation.status)._tag, "Online")
+    })
+  )
+
+  it.effect(
+    "keeps reporting Offline through a retry turn until it succeeds",
+    Effect.fnUntraced(function*() {
+      const controlled = yield* makeControlledReconciliation
+      yield* controlled.unreachable
+      yield* controlled.reconciliation.sync.pipe(Effect.exit)
+      assert.strictEqual((yield* controlled.reconciliation.status)._tag, "Offline")
+
+      const turn = yield* controlled.holdNextTurn
+      assert.strictEqual((yield* controlled.reconciliation.status)._tag, "Offline")
+      yield* controlled.releasePulls
+      yield* Fiber.join(turn)
+      assert.strictEqual((yield* controlled.reconciliation.status)._tag, "Online")
+    })
+  )
+
+  it.effect(
+    "ignores a transient watch failure while a sync turn is in flight but not while idle",
+    Effect.fnUntraced(function*() {
+      const controlled = yield* makeControlledReconciliation
+      yield* controlled.reconciliation.sync
+      const turn = yield* controlled.holdNextTurn
+      yield* controlled.reconciliation.watchFailed(new ReplicaError.ServerUnavailable())
+      assert.strictEqual((yield* controlled.reconciliation.status)._tag, "Online")
+      yield* controlled.releasePulls
+      yield* Fiber.join(turn)
+      assert.strictEqual((yield* controlled.reconciliation.status)._tag, "Online")
+
+      yield* controlled.reconciliation.watchFailed(new ReplicaError.ServerUnavailable())
+      assert.strictEqual((yield* controlled.reconciliation.status)._tag, "Offline")
+    })
+  )
+
   it.effect(
     "starts Connecting and reports Online only after its own sync succeeds",
     Effect.fnUntraced(function*() {

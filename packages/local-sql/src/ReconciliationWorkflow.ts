@@ -23,6 +23,7 @@ import * as DurableClock from "effect/unstable/workflow/DurableClock"
 import * as Workflow from "effect/unstable/workflow/Workflow"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
 import * as Configuration from "./internal/configuration.js"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Reconciler from "./Reconciler.js"
 import * as SyncEngine from "./SyncEngine.js"
@@ -567,7 +568,7 @@ const layerSchedulerWithConfiguration = (
       const supervise = Effect.gen(function*() {
         let retryAttempt = 0
         while (true) {
-          yield* Queue.take(wake)
+          yield* LosslessQueue.take(wake)
           yield* awaitAuthenticationChange
           const result = yield* Effect.gen(function*() {
             while (true) {

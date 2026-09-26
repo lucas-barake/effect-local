@@ -5,8 +5,9 @@ import * as EffectLayer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Scope from "effect/Scope"
-import * as Stream from "effect/Stream"
+import type * as Stream from "effect/Stream"
 import { BrowserStorageError } from "../BrowserStorageError.js"
+import * as LosslessQueue from "./losslessQueue.js"
 
 export { BrowserStorageError }
 
@@ -185,7 +186,7 @@ export const layerTabVisibilityDocument: EffectLayer.Layer<TabVisibility> = Effe
   TabVisibility,
   {
     visible: Effect.sync(() => typeof document !== "object" || document.visibilityState !== "hidden"),
-    changes: Stream.callback<void>((queue) => {
+    changes: LosslessQueue.callback<void>((queue) => {
       if (typeof document !== "object") return Queue.offer(queue, undefined)
       const listener = () => {
         Queue.offerUnsafe(queue, undefined)

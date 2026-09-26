@@ -18,6 +18,7 @@ import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as Configuration from "./internal/configuration.js"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 import { backoff } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as SyncEngine from "./SyncEngine.js"
@@ -402,7 +403,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
   }
 
   const worker = Effect.forever(Effect.gen(function*() {
-    const work = yield* Queue.take(queue)
+    const work = yield* LosslessQueue.take(queue)
     const selected = selectWork(work)
     if (selected === undefined) return
     const fiber = yield* FiberMap.run(
@@ -532,6 +533,8 @@ export const layerOnePass = (
       const gate = yield* Semaphore.make(1)
       const status = yield* Ref.make<ReplicaStatus.ReplicaStatus>({ _tag: "Connecting", pending: 0 })
       let syncAttempted = false
+      let syncing = false
+      let failedSinceSyncStarted = false
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
       const setStatus = (value: ReplicaStatus.ReplicaStatus) =>
         Ref.set(status, value).pipe(
@@ -550,7 +553,7 @@ export const layerOnePass = (
                   return [next, next]
                 }
                 if (current._tag === "NeedsAuthentication") return [undefined, current]
-                if (preserveConnecting && current._tag === "Connecting" && isTransientFailure(error)) {
+                if (preserveConnecting && (current._tag === "Connecting" || syncing) && isTransientFailure(error)) {
                   return [undefined, current]
                 }
                 if (
@@ -567,6 +570,7 @@ export const layerOnePass = (
             ).pipe(
               Effect.flatMap((next) => {
                 if (next === undefined) return Effect.void
+                failedSinceSyncStarted = true
                 return local.invalidateStatus.pipe(
                   Effect.andThen(options.onStatusChange?.(next) ?? Effect.void)
                 )
@@ -577,14 +581,19 @@ export const layerOnePass = (
       const failed = (error: ReplicaError.ReplicaError) => reportFailure(error, false)
       const watchFailed = (error: ReplicaError.ReplicaError) => reportFailure(error, true)
       const succeeded = Effect.gen(function*() {
-        if (!syncAttempted) return
-        if ((yield* Ref.get(status))._tag !== "Connecting") return
+        if (!syncAttempted || failedSinceSyncStarted) return
         const pending = yield* local.pendingCount
         const cursor = yield* local.cursor
         const serverSchema = yield* Ref.get(updateAvailable)
+        const current = yield* Ref.get(status)
         if (serverSchema !== undefined) {
+          if (
+            current._tag === "SchemaUpdateAvailable" && current.pending === pending && current.cursor === cursor &&
+            current.serverSchema.version === serverSchema.version && current.serverSchema.hash === serverSchema.hash
+          ) return
           yield* setStatus({ _tag: "SchemaUpdateAvailable", pending, cursor, serverSchema })
         } else {
+          if (current._tag === "Online" && current.pending === pending && current.cursor === cursor) return
           yield* setStatus({ _tag: "Online", pending, cursor })
         }
       })
@@ -780,16 +789,23 @@ export const layerOnePass = (
         }
       })
 
-      const sync = gate.withPermit(Effect.gen(function*() {
-        syncAttempted = true
-        const pending = yield* local.pendingCount
-        yield* setStatus({ _tag: "Connecting", pending })
-        yield* catchUp
-        yield* submitPending
-        yield* catchUp
-        yield* local.settleReceipts
-        yield* succeeded
-      })).pipe(
+      const sync = gate.withPermit(
+        Effect.gen(function*() {
+          syncAttempted = true
+          syncing = true
+          failedSinceSyncStarted = false
+          yield* catchUp
+          yield* submitPending
+          yield* catchUp
+          yield* local.settleReceipts
+          syncing = false
+          yield* succeeded
+        }).pipe(
+          Effect.ensuring(Effect.sync(() => {
+            syncing = false
+          }))
+        )
+      ).pipe(
         Effect.tapError(failed),
         Effect.withSpan("Reconciliation.sync")
       )
@@ -911,7 +927,7 @@ export const layerInMemoryScheduler = (
             )
           }))
         )
-      const worker = Effect.andThen(Queue.take(wake), awaitAuthenticationChange).pipe(
+      const worker = Effect.andThen(LosslessQueue.take(wake), awaitAuthenticationChange).pipe(
         Effect.andThen(remote.transportGeneration),
         Effect.flatMap(turn),
         Effect.forever()

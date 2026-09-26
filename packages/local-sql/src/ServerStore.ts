@@ -31,6 +31,7 @@ import * as AcceptedLog from "./internal/acceptedLog.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Dialect from "./internal/dialect.js"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as OfflineWakeRuntime from "./internal/offlineWake.js"
 import * as ReadAuthorization from "./internal/readAuthorization.js"
 import * as Rows from "./internal/rows.js"
@@ -418,7 +419,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
       )
       yield* refreshMetricDepths
       const metricDepthRefreshRequests = yield* Effect.acquireRelease(Queue.dropping<void>(1), Queue.shutdown)
-      yield* Queue.take(metricDepthRefreshRequests).pipe(
+      yield* LosslessQueue.take(metricDepthRefreshRequests).pipe(
         Effect.andThen(Effect.sleep("10 millis")),
         Effect.andThen(refreshMetricDepths),
         Effect.forever,

@@ -27,6 +27,7 @@ import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import type * as Authentication from "./Authentication.js"
 import { positiveFiniteDurationMillis, reconnectPolicy } from "./internal/configuration.js"
 import { invalidConfiguration } from "./internal/errors.js"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSession from "./ProtocolSession.js"
 import * as Transport from "./Transport.js"
@@ -508,7 +509,7 @@ export const layerFromSession = (
                 }),
                 Effect.ensuring(Fiber.interrupt(acquisition))
               )
-              const messages = Stream.fromQueue(queue).pipe(
+              const messages = LosslessQueue.stream(queue).pipe(
                 Stream.catchReasons(
                   "RpcClientError",
                   {

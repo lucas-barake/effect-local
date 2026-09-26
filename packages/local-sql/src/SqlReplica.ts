@@ -30,6 +30,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
@@ -679,7 +680,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           retrySchedule.sort((left, right) => left.readyAt - right.readyAt)
         }
         if (retrySchedule.length === 0) {
-          return Queue.take(retryQueue).pipe(
+          return LosslessQueue.take(retryQueue).pipe(
             Effect.tap((work) => {
               insert(work)
               return Effect.void
@@ -701,7 +702,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               return enqueueBackground(next.entry, false)
             }
             return Effect.raceAllFirst([
-              Queue.take(retryQueue).pipe(Effect.map((work) => Option.some(work))),
+              LosslessQueue.take(retryQueue).pipe(Effect.map((work) => Option.some(work))),
               Effect.sleep(Duration.millis(next.readyAt - now)).pipe(Effect.as(Option.none<RetryWork>())),
               awaitTransportRetry.pipe(Effect.andThen(releaseTransportRetries), Effect.as(Option.none<RetryWork>()))
             ]).pipe(
@@ -1455,7 +1456,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const status = Ref.get(aggregate)
 
       const backgroundTurn = Effect.gen(function*() {
-        const work = yield* Queue.take(backgroundQueue)
+        const work = yield* LosslessQueue.take(backgroundQueue)
         if (work._tag === "Deactivate") {
           const result = yield* deactivate(work.entry, false, work.runtime, false).pipe(Effect.result)
           if (Result.isFailure(result)) yield* scheduleBackgroundRetry(work.entry, Option.none())

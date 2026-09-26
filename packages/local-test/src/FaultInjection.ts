@@ -8,6 +8,7 @@ import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as SynchronizedRef from "effect/SynchronizedRef"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 
 export interface State {
   readonly online: boolean
@@ -241,15 +242,15 @@ export const layer: Layer.Layer<FaultInjection> = Layer.effect(
         }
       },
       awaitReceiptCommitted: (spaceId) =>
-        queuesFor(spaceId).pipe(Effect.flatMap((queues) => Queue.take(queues.receiptCommitted))),
+        queuesFor(spaceId).pipe(Effect.flatMap((queues) => LosslessQueue.take(queues.receiptCommitted))),
       awaitReceiptDropped: (spaceId) =>
-        queuesFor(spaceId).pipe(Effect.flatMap((queues) => Queue.take(queues.receiptDropped))),
+        queuesFor(spaceId).pipe(Effect.flatMap((queues) => LosslessQueue.take(queues.receiptDropped))),
       awaitReceiptReturned: (spaceId) =>
-        queuesFor(spaceId).pipe(Effect.flatMap((queues) => Queue.take(queues.receiptReturned))),
+        queuesFor(spaceId).pipe(Effect.flatMap((queues) => LosslessQueue.take(queues.receiptReturned))),
       awaitPullCompletedAfterReceipt: (spaceId) =>
-        queuesFor(spaceId).pipe(Effect.flatMap((queues) => Queue.take(queues.pullCompletedAfterReceipt))),
+        queuesFor(spaceId).pipe(Effect.flatMap((queues) => LosslessQueue.take(queues.pullCompletedAfterReceipt))),
       awaitRequestRejectedOffline: (spaceId) =>
-        queuesFor(spaceId).pipe(Effect.flatMap((queues) => Queue.take(queues.requestRejectedOffline)))
+        queuesFor(spaceId).pipe(Effect.flatMap((queues) => LosslessQueue.take(queues.requestRejectedOffline)))
     })
   })
 )

@@ -17,7 +17,8 @@ import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import { useState } from "react"
 import { Avatar } from "./avatar.js"
 import { ChatView } from "./chat.js"
-import { type ChatClient, clientFor, type Connection, logoutAtom } from "./replica.js"
+import type { Connection } from "./connection.js"
+import { type ChatClient, clientFor, logoutAtom } from "./replica.js"
 import { formatTime } from "./time.js"
 
 const conversationPeer = (conversation: Conversation, me: UserId): ChatUser | undefined => {

@@ -735,6 +735,50 @@ describe("BrowserReplica", () => {
   )
 
   it.effect(
+    "reports Connecting, not Offline, to a follower while the new leader's first sync is slow",
+    Effect.fnUntraced(
+      function*() {
+        const pullReleased = yield* Deferred.make<void>()
+        let holdPulls = false
+        const environment = yield* makeEnvironmentWith({
+          pullGate: Effect.suspend(() => {
+            if (holdPulls) return Deferred.await(pullReleased)
+            return Effect.void
+          })
+        })
+        const leader = yield* environment.openTab
+        const follower = yield* environment.openTab
+        const space = yield* settle(follower.replica.space(spaceId))
+        const reactivity = Context.get(follower.context, Reactivity.Reactivity)
+        const observed: Array<string> = []
+        const awaitOnline = reactivity.stream([ReactivityKey.status(spaceId)], space.status).pipe(
+          Stream.tap((status) => Effect.sync(() => observed.push(status._tag))),
+          Stream.filter((status) => status._tag === "Online"),
+          Stream.runHead
+        )
+        yield* settle(space.mutate(PutTodo, { id: "1", title: "before the failover" }))
+        assert.isTrue(Option.isSome(yield* settle(awaitOnline)))
+
+        holdPulls = true
+        yield* settle(Scope.close(leader.scope, Exit.void))
+        yield* settle(space.mutate(PutTodo, { id: "2", title: "after the failover" }))
+        observed.length = 0
+        const online = yield* awaitOnline.pipe(Effect.forkChild({ startImmediately: true }))
+        assert.strictEqual((yield* settle(space.status))._tag, "Connecting")
+        yield* TestClock.adjust("1 minute")
+        assert.strictEqual((yield* settle(space.status))._tag, "Connecting")
+
+        yield* Deferred.succeed(pullReleased, undefined)
+        assert.isTrue(Option.isSome(yield* settle(Fiber.join(online))))
+        assert.notInclude(observed, "Offline")
+        assert.strictEqual(yield* Ref.get(environment.databaseOpens), 2)
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
     "keeps serving the same replica from the follower after the leader tab closes",
     Effect.fnUntraced(
       function*() {

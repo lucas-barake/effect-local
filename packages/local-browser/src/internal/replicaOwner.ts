@@ -15,6 +15,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as InvalidationHub from "./invalidationHub.js"
 import type * as lockNames from "./lockNames.js"
+import * as LosslessQueue from "./losslessQueue.js"
 import type * as platform from "./platform.js"
 import type { OwnerResources } from "./replicaHost.js"
 
@@ -164,7 +165,7 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
 
   const awaitOutranked = Effect.gen(function*() {
     const inbox = yield* announcements.messages
-    const announced = Stream.fromQueue(inbox).pipe(
+    const announced = LosslessQueue.stream(inbox).pipe(
       Stream.mapEffect((raw) =>
         decodeAnnouncement(raw).pipe(
           Effect.as(true),

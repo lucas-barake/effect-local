@@ -12,6 +12,7 @@ import type * as RpcMessage from "effect/unstable/rpc/RpcMessage"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import * as lockNames from "./lockNames.js"
+import * as LosslessQueue from "./losslessQueue.js"
 import type * as platform from "./platform.js"
 
 const RequestId = Schema.Union([Schema.String, Schema.Number])
@@ -187,7 +188,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
   }
 
   const inbox = yield* options.channels.open(names.inbox(self)).pipe(Effect.flatMap((channel) => channel.messages))
-  yield* Queue.take(inbox).pipe(
+  yield* LosslessQueue.take(inbox).pipe(
     Effect.flatMap((raw) =>
       decodeFrame(raw).pipe(
         Effect.flatMap(dispatch),

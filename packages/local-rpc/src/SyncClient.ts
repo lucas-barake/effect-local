@@ -19,6 +19,7 @@ import * as Socket from "effect/unstable/socket/Socket"
 import * as Authentication from "./Authentication.js"
 import * as EphemeralClient from "./EphemeralClient.js"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSocket from "./internal/protocolSocket.js"
 import { hasRemoteDefect } from "./internal/remoteDefect.js"
@@ -411,7 +412,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                     }),
                     Effect.ensuring(Fiber.interrupt(acquisition))
                   )
-                  return Stream.fromQueue(queue).pipe(
+                  return LosslessQueue.stream(queue).pipe(
                     Stream.catchReasons(
                       "RpcClientError",
                       {

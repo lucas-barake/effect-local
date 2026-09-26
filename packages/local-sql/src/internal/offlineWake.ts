@@ -16,6 +16,7 @@ import type * as OfflineWake from "../OfflineWake.js"
 import * as Codec from "./codec.js"
 import * as Configuration from "./configuration.js"
 import * as Dialect from "./dialect.js"
+import * as LosslessQueue from "./losslessQueue.js"
 import * as Rows from "./rows.js"
 import * as StorageUnavailable from "./storageUnavailable.js"
 import * as SqlTransaction from "./transaction.js"
@@ -852,7 +853,7 @@ export const make = Effect.fnUntraced(function*<R,>(
     Effect.forkScoped
   )
 
-  const prompted = Queue.take(prompt)
+  const prompted = LosslessQueue.take(prompt)
   const polled = Effect.sleep(pollIntervalMillis)
   yield* Effect.raceFirst(prompted, polled).pipe(
     Effect.andThen(run),
