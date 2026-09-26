@@ -207,11 +207,6 @@ export const makeServerLayer = (options: ChatServerOptions) => {
   const layerStore = makeLayerStore(layerDatabase)
 
   const layerCluster = SpaceEntity.layer({
-    admissionMailboxCapacity: 64,
-    readMailboxCapacity: 64,
-    watchMailboxCapacity: 64,
-    ephemeralJoinMailboxCapacity: 64,
-    ephemeralCommandMailboxCapacity: 64,
     maximumConcurrentBootstrapAuthorizations: 16,
     maximumConcurrentBootstrapPagesPerSpace: 4,
     maximumConcurrentEphemeralJoinVerificationsPerSpace: 16,

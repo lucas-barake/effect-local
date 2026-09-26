@@ -105,11 +105,6 @@ const layerShardingConfig = ShardingConfig.layer({
 const provideShardingConfig = Effect.provide(layerShardingConfig)
 const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
 const handlerOptions = {
-  admissionMailboxCapacity: 32,
-  readMailboxCapacity: 32,
-  watchMailboxCapacity: 32,
-  ephemeralJoinMailboxCapacity: 32,
-  ephemeralCommandMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 4,
   maximumConcurrentBootstrapPagesPerSpace: 1,
   maximumConcurrentEphemeralJoinVerificationsPerSpace: 4,
@@ -134,6 +129,47 @@ const envelope = (spaceId: Identity.SpaceId) => {
 }
 
 describe("SpaceEntity", () => {
+  it.effect("serves watch, submit and pull of a space from a single resident entity", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const layerCluster = SpaceEntity.layer(handlerOptions).pipe(
+        Layer.provide(layerAssertionVerifier),
+        Layer.provide(layerStore),
+        Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+        Layer.provide(
+          SingleRunner.layer({
+            runnerStorage: "memory",
+            shardingConfig: { maxResidentEntities: 2, entityTerminationTimeout: 0, sendRetryInterval: 100 }
+          }).pipe(Layer.provide(layerDatabase))
+        )
+      )
+      yield* Effect.gen(function*() {
+        const client = yield* SpaceEntity.Client
+        const reader = yield* assertionOf({ subject: "reader" })
+        const watchRequest = {
+          spaceId: spaceA,
+          clientId,
+          schema: definition.schemaIdentity,
+          scope,
+          scopeGeneration,
+          cursor: null
+        }
+        const wakes = yield* Queue.unbounded<Protocol.Wake>()
+        yield* client.watch(spaceA, watchRequest, reader).pipe(
+          Stream.runForEach((wake) => Queue.offer(wakes, wake)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        assert.deepStrictEqual(yield* Queue.take(wakes), { spaceId: spaceA })
+        const submitted = yield* envelope(spaceA)
+        const writer = yield* assertionOf({ subject: "writer" })
+        const receipt = yield* client.submit(spaceA, { envelope: submitted, schema: definition.schemaIdentity }, writer)
+        assert.strictEqual(receipt._tag, "Accepted")
+        const pullA = yield* client.pull(spaceA, { ...watchRequest, limit: 10 }, reader)
+        assert.isTrue("_tag" in pullA)
+        const pullB = yield* client.pull(spaceB, { ...watchRequest, spaceId: spaceB, limit: 10 }, reader)
+        assert.isTrue("_tag" in pullB)
+      }).pipe(Effect.provide(layerCluster))
+    })).pipe(TestClock.withLive, provideShardingConfig, provideNodeCrypto))
+
   it.effect("routes synchronization and ephemera through the split space boundaries", () =>
     Effect.scoped(Effect.gen(function*() {
       const ephemeralReady = yield* Deferred.make<void>()
@@ -155,11 +191,11 @@ describe("SpaceEntity", () => {
         Layer.provide(Layer.succeed(ServerStore.ServerStore, actualStore)),
         Layer.provide(Layer.succeed(EphemeralHub.EphemeralHub, actualEphemeral))
       )
-      const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, layerEntityHandlers)
-      const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerEntityHandlers)
-      const makeWatchClient = yield* Entity.makeTestClient(SpaceEntity.SpaceWatchEntity, layerEntityHandlers)
+      const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerEntityHandlers)
+      const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerEntityHandlers)
+      const makeWatchClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerEntityHandlers)
       const makeEphemeralClient = yield* Entity.makeTestClient(
-        SpaceEntity.SpaceEphemeralJoinEntity,
+        SpaceEntity.Space,
         layerEntityHandlers
       )
       const admissionClient = yield* makeAdmissionClient(spaceA)
@@ -277,19 +313,18 @@ describe("SpaceEntity", () => {
         EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 8 })
       ).pipe(Effect.map(Context.get(EphemeralHub.EphemeralHub)))
       const layerEntityHandlers = SpaceEntity.layerHandlers({
-        ...handlerOptions,
-        ephemeralCommandMailboxCapacity: 1
+        ...handlerOptions
       }).pipe(
         Layer.provide(layerAssertionVerifier),
         Layer.provide(layerStore),
         Layer.provide(Layer.succeed(EphemeralHub.EphemeralHub, actualEphemeral))
       )
       const makeJoinClient = yield* Entity.makeTestClient(
-        SpaceEntity.SpaceEphemeralJoinEntity,
+        SpaceEntity.Space,
         layerEntityHandlers
       )
       const makeCommandClient = yield* Entity.makeTestClient(
-        SpaceEntity.SpaceEphemeralCommandEntity,
+        SpaceEntity.Space,
         layerEntityHandlers
       )
       const joinClient = yield* makeJoinClient(spaceA)
@@ -342,7 +377,6 @@ describe("SpaceEntity", () => {
       )
       const layerEntityHandlers = SpaceEntity.layerHandlers({
         ...handlerOptions,
-        ephemeralJoinMailboxCapacity: 2,
         maximumConcurrentEphemeralJoinVerificationsPerSpace: 1
       }).pipe(
         Layer.provide(layerBlockingVerifier),
@@ -350,7 +384,7 @@ describe("SpaceEntity", () => {
         Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 8 }))
       )
       const makeJoinClient = yield* Entity.makeTestClient(
-        SpaceEntity.SpaceEphemeralJoinEntity,
+        SpaceEntity.Space,
         layerEntityHandlers
       )
       const joinClient = yield* makeJoinClient(spaceA)
@@ -405,10 +439,10 @@ describe("SpaceEntity", () => {
           Layer.provide(layerStore),
           Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }))
         )
-        const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, layerEntityHandlers)
-        const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerEntityHandlers)
+        const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerEntityHandlers)
+        const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerEntityHandlers)
         const makeEphemeralClient = yield* Entity.makeTestClient(
-          SpaceEntity.SpaceEphemeralCommandEntity,
+          SpaceEntity.Space,
           layerEntityHandlers
         )
         const admissionClient = yield* makeAdmissionClient(spaceA)

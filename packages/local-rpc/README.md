@@ -41,11 +41,6 @@ const layerEphemeral = EphemeralHub.layer({
 })
 
 const layerSpace = SpaceEntity.layer({
-  admissionMailboxCapacity: 64,
-  readMailboxCapacity: 64,
-  watchMailboxCapacity: 2_048,
-  ephemeralJoinMailboxCapacity: 1_280,
-  ephemeralCommandMailboxCapacity: 256,
   maximumConcurrentBootstrapAuthorizations: 64,
   maximumConcurrentBootstrapPagesPerSpace: 8,
   maximumConcurrentEphemeralJoinVerificationsPerSpace: 64,

@@ -91,11 +91,6 @@ const layerEphemeralHub = EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1
 const assertion = PrincipalAssertion.PrincipalAssertion.make("fanout-benchmark")
 const layerAssertionVerifier = PrincipalAssertion.layerVerifier(() => Effect.succeed(null))
 const layerCluster = SpaceEntity.layer({
-  admissionMailboxCapacity: 32,
-  readMailboxCapacity: 32,
-  watchMailboxCapacity: 1_024,
-  ephemeralJoinMailboxCapacity: 1_280,
-  ephemeralCommandMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
   maximumConcurrentEphemeralJoinVerificationsPerSpace: 16,

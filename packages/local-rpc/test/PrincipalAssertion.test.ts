@@ -103,11 +103,6 @@ describe("principal assertions", () => {
           return Effect.fail(new ReplicaError.AuthorizationDenied({ reason: "forged assertion" }))
         })
         const layerHandlers = SpaceEntity.layerHandlers({
-          admissionMailboxCapacity: 32,
-          readMailboxCapacity: 32,
-          watchMailboxCapacity: 32,
-          ephemeralJoinMailboxCapacity: 32,
-          ephemeralCommandMailboxCapacity: 32,
           maximumConcurrentBootstrapAuthorizations: 16,
           maximumConcurrentBootstrapPagesPerSpace: 4,
           maximumConcurrentEphemeralJoinVerificationsPerSpace: 16,
@@ -118,7 +113,7 @@ describe("principal assertions", () => {
           Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
           Layer.provide(layerVerifier)
         )
-        const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerLiveHandlers)
+        const makeClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerLiveHandlers)
         const client = yield* makeClient(spaceId)
         const request = Protocol.PullRequest.make({
           spaceId,

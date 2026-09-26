@@ -161,11 +161,6 @@ const serverHistory = {
   migration
 }
 const entityOptions = {
-  admissionMailboxCapacity: 64,
-  readMailboxCapacity: 64,
-  watchMailboxCapacity: 64,
-  ephemeralJoinMailboxCapacity: 64,
-  ephemeralCommandMailboxCapacity: 64,
   maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
   maximumConcurrentEphemeralJoinVerificationsPerSpace: 16,
