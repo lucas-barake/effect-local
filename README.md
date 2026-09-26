@@ -448,7 +448,9 @@ export const layerServer = SyncServer.layer({
 ```
 
 Replace `SingleRunner.layer` with Effect Cluster's runner transport and SQL runner and message storage to run the same
-layer on several processes, and pass one `assertionSecret` to all of them.
+layer on several processes, and pass one `assertionSecret` to all of them. Use NDJSON runner serialization, for
+example `NodeClusterSocket.layer({ serialization: "ndjson" })`: in Effect `4.0.0-rc.117` the default SchemaBinary
+runner serialization breaks volatile streaming entity calls between runners after their first element.
 
 `ServerStore.layer` requires `authorizeAccess`, `authorizeMutation`, and `authorizeRead`. Access authorization runs
 before retry receipt lookup. Mutation admission rejection consumes the client's local sequence and persists an exact

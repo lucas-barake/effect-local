@@ -52,6 +52,13 @@ For one process, provide `SingleRunner.layer`. For several processes, provide Ef
 SQL runner and message storage instead. `SyncServer.layer` itself is the same on every runner. The gateway on any
 runner forwards a request to the runner that owns the space, and the maintenance sweep runs on one runner at a time.
 
+Run the runners' socket transport with NDJSON serialization, for example
+`NodeClusterSocket.layer({ serialization: "ndjson" })`. In Effect `4.0.0-rc.117` the default SchemaBinary runner
+serialization breaks volatile streaming entity calls between runners after their first element, which would stop
+cross-runner watches and presence. `packages/local-rpc/test/MultiRunner.test.ts` runs two real runners over sockets
+with shared SQL storage and covers submit, watch, presence, mismatched assertion secrets, and the maintenance
+singleton.
+
 Requests reach the space entity with a principal assertion signed by HMAC-SHA256. Pass the same `assertionSecret`
 (`Redacted`, at least 32 bytes) to every runner. Without it each process generates its own secret, which is correct
 for a single process and makes cross-runner requests fail with `AuthorizationDenied`.
