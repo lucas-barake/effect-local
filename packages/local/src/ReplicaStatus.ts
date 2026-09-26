@@ -25,12 +25,12 @@ export const ReplicaStatus = Schema.Union([
 export type ReplicaStatus = typeof ReplicaStatus.Type
 
 export const SpaceStatus = Schema.Union([
-  Schema.Struct({ spaceId: Identity.SpaceId, ...Offline.fields }),
-  Schema.Struct({ spaceId: Identity.SpaceId, ...Connecting.fields }),
-  Schema.Struct({ spaceId: Identity.SpaceId, ...Online.fields }),
-  Schema.Struct({ spaceId: Identity.SpaceId, ...SchemaUpdateAvailable.fields }),
-  Schema.Struct({ spaceId: Identity.SpaceId, ...NeedsAuthentication.fields }),
-  Schema.Struct({ spaceId: Identity.SpaceId, ...Failed.fields })
+  Schema.Struct({ spaceId: Identity.SpaceId, synced: Schema.Boolean, ...Offline.fields }),
+  Schema.Struct({ spaceId: Identity.SpaceId, synced: Schema.Boolean, ...Connecting.fields }),
+  Schema.Struct({ spaceId: Identity.SpaceId, synced: Schema.Boolean, ...Online.fields }),
+  Schema.Struct({ spaceId: Identity.SpaceId, synced: Schema.Boolean, ...SchemaUpdateAvailable.fields }),
+  Schema.Struct({ spaceId: Identity.SpaceId, synced: Schema.Boolean, ...NeedsAuthentication.fields }),
+  Schema.Struct({ spaceId: Identity.SpaceId, synced: Schema.Boolean, ...Failed.fields })
 ])
 export type SpaceStatus = typeof SpaceStatus.Type
 

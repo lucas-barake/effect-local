@@ -140,6 +140,7 @@ interface RememberedEntry {
   leaveCompletion: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
   workflowRegistration: ReconciliationWorkflow.RegistrationService | undefined
   summaryStatus: ReplicaStatus.ReplicaStatus
+  synced: boolean
   retryAttempt: number
   retryVersion: number
 }
@@ -159,13 +160,15 @@ const RememberedRow = Schema.Struct({
   space_id: Identity.SpaceId,
   membership_incarnation: Identity.MembershipIncarnation,
   desired_scope_json: Schema.String,
+  replication_view_id: Schema.NullOr(Identity.ReplicationViewId),
   count: Schema.Int
 })
 
 const addressedStatus = (
   spaceId: Identity.SpaceId,
+  synced: boolean,
   status: ReplicaStatus.ReplicaStatus
-): ReplicaStatus.SpaceStatus => ({ spaceId, ...status })
+): ReplicaStatus.SpaceStatus => ({ spaceId, synced, ...status })
 
 type AggregateCounts = ReplicaStatus.Aggregate["counts"]
 type AggregateCategory = keyof AggregateCounts
@@ -384,23 +387,25 @@ const makeLayer = <D extends Definition.Any, R,>(
         Request: Schema.Void,
         Result: RememberedRow,
         execute: () =>
-          sql`SELECT s.space_id, s.membership_incarnation, s.desired_scope_json, COUNT(p.mutation_id) AS count
+          sql`SELECT s.space_id, s.membership_incarnation, s.desired_scope_json, s.replication_view_id,
+            COUNT(p.mutation_id) AS count
           FROM effect_local_client_spaces AS s
           LEFT JOIN effect_local_client_pending_data AS p
             ON p.space_id = s.space_id AND p.schema_generation = s.active_schema_generation
-          GROUP BY s.space_id, s.membership_incarnation, s.desired_scope_json
+          GROUP BY s.space_id, s.membership_incarnation, s.desired_scope_json, s.replication_view_id
           ORDER BY s.space_id`
       })
       const readMembership = SqlSchema.findOneOption({
         Request: Identity.SpaceId,
         Result: RememberedRow,
         execute: (spaceId) =>
-          sql`SELECT s.space_id, s.membership_incarnation, s.desired_scope_json, COUNT(p.mutation_id) AS count
+          sql`SELECT s.space_id, s.membership_incarnation, s.desired_scope_json, s.replication_view_id,
+            COUNT(p.mutation_id) AS count
           FROM effect_local_client_spaces AS s
           LEFT JOIN effect_local_client_pending_data AS p
             ON p.space_id = s.space_id AND p.schema_generation = s.active_schema_generation
           WHERE s.space_id = ${spaceId}
-          GROUP BY s.space_id, s.membership_incarnation, s.desired_scope_json`
+          GROUP BY s.space_id, s.membership_incarnation, s.desired_scope_json, s.replication_view_id`
       })
       const pendingCount = SqlSchema.findOne({
         Request: Identity.SpaceId,
@@ -423,6 +428,13 @@ const makeLayer = <D extends Definition.Any, R,>(
         capacityChanged = yield* Deferred.make<void>()
         yield* Deferred.succeed(previous, undefined)
       })
+
+      const recordReplicationView = (entry: RememberedEntry, installed: boolean) =>
+        Effect.suspend(() => {
+          if (entry.synced === installed) return Effect.void
+          entry.synced = installed
+          return reactivity.invalidate([ReactivityKey.status(entry.spaceId)])
+        })
 
       const publishSettlements = (entry: RememberedEntry) =>
         Effect.suspend(() => {
@@ -463,7 +475,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           ...options,
           scope: entry.replicationScope,
           spaceId,
-          onSettlementsRecorded: publishSettlements(entry)
+          onSettlementsRecorded: publishSettlements(entry),
+          onReplicationView: (installed) => recordReplicationView(entry, installed)
         }).pipe(Layer.provide(layerMutationRuntime))
         const layerQueryExecutor = QueryExecutor.layer(options.definition, spaceId)
         let local: LocalStore.Service
@@ -1177,7 +1190,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             const runtime = entry.runtime
             if (entry.activation === "Active" && runtime !== undefined) {
               return Effect.all([runtime.reconciler.status, runtime.local.pendingCount]).pipe(
-                Effect.map(([status, pending]) => addressedStatus(entry.spaceId, { ...status, pending }))
+                Effect.map(([status, pending]) => addressedStatus(entry.spaceId, entry.synced, { ...status, pending }))
               )
             }
             return pendingCount(entry.spaceId).pipe(
@@ -1200,9 +1213,9 @@ const makeLayer = <D extends Definition.Any, R,>(
               }),
               Effect.map((row) => {
                 if (entry.activation === "Activating") {
-                  return addressedStatus(entry.spaceId, { _tag: "Connecting", pending: row.count })
+                  return addressedStatus(entry.spaceId, entry.synced, { _tag: "Connecting", pending: row.count })
                 }
-                return addressedStatus(entry.spaceId, { _tag: "Offline", pending: row.count })
+                return addressedStatus(entry.spaceId, entry.synced, { _tag: "Offline", pending: row.count })
               })
             )
           })
@@ -1230,6 +1243,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           leaveCompletion: undefined,
           workflowRegistration: undefined,
           summaryStatus: { _tag: "Offline", pending: row.count },
+          synced: row.replication_view_id !== null,
           retryAttempt: 0,
           retryVersion: 0
         }

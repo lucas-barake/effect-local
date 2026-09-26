@@ -57,6 +57,7 @@ export interface Options {
   readonly retainedMutationIds?: number
   readonly migration: Migrations.Options
   readonly onSettlementsRecorded?: Effect.Effect<void>
+  readonly onReplicationView?: (installed: boolean) => Effect.Effect<void>
 }
 
 export interface ReconciliationGenerations {
@@ -2901,9 +2902,11 @@ export const layer = (
         return deletedSettlements
       }, Effect.uninterruptible)
 
+      const reportReplicationView = (installed: boolean) => options.onReplicationView?.(installed) ?? Effect.void
+
       const installBootstrap = (manifest: Protocol.SnapshotManifest) =>
         withProjectionGateThen(installBootstrapInGate(manifest), publishSettlements).pipe(
-          Effect.asVoid,
+          Effect.andThen(reportReplicationView(true)),
           Effect.withSpan("LocalStore.installBootstrap", {
             attributes: { "snapshot.id": manifest.snapshotId, "server.sequence": manifest.sequence }
           })
@@ -3025,6 +3028,7 @@ export const layer = (
         yield* invalidate(entities)
       }).pipe(
         Semaphore.withPermit(projectionGate),
+        Effect.andThen(reportReplicationView(false)),
         Effect.uninterruptible,
         Effect.withSpan("LocalStore.revokeReplication")
       )
@@ -3565,6 +3569,7 @@ export const layer = (
         installBootstrap,
         invalidateStatus: reactivity.invalidate([ReactivityKey.status(options.spaceId)])
       }
+      yield* reportReplicationView(initializedMeta.replication_view_id !== null)
       return Store.of(service)
     })
   )

@@ -170,6 +170,7 @@ interface EnvironmentOptions {
   readonly name?: string
   readonly kit?: testKit.MemoryPlatform
   readonly retryDelay?: BrowserReplica.Options<typeof definition, never, never>["retryDelay"]
+  readonly pullGate?: Effect.Effect<void>
 }
 
 const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: EnvironmentOptions) {
@@ -189,7 +190,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
           return Effect.never
         }),
       discard: (request) => store.discard(request, null),
-      pull: store.pull,
+      pull: (request) => (environmentOptions.pullGate ?? Effect.void).pipe(Effect.andThen(store.pull(request))),
       bootstrap: store.bootstrap,
       watch: store.watch
     }),
@@ -217,7 +218,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
   )
   const openTabWith = Effect.fnUntraced(function*(visible: boolean) {
     const visibility = yield* testKit.makeMemoryVisibility(visible)
-    const layerTab = layerReplicaWith(visibility.service).pipe(Layer.provide(Layer.fresh(Reactivity.layer)))
+    const layerTab = layerReplicaWith(visibility.service).pipe(Layer.provideMerge(Layer.fresh(Reactivity.layer)))
     const scope = yield* Scope.make()
     const context = yield* settle(Layer.buildWithScope(layerTab, scope))
     return { scope, context, replica: Context.get(context, Replica.Replica), visibility }
@@ -281,6 +282,40 @@ const listFrom = (replica: Replica.Service) =>
   replica.space(spaceId).pipe(Effect.flatMap((space) => space.query(ListTodos, undefined)))
 
 describe("BrowserReplica", () => {
+  it.effect(
+    "reports the leader replica's first sync to a follower tab through the synced status",
+    Effect.fnUntraced(
+      function*() {
+        const pullReleased = yield* Deferred.make<void>()
+        const environment = yield* makeEnvironmentWith({ pullGate: Deferred.await(pullReleased) })
+        yield* environment.openTab
+        const follower = yield* environment.openTab
+        const space = yield* settle(follower.replica.space(spaceId))
+        yield* settle(space.activate)
+        const before = yield* settle(space.status)
+        assert.strictEqual(before._tag, "Connecting")
+        assert.strictEqual(before.synced, false)
+
+        const clock = yield* TestClock.adjust("100 millis").pipe(
+          Effect.forever,
+          Effect.forkChild({ startImmediately: true })
+        )
+        const reactivity = Context.get(follower.context, Reactivity.Reactivity)
+        const synced = reactivity.stream([ReactivityKey.status(spaceId)], space.status).pipe(
+          Stream.filter((status) => status.synced),
+          Stream.runHead
+        )
+        const observed = yield* synced.pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.succeed(pullReleased, undefined)
+        const status = yield* Fiber.join(observed)
+        yield* Fiber.interrupt(clock)
+        assert.isTrue(Option.isSome(status))
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
   it.effect(
     "serves a follower tab's mutations and queries from the leader tab's replica",
     Effect.fnUntraced(

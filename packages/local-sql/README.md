@@ -10,6 +10,16 @@ runtimes and `foregroundActiveSpaces` reserves capacity for addressed work. `for
 reserves foreground turns within the total `reconciliationConcurrency`. Active logical watches share the one
 `SyncEngine` and RPC WebSocket.
 
+`Replica.Space.status` reports a `SpaceStatus`. An activated space is `Connecting` until its first sync attempt
+resolves and again while a sync runs. It becomes `Online` once the sync completes, and `Offline` only after an attempt
+failed or the transport reports that it cannot connect. Inactive spaces report `Offline`. Every status carries
+`synced`, which is `true` once the space has an installed replication view, meaning a bootstrap completed at least
+once, and `false` before that. It is read from durable storage, so a synced space stays `synced` after an offline
+reload. It returns to `false` only when the view is cleared: after leaving and rejoining the space, after the server
+revokes read access, or after a schema migration that requires a fresh bootstrap. A scope change keeps the installed
+view until the next bootstrap replaces it. An app can show an empty state when `synced` is `true` and a loading state
+while it is `false`.
+
 `SqlReplica.layerWorkflow` uses the same store, query executor, and idempotent reconciliation pass with finite Effect
 Workflow generations. Local SQLite stores canonical entities, visible entities, pending mutations, bounded terminal
 receipts, a bounded accepted suffix, per space cursors, resumable snapshot staging, and requested and completed

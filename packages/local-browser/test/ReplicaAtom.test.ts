@@ -1019,6 +1019,7 @@ describe("Replica Atom graph", () => {
       )
       const status = yield* AtomRegistry.getResult(registry, graph.status(spaceId))
       assert.strictEqual(status._tag, "Online")
+      assert.strictEqual(status.synced, true)
     })
   )
 
