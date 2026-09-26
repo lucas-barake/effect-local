@@ -78,6 +78,10 @@ export interface SettlementOptions {
   readonly from?: SettlementStart | undefined
 }
 
+export interface MutateOptions {
+  readonly mutationId?: Identity.MutationId | undefined
+}
+
 export const Activation = Schema.Literals(["Inactive", "Activating", "Active", "Deactivating"])
 export type Activation = typeof Activation.Type
 
@@ -90,7 +94,8 @@ export interface Space {
   readonly deactivate: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly mutate: <M extends Mutation.Any,>(
     mutation: M,
-    payload: Mutation.Payload<M>
+    payload: Mutation.Payload<M>,
+    options?: MutateOptions
   ) => Effect.Effect<Protocol.PendingMutation, ReplicaError.ReplicaError | Mutation.Rejection<M>>
   readonly get: <M extends Model.Any,>(
     model: M,

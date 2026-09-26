@@ -854,9 +854,9 @@ const makeLayer = <D extends Definition.Any, R,>(
           }),
           activate: activate(entry, true).pipe(Effect.asVoid),
           deactivate: deactivate(entry, true).pipe(Effect.asVoid),
-          mutate: (mutation, payload) =>
+          mutate: (mutation, payload, mutateOptions) =>
             withActive(entry, (runtime) =>
-              runtime.local.mutate(mutation, payload).pipe(
+              runtime.local.mutate(mutation, payload, mutateOptions).pipe(
                 Effect.tap(() =>
                   runtime.local.pendingCount.pipe(
                     Effect.flatMap((pending) => updatePendingContribution(entry, pending))

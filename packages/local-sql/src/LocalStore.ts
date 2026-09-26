@@ -75,7 +75,8 @@ export interface Service {
   readonly schema: Identity.SchemaIdentity
   readonly mutate: <M extends Mutation.Any,>(
     mutation: M,
-    payload: Mutation.Payload<M>
+    payload: Mutation.Payload<M>,
+    options?: Replica.MutateOptions
   ) => Effect.Effect<Protocol.PendingMutation, ReplicaError.ReplicaError | Mutation.Rejection<M>>
   readonly get: <M extends Model.Any,>(
     model: M,
@@ -497,6 +498,15 @@ export const layer = (
               WHERE space_id = ${options.spaceId} AND schema_generation = ${requestedSchemaGeneration}
                 AND projection_generation = ${projectionGeneration} ORDER BY rowid LIMIT ${limit}`
         }
+      })
+      const findSettledPendingByMutation = SqlSchema.findOneOption({
+        Request: Identity.MutationId,
+        Result: Rows.SettledPendingRow,
+        execute: (mutationId) =>
+          sql`SELECT settled_pending_json FROM effect_local_client_receipts_data
+          WHERE space_id = ${options.spaceId} AND schema_generation = (
+            SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+            AND mutation_id = ${mutationId}`
       })
       const findReceipt = SqlSchema.findOneOption({
         Request: Identity.MutationId,
@@ -3030,10 +3040,45 @@ export const layer = (
         return yield* Effect.void
       })
 
+      const recordedMutation = Effect.fnUntraced(function*<M extends Mutation.Any,>(
+        mutation: M,
+        payloadValue: Mutation.Payload<M>,
+        mutationId: Identity.MutationId
+      ) {
+        const conflict = new ReplicaError.MutationIdentityConflict({ mutationId })
+        const requestedPayload = yield* Codec.encode(mutation.payloadSchema, payloadValue).pipe(
+          Effect.flatMap(Canonical.stringifyEffect)
+        )
+        const sameMutation = Effect.fnUntraced(function*(recorded: Protocol.PendingMutation) {
+          if (recorded.envelope.name !== mutation.name) return false
+          return (yield* Canonical.stringifyEffect(recorded.envelope.payload)) === requestedPayload
+        })
+        const pendingRow = yield* findPendingByMutation(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
+        if (Option.isSome(pendingRow)) {
+          const recordedPending = yield* decodePendingRow(pendingRow.value)
+          if (!(yield* sameMutation(recordedPending))) return yield* conflict
+          return Option.some(recordedPending)
+        }
+        const quarantined = yield* findQuarantineByMutation(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
+        if (Option.isSome(quarantined)) return yield* conflict
+        const settledRow = yield* findSettledPendingByMutation(mutationId).pipe(
+          Effect.mapError(StorageUnavailable.make)
+        )
+        if (Option.isNone(settledRow)) return Option.none<Protocol.PendingMutation>()
+        const snapshot = settledRow.value.settled_pending_json
+        if (snapshot === null) return yield* conflict
+        const settled = yield* Codec.parse(snapshot).pipe(
+          Effect.flatMap((value) => Codec.decode(Protocol.PendingMutation, value))
+        )
+        if (!(yield* sameMutation(settled))) return yield* conflict
+        return Option.some(settled)
+      })
+
       const mutateInTransaction = Effect.fnUntraced(function*<M extends Mutation.Any,>(
         mutation: M,
         payloadValue: Mutation.Payload<M>,
-        replacingQuarantine = false
+        replacingQuarantine = false,
+        requestedMutationId?: Identity.MutationId
       ) {
         const storedMeta = yield* meta
         yield* validateFence(storedMeta)
@@ -3054,7 +3099,8 @@ export const layer = (
             limit: maximumPending
           })
         }
-        const mutationId = yield* Identity.makeMutationId.pipe(Effect.provideService(Crypto.Crypto, crypto))
+        const mutationId = requestedMutationId ??
+          (yield* Identity.makeMutationId.pipe(Effect.provideService(Crypto.Crypto, crypto)))
         const encodedPayload = yield* Codec.encode(mutation.payloadSchema, payloadValue)
         const payloadJsonValue = yield* Schema.decodeUnknownEffect(Schema.Json)(encodedPayload).pipe(
           Effect.mapError((cause) =>
@@ -3229,11 +3275,20 @@ export const layer = (
       const service: Service = {
         membershipIncarnation: initializedMeta.membership_incarnation,
         schema: options.definition.schemaIdentity,
-        mutate: (mutation, payloadValue) =>
+        mutate: (mutation, payloadValue, mutateOptions) =>
           withProjectionGate(Effect.gen(function*() {
-            const result = yield* sql.withTransaction(mutateInTransaction(mutation, payloadValue)).pipe(
+            const requestedMutationId = mutateOptions?.mutationId
+            const result = yield* sql.withTransaction(Effect.gen(function*() {
+              if (requestedMutationId !== undefined) {
+                const recorded = yield* recordedMutation(mutation, payloadValue, requestedMutationId)
+                if (Option.isSome(recorded)) return { pendingMutation: recorded.value, recorded: true }
+              }
+              const created = yield* mutateInTransaction(mutation, payloadValue, false, requestedMutationId)
+              return { pendingMutation: created.pendingMutation, recorded: false }
+            })).pipe(
               Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
             )
+            if (result.recorded) return result.pendingMutation
             yield* updatePendingMetric(1)
             const entities = result.pendingMutation.changes.map((change) => change.entity)
             yield* reactivity.withBatch(invalidate(entities, [], true))

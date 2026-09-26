@@ -144,6 +144,10 @@ export const ReceiptRow = Schema.Struct({
   receipt_json: Schema.String
 })
 
+export const SettledPendingRow = Schema.Struct({
+  settled_pending_json: Schema.NullOr(Schema.String)
+})
+
 export const ServerMetaRow = Schema.Struct({
   definition_hash: Schema.String,
   schema_version: Identity.SchemaVersion,
