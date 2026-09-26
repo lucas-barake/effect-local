@@ -103,7 +103,7 @@ export const layer = <D extends Definition.Any,>(
           }`
         }
         return sql`${sql.literal(quoteIdentifier(model.name))} AS (
-          SELECT entity_key AS "key", value_json AS "value"${projected}
+          SELECT json_extract(entity_key, '$') AS "key", value_json AS "value"${projected}
           FROM effect_local_client_visible_entities_data
           WHERE space_id = ${address.spaceId}
             AND schema_generation = ${address.schemaGeneration}

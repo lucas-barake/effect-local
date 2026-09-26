@@ -65,13 +65,25 @@ const CollidingKeys = Query.make("CollidingKeys", {
   success: Schema.Array(Schema.Struct({ key: Schema.String, embedded: Schema.String }))
 })
 const EmptyModels = Query.make("EmptyModels", { success: Schema.Array(Schema.Number) })
+const TodosByAuthorKey = Query.make("TodosByAuthorKey", {
+  success: Schema.Array(Schema.Struct({ author: Schema.String, todo: Schema.String }))
+})
 const QuotedIds = Query.make("QuotedIds", { success: Schema.Array(Schema.String) })
 
 const definition = Definition.make({
   version: 1,
   models: [Todo, Author, Colliding, Quoted],
   mutations: [PutTodo, PutAuthor, PutColliding, PutQuoted],
-  queries: [CountByAuthor, RecursiveSeries, OwnWith, MissingTable, CollidingKeys, EmptyModels, QuotedIds]
+  queries: [
+    CountByAuthor,
+    RecursiveSeries,
+    OwnWith,
+    MissingTable,
+    CollidingKeys,
+    EmptyModels,
+    QuotedIds,
+    TodosByAuthorKey
+  ]
 })
 
 const layerHandlers = Layer.mergeAll(
@@ -83,6 +95,20 @@ const layerHandlers = Layer.mergeAll(
     transaction.set(Colliding, payload.id, payload).pipe(Effect.as(payload.id))
   ),
   // A join with an aggregate and a subquery across two models, decoded through SqlSchema.
+  TodosByAuthorKey.toLayer(({ query }) =>
+    SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: Schema.Struct({ author: Schema.String, todo: Schema.String }),
+      execute: () =>
+        query.sql([Todo, Author], (sql) =>
+          sql`SELECT a."name" AS author, t."key" AS todo
+            FROM "Author" a
+            JOIN "Todo" t ON t."authorId" = a."key"
+            ORDER BY todo`)
+    })(undefined).pipe(
+      Effect.catchTag("SchemaError", (cause) => Effect.die(cause))
+    )
+  ),
   CountByAuthor.toLayer(({ payload, query }) =>
     SqlSchema.findAll({
       Request: Schema.Void,
@@ -251,12 +277,26 @@ describe("raw SQL queries", () => {
   )
 
   it.effect(
+    "exposes each entity key as its SQL value so a field can be joined to another model's key",
+    Effect.fnUntraced(function*() {
+      const { executor, store } = yield* harness()
+      yield* store.mutate(PutAuthor, { id: "author-1", name: "Ada" })
+      yield* store.mutate(PutTodo, { id: "t1", title: "one", authorId: "author-1", count: 1 })
+      yield* store.mutate(PutTodo, { id: "t2", title: "two", authorId: "author-1", count: 2 })
+      assert.deepStrictEqual(yield* executor.execute(TodosByAuthorKey, undefined), [
+        { author: "Ada", todo: "t1" },
+        { author: "Ada", todo: "t2" }
+      ])
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "keeps the entity key column when a model field is named key",
     Effect.fnUntraced(function*() {
       const { executor, store } = yield* harness()
       yield* store.mutate(PutColliding, { id: "c1", key: "embedded-value" })
       assert.deepStrictEqual(yield* executor.execute(CollidingKeys, undefined), [
-        { key: "\"c1\"", embedded: "embedded-value" }
+        { key: "c1", embedded: "embedded-value" }
       ])
     }, Effect.scoped)
   )
