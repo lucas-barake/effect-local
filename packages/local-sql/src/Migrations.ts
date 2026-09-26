@@ -1319,6 +1319,22 @@ const clientV14 = makeMigration({
   ]
 })
 
+const clientV15 = makeMigration({
+  id: 15,
+  name: "retired-mutation-ids",
+  statements: [
+    `CREATE TABLE effect_local_client_retired_mutations (
+      space_id TEXT NOT NULL,
+      mutation_id TEXT NOT NULL,
+      local_sequence INTEGER NOT NULL,
+      PRIMARY KEY (space_id, mutation_id),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    `CREATE INDEX effect_local_client_retired_mutations_sequence
+      ON effect_local_client_retired_mutations (space_id, local_sequence)`
+  ]
+})
+
 export const clientCatalog = Object.freeze([
   clientV1,
   clientV2,
@@ -1333,7 +1349,8 @@ export const clientCatalog = Object.freeze([
   clientV11,
   clientV12,
   clientV13,
-  clientV14
+  clientV14,
+  clientV15
 ])
 
 const serverV6 = makeMigration({

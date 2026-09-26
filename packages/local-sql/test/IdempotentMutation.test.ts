@@ -67,12 +67,16 @@ const layerDisconnectedSync = Layer.succeed(SyncEngine.SyncEngine, {
   watch: () => Stream.never
 })
 
-const layerReplica = <E,>(layerSync: Layer.Layer<SyncEngine.SyncEngine, E>) =>
+const layerReplica = <E,>(
+  layerSync: Layer.Layer<SyncEngine.SyncEngine, E>,
+  options: { readonly retainedReceipts?: number; readonly retainedMutationIds?: number } = {}
+) =>
   SqlReplica.layer({
     definition: Domain.definition,
     clientId,
     initialSpaces: [spaceId],
-    retryDelay: "10 millis"
+    retryDelay: "10 millis",
+    ...options
   }).pipe(
     Layer.provide(layerSync),
     Layer.provide(Domain.layerHandlers),
@@ -83,6 +87,10 @@ const layerReplica = <E,>(layerSync: Layer.Layer<SyncEngine.SyncEngine, E>) =>
 const space = Replica.Replica.use((replica) => replica.space(spaceId))
 const provideOffline = Effect.provide(layerReplica(layerDisconnectedSync))
 const provideOnline = Effect.provide(layerReplica(layerConnectedSync))
+const provideOnlineWithoutReceipts = Effect.provide(layerReplica(layerConnectedSync, { retainedReceipts: 0 }))
+const provideOnlineWithOneRetiredId = Effect.provide(
+  layerReplica(layerConnectedSync, { retainedReceipts: 0, retainedMutationIds: 1 })
+)
 
 describe("caller-minted mutation ids", () => {
   it.effect(
@@ -124,5 +132,38 @@ describe("caller-minted mutation ids", () => {
       assert.deepStrictEqual(replayed.envelope, first.envelope)
       assert.deepStrictEqual(yield* target.pending, [])
     }, provideOnline)
+  )
+
+  it.effect(
+    "fails with MutationIdentityConflict when the id is reused after its receipt was pruned",
+    Effect.fnUntraced(function*() {
+      const target = yield* space
+      yield* target.mutate(Domain.PutTodo, Domain.todo("todo-1"), { mutationId })
+      yield* target.settlements({ from: 0 }).pipe(Stream.take(1), Stream.runDrain)
+      yield* target.mutate(Domain.PutTodo, Domain.todo("todo-2"))
+      yield* target.settlements({ from: 1 }).pipe(Stream.take(1), Stream.runDrain)
+      const outcome = yield* target.mutate(Domain.PutTodo, Domain.todo("todo-1"), { mutationId }).pipe(
+        Effect.as("executed again" as const),
+        Effect.catchTag("MutationIdentityConflict", () => Effect.succeed("conflict" as const))
+      )
+      assert.strictEqual(outcome, "conflict")
+      assert.deepStrictEqual(yield* target.pending, [])
+    }, provideOnlineWithoutReceipts)
+  )
+
+  it.effect(
+    "accepts a retired id as a new mutation once retainedMutationIds newer mutations were issued",
+    Effect.fnUntraced(function*() {
+      const target = yield* space
+      yield* target.mutate(Domain.PutTodo, Domain.todo("todo-1"), { mutationId })
+      yield* target.settlements({ from: 0 }).pipe(Stream.take(1), Stream.runDrain)
+      yield* target.mutate(Domain.PutTodo, Domain.todo("todo-2"))
+      yield* target.settlements({ from: 1 }).pipe(Stream.take(1), Stream.runDrain)
+      yield* target.mutate(Domain.PutTodo, Domain.todo("todo-3"))
+      yield* target.settlements({ from: 2 }).pipe(Stream.take(1), Stream.runDrain)
+      const replayed = yield* target.mutate(Domain.PutTodo, Domain.todo("todo-1"), { mutationId })
+      assert.strictEqual(replayed.envelope.mutationId, mutationId)
+      assert.strictEqual(replayed.envelope.localSequence, 4)
+    }, provideOnlineWithOneRetiredId)
   )
 })

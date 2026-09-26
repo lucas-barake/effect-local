@@ -61,6 +61,7 @@ export interface Options<D extends Definition.Any,> {
   readonly maximumBootstrapBytes?: number
   readonly maximumBootstrapPageBytes?: number
   readonly maximumSettlementSnapshotBytes?: number
+  readonly retainedMutationIds?: number
   readonly migration?: Migrations.Options
   readonly pageSize?: number
   readonly reconciliationConcurrency?: number

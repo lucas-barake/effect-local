@@ -54,6 +54,7 @@ export interface Options {
   readonly maximumBootstrapBytes: number
   readonly maximumBootstrapPageBytes: number
   readonly maximumSettlementSnapshotBytes?: number
+  readonly retainedMutationIds?: number
   readonly migration: Migrations.Options
 }
 
@@ -156,6 +157,8 @@ export interface Service {
 
 export class Store extends Context.Service<Store, Service>()("@lucas-barake/effect-local-sql/LocalStore") {}
 
+const defaultRetainedMutationIds = 100_000
+
 export const layer = (
   options: Options
 ): Layer.Layer<
@@ -191,6 +194,13 @@ export const layer = (
         return yield* new ReplicaError.InvalidConfiguration({
           option: "maximumSettlementSnapshotBytes",
           message: "maximumSettlementSnapshotBytes must be a positive safe integer"
+        })
+      }
+      const retainedMutationIds = options.retainedMutationIds ?? defaultRetainedMutationIds
+      if (!Number.isSafeInteger(retainedMutationIds) || retainedMutationIds <= 0) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "retainedMutationIds",
+          message: "retainedMutationIds must be a positive safe integer"
         })
       }
       if (!Number.isSafeInteger(options.retainedReceipts) || options.retainedReceipts < 0) {
@@ -510,6 +520,13 @@ export const layer = (
           WHERE space_id = ${options.spaceId} AND schema_generation = (
             SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
             AND mutation_id = ${mutationId}`
+      })
+      const findRetiredMutation = SqlSchema.findOneOption({
+        Request: Identity.MutationId,
+        Result: Schema.Struct({ local_sequence: Identity.LocalSequence }),
+        execute: (mutationId) =>
+          sql`SELECT local_sequence FROM effect_local_client_retired_mutations
+          WHERE space_id = ${options.spaceId} AND mutation_id = ${mutationId}`
       })
       const findReceipt = SqlSchema.findOneOption({
         Request: Identity.MutationId,
@@ -1865,10 +1882,19 @@ export const layer = (
         }
         for (let offset = 0; offset < rows.length; offset += 500) {
           const mutationIds = rows.slice(offset, offset + 500).map((row) => row.mutation_id)
+          yield* sql`INSERT INTO effect_local_client_retired_mutations (space_id, mutation_id, local_sequence)
+              SELECT space_id, mutation_id, local_sequence FROM effect_local_client_receipts_data
+              WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
+                AND mutation_id IN ${sql.in(mutationIds)}
+              ON CONFLICT (space_id, mutation_id) DO NOTHING`
           yield* sql`DELETE FROM effect_local_client_receipts_data
               WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
                 AND mutation_id IN ${sql.in(mutationIds)}`
         }
+        yield* sql`DELETE FROM effect_local_client_retired_mutations
+            WHERE space_id = ${options.spaceId} AND local_sequence < (
+              SELECT next_local_sequence FROM effect_local_client_spaces WHERE space_id = ${options.spaceId}
+            ) - ${retainedMutationIds}`
         let prunedThrough = 0
         const prunedByName = new Map<string, number>()
         for (const row of rows) {
@@ -3067,7 +3093,11 @@ export const layer = (
         const settledRow = yield* findSettledPendingByMutation(mutationId).pipe(
           Effect.mapError(StorageUnavailable.make)
         )
-        if (Option.isNone(settledRow)) return Option.none<Protocol.PendingMutation>()
+        if (Option.isNone(settledRow)) {
+          const retired = yield* findRetiredMutation(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
+          if (Option.isSome(retired)) return yield* conflict
+          return Option.none<Protocol.PendingMutation>()
+        }
         const snapshot = settledRow.value.settled_pending_json
         if (snapshot === null) return yield* conflict
         const settled = yield* Codec.parse(snapshot).pipe(
