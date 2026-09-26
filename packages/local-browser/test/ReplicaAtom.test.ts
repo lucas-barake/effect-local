@@ -208,6 +208,34 @@ const layerReplica = Layer.merge(
   layerEphemeralInactive
 )
 
+const layerReplicaWithHeldQuery = (probe: {
+  readonly armed: Ref.Ref<boolean>
+  readonly entered: Deferred.Deferred<void>
+  readonly release: Deferred.Deferred<void>
+}) =>
+  Layer.effectContext(Effect.gen(function*() {
+    const context = yield* Layer.build(layerReplica)
+    const replica = Context.get(context, Replica.Replica)
+    const holdResult = Ref.getAndSet(probe.armed, false).pipe(
+      Effect.flatMap((armed) => {
+        if (!armed) return Effect.void
+        return Deferred.succeed(probe.entered, undefined).pipe(Effect.andThen(Deferred.await(probe.release)))
+      })
+    )
+    return Context.add(
+      context,
+      Replica.Replica,
+      Replica.Replica.of({
+        ...replica,
+        space: (id) =>
+          replica.space(id).pipe(Effect.map((space) => ({
+            ...space,
+            query: (query, payload) => space.query(query, payload).pipe(Effect.tap(() => holdResult))
+          })))
+      })
+    )
+  }))
+
 const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) => {
   const layerFaults = FaultInjection.layer.pipe(
     Layer.tap((context) => Deferred.succeed(faultsReady, Context.get(context, FaultInjection.FaultInjection)))
@@ -749,6 +777,38 @@ describe("Replica Atom graph", () => {
       assert.isAtLeast(rangeReads.get("a:m") ?? 0, 2)
       assert.isAtLeast(rangeReads.get("n:z") ?? 0, 2)
     })
+  )
+
+  it.effect(
+    "publishes a query result outdated by an invalidation during its run as waiting",
+    Effect.fnUntraced(function*() {
+      const probe = {
+        armed: yield* Ref.make(true),
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>()
+      }
+      const graph = ReplicaAtom.make(layerReplicaWithHeldQuery(probe))
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const todos = graph.query(spaceId, ListTodos)(undefined)
+      const mutation = graph.mutation(spaceId, PutTodo)
+      const unmountTodos = registry.mount(todos)
+      const unmountMutation = registry.mount(mutation)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountMutation()
+          unmountTodos()
+        })
+      )
+      yield* Deferred.await(probe.entered)
+      registry.set(mutation, { id: "held", title: "written during the read" })
+      yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      const firstSettled = yield* AtomRegistry.getResult(registry, todos, { suspendOnWaiting: true }).pipe(
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Deferred.succeed(probe.release, undefined)
+      assert.deepStrictEqual(yield* Fiber.join(firstSettled), [{ id: "held", title: "written during the read" }])
+    }, Effect.scoped)
   )
 
   it.effect(

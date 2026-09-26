@@ -403,8 +403,11 @@ describe("BrowserReplica", () => {
         yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
         const runIndex = graph.query(spaceId, RunIndex)(undefined)
         const shown: Array<number> = []
+        const settled: Array<number> = []
         const unsubscribe = registry.subscribe(runIndex, (result) => {
-          if (AsyncResult.isSuccess(result) && !result.waiting) shown.push(result.value)
+          if (!AsyncResult.isSuccess(result)) return
+          if (shown.at(-1) !== result.value) shown.push(result.value)
+          if (!result.waiting) settled.push(result.value)
         }, { immediate: true })
         yield* Effect.addFinalizer(() => Effect.sync(unsubscribe))
         const reactivityAtom = graph.runtime.atom(Effect.service(Reactivity.Reactivity))
@@ -419,6 +422,7 @@ describe("BrowserReplica", () => {
         yield* Deferred.succeed(yield* settle(Queue.take(started)), undefined)
         assert.strictEqual(yield* settle(AtomRegistry.getResult(registry, runIndex, { suspendOnWaiting: true })), 3)
         assert.deepStrictEqual(shown, [1, 2, 3])
+        assert.deepStrictEqual(settled, [1, 3])
       },
       Effect.scoped,
       provideFileSystem

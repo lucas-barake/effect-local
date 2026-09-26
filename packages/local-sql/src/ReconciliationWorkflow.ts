@@ -716,7 +716,13 @@ const layerSchedulerWithConfiguration = (
         }
         yield* Fiber.join(supervisorInterruption)
       })
-      return Reconciler.Reconciler.of({ sync: reconciliation.sync, notify, status: reconciliation.status, shutdown })
+      return Reconciler.Reconciler.of({
+        sync: reconciliation.sync,
+        notify,
+        schedule: notify,
+        status: reconciliation.status,
+        shutdown
+      })
     })
   )
 

@@ -12,11 +12,14 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
+import * as Queue from "effect/Queue"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
@@ -58,6 +61,7 @@ export interface Options {
   readonly migration: Migrations.Options
   readonly onSettlementsRecorded?: Effect.Effect<void>
   readonly onReplicationView?: (installed: boolean) => Effect.Effect<void>
+  readonly onMutationsCommitted?: (pending: number) => Effect.Effect<void, ReplicaError.ReplicaError>
 }
 
 export interface ReconciliationGenerations {
@@ -162,6 +166,26 @@ export interface Service {
 }
 
 export class Store extends Context.Service<Store, Service>()("@lucas-barake/effect-local-sql/LocalStore") {}
+
+interface CreatedMutation {
+  readonly pendingMutation: Protocol.PendingMutation
+  readonly pending: number
+}
+
+interface AppliedMutation {
+  readonly created: Option.Option<CreatedMutation>
+  readonly succeeded: boolean
+  readonly abort: Option.Option<unknown>
+  readonly settle: Effect.Effect<void>
+}
+
+interface QueuedMutation {
+  readonly apply: Effect.Effect<AppliedMutation>
+  readonly fail: (cause: Cause.Cause<ReplicaError.ReplicaError>) => Effect.Effect<void>
+  withdrawn: boolean
+}
+
+const maximumCommitBatch = 32
 
 const defaultRetainedMutationIds = 100_000
 
@@ -438,6 +462,67 @@ export const layer = (
             SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
             AND local_sequence > ${after}
           ORDER BY local_sequence LIMIT ${limit}`
+      })
+      const findProjectionPendingBatch = SqlSchema.findAll({
+        Request: Schema.Struct({ after: Schema.Int, limit: Schema.Int }),
+        Result: Schema.Struct({
+          membership_incarnation: Identity.MembershipIncarnation,
+          mutation_id: Identity.MutationId,
+          local_sequence: Identity.LocalSequence,
+          name: Schema.String,
+          changes_json: Schema.String,
+          replayable: Schema.Literals([0, 1]),
+          receipt_json: Schema.NullOr(Schema.String)
+        }),
+        execute: ({ after, limit }) =>
+          sql`SELECT p.membership_incarnation, p.mutation_id, p.local_sequence, p.name, p.changes_json, r.receipt_json,
+            CASE WHEN p.submission_state <> 'AwaitingReceipt' AND NOT EXISTS (
+              SELECT 1 FROM effect_local_server_log AS l
+              WHERE l.space_id = ${options.spaceId} AND l.mutation_id = p.mutation_id
+            ) THEN 1 ELSE 0 END AS replayable
+          FROM effect_local_client_pending_data AS p
+          LEFT JOIN effect_local_client_receipts_data AS r
+            ON r.space_id = p.space_id AND r.schema_generation = p.schema_generation
+              AND r.mutation_id = p.mutation_id
+          WHERE p.space_id = ${options.spaceId} AND p.schema_generation = (
+            SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})
+            AND p.local_sequence > ${after}
+          ORDER BY p.local_sequence LIMIT ${limit}`
+      })
+      const countRetracted = SqlSchema.findOne({
+        Request: Schema.Struct({ identities: Schema.String, schemaGeneration: Schema.Int }),
+        Result: Schema.Struct({ count: Schema.Number }),
+        execute: ({ identities, schemaGeneration }) =>
+          sql`SELECT COUNT(*) AS count FROM json_each(${identities}) AS requested
+          JOIN effect_local_client_retractions AS r
+            ON r.space_id = ${options.spaceId} AND r.generation = ${schemaGeneration}
+              AND r.model = json_extract(requested.value, '$.model')
+              AND r.entity_key = json_extract(requested.value, '$.key')`
+      })
+      const countProjectionDivergence = SqlSchema.findOne({
+        Request: Schema.Struct({
+          identities: Schema.String,
+          schemaGeneration: Schema.Int,
+          projectionGeneration: Schema.Int
+        }),
+        Result: Schema.Struct({ count: Schema.Number }),
+        execute: ({ identities, schemaGeneration, projectionGeneration }) =>
+          sql`SELECT COUNT(*) AS count FROM json_each(${identities}) AS requested
+          LEFT JOIN effect_local_client_canonical_entities_data AS c
+            ON c.space_id = ${options.spaceId} AND c.schema_generation = ${schemaGeneration}
+              AND c.model = json_extract(requested.value, '$.model')
+              AND c.entity_key = json_extract(requested.value, '$.key')
+              AND NOT EXISTS (
+                SELECT 1 FROM effect_local_client_retractions AS r
+                WHERE r.space_id = c.space_id AND r.generation = c.schema_generation
+                  AND r.model = c.model AND r.entity_key = c.entity_key
+              )
+          LEFT JOIN effect_local_client_visible_entities_data AS v
+            ON v.space_id = ${options.spaceId} AND v.schema_generation = ${schemaGeneration}
+              AND v.projection_generation = ${projectionGeneration}
+              AND v.model = json_extract(requested.value, '$.model')
+              AND v.entity_key = json_extract(requested.value, '$.key')
+          WHERE c.value_json IS NOT v.value_json OR c.model_version IS NOT v.model_version`
       })
       const deletePendingByMutationIds = SqlSchema.findAll({
         Request: Schema.Array(Identity.MutationId),
@@ -1426,6 +1511,38 @@ export const layer = (
         return target
       })
 
+      const receiptMatchesPendingRow = (
+        receipt: Protocol.Receipt,
+        row: {
+          readonly membership_incarnation: Identity.MembershipIncarnation
+          readonly mutation_id: Identity.MutationId
+          readonly local_sequence: Identity.LocalSequence
+          readonly name: string
+        }
+      ) =>
+        receipt.spaceId === options.spaceId &&
+        receipt.clientId === options.clientId &&
+        receipt.membershipIncarnation === row.membership_incarnation &&
+        receipt.mutationId === row.mutation_id &&
+        receipt.localSequence === row.local_sequence &&
+        (receipt._tag === "Legacy" || receipt.name === row.name)
+
+      const receiptTerminallyReady = (receipt: Protocol.Receipt, installed: typeof Rows.ClientMetaRow.Type) => {
+        if (receipt._tag === "Accepted") {
+          return receipt.serverSequence <= installed.server_cursor ||
+            (installed.installed_snapshot_id !== null &&
+              receipt.serverSequence <= installed.installed_snapshot_sequence &&
+              (receipt.terminalSequence === undefined ||
+                receipt.terminalSequence <= installed.installed_snapshot_terminal_sequence))
+        }
+        if (receipt._tag === "Expired") {
+          return installed.installed_snapshot_id !== null &&
+            receipt.snapshotSequence <= installed.installed_snapshot_sequence &&
+            receipt.terminalSequenceThrough <= installed.installed_snapshot_terminal_sequence
+        }
+        return true
+      }
+
       const replayPendingRow = Effect.fnUntraced(function*(
         row: typeof Rows.PendingRow.Type & { readonly receipt_json: string | null },
         replaySchemaGeneration: number,
@@ -1437,31 +1554,12 @@ export const layer = (
           const receipt = yield* Codec.parse(row.receipt_json).pipe(
             Effect.flatMap((value) => Codec.decode(Protocol.Receipt, value))
           )
-          if (
-            receipt.spaceId !== item.envelope.spaceId ||
-            receipt.clientId !== item.envelope.clientId ||
-            receipt.membershipIncarnation !== item.envelope.membershipIncarnation ||
-            receipt.mutationId !== item.envelope.mutationId ||
-            receipt.localSequence !== item.envelope.localSequence ||
-            (receipt._tag !== "Legacy" && receipt.name !== item.envelope.name)
-          ) {
+          if (!receiptMatchesPendingRow(receipt, row)) {
             yield* new ReplicaError.ProtocolInvalid({
               message: `Receipt does not match pending mutation ${item.envelope.mutationId}`
             })
           }
-          let terminallyReady = receipt._tag !== "Accepted" && receipt._tag !== "Expired"
-          if (receipt._tag === "Accepted") {
-            terminallyReady = receipt.serverSequence <= installed.server_cursor ||
-              (installed.installed_snapshot_id !== null &&
-                receipt.serverSequence <= installed.installed_snapshot_sequence &&
-                (receipt.terminalSequence === undefined ||
-                  receipt.terminalSequence <= installed.installed_snapshot_terminal_sequence))
-          } else if (receipt._tag === "Expired") {
-            terminallyReady = installed.installed_snapshot_id !== null &&
-              receipt.snapshotSequence <= installed.installed_snapshot_sequence &&
-              receipt.terminalSequenceThrough <= installed.installed_snapshot_terminal_sequence
-          }
-          if (terminallyReady) {
+          if (receiptTerminallyReady(receipt, installed)) {
             const settled: ReadonlyArray<Protocol.EntityChange> = []
             return settled
           }
@@ -1757,6 +1855,66 @@ export const layer = (
         }
       })
 
+      const projectionMatchesReplay = Effect.fnUntraced(function*(
+        current: typeof Rows.ClientMetaRow.Type,
+        dirty: ReadonlyMap<string, { readonly model: string; readonly entityKey: string }>
+      ) {
+        let replayedSeen = false
+        const replayedIdentities = new Map<string, { readonly model: string; readonly entityKey: string }>()
+        let after = 0
+        while (true) {
+          const batch = yield* findProjectionPendingBatch({ after, limit: projectionReplayBatchSize }).pipe(
+            Effect.mapError(StorageUnavailable.make)
+          )
+          if (batch.length === 0) break
+          for (const row of batch) {
+            let dropped = row.replayable === 0
+            if (!dropped && row.receipt_json !== null) {
+              const receipt = yield* Codec.parse(row.receipt_json).pipe(
+                Effect.flatMap((value) => Codec.decode(Protocol.Receipt, value))
+              )
+              if (!receiptMatchesPendingRow(receipt, row)) return false
+              dropped = receiptTerminallyReady(receipt, current)
+            }
+            if (dropped && replayedSeen) return false
+            if (!dropped) replayedSeen = true
+            const changes = yield* Codec.parse(row.changes_json).pipe(
+              Effect.flatMap((value) => Codec.decode(Schema.Array(Protocol.EntityChange), value))
+            )
+            for (const change of changes) {
+              const entityKey = yield* Codec.stringify(change.entity.key)
+              const identity = `${change.entity.model}\u0000${entityKey}`
+              if (dropped !== dirty.has(identity)) return false
+              if (!dropped) replayedIdentities.set(identity, { model: change.entity.model, entityKey })
+            }
+          }
+          after = batch[batch.length - 1].local_sequence
+          if (batch.length < projectionReplayBatchSize) break
+        }
+        const replayed = [...replayedIdentities.values()]
+        for (let offset = 0; offset < replayed.length; offset += 100) {
+          const retracted = yield* countRetracted({
+            identities: yield* Codec.stringify(
+              replayed.slice(offset, offset + 100).map((entity) => ({ model: entity.model, key: entity.entityKey }))
+            ),
+            schemaGeneration: current.active_schema_generation
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+          if (retracted.count > 0) return false
+        }
+        const identities = [...dirty.values()]
+        for (let offset = 0; offset < identities.length; offset += 100) {
+          const divergence = yield* countProjectionDivergence({
+            identities: yield* Codec.stringify(
+              identities.slice(offset, offset + 100).map((entity) => ({ model: entity.model, key: entity.entityKey }))
+            ),
+            schemaGeneration: current.active_schema_generation,
+            projectionGeneration: current.active_projection_generation
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+          if (divergence.count > 0) return false
+        }
+        return true
+      })
+
       const applyProjectionDeltaInGate = sql.withTransaction(Effect.gen(function*() {
         const current = yield* meta
         yield* validateFence(current)
@@ -1782,6 +1940,12 @@ export const layer = (
             key: yield* Codec.parse(row.entity_key)
           })
           record(entity, row.entity_key)
+        }
+        if (yield* projectionMatchesReplay(current, touched)) {
+          yield* sql`DELETE FROM effect_local_client_projection_dirty
+            WHERE space_id = ${options.spaceId} AND schema_generation = ${replaySchemaGeneration}`
+          const unchanged: ReadonlyArray<Protocol.EntityKey> = []
+          return Option.some({ entities: unchanged })
         }
         let after = 0
         while (true) {
@@ -3221,7 +3385,7 @@ export const layer = (
                 visible_revision = visible_revision + 1,
                 requested_generation = requested_generation + 1
             WHERE space_id = ${options.spaceId}`
-        return { pendingMutation }
+        return { pendingMutation, pending: pendingCount.count + 1 }
       })
 
       const ensureQuarantineResubmission = <M extends Mutation.Any,>(
@@ -3326,34 +3490,195 @@ export const layer = (
           )
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
+      let admittedCommits = 0
+      let releasedCommits = 0
+      const commitBarriers: Array<{ readonly target: number; readonly reached: Deferred.Deferred<void> }> = []
+      const releaseCommits = (count: number) => {
+        releasedCommits += count
+        let barrier = commitBarriers.at(0)
+        while (barrier !== undefined && barrier.target <= releasedCommits) {
+          commitBarriers.shift()
+          Deferred.doneUnsafe(barrier.reached, Exit.void)
+          barrier = commitBarriers.at(0)
+        }
+      }
+      const afterLocalCommits = <A, E extends Mutation.TaggedError, R,>(effect: Effect.Effect<A, E, R>) =>
+        Effect.suspend(() => {
+          if (releasedCommits >= admittedCommits) return effect
+          const reached = Deferred.makeUnsafe<void>()
+          commitBarriers.push({ target: admittedCommits, reached })
+          return Effect.andThen(Deferred.await(reached), effect)
+        })
+      const settleRequest = (effect: Effect.Effect<void>) =>
+        Effect.ensuring(effect, Effect.sync(() => releaseCommits(1)))
+
+      const abandon = (request: QueuedMutation) => {
+        const unavailable = Cause.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
+        return settleRequest(request.fail(unavailable))
+      }
+
+      const commitQueue = yield* Effect.acquireRelease(
+        Queue.unbounded<QueuedMutation>(),
+        (queue) =>
+          Queue.clear(queue).pipe(
+            Effect.flatMap(Effect.forEach(abandon, { discard: true })),
+            Effect.andThen(Queue.shutdown(queue))
+          )
+      )
+
+      const commitBatch = Effect.fnUntraced(function*(initial: ReadonlyArray<QueuedMutation>) {
+        const claimed: Array<QueuedMutation> = []
+        const claim = (request: QueuedMutation) => {
+          if (request.withdrawn) releaseCommits(1)
+          else claimed.push(request)
+        }
+        for (const request of initial) claim(request)
+        if (claimed.length === 0) return []
+        let aborted: { readonly index: number; readonly outcome: AppliedMutation } | undefined
+        const exit = yield* withProjectionGate(Effect.gen(function*() {
+          const committed = yield* sql.withTransaction(Effect.gen(function*() {
+            while (claimed.length < maximumCommitBatch) {
+              const next = yield* Queue.poll(commitQueue)
+              if (Option.isNone(next)) break
+              claim(next.value)
+            }
+            yield* Effect.annotateCurrentSpan({ "mutation.count": claimed.length })
+            const applied: Array<AppliedMutation> = []
+            for (const [index, request] of claimed.entries()) {
+              const outcome = yield* request.apply
+              if (Option.isSome(outcome.abort)) {
+                aborted = { index, outcome }
+                return yield* Effect.die(outcome.abort.value)
+              }
+              applied.push(outcome)
+            }
+            const created = applied.flatMap((item) => Option.toArray(item.created))
+            let pendingAfter = created.at(-1)?.pending
+            if (pendingAfter === undefined && applied.some((item) => item.succeeded)) {
+              pendingAfter = (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
+            }
+            return { applied, created, pending: pendingAfter }
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          if (committed.created.length > 0) {
+            yield* updatePendingMetric(committed.created.length)
+            const entities = committed.created.flatMap((created) =>
+              created.pendingMutation.changes.map((change) => change.entity)
+            )
+            yield* reactivity.withBatch(invalidate(entities, [], true))
+          }
+          if (committed.pending !== undefined && options.onMutationsCommitted !== undefined) {
+            yield* options.onMutationsCommitted(committed.pending).pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("Committed local mutations could not schedule reconciliation").pipe(
+                  Effect.annotateLogs({ error: error._tag, "space.id": options.spaceId })
+                )
+              )
+            )
+          }
+          return committed.applied
+        })).pipe(
+          Effect.withSpan("LocalStore.commitMutations", {
+            attributes: { "space.id": options.spaceId, "client.id": options.clientId }
+          }),
+          Effect.exit
+        )
+        if (Exit.isSuccess(exit)) {
+          yield* Effect.forEach(exit.value, (item) => settleRequest(item.settle), { discard: true })
+          return []
+        }
+        if (aborted !== undefined) {
+          const culprit = aborted
+          yield* settleRequest(culprit.outcome.settle)
+          return claimed.filter((_, index) => index !== culprit.index)
+        }
+        yield* Effect.forEach(claimed, (request) => settleRequest(request.fail(exit.cause)), { discard: true })
+        return []
+      })
+
+      const commitAll = (batch: ReadonlyArray<QueuedMutation>): Effect.Effect<void> =>
+        commitBatch(batch).pipe(
+          Effect.flatMap((carried) => {
+            if (carried.length === 0) return Effect.void
+            return commitAll(carried)
+          })
+        )
+
+      yield* Effect.uninterruptibleMask((restore) =>
+        restore(Queue.take(commitQueue)).pipe(Effect.flatMap((first) => commitAll([first])))
+      ).pipe(
+        Effect.forever,
+        Effect.forkScoped
+      )
+
+      const mutate = Effect.fn("LocalStore.mutate")(function*<M extends Mutation.Any,>(
+        mutation: M,
+        payloadValue: Mutation.Payload<M>,
+        mutateOptions?: Replica.MutateOptions
+      ) {
+        yield* Effect.annotateCurrentSpan({
+          "mutation.name": mutation.name,
+          "space.id": options.spaceId,
+          "client.id": options.clientId
+        })
+        const result = yield* Deferred.make<
+          Protocol.PendingMutation,
+          ReplicaError.ReplicaError | Mutation.Rejection<M>
+        >()
+        const requestedMutationId = mutateOptions?.mutationId
+        const request: QueuedMutation = {
+          withdrawn: false,
+          apply: sql.withTransaction(Effect.gen(function*() {
+            if (requestedMutationId !== undefined) {
+              const recorded = yield* recordedMutation(mutation, payloadValue, requestedMutationId)
+              if (Option.isSome(recorded)) {
+                return { pendingMutation: recorded.value, created: Option.none<CreatedMutation>() }
+              }
+            }
+            const created = yield* mutateInTransaction(mutation, payloadValue, false, requestedMutationId)
+            return { pendingMutation: created.pendingMutation, created: Option.some(created) }
+          })).pipe(
+            Effect.exit,
+            Effect.flatMap((raw) =>
+              raw.pipe(
+                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+                Effect.exit,
+                Effect.map((exit) => ({
+                  created: Exit.match(exit, {
+                    onSuccess: (value) => value.created,
+                    onFailure: () => Option.none<CreatedMutation>()
+                  }),
+                  succeeded: Exit.isSuccess(exit),
+                  abort: Exit.match(raw, {
+                    onSuccess: () => Option.none(),
+                    onFailure: (cause) => {
+                      if (!Cause.hasDies(cause)) return Option.none()
+                      return Option.some(Cause.squash(cause))
+                    }
+                  }),
+                  settle: Deferred.done(result, Exit.map(exit, (value) => value.pendingMutation)).pipe(Effect.asVoid)
+                }))
+              )
+            )
+          ),
+          fail: (cause) => Deferred.failCause(result, cause).pipe(Effect.asVoid)
+        }
+        if (!Queue.offerUnsafe(commitQueue, request)) {
+          return yield* new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId })
+        }
+        admittedCommits += 1
+        return yield* Deferred.await(result).pipe(
+          Effect.onInterrupt(() =>
+            Effect.sync(() => {
+              request.withdrawn = true
+            })
+          )
+        )
+      })
+
       const service: Service = {
         membershipIncarnation: initializedMeta.membership_incarnation,
         schema: options.definition.schemaIdentity,
-        mutate: (mutation, payloadValue, mutateOptions) =>
-          withProjectionGate(Effect.gen(function*() {
-            const requestedMutationId = mutateOptions?.mutationId
-            const result = yield* sql.withTransaction(Effect.gen(function*() {
-              if (requestedMutationId !== undefined) {
-                const recorded = yield* recordedMutation(mutation, payloadValue, requestedMutationId)
-                if (Option.isSome(recorded)) return { pendingMutation: recorded.value, recorded: true }
-              }
-              const created = yield* mutateInTransaction(mutation, payloadValue, false, requestedMutationId)
-              return { pendingMutation: created.pendingMutation, recorded: false }
-            })).pipe(
-              Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
-            )
-            if (result.recorded) return result.pendingMutation
-            yield* updatePendingMetric(1)
-            const entities = result.pendingMutation.changes.map((change) => change.entity)
-            yield* reactivity.withBatch(invalidate(entities, [], true))
-            return result.pendingMutation
-          })).pipe(Effect.withSpan("LocalStore.mutate", {
-            attributes: {
-              "mutation.name": mutation.name,
-              "space.id": options.spaceId,
-              "client.id": options.clientId
-            }
-          })),
+        mutate,
         get: (model, key) =>
           sql.withTransaction(Effect.gen(function*() {
             const current = yield* meta
@@ -3369,13 +3694,13 @@ export const layer = (
               key
             )
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
-        pendingToSubmit,
+        pendingToSubmit: afterLocalCommits(pendingToSubmit),
         pending,
         settlements: settlementsStream,
         readSettlements,
         resolveSettlementStart,
         acknowledgeSettlements,
-        markSubmitting,
+        markSubmitting: (mutationId) => afterLocalCommits(markSubmitting(mutationId)),
         markRetrying,
         quarantine,
         quarantineByMutation,
@@ -3398,7 +3723,7 @@ export const layer = (
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
         replicationState,
         setScope,
-        applyViewPage,
+        applyViewPage: (page) => afterLocalCommits(applyViewPage(page)),
         revokeReplication,
         pendingCount: pipe(
           Effect.gen(function*() {
@@ -3567,8 +3892,8 @@ export const layer = (
           ),
         applyReceipts,
         applyReceipt: (terminalReceipt) => applyReceipts([terminalReceipt]),
-        persistReceipt,
-        settleReceipts,
+        persistReceipt: (serverReceipt) => afterLocalCommits(persistReceipt(serverReceipt)),
+        settleReceipts: afterLocalCommits(settleReceipts),
         prepareBootstrap,
         stageBootstrapPage,
         installBootstrap,

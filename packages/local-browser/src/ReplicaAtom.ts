@@ -190,9 +190,12 @@ export const make = <E,>(
         if (stale) get.registry.refresh(atom)
       })
       get.subscribe(atom, (value) => {
-        get.setSelf(value)
-        if (!stale || value.waiting) return
+        if (!stale || value.waiting) {
+          get.setSelf(value)
+          return
+        }
         stale = false
+        get.setSelf(AsyncResult.waiting(value))
         get.refresh(atom)
       })
       const service = get(reactivity)

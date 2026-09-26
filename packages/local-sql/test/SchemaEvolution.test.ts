@@ -1816,6 +1816,52 @@ describe("client schema evolution", () => {
   )
 
   it.effect(
+    "resolves a quarantined mutation discarded twice concurrently with one server discard",
+    Effect.fnUntraced(
+      function*() {
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const original = yield* v1.mutate(PutTodoV1, { id: "61", title: "original" })
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 0 })
+        const live = serverSync(server)
+        const discards = yield* Ref.make(0)
+        const discardEntered = yield* Deferred.make<void>()
+        const releaseDiscard = yield* Deferred.make<void>()
+        const gatedDiscard = SyncEngine.SyncEngine.of({
+          ...live,
+          discard: (request) =>
+            Ref.updateAndGet(discards, (count) => count + 1).pipe(
+              Effect.tap((count) => {
+                if (count > 1) return Effect.void
+                return Deferred.succeed(discardEntered, undefined).pipe(Effect.andThen(Deferred.await(releaseDiscard)))
+              }),
+              Effect.andThen(live.discard(request))
+            )
+        })
+        const replica = yield* buildReplica(definitionV2, layerHandlersV2, gatedDiscard, evolution)
+        const first = yield* replica.discardQuarantined(original.envelope.mutationId).pipe(
+          Effect.exit,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(discardEntered)
+        const second = yield* replica.discardQuarantined(original.envelope.mutationId).pipe(
+          Effect.exit,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.succeed(releaseDiscard, undefined)
+        const outcomes = [yield* Fiber.join(first), yield* Fiber.join(second)].map((exit) =>
+          Exit.match(exit, { onSuccess: (receipt) => receipt._tag, onFailure: (cause) => String(cause) })
+        )
+        assert.deepStrictEqual(outcomes, ["Rejected", "Rejected"])
+        assert.strictEqual(yield* Ref.get(discards), 1)
+        assert.deepStrictEqual(yield* replica.quarantine, [])
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect(
     "resumes staged replacement cancellation after an intervening submit failure",
     Effect.fnUntraced(
       function*() {

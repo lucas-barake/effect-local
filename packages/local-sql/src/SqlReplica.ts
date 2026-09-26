@@ -113,10 +113,13 @@ type BaseRequirements<D extends Definition.Any,> =
   | MutationRuntime.Handlers<D>
   | QueryExecutor.Handlers<D>
 
+const operationPermits = Number.MAX_SAFE_INTEGER
+
 interface ActiveRuntime {
   readonly foreground: boolean
   readonly scope: Scope.Closeable
   readonly operationGate: Semaphore.Semaphore
+  readonly quarantineGate: Semaphore.Semaphore
   readonly preemption: Deferred.Deferred<void>
   readonly local: LocalStore.Service
   readonly queries: QueryExecutor.Service
@@ -471,12 +474,18 @@ const makeLayer = <D extends Definition.Any, R,>(
           ).pipe(Scope.provide(childScope))
         }
         const layerMutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
+        const reconcilerReady = yield* Deferred.make<Reconciler.Service>()
         const layerLocalStore = LocalStore.layer({
           ...options,
           scope: entry.replicationScope,
           spaceId,
           onSettlementsRecorded: publishSettlements(entry),
-          onReplicationView: (installed) => recordReplicationView(entry, installed)
+          onReplicationView: (installed) => recordReplicationView(entry, installed),
+          onMutationsCommitted: (pending) =>
+            updatePendingContribution(entry, pending).pipe(
+              Effect.andThen(Deferred.await(reconcilerReady)),
+              Effect.flatMap((ready) => ready.schedule)
+            )
         }).pipe(Layer.provide(layerMutationRuntime))
         const layerQueryExecutor = QueryExecutor.layer(options.definition, spaceId)
         let local: LocalStore.Service
@@ -524,6 +533,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             reconciler = Reconciler.Reconciler.of({
               sync: reconciliation.sync,
               notify: local.requestReconciliation.pipe(Effect.asVoid),
+              schedule: Effect.void,
               status: reconciliation.status,
               shutdown: Effect.void
             })
@@ -568,6 +578,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             reconciler = Reconciler.Reconciler.of({
               sync: manager.sync(spaceId),
               notify: manager.notify(spaceId),
+              schedule: manager.schedule(spaceId),
               status: manager.status(spaceId),
               shutdown: Effect.void
             })
@@ -575,17 +586,21 @@ const makeLayer = <D extends Definition.Any, R,>(
             reconciler = Reconciler.Reconciler.of({
               sync: reconciliation.sync,
               notify: local.requestReconciliation.pipe(Effect.asVoid),
+              schedule: Effect.void,
               status: reconciliation.status,
               shutdown: Effect.void
             })
           }
         }
-        const operationGate = yield* Semaphore.make(1)
+        yield* Deferred.succeed(reconcilerReady, reconciler)
+        const operationGate = yield* Semaphore.make(operationPermits)
+        const quarantineGate = yield* Semaphore.make(1)
         const preemption = yield* Deferred.make<void>()
         return {
           foreground,
           scope: childScope,
           operationGate,
+          quarantineGate,
           preemption,
           local,
           queries,
@@ -742,7 +757,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           foregroundResidents.delete(entry.spaceId)
           yield* invalidateActivation(entry.spaceId)
           const shutdown = Scope.close(runtime.scope, Exit.void)
-          const result = yield* runtime.operationGate.withPermit(shutdown).pipe(Effect.exit)
+          const result = yield* runtime.operationGate.withPermits(operationPermits)(shutdown).pipe(Effect.exit)
           entry.runtime = undefined
           entry.activation = "Inactive"
           entry.transition = undefined
@@ -856,7 +871,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           const startRuntime = restore(initialize(entry, generation, foreground))
           let start = startRuntime
           if (retiring !== undefined) {
-            start = retiring.operationGate.withPermit(Scope.close(retiring.scope, Exit.void)).pipe(
+            start = retiring.operationGate.withPermits(operationPermits)(Scope.close(retiring.scope, Exit.void)).pipe(
               Effect.andThen(restore(
                 pendingCount(entry.spaceId).pipe(
                   Effect.catchTags({
@@ -1083,15 +1098,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           activate: activate(entry, true).pipe(Effect.asVoid),
           deactivate: deactivate(entry, true).pipe(Effect.asVoid),
           mutate: (mutation, payload, mutateOptions) =>
-            withActive(entry, (runtime) =>
-              runtime.local.mutate(mutation, payload, mutateOptions).pipe(
-                Effect.tap(() =>
-                  runtime.local.pendingCount.pipe(
-                    Effect.flatMap((pending) => updatePendingContribution(entry, pending))
-                  )
-                ),
-                Effect.tap(() => runtime.reconciler.notify)
-              )),
+            withActive(entry, (runtime) => runtime.local.mutate(mutation, payload, mutateOptions)),
           get: (model, key) => withActive(entry, (runtime) => runtime.local.get(model, key)),
           query: (query, payload) => withActive(entry, (runtime) => runtime.queries.execute(query, payload)),
           receipt: (mutation, mutationId) =>
@@ -1125,21 +1132,23 @@ const makeLayer = <D extends Definition.Any, R,>(
           quarantine: withActive(entry, (runtime) => runtime.local.quarantine),
           discardQuarantined: (mutationId) =>
             withActive(entry, (runtime) =>
-              Effect.fnUntraced(function*() {
-                const found = yield* runtime.local.quarantineByMutation(mutationId)
-                if (Option.isNone(found)) {
-                  const continuation = yield* runtime.local.quarantineCancellation(mutationId)
-                  yield* continueCancellation(runtime, continuation)
-                  return yield* findReceipt(runtime, mutationId)
-                }
-                const receipt = yield* remote.discard({
-                  envelope: found.value.envelope,
-                  schema: runtime.local.schema
-                })
-                const canceled = yield* runtime.local.resolveQuarantine(receipt, "Discard")
-                yield* continueCancellation(runtime, canceled)
-                return receipt
-              })().pipe(
+              runtime.quarantineGate.withPermit(
+                Effect.fnUntraced(function*() {
+                  const found = yield* runtime.local.quarantineByMutation(mutationId)
+                  if (Option.isNone(found)) {
+                    const continuation = yield* runtime.local.quarantineCancellation(mutationId)
+                    yield* continueCancellation(runtime, continuation)
+                    return yield* findReceipt(runtime, mutationId)
+                  }
+                  const receipt = yield* remote.discard({
+                    envelope: found.value.envelope,
+                    schema: runtime.local.schema
+                  })
+                  const canceled = yield* runtime.local.resolveQuarantine(receipt, "Discard")
+                  yield* continueCancellation(runtime, canceled)
+                  return receipt
+                })()
+              ).pipe(
                 Effect.exit,
                 Effect.flatMap((exit) =>
                   runtime.local.pendingCount.pipe(
@@ -1155,28 +1164,30 @@ const makeLayer = <D extends Definition.Any, R,>(
             payload: Mutation.Payload<M>
           ) =>
             withActive(entry, (runtime) =>
-              Effect.fnUntraced(function*() {
-                const found = yield* runtime.local.quarantineByMutation(mutationId)
-                if (Option.isNone(found)) {
-                  const continuation = yield* runtime.local.quarantineCancellation(mutationId)
-                  yield* continueCancellation(runtime, continuation)
-                  return Quarantine.AlreadyResolved.make({ receipt: yield* findReceipt(runtime, mutationId) })
-                }
-                const item = found.value
-                if (mutation.name !== item.envelope.name) {
-                  return yield* new ReplicaError.ProtocolInvalid({
-                    message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
-                  })
-                }
-                const pending = yield* runtime.local.ensureQuarantineResubmission(mutationId, mutation, payload)
-                const receipt = yield* remote.discard({ envelope: item.envelope, schema: runtime.local.schema })
-                const canceled = yield* runtime.local.resolveQuarantine(receipt, "Resubmit")
-                yield* continueCancellation(runtime, canceled)
-                if (receipt._tag !== "Rejected" || receipt.origin !== "Quarantine") {
-                  return Quarantine.AlreadyResolved.make({ receipt })
-                }
-                return Quarantine.Resubmitted.make({ pending })
-              })().pipe(
+              runtime.quarantineGate.withPermit(
+                Effect.fnUntraced(function*() {
+                  const found = yield* runtime.local.quarantineByMutation(mutationId)
+                  if (Option.isNone(found)) {
+                    const continuation = yield* runtime.local.quarantineCancellation(mutationId)
+                    yield* continueCancellation(runtime, continuation)
+                    return Quarantine.AlreadyResolved.make({ receipt: yield* findReceipt(runtime, mutationId) })
+                  }
+                  const item = found.value
+                  if (mutation.name !== item.envelope.name) {
+                    return yield* new ReplicaError.ProtocolInvalid({
+                      message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
+                    })
+                  }
+                  const pending = yield* runtime.local.ensureQuarantineResubmission(mutationId, mutation, payload)
+                  const receipt = yield* remote.discard({ envelope: item.envelope, schema: runtime.local.schema })
+                  const canceled = yield* runtime.local.resolveQuarantine(receipt, "Resubmit")
+                  yield* continueCancellation(runtime, canceled)
+                  if (receipt._tag !== "Rejected" || receipt.origin !== "Quarantine") {
+                    return Quarantine.AlreadyResolved.make({ receipt })
+                  }
+                  return Quarantine.Resubmitted.make({ pending })
+                })()
+              ).pipe(
                 Effect.exit,
                 Effect.flatMap((exit) =>
                   runtime.local.pendingCount.pipe(

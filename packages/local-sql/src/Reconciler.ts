@@ -37,6 +37,7 @@ export class Reconciliation extends Context.Service<Reconciliation, Reconciliati
 export interface Service {
   readonly sync: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly notify: Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly schedule: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly status: Effect.Effect<ReplicaStatus.ReplicaStatus, ReplicaError.ReplicaError>
   readonly shutdown: Effect.Effect<void>
 }
@@ -72,6 +73,7 @@ export interface ManagerService {
   readonly unregister: (spaceId: Identity.SpaceId, generation: number) => Effect.Effect<void>
   readonly sync: (spaceId: Identity.SpaceId) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly notify: (spaceId: Identity.SpaceId) => Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly schedule: (spaceId: Identity.SpaceId) => Effect.Effect<void, ReplicaError.ReplicaError>
   readonly status: (
     spaceId: Identity.SpaceId
   ) => Effect.Effect<ReplicaStatus.ReplicaStatus, ReplicaError.ReplicaError>
@@ -135,19 +137,10 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       return Effect.succeed(space)
     })
 
-  const enqueue = (space: ManagedState) =>
-    Effect.uninterruptibleMask(Effect.fnUntraced(function*(restore) {
-      const current = spaces.get(space.spaceId)
-      if (current !== space) {
-        yield* new ReplicaError.SpaceNotJoined({ spaceId: space.spaceId })
-        return
-      }
-      yield* restore(current.local.requestReconciliation)
+  const admit = (space: ManagedState) =>
+    Effect.uninterruptible(Effect.suspend(() => {
       const admitted = spaces.get(space.spaceId)
-      if (admitted !== space) {
-        yield* new ReplicaError.SpaceNotJoined({ spaceId: space.spaceId })
-        return
-      }
+      if (admitted !== space) return Effect.fail(new ReplicaError.SpaceNotJoined({ spaceId: space.spaceId }))
       admitted.dirtyEpoch += 1
       admitted.halted = false
       if (
@@ -155,12 +148,24 @@ export const makeManager = Effect.fnUntraced(function*(options: {
         admitted.running ||
         admitted.retrying ||
         admitted.authenticationGate !== undefined
-      ) return
+      ) return Effect.void
       admitted.queued = true
-      yield* Queue.offer(queue, { spaceId: admitted.spaceId, generation: admitted.generation })
+      return Queue.offer(queue, { spaceId: admitted.spaceId, generation: admitted.generation }).pipe(Effect.asVoid)
+    }))
+
+  const enqueue = (space: ManagedState) =>
+    Effect.uninterruptibleMask(Effect.fnUntraced(function*(restore) {
+      const current = spaces.get(space.spaceId)
+      if (current !== space) {
+        return yield* new ReplicaError.SpaceNotJoined({ spaceId: space.spaceId })
+      }
+      yield* restore(current.local.requestReconciliation)
+      return yield* admit(space)
     }))
 
   const notify = (spaceId: Identity.SpaceId) => lookup(spaceId).pipe(Effect.flatMap(enqueue))
+
+  const schedule = (spaceId: Identity.SpaceId) => lookup(spaceId).pipe(Effect.flatMap(admit))
 
   const admitCredentialPause = Effect.fnUntraced(function*(
     space: ManagedState,
@@ -474,7 +479,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
   const status = (spaceId: Identity.SpaceId) =>
     lookup(spaceId).pipe(Effect.flatMap((space) => space.reconciliation.status))
 
-  return Manager.of({ register, unregister, sync, notify, status })
+  return Manager.of({ register, unregister, sync, notify, schedule, status })
 })
 
 export const layerManager: Layer.Layer<Manager, ReplicaError.InvalidConfiguration, SyncEngine.SyncEngine> = Layer
@@ -904,6 +909,7 @@ export const layerInMemoryScheduler = (
       return Reconciler.of({
         sync: reconciliation.sync,
         notify,
+        schedule: notify,
         status: reconciliation.status,
         shutdown: Effect.void
       })

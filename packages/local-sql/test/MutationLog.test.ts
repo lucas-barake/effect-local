@@ -2535,6 +2535,11 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         },
         ({ ids, mutate }) => Effect.forEach(ids, mutate)
       )
+      const foreignClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+      const foreign = yield* service(LocalStore.Store, localLayer({ clientId: foreignClientId }))
+      yield* installFreshView(foreign, server, foreignClientId)
+      const foreignPending = yield* foreign.mutate(Domain.PutTodo, Domain.todo("projection-2", "foreign"))
+      yield* server.submit(foreignPending.envelope)
       const receipt = yield* server.submit(pending[0].envelope)
       const state = yield* local.replicationState
       const page = incremental(
@@ -4192,6 +4197,247 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
       assert.strictEqual(yield* store.pendingCount, 0)
       assert.isAtMost(yield* Ref.get(executions), mutationCount * 3)
+    }, Effect.scoped))
+  )
+
+  it.effect(
+    "accepts a queue of own mutations without re-executing any pending handler",
+    pipe(Effect.fnUntraced(function*() {
+      const Item = Model.make("AcceptedQueueItem", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ id: Schema.String, value: Schema.Number })
+      })
+      const PutItem = Mutation.make("PutAcceptedQueueItem", {
+        version: 1,
+        payload: Item.schema,
+        success: Item.schema
+      })
+      const workDefinition = Definition.make({ version: 1, models: [Item], mutations: [PutItem] })
+      const executions = yield* Ref.make(0)
+      const layerWorkRuntime = MutationRuntime.layer(workDefinition).pipe(
+        Layer.provide(PutItem.toLayer(({ payload, transaction }) =>
+          Ref.update(executions, (count) => count + 1).pipe(
+            Effect.andThen(transaction.set(Item, payload.id, payload)),
+            Effect.as(payload)
+          )
+        ))
+      )
+      const server = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layerTrusted({ ...serverHistory, definition: workDefinition }).pipe(
+          Layer.provide(layerWorkRuntime),
+          Layer.provide(serverDatabase())
+        )
+      )
+      const layerLocal = LocalStore.layer({
+        ...clientHistory,
+        scope: Protocol.ReplicationScope.make({ models: [Item.name] }),
+        definition: workDefinition,
+        spaceId,
+        clientId
+      }).pipe(
+        Layer.provide(layerWorkRuntime),
+        Layer.provide(clientDatabase())
+      )
+      const context = yield* Layer.build(Layer.merge(
+        layerLocal,
+        Reconciler.layer({ definition: workDefinition, spaceId }).pipe(
+          Layer.provide(layerLocal),
+          Layer.provide(directSync(server))
+        )
+      ))
+      const store = Context.get(context, LocalStore.Store)
+      yield* Context.get(context, Reconciler.Reconciler).sync
+
+      const ids = Array.from({ length: 12 }, (_, index) => `accepted-${index}`)
+      yield* Ref.set(executions, 0)
+      yield* Effect.forEach(ids, (id, index) => store.mutate(PutItem, { id, value: index }))
+      yield* Context.get(context, Reconciler.Reconciler).sync
+
+      assert.strictEqual(yield* store.pendingCount, 0)
+      assert.strictEqual(yield* Ref.get(executions), ids.length * 2)
+      for (const [index, id] of ids.entries()) {
+        assert.deepStrictEqual(yield* store.get(Item, id), Option.some({ id, value: index }))
+      }
+    }, Effect.scoped))
+  )
+
+  it.effect(
+    "keeps a retracted entity hidden behind a pending write when an earlier mutation settles",
+    pipe(Effect.fnUntraced(function*() {
+      let hidden = false
+      const server = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layer({
+          ...serverHistory,
+          definition: Domain.definition,
+          authorizeAccess: () => Effect.void,
+          authorizeMutation: () => Effect.void,
+          authorizeRead: (input) => {
+            if (hidden && input._tag === "Entity" && input.entity.key === "retracted") {
+              return Effect.fail(new TestAuthorizationError({ reason: "revoked" }))
+            }
+            return Effect.void
+          }
+        }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(serverDatabase())
+        )
+      )
+      const writerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+      const writer = yield* service(LocalStore.Store, localLayer({ clientId: writerId }))
+      yield* server.submit((yield* writer.mutate(Domain.PutTodo, Domain.todo("retracted"))).envelope)
+
+      const local = yield* service(LocalStore.Store, localLayer())
+      const pull = (cursor: Protocol.ReplicationCursor | null) =>
+        server.pullAuthorized(pullRequest(cursor), "reader").pipe(
+          Effect.map((result) => {
+            if ("_tag" in result) assert.fail("expected an incremental page")
+            return result
+          })
+        )
+      const required = yield* server.pullAuthorized(pullRequest(null), "reader")
+      if (!("_tag" in required)) {
+        assert.fail("expected a bootstrap")
+      }
+      const snapshot = yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+      yield* local.prepareBootstrap(snapshot.manifest)
+      assert.isTrue(yield* local.stageBootstrapPage(snapshot))
+      yield* local.installBootstrap(snapshot.manifest)
+      for (let round = 0; round < 2; round++) {
+        yield* local.applyViewPage(yield* pull((yield* local.replicationState).cursor))
+      }
+      hidden = true
+      const revoked = yield* pull((yield* local.replicationState).cursor)
+      assert.deepStrictEqual(revoked.changes.map((change) => change._tag), ["Retract"])
+      yield* local.applyViewPage(revoked)
+      assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "retracted")))
+
+      const settling = yield* local.mutate(Domain.PutTodo, Domain.todo("settling"))
+      yield* local.mutate(Domain.PutTodo, Domain.todo("retracted", "local"))
+      yield* local.persistReceipt(yield* server.submit(settling.envelope))
+      yield* local.applyViewPage(yield* pull((yield* local.replicationState).cursor))
+
+      assert.strictEqual(yield* local.pendingCount, 1)
+      const settled = Domain.todo("settling")
+      assert.deepStrictEqual(yield* local.get(Domain.Todo, "settling"), Option.some(settled))
+      assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "retracted")))
+    }, Effect.scoped))
+  )
+
+  it.effect(
+    "replays a pending mutation when a foreign write changes an entity it only read",
+    pipe(Effect.fnUntraced(function*() {
+      const Source = Model.make("ReadDependencySource", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ id: Schema.String, value: Schema.Number })
+      })
+      const Copy = Model.make("ReadDependencyCopy", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ id: Schema.String, value: Schema.Number })
+      })
+      const PutSource = Mutation.make("PutReadDependencySource", {
+        version: 1,
+        payload: Source.schema,
+        success: Source.schema
+      })
+      const CopySource = Mutation.make("CopyReadDependencySource", {
+        version: 1,
+        payload: { sourceId: Schema.String, copyId: Schema.String },
+        success: Schema.Number
+      })
+      const workDefinition = Definition.make({
+        version: 1,
+        models: [Source, Copy],
+        mutations: [PutSource, CopySource]
+      })
+      const layerPutSource = PutSource.toLayer(({ payload, transaction }) =>
+        transaction.set(Source, payload.id, payload).pipe(Effect.as(payload))
+      )
+      const layerCopySource = CopySource.toLayer(({ payload, transaction }) =>
+        transaction.get(Source, payload.sourceId).pipe(
+          Effect.map(Option.match({ onNone: () => 0, onSome: (source) => source.value })),
+          Effect.tap((value) => transaction.set(Copy, payload.copyId, { id: payload.copyId, value }))
+        )
+      )
+      const layerWorkRuntime = MutationRuntime.layer(workDefinition).pipe(
+        Layer.provide(Layer.merge(layerPutSource, layerCopySource))
+      )
+      const server = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layerTrusted({ ...serverHistory, definition: workDefinition }).pipe(
+          Layer.provide(layerWorkRuntime),
+          Layer.provide(serverDatabase())
+        )
+      )
+      const workScope = Protocol.ReplicationScope.make({ models: [Source.name, Copy.name] })
+      const workLocal = (id: Identity.ClientId) =>
+        LocalStore.layer({ ...clientHistory, scope: workScope, definition: workDefinition, spaceId, clientId: id })
+          .pipe(
+            Layer.provide(layerWorkRuntime),
+            Layer.provide(clientDatabase())
+          )
+      const layerWriterLocal = workLocal(Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"))
+      const writer = yield* Layer.build(Layer.merge(
+        layerWriterLocal,
+        Reconciler.layer({ definition: workDefinition, spaceId }).pipe(
+          Layer.provide(layerWriterLocal),
+          Layer.provide(directSync(server))
+        )
+      ))
+      const writerStore = Context.get(writer, LocalStore.Store)
+      const writerSync = Context.get(writer, Reconciler.Reconciler)
+      const readerStore = yield* service(LocalStore.Store, workLocal(clientId))
+      const pullReader = (cursor: Protocol.ReplicationCursor | null) =>
+        server.pull(Protocol.PullRequest.make({
+          spaceId,
+          clientId,
+          schema: workDefinition.schemaIdentity,
+          scope: workScope,
+          scopeGeneration,
+          cursor,
+          limit: 10
+        }))
+
+      yield* writerSync.sync
+      yield* writerStore.mutate(PutSource, { id: "source", value: 1 })
+      yield* writerSync.sync
+      const required = yield* pullReader(null)
+      if (!("_tag" in required)) {
+        assert.fail("expected a bootstrap")
+      }
+      const snapshot = yield* server.bootstrap(Protocol.BootstrapRequest.make({
+        spaceId,
+        clientId: required.manifest.clientId,
+        schema: workDefinition.schemaIdentity,
+        scope: workScope,
+        scopeGeneration: required.manifest.scopeGeneration,
+        cursor: required.manifest.cursor,
+        snapshotId: required.manifest.snapshotId,
+        afterOrdinal: -1,
+        limit: 10
+      }))
+      yield* readerStore.prepareBootstrap(snapshot.manifest)
+      assert.isTrue(yield* readerStore.stageBootstrapPage(snapshot))
+      yield* readerStore.installBootstrap(snapshot.manifest)
+
+      yield* writerStore.mutate(PutSource, { id: "source", value: 2 })
+      yield* writerSync.sync
+      yield* readerStore.mutate(CopySource, { sourceId: "source", copyId: "copy" })
+      assert.deepStrictEqual(yield* readerStore.get(Copy, "copy"), Option.some({ id: "copy", value: 1 }))
+
+      const page = yield* pullReader((yield* readerStore.replicationState).cursor)
+      if ("_tag" in page) {
+        assert.fail("expected an incremental page")
+      }
+      yield* readerStore.applyViewPage(page)
+
+      assert.strictEqual(yield* readerStore.pendingCount, 1)
+      assert.deepStrictEqual(yield* readerStore.get(Source, "source"), Option.some({ id: "source", value: 2 }))
+      assert.deepStrictEqual(yield* readerStore.get(Copy, "copy"), Option.some({ id: "copy", value: 2 }))
     }, Effect.scoped))
   )
 
