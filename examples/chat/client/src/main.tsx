@@ -1,12 +1,13 @@
-import { RegistryProvider, useAtomValue } from "@effect/atom-react"
+import { RegistryProvider, useAtomMount, useAtomValue } from "@effect/atom-react"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import { createRoot } from "react-dom/client"
 import { App } from "./app.js"
 import { Login } from "./login.js"
-import { sessionAtom } from "./replica.js"
+import { followStoredSessionAtom, sessionAtom } from "./replica.js"
 import "./style.css"
 
 const Root = () => {
+  useAtomMount(followStoredSessionAtom)
   const session = useAtomValue(sessionAtom)
   // Nothing renders until the stored session has been read: a login screen
   // that flashes before an existing session resumes would be a lie.

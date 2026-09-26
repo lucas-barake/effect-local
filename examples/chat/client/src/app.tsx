@@ -11,30 +11,14 @@ import {
   users
 } from "@effect-local/example-chat-shared/domain"
 import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
+import * as Match from "effect/Match"
+import * as Option from "effect/Option"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import { useState } from "react"
+import { Avatar } from "./avatar.js"
 import { ChatView } from "./chat.js"
-import { type ChatClient, clientFor, logoutAtom } from "./replica.js"
-
-const latest = <A, E,>(result: AsyncResult.AsyncResult<A, E>, fallback: A): A =>
-  AsyncResult.getOrElse(result, () => fallback)
-
-const timeFormatter = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" })
-
-export const formatTime = (millis: number): string => timeFormatter.format(millis)
-
-export const Avatar = ({ name, color, size = 40 }: {
-  readonly name: string
-  readonly color: string
-  readonly size?: number
-}) => (
-  <span
-    className="avatar"
-    style={{ backgroundColor: color, width: size, height: size, fontSize: size * 0.42 }}
-  >
-    {name[0]}
-  </span>
-)
+import { type ChatClient, clientFor, type Connection, logoutAtom } from "./replica.js"
+import { formatTime } from "./time.js"
 
 const conversationPeer = (conversation: Conversation, me: UserId): ChatUser | undefined => {
   if (conversation.kind === "group") return undefined
@@ -48,28 +32,29 @@ const conversationTitle = (conversation: Conversation, me: UserId): string =>
 const conversationColor = (conversation: Conversation, me: UserId): string =>
   conversation.kind === "group" ? "#667781" : conversationPeer(conversation, me)?.color ?? "#667781"
 
-const StatusBanner = ({ status }: {
-  readonly status: AsyncResult.AsyncResult<{ readonly _tag: string }, unknown>
-}) => {
+const StatusBanner = ({ connection }: { readonly connection: Connection }) => {
   const logout = useAtomSet(logoutAtom)
-  if (!AsyncResult.isSuccess(status) || status.value._tag === "Online") return null
-  if (status.value._tag === "NeedsAuthentication") {
-    return (
-      <div className="banner banner-warning">
+  return Match.value(connection).pipe(
+    Match.when("online", () => null),
+    Match.when("connecting", () => null),
+    Match.when("needsAuthentication", () => (
+      <div className="banner banner-warning" role="status">
         Session expired.{" "}
         <button type="button" className="banner-action" onClick={() => logout(undefined)}>
           Sign in again
         </button>
       </div>
-    )
-  }
-  if (status.value._tag === "Failed") {
-    return <div className="banner banner-error">Sync failed — local data remains available.</div>
-  }
-  return (
-    <div className="banner banner-warning">
-      Offline — messages send and receipts advance when the connection returns.
-    </div>
+    )),
+    Match.when(
+      "failed",
+      () => <div className="banner banner-error" role="status">Sync failed — local data remains available.</div>
+    ),
+    Match.when("offline", () => (
+      <div className="banner banner-warning" role="status">
+        Offline — messages send and receipts advance when the connection returns.
+      </div>
+    )),
+    Match.exhaustive
   )
 }
 
@@ -79,21 +64,32 @@ const Sidebar = ({ client, me, openId, onOpen }: {
   readonly openId: ConversationId | null
   readonly onOpen: (conversationId: ConversationId) => void
 }) => {
-  const summaries = latest(useAtomValue(client.summariesAtom), [])
-  const members = latest(useAtomValue(client.membersAtom), [])
+  const summariesResult = useAtomValue(client.summariesAtom)
+  const members = AsyncResult.getOrElse(useAtomValue(client.membersAtom), () => [])
   const onlineIds = new Set(members.map((entry) => entry.value.userId))
 
-  const mine = summaries
+  const summaries = AsyncResult.value(summariesResult)
+  if (Option.isNone(summaries)) {
+    return (
+      <aside className="sidebar" aria-label="Conversations">
+        {AsyncResult.isFailure(summariesResult) && (
+          <p className="sidebar-empty" role="alert">Could not load conversations.</p>
+        )}
+      </aside>
+    )
+  }
+
+  const mine = summaries.value
     .filter((summary) => summary.conversation.memberIds.includes(me))
     .toSorted((left, right) =>
       (right.lastMessage?.createdAt ?? right.conversation.createdAt) -
       (left.lastMessage?.createdAt ?? left.conversation.createdAt)
     )
-  const knownIds = new Set(summaries.map((summary) => summary.conversation.id))
+  const knownIds = new Set(summaries.value.map((summary) => summary.conversation.id))
   const newDmUsers = users.filter((user) => user.id !== me && !knownIds.has(dmConversationId(me, user.id)))
 
   return (
-    <aside className="sidebar">
+    <aside className="sidebar" aria-label="Conversations">
       <div className="sidebar-list">
         {mine.map((summary) => (
           <ConversationRow
@@ -121,7 +117,7 @@ const Sidebar = ({ client, me, openId, onOpen }: {
             >
               <Avatar name={user.name} color={user.color} size={32} />
               <span>{user.name}</span>
-              {onlineIds.has(user.id) && <span className="presence-dot" />}
+              {onlineIds.has(user.id) && <span className="presence-dot" role="img" aria-label="online" />}
             </button>
           ))}
           {!knownIds.has(groupConversationId) && (
@@ -155,11 +151,12 @@ const ConversationRow = ({ summary, me, online, active, onOpen }: {
     <button
       type="button"
       className={active ? "conversation conversation-active" : "conversation"}
+      aria-current={active ? "true" : undefined}
       onClick={() => onOpen(summary.conversation.id)}
     >
       <span className="conversation-avatar">
         <Avatar name={title} color={conversationColor(summary.conversation, me)} />
-        {online && <span className="presence-dot presence-dot-inline" />}
+        {online && <span className="presence-dot presence-dot-inline" role="img" aria-label="online" />}
       </span>
       <span className="conversation-body">
         <span className="conversation-top">
@@ -170,7 +167,9 @@ const ConversationRow = ({ summary, me, online, active, onOpen }: {
         </span>
         <span className="conversation-bottom">
           <span className="conversation-preview">{preview}</span>
-          {summary.unreadCount > 0 && <span className="unread-badge">{summary.unreadCount}</span>}
+          {summary.unreadCount > 0 && (
+            <span className="unread-badge" aria-label={`${summary.unreadCount} unread`}>{summary.unreadCount}</span>
+          )}
         </span>
       </span>
     </button>
@@ -182,7 +181,7 @@ export const App = ({ session }: { readonly session: LoginResponse }) => {
   useAtomMount(client.presenceAtom)
   useAtomMount(client.deliveryDaemon)
   useAtomMount(client.settlementDaemon)
-  const status = useAtomValue(client.statusAtom)
+  const connection = AsyncResult.getOrElse(useAtomValue(client.connectionAtom), (): Connection => "connecting")
   const logout = useAtomSet(logoutAtom)
   const startConversation = useAtomSet(client.startConversation)
   const [openId, setOpenId] = useState<ConversationId | null>(null)
@@ -200,25 +199,35 @@ export const App = ({ session }: { readonly session: LoginResponse }) => {
 
   return (
     <div className="app">
-      <div className="app-sidebar">
-        <header className="sidebar-header">
-          <Avatar name={session.name} color={session.color} />
-          <span className="sidebar-me">{session.name}</span>
-          <button type="button" className="sidebar-logout" onClick={() => logout(undefined)}>
-            Log out
-          </button>
-        </header>
-        <StatusBanner status={status} />
-        <Sidebar client={client} me={me} openId={openId} onOpen={open} />
+      <StatusBanner connection={connection} />
+      <div className={openId === null ? "app-panes" : "app-panes app-panes-chat-open"}>
+        <div className="app-sidebar">
+          <header className="sidebar-header">
+            <Avatar name={session.name} color={session.color} />
+            <span className="sidebar-me">{session.name}</span>
+            <button type="button" className="sidebar-logout" onClick={() => logout(undefined)}>
+              Log out
+            </button>
+          </header>
+          <Sidebar client={client} me={me} openId={openId} onOpen={open} />
+        </div>
+        {openId === null
+          ? (
+            <div className="chat-placeholder">
+              <p>Effect Chat — local-first, multi-tab, offline-capable.</p>
+              <p>Pick a conversation to start messaging.</p>
+            </div>
+          )
+          : (
+            <ChatView
+              key={openId}
+              client={client}
+              me={me}
+              conversationId={openId}
+              onBack={() => setOpenId(null)}
+            />
+          )}
       </div>
-      {openId === null
-        ? (
-          <div className="chat-placeholder">
-            <p>Effect Chat — local-first, multi-tab, offline-capable.</p>
-            <p>Pick a conversation to start messaging.</p>
-          </div>
-        )
-        : <ChatView key={openId} client={client} me={me} conversationId={openId} />}
     </div>
   )
 }

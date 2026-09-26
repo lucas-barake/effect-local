@@ -34,17 +34,23 @@ import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Match from "effect/Match"
+import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
+import * as Stream from "effect/Stream"
 import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient"
 import * as HttpClient from "effect/unstable/http/HttpClient"
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest"
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse"
 import * as KeyValueStore from "effect/unstable/persistence/KeyValueStore"
+import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import * as Atom from "effect/unstable/reactivity/Atom"
 import * as Socket from "effect/unstable/socket/Socket"
 import { makeFailedMessages, makeSettlementDaemonBody } from "./settlementDaemon.js"
@@ -78,7 +84,7 @@ export const sessionAtom = Atom.kvs({
 
 class LoginFailed extends Schema.TaggedError<LoginFailed>(
   "@effect-local/example-chat/LoginFailed"
-)("LoginFailed", { reason: Schema.String }) {}
+)("LoginFailed", { message: Schema.String }) {}
 
 const login = Effect.fn("chat.login")(
   function*(credentials: LoginRequest, get: Atom.FnContext) {
@@ -88,7 +94,7 @@ const login = Effect.fn("chat.login")(
     )
     const response = yield* client.execute(request)
     if (response.status === 401) {
-      return yield* new LoginFailed({ reason: "Invalid username or password" })
+      return yield* new LoginFailed({ message: "Invalid username or password" })
     }
     const ok = yield* HttpClientResponse.filterStatusOk(response)
     const session = yield* HttpClientResponse.schemaBodyJson(LoginResponse)(ok)
@@ -96,9 +102,9 @@ const login = Effect.fn("chat.login")(
     return session
   },
   Effect.catchTags({
-    HttpBodyError: () => new LoginFailed({ reason: "Could not encode the login request" }),
-    HttpClientError: () => new LoginFailed({ reason: "Login service unavailable" }),
-    SchemaError: () => new LoginFailed({ reason: "Malformed login response" })
+    HttpBodyError: () => new LoginFailed({ message: "Could not encode the login request" }),
+    HttpClientError: () => new LoginFailed({ message: "Login service unavailable" }),
+    SchemaError: () => new LoginFailed({ message: "Malformed login response" })
   })
 )
 
@@ -109,6 +115,13 @@ export const loginAtom = pageRuntime.fn<LoginRequest>()(login)
 export const logoutAtom = pageRuntime.fn<void>()(() =>
   KeyValueStore.KeyValueStore.use((store) => store.remove(sessionKey)).pipe(
     Effect.andThen(Effect.sync(() => location.reload()))
+  )
+)
+
+export const followStoredSessionAtom = Atom.make(
+  Stream.fromEventListener<StorageEvent>(window, "storage").pipe(
+    Stream.filter((event) => event.storageArea === localStorage && (event.key === sessionKey || event.key === null)),
+    Stream.runForEach(() => Effect.sync(() => location.reload()))
   )
 )
 
@@ -168,11 +181,31 @@ const makeGraph = (session: LoginResponse) => {
 
 export type ChatClient = ReturnType<typeof makeClient>
 
-const windowSizeAtom = Atom.make(50)
-export const loadMoreAtom = Atom.writable(
-  (get) => get(windowSizeAtom),
-  (context) => context.set(windowSizeAtom, Math.min(context.get(windowSizeAtom) + 50, 1_000))
-)
+const windowPage = 50
+const windowLimit = 1_000
+
+export type Connection = "online" | "connecting" | "offline" | "needsAuthentication" | "failed"
+
+const offlineGrace = Duration.seconds(2)
+const online: Connection = "online"
+const connecting: Connection = "connecting"
+const offline: Connection = "offline"
+
+const connectionOf = (
+  status: AsyncResult.AsyncResult<ReplicaStatus.SpaceStatus, unknown>
+): Connection => {
+  if (!AsyncResult.isSuccess(status)) return connecting
+  return Match.value(status.value).pipe(
+    Match.tagsExhaustive({
+      Online: () => online,
+      SchemaUpdateAvailable: () => online,
+      NeedsAuthentication: (): Connection => "needsAuthentication",
+      Failed: (): Connection => "failed",
+      Offline: () => connecting,
+      Connecting: () => connecting
+    })
+  )
+}
 
 const findUserName = (userId: UserId): string => findUser(userId)?.name ?? userId
 
@@ -210,10 +243,45 @@ const makeClient = (session: LoginResponse) => {
   const pendingSendsAtom = graph.pendingFor(spaceId, SendMessage)
   const statusAtom = graph.status(spaceId)
 
-  // One atom per conversation: the window query re-keys on the shared window
-  // size, and a fresh wrapper per render would resubscribe on every keystroke.
+  const connectionAtom = Atom.make(
+    (get) =>
+      get.stream(statusAtom).pipe(
+        Stream.map(connectionOf),
+        Stream.changes,
+        Stream.switchMap((connection): Stream.Stream<Connection> => {
+          if (connection !== connecting) return Stream.succeed(connection)
+          return Stream.concat(
+            Stream.succeed(connection),
+            Stream.fromEffect(Effect.sleep(offlineGrace)).pipe(Stream.as(offline))
+          )
+        })
+      ),
+    { initialValue: connecting }
+  )
+
+  const windowSize = Atom.family((_conversationId: ConversationId) => Atom.make(windowPage))
+  const loadEarlier = Atom.family((conversationId: ConversationId) =>
+    Atom.writable(
+      (get) => get(windowSize(conversationId)),
+      (context) =>
+        context.set(
+          windowSize(conversationId),
+          Math.min(context.get(windowSize(conversationId)) + windowPage, windowLimit)
+        )
+    )
+  )
+
   const messagesWindow = Atom.family((conversationId: ConversationId) =>
-    Atom.readable((get) => get(graph.query(spaceId, MessagesWindow)({ conversationId, limit: get(windowSizeAtom) })))
+    Atom.readable((get) => {
+      const result = get(
+        graph.query(spaceId, MessagesWindow)({ conversationId, limit: get(windowSize(conversationId)) })
+      )
+      if (!AsyncResult.isInitial(result)) return result
+      return Option.match(get.self<typeof result>(), {
+        onNone: () => result,
+        onSome: (previous) => AsyncResult.waiting(previous)
+      })
+    })
   )
   const readStates = (conversationId: ConversationId) => graph.query(spaceId, ReadStates)({ conversationId })
 
@@ -355,7 +423,7 @@ const makeClient = (session: LoginResponse) => {
     membersAtom,
     summariesAtom,
     pendingSendsAtom,
-    statusAtom,
+    connectionAtom,
     sendMessage,
     retryMessage,
     discardMessage,
@@ -366,6 +434,7 @@ const makeClient = (session: LoginResponse) => {
     deliveryDaemon,
     settlementDaemon,
     messagesWindow,
+    loadEarlier,
     readStates,
     typingEntries,
     failedMessages

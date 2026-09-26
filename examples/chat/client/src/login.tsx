@@ -1,8 +1,8 @@
 import { type UserId, users } from "@effect-local/example-chat-shared/domain"
 import { useAtomSet, useAtomValue } from "@effect/atom-react"
-import * as Cause from "effect/Cause"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import { useState } from "react"
+import { Avatar } from "./avatar.js"
 import { loginAtom } from "./replica.js"
 
 /**
@@ -15,7 +15,12 @@ export const Login = () => {
   const [password, setPassword] = useState("")
   const login = useAtomSet(loginAtom)
   const result = useAtomValue(loginAtom)
-  const error = AsyncResult.isFailure(result) ? Cause.pretty(result.cause) : undefined
+  const error = AsyncResult.matchWithError(result, {
+    onInitial: () => undefined,
+    onSuccess: () => undefined,
+    onError: (failure) => failure.message,
+    onDefect: () => "Sign in failed unexpectedly. Try again."
+  })
 
   const submit = (event: { preventDefault(): void }) => {
     event.preventDefault()
@@ -33,9 +38,10 @@ export const Login = () => {
               key={user.id}
               type="button"
               className={user.id === userId ? "login-user login-user-active" : "login-user"}
+              aria-pressed={user.id === userId}
               onClick={() => setUserId(user.id)}
             >
-              <span className="avatar" style={{ backgroundColor: user.color }}>{user.name[0]}</span>
+              <Avatar name={user.name} color={user.color} size={32} />
               <span>{user.name}</span>
             </button>
           ))}
@@ -46,11 +52,12 @@ export const Login = () => {
             value={password}
             onChange={(event) => setPassword(event.target.value)}
             placeholder={`Password for ${userId} (hint: ${userId}123)`}
+            aria-label="Password"
             className="login-password"
           />
           <button type="submit" className="login-submit">Sign in</button>
         </form>
-        {error !== undefined && <p className="login-error">{error}</p>}
+        {error !== undefined && <p className="login-error" role="alert">{error}</p>}
       </div>
     </div>
   )
