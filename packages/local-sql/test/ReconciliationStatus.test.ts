@@ -261,6 +261,60 @@ describe("reconciliation status", () => {
   )
 
   it.effect(
+    "reports the transport failure of the first turn after a credential change instead of NeedsAuthentication",
+    Effect.fnUntraced(function*() {
+      const clientDatabase = yield* Layer.build(database())
+      const local = Context.get(
+        yield* Layer.build(
+          LocalStore.layer(localOptions).pipe(
+            Layer.provide(layerRuntime),
+            Layer.provide(Layer.succeedContext(clientDatabase))
+          )
+        ),
+        LocalStore.Store
+      )
+      const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
+      let credentialAccepted = false
+      const awaitingCredential = yield* Deferred.make<void>()
+      const credentialChanged = yield* Deferred.make<void>()
+      const backingOff = yield* Deferred.make<void>()
+      const remote = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () =>
+          Deferred.succeed(awaitingCredential, undefined).pipe(Effect.andThen(Deferred.await(credentialChanged))),
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Deferred.succeed(backingOff, undefined).pipe(Effect.andThen(Effect.never)),
+        submitBatch: (request) => server.admitBatch(request, null),
+        discard: (request) => server.discard(request, null),
+        pull: () =>
+          Effect.suspend((): Effect.Effect<never, ReplicaError.ServerUnavailable | ReplicaError.CredentialRejected> => {
+            if (credentialAccepted) return Effect.fail(new ReplicaError.ServerUnavailable())
+            return Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 1 }))
+          }),
+        bootstrap: server.bootstrap,
+        watch: () => Stream.never
+      })
+      const reconciliation = Context.get(
+        yield* Layer.build(
+          Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+            Layer.provide(Layer.succeed(LocalStore.Store, local)),
+            Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
+          )
+        ),
+        Reconciler.Reconciliation
+      )
+      const manager = yield* Reconciler.makeManager().pipe(Effect.provideService(SyncEngine.SyncEngine, remote))
+      yield* manager.register({ spaceId, generation: 1, definition: Domain.definition, local, reconciliation })
+      yield* Deferred.await(awaitingCredential)
+      assert.strictEqual((yield* manager.status(spaceId))._tag, "NeedsAuthentication")
+
+      credentialAccepted = true
+      yield* Deferred.succeed(credentialChanged, undefined)
+      yield* Deferred.await(backingOff)
+      assert.strictEqual((yield* manager.status(spaceId))._tag, "Offline")
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "records one durable reconciliation request for a burst of wakes that arrive during one turn",
     Effect.fnUntraced(function*() {
       const clientDatabase = yield* Layer.build(database())

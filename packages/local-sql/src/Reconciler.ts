@@ -552,7 +552,7 @@ export const layerOnePass = (
                   const next = { _tag: "NeedsAuthentication", pending } as const
                   return [next, next]
                 }
-                if (current._tag === "NeedsAuthentication") return [undefined, current]
+                if (current._tag === "NeedsAuthentication" && failedSinceSyncStarted) return [undefined, current]
                 if (preserveConnecting && (current._tag === "Connecting" || syncing) && isTransientFailure(error)) {
                   return [undefined, current]
                 }
