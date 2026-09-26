@@ -10,7 +10,8 @@
     "dev:client": "pnpm -C client dev",
     "build": "pnpm -C client build",
     "check": "tsc -b tsconfig.json",
-    "test": "vitest run"
+    "test": "vitest run",
+    "e2e": "playwright test -c e2e/playwright.config.ts"
   },
   "dependencies": {
     "@effect-local/example-chat-client": "workspace:^",
@@ -26,6 +27,7 @@
   },
   "devDependencies": {
     "@effect/vitest": "4.0.0-rc.117",
+    "@playwright/test": "1.63.0",
     "@types/node": "^25.7.0",
     "vitest": "5.0.2"
   }
