@@ -2,16 +2,15 @@ import { type LoginRequest, LoginResponse } from "@effect-local/example-chat-sha
 import {
   AdvanceDelivery,
   AdvanceRead,
-  Conversation,
+  type Conversation,
   type ConversationId,
-  ConversationReadState,
   ConversationSummaries,
   definition,
   dmConversationId,
   ephemerals,
   findUser,
   groupConversationId,
-  Message,
+  type Message,
   MessageId,
   MessagesWindow,
   PresenceProfile,
@@ -29,10 +28,9 @@ import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
 import * as BrowserKeyValueStore from "@effect/platform-browser/BrowserKeyValueStore"
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
-import * as MultiTab from "@lucas-barake/effect-local-browser/MultiTab"
+import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
-import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
@@ -140,7 +138,7 @@ const syncUrl = () => {
   return `${scheme}://${location.host}/sync`
 }
 
-const makeOwner = (session: LoginResponse) => (context: MultiTab.OwnerContext) => {
+const makeGraph = (session: LoginResponse) => {
   // A rejected bearer parks the space at NeedsAuthentication; the banner then
   // signs out and reloads, so the token never rotates inside one page load.
   const bearer = Redacted.make(session.token)
@@ -151,41 +149,18 @@ const makeOwner = (session: LoginResponse) => (context: MultiTab.OwnerContext) =
   const layerDatabase = BrowserSqlite.layerWorker(() =>
     new Worker(new URL("./sqlite.worker.ts", import.meta.url), { type: "module", name: session.userId })
   )
-  return SqlReplica.layer({
-    definition,
-    clientId: context.clientId,
-    defaultScope: Protocol.ReplicationScope.make({
-      models: [Conversation.name, Message.name, ConversationReadState.name]
-    }),
-    initialSpaces: [spaceId],
-    maximumActiveSpaces: 4,
-    foregroundActiveSpaces: 2,
-    retainedReceipts: 256,
-    maximumReceipts: 10_000,
-    retainedHistoryEntries: 256,
-    maximumBootstrapEntities: 10_000,
-    maximumBootstrapBytes: 64 * 1024 * 1024,
-    maximumBootstrapPageBytes: 4 * 1024 * 1024,
-    migration: { retryDelay: "100 millis", maximumAttempts: 8 }
-  }).pipe(
-    Layer.provide(layerDomain),
-    Layer.provideMerge(layerDatabase),
-    Layer.provide(BrowserCrypto.layer),
-    Layer.provideMerge(layerSync)
-  )
-}
-
-const makeGraph = (session: LoginResponse) =>
-  BrowserReplica.make(
-    MultiTab.layer({
+  return ReplicaAtom.make(
+    BrowserReplica.layer({
       name: `chat-${session.userId}`,
       definition,
-      owner: makeOwner(session),
+      layerDatabase,
+      layerSync,
+      spaces: [spaceId],
       ephemerals,
-      profiles,
-      requestPersistence: true
-    })
+      profiles
+    }).pipe(Layer.provide(layerDomain))
   )
+}
 
 // ---------------------------------------------------------------------------
 // Atoms (per session)

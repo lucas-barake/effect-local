@@ -4,16 +4,22 @@ import * as Schema from "effect/Schema"
 
 export type Json = typeof Schema.Json.Type
 
-export const encodeJson = (schema: Schema.Top, value: unknown): Effect.Effect<Json, ReplicaError.StorageCorrupt> =>
-  // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion, effect-local/noUnknownEffectChannels -- Every wire definition schema encodes to Json without services; the generic Schema.Top erases both facts.
+export type WireCodec = Schema.Top & Schema.ConstraintCodec<unknown, Json>
+
+export const encodeJson = (
+  schema: WireCodec,
+  value: unknown
+): Effect.Effect<Json, ReplicaError.StorageCorrupt> =>
   Schema.encodeUnknownEffect(schema)(value).pipe(
     Effect.catchTag("SchemaError", (error) =>
       Effect.fail(new ReplicaError.StorageCorrupt({ message: "multi-tab wire codec failure", cause: error })))
-  ) as Effect.Effect<Json, ReplicaError.StorageCorrupt>
+  )
 
-export const decodeWith = (schema: Schema.Top, value: unknown): Effect.Effect<unknown, ReplicaError.StorageCorrupt> =>
-  // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion, effect-local/noUnknownEffectChannels -- Every wire definition schema decodes without services; the generic Schema.Top erases that.
+export const decodeWith = <S extends WireCodec,>(
+  schema: S,
+  value: unknown
+): Effect.Effect<S["Type"], ReplicaError.StorageCorrupt> =>
   Schema.decodeUnknownEffect(schema)(value).pipe(
     Effect.catchTag("SchemaError", (error) =>
       Effect.fail(new ReplicaError.StorageCorrupt({ message: "multi-tab wire codec failure", cause: error })))
-  ) as Effect.Effect<unknown, ReplicaError.StorageCorrupt>
+  )

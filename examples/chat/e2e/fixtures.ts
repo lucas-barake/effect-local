@@ -7,13 +7,25 @@ export const names: Record<UserId, string> = { alice: "Alice", bob: "Bob", carol
 
 export interface Chat {
   readonly signIn: (user: UserId) => Promise<Page>
+  readonly openTab: (page: Page, label: string) => Promise<Page>
+}
+
+const capture = (page: Page, label: string, lines: Array<string>): void => {
+  page.on("console", (message) => lines.push(`[${label}:${message.type()}] ${message.text()}`))
+  page.on("pageerror", (error) => lines.push(`[${label}:pageerror] ${error.message}`))
+}
+
+const openTab = async (page: Page, label: string, lines: Array<string>): Promise<Page> => {
+  const tab = await page.context().newPage()
+  capture(tab, label, lines)
+  await tab.goto("/")
+  return tab
 }
 
 const signIn = async (browser: Browser, user: UserId, lines: Array<string>): Promise<Page> => {
   const context = await browser.newContext()
   const page = await context.newPage()
-  page.on("console", (message) => lines.push(`[${user}:${message.type()}] ${message.text()}`))
-  page.on("pageerror", (error) => lines.push(`[${user}:pageerror] ${error.message}`))
+  capture(page, user, lines)
   await page.goto("/")
   await page.locator(".login-user", { hasText: names[user] }).click()
   await page.locator(".login-password").fill(`${user}123`)
@@ -25,7 +37,10 @@ const signIn = async (browser: Browser, user: UserId, lines: Array<string>): Pro
 export const test = base.extend<{ readonly chat: Chat }>({
   chat: async ({ browser }, use, testInfo) => {
     const lines: Array<string> = []
-    await use({ signIn: (user) => signIn(browser, user, lines) })
+    await use({
+      signIn: (user) => signIn(browser, user, lines),
+      openTab: (page, label) => openTab(page, label, lines)
+    })
     if (testInfo.status === testInfo.expectedStatus) return
     const path = testInfo.outputPath("console.txt")
     writeFileSync(path, lines.join("\n"))

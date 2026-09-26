@@ -19,7 +19,7 @@ import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import { AtomRegistry } from "effect/unstable/reactivity"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import * as BrowserReplica from "../src/BrowserReplica.js"
+import * as ReplicaAtom from "../src/ReplicaAtom.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
@@ -215,7 +215,7 @@ describe("broad invalidation", () => {
     Effect.fnUntraced(function*() {
       chatReads.clear()
       noteReads = 0
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const mutation = graph.mutation(spaceId, PutManyMessages)

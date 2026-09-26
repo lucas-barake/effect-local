@@ -3,44 +3,45 @@ import type * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReact
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
-import type * as Model from "@lucas-barake/effect-local/Model"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import type * as Query from "@lucas-barake/effect-local/Query"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
-import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
-import * as Queue from "effect/Queue"
+import * as PubSub from "effect/PubSub"
 import * as Schema from "effect/Schema"
-import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
-import type * as broadcastRpc from "./broadcastRpc.js"
-import type * as Wire from "./multiTabWire.js"
 import * as replicaWire from "./replicaWire.js"
 import { decodeWith, encodeJson } from "./wireCodec.js"
 
 const isReplicaError = Schema.is(ReplicaError.ReplicaError)
 
+export interface OwnerResources {
+  readonly session: string
+  readonly replica: Replica.Service
+  readonly queryReactivity: QueryReactivity.Service
+  readonly ephemeral: EphemeralClient.Service
+  readonly invalidations: PubSub.PubSub<ReadonlyArray<string>>
+}
+
 export interface HostOptions {
   readonly definition: Definition.Any
   readonly ephemerals: ReadonlyArray<Ephemeral.Any>
   readonly profiles: ReadonlyMap<string, Ephemeral.AnyMember>
-  readonly replica: Replica.Service
-  readonly queryReactivity: QueryReactivity.Service
-  readonly ephemeral: EphemeralClient.Service
-  readonly server: broadcastRpc.ServerProtocol
-  readonly disconnectGrace: Duration.Input
+  readonly resources: OwnerResources
 }
 
 interface EphemeralSessionEntry {
-  readonly tabId: Wire.TabId
   readonly profileName: string
   readonly profile: Ephemeral.AnyMember
   readonly session: EphemeralClient.Session<Ephemeral.AnyMember>
-  readonly close: Effect.Effect<void>
+}
+
+interface SettlementConsumer {
+  streams: number
+  sequence: number
 }
 
 export const encodeReceipt = Effect.fnUntraced(function*(
@@ -94,37 +95,18 @@ export const encodeSettlement = Effect.fnUntraced(function*(
   return settlement
 })
 
-export const makeHost = Effect.fn("localBrowser.replicaHost")(function*(options: HostOptions) {
+export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(options: HostOptions) {
   const definition = options.definition
-  const graceMillis = Duration.toMillis(options.disconnectGrace)
+  const resources = options.resources
   const ephemeralByName = new Map<string, Ephemeral.Any>()
   for (const entry of options.ephemerals) {
     ephemeralByName.set(entry.name, entry)
   }
 
-  const retains = new Map<Wire.TabId, Map<string, Effect.Effect<void>>>()
   const sessions = new Map<string, EphemeralSessionEntry>()
-  const acks = new Map<Identity.SpaceId, Map<string, number>>()
+  const consumers = new Map<Identity.SpaceId, Map<string, SettlementConsumer>>()
   const applied = new Map<Identity.SpaceId, number>()
-
-  yield* Effect.addFinalizer(
-    Effect.fnUntraced(function*() {
-      const retainReleases = Array.from(retains.values()).flatMap((entries) => Array.from(entries.values()))
-      const sessionCloses = Array.from(sessions.values(), (entry) => entry.close)
-      retains.clear()
-      sessions.clear()
-      acks.clear()
-      applied.clear()
-      const exits = yield* Effect.forEach(
-        [...retainReleases, ...sessionCloses],
-        (release) => Effect.exit(release)
-      )
-      const failure = exits.find((exit) => exit._tag === "Failure")
-      if (failure !== undefined && failure._tag === "Failure") {
-        yield* Effect.failCause(failure.cause)
-      }
-    })
-  )
+  let nextHandle = 0
 
   const mutationFor = (name: string) =>
     Effect.suspend(() => {
@@ -171,83 +153,49 @@ export const makeHost = Effect.fn("localBrowser.replicaHost")(function*(options:
       return Effect.succeed(profile)
     })
 
-  const tabFor = (clientId: number): Wire.TabId | undefined => options.server.tabIdOf(clientId)
-
-  const sessionFor = (handle: string, clientId: number) =>
+  const sessionFor = (handle: string) =>
     Effect.suspend(() => {
       const entry = sessions.get(handle)
-      const tabId = tabFor(clientId)
-      if (entry === undefined || tabId === undefined || entry.tabId !== tabId) {
-        return Effect.fail(new replicaWire.WireUnknownSession({ handle }))
-      }
+      if (entry === undefined) return Effect.fail(new replicaWire.WireUnknownSession({ handle }))
       return Effect.succeed(entry)
     })
 
-  const applyAck = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
-    const perSpace = acks.get(spaceId)
-    if (perSpace === undefined || perSpace.size === 0) return
-    let minimum = Number.POSITIVE_INFINITY
-    for (const value of perSpace.values()) {
-      if (value < minimum) minimum = value
+  const applyAck = Effect.fnUntraced(function*(spaceId: Identity.SpaceId, floor: number) {
+    let minimum = floor
+    for (const consumer of consumers.get(spaceId)?.values() ?? []) {
+      if (consumer.sequence < minimum) minimum = consumer.sequence
     }
     const current = applied.get(spaceId) ?? 0
-    if (minimum <= current) return
-    const space = yield* options.replica.space(spaceId)
+    if (!Number.isFinite(minimum) || minimum <= current) return
+    const space = yield* resources.replica.space(spaceId)
     yield* space.acknowledgeSettlements(minimum)
     applied.set(spaceId, minimum)
   })
 
-  const ackFrom = Effect.fnUntraced(function*(
-    source: string,
-    spaceId: Identity.SpaceId,
-    sequence: number
-  ) {
-    let perSpace = acks.get(spaceId)
-    if (perSpace === undefined) {
-      perSpace = new Map()
-      acks.set(spaceId, perSpace)
-    }
-    const previous = perSpace.get(source) ?? 0
-    if (sequence > previous) perSpace.set(source, sequence)
-    yield* applyAck(spaceId)
-  })
-
-  const cleanupTab = Effect.fnUntraced(function*(tabId: Wire.TabId) {
-    const tabRetains = retains.get(tabId)
-    if (tabRetains !== undefined) {
-      retains.delete(tabId)
-      yield* Effect.forEach(tabRetains.values(), (release) => release, { discard: true })
-    }
-    const closing: Array<Effect.Effect<void>> = []
-    for (const [handle, entry] of sessions) {
-      if (entry.tabId === tabId) {
-        sessions.delete(handle)
-        closing.push(entry.close)
+  const openConsumer = (spaceId: Identity.SpaceId, consumer: string) =>
+    Effect.sync(() => {
+      let perSpace = consumers.get(spaceId)
+      if (perSpace === undefined) {
+        perSpace = new Map()
+        consumers.set(spaceId, perSpace)
       }
-    }
-    yield* Effect.forEach(closing, (close) => close, { discard: true })
-    const touched: Array<Identity.SpaceId> = []
-    for (const [spaceId, perSpace] of acks) {
-      if (perSpace.delete(tabId)) touched.push(spaceId)
-    }
-    yield* Effect.forEach(touched, (spaceId) => applyAck(spaceId), { discard: true })
-  })
+      const existing = perSpace.get(consumer)
+      if (existing === undefined) perSpace.set(consumer, { streams: 1, sequence: applied.get(spaceId) ?? 0 })
+      else existing.streams += 1
+    })
 
-  yield* Queue.take(options.server.tabDisconnects).pipe(
-    Effect.flatMap((tabId) =>
-      Effect.sleep(graceMillis).pipe(
-        Effect.andThen(Effect.suspend(() => {
-          if (options.server.isConnected(tabId)) return Effect.void
-          return cleanupTab(tabId)
-        })),
-        Effect.forkScoped
-      )
-    ),
-    Effect.forever,
-    Effect.forkScoped
-  )
+  const closeConsumer = (spaceId: Identity.SpaceId, consumer: string) =>
+    Effect.suspend(() => {
+      const perSpace = consumers.get(spaceId)
+      const existing = perSpace?.get(consumer)
+      if (perSpace === undefined || existing === undefined) return Effect.void
+      existing.streams -= 1
+      if (existing.streams > 0) return Effect.void
+      perSpace.delete(consumer)
+      return applyAck(spaceId, Number.POSITIVE_INFINITY).pipe(Effect.ignore)
+    })
 
-  const spaceFor = (spaceId: Identity.SpaceId) => options.replica.space(spaceId)
+  const spaceFor = (spaceId: Identity.SpaceId) => resources.replica.space(spaceId)
 
   const failMutation = (
     mutation: Mutation.Any,
@@ -274,384 +222,187 @@ export const makeHost = Effect.fn("localBrowser.replicaHost")(function*(options:
     )
   }
 
-  const layerHandlers = replicaWire.ReplicaRpcs.toLayer(Effect.succeed({
-    Join: (request: { readonly spaceId: Identity.SpaceId }) =>
-      options.replica.join(request.spaceId).pipe(Effect.asVoid),
-    Leave: (request: { readonly spaceId: Identity.SpaceId }) => options.replica.leave(request.spaceId),
-    Spaces: () =>
-      options.replica.spaces.pipe(
-        Effect.map((spaces) => spaces.map((space) => space.spaceId))
-      ),
-    AggregateStatus: () => options.replica.status,
-    SpaceScope: (request: { readonly spaceId: Identity.SpaceId }) =>
-      spaceFor(request.spaceId).pipe(Effect.flatMap((space) => space.scope)),
-    SetScope: (request: { readonly spaceId: Identity.SpaceId; readonly scope: Protocol.ReplicationScope }) =>
-      spaceFor(request.spaceId).pipe(Effect.flatMap((space) => space.setScope(request.scope))),
-    Activation: (request: { readonly spaceId: Identity.SpaceId }) =>
-      spaceFor(request.spaceId).pipe(Effect.flatMap((space) => space.activation)),
-    Activate: (request: { readonly spaceId: Identity.SpaceId }) =>
-      spaceFor(request.spaceId).pipe(Effect.flatMap((space) => space.activate)),
-    Deactivate: (request: { readonly spaceId: Identity.SpaceId }) =>
-      spaceFor(request.spaceId).pipe(Effect.flatMap((space) => space.deactivate)),
-    SpaceStatus: (request: { readonly spaceId: Identity.SpaceId }) =>
-      spaceFor(request.spaceId).pipe(Effect.flatMap((space) => space.status)),
-    Mutate: Effect.fnUntraced(
-      function*(request: {
-        readonly spaceId: Identity.SpaceId
-        readonly name: string
-        readonly payload: unknown
-      }) {
-        const mutation = yield* mutationFor(request.name)
-        const payload = yield* decodeWith(mutation.payloadSchema, request.payload)
-        const space = yield* spaceFor(request.spaceId)
-        // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The payload was decoded with this exact mutation's schema; Mutation.Any erases the payload type.
-        return yield* space.mutate(mutation, payload as never).pipe(
-          Effect.catch((error) => failMutation(mutation, error))
+  const wirePending = (entry: Replica.PendingMutation): Protocol.PendingMutation => ({
+    envelope: entry.envelope,
+    optimisticResult: null,
+    changes: entry.changes,
+    submissionState: entry.submissionState,
+    attempts: entry.attempts
+  })
+
+  const sessionFrames = (entry: EphemeralSessionEntry): Stream.Stream<
+    replicaWire.EphemeralSessionFrame,
+    ReplicaError.ReplicaError | replicaWire.WireUnknownDefinition
+  > => {
+    const members = entry.session.members.pipe(
+      Stream.mapEffect(Effect.forEach((item) =>
+        encodeJson(entry.profile.payloadSchema, item.value).pipe(
+          Effect.map((value) => ({ member: item.member, value, expiresAtMillis: item.expiresAtMillis }))
         )
-      }
-    ),
-    GetEntity: (request: {
-      readonly spaceId: Identity.SpaceId
-      readonly name: string
-      readonly key: unknown
-    }) =>
-      modelFor(request.name).pipe(
-        Effect.flatMap((model: Model.Any) =>
-          decodeWith(model.key, request.key).pipe(
-            Effect.flatMap((key) =>
-              spaceFor(request.spaceId).pipe(
-                Effect.flatMap((space) => space.get(model, key)),
-                Effect.flatMap(Option.match({
-                  onNone: () => Effect.succeedNone,
-                  onSome: (value) => encodeJson(model.schema, value).pipe(Effect.map(Option.some))
-                }))
-              )
-            )
-          )
-        )
-      ),
-    Query: Effect.fnUntraced(
-      function*(request: {
-        readonly spaceId: Identity.SpaceId
-        readonly name: string
-        readonly payload: unknown
-      }) {
-        const query = yield* queryFor(request.name)
-        const payload = yield* decodeWith(query.payloadSchema, request.payload)
-        const space = yield* spaceFor(request.spaceId)
-        // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The payload was decoded with this exact query's schema; Query.Any erases the payload type.
-        const result = yield* space.query(query, payload as never).pipe(
-          Effect.catch((error) => failQuery(query, error))
-        )
-        return yield* encodeJson(query.successSchema, result)
-      }
-    ),
-    ReceiptOf: (request: {
-      readonly spaceId: Identity.SpaceId
-      readonly name: string
-      readonly mutationId: Identity.MutationId
-    }) =>
-      mutationFor(request.name).pipe(
-        Effect.flatMap((mutation) =>
-          spaceFor(request.spaceId).pipe(
-            Effect.flatMap((space) => space.receipt(mutation, request.mutationId)),
-            Effect.flatMap(Option.match({
-              onNone: () => Effect.succeedNone,
-              onSome: (receipt) => encodeReceipt(definition, receipt).pipe(Effect.map(Option.some))
-            }))
-          )
-        )
-      ),
-    Pending: (request: { readonly spaceId: Identity.SpaceId }) =>
-      spaceFor(request.spaceId).pipe(
-        Effect.flatMap((space) => space.pending),
-        Effect.map((pending) =>
-          pending.map((entry): Protocol.PendingMutation => ({
-            envelope: entry.envelope,
-            optimisticResult: null,
-            changes: entry.changes,
-            submissionState: entry.submissionState,
-            attempts: entry.attempts
-          }))
-        )
-      ),
-    PendingFor: (request: { readonly spaceId: Identity.SpaceId; readonly name: string }) =>
-      mutationFor(request.name).pipe(
-        Effect.flatMap((mutation) =>
-          spaceFor(request.spaceId).pipe(
-            Effect.flatMap((space) => space.pendingFor(mutation)),
-            Effect.map((pending) =>
-              pending.map((entry): Protocol.PendingMutation => ({
-                envelope: entry.envelope,
-                optimisticResult: null,
-                changes: entry.changes,
-                submissionState: entry.submissionState,
-                attempts: entry.attempts
+      )),
+      Stream.map((entries): replicaWire.EphemeralSessionFrame => ({ _tag: "Members", entries }))
+    )
+    const projections = options.ephemerals.map((ephemeralDefinition) => {
+      if (ephemeralDefinition.kind === "event") {
+        return entry.session.events(ephemeralDefinition).pipe(
+          Stream.mapEffect((envelope) =>
+            encodeJson(ephemeralDefinition.payloadSchema, envelope.payload).pipe(
+              Effect.map((payload): replicaWire.EphemeralSessionFrame => ({
+                _tag: "Event",
+                name: ephemeralDefinition.name,
+                member: envelope.member,
+                payload
               }))
             )
           )
         )
+      }
+      return entry.session.state(ephemeralDefinition).pipe(
+        Stream.mapEffect(Effect.forEach((item) =>
+          Effect.all({
+            key: encodeJson(ephemeralDefinition.keySchema, item.key),
+            value: encodeJson(ephemeralDefinition.payloadSchema, item.value)
+          }).pipe(
+            Effect.map(({ key, value }) => ({
+              member: item.member,
+              key,
+              value,
+              expiresAtMillis: item.expiresAtMillis
+            }))
+          )
+        )),
+        Stream.map((entries): replicaWire.EphemeralSessionFrame => ({
+          _tag: "State",
+          name: ephemeralDefinition.name,
+          entries
+        }))
+      )
+    })
+    return Stream.mergeAll([members, ...projections], { concurrency: "unbounded" }).pipe(
+      Stream.catchTag(
+        "EphemeralDecodeError",
+        () => Stream.fail(new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: entry.profileName }))
+      )
+    )
+  }
+
+  const retainedLease = Stream.concat(Stream.succeed(undefined), Stream.never)
+
+  return replicaWire.ReplicaEntity.of({
+    Join: ({ payload }) => resources.replica.join(payload.spaceId).pipe(Effect.asVoid),
+    Leave: ({ payload }) => resources.replica.leave(payload.spaceId),
+    Spaces: () => resources.replica.spaces.pipe(Effect.map((spaces) => spaces.map((space) => space.spaceId))),
+    AggregateStatus: () => resources.replica.status,
+    SpaceScope: ({ payload }) => spaceFor(payload.spaceId).pipe(Effect.flatMap((space) => space.scope)),
+    SetScope: ({ payload }) => spaceFor(payload.spaceId).pipe(Effect.flatMap((space) => space.setScope(payload.scope))),
+    Activation: ({ payload }) => spaceFor(payload.spaceId).pipe(Effect.flatMap((space) => space.activation)),
+    Activate: ({ payload }) => spaceFor(payload.spaceId).pipe(Effect.flatMap((space) => space.activate)),
+    Deactivate: ({ payload }) => spaceFor(payload.spaceId).pipe(Effect.flatMap((space) => space.deactivate)),
+    SpaceStatus: ({ payload }) => spaceFor(payload.spaceId).pipe(Effect.flatMap((space) => space.status)),
+    Mutate: Effect.fnUntraced(function*({ payload: request }) {
+      const mutation = yield* mutationFor(request.name)
+      const payload = yield* decodeWith(mutation.payloadSchema, request.payload)
+      const space = yield* spaceFor(request.spaceId)
+      return yield* space.mutate(mutation, payload, { mutationId: request.mutationId }).pipe(
+        Effect.catch((error) => failMutation(mutation, error))
+      )
+    }),
+    GetEntity: Effect.fnUntraced(function*({ payload: request }) {
+      const model = yield* modelFor(request.name)
+      const key = yield* decodeWith(model.key, request.key)
+      const space = yield* spaceFor(request.spaceId)
+      const value = yield* space.get(model, key)
+      if (Option.isNone(value)) return Option.none()
+      return Option.some(yield* encodeJson(model.schema, value.value))
+    }),
+    Query: Effect.fnUntraced(function*({ payload: request }) {
+      const query = yield* queryFor(request.name)
+      const payload = yield* decodeWith(query.payloadSchema, request.payload)
+      const space = yield* spaceFor(request.spaceId)
+      const result = yield* space.query(query, payload).pipe(
+        Effect.catch((error) => failQuery(query, error))
+      )
+      return yield* encodeJson(query.successSchema, result)
+    }),
+    ReceiptOf: Effect.fnUntraced(function*({ payload: request }) {
+      const mutation = yield* mutationFor(request.name)
+      const space = yield* spaceFor(request.spaceId)
+      const receipt = yield* space.receipt(mutation, request.mutationId)
+      if (Option.isNone(receipt)) return Option.none()
+      return Option.some(yield* encodeReceipt(definition, receipt.value))
+    }),
+    Pending: ({ payload }) =>
+      spaceFor(payload.spaceId).pipe(
+        Effect.flatMap((space) => space.pending),
+        Effect.map((pending) => pending.map(wirePending))
       ),
-    Settlements: (request: {
-      readonly spaceId: Identity.SpaceId
-      readonly from?: Replica.SettlementStart | undefined
-      readonly name?: string | undefined
-    }) => {
+    PendingFor: Effect.fnUntraced(function*({ payload: request }) {
+      const mutation = yield* mutationFor(request.name)
+      const space = yield* spaceFor(request.spaceId)
+      const pending = yield* space.pendingFor(mutation)
+      return pending.map(wirePending)
+    }),
+    Settlements: ({ payload: request }) => {
       const settlementOptions: Replica.SettlementOptions = { from: request.from }
       const name = request.name
-      if (name === undefined) {
-        return Stream.unwrap(
-          spaceFor(request.spaceId).pipe(
-            Effect.map((space) => space.settlements(settlementOptions))
-          )
-        ).pipe(
-          Stream.mapEffect((settled) => encodeSettlement(definition, settled))
-        )
-      }
-      return Stream.unwrap(
-        Effect.all([mutationFor(name), spaceFor(request.spaceId)]).pipe(
-          Effect.map(([mutation, space]) => space.settlementsFor(mutation, settlementOptions))
-        )
-      ).pipe(
-        Stream.mapEffect((settled) => encodeSettlement(definition, settled))
-      )
-    },
-    AcknowledgeSettlements: (
-      request: { readonly spaceId: Identity.SpaceId; readonly sequence: number },
-      context: { readonly client: { readonly id: number } }
-    ) =>
-      Effect.suspend(() => {
-        const tabId = tabFor(context.client.id)
-        if (tabId === undefined) return Effect.void
-        return ackFrom(tabId, request.spaceId, request.sequence)
-      }),
-    QuarantineList: (request: { readonly spaceId: Identity.SpaceId }) =>
-      spaceFor(request.spaceId).pipe(Effect.flatMap((space) => space.quarantine)),
-    DiscardQuarantined: (request: {
-      readonly spaceId: Identity.SpaceId
-      readonly mutationId: Identity.MutationId
-    }) =>
-      spaceFor(request.spaceId).pipe(
-        Effect.flatMap((space) => space.discardQuarantined(request.mutationId))
-      ),
-    ResubmitQuarantined: Effect.fnUntraced(
-      function*(request: {
-        readonly spaceId: Identity.SpaceId
-        readonly mutationId: Identity.MutationId
-        readonly name: string
-        readonly payload: unknown
-      }) {
-        const mutation = yield* mutationFor(request.name)
-        const payload = yield* decodeWith(mutation.payloadSchema, request.payload)
+      const settled = Stream.unwrap(Effect.gen(function*() {
         const space = yield* spaceFor(request.spaceId)
-        // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The payload was decoded with this exact mutation's schema; Mutation.Any erases the payload type.
-        return yield* space.resubmitQuarantined(request.mutationId, mutation, payload as never).pipe(
-          Effect.catch((error) => failMutation(mutation, error))
-        )
-      }
-    ),
-    Retain: (
-      request: { readonly key: string },
-      context: { readonly client: { readonly id: number } }
-    ) =>
+        if (name === undefined) return space.settlements(settlementOptions)
+        const mutation = yield* mutationFor(name)
+        return space.settlementsFor(mutation, settlementOptions)
+      }))
+      return Stream.unwrap(
+        Effect.acquireRelease(
+          openConsumer(request.spaceId, request.consumer),
+          () => closeConsumer(request.spaceId, request.consumer)
+        ).pipe(Effect.as(settled))
+      ).pipe(Stream.mapEffect((entry) => encodeSettlement(definition, entry)))
+    },
+    AcknowledgeSettlements: ({ payload: request }) =>
       Effect.suspend(() => {
-        const tabId = tabFor(context.client.id)
-        if (tabId === undefined) return Effect.void
-        let tabRetains = retains.get(tabId)
-        if (tabRetains === undefined) {
-          tabRetains = new Map()
-          retains.set(tabId, tabRetains)
-        }
-        if (tabRetains.has(request.key)) return Effect.void
-        const target = tabRetains
-        return options.queryReactivity.retain(request.key).pipe(
-          Effect.map((release) => {
-            target.set(request.key, release)
-          })
+        const consumer = consumers.get(request.spaceId)?.get(request.consumer)
+        if (consumer === undefined) return applyAck(request.spaceId, request.sequence)
+        if (request.sequence > consumer.sequence) consumer.sequence = request.sequence
+        return applyAck(request.spaceId, Number.POSITIVE_INFINITY)
+      }),
+    QuarantineList: ({ payload }) => spaceFor(payload.spaceId).pipe(Effect.flatMap((space) => space.quarantine)),
+    DiscardQuarantined: ({ payload }) =>
+      spaceFor(payload.spaceId).pipe(Effect.flatMap((space) => space.discardQuarantined(payload.mutationId))),
+    ResubmitQuarantined: Effect.fnUntraced(function*({ payload: request }) {
+      const mutation = yield* mutationFor(request.name)
+      const payload = yield* decodeWith(mutation.payloadSchema, request.payload)
+      const space = yield* spaceFor(request.spaceId)
+      return yield* space.resubmitQuarantined(request.mutationId, mutation, payload).pipe(
+        Effect.catch((error) => failMutation(mutation, error))
+      )
+    }),
+    Retain: ({ payload }) =>
+      Stream.unwrap(
+        Effect.acquireRelease(resources.queryReactivity.retain(payload.key), (release) => release).pipe(
+          Effect.as(retainedLease)
         )
-      }),
-    Release: (
-      request: { readonly key: string },
-      context: { readonly client: { readonly id: number } }
-    ) =>
-      Effect.suspend(() => {
-        const tabId = tabFor(context.client.id)
-        if (tabId === undefined) return Effect.void
-        const tabRetains = retains.get(tabId)
-        const release = tabRetains?.get(request.key)
-        if (tabRetains === undefined || release === undefined) return Effect.void
-        tabRetains.delete(request.key)
-        return release
-      }),
-    EphemeralOpen: Effect.fnUntraced(
-      function*(
-        request: {
-          readonly handle: string
-          readonly name: string
-          readonly spaceId: Identity.SpaceId
-          readonly member: Protocol.EphemeralMember
-          readonly value: unknown
-          readonly ttlMillis: number
-        },
-        context: { readonly client: { readonly id: number } }
-      ) {
-        if (sessions.has(request.handle)) return
-        const tabId = tabFor(context.client.id)
-        if (tabId === undefined) return
+      ),
+    Invalidations: () =>
+      Stream.unwrap(
+        PubSub.subscribe(resources.invalidations).pipe(
+          Effect.map((subscription) =>
+            Stream.concat(
+              Stream.succeed<replicaWire.InvalidationFrame>({ _tag: "Session", session: resources.session }),
+              Stream.fromSubscription(subscription).pipe(
+                Stream.map((keys): replicaWire.InvalidationFrame => ({ _tag: "Keys", keys }))
+              )
+            )
+          )
+        )
+      ),
+    EphemeralSession: ({ payload: request }) =>
+      Stream.unwrap(Effect.gen(function*() {
         const profile = yield* profileFor(request.name)
         const value = yield* decodeWith(profile.payloadSchema, request.value)
-        const scope = yield* Scope.make()
-        const session = yield* options.ephemeral.session(profile, {
+        const session = yield* resources.ephemeral.session(profile, {
           spaceId: request.spaceId,
           member: request.member,
-          // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The profile's payload type is erased by AnyMember; the value was decoded with this exact profile's schema.
-          value: value as never,
-          ttl: request.ttlMillis
-        }).pipe(
-          Scope.provide(scope),
-          Effect.catchTag(
-            "EphemeralEncodeError",
-            () => Effect.fail(new replicaWire.WireEphemeralEncodeError({ name: request.name }))
-          ),
-          Effect.onError((cause) => Scope.close(scope, Exit.failCause(cause)))
-        )
-        sessions.set(request.handle, {
-          tabId,
-          profileName: request.name,
-          profile,
-          session,
-          close: Scope.close(scope, Exit.void)
-        })
-      }
-    ),
-    EphemeralClose: (
-      request: { readonly handle: string },
-      context: { readonly client: { readonly id: number } }
-    ) =>
-      sessionFor(request.handle, context.client.id).pipe(
-        Effect.flatMap((entry) => {
-          sessions.delete(request.handle)
-          return entry.close
-        })
-      ),
-    EphemeralUpdateMember: (
-      request: { readonly handle: string; readonly value: unknown },
-      context: { readonly client: { readonly id: number } }
-    ) =>
-      sessionFor(request.handle, context.client.id).pipe(
-        Effect.flatMap((entry) =>
-          decodeWith(entry.profile.payloadSchema, request.value).pipe(
-            Effect.flatMap((value) =>
-              // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The profile's payload type is erased by AnyMember; the value was decoded with this exact profile's schema.
-              entry.session.updateMember(value as never).pipe(
-                Effect.catchTag(
-                  "EphemeralEncodeError",
-                  () => Effect.fail(new replicaWire.WireEphemeralEncodeError({ name: entry.profileName }))
-                )
-              )
-            )
-          )
-        )
-      ),
-    EphemeralEvents: (
-      request: { readonly handle: string; readonly name: string },
-      context: { readonly client: { readonly id: number } }
-    ) =>
-      Stream.unwrap(
-        Effect.all([sessionFor(request.handle, context.client.id), ephemeralFor(request.name)]).pipe(
-          Effect.map(([entry, event]) => {
-            if (event.kind !== "event") {
-              return Stream.fail(new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name }))
-            }
-            return entry.session.events(event).pipe(
-              Stream.mapEffect((envelope) =>
-                encodeJson(event.payloadSchema, envelope.payload).pipe(
-                  Effect.map((payload) => ({ member: envelope.member, payload }))
-                )
-              ),
-              Stream.catchTag(
-                "EphemeralDecodeError",
-                () => Stream.fail(new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name }))
-              )
-            )
-          })
-        )
-      ),
-    EphemeralState: (
-      request: { readonly handle: string; readonly name: string },
-      context: { readonly client: { readonly id: number } }
-    ) =>
-      Stream.unwrap(
-        Effect.all([sessionFor(request.handle, context.client.id), ephemeralFor(request.name)]).pipe(
-          Effect.map(([entry, state]) => {
-            if (state.kind !== "state") {
-              return Stream.fail(
-                new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name })
-              )
-            }
-            return entry.session.state(state).pipe(
-              Stream.mapEffect(Effect.forEach((item) =>
-                Effect.all({
-                  key: encodeJson(state.keySchema, item.key),
-                  value: encodeJson(state.payloadSchema, item.value)
-                }).pipe(
-                  Effect.map(({ key, value }) => ({
-                    member: item.member,
-                    key,
-                    value,
-                    expiresAtMillis: item.expiresAtMillis
-                  }))
-                )
-              )),
-              Stream.catchTag("EphemeralDecodeError", () =>
-                Stream.fail(new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name })))
-            )
-          })
-        )
-      ),
-    EphemeralMembers: (
-      request: { readonly handle: string },
-      context: { readonly client: { readonly id: number } }
-    ) =>
-      Stream.unwrap(
-        sessionFor(request.handle, context.client.id).pipe(
-          Effect.map((entry) =>
-            entry.session.members.pipe(
-              Stream.mapEffect(Effect.forEach((item) =>
-                encodeJson(entry.profile.payloadSchema, item.value).pipe(
-                  Effect.map((value) => ({
-                    member: item.member,
-                    value,
-                    expiresAtMillis: item.expiresAtMillis
-                  }))
-                )
-              )),
-              Stream.catchTag("EphemeralDecodeError", () =>
-                Stream.fail(
-                  new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: entry.profileName })
-                ))
-            )
-          )
-        )
-      ),
-    EphemeralPublishEvent: Effect.fnUntraced(
-      function*(request: {
-        readonly name: string
-        readonly spaceId: Identity.SpaceId
-        readonly member: Protocol.EphemeralMember
-        readonly payload: unknown
-        readonly ttlMillis: number
-      }) {
-        const event = yield* ephemeralFor(request.name)
-        if (event.kind !== "event") {
-          return yield* Effect.fail(new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name }))
-        }
-        const payload = yield* decodeWith(event.payloadSchema, request.payload)
-        return yield* options.ephemeral.publish(event, {
-          spaceId: request.spaceId,
-          member: request.member,
-          // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The payload was decoded with this exact definition's schema; AnyEvent erases the payload type.
-          payload: payload as never,
+          value,
           ttl: request.ttlMillis
         }).pipe(
           Effect.catchTag(
@@ -659,81 +410,88 @@ export const makeHost = Effect.fn("localBrowser.replicaHost")(function*(options:
             () => Effect.fail(new replicaWire.WireEphemeralEncodeError({ name: request.name }))
           )
         )
-      }
-    ),
-    EphemeralPublishState: Effect.fnUntraced(
-      function*(request: {
-        readonly name: string
-        readonly spaceId: Identity.SpaceId
-        readonly member: Protocol.EphemeralMember
-        readonly key: unknown
-        readonly payload: unknown
-        readonly ttlMillis: number
-      }) {
-        const state = yield* ephemeralFor(request.name)
-        if (state.kind !== "state") {
-          return yield* Effect.fail(new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name }))
-        }
-        const key = yield* decodeWith(state.keySchema, request.key)
-        const payload = yield* decodeWith(state.payloadSchema, request.payload)
-        return yield* options.ephemeral.publish(state, {
-          spaceId: request.spaceId,
-          member: request.member,
-          // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The key was decoded with this exact definition's key schema; AnyState erases the key type.
-          key: key as never,
-          // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The payload was decoded with this exact definition's schema; AnyState erases the payload type.
-          payload: payload as never,
-          ttl: request.ttlMillis
-        }).pipe(
-          Effect.catchTag(
-            "EphemeralEncodeError",
-            () => Effect.fail(new replicaWire.WireEphemeralEncodeError({ name: request.name }))
-          )
+        const handle = `${resources.session}:${nextHandle++}`
+        const entry: EphemeralSessionEntry = { profileName: request.name, profile, session }
+        yield* Effect.acquireRelease(
+          Effect.sync(() => sessions.set(handle, entry)),
+          () => Effect.sync(() => sessions.delete(handle))
         )
-      }
-    ),
-    EphemeralClear: Effect.fnUntraced(
-      function*(request: {
-        readonly name: string
-        readonly spaceId: Identity.SpaceId
-        readonly member: Protocol.EphemeralMember
-      }) {
-        const event = yield* ephemeralFor(request.name)
-        if (event.kind !== "event") {
-          return yield* Effect.fail(new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name }))
-        }
-        return yield* options.ephemeral.clear(event, { spaceId: request.spaceId, member: request.member })
-      }
-    ),
-    EphemeralRemove: Effect.fnUntraced(
-      function*(request: {
-        readonly name: string
-        readonly spaceId: Identity.SpaceId
-        readonly member: Protocol.EphemeralMember
-        readonly key: unknown
-      }) {
-        const state = yield* ephemeralFor(request.name)
-        if (state.kind !== "state") {
-          return yield* Effect.fail(new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name }))
-        }
-        const key = yield* decodeWith(state.keySchema, request.key)
-        return yield* options.ephemeral.remove(state, {
-          spaceId: request.spaceId,
-          member: request.member,
-          // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The key was decoded with this exact definition's key schema; AnyState erases the key type.
-          key: key as never
-        }).pipe(
-          Effect.catchTag(
-            "EphemeralEncodeError",
-            () => Effect.fail(new replicaWire.WireEphemeralEncodeError({ name: request.name }))
-          )
+        return Stream.concat(
+          Stream.succeed<replicaWire.EphemeralSessionFrame>({ _tag: "Opened", handle }),
+          sessionFrames(entry)
         )
+      })),
+    EphemeralUpdateMember: Effect.fnUntraced(function*({ payload: request }) {
+      const entry = yield* sessionFor(request.handle)
+      const value = yield* decodeWith(entry.profile.payloadSchema, request.value)
+      return yield* entry.session.updateMember(value).pipe(
+        Effect.catchTag(
+          "EphemeralEncodeError",
+          () => Effect.fail(new replicaWire.WireEphemeralEncodeError({ name: entry.profileName }))
+        )
+      )
+    }),
+    EphemeralPublishEvent: Effect.fnUntraced(function*({ payload: request }) {
+      const event = yield* ephemeralFor(request.name)
+      if (event.kind !== "event") {
+        return yield* new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name })
       }
-    )
-  }))
-
-  return {
-    layerHandlers,
-    acknowledgeLocal: (spaceId: Identity.SpaceId, sequence: number) => ackFrom("$local", spaceId, sequence)
-  }
+      const payload = yield* decodeWith(event.payloadSchema, request.payload)
+      return yield* resources.ephemeral.publish(event, {
+        spaceId: request.spaceId,
+        member: request.member,
+        payload,
+        ttl: request.ttlMillis
+      }).pipe(
+        Effect.catchTag(
+          "EphemeralEncodeError",
+          () => Effect.fail(new replicaWire.WireEphemeralEncodeError({ name: request.name }))
+        )
+      )
+    }),
+    EphemeralPublishState: Effect.fnUntraced(function*({ payload: request }) {
+      const state = yield* ephemeralFor(request.name)
+      if (state.kind !== "state") {
+        return yield* new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name })
+      }
+      const key = yield* decodeWith(state.keySchema, request.key)
+      const payload = yield* decodeWith(state.payloadSchema, request.payload)
+      return yield* resources.ephemeral.publish(state, {
+        spaceId: request.spaceId,
+        member: request.member,
+        key,
+        payload,
+        ttl: request.ttlMillis
+      }).pipe(
+        Effect.catchTag(
+          "EphemeralEncodeError",
+          () => Effect.fail(new replicaWire.WireEphemeralEncodeError({ name: request.name }))
+        )
+      )
+    }),
+    EphemeralClear: Effect.fnUntraced(function*({ payload: request }) {
+      const event = yield* ephemeralFor(request.name)
+      if (event.kind !== "event") {
+        return yield* new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name })
+      }
+      return yield* resources.ephemeral.clear(event, { spaceId: request.spaceId, member: request.member })
+    }),
+    EphemeralRemove: Effect.fnUntraced(function*({ payload: request }) {
+      const state = yield* ephemeralFor(request.name)
+      if (state.kind !== "state") {
+        return yield* new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: request.name })
+      }
+      const key = yield* decodeWith(state.keySchema, request.key)
+      return yield* resources.ephemeral.remove(state, {
+        spaceId: request.spaceId,
+        member: request.member,
+        key
+      }).pipe(
+        Effect.catchTag(
+          "EphemeralEncodeError",
+          () => Effect.fail(new replicaWire.WireEphemeralEncodeError({ name: request.name }))
+        )
+      )
+    })
+  })
 })

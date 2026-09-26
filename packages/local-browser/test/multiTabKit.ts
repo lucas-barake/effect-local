@@ -1,6 +1,7 @@
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as EffectLayer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Scope from "effect/Scope"
 import * as platform from "../src/internal/platform.js"
@@ -22,22 +23,21 @@ interface MemoryWaiter {
 interface MemoryLock {
   holder: MemoryHolder | undefined
   readonly queue: Array<MemoryWaiter>
+  readonly releases: Array<Deferred.Deferred<void>>
 }
 
 export interface MemoryPlatform {
   readonly tabChannel: platform.TabChannelService
   readonly webLocks: platform.WebLocksService
-  readonly epochStore: platform.EpochStoreService
   readonly clientIdentityStore: platform.ClientIdentityStoreService
   readonly layerAll: EffectLayer.Layer<
-    platform.TabChannel | platform.WebLocks | platform.EpochStore | platform.ClientIdentityStore
+    platform.TabChannel | platform.WebLocks | platform.ClientIdentityStore
   >
 }
 
 export const makeMemoryPlatform = Effect.sync((): MemoryPlatform => {
   const channels = new Map<string, Set<MemoryConnection>>()
   const locks = new Map<string, MemoryLock>()
-  const epochs = new Map<string, number>()
   const identities = new Map<string, string>()
 
   const tabChannel: platform.TabChannelService = {
@@ -81,7 +81,7 @@ export const makeMemoryPlatform = Effect.sync((): MemoryPlatform => {
   const lockState = (name: string): MemoryLock => {
     let state = locks.get(name)
     if (state === undefined) {
-      state = { holder: undefined, queue: [] }
+      state = { holder: undefined, queue: [], releases: [] }
       locks.set(name, state)
     }
     return state
@@ -96,6 +96,7 @@ export const makeMemoryPlatform = Effect.sync((): MemoryPlatform => {
       Deferred.doneUnsafe(waiter.grant, Effect.void)
       return
     }
+    for (const release of state.releases.splice(0)) Deferred.doneUnsafe(release, Effect.void)
   }
 
   const webLocks: platform.WebLocksService = {
@@ -130,16 +131,37 @@ export const makeMemoryPlatform = Effect.sync((): MemoryPlatform => {
       )
       const hold: platform.WebLockHold = { lost: Deferred.await(lost) }
       return hold
-    })
-  }
-
-  const epochStore: platform.EpochStoreService = {
-    bump: (key) =>
+    }),
+    tryAcquire: Effect.fnUntraced(function*(name) {
+      const scope = yield* Effect.scope
+      const state = lockState(name)
+      if (state.holder !== undefined || state.queue.length > 0) return Option.none<platform.WebLockHold>()
+      const lost = yield* Deferred.make<void>()
+      const holder: MemoryHolder = { lost }
+      state.holder = holder
+      yield* Scope.addFinalizer(
+        scope,
+        Effect.sync(() => {
+          if (state.holder === holder) promoteNext(state)
+        })
+      )
+      return Option.some<platform.WebLockHold>({ lost: Deferred.await(lost) })
+    }),
+    held: (prefix) =>
       Effect.sync(() => {
-        const next = (epochs.get(key) ?? 0) + 1
-        epochs.set(key, next)
-        return next
-      })
+        const names: Array<string> = []
+        for (const [name, state] of locks) {
+          if (state.holder !== undefined && name.startsWith(prefix)) names.push(name)
+        }
+        return names
+      }),
+    released: Effect.fnUntraced(function*(name) {
+      const state = lockState(name)
+      if (state.holder === undefined) return
+      const release = yield* Deferred.make<void>()
+      state.releases.push(release)
+      yield* Deferred.await(release)
+    })
   }
 
   const clientIdentityStore: platform.ClientIdentityStoreService = {
@@ -153,12 +175,10 @@ export const makeMemoryPlatform = Effect.sync((): MemoryPlatform => {
   return {
     tabChannel,
     webLocks,
-    epochStore,
     clientIdentityStore,
     layerAll: EffectLayer.mergeAll(
       EffectLayer.succeed(platform.TabChannel, tabChannel),
       EffectLayer.succeed(platform.WebLocks, webLocks),
-      EffectLayer.succeed(platform.EpochStore, epochStore),
       EffectLayer.succeed(platform.ClientIdentityStore, clientIdentityStore)
     )
   }

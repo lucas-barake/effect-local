@@ -5,6 +5,7 @@ import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Schema from "effect/Schema"
+import * as Entity from "effect/unstable/cluster/Entity"
 import * as Rpc from "effect/unstable/rpc/Rpc"
 import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 
@@ -135,7 +136,7 @@ export class SpaceStatus extends Rpc.make("SpaceStatus", {
 }) {}
 
 export class Mutate extends Rpc.make("Mutate", {
-  payload: { spaceId: Identity.SpaceId, name: Schema.String, payload: Schema.Json },
+  payload: { spaceId: Identity.SpaceId, name: Schema.String, payload: Schema.Json, mutationId: Identity.MutationId },
   success: Protocol.PendingMutation,
   error: MutateError
 }) {}
@@ -173,6 +174,7 @@ export class PendingFor extends Rpc.make("PendingFor", {
 export class Settlements extends Rpc.make("Settlements", {
   payload: {
     spaceId: Identity.SpaceId,
+    consumer: Schema.String,
     from: Schema.optional(SettlementStart),
     name: Schema.optional(Schema.String)
   },
@@ -182,7 +184,7 @@ export class Settlements extends Rpc.make("Settlements", {
 }) {}
 
 export class AcknowledgeSettlements extends Rpc.make("AcknowledgeSettlements", {
-  payload: { spaceId: Identity.SpaceId, sequence: Schema.Int },
+  payload: { spaceId: Identity.SpaceId, consumer: Schema.String, sequence: Schema.Int },
   success: Schema.Void,
   error: ReplicaError.ReplicaError
 }) {}
@@ -213,63 +215,20 @@ export class ResubmitQuarantined extends Rpc.make("ResubmitQuarantined", {
 export class Retain extends Rpc.make("Retain", {
   payload: { key: Schema.String },
   success: Schema.Void,
-  error: Schema.Never
-}) {}
-
-export class Release extends Rpc.make("Release", {
-  payload: { key: Schema.String },
-  success: Schema.Void,
-  error: Schema.Never
-}) {}
-
-export class EphemeralOpen extends Rpc.make("EphemeralOpen", {
-  payload: {
-    handle: Schema.String,
-    name: Schema.String,
-    spaceId: Identity.SpaceId,
-    member: Protocol.EphemeralMember,
-    value: Schema.Json,
-    ttlMillis: Schema.Int
-  },
-  success: Schema.Void,
-  error: EphemeralError
-}) {}
-
-export class EphemeralClose extends Rpc.make("EphemeralClose", {
-  payload: { handle: Schema.String },
-  success: Schema.Void,
-  error: WireUnknownSession
-}) {}
-
-export class EphemeralUpdateMember extends Rpc.make("EphemeralUpdateMember", {
-  payload: { handle: Schema.String, value: Schema.Json },
-  success: Schema.Void,
-  error: EphemeralError
-}) {}
-
-export const EphemeralEventFrame = Schema.Struct({
-  member: Protocol.EphemeralMember,
-  payload: Schema.Json
-})
-
-export class EphemeralEvents extends Rpc.make("EphemeralEvents", {
-  payload: { handle: Schema.String, name: Schema.String },
-  success: EphemeralEventFrame,
-  error: EphemeralError,
+  error: Schema.Never,
   stream: true
 }) {}
 
-export const EphemeralStateFrame = Schema.Struct({
-  member: Protocol.EphemeralMember,
-  key: Schema.Json,
-  value: Schema.Json,
-  expiresAtMillis: Schema.Number
-})
+export const InvalidationFrame = Schema.Union([
+  Schema.TaggedStruct("Session", { session: Schema.String }),
+  Schema.TaggedStruct("Keys", { keys: Schema.Array(Schema.String) })
+])
+export type InvalidationFrame = typeof InvalidationFrame.Type
 
-export class EphemeralState extends Rpc.make("EphemeralState", {
-  payload: { handle: Schema.String, name: Schema.String },
-  success: Schema.Array(EphemeralStateFrame),
-  error: EphemeralError,
+export class Invalidations extends Rpc.make("Invalidations", {
+  payload: {},
+  success: InvalidationFrame,
+  error: Schema.Never,
   stream: true
 }) {}
 
@@ -279,11 +238,38 @@ export const EphemeralMemberFrame = Schema.Struct({
   expiresAtMillis: Schema.Number
 })
 
-export class EphemeralMembers extends Rpc.make("EphemeralMembers", {
-  payload: { handle: Schema.String },
-  success: Schema.Array(EphemeralMemberFrame),
+export const EphemeralStateFrame = Schema.Struct({
+  member: Protocol.EphemeralMember,
+  key: Schema.Json,
+  value: Schema.Json,
+  expiresAtMillis: Schema.Number
+})
+
+export const EphemeralSessionFrame = Schema.Union([
+  Schema.TaggedStruct("Opened", { handle: Schema.String }),
+  Schema.TaggedStruct("Members", { entries: Schema.Array(EphemeralMemberFrame) }),
+  Schema.TaggedStruct("Event", { name: Schema.String, member: Protocol.EphemeralMember, payload: Schema.Json }),
+  Schema.TaggedStruct("State", { name: Schema.String, entries: Schema.Array(EphemeralStateFrame) })
+])
+export type EphemeralSessionFrame = typeof EphemeralSessionFrame.Type
+
+export class EphemeralSession extends Rpc.make("EphemeralSession", {
+  payload: {
+    name: Schema.String,
+    spaceId: Identity.SpaceId,
+    member: Protocol.EphemeralMember,
+    value: Schema.Json,
+    ttlMillis: Schema.Int
+  },
+  success: EphemeralSessionFrame,
   error: EphemeralError,
   stream: true
+}) {}
+
+export class EphemeralUpdateMember extends Rpc.make("EphemeralUpdateMember", {
+  payload: { handle: Schema.String, value: Schema.Json },
+  success: Schema.Void,
+  error: EphemeralError
 }) {}
 
 export class EphemeralPublishEvent extends Rpc.make("EphemeralPublishEvent", {
@@ -355,15 +341,13 @@ export const ReplicaRpcs = RpcGroup.make(
   DiscardQuarantined,
   ResubmitQuarantined,
   Retain,
-  Release,
-  EphemeralOpen,
-  EphemeralClose,
+  Invalidations,
+  EphemeralSession,
   EphemeralUpdateMember,
-  EphemeralEvents,
-  EphemeralState,
-  EphemeralMembers,
   EphemeralPublishEvent,
   EphemeralPublishState,
   EphemeralClear,
   EphemeralRemove
 )
+
+export const ReplicaEntity = Entity.fromRpcGroup("@lucas-barake/effect-local-browser/Replica", ReplicaRpcs)

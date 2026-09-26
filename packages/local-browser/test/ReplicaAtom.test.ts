@@ -35,7 +35,7 @@ import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { Atom, AtomRegistry } from "effect/unstable/reactivity"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import * as BrowserReplica from "../src/BrowserReplica.js"
+import * as ReplicaAtom from "../src/ReplicaAtom.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
@@ -335,7 +335,7 @@ describe("Replica Atom graph", () => {
           }]
         })
       )
-      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const graph = ReplicaAtom.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const session = graph.ephemeral(StatusProfile, statusSessionOptions)
@@ -396,7 +396,7 @@ describe("Replica Atom graph", () => {
       const harness = yield* makeEphemeralHarness({ gatePublishes: 1 })
       yield* Queue.offer(harness.messages, ephemeralStarted)
       yield* Queue.offer(harness.messages, ephemeralSnapshot(1))
-      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const graph = ReplicaAtom.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const session = graph.ephemeral(StatusProfile, statusSessionOptions)
@@ -465,7 +465,7 @@ describe("Replica Atom graph", () => {
       const harness = yield* makeEphemeralHarness()
       yield* Queue.offer(harness.messages, ephemeralStarted)
       yield* Queue.offer(harness.messages, ephemeralSnapshot(1))
-      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const graph = ReplicaAtom.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const session = graph.ephemeral(StatusProfile, statusSessionOptions)
@@ -494,7 +494,7 @@ describe("Replica Atom graph", () => {
       const harness = yield* makeEphemeralHarness()
       yield* Queue.offer(harness.messages, ephemeralStarted)
       yield* Queue.offer(harness.messages, ephemeralSnapshot(1))
-      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const graph = ReplicaAtom.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const session = graph.ephemeral(StatusProfile, statusSessionOptions)
@@ -539,7 +539,7 @@ describe("Replica Atom graph", () => {
           }]
         })
       )
-      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const graph = ReplicaAtom.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const session = graph.ephemeral(StatusProfile, statusSessionOptions)
@@ -576,7 +576,7 @@ describe("Replica Atom graph", () => {
     "reacts to pending mutation submission and settlement",
     Effect.fnUntraced(function*() {
       const faultsReady = yield* Deferred.make<FaultInjection.Service>()
-      const graph = BrowserReplica.make(faultedReplica(faultsReady))
+      const graph = ReplicaAtom.make(faultedReplica(faultsReady))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const pending = graph.pendingFor(spaceId, PutTodo)
@@ -626,7 +626,7 @@ describe("Replica Atom graph", () => {
     "settles a derived atom that looks up its query while reading",
     Effect.fnUntraced(function*() {
       rangeReads.clear()
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const upper = Atom.make("m")
@@ -642,7 +642,7 @@ describe("Replica Atom graph", () => {
   it.effect(
     "returns the same atom for equal arguments from every graph accessor",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
       assert.strictEqual(
         graph.query(spaceId, RangeTodos)({ lower: "a", upper: "m" }),
@@ -660,7 +660,7 @@ describe("Replica Atom graph", () => {
   it.effect(
     "keeps query payloads whose decoded values differ on separate atoms",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const first = graph.query(spaceId, TitlesEcho)({ titles: new Set(["a"]) })
@@ -681,7 +681,7 @@ describe("Replica Atom graph", () => {
   it.effect(
     "resolves each mutation handle with the mutation it submitted",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const firstRow = graph.mutation(spaceId, PutTodo)
@@ -707,7 +707,7 @@ describe("Replica Atom graph", () => {
     "reruns raw-SQL queries of the written model and keeps every window correct",
     Effect.fnUntraced(function*() {
       rangeReads.clear()
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const related = graph.query(spaceId, RangeTodos)({ lower: "a", upper: "m" })
@@ -745,7 +745,7 @@ describe("Replica Atom graph", () => {
   it.effect(
     "refreshes an entity atom when its key has a different encoded representation",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const entity = graph.entity(spaceId, Numbered)(1)
@@ -794,7 +794,7 @@ describe("Replica Atom graph", () => {
         Layer.effect(Replica.Replica),
         Layer.provideMerge(layerReplica)
       )
-      const graph = BrowserReplica.make(layerObserved)
+      const graph = ReplicaAtom.make(layerObserved)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const changed = graph.entity(spaceId, Todo)("changed")
@@ -861,7 +861,7 @@ describe("Replica Atom graph", () => {
         Layer.effect(Replica.Replica),
         Layer.provideMerge(layerReplica)
       )
-      const graph = BrowserReplica.make(layerObserved)
+      const graph = ReplicaAtom.make(layerObserved)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const membership = graph.spaces
@@ -890,7 +890,7 @@ describe("Replica Atom graph", () => {
   it.effect(
     "reacts to per-space scope and activation commands",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const scopeAtom = graph.scope(spaceId)
@@ -927,11 +927,11 @@ describe("Replica Atom graph", () => {
   )
 
   it("uses the shared runtime factory by default and preserves an explicit factory", () => {
-    const graph = BrowserReplica.make(layerReplica)
+    const graph = ReplicaAtom.make(layerReplica)
     assert.strictEqual(graph.factory, Atom.runtime)
 
     const factory = Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
-    const customGraph = BrowserReplica.make(layerReplica, { factory })
+    const customGraph = ReplicaAtom.make(layerReplica, { factory })
     assert.strictEqual(customGraph.factory, factory)
   })
 
@@ -943,7 +943,7 @@ describe("Replica Atom graph", () => {
         return 17
       }
     } satisfies Duration.Input
-    const graph = BrowserReplica.make(layerReplica, { idleTTL })
+    const graph = ReplicaAtom.make(layerReplica, { idleTTL })
     const readsAfterConstruction = reads
 
     assert.isAbove(readsAfterConstruction, 0)
@@ -961,7 +961,7 @@ describe("Replica Atom graph", () => {
   it.live(
     "runs mutation, entity, query, receipt, and status state through one reactive runtime",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica, {
+      const graph = ReplicaAtom.make(layerReplica, {
         factory: Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
       })
       const registry = AtomRegistry.make()
@@ -1016,7 +1016,7 @@ describe("Replica Atom graph", () => {
   it.effect(
     "keeps addressed atoms isolated and shares membership through one runtime",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const firstEntity = graph.entity(spaceId, Todo)("shared")
