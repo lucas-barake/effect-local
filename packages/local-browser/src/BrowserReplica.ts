@@ -15,6 +15,7 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schedule from "effect/Schedule"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Sharding from "effect/unstable/cluster/Sharding"
 import type * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
@@ -28,6 +29,7 @@ import * as ReplicaOwner from "./internal/replicaOwner.js"
 import * as replicaProxy from "./internal/replicaProxy.js"
 import * as replicaWire from "./internal/replicaWire.js"
 import * as TabCluster from "./internal/tabCluster.js"
+import * as TabScheduler from "./internal/tabScheduler.js"
 
 export { BrowserStorageError } from "./BrowserStorageError.js"
 
@@ -101,93 +103,100 @@ export const layer = <D extends Definition.Any, ED extends Tagged, ES extends Ta
   Reactivity.Reactivity | MutationRuntime.Handlers<D> | QueryExecutor.Handlers<D>
 > =>
   Layer.effectContext(Effect.gen(function*() {
-    const reactivity = yield* Reactivity.Reactivity
-    const handlers = Context.pick(
-      ...options.definition.mutations.map((mutation) => mutation.handler),
-      ...options.definition.queries.map((query) => query.handler)
-    )(yield* Effect.context<MutationRuntime.Handlers<D> | QueryExecutor.Handlers<D>>())
-    const crypto = yield* Crypto.Crypto
-    const platformContext = yield* Layer.build(options.layerPlatform ?? layerPlatformBrowser)
-    const locks = Context.get(platformContext, platform.WebLocks)
-    const channels = Context.get(platformContext, platform.TabChannel)
-    const identities = Context.get(platformContext, platform.ClientIdentityStore)
-    const names = lockNames.make(options.name)
-    const host = yield* randomUuid
-    const clientId = yield* loadClientId(
-      names,
-      `@lucas-barake/effect-local-browser:${options.name}:client-id`,
-      locks,
-      identities
-    )
-    const retryDelay = options.retryDelay ?? Duration.seconds(1)
-    const profiles = new Map<string, Ephemeral.AnyMember>(Object.entries(options.profiles ?? {}))
-    const profileNames = new Map<Ephemeral.AnyMember, string>()
-    for (const [name, profile] of profiles) profileNames.set(profile, name)
-    const ephemerals = options.ephemerals ?? []
-
-    const layerStack = SqlReplica.layer({
-      ...options.replica,
-      definition: options.definition,
-      clientId,
-      initialSpaces: options.spaces ?? []
-    }).pipe(
-      Layer.provide(Layer.succeedContext(handlers)),
-      Layer.provide(options.layerDatabase),
-      Layer.provide(BrowserCrypto.layer),
-      Layer.provideMerge(options.layerSync)
-    )
-    let layerOwner = layerStack
-    if (options.requestPersistence !== false) {
-      layerOwner = Layer.merge(layerStack, layerRequestPersistence)
-    }
-
-    const owner = yield* ReplicaOwner.make({
-      host,
-      names,
-      locks,
-      retryDelay,
-      layerOwner
-    })
-    const cluster = yield* TabCluster.make({
-      name: options.name,
-      host,
-      names,
-      locks,
-      channels,
-      isReady: owner.isReady,
-      shardingConfig: options.sharding
-    })
-    const layerEntity = replicaWire.ReplicaEntity.toLayer(
-      ReplicaOwner.ReplicaOwnerService.use((service) => service.current).pipe(
-        Effect.flatMap((resources) =>
-          replicaHost.makeHandlers({ definition: options.definition, ephemerals, profiles, resources })
-        )
-      ),
-      { concurrency: "unbounded", mailboxCapacity: "unbounded" }
-    )
-    const shardingContext = yield* Layer.build(
-      layerEntity.pipe(
-        Layer.provideMerge(cluster.layer),
-        Layer.provide(Layer.succeed(ReplicaOwner.ReplicaOwnerService, owner))
-      )
-    )
-    const sharding = Context.get(shardingContext, Sharding.Sharding)
-    yield* cluster.registered
-    const makeClient = yield* replicaWire.ReplicaEntity.client.pipe(
-      Effect.provideService(Sharding.Sharding, sharding)
-    )
-    const proxy = yield* replicaProxy.makeProxy({
-      definition: options.definition,
-      profileNames,
-      client: makeClient(options.name),
-      consumer: host,
-      reactivity,
-      crypto,
-      retrySchedule: Schedule.spaced(retryDelay)
-    })
-    return Context.make(Replica.Replica, proxy.replica).pipe(
-      Context.add(QueryReactivity.QueryReactivity, proxy.queryReactivity),
-      Context.add(EphemeralClient.EphemeralClient, proxy.ephemeral),
-      Context.add(Sharding.Sharding, sharding)
-    )
+    const scheduler = yield* TabScheduler.make
+    return yield* build(options).pipe(Effect.provideService(Scheduler.Scheduler, scheduler))
   })).pipe(Layer.provide(BrowserCrypto.layer))
+
+const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends Tagged, ES extends Tagged,>(
+  options: Options<D, ED, ES>
+) {
+  const reactivity = yield* Reactivity.Reactivity
+  const handlers = Context.pick(
+    ...options.definition.mutations.map((mutation) => mutation.handler),
+    ...options.definition.queries.map((query) => query.handler)
+  )(yield* Effect.context<MutationRuntime.Handlers<D> | QueryExecutor.Handlers<D>>())
+  const crypto = yield* Crypto.Crypto
+  const platformContext = yield* Layer.build(options.layerPlatform ?? layerPlatformBrowser)
+  const locks = Context.get(platformContext, platform.WebLocks)
+  const channels = Context.get(platformContext, platform.TabChannel)
+  const identities = Context.get(platformContext, platform.ClientIdentityStore)
+  const names = lockNames.make(options.name)
+  const host = yield* randomUuid
+  const clientId = yield* loadClientId(
+    names,
+    `@lucas-barake/effect-local-browser:${options.name}:client-id`,
+    locks,
+    identities
+  )
+  const retryDelay = options.retryDelay ?? Duration.seconds(1)
+  const profiles = new Map<string, Ephemeral.AnyMember>(Object.entries(options.profiles ?? {}))
+  const profileNames = new Map<Ephemeral.AnyMember, string>()
+  for (const [name, profile] of profiles) profileNames.set(profile, name)
+  const ephemerals = options.ephemerals ?? []
+
+  const layerStack = SqlReplica.layer({
+    ...options.replica,
+    definition: options.definition,
+    clientId,
+    initialSpaces: options.spaces ?? []
+  }).pipe(
+    Layer.provide(Layer.succeedContext(handlers)),
+    Layer.provide(options.layerDatabase),
+    Layer.provide(BrowserCrypto.layer),
+    Layer.provideMerge(options.layerSync)
+  )
+  let layerOwner = layerStack
+  if (options.requestPersistence !== false) {
+    layerOwner = Layer.merge(layerStack, layerRequestPersistence)
+  }
+
+  const owner = yield* ReplicaOwner.make({
+    host,
+    names,
+    locks,
+    retryDelay,
+    layerOwner
+  })
+  const cluster = yield* TabCluster.make({
+    name: options.name,
+    host,
+    names,
+    locks,
+    channels,
+    isReady: owner.isReady,
+    shardingConfig: options.sharding
+  })
+  const layerEntity = replicaWire.ReplicaEntity.toLayer(
+    ReplicaOwner.ReplicaOwnerService.use((service) => service.current).pipe(
+      Effect.flatMap((resources) =>
+        replicaHost.makeHandlers({ definition: options.definition, ephemerals, profiles, resources })
+      )
+    ),
+    { concurrency: "unbounded", mailboxCapacity: "unbounded" }
+  )
+  const shardingContext = yield* Layer.build(
+    layerEntity.pipe(
+      Layer.provideMerge(cluster.layer),
+      Layer.provide(Layer.succeed(ReplicaOwner.ReplicaOwnerService, owner))
+    )
+  )
+  const sharding = Context.get(shardingContext, Sharding.Sharding)
+  yield* cluster.registered
+  const makeClient = yield* replicaWire.ReplicaEntity.client.pipe(
+    Effect.provideService(Sharding.Sharding, sharding)
+  )
+  const proxy = yield* replicaProxy.makeProxy({
+    definition: options.definition,
+    profileNames,
+    client: makeClient(options.name),
+    consumer: host,
+    reactivity,
+    crypto,
+    retrySchedule: Schedule.spaced(retryDelay)
+  })
+  return Context.make(Replica.Replica, proxy.replica).pipe(
+    Context.add(QueryReactivity.QueryReactivity, proxy.queryReactivity),
+    Context.add(EphemeralClient.EphemeralClient, proxy.ephemeral),
+    Context.add(Sharding.Sharding, sharding)
+  )
+})
