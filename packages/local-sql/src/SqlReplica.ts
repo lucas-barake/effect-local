@@ -45,23 +45,23 @@ import * as SyncEngine from "./SyncEngine.js"
 export interface Options<D extends Definition.Any,> {
   readonly definition: D
   readonly clientId: Identity.ClientId
-  readonly defaultScope: Protocol.ReplicationScope
-  readonly maximumActiveSpaces: number
-  readonly foregroundActiveSpaces: number
+  readonly defaultScope?: Protocol.ReplicationScope
+  readonly maximumActiveSpaces?: number
+  readonly foregroundActiveSpaces?: number
   readonly initialSpaces?: Iterable<Identity.SpaceId>
   readonly spaceId?: Identity.SpaceId
   readonly maximumPendingMutations?: number
   readonly evolution?: Evolution.Evolution
   readonly schemaEvolutionBatchSize?: number
   readonly schemaEvolutionBatchBytes?: number
-  readonly retainedReceipts: number
-  readonly maximumReceipts: number
-  readonly retainedHistoryEntries: number
-  readonly maximumBootstrapEntities: number
-  readonly maximumBootstrapBytes: number
-  readonly maximumBootstrapPageBytes: number
+  readonly retainedReceipts?: number
+  readonly maximumReceipts?: number
+  readonly retainedHistoryEntries?: number
+  readonly maximumBootstrapEntities?: number
+  readonly maximumBootstrapBytes?: number
+  readonly maximumBootstrapPageBytes?: number
   readonly maximumSettlementSnapshotBytes?: number
-  readonly migration: Migrations.Options
+  readonly migration?: Migrations.Options
   readonly pageSize?: number
   readonly reconciliationConcurrency?: number
   readonly foregroundReconciliationConcurrency?: number
@@ -69,6 +69,39 @@ export interface Options<D extends Definition.Any,> {
   readonly maximumRetryDelay?: Duration.Input
   readonly maximumAttempts?: number
 }
+
+type ResolvedOptions<D extends Definition.Any,> =
+  & Options<D>
+  & {
+    readonly defaultScope: Protocol.ReplicationScope
+    readonly maximumActiveSpaces: number
+    readonly foregroundActiveSpaces: number
+    readonly retainedReceipts: number
+    readonly maximumReceipts: number
+    readonly retainedHistoryEntries: number
+    readonly maximumBootstrapEntities: number
+    readonly maximumBootstrapBytes: number
+    readonly maximumBootstrapPageBytes: number
+    readonly migration: Migrations.Options
+  }
+
+export const defaults = {
+  maximumActiveSpaces: 16,
+  foregroundActiveSpaces: 4,
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  retainedHistoryEntries: 256,
+  maximumBootstrapEntities: 100_000,
+  maximumBootstrapBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: Protocol.maximumBatchBytes,
+  migration: { retryDelay: "100 millis", maximumAttempts: 8 }
+} as const satisfies Partial<Options<Definition.Any>>
+
+const resolveOptions = <D extends Definition.Any,>(input: Options<D>): ResolvedOptions<D> => ({
+  ...defaults,
+  defaultScope: Protocol.ReplicationScope.make({ models: input.definition.models.map((model) => model.name) }),
+  ...input
+})
 
 type BaseRequirements<D extends Definition.Any,> =
   | SqlClient.SqlClient
@@ -164,13 +197,14 @@ const settledFor =
     settled.settlement.pending.envelope.name === mutation.name
 
 const makeLayer = <D extends Definition.Any, R,>(
-  options: Options<D>,
+  input: Options<D>,
   workflowEngine: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"] | undefined, never, R>
 ): Layer.Layer<
   Replica.Replica | QueryReactivity.QueryReactivity,
   ReplicaError.ReplicaError,
   BaseRequirements<D> | R
 > => {
+  const options = resolveOptions(input)
   const layerQueryReactivity = QueryReactivity.makeLayer()
   return Layer.effect(
     Replica.Replica,

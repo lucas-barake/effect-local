@@ -72,16 +72,6 @@ const layerReplica = <E,>(layerSync: Layer.Layer<SyncEngine.SyncEngine, E>) =>
     definition: Domain.definition,
     clientId,
     initialSpaces: [spaceId],
-    defaultScope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
-    maximumActiveSpaces: 4,
-    foregroundActiveSpaces: 2,
-    retainedReceipts: 256,
-    maximumReceipts: 10_000,
-    retainedHistoryEntries: 256,
-    maximumBootstrapEntities: 10_000,
-    maximumBootstrapBytes: 64 * 1024 * 1024,
-    maximumBootstrapPageBytes: Protocol.maximumBatchBytes,
-    migration,
     retryDelay: "10 millis"
   }).pipe(
     Layer.provide(layerSync),
