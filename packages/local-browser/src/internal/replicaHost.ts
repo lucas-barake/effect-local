@@ -172,7 +172,7 @@ export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(opti
     applied.set(spaceId, minimum)
   })
 
-  const openConsumer = (spaceId: Identity.SpaceId, consumer: string) =>
+  const openConsumer = (spaceId: Identity.SpaceId, consumer: string, after: number) =>
     Effect.sync(() => {
       let perSpace = consumers.get(spaceId)
       if (perSpace === undefined) {
@@ -180,8 +180,11 @@ export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(opti
         consumers.set(spaceId, perSpace)
       }
       const existing = perSpace.get(consumer)
-      if (existing === undefined) perSpace.set(consumer, { streams: 1, sequence: applied.get(spaceId) ?? 0 })
-      else existing.streams += 1
+      if (existing === undefined) {
+        perSpace.set(consumer, { streams: 1, sequence: Math.max(after, applied.get(spaceId) ?? 0) })
+      } else {
+        existing.streams += 1
+      }
     })
 
   const closeConsumer = (spaceId: Identity.SpaceId, consumer: string) =>
@@ -342,8 +345,10 @@ export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(opti
       const pending = yield* space.pendingFor(mutation)
       return pending.map(wirePending)
     }),
+    ResolveSettlementStart: ({ payload: request }) =>
+      spaceFor(request.spaceId).pipe(Effect.flatMap((space) => space.resolveSettlementStart(request.from))),
     Settlements: ({ payload: request }) => {
-      const settlementOptions: Replica.SettlementOptions = { from: request.from }
+      const settlementOptions: Replica.SettlementOptions = { from: request.after }
       const name = request.name
       const settled = Stream.unwrap(Effect.gen(function*() {
         const space = yield* spaceFor(request.spaceId)
@@ -353,7 +358,7 @@ export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(opti
       }))
       return Stream.unwrap(
         Effect.acquireRelease(
-          openConsumer(request.spaceId, request.consumer),
+          openConsumer(request.spaceId, request.consumer, request.after),
           () => closeConsumer(request.spaceId, request.consumer)
         ).pipe(Effect.as(settled))
       ).pipe(Stream.mapEffect((entry) => encodeSettlement(definition, entry)))

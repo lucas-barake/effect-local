@@ -932,6 +932,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                 )
               )
             ),
+          resolveSettlementStart: (from) => withActive(entry, (runtime) => runtime.local.resolveSettlementStart(from)),
           acknowledgeSettlements: (sequence) =>
             withActive(entry, (runtime) => runtime.local.acknowledgeSettlements(sequence)),
           quarantine: withActive(entry, (runtime) => runtime.local.quarantine),

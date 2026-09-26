@@ -88,6 +88,9 @@ export interface Service {
     readonly from: Replica.SettlementStart
     readonly mutationName?: string | undefined
   }) => Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError>
+  readonly resolveSettlementStart: (
+    from: Replica.SettlementStart
+  ) => Effect.Effect<number, ReplicaError.ReplicaError>
   readonly acknowledgeSettlements: (
     sequence: number
   ) => Effect.Effect<void, ReplicaError.ReplicaError>
@@ -3318,6 +3321,7 @@ export const layer = (
         pendingToSubmit,
         pending,
         settlements: settlementsStream,
+        resolveSettlementStart,
         acknowledgeSettlements,
         markSubmitting,
         markRetrying,

@@ -123,6 +123,9 @@ export interface Space {
     mutation: M,
     options?: SettlementOptions
   ) => Stream.Stream<SettledMutation<M>, ReplicaError.ReplicaError>
+  readonly resolveSettlementStart: (
+    from: SettlementStart
+  ) => Effect.Effect<number, ReplicaError.ReplicaError>
   readonly acknowledgeSettlements: (
     sequence: number
   ) => Effect.Effect<void, ReplicaError.ReplicaError>

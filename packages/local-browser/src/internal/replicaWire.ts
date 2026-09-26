@@ -63,9 +63,11 @@ const EphemeralError = Schema.Union([
   WireUnknownSession
 ])
 
+export const SettlementCursor = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+
 export const SettlementStart = Schema.Union([
   Schema.Literals(["live", "acknowledged"]),
-  Schema.Int
+  SettlementCursor
 ])
 
 export const WireSettlement = Schema.Struct({
@@ -171,11 +173,17 @@ export class PendingFor extends Rpc.make("PendingFor", {
   error: ReplicaOrUnknown
 }) {}
 
+export class ResolveSettlementStart extends Rpc.make("ResolveSettlementStart", {
+  payload: { spaceId: Identity.SpaceId, from: SettlementStart },
+  success: SettlementCursor,
+  error: ReplicaError.ReplicaError
+}) {}
+
 export class Settlements extends Rpc.make("Settlements", {
   payload: {
     spaceId: Identity.SpaceId,
     consumer: Schema.String,
-    from: Schema.optional(SettlementStart),
+    after: SettlementCursor,
     name: Schema.optional(Schema.String)
   },
   success: WireSettlement,
@@ -335,6 +343,7 @@ export const ReplicaRpcs = RpcGroup.make(
   ReceiptOf,
   Pending,
   PendingFor,
+  ResolveSettlementStart,
   Settlements,
   AcknowledgeSettlements,
   QuarantineList,

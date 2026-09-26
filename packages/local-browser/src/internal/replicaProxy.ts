@@ -220,12 +220,22 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     name: string | undefined
   ): Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError> => {
     let cursor: number | undefined
+    const resolveCursor = Effect.suspend(() => {
+      if (cursor !== undefined) return Effect.succeed(cursor)
+      return client.ResolveSettlementStart({ spaceId, from: streamOptions?.from ?? "live" }).pipe(
+        Effect.tap((resolved) =>
+          Effect.sync(() => {
+            cursor = resolved
+          })
+        )
+      )
+    })
     const open = (): Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError> =>
-      Stream.suspend(() => {
-        let from = streamOptions?.from
-        if (cursor !== undefined) from = cursor
-        return client.Settlements({ spaceId, consumer: options.consumer, from, name })
-      }).pipe(
+      Stream.unwrap(
+        resolveCursor.pipe(
+          Effect.map((after) => client.Settlements({ spaceId, consumer: options.consumer, after, name }))
+        )
+      ).pipe(
         Stream.catchTag("WireUnknownDefinition", (error) => Stream.die(error)),
         Stream.catchTags({
           MailboxFull: () => Stream.fail(ownerUnavailable),
@@ -233,7 +243,6 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
           PersistenceError: () => Stream.fail(ownerUnavailable),
           EntityNotAssignedToRunner: () => Stream.fail(ownerUnavailable)
         }),
-        Stream.filter((wire) => cursor === undefined || wire.sequence > cursor),
         Stream.mapEffect((wire) => decodeSettlement(definition, wire)),
         Stream.tap((settled) =>
           Effect.sync(() => {
@@ -401,6 +410,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       pendingFor,
       settlements: (streamOptions) => settlementsStream(spaceId, streamOptions, undefined),
       settlementsFor,
+      resolveSettlementStart: (from) => call(client.ResolveSettlementStart({ spaceId, from })),
       acknowledgeSettlements: (sequence) =>
         call(client.AcknowledgeSettlements({ spaceId, consumer: options.consumer, sequence })),
       quarantine: call(client.QuarantineList({ spaceId })),
@@ -481,6 +491,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     const initialValue = yield* encodeJson(profile.payloadSchema, sessionOptions.value)
     const ttlMillis = Duration.toMillis(sessionOptions.ttl)
     let latestValue: Json = initialValue
+    let openedValue: Json = initialValue
     const handle = yield* SubscriptionRef.make(Option.none<string>())
     const members = yield* SubscriptionRef.make(
       Option.none<ReadonlyArray<typeof replicaWire.EphemeralMemberFrame.Type>>()
@@ -504,7 +515,12 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       SubscriptionRef.get(handle).pipe(
         Effect.flatMap(Option.match({
           onNone: () => Effect.void,
-          onSome: (current) => call(client.EphemeralUpdateMember({ handle: current, value }))
+          onSome: (current) =>
+            retryHandover(client.EphemeralUpdateMember({ handle: current, value })).pipe(
+              Effect.catchTag("WireUnknownSession", () => Effect.void),
+              mapTransport,
+              dieUnknownDefinition
+            )
         }))
       )
 
@@ -513,7 +529,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         return SubscriptionRef.set(handle, Option.some(frame.handle)).pipe(
           Effect.andThen(Deferred.succeed(opened, undefined)),
           Effect.andThen(Effect.suspend(() => {
-            if (latestValue === initialValue) return Effect.void
+            if (latestValue === openedValue) return Effect.void
             return updateRemote(latestValue).pipe(
               Effect.catchTag("WireEphemeralEncodeError", (error) => Effect.die(error))
             )
@@ -527,20 +543,30 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       )
     }
 
-    yield* client.EphemeralSession({
-      name,
-      spaceId: sessionOptions.spaceId,
-      member: sessionOptions.member,
-      value: initialValue,
-      ttlMillis
-    }).pipe(
+    const openRemote = Stream.suspend(() => {
+      openedValue = latestValue
+      return client.EphemeralSession({
+        name,
+        spaceId: sessionOptions.spaceId,
+        member: sessionOptions.member,
+        value: openedValue,
+        ttlMillis
+      })
+    })
+
+    yield* openRemote.pipe(
       Stream.runForEach(onFrame),
       Effect.catchTag("WireEphemeralEncodeError", (error) => Effect.die(error)),
       Effect.catchTag("WireUnknownDefinition", (error) => Effect.die(error)),
       Effect.catchTag("WireUnknownSession", (error) => Effect.die(error)),
       mapTransport,
-      Effect.tapCause((cause) => Deferred.failCause(opened, cause)),
-      (effect) => repeatForever(effect, options.retrySchedule),
+      Effect.exit,
+      Effect.tap(() => SubscriptionRef.set(handle, Option.none())),
+      Effect.flatMap((exit) => {
+        if (Exit.isSuccess(exit) || Cause.hasInterruptsOnly(exit.cause)) return Effect.succeed(false)
+        return Deferred.failCause(opened, exit.cause)
+      }),
+      Effect.repeat({ schedule: options.retrySchedule, until: (openFailed) => openFailed }),
       Effect.forkIn(sessionScope)
     )
     yield* Deferred.await(opened)

@@ -6,19 +6,23 @@ import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
 import * as Definition from "@lucas-barake/effect-local/Definition"
+import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -92,6 +96,31 @@ const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
   remove: () => Effect.void
 })
 
+const StatusProfile = Ephemeral.member({ status: Schema.String })
+const member = Protocol.EphemeralMember.make({
+  clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000401"),
+  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000401")
+})
+
+const layerEphemeralOpening = (
+  opening: Effect.Effect<void, ReplicaError.ReplicaError>,
+  updates: Ref.Ref<ReadonlyArray<unknown>>
+) =>
+  Layer.succeed(EphemeralClient.EphemeralClient, {
+    session: (_profile, options) =>
+      opening.pipe(Effect.as({
+        spaceId: options.spaceId,
+        member: options.member,
+        events: () => Stream.never,
+        state: () => Stream.never,
+        members: Stream.never,
+        updateMember: (value: unknown) => Ref.update(updates, (values) => [...values, value])
+      })),
+    publish: () => Effect.void,
+    clear: () => Effect.void,
+    remove: () => Effect.void
+  })
+
 const settle = Effect.fnUntraced(function*<A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) {
   const fiber = yield* Effect.forkChild(effect)
   yield* TestClock.adjust("5 seconds")
@@ -100,7 +129,12 @@ const settle = Effect.fnUntraced(function*<A, E extends { readonly _tag: string 
 
 const provideFileSystem = Effect.provide(NodeFileSystem.layer)
 
-const makeEnvironment = Effect.gen(function*() {
+interface EnvironmentOptions {
+  readonly layerEphemeral: Layer.Layer<EphemeralClient.EphemeralClient>
+  readonly submitAllowed: () => boolean
+}
+
+const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: EnvironmentOptions) {
   const fs = yield* FileSystem.FileSystem
   const directory = yield* fs.makeTempDirectoryScoped()
   const kit = yield* testKit.makeMemoryPlatform
@@ -109,13 +143,17 @@ const makeEnvironment = Effect.gen(function*() {
   const layerSync = Layer.merge(
     Layer.succeed(SyncEngine.SyncEngine, {
       waitForCredentialChange: () => Effect.never,
-      submit: store.submit,
+      submit: (request) =>
+        Effect.suspend(() => {
+          if (environmentOptions.submitAllowed()) return store.submit(request)
+          return Effect.never
+        }),
       discard: (request) => store.discard(request, null),
       pull: store.pull,
       bootstrap: store.bootstrap,
       watch: store.watch
     }),
-    layerEphemeralInactive
+    environmentOptions.layerEphemeral
   )
   const layerDatabase = SqliteClient.layer({ filename: `${directory}/replica.sqlite` }).pipe(
     Layer.tap(() => Ref.update(databaseOpens, (count) => count + 1))
@@ -126,6 +164,7 @@ const makeEnvironment = Effect.gen(function*() {
     layerDatabase,
     layerSync,
     spaces: [spaceId],
+    profiles: { status: StatusProfile },
     layerPlatform: kit.layerAll,
     requestPersistence: false,
     retryDelay: "100 millis"
@@ -138,6 +177,16 @@ const makeEnvironment = Effect.gen(function*() {
   })
   return { openTab, databaseOpens, layerReplica }
 })
+
+const makeEnvironment = makeEnvironmentWith({ layerEphemeral: layerEphemeralInactive, submitAllowed: () => true })
+
+const openStatusSession = (context: Context.Context<EphemeralClient.EphemeralClient>) =>
+  Context.get(context, EphemeralClient.EphemeralClient).session(StatusProfile, {
+    spaceId,
+    member,
+    value: { status: "online" },
+    ttl: "30 seconds"
+  })
 
 const listFrom = (replica: Replica.Service) =>
   replica.space(spaceId).pipe(Effect.flatMap((space) => space.query(ListTodos, undefined)))
@@ -225,6 +274,97 @@ describe("BrowserReplica", () => {
           assert.strictEqual(settled.value.settlement.pending.envelope.mutationId, pending.envelope.mutationId)
           assert.strictEqual(settled.value.settlement.receipt._tag, "Accepted")
         }
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "delivers a settlement that lands during failover to a live settlement stream opened before it",
+    Effect.fnUntraced(
+      function*() {
+        let submitAllowed = false
+        const environment = yield* makeEnvironmentWith({
+          layerEphemeral: layerEphemeralInactive,
+          submitAllowed: () => submitAllowed
+        })
+        const leader = yield* environment.openTab
+        const follower = yield* environment.openTab
+        const space = yield* settle(follower.replica.space(spaceId))
+        const received = yield* Effect.forkChild(
+          space.settlements({ from: "live" }).pipe(Stream.runHead, Effect.timeoutOption("60 seconds"))
+        )
+        yield* TestClock.adjust("5 seconds")
+        const pending = yield* settle(space.mutate(PutTodo, { id: "6", title: "settles on the new leader" }))
+        submitAllowed = true
+        yield* settle(Scope.close(leader.scope, Exit.void))
+        yield* TestClock.adjust("60 seconds")
+        const settled = Option.flatten(yield* Fiber.join(received))
+        assert.isTrue(Option.isSome(settled))
+        if (Option.isSome(settled)) {
+          assert.strictEqual(settled.value.settlement.pending.envelope.mutationId, pending.envelope.mutationId)
+        }
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "updates a follower's ephemeral member after the leader tab closes",
+    Effect.fnUntraced(
+      function*() {
+        const opens = yield* Ref.make(0)
+        const reopened = yield* Deferred.make<void>()
+        const opening = Ref.getAndUpdate(opens, (count) => count + 1).pipe(
+          Effect.flatMap((count) => {
+            if (count === 0) return Effect.void
+            return Deferred.await(reopened)
+          })
+        )
+        const updates = yield* Ref.make<ReadonlyArray<unknown>>([])
+        const environment = yield* makeEnvironmentWith({
+          layerEphemeral: layerEphemeralOpening(opening, updates),
+          submitAllowed: () => true
+        })
+        const leader = yield* environment.openTab
+        const follower = yield* environment.openTab
+        const session = yield* settle(openStatusSession(follower.context).pipe(Scope.provide(yield* Effect.scope)))
+        yield* settle(Scope.close(leader.scope, Exit.void))
+        assert.strictEqual(yield* Ref.get(opens), 2)
+        const updated = yield* settle(session.updateMember({ status: "away" }).pipe(Effect.exit))
+        assert.isTrue(Exit.isSuccess(updated), String(updated))
+        yield* settle(Deferred.succeed(reopened, undefined))
+        assert.deepStrictEqual(yield* Ref.get(updates), [{ status: "away" }])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "stops opening an ephemeral session whose first open failed",
+    Effect.fnUntraced(
+      function*() {
+        const opens = yield* Ref.make(0)
+        const opening = Ref.getAndUpdate(opens, (count) => count + 1).pipe(
+          Effect.flatMap((count) => {
+            if (count === 0) return Effect.fail(new ReplicaError.ServerUnavailable())
+            return Effect.void
+          })
+        )
+        const environment = yield* makeEnvironmentWith({
+          layerEphemeral: layerEphemeralOpening(opening, yield* Ref.make<ReadonlyArray<unknown>>([])),
+          submitAllowed: () => true
+        })
+        const tab = yield* environment.openTab
+        const outcome = yield* settle(
+          openStatusSession(tab.context).pipe(Scope.provide(yield* Effect.scope), Effect.exit)
+        )
+        assert.isTrue(Exit.isFailure(outcome), String(outcome))
+        yield* TestClock.adjust("5 seconds")
+        assert.strictEqual(yield* Ref.get(opens), 1)
       },
       Effect.scoped,
       provideFileSystem
