@@ -193,6 +193,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
   const definition = options.definition
   const client = options.client
   const handles = new Map<Identity.SpaceId, Replica.Space>()
+  const known = new Set<Identity.SpaceId>()
   const joined = new Set<Identity.SpaceId>()
   let membershipEpoch = 0
   let invalidationsLive = false
@@ -200,7 +201,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
 
   const fullRefreshKeys = (): Array<string> => {
     const keys: Array<string> = [ReactivityKey.spaces, ReactivityKey.aggregateStatus]
-    for (const spaceId of handles.keys()) keys.push(ReactivityKey.membership(spaceId))
+    for (const spaceId of known) keys.push(ReactivityKey.membership(spaceId))
     return keys
   }
 
@@ -216,7 +217,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
 
   const forgetInvalidatedMemberships = (keys: ReadonlyArray<string>) => {
     const invalidated = new Set(keys)
-    for (const spaceId of handles.keys()) {
+    for (const spaceId of known) {
       if (!invalidated.has(ReactivityKey.membership(spaceId))) continue
       membershipEpoch += 1
       joined.delete(spaceId)
@@ -246,7 +247,10 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         return options.reactivity.invalidate(fullRefreshKeys())
       }
       invalidationsLive = true
-      if (resubscribing) return options.reactivity.invalidate(fullRefreshKeys())
+      if (resubscribing) {
+        dropMemberships()
+        return options.reactivity.invalidate(fullRefreshKeys())
+      }
       resubscribing = true
       return Deferred.succeed(subscribed, undefined)
     }),
@@ -261,12 +265,14 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     streamOptions: Replica.SettlementOptions | undefined,
     name: string | undefined
   ): Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError> => {
-    let cursor: number | undefined
-    const resolveCursor = Effect.suspend(() => {
-      if (cursor !== undefined) return Effect.succeed(cursor)
+    let start: number | undefined
+    let cursor = 0
+    const resolveStart = Effect.suspend(() => {
+      if (start !== undefined) return Effect.succeed(start)
       return client.ResolveSettlementStart({ spaceId, from: streamOptions?.from ?? "live" }).pipe(
         Effect.tap((resolved) =>
           Effect.sync(() => {
+            start = resolved
             cursor = resolved
           })
         )
@@ -274,8 +280,10 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     })
     const open = (): Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError> =>
       Stream.unwrap(
-        resolveCursor.pipe(
-          Effect.map((after) => client.Settlements({ spaceId, consumer: options.consumer, after, name }))
+        resolveStart.pipe(
+          Effect.map((resolved) =>
+            client.Settlements({ spaceId, consumer: options.consumer, start: resolved, after: cursor, name })
+          )
         )
       ).pipe(
         Stream.catchTag("WireUnknownDefinition", (error) => Stream.die(error)),
@@ -285,6 +293,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
           PersistenceError: () => Stream.fail(ownerUnavailable),
           EntityNotAssignedToRunner: () => Stream.fail(ownerUnavailable)
         }),
+        Stream.filter((wire) => wire.sequence > cursor),
         Stream.mapEffect((wire) => decodeSettlement(definition, wire)),
         Stream.tap((settled) =>
           Effect.sync(() => {
@@ -300,8 +309,9 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
   }
 
   const spaceHandle = (spaceId: Identity.SpaceId): Replica.Space => {
-    const known = handles.get(spaceId)
-    if (known !== undefined) return known
+    const existing = handles.get(spaceId)
+    if (existing !== undefined) return existing
+    known.add(spaceId)
     const created = makeSpace(spaceId)
     handles.set(spaceId, created)
     return created
@@ -484,6 +494,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     }),
     space: (spaceId) =>
       Effect.suspend(() => {
+        known.add(spaceId)
         if (joined.has(spaceId)) return Effect.succeed(spaceHandle(spaceId))
         const epoch = liveEpoch()
         return call(client.SpaceScope({ spaceId })).pipe(

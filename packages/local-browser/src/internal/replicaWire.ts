@@ -183,6 +183,7 @@ export class Settlements extends Rpc.make("Settlements", {
   payload: {
     spaceId: Identity.SpaceId,
     consumer: Schema.String,
+    start: SettlementCursor,
     after: SettlementCursor,
     name: Schema.optional(Schema.String)
   },

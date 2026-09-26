@@ -172,7 +172,7 @@ export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(opti
     applied.set(spaceId, minimum)
   })
 
-  const openConsumer = (spaceId: Identity.SpaceId, consumer: string, after: number) =>
+  const openConsumer = (spaceId: Identity.SpaceId, consumer: string, start: number) =>
     Effect.sync(() => {
       let perSpace = consumers.get(spaceId)
       if (perSpace === undefined) {
@@ -180,10 +180,12 @@ export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(opti
         consumers.set(spaceId, perSpace)
       }
       const existing = perSpace.get(consumer)
+      const floor = Math.max(start, applied.get(spaceId) ?? 0)
       if (existing === undefined) {
-        perSpace.set(consumer, { streams: 1, sequence: Math.max(after, applied.get(spaceId) ?? 0) })
+        perSpace.set(consumer, { streams: 1, sequence: floor })
       } else {
         existing.streams += 1
+        existing.sequence = Math.min(existing.sequence, floor)
       }
     })
 
@@ -358,7 +360,7 @@ export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(opti
       }))
       return Stream.unwrap(
         Effect.acquireRelease(
-          openConsumer(request.spaceId, request.consumer, request.after),
+          openConsumer(request.spaceId, request.consumer, request.start),
           () => closeConsumer(request.spaceId, request.consumer)
         ).pipe(Effect.as(settled))
       ).pipe(Stream.mapEffect((entry) => encodeSettlement(definition, entry)))

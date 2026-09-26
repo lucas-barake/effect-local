@@ -15,6 +15,7 @@ import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -439,6 +440,84 @@ describe("BrowserReplica", () => {
           )
         )
         assert.strictEqual(outcome, "not joined")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "keeps the acknowledgement floor at the tab's acknowledgement while an acknowledged stream is open",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        yield* environment.openTab
+        const follower = yield* environment.openTab
+        const space = yield* settle(follower.replica.space(spaceId))
+        yield* settle(space.mutate(PutTodo, { id: "a", title: "a" }))
+        yield* settle(space.mutate(PutTodo, { id: "b", title: "b" }))
+        yield* settle(space.mutate(PutTodo, { id: "c", title: "c" }))
+        assert.strictEqual(yield* settle(space.resolveSettlementStart("live")), 3)
+        yield* space.settlements({ from: "live" }).pipe(Stream.runDrain, Effect.forkScoped)
+        yield* TestClock.adjust("5 seconds")
+        yield* space.settlements({ from: "acknowledged" }).pipe(Stream.runDrain, Effect.forkScoped)
+        yield* TestClock.adjust("5 seconds")
+        yield* settle(space.acknowledgeSettlements(1))
+        assert.strictEqual(yield* settle(space.resolveSettlementStart("acknowledged")), 1)
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "delivers each settlement once to a follower's settlement stream across a leader handover",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const leader = yield* environment.openTab
+        const follower = yield* environment.openTab
+        const space = yield* settle(follower.replica.space(spaceId))
+        const delivered = yield* Ref.make<ReadonlyArray<number>>([])
+        yield* space.settlements({ from: "acknowledged" }).pipe(
+          Stream.runForEach((settled) => Ref.update(delivered, (sequences) => [...sequences, settled.sequence])),
+          Effect.forkScoped
+        )
+        yield* TestClock.adjust("5 seconds")
+        yield* settle(space.mutate(PutTodo, { id: "a", title: "a" }))
+        yield* settle(space.mutate(PutTodo, { id: "b", title: "b" }))
+        yield* settle(Scope.close(leader.scope, Exit.void))
+        yield* settle(space.mutate(PutTodo, { id: "c", title: "c" }))
+        assert.deepStrictEqual(yield* Ref.get(delivered), [1, 2, 3])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "refreshes a follower's space status for a space it could not open once a new leader joins it",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const leader = yield* environment.openTab
+        yield* environment.openTab
+        yield* settle(leader.replica.leave(spaceId))
+        const graph = ReplicaAtom.make(
+          environment.layerReplica.pipe(Layer.provide(Layer.succeed(Clock.Clock, yield* Clock.Clock)))
+        )
+        const registry = AtomRegistry.make()
+        yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+        const status = graph.status(spaceId)
+        const unmount = registry.mount(status)
+        yield* Effect.addFinalizer(() => Effect.sync(unmount))
+        const read = AtomRegistry.getResult(registry, status, { suspendOnWaiting: true }).pipe(
+          Effect.as("joined" as const),
+          Effect.catchTag("SpaceNotJoined", () => Effect.succeed("not joined" as const))
+        )
+        assert.strictEqual(yield* settle(read), "not joined")
+        yield* settle(Scope.close(leader.scope, Exit.void))
+        assert.strictEqual(yield* settle(read), "joined")
       },
       Effect.scoped,
       provideFileSystem
