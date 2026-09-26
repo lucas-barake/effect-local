@@ -22,7 +22,7 @@ import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import type * as AtomRegistry from "effect/unstable/reactivity/AtomRegistry"
-import type * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 
 class QueryKey implements Equal.Equal {
   readonly spaceId: Identity.SpaceId
@@ -178,6 +178,29 @@ export const make = <E,>(
   const factory = options?.factory ?? Atom.runtime
   const runtime = factory(layer)
   const idleTTL = Duration.toMillis(options?.idleTTL ?? Duration.seconds(30))
+  const reactivity = runtime.atom(Effect.service(Reactivity.Reactivity))
+
+  const refreshOn = (keys: ReadonlyArray<string>) =>
+  <A, EA,>(
+    atom: Atom.Atom<AsyncResult.AsyncResult<A, EA>>
+  ): Atom.Atom<AsyncResult.AsyncResult<A, EA>> =>
+    Atom.transform(atom, (get) => {
+      let stale = false
+      get.subscribe(atom, (value) => {
+        get.setSelf(value)
+        if (!stale || value.waiting) return
+        stale = false
+        get.refresh(atom)
+      })
+      const service = get(reactivity)
+      if (AsyncResult.isSuccess(service)) {
+        get.addFinalizer(service.value.registerUnsafe(keys, () => {
+          if (get.once(atom).waiting) stale = true
+          else get.refresh(atom)
+        }))
+      }
+      return get.once(atom)
+    }, { initialValueTarget: atom })
 
   type SessionError = ReplicaError.ReplicaError | Ephemeral.EncodeError | E
   type SessionAtom<M extends Ephemeral.AnyMember,> = Atom.Atom<
@@ -354,7 +377,7 @@ export const make = <E,>(
         replica.space(key.spaceId).pipe(Effect.flatMap((space) => space.get(key.model, key.key)))
       )
     ).pipe(
-      factory.withReactivity([
+      refreshOn([
         ReactivityKey.membership(key.spaceId),
         ReactivityKey.entity(key.spaceId, key.model.name, key.key)
       ]),
@@ -387,7 +410,7 @@ export const make = <E,>(
         replica.space(key.spaceId).pipe(Effect.flatMap((space) => space.query(key.definition, key.payload)))
       )
     ).pipe(
-      factory.withReactivity([ReactivityKey.membership(key.spaceId), token])
+      refreshOn([ReactivityKey.membership(key.spaceId), token])
     )
     return Atom.transform(target, (get, atom) => {
       if (!AsyncResult.isSuccess(get(retention))) return AsyncResult.initial(true)
@@ -432,7 +455,7 @@ export const make = <E,>(
         )
       )
     ).pipe(
-      factory.withReactivity([
+      refreshOn([
         ReactivityKey.membership(key.spaceId),
         ReactivityKey.receipt(key.spaceId, Identity.MutationId.make(key.qualifier))
       ]),
@@ -456,7 +479,7 @@ export const make = <E,>(
     runtime.atom(
       Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.pending)))
     ).pipe(
-      factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.pending(spaceId)]),
+      refreshOn([ReactivityKey.membership(spaceId), ReactivityKey.pending(spaceId)]),
       Atom.setIdleTTL(idleTTL)
     )
   )
@@ -467,7 +490,7 @@ export const make = <E,>(
         replica.space(key.spaceId).pipe(Effect.flatMap((space) => space.pendingFor(key.definition)))
       )
     ).pipe(
-      factory.withReactivity([ReactivityKey.membership(key.spaceId), ReactivityKey.pending(key.spaceId)]),
+      refreshOn([ReactivityKey.membership(key.spaceId), ReactivityKey.pending(key.spaceId)]),
       Atom.setIdleTTL(idleTTL)
     )
   )
@@ -486,7 +509,7 @@ export const make = <E,>(
     runtime.atom(
       Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.map((space) => space.settlements())))
     ).pipe(
-      factory.withReactivity([ReactivityKey.membership(spaceId)]),
+      refreshOn([ReactivityKey.membership(spaceId)]),
       Atom.setIdleTTL(idleTTL)
     )
   )
@@ -497,7 +520,7 @@ export const make = <E,>(
         replica.space(key.spaceId).pipe(Effect.map((space) => space.settlementsFor(key.definition)))
       )
     ).pipe(
-      factory.withReactivity([ReactivityKey.membership(key.spaceId)]),
+      refreshOn([ReactivityKey.membership(key.spaceId)]),
       Atom.setIdleTTL(idleTTL)
     )
   )
@@ -517,20 +540,20 @@ export const make = <E,>(
   const status = Atom.family((spaceId: Identity.SpaceId) =>
     runtime.atom(
       Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.status)))
-    ).pipe(factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.status(spaceId)]))
+    ).pipe(refreshOn([ReactivityKey.membership(spaceId), ReactivityKey.status(spaceId)]))
   )
   const scope = Atom.family((spaceId: Identity.SpaceId) =>
     runtime.atom(
       Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.scope)))
     ).pipe(
-      factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.scope(spaceId)])
+      refreshOn([ReactivityKey.membership(spaceId), ReactivityKey.scope(spaceId)])
     )
   )
   const activation = Atom.family((spaceId: Identity.SpaceId) =>
     runtime.atom(
       Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.activation)))
     ).pipe(
-      factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.activation(spaceId)])
+      refreshOn([ReactivityKey.membership(spaceId), ReactivityKey.activation(spaceId)])
     )
   )
   const setScope = Atom.family((spaceId: Identity.SpaceId) =>
@@ -555,10 +578,10 @@ export const make = <E,>(
     )
   )
   const spaces = runtime.atom(Replica.Replica.use((replica) => replica.spaces)).pipe(
-    factory.withReactivity([ReactivityKey.spaces])
+    refreshOn([ReactivityKey.spaces])
   )
   const aggregateStatus = runtime.atom(Replica.Replica.use((replica) => replica.status)).pipe(
-    factory.withReactivity([ReactivityKey.aggregateStatus])
+    refreshOn([ReactivityKey.aggregateStatus])
   )
   const join = runtime.fn<Identity.SpaceId>()(
     (spaceId) => Replica.Replica.use((replica) => replica.join(spaceId)),

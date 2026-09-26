@@ -12,6 +12,7 @@ import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
@@ -24,12 +25,14 @@ import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import { AtomRegistry } from "effect/unstable/reactivity"
+import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as BrowserReplica from "../src/BrowserReplica.js"
@@ -43,7 +46,13 @@ const TodoSchema = Schema.Struct({ id: Schema.String, title: Schema.String })
 const Todo = Model.make("Todo", { version: 1, key: Schema.String, schema: TodoSchema })
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema })
 const ListTodos = Query.make("ListTodos", { success: Schema.Array(Todo.schema) })
-const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo], queries: [ListTodos] })
+const RunIndex = Query.make("RunIndex", { success: Schema.Number })
+const definition = Definition.make({
+  version: 1,
+  models: [Todo],
+  mutations: [PutTodo],
+  queries: [ListTodos, RunIndex]
+})
 
 const TodoRow = Schema.Struct({ value: Schema.fromJsonString(TodoSchema) })
 const listTodos = (query: Transaction.Query) =>
@@ -56,10 +65,18 @@ const listTodos = (query: Transaction.Query) =>
     Effect.catchTag("SchemaError", (cause) => Effect.die(cause))
   )
 
-const layerHandlers = Layer.mergeAll(
-  PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload)),
-  ListTodos.toLayer(({ query }) => listTodos(query))
-)
+type ListTodosError = Effect.Error<ReturnType<typeof listTodos>>
+
+const layerHandlersWith = (runIndex: (query: Transaction.Query) => Effect.Effect<number, ListTodosError>) =>
+  Layer.mergeAll(
+    PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload)),
+    ListTodos.toLayer(({ query }) => listTodos(query)),
+    RunIndex.toLayer(({ query }) => runIndex(query))
+  )
+
+const firstRunIndex = (query: Transaction.Query) => listTodos(query).pipe(Effect.as(0))
+
+const layerHandlers = layerHandlersWith(firstRunIndex)
 
 const layerServerDatabase = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
@@ -134,6 +151,7 @@ interface EnvironmentOptions {
   readonly layerEphemeral?: Layer.Layer<EphemeralClient.EphemeralClient>
   readonly submitAllowed?: () => boolean
   readonly sharding?: BrowserReplica.Options<typeof definition, never, never>["sharding"]
+  readonly runIndex?: (query: Transaction.Query) => Effect.Effect<number, ListTodosError>
 }
 
 const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: EnvironmentOptions) {
@@ -171,7 +189,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
     requestPersistence: false,
     retryDelay: "100 millis",
     sharding: environmentOptions.sharding
-  }).pipe(Layer.provide(layerHandlers))
+  }).pipe(Layer.provide(layerHandlersWith(environmentOptions.runIndex ?? firstRunIndex)))
   const layerTab = layerReplica.pipe(Layer.provide(Layer.fresh(Reactivity.layer)))
   const openTab = Effect.gen(function*() {
     const scope = yield* Scope.make()
@@ -232,6 +250,83 @@ describe("BrowserReplica", () => {
           yield* settle(AtomRegistry.getResult(registry, todos, { suspendOnWaiting: true })),
           [{ id: "2", title: "from the leader" }]
         )
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "renders a follower's own write in its live query without advancing the clock",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        yield* environment.openTab
+        const graph = ReplicaAtom.make(
+          environment.layerReplica.pipe(Layer.provideMerge(Layer.succeed(Clock.Clock, yield* Clock.Clock)))
+        )
+        const registry = AtomRegistry.make()
+        yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+        const todos = graph.query(spaceId, ListTodos)(undefined)
+        const put = graph.mutation(spaceId, PutTodo)
+        const unmountTodos = registry.mount(todos)
+        const unmountPut = registry.mount(put)
+        yield* Effect.addFinalizer(() => Effect.sync(() => [unmountTodos(), unmountPut()]))
+        assert.deepStrictEqual(yield* settle(AtomRegistry.getResult(registry, todos, { suspendOnWaiting: true })), [])
+        const rendered = yield* Deferred.make<ReadonlyArray<typeof TodoSchema.Type>>()
+        const unsubscribe = registry.subscribe(todos, (result) => {
+          if (AsyncResult.isSuccess(result) && result.value.length > 0) {
+            Deferred.doneUnsafe(rendered, Effect.succeed(result.value))
+          }
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribe))
+        registry.set(put, { id: "own", title: "rendered without a timer" })
+        assert.deepStrictEqual(yield* Deferred.await(rendered), [{ id: "own", title: "rendered without a timer" }])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "lets a follower's in-flight live query finish when it is invalidated again, then reruns it once",
+    Effect.fnUntraced(
+      function*() {
+        const started = yield* Queue.unbounded<Deferred.Deferred<void>>()
+        let runs = 0
+        const environment = yield* makeEnvironmentWith({
+          runIndex: Effect.fnUntraced(function*(query) {
+            runs += 1
+            const index = runs
+            const gate = yield* Deferred.make<void>()
+            yield* Queue.offer(started, gate)
+            yield* Deferred.await(gate)
+            yield* listTodos(query)
+            return index
+          })
+        })
+        yield* environment.openTab
+        const graph = ReplicaAtom.make(environment.layerReplica)
+        const registry = AtomRegistry.make()
+        yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+        const runIndex = graph.query(spaceId, RunIndex)(undefined)
+        const shown: Array<number> = []
+        const unsubscribe = registry.subscribe(runIndex, (result) => {
+          if (AsyncResult.isSuccess(result) && !result.waiting) shown.push(result.value)
+        }, { immediate: true })
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribe))
+        const reactivityAtom = graph.runtime.atom(Effect.service(Reactivity.Reactivity))
+        const reactivity = yield* settle(AtomRegistry.getResult(registry, reactivityAtom, { suspendOnWaiting: true }))
+        const invalidate = reactivity.invalidate([ReactivityKey.query(spaceId, RunIndex.name, undefined)])
+        yield* Deferred.succeed(yield* settle(Queue.take(started)), undefined)
+        assert.strictEqual(yield* settle(AtomRegistry.getResult(registry, runIndex, { suspendOnWaiting: true })), 1)
+        yield* invalidate
+        const second = yield* settle(Queue.take(started))
+        yield* invalidate
+        yield* Deferred.succeed(second, undefined)
+        yield* Deferred.succeed(yield* settle(Queue.take(started)), undefined)
+        assert.strictEqual(yield* settle(AtomRegistry.getResult(registry, runIndex, { suspendOnWaiting: true })), 3)
+        assert.deepStrictEqual(shown, [1, 2, 3])
       },
       Effect.scoped,
       provideFileSystem
