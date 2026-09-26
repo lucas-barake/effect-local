@@ -133,6 +133,7 @@ interface RememberedEntry {
   transition: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
   foreground: boolean
   foregroundDemand: number
+  settlementsRecorded: Deferred.Deferred<void>
   leases: number
   leaving: boolean
   leaveCompletion: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
@@ -421,6 +422,13 @@ const makeLayer = <D extends Definition.Any, R,>(
         yield* Deferred.succeed(previous, undefined)
       })
 
+      const publishSettlements = (entry: RememberedEntry) =>
+        Effect.suspend(() => {
+          const recorded = entry.settlementsRecorded
+          entry.settlementsRecorded = Deferred.makeUnsafe<void>()
+          return Deferred.succeed(recorded, undefined)
+        }).pipe(Effect.asVoid)
+
       const invalidateActivation = (spaceId: Identity.SpaceId) =>
         reactivity.invalidate([
           ReactivityKey.activation(spaceId),
@@ -452,7 +460,8 @@ const makeLayer = <D extends Definition.Any, R,>(
         const layerLocalStore = LocalStore.layer({
           ...options,
           scope: entry.replicationScope,
-          spaceId
+          spaceId,
+          onSettlementsRecorded: publishSettlements(entry)
         }).pipe(Layer.provide(layerMutationRuntime))
         const layerQueryExecutor = QueryExecutor.layer(options.definition, spaceId)
         let local: LocalStore.Service
@@ -918,6 +927,57 @@ const makeLayer = <D extends Definition.Any, R,>(
           return runtime.operationGate.withPermit(operation)
         })
 
+      const withResidentRuntime = <A, E extends { readonly _tag: string },>(
+        entry: RememberedEntry,
+        use: (runtime: ActiveRuntime) => Effect.Effect<A, E>
+      ): Effect.Effect<A, E | ReplicaError.ReplicaError> =>
+        Effect.suspend(() => {
+          const runtime = entry.runtime
+          if (
+            entries.get(entry.spaceId) !== entry || entry.leaving || entry.activation !== "Active" ||
+            runtime === undefined
+          ) return withActive(entry, use)
+          return runtime.operationGate.withPermit(Effect.suspend(() => {
+            if (entry.activation !== "Active" || entry.runtime !== runtime || entry.leaving) {
+              return Effect.succeed(Option.none<A>())
+            }
+            return use(runtime).pipe(Effect.map(Option.some))
+          })).pipe(
+            Effect.flatMap(Option.match({
+              onNone: () => withResidentRuntime(entry, use),
+              onSome: Effect.succeed
+            }))
+          )
+        })
+
+      const settledStream = (
+        entry: RememberedEntry,
+        from: Replica.SettlementStart,
+        mutationName?: string
+      ): Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError> =>
+        Stream.unwrap(
+          withResidentRuntime(entry, (runtime) => runtime.local.resolveSettlementStart(from)).pipe(
+            Effect.map((start) =>
+              Stream.paginate(
+                start,
+                Effect.fnUntraced(function*(cursor: number) {
+                  while (true) {
+                    const recorded = entry.settlementsRecorded
+                    const settled = yield* withResidentRuntime(
+                      entry,
+                      (runtime) => runtime.local.readSettlements({ after: cursor, mutationName })
+                    )
+                    if (settled.length > 0) {
+                      return [settled, Option.some<number>(settled[settled.length - 1].sequence)] as const
+                    }
+                    yield* Deferred.await(recorded)
+                  }
+                })
+              )
+            )
+          )
+        )
+
       const continueCancellation = Effect.fnUntraced(function*(
         runtime: ActiveRuntime,
         initial: Option.Option<Quarantine.QuarantinedMutation>
@@ -947,11 +1007,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         )
 
       const makeHandle = (entry: RememberedEntry): Replica.Space => {
-        const runtimeLease = Effect.uninterruptibleMask((restore) =>
-          acquire(entry, true, restore).pipe(
-            Effect.tap(() => Effect.addFinalizer(() => release(entry)))
-          )
-        )
         return {
           spaceId: entry.spaceId,
           scope: Effect.suspend(() => {
@@ -1009,21 +1064,14 @@ const makeLayer = <D extends Definition.Any, R,>(
                   })
                 )
               )),
-          settlements: (settlementOptions) =>
-            Stream.scoped(
-              Stream.fromEffect(runtimeLease).pipe(
-                Stream.flatMap((runtime) => runtime.local.settlements({ from: settlementOptions?.from ?? "live" }))
-              )
-            ),
+          settlements: (settlementOptions) => settledStream(entry, settlementOptions?.from ?? "live"),
           settlementsFor: (mutation, settlementOptions) =>
-            Stream.scoped(
-              Stream.fromEffect(runtimeLease).pipe(
-                Stream.tap(() => MutationDescriptor.validate(options.definition, mutation)),
-                Stream.flatMap((runtime) =>
-                  runtime.local.settlements({
-                    from: settlementOptions?.from ?? "live",
-                    mutationName: mutation.name
-                  }).pipe(Stream.filter(settledFor(mutation)))
+            Stream.unwrap(
+              MutationDescriptor.validate(options.definition, mutation).pipe(
+                Effect.as(
+                  settledStream(entry, settlementOptions?.from ?? "live", mutation.name).pipe(
+                    Stream.filter(settledFor(mutation))
+                  )
                 )
               )
             ),
@@ -1140,6 +1188,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           transition: undefined,
           foreground: false,
           foregroundDemand: 0,
+          settlementsRecorded: Deferred.makeUnsafe<void>(),
           leases: 0,
           leaving: false,
           leaveCompletion: undefined,
@@ -1303,7 +1352,8 @@ const makeLayer = <D extends Definition.Any, R,>(
             ),
             Effect.tap(() =>
               removeContribution(current).pipe(
-                Effect.andThen(Effect.sync(() => entries.delete(spaceId)))
+                Effect.andThen(Effect.sync(() => entries.delete(spaceId))),
+                Effect.andThen(publishSettlements(current))
               )
             ),
             Effect.tap(() =>

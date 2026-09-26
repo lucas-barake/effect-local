@@ -56,6 +56,7 @@ export interface Options {
   readonly maximumSettlementSnapshotBytes?: number
   readonly retainedMutationIds?: number
   readonly migration: Migrations.Options
+  readonly onSettlementsRecorded?: Effect.Effect<void>
 }
 
 export interface ReconciliationGenerations {
@@ -89,6 +90,10 @@ export interface Service {
     readonly from: Replica.SettlementStart
     readonly mutationName?: string | undefined
   }) => Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError>
+  readonly readSettlements: (options: {
+    readonly after: number
+    readonly mutationName?: string | undefined
+  }) => Effect.Effect<ReadonlyArray<Replica.SettledMutation>, ReplicaError.ReplicaError>
   readonly resolveSettlementStart: (
     from: Replica.SettlementStart
   ) => Effect.Effect<number, ReplicaError.ReplicaError>
@@ -1042,7 +1047,9 @@ export const layer = (
 
       const publishSettlements = (settlements: ReadonlyArray<Replica.MutationSettlement>) => {
         if (settlements.length === 0) return Effect.void
-        return PubSub.publish(settlementSignal, undefined).pipe(Effect.asVoid)
+        const published = PubSub.publish(settlementSignal, undefined).pipe(Effect.asVoid)
+        if (options.onSettlementsRecorded === undefined) return published
+        return published.pipe(Effect.andThen(options.onSettlementsRecorded))
       }
 
       const settlementPageSize = 64
@@ -1095,44 +1102,48 @@ export const layer = (
         return from
       })
 
+      const readSettlements = (readOptions: {
+        readonly after: number
+        readonly mutationName?: string | undefined
+      }) =>
+        sql.withTransaction(Effect.gen(function*() {
+          const mark = yield* readPruneMark(readOptions.mutationName)
+          if (readOptions.after < mark) {
+            return yield* new ReplicaError.SettlementReplayTruncated({
+              requested: readOptions.after,
+              oldestAvailable: mark
+            })
+          }
+          return yield* findSettledReceipts({
+            after: readOptions.after,
+            limit: settlementPageSize,
+            name: readOptions.mutationName ?? null
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+        })).pipe(
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.flatMap(Effect.forEach(decodeSettledRow))
+        )
+
       const settlementsStream = (readOptions: {
         readonly from: Replica.SettlementStart
         readonly mutationName?: string | undefined
-      }): Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError> => {
-        const readStep = (cursor: number) =>
-          sql.withTransaction(Effect.gen(function*() {
-            const mark = yield* readPruneMark(readOptions.mutationName)
-            if (cursor < mark) {
-              return yield* new ReplicaError.SettlementReplayTruncated({
-                requested: cursor,
-                oldestAvailable: mark
-              })
-            }
-            return yield* findSettledReceipts({
-              after: cursor,
-              limit: settlementPageSize,
-              name: readOptions.mutationName ?? null
-            }).pipe(Effect.mapError(StorageUnavailable.make))
-          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-        return Stream.unwrap(Effect.gen(function*() {
+      }): Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError> =>
+        Stream.unwrap(Effect.gen(function*() {
           const subscription = yield* PubSub.subscribe(settlementSignal)
           const start = yield* resolveSettlementStart(readOptions.from)
           return Stream.paginate(
             start,
             Effect.fnUntraced(function*(cursor: number) {
               while (true) {
-                const rows = yield* readStep(cursor)
-                if (rows.length > 0) {
-                  const settled = yield* Effect.forEach(rows, decodeSettledRow)
-                  const last = rows[rows.length - 1].settled_sequence
-                  return [settled, Option.some<number>(last)] as const
+                const settled = yield* readSettlements({ after: cursor, mutationName: readOptions.mutationName })
+                if (settled.length > 0) {
+                  return [settled, Option.some<number>(settled[settled.length - 1].sequence)] as const
                 }
                 yield* PubSub.take(subscription)
               }
             })
           )
         }))
-      }
 
       const acknowledgeSettlements = (sequence: number) => {
         if (!Number.isSafeInteger(sequence) || sequence < 0) {
@@ -3352,6 +3363,7 @@ export const layer = (
         pendingToSubmit,
         pending,
         settlements: settlementsStream,
+        readSettlements,
         resolveSettlementStart,
         acknowledgeSettlements,
         markSubmitting,
