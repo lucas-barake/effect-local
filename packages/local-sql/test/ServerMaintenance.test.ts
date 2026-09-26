@@ -99,6 +99,22 @@ describe("ServerStore maintenance", () => {
   )
 
   it.effect(
+    "returns a compacted space's history to the retained bound in one compaction",
+    Effect.fnUntraced(function*() {
+      const context = yield* layerStore({
+        retainedHistoryEntries: 1,
+        maximumHistoryEntries: 100,
+        retainedReceipts: 1,
+        maximumReceipts: 100,
+        pruneBatchSize: 10
+      }).pipe(Layer.provideMerge(layerDatabase), Layer.build)
+      const outcomes = yield* submitAll(1, 51).pipe(Effect.provide(context))
+      assert.deepStrictEqual(outcomes, Array.from({ length: 51 }, () => "Accepted"))
+      yield* awaitHistoryAtMost(1).pipe(Effect.provide(context))
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "sweeps every space from one cluster singleton on the configured interval",
     Effect.fnUntraced(function*() {
       const layerSharding = SingleRunner.layer({

@@ -1699,8 +1699,8 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           })
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
-      const publishAndPrune = Option.match({
-        onNone: () => Effect.succeed({ history: 0, receipts: 0 }),
+      const publish = Option.match({
+        onNone: () => Effect.void,
         onSome: (
           candidate: Effect.Success<ReturnType<typeof prepareSnapshot>> extends Option.Option<infer A> ? A : never
         ) =>
@@ -1711,7 +1711,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               meta.next_server_sequence !== candidate.observedNextServer ||
               meta.next_terminal_sequence !== candidate.observedNextTerminal ||
               meta.schema_generation !== candidate.observedSchemaGeneration
-            ) return { history: 0, receipts: 0 }
+            ) return
             let snapshotId = meta.snapshot_id
             if (
               snapshotId === null ||
@@ -1750,58 +1750,11 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                     ${sql.insert(snapshotRows.slice(offset, offset + 100))}`
               }
             }
-            const historyFloor = Identity.ServerSequence.make(
-              Math.max(meta.history_floor, candidate.manifest.sequence - options.retainedHistoryEntries)
-            )
-            const receiptFloor = Identity.TerminalSequence.make(
-              Math.max(
-                meta.receipt_floor,
-                candidate.manifest.terminalSequenceThrough - options.retainedReceipts
-              )
-            )
             yield* sql`UPDATE effect_local_server_spaces SET
                 snapshot_id = ${snapshotId},
                 snapshot_sequence = ${candidate.manifest.sequence},
-                snapshot_terminal_sequence = ${candidate.manifest.terminalSequenceThrough},
-                history_floor = ${historyFloor},
-                receipt_floor = ${receiptFloor}
+                snapshot_terminal_sequence = ${candidate.manifest.terminalSequenceThrough}
                 WHERE space_id = ${candidate.manifest.spaceId}`
-
-            const history = yield* findHistoryPrune({
-              spaceId: candidate.manifest.spaceId,
-              through: historyFloor,
-              limit: options.pruneBatchSize
-            }).pipe(Effect.mapError(StorageUnavailable.make))
-            if (history.length > 0) {
-              const through = history.at(-1)!.server_sequence
-              yield* sql`DELETE FROM effect_local_authoritative_log
-                  WHERE space_id = ${candidate.manifest.spaceId} AND server_sequence <= ${through}`
-              yield* sql`DELETE FROM effect_local_server_index_partition_log
-                  WHERE space_id = ${candidate.manifest.spaceId} AND server_sequence <= ${through}`
-            }
-            const receipts = yield* findReceiptPrune({
-              spaceId: candidate.manifest.spaceId,
-              through: receiptFloor,
-              limit: options.pruneBatchSize
-            }).pipe(Effect.mapError(StorageUnavailable.make))
-            if (receipts.length > 0) {
-              const through = receipts.at(-1)!.terminal_sequence
-              yield* sql`UPDATE effect_local_server_clients AS c SET
-                  expired_local_sequence = MAX(expired_local_sequence, COALESCE((
-                    SELECT MAX(r.local_sequence) FROM effect_local_server_receipts AS r
-                    WHERE r.space_id = c.space_id AND r.client_id = c.client_id
-                      AND r.membership_incarnation = c.membership_incarnation
-                      AND r.terminal_sequence <= ${through}
-                  ), expired_local_sequence))
-                  WHERE c.space_id = ${candidate.manifest.spaceId} AND EXISTS (
-                    SELECT 1 FROM effect_local_server_receipts AS r
-                    WHERE r.space_id = c.space_id AND r.client_id = c.client_id
-                      AND r.membership_incarnation = c.membership_incarnation
-                      AND r.terminal_sequence <= ${through}
-                  )`
-              yield* sql`DELETE FROM effect_local_server_receipts
-                  WHERE space_id = ${candidate.manifest.spaceId} AND terminal_sequence <= ${through}`
-            }
             yield* sql`DELETE FROM effect_local_server_snapshot_entities
                 WHERE space_id = ${candidate.manifest.spaceId} AND snapshot_id IN (
                   SELECT snapshot_id FROM effect_local_server_snapshots
@@ -1816,13 +1769,92 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                   ORDER BY server_sequence DESC, terminal_sequence DESC
                   LIMIT -1 OFFSET ${options.retainedSnapshots}
                 )`
-            return { history: history.length, receipts: receipts.length }
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
       })
 
+      const pruneBatch = (spaceId: Identity.SpaceId) =>
+        sql.withTransaction(Effect.gen(function*() {
+          const meta = yield* lockSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+          yield* validateStoredSpace(meta)
+          if (meta.snapshot_id === null) return { history: 0, receipts: 0 }
+          const historyFloor = Identity.ServerSequence.make(
+            Math.max(meta.history_floor, meta.snapshot_sequence - options.retainedHistoryEntries)
+          )
+          const receiptFloor = Identity.TerminalSequence.make(
+            Math.max(meta.receipt_floor, meta.snapshot_terminal_sequence - options.retainedReceipts)
+          )
+          if (historyFloor !== meta.history_floor || receiptFloor !== meta.receipt_floor) {
+            yield* sql`UPDATE effect_local_server_spaces SET
+                history_floor = ${historyFloor},
+                receipt_floor = ${receiptFloor}
+                WHERE space_id = ${spaceId}`
+          }
+          const history = yield* findHistoryPrune({
+            spaceId: spaceId,
+            through: historyFloor,
+            limit: options.pruneBatchSize
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+          if (history.length > 0) {
+            const through = history.at(-1)!.server_sequence
+            yield* sql`DELETE FROM effect_local_authoritative_log
+                  WHERE space_id = ${spaceId} AND server_sequence <= ${through}`
+            yield* sql`DELETE FROM effect_local_server_index_partition_log
+                  WHERE space_id = ${spaceId} AND server_sequence <= ${through}`
+          }
+          const receipts = yield* findReceiptPrune({
+            spaceId: spaceId,
+            through: receiptFloor,
+            limit: options.pruneBatchSize
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+          if (receipts.length > 0) {
+            const through = receipts.at(-1)!.terminal_sequence
+            yield* sql`UPDATE effect_local_server_clients AS c SET
+                  expired_local_sequence = MAX(expired_local_sequence, COALESCE((
+                    SELECT MAX(r.local_sequence) FROM effect_local_server_receipts AS r
+                    WHERE r.space_id = c.space_id AND r.client_id = c.client_id
+                      AND r.membership_incarnation = c.membership_incarnation
+                      AND r.terminal_sequence <= ${through}
+                  ), expired_local_sequence))
+                  WHERE c.space_id = ${spaceId} AND EXISTS (
+                    SELECT 1 FROM effect_local_server_receipts AS r
+                    WHERE r.space_id = c.space_id AND r.client_id = c.client_id
+                      AND r.membership_incarnation = c.membership_incarnation
+                      AND r.terminal_sequence <= ${through}
+                  )`
+            yield* sql`DELETE FROM effect_local_server_receipts
+                  WHERE space_id = ${spaceId} AND terminal_sequence <= ${through}`
+          }
+          return { history: history.length, receipts: receipts.length }
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+
+      const pruneToFloors = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
+        const total = { history: 0, receipts: 0 }
+        while (true) {
+          const batch = yield* pruneBatch(spaceId)
+          total.history += batch.history
+          total.receipts += batch.receipts
+          if (batch.history < options.pruneBatchSize && batch.receipts < options.pruneBatchSize) return total
+        }
+      })
+
+      const snapshotCurrent = (meta: typeof Rows.ServerMetaRow.Type) =>
+        meta.metadata_verified === 1 &&
+        meta.snapshot_id !== null &&
+        meta.snapshot_sequence === meta.next_server_sequence - 1 &&
+        meta.snapshot_terminal_sequence === meta.next_terminal_sequence - 1
+
+      const publishCurrentSnapshot = (spaceId: Identity.SpaceId) =>
+        findSpace(spaceId).pipe(
+          Effect.mapError(StorageUnavailable.make),
+          Effect.flatMap((stored) => {
+            if (Option.isSome(stored) && snapshotCurrent(stored.value)) return Effect.void
+            return prepareSnapshot(spaceId).pipe(Effect.flatMap(publish))
+          })
+        )
+
       const maintainSpace = (spaceId: Identity.SpaceId) =>
-        prepareSnapshot(spaceId).pipe(
-          Effect.flatMap(publishAndPrune),
+        publishCurrentSnapshot(spaceId).pipe(
+          Effect.andThen(pruneToFloors(spaceId)),
           Effect.tap((pruned) =>
             Effect.all([
               metrics.recordMaintenance("completed"),
