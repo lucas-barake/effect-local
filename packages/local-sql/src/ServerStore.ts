@@ -1849,7 +1849,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
             Effect.forkIn(storeScope),
             Effect.asVoid
           )
-        })
+        }).pipe(Effect.uninterruptible)
       const maintainAll = Effect.gen(function*() {
         let after = ""
         while (true) {
