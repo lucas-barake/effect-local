@@ -2,7 +2,7 @@ import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient
 import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
-import type * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import type * as Protocol from "@lucas-barake/effect-local/Protocol"
@@ -16,6 +16,7 @@ import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Hash from "effect/Hash"
 import type * as Layer from "effect/Layer"
+import type * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { Atom } from "effect/unstable/reactivity"
@@ -23,18 +24,58 @@ import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import type * as AtomRegistry from "effect/unstable/reactivity/AtomRegistry"
 import type * as Reactivity from "effect/unstable/reactivity/Reactivity"
 
-class QueryKey<P,> implements Equal.Equal {
+class QueryKey implements Equal.Equal {
+  readonly spaceId: Identity.SpaceId
+  readonly definition: Query.Any
+  readonly payload: unknown
   readonly value: string
-  readonly payload: P
-  constructor(value: string, payload: P) {
-    this.value = value
+  constructor(spaceId: Identity.SpaceId, definition: Query.Any, payload: unknown) {
+    this.spaceId = spaceId
+    this.definition = definition
     this.payload = payload
+    this.value = `${spaceId}:${definition.name}:${Canonical.hash(payload)}`
   }
   [Equal.symbol](that: unknown): boolean {
-    return that instanceof QueryKey && this.value === that.value
+    return that instanceof QueryKey && this.value === that.value && this.definition === that.definition
   }
   [Hash.symbol](): number {
     return Hash.string(this.value)
+  }
+}
+
+class EntityKey implements Equal.Equal {
+  readonly spaceId: Identity.SpaceId
+  readonly model: Model.Any
+  readonly key: unknown
+  constructor(spaceId: Identity.SpaceId, model: Model.Any, key: unknown) {
+    this.spaceId = spaceId
+    this.model = model
+    this.key = key
+  }
+  [Equal.symbol](that: unknown): boolean {
+    return that instanceof EntityKey && this.spaceId === that.spaceId && this.model === that.model &&
+      Equal.equals(this.key, that.key)
+  }
+  [Hash.symbol](): number {
+    return Hash.string(`${this.spaceId}:${this.model.name}`) ^ Hash.hash(this.key)
+  }
+}
+
+class MutationKey implements Equal.Equal {
+  readonly spaceId: Identity.SpaceId
+  readonly definition: Mutation.Any
+  readonly qualifier: string
+  constructor(spaceId: Identity.SpaceId, definition: Mutation.Any, qualifier: string) {
+    this.spaceId = spaceId
+    this.definition = definition
+    this.qualifier = qualifier
+  }
+  [Equal.symbol](that: unknown): boolean {
+    return that instanceof MutationKey && this.spaceId === that.spaceId && this.definition === that.definition &&
+      this.qualifier === that.qualifier
+  }
+  [Hash.symbol](): number {
+    return Hash.string(`${this.spaceId}:${this.definition.name}:${this.qualifier}`)
   }
 }
 
@@ -306,74 +347,122 @@ export const make = <E,>(
     return ephemeralRemoveFamily(new EphemeralTargetKey(definition, target))
   }
 
-  const entity = <M extends Model.Any,>(spaceId: Identity.SpaceId, model: M) =>
-    Atom.family((key: Model.Key<M>) =>
-      runtime.atom(
-        Replica.Replica.use((replica) => replica.space(spaceId).pipe(Effect.flatMap((space) => space.get(model, key))))
-      ).pipe(
-        factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.entity(spaceId, model.name, key)]),
-        Atom.setIdleTTL(idleTTL)
-      )
-    )
+  type GraphError = ReplicaError.ReplicaError | E
 
-  const query = <Q extends Query.Any,>(spaceId: Identity.SpaceId, definition: Q) => {
-    const family = Atom.family((key: QueryKey<Q["payloadSchema"]["Type"]>) => {
-      const token = ReactivityKey.query(spaceId, definition.name, key.payload)
-      const retention = runtime.atom(
-        QueryReactivity.QueryReactivity.use((service) =>
-          Effect.acquireRelease(
-            service.retain(token),
-            (release) => release
-          ).pipe(Effect.asVoid)
-        )
-      ).pipe(Atom.setIdleTTL(idleTTL))
-      const target = runtime.atom(
-        Replica.Replica.use((replica) =>
-          replica.space(spaceId).pipe(Effect.flatMap((space) => space.query(definition, key.payload)))
-        )
-      ).pipe(
-        factory.withReactivity([ReactivityKey.membership(spaceId), token])
+  const entityFamily = Atom.family((key: EntityKey) =>
+    runtime.atom(
+      Replica.Replica.use((replica) =>
+        replica.space(key.spaceId).pipe(Effect.flatMap((space) => space.get(key.model, key.key)))
       )
-      return Atom.transform(target, (get, atom) => {
-        if (!AsyncResult.isSuccess(get(retention))) return AsyncResult.initial(true)
-        get.subscribe(atom, (value) => get.setSelf(value))
-        return get.once(atom)
-      }, { initialValueTarget: target }).pipe(Atom.setIdleTTL(idleTTL))
-    })
-    return (payload: Q["payloadSchema"]["Type"]) => {
-      return family(new QueryKey(`${spaceId}:${definition.name}:${Canonical.hash(payload)}`, payload))
-    }
+    ).pipe(
+      factory.withReactivity([
+        ReactivityKey.membership(key.spaceId),
+        ReactivityKey.entity(key.spaceId, key.model.name, key.key)
+      ]),
+      Atom.setIdleTTL(idleTTL)
+    )
+  )
+  function entity<M extends Model.Any,>(
+    spaceId: Identity.SpaceId,
+    model: M
+  ): (key: Model.Key<M>) => Atom.Atom<AsyncResult.AsyncResult<Option.Option<Model.Value<M>>, GraphError>>
+  function entity(
+    spaceId: Identity.SpaceId,
+    model: Model.Any
+  ): (key: unknown) => Atom.Atom<AsyncResult.AsyncResult<Option.Option<unknown>, GraphError>> {
+    return (key) => entityFamily(new EntityKey(spaceId, model, key))
   }
 
-  const mutation = <M extends Mutation.Any,>(spaceId: Identity.SpaceId, definition: M) =>
-    runtime.fn<Mutation.Payload<M>>()(
+  const queryFamily = Atom.family((key: QueryKey) => {
+    const token = ReactivityKey.query(key.spaceId, key.definition.name, key.payload)
+    const retention = runtime.atom(
+      QueryReactivity.QueryReactivity.use((service) =>
+        Effect.acquireRelease(
+          service.retain(token),
+          (release) => release
+        ).pipe(Effect.asVoid)
+      )
+    ).pipe(Atom.setIdleTTL(idleTTL))
+    const target = runtime.atom(
+      Replica.Replica.use((replica) =>
+        replica.space(key.spaceId).pipe(Effect.flatMap((space) => space.query(key.definition, key.payload)))
+      )
+    ).pipe(
+      factory.withReactivity([ReactivityKey.membership(key.spaceId), token])
+    )
+    return Atom.transform(target, (get, atom) => {
+      if (!AsyncResult.isSuccess(get(retention))) return AsyncResult.initial(true)
+      get.subscribe(atom, (value) => get.setSelf(value))
+      return get.once(atom)
+    }, { initialValueTarget: target }).pipe(Atom.setIdleTTL(idleTTL))
+  })
+  function query<Q extends Query.Any,>(
+    spaceId: Identity.SpaceId,
+    definition: Q
+  ): (payload: Q["payloadSchema"]["Type"]) => Atom.Atom<
+    AsyncResult.AsyncResult<
+      Q["successSchema"]["Type"],
+      GraphError | ReplicaError.QueryFailed | Q["errorSchema"]["Type"]
+    >
+  >
+  function query(
+    spaceId: Identity.SpaceId,
+    definition: Query.Any
+  ): (payload: unknown) => Atom.Atom<AsyncResult.AsyncResult<unknown, unknown>> {
+    return (payload) => queryFamily(new QueryKey(spaceId, definition, payload))
+  }
+
+  const mutationFamily = Atom.family((key: MutationKey) =>
+    runtime.fn<unknown>()(
       (payload) =>
         Effect.yieldNow.pipe(
           Effect.andThen(
             Replica.Replica.use((replica) =>
-              replica.space(spaceId).pipe(Effect.flatMap((space) => space.mutate(definition, payload)))
+              replica.space(key.spaceId).pipe(Effect.flatMap((space) => space.mutate(key.definition, payload)))
             )
           )
         ),
       { concurrent: true }
     )
-
-  const receipt = <M extends Mutation.Any,>(
+  )
+  function mutation<M extends Mutation.Any,>(
     spaceId: Identity.SpaceId,
-    definition: M,
-    mutationId: Identity.MutationId
-  ) =>
+    definition: M
+  ): Atom.AtomResultFn<Mutation.Payload<M>, Protocol.PendingMutation, GraphError | Mutation.Rejection<M>>
+  function mutation(
+    spaceId: Identity.SpaceId,
+    definition: Mutation.Any
+  ): Atom.AtomResultFn<unknown, Protocol.PendingMutation, unknown> {
+    return mutationFamily(new MutationKey(spaceId, definition, ""))
+  }
+
+  const receiptFamily = Atom.family((key: MutationKey) =>
     runtime.atom(
       Replica.Replica.use((replica) =>
-        replica.space(spaceId).pipe(Effect.flatMap((space) => space.receipt(definition, mutationId)))
+        replica.space(key.spaceId).pipe(
+          Effect.flatMap((space) => space.receipt(key.definition, Identity.MutationId.make(key.qualifier)))
+        )
       )
     ).pipe(
       factory.withReactivity([
-        ReactivityKey.membership(spaceId),
-        ReactivityKey.receipt(spaceId, mutationId)
+        ReactivityKey.membership(key.spaceId),
+        ReactivityKey.receipt(key.spaceId, Identity.MutationId.make(key.qualifier))
       ]),
       Atom.setIdleTTL(idleTTL)
     )
+  )
+  function receipt<M extends Mutation.Any,>(
+    spaceId: Identity.SpaceId,
+    definition: M,
+    mutationId: Identity.MutationId
+  ): Atom.Atom<AsyncResult.AsyncResult<Option.Option<Replica.Receipt<M>>, GraphError>>
+  function receipt(
+    spaceId: Identity.SpaceId,
+    definition: Mutation.Any,
+    mutationId: Identity.MutationId
+  ): Atom.Atom<AsyncResult.AsyncResult<Option.Option<unknown>, GraphError>> {
+    return receiptFamily(new MutationKey(spaceId, definition, mutationId))
+  }
 
   const pending = Atom.family((spaceId: Identity.SpaceId) =>
     runtime.atom(
@@ -384,15 +473,26 @@ export const make = <E,>(
     )
   )
 
-  const pendingFor = <M extends Mutation.Any,>(spaceId: Identity.SpaceId, definition: M) =>
+  const pendingForFamily = Atom.family((key: MutationKey) =>
     runtime.atom(
       Replica.Replica.use((replica) =>
-        replica.space(spaceId).pipe(Effect.flatMap((space) => space.pendingFor(definition)))
+        replica.space(key.spaceId).pipe(Effect.flatMap((space) => space.pendingFor(key.definition)))
       )
     ).pipe(
-      factory.withReactivity([ReactivityKey.membership(spaceId), ReactivityKey.pending(spaceId)]),
+      factory.withReactivity([ReactivityKey.membership(key.spaceId), ReactivityKey.pending(key.spaceId)]),
       Atom.setIdleTTL(idleTTL)
     )
+  )
+  function pendingFor<M extends Mutation.Any,>(
+    spaceId: Identity.SpaceId,
+    definition: M
+  ): Atom.Atom<AsyncResult.AsyncResult<ReadonlyArray<Replica.PendingMutation<M>>, GraphError>>
+  function pendingFor(
+    spaceId: Identity.SpaceId,
+    definition: Mutation.Any
+  ): Atom.Atom<AsyncResult.AsyncResult<ReadonlyArray<Replica.PendingMutation>, GraphError>> {
+    return pendingForFamily(new MutationKey(spaceId, definition, ""))
+  }
 
   const settlements = Atom.family((spaceId: Identity.SpaceId) =>
     runtime.atom(
@@ -403,15 +503,28 @@ export const make = <E,>(
     )
   )
 
-  const settlementsFor = <M extends Mutation.Any,>(spaceId: Identity.SpaceId, definition: M) =>
+  const settlementsForFamily = Atom.family((key: MutationKey) =>
     runtime.atom(
       Replica.Replica.use((replica) =>
-        replica.space(spaceId).pipe(Effect.map((space) => space.settlementsFor(definition)))
+        replica.space(key.spaceId).pipe(Effect.map((space) => space.settlementsFor(key.definition)))
       )
     ).pipe(
-      factory.withReactivity([ReactivityKey.membership(spaceId)]),
+      factory.withReactivity([ReactivityKey.membership(key.spaceId)]),
       Atom.setIdleTTL(idleTTL)
     )
+  )
+  function settlementsFor<M extends Mutation.Any,>(
+    spaceId: Identity.SpaceId,
+    definition: M
+  ): Atom.Atom<
+    AsyncResult.AsyncResult<Stream.Stream<Replica.SettledMutation<M>, ReplicaError.ReplicaError>, GraphError>
+  >
+  function settlementsFor(
+    spaceId: Identity.SpaceId,
+    definition: Mutation.Any
+  ): Atom.Atom<AsyncResult.AsyncResult<Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError>, GraphError>> {
+    return settlementsForFamily(new MutationKey(spaceId, definition, ""))
+  }
 
   const status = Atom.family((spaceId: Identity.SpaceId) =>
     runtime.atom(

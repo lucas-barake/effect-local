@@ -618,6 +618,42 @@ describe("Replica Atom graph", () => {
   )
 
   it.effect(
+    "settles a derived atom that looks up its query while reading",
+    Effect.fnUntraced(function*() {
+      rangeReads.clear()
+      const graph = BrowserReplica.make(layerReplica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const upper = Atom.make("m")
+      const window = Atom.readable((get) => get(graph.query(spaceId, RangeTodos)({ lower: "a", upper: get(upper) })))
+      const unmount = registry.mount(window)
+      yield* Effect.addFinalizer(() => Effect.sync(unmount))
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, window), [])
+      yield* Effect.yieldNow.pipe(Effect.repeat({ times: 64 }))
+      assert.strictEqual(rangeReads.get("a:m"), 1)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "returns the same atom for equal arguments from every graph accessor",
+    Effect.fnUntraced(function*() {
+      const graph = BrowserReplica.make(layerReplica)
+      const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
+      assert.strictEqual(
+        graph.query(spaceId, RangeTodos)({ lower: "a", upper: "m" }),
+        graph.query(spaceId, RangeTodos)({ lower: "a", upper: "m" })
+      )
+      assert.strictEqual(graph.query(spaceId, ListTodos)(undefined), graph.query(spaceId, ListTodos)(undefined))
+      assert.strictEqual(graph.entity(spaceId, Todo)("1"), graph.entity(spaceId, Todo)("1"))
+      assert.strictEqual(graph.mutation(spaceId, PutTodo), graph.mutation(spaceId, PutTodo))
+      assert.strictEqual(graph.receipt(spaceId, PutTodo, mutationId), graph.receipt(spaceId, PutTodo, mutationId))
+      assert.strictEqual(graph.pendingFor(spaceId, PutTodo), graph.pendingFor(spaceId, PutTodo))
+      assert.strictEqual(graph.settlementsFor(spaceId, PutTodo), graph.settlementsFor(spaceId, PutTodo))
+      assert.notStrictEqual(graph.pendingFor(spaceId, PutTodo), graph.pendingFor(secondSpaceId, PutTodo))
+    })
+  )
+
+  it.effect(
     "reruns raw-SQL queries of the written model and keeps every window correct",
     Effect.fnUntraced(function*() {
       rangeReads.clear()
