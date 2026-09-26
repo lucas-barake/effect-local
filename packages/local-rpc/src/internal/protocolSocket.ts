@@ -4,11 +4,12 @@ import { constVoid } from "effect/Function"
 import * as Latch from "effect/Latch"
 import * as Option from "effect/Option"
 import * as Result from "effect/Result"
-import * as Schedule from "effect/Schedule"
+import type * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import { RpcClient, RpcClientError, RpcMessage, RpcSerialization } from "effect/unstable/rpc"
 import * as Socket from "effect/unstable/socket/Socket"
+import { reconnectPolicy } from "./configuration.js"
 
 export interface Options {
   readonly retryTransientErrors?: boolean
@@ -164,7 +165,7 @@ export const make = (options?: Options): Effect.Effect<
         return failCurrentSocket(new RpcClientError.RpcClientError({ reason }))
       }),
       Effect.retryOrElse(
-        options?.retryPolicy ?? defaultRetryPolicy,
+        options?.retryPolicy ?? reconnectPolicy,
         (error) => failCurrentSocket(new RpcClientError.RpcClientError({ reason: error.reason }))
       ),
       Effect.annotateLogs({
@@ -190,11 +191,6 @@ export const make = (options?: Options): Effect.Effect<
       codecFor: serialization.codecFor
     }
   }))
-
-const defaultRetryPolicy = Schedule.min([
-  Schedule.exponential(500, 1.5),
-  Schedule.spaced(5000)
-])
 
 const makePinger = Effect.fnUntraced(function*<A, E extends { readonly _tag: string }, R,>(
   writePing: Effect.Effect<A, E, R>

@@ -484,7 +484,8 @@ export const layerOnePass = (
       const local = yield* LocalStore.Store
       const remote = yield* SyncEngine.SyncEngine
       const gate = yield* Semaphore.make(1)
-      const status = yield* Ref.make<ReplicaStatus.ReplicaStatus>({ _tag: "Offline", pending: 0 })
+      const status = yield* Ref.make<ReplicaStatus.ReplicaStatus>({ _tag: "Connecting", pending: 0 })
+      let syncAttempted = false
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
       const setStatus = (value: ReplicaStatus.ReplicaStatus) =>
         Ref.set(status, value).pipe(
@@ -530,6 +531,7 @@ export const layerOnePass = (
       const failed = (error: ReplicaError.ReplicaError) => reportFailure(error, false)
       const watchFailed = (error: ReplicaError.ReplicaError) => reportFailure(error, true)
       const succeeded = Effect.gen(function*() {
+        if (!syncAttempted) return
         if ((yield* Ref.get(status))._tag !== "Connecting") return
         const pending = yield* local.pendingCount
         const cursor = yield* local.cursor
@@ -685,6 +687,7 @@ export const layerOnePass = (
       })
 
       const sync = gate.withPermit(Effect.gen(function*() {
+        syncAttempted = true
         const pending = yield* local.pendingCount
         yield* setStatus({ _tag: "Connecting", pending })
         yield* catchUp

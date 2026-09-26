@@ -1,5 +1,6 @@
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -78,6 +79,10 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                 },
                 (_, error) => Effect.die(error)
               ),
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+                return Effect.failCause(cause)
+              }),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
                 orElse: () =>
@@ -132,6 +137,10 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                 },
                 (_, error) => Effect.die(error)
               ),
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+                return Effect.failCause(cause)
+              }),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
                 orElse: () =>
@@ -186,6 +195,10 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                 },
                 (_, error) => Effect.die(error)
               ),
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+                return Effect.failCause(cause)
+              }),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
                 orElse: () =>
@@ -242,6 +255,10 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                 },
                 (_, error) => Effect.die(error)
               ),
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+                return Effect.failCause(cause)
+              }),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
                 orElse: () =>
@@ -314,7 +331,11 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                           )
                       },
                       (_, error) => Stream.die(error)
-                    )
+                    ),
+                    Stream.catchCause((cause) => {
+                      if (Cause.hasInterruptsOnly(cause)) return Stream.fail(new ReplicaError.ServerUnavailable())
+                      return Stream.failCause(cause)
+                    })
                   )
                 })
               )

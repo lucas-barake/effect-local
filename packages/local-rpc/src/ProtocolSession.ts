@@ -1,5 +1,6 @@
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -96,6 +97,10 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
             },
             (_, error) => Effect.die(error)
           ),
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+            return Effect.failCause(cause)
+          }),
           Effect.withSpan("ProtocolSession.negotiate")
         )
         yield* Ref.set(selected, negotiated.version)

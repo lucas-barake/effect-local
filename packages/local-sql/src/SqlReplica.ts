@@ -809,6 +809,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.activation = "Activating"
           entry.transition = completion
           entry.runtime = undefined
+          yield* modifyContribution(entry, (current) => ({ _tag: "Connecting", pending: current.pending }))
           yield* invalidateActivation(entry.spaceId)
           const startRuntime = restore(initialize(entry, generation, foreground))
           let start = startRuntime
@@ -833,7 +834,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                         })
                       )
                   }),
-                  Effect.flatMap((count) => updateContribution(entry, { _tag: "Offline", pending: count.count }))
+                  Effect.flatMap((count) => updateContribution(entry, { _tag: "Connecting", pending: count.count }))
                 )
               )),
               Effect.andThen(startRuntime)
@@ -853,6 +854,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.transition = undefined
           entry.foreground = false
           foregroundResidents.delete(entry.spaceId)
+          yield* modifyContribution(entry, (current) => ({ _tag: "Offline", pending: current.pending }))
           if (Exit.hasInterrupts(result)) yield* Deferred.succeed(completion, undefined)
           else yield* Deferred.done(completion, result)
           yield* invalidateActivation(entry.spaceId)
@@ -1167,7 +1169,12 @@ const makeLayer = <D extends Definition.Any, R,>(
                     })
                   )
               }),
-              Effect.map((row) => addressedStatus(entry.spaceId, { _tag: "Offline", pending: row.count }))
+              Effect.map((row) => {
+                if (entry.activation === "Activating") {
+                  return addressedStatus(entry.spaceId, { _tag: "Connecting", pending: row.count })
+                }
+                return addressedStatus(entry.spaceId, { _tag: "Offline", pending: row.count })
+              })
             )
           })
         }

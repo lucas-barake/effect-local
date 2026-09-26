@@ -3,6 +3,7 @@ import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
@@ -22,7 +23,7 @@ import * as Stream from "effect/Stream"
 import type * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import type * as Authentication from "./Authentication.js"
-import { positiveFiniteDurationMillis } from "./internal/configuration.js"
+import { positiveFiniteDurationMillis, reconnectPolicy } from "./internal/configuration.js"
 import { invalidConfiguration } from "./internal/errors.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSession from "./ProtocolSession.js"
@@ -124,6 +125,7 @@ export class EphemeralClient extends Context.Service<EphemeralClient, Service>()
 export interface Options extends ProtocolSession.Options {
   readonly rpcTimeout?: Duration.Input
   readonly heartbeatInterval?: Duration.Input
+  readonly rejoinPolicy?: Schedule.Schedule<unknown, ReplicaError.ReplicaError>
 }
 
 const boundedTtlMillis = Effect.fnUntraced(function*(
@@ -270,6 +272,11 @@ const memberSlice = (view: RawView): ReadonlyArray<Protocol.EphemeralMemberEntry
 
 const noProjection = (): string | undefined => undefined
 
+const isTransientFailure = (error: ReplicaError.ReplicaError) =>
+  error._tag === "ServerUnavailable" ||
+  error._tag === "OperationTimeout" ||
+  error._tag === "AuthenticatorUnavailable"
+
 const projectSlice = <A,>(
   affects: (scope: ViewScope) => boolean,
   slice: (view: RawView) => A
@@ -283,7 +290,7 @@ const projectSlice = <A,>(
 }
 
 export const layerFromSession = (
-  options?: Pick<Options, "rpcTimeout" | "heartbeatInterval">
+  options?: Pick<Options, "rpcTimeout" | "heartbeatInterval" | "rejoinPolicy">
 ): Layer.Layer<EphemeralClient, ReplicaError.InvalidConfiguration, ProtocolSession.ProtocolSession> =>
   Layer.effect(
     EphemeralClient,
@@ -295,6 +302,10 @@ export const layerFromSession = (
       const heartbeatIntervalMillis = yield* positiveFiniteDurationMillis(
         "heartbeatInterval",
         options?.heartbeatInterval ?? "20 seconds"
+      )
+      const rejoinPolicy = Schedule.while(
+        options?.rejoinPolicy ?? reconnectPolicy,
+        ({ input }) => isTransientFailure(input)
       )
       const session = yield* ProtocolSession.ProtocolSession
       const client = session.client
@@ -363,6 +374,10 @@ export const layerFromSession = (
                     },
                     (_, error) => Effect.die(error)
                   ),
+                  Effect.catchCause((cause) => {
+                    if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+                    return Effect.failCause(cause)
+                  }),
                   Effect.timeoutOrElse({
                     duration: rpcTimeoutMillis,
                     orElse: () =>
@@ -429,6 +444,10 @@ export const layerFromSession = (
                     },
                     (_, error) => Effect.die(error)
                   ),
+                  Effect.catchCause((cause) => {
+                    if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+                    return Effect.failCause(cause)
+                  }),
                   Effect.timeoutOrElse({
                     duration: rpcTimeoutMillis,
                     orElse: () =>
@@ -511,7 +530,11 @@ export const layerFromSession = (
                       )
                   },
                   (_, error) => Stream.die(error)
-                )
+                ),
+                Stream.catchCause((cause) => {
+                  if (Cause.hasInterruptsOnly(cause)) return Stream.fail(new ReplicaError.ServerUnavailable())
+                  return Stream.failCause(cause)
+                })
               )
               const visible = messages.pipe(
                 Stream.tap((message) => {
@@ -558,6 +581,7 @@ export const layerFromSession = (
           const ready = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           const failure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
           let view: RawView | undefined
+          let unknownPresented = false
           let memberValue = identity.request.value
           const consume = (message: Protocol.EphemeralMessage) => {
             if (message._tag === "Event") return PubSub.publish(events, message.entry).pipe(Effect.asVoid)
@@ -565,12 +589,27 @@ export const layerFromSession = (
             const next = reduceView(view, message)
             if (next === undefined) return Effect.void
             view = next.view
+            unknownPresented = false
             return PubSub.publish(views, next).pipe(
               Effect.andThen(Deferred.succeed(ready, undefined)),
               Effect.asVoid
             )
           }
+          const presentUnknown = Effect.suspend(() => {
+            if (unknownPresented) return Effect.void
+            view = undefined
+            unknownPresented = true
+            return PubSub.publish(views, { view: { members: [], states: new Map() }, scope: { kind: "all" } }).pipe(
+              Effect.andThen(Deferred.succeed(ready, undefined)),
+              Effect.asVoid
+            )
+          })
           yield* joinWire(identity.request, () => memberValue).pipe(
+            Stream.tapError((error) => {
+              if (isTransientFailure(error)) return presentUnknown
+              return Effect.void
+            }),
+            Stream.retry(rejoinPolicy),
             Stream.runForEach(consume),
             Effect.catchCause((cause) =>
               Deferred.failCause(ready, cause).pipe(
