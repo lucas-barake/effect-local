@@ -13,7 +13,7 @@ export const take = <A, E extends { readonly _tag: string } = never,>(
   queue: Queue.Dequeue<A, E>
 ): Effect.Effect<A, E> => Effect.suspend(() => Queue.takeUnsafe(queue) ?? withoutYield(Queue.take(queue)))
 
-export const stream = <A, E extends Cause.Done = never,>(
+export const stream = <A, E extends { readonly _tag: string } = never,>(
   queue: Queue.Dequeue<A, E>
 ): Stream.Stream<A, Exclude<E, Cause.Done>> =>
   Queue.takeAll(queue).pipe(withoutYield, Effect.succeed, Channel.fromPull, Stream.fromChannel)

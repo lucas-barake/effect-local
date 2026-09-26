@@ -28,6 +28,7 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
@@ -37,6 +38,7 @@ import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as BrowserReplica from "../src/BrowserReplica.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as platform from "../src/internal/platform.js"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
 import * as testKit from "./multiTabKit.js"
@@ -156,11 +158,17 @@ const layerEphemeralOpening = (
 
 const settle = Effect.fnUntraced(function*<A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) {
   const fiber = yield* Effect.forkChild(effect)
-  yield* TestClock.adjust("5 seconds")
+  for (let step = 0; step < 100; step++) yield* TestClock.adjust("50 millis")
   return yield* Fiber.join(fiber)
 })
 
 const provideFileSystem = Effect.provide(NodeFileSystem.layer)
+
+const statusChanges = (reactivity: Reactivity.Reactivity, space: Replica.Space) =>
+  reactivity.query([ReactivityKey.status(spaceId)], space.status).pipe(
+    Effect.map(LosslessQueue.stream),
+    Stream.unwrap
+  )
 
 interface EnvironmentOptions {
   readonly layerEphemeral?: Layer.Layer<EphemeralClient.EphemeralClient>
@@ -281,6 +289,20 @@ const openStatusSession = (context: Context.Context<EphemeralClient.EphemeralCli
 const listFrom = (replica: Replica.Service) =>
   replica.space(spaceId).pipe(Effect.flatMap((space) => space.query(ListTodos, undefined)))
 
+const liveSettlementsFailWhenTheTabCloses = Effect.fnUntraced(
+  function*() {
+    const environment = yield* makeEnvironment
+    const leader = yield* environment.openTabWith(true)
+    const space = yield* settle(leader.replica.space(spaceId))
+    const streaming = yield* Effect.forkChild(space.settlements({ from: "live" }).pipe(Stream.runDrain))
+    yield* TestClock.adjust("5 seconds")
+    yield* settle(Scope.close(leader.scope, Exit.void))
+    assert.strictEqual(failureTag(yield* settle(Fiber.await(streaming))), "OwnerUnavailable")
+  },
+  Effect.scoped,
+  provideFileSystem
+)
+
 describe("BrowserReplica", () => {
   it.effect(
     "reports the leader replica's first sync to a follower tab through the synced status",
@@ -301,7 +323,7 @@ describe("BrowserReplica", () => {
           Effect.forkChild({ startImmediately: true })
         )
         const reactivity = Context.get(follower.context, Reactivity.Reactivity)
-        const synced = reactivity.stream([ReactivityKey.status(spaceId)], space.status).pipe(
+        const synced = statusChanges(reactivity, space).pipe(
           Stream.filter((status) => status.synced),
           Stream.runHead
         )
@@ -631,19 +653,7 @@ describe("BrowserReplica", () => {
 
   it.effect(
     "fails a caller's live settlement stream with OwnerUnavailable when its tab's replica closes",
-    Effect.fnUntraced(
-      function*() {
-        const environment = yield* makeEnvironment
-        const leader = yield* environment.openTabWith(true)
-        const space = yield* settle(leader.replica.space(spaceId))
-        const streaming = yield* Effect.forkChild(space.settlements({ from: "live" }).pipe(Stream.runDrain))
-        yield* TestClock.adjust("5 seconds")
-        yield* settle(Scope.close(leader.scope, Exit.void))
-        assert.strictEqual(failureTag(yield* settle(Fiber.await(streaming))), "OwnerUnavailable")
-      },
-      Effect.scoped,
-      provideFileSystem
-    )
+    liveSettlementsFailWhenTheTabCloses
   )
 
   it.effect(
@@ -751,7 +761,7 @@ describe("BrowserReplica", () => {
         const space = yield* settle(follower.replica.space(spaceId))
         const reactivity = Context.get(follower.context, Reactivity.Reactivity)
         const observed: Array<string> = []
-        const awaitOnline = reactivity.stream([ReactivityKey.status(spaceId)], space.status).pipe(
+        const awaitOnline = statusChanges(reactivity, space).pipe(
           Stream.tap((status) => Effect.sync(() => observed.push(status._tag))),
           Stream.filter((status) => status._tag === "Online"),
           Stream.runHead
@@ -1104,5 +1114,12 @@ describe("BrowserReplica", () => {
       )
       assert.strictEqual(outcome, "decode")
     }, Effect.scoped)
+  )
+})
+
+describe("BrowserReplica at small scheduler budgets", () => {
+  it.effect(
+    "fails a caller's live settlement stream with OwnerUnavailable when its tab's replica closes at a scheduler budget of 20 operations",
+    () => liveSettlementsFailWhenTheTabCloses().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 20))
   )
 })
