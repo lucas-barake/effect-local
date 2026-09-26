@@ -76,6 +76,44 @@ const activeChildFibers = Metric.snapshot.pipe(
   })
 )
 
+const restartWithStalledBackgroundPull = Effect.fnUntraced(function*(constructor: "layer" | "layerWorkflow") {
+  const databaseContext = yield* Layer.mergeAll(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer,
+    Reactivity.layer,
+    WorkflowEngine.layerMemory
+  ).pipe(Layer.build)
+  const backgroundPullStarted = yield* Deferred.make<void>()
+  let observePull = false
+  const stalledRemote = SyncEngine.SyncEngine.of({
+    ...remoteService,
+    pull: () => {
+      if (!observePull) return Effect.never
+      return Deferred.succeed(backgroundPullStarted, undefined).pipe(Effect.andThen(Effect.never))
+    }
+  })
+  const layerServices = Layer.mergeAll(
+    Domain.layerHandlers,
+    Layer.succeed(SyncEngine.SyncEngine, stalledRemote),
+    Layer.succeedContext(databaseContext)
+  )
+  const options = { ...clientHistory, definition: Domain.definition, clientId }
+  let layerReplica = SqlReplica.layer(options).pipe(Layer.provide(layerServices))
+  if (constructor === "layerWorkflow") {
+    layerReplica = SqlReplica.layerWorkflow(options).pipe(Layer.provide(layerServices))
+  }
+
+  const firstScope = yield* Scope.make()
+  const first = Context.get(yield* Layer.buildWithScope(layerReplica, firstScope), Replica.Replica)
+  yield* (yield* first.join(spaceA)).mutate(Domain.PutTodo, Domain.todo("restart", "retained"))
+  yield* Scope.close(firstScope, Exit.void)
+
+  observePull = true
+  const second = Context.get(yield* Layer.build(layerReplica), Replica.Replica)
+  yield* Deferred.await(backgroundPullStarted)
+  return second
+})
+
 describe("multi space Replica", () => {
   it.effect(
     "isolates overlapping entity keys for two spaces in one database",
@@ -175,6 +213,27 @@ describe("multi space Replica", () => {
         "retained"
       )
       yield* Scope.close(secondScope, Exit.void)
+    }, Effect.scoped)
+  )
+
+  it.effect.each(["layer", "layerWorkflow"] as const)(
+    "serves a restored space while its background reconciliation waits on the remote with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const replica = yield* restartWithStalledBackgroundPull(constructor)
+      const restored = yield* replica.space(spaceA)
+      assert.strictEqual(Option.getOrThrow(yield* restored.get(Domain.Todo, "restart")).title, "retained")
+      assert.strictEqual(yield* restored.activation, "Active")
+    }, Effect.scoped)
+  )
+
+  it.effect.each(["layer", "layerWorkflow"] as const)(
+    "leaves a restored space while its background reconciliation waits on the remote with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const replica = yield* restartWithStalledBackgroundPull(constructor)
+      yield* replica.leave(spaceA)
+      const missing = yield* replica.space(spaceA).pipe(Effect.result)
+      assert.strictEqual(missing._tag, "Failure")
+      if (missing._tag === "Failure") assert.strictEqual(missing.failure._tag, "SpaceNotJoined")
     }, Effect.scoped)
   )
 

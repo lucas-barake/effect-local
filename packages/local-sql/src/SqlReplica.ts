@@ -115,6 +115,7 @@ interface ActiveRuntime {
   readonly foreground: boolean
   readonly scope: Scope.Closeable
   readonly operationGate: Semaphore.Semaphore
+  readonly preemption: Deferred.Deferred<void>
   readonly local: LocalStore.Service
   readonly queries: QueryExecutor.Service
   readonly reconciler: Reconciler.Service
@@ -554,10 +555,12 @@ const makeLayer = <D extends Definition.Any, R,>(
             }
           }
           const operationGate = yield* Semaphore.make(1)
+          const preemption = yield* Deferred.make<void>()
           return {
             foreground,
             scope: childScope,
             operationGate,
+            preemption,
             local,
             queries,
             reconciler,
@@ -663,10 +666,11 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (entry.leases > 0) {
             if (!explicit) return false
             const changed = capacityChanged
+            yield* Deferred.succeed(runtime.preemption, undefined)
             yield* restore(Deferred.await(changed))
             return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
           }
-          const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
+          const completion = Deferred.makeUnsafe<void, ReplicaError.ReplicaError>()
           entry.activation = "Deactivating"
           entry.transition = completion
           entry.foreground = false
@@ -754,28 +758,53 @@ const makeLayer = <D extends Definition.Any, R,>(
             foregroundResidents.delete(entry.spaceId)
             foregroundResidents.set(entry.spaceId, entry)
           }
+          let retiring: ActiveRuntime | undefined
           if (entry.activation === "Active" && entry.runtime !== undefined) {
             if (!foreground || entry.runtime.foreground) return entry.runtime
             if (entry.leases > 0) {
               const changed = capacityChanged
+              yield* Deferred.succeed(entry.runtime.preemption, undefined)
               yield* restore(Deferred.await(changed))
               return yield* activate(entry, foreground)
             }
-            yield* restore(deactivate(entry, false))
-            entry.foreground = true
-            return yield* activate(entry, foreground)
-          }
-          if (entry.activation === "Activating" || entry.activation === "Deactivating") {
+            retiring = entry.runtime
+          } else if (entry.activation === "Activating" || entry.activation === "Deactivating") {
             const transition = entry.transition
             if (transition !== undefined) yield* restore(Deferred.await(transition))
             return yield* activate(entry, foreground)
           }
-          const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
+          const completion = Deferred.makeUnsafe<void, ReplicaError.ReplicaError>()
           const generation = ++nextGeneration
           entry.activation = "Activating"
           entry.transition = completion
+          entry.runtime = undefined
           yield* invalidateActivation(entry.spaceId)
-          const result = yield* restore(initialize(entry, generation, foreground)).pipe(Effect.exit)
+          let start = initialize(entry, generation, foreground)
+          if (retiring !== undefined) {
+            start = retiring.operationGate.withPermit(Scope.close(retiring.scope, Exit.void)).pipe(
+              Effect.andThen(pendingCount(entry.spaceId)),
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({
+                      message: "Client membership row is corrupt",
+                      cause
+                    })
+                  ),
+                NoSuchElementError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({
+                      message: "Client membership row is missing",
+                      cause
+                    })
+                  )
+              }),
+              Effect.flatMap((count) => updateContribution(entry, { _tag: "Offline", pending: count.count })),
+              Effect.andThen(start)
+            )
+          }
+          const result = yield* restore(start).pipe(Effect.exit)
           if (Exit.isSuccess(result)) {
             entry.runtime = result.value
             entry.activation = "Active"
@@ -785,7 +814,6 @@ const makeLayer = <D extends Definition.Any, R,>(
             yield* signalCapacity
             return result.value
           }
-          entry.runtime = undefined
           entry.activation = "Inactive"
           entry.transition = undefined
           entry.foreground = false
@@ -793,20 +821,24 @@ const makeLayer = <D extends Definition.Any, R,>(
           yield* Deferred.done(completion, result)
           yield* invalidateActivation(entry.spaceId)
           yield* signalCapacity
+          if (retiring !== undefined) yield* enqueueBackground(entry)
           return yield* result
         }))
 
-      const acquire = (entry: RememberedEntry, foreground: boolean) =>
+      const acquire = (
+        entry: RememberedEntry,
+        foreground: boolean
+      ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
         activate(entry, foreground).pipe(
-          Effect.tap(() =>
-            Effect.sync(() => {
-              entry.leases += 1
-              if (foreground) {
-                foregroundResidents.delete(entry.spaceId)
-                foregroundResidents.set(entry.spaceId, entry)
-              }
-            })
-          )
+          Effect.flatMap((runtime) => {
+            if (entry.activation !== "Active" || entry.runtime !== runtime) return acquire(entry, foreground)
+            entry.leases += 1
+            if (foreground) {
+              foregroundResidents.delete(entry.spaceId)
+              foregroundResidents.set(entry.spaceId, entry)
+            }
+            return Effect.succeed(runtime)
+          })
         )
 
       const release = (entry: RememberedEntry) =>
@@ -1261,8 +1293,9 @@ const makeLayer = <D extends Definition.Any, R,>(
             return Effect.void
           })),
           (runtime) => {
-            if (workflow === undefined) return runtime.reconciler.sync
-            return backgroundWorkflowTurns.withPermit(runtime.reconciler.sync)
+            let sync = runtime.reconciler.sync
+            if (workflow !== undefined) sync = backgroundWorkflowTurns.withPermit(sync)
+            return Effect.raceFirst(sync, Deferred.await(runtime.preemption))
           },
           () => release(entry)
         ).pipe(Effect.result)
