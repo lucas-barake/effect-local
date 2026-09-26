@@ -29,6 +29,7 @@ import * as ReplicaOwner from "./internal/replicaOwner.js"
 import * as replicaProxy from "./internal/replicaProxy.js"
 import * as replicaWire from "./internal/replicaWire.js"
 import * as TabCluster from "./internal/tabCluster.js"
+import * as TabRunnerStorage from "./internal/tabRunnerStorage.js"
 import * as TabScheduler from "./internal/tabScheduler.js"
 
 export { BrowserStorageError } from "./BrowserStorageError.js"
@@ -46,7 +47,7 @@ export interface Options<D extends Definition.Any, ED extends Tagged, ES extends
   readonly retryDelay?: Duration.Input | undefined
   readonly sharding?: Partial<ShardingConfig.ShardingConfig["Service"]> | undefined
   readonly layerPlatform?:
-    | Layer.Layer<platform.WebLocks | platform.TabChannel | platform.ClientIdentityStore>
+    | Layer.Layer<platform.WebLocks | platform.TabChannel | platform.TabVisibility | platform.ClientIdentityStore>
     | undefined
 }
 
@@ -55,10 +56,11 @@ interface Tagged {
 }
 
 export const layerPlatformBrowser: Layer.Layer<
-  platform.WebLocks | platform.TabChannel | platform.ClientIdentityStore
+  platform.WebLocks | platform.TabChannel | platform.TabVisibility | platform.ClientIdentityStore
 > = Layer.mergeAll(
   platform.layerWebLocksNavigator,
   platform.layerTabChannelBroadcast,
+  platform.layerTabVisibilityDocument,
   platform.layerClientIdentityStoreLocalStorage
 )
 
@@ -119,6 +121,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
   const platformContext = yield* Layer.build(options.layerPlatform ?? layerPlatformBrowser)
   const locks = Context.get(platformContext, platform.WebLocks)
   const channels = Context.get(platformContext, platform.TabChannel)
+  const visibility = Context.get(platformContext, platform.TabVisibility)
   const identities = Context.get(platformContext, platform.ClientIdentityStore)
   const names = lockNames.make(options.name)
   const host = yield* randomUuid
@@ -150,10 +153,14 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     layerOwner = Layer.merge(layerStack, layerRequestPersistence)
   }
 
+  const hosting = TabRunnerStorage.makeHosting()
   const owner = yield* ReplicaOwner.make({
     host,
     names,
     locks,
+    channels,
+    visibility,
+    shardsReleased: hosting.released,
     retryDelay,
     layerOwner
   })
@@ -164,6 +171,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     locks,
     channels,
     isReady: owner.isReady,
+    hosting,
     shardingConfig: options.sharding
   })
   const layerEntity = replicaWire.ReplicaEntity.toLayer(

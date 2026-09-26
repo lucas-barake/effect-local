@@ -5,8 +5,12 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
-import * as Schedule from "effect/Schedule"
+import * as Schema from "effect/Schema"
+import * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
+import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as InvalidationHub from "./invalidationHub.js"
 import type * as lockNames from "./lockNames.js"
@@ -17,6 +21,9 @@ export interface Options<E extends { readonly _tag: string },> {
   readonly host: string
   readonly names: lockNames.LockNames
   readonly locks: platform.WebLocksService
+  readonly channels: platform.TabChannelService
+  readonly visibility: platform.TabVisibilityService
+  readonly shardsReleased: Effect.Effect<void>
   readonly retryDelay: Duration.Input
   readonly layerOwner: Layer.Layer<
     Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient,
@@ -48,13 +55,92 @@ const stringKeys = (keys: ReadonlyArray<unknown> | Readonly<Record<string, Reado
   return flat
 }
 
+const decodeAnnouncement = Schema.decodeUnknownEffect(Schema.String)
+
 export const make = Effect.fnUntraced(function*<E extends { readonly _tag: string },>(options: Options<E>) {
+  const ownerScope = yield* Effect.scope
+  const names = options.names
   let ready = false
   let terms = 0
   let term = yield* Deferred.make<OwnerResources>()
 
+  const visible = yield* SubscriptionRef.make(yield* options.visibility.visible)
+  const announcements = yield* options.channels.open(names.visibilityChannel)
+  let marker: Scope.Closeable | undefined
+
+  const syncMarker = Effect.gen(function*() {
+    const now = yield* options.visibility.visible
+    yield* SubscriptionRef.set(visible, now)
+    if (now && marker === undefined) {
+      const markerScope = yield* Scope.fork(ownerScope)
+      marker = markerScope
+      yield* options.locks.acquire(names.visible(options.host)).pipe(Scope.provide(markerScope))
+      yield* announcements.post(options.host)
+    } else if (!now && marker !== undefined) {
+      const released = marker
+      marker = undefined
+      yield* Scope.close(released, Exit.void)
+    }
+  })
+
+  yield* options.visibility.changes.pipe(
+    Stream.runForEach(() => syncMarker),
+    Effect.forkScoped
+  )
+
+  const visibleElsewhere = options.locks.held.pipe(
+    Effect.map((held) => {
+      const hosts: Array<string> = []
+      for (const name of held) {
+        if (!name.startsWith(names.visiblePrefix)) continue
+        const host = name.slice(names.visiblePrefix.length)
+        if (host !== options.host) hosts.push(host)
+      }
+      return hosts
+    })
+  )
+
+  const outranked = Effect.gen(function*() {
+    if (yield* SubscriptionRef.get(visible)) return false
+    const hosts = yield* visibleElsewhere
+    return hosts.length > 0
+  })
+
+  const awaitCandidacy = Effect.gen(function*() {
+    while (true) {
+      if (yield* SubscriptionRef.get(visible)) return
+      const hosts = yield* visibleElsewhere
+      if (hosts.length === 0) return
+      const hidden = hosts.map((host) => options.locks.released(names.visible(host)))
+      yield* Effect.raceFirst(
+        SubscriptionRef.changes(visible).pipe(Stream.filter((now) => now), Stream.runHead),
+        Effect.raceAll(hidden)
+      )
+    }
+  })
+
+  const awaitOutranked = Effect.gen(function*() {
+    const inbox = yield* announcements.messages
+    const announced = Stream.fromQueue(inbox).pipe(
+      Stream.mapEffect((raw) =>
+        decodeAnnouncement(raw).pipe(
+          Effect.as(true),
+          Effect.catchTag("SchemaError", () => Effect.succeed(false))
+        )
+      ),
+      Stream.filter((valid) => valid)
+    )
+    yield* Stream.merge(SubscriptionRef.changes(visible), announced).pipe(
+      Stream.mapEffect(() => outranked),
+      Stream.filter((yieldLeadership) => yieldLeadership),
+      Stream.runHead
+    )
+  })
+
   const lead = Effect.gen(function*() {
-    yield* options.locks.acquire(options.names.leader)
+    yield* awaitCandidacy
+    yield* options.locks.acquire(names.leader)
+    if (yield* outranked) return
     const invalidations = yield* Effect.acquireRelease(
       Effect.sync(() => InvalidationHub.make(invalidationBacklogCapacity)),
       (hub) => hub.shutdown
@@ -89,9 +175,13 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
       )
     )
     yield* Deferred.succeed(term, resources)
-    yield* options.locks.acquire(options.names.ready(options.host))
+    const readyScope = yield* Scope.fork(yield* Effect.scope)
+    yield* options.locks.acquire(names.ready(options.host)).pipe(Scope.provide(readyScope))
     ready = true
-    return yield* Effect.never
+    yield* awaitOutranked
+    ready = false
+    yield* Scope.close(readyScope, Exit.void)
+    yield* options.shardsReleased
   })
 
   yield* Effect.scoped(lead).pipe(
@@ -99,7 +189,11 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
       Effect.logWarning("browser replica owner stack stopped").pipe(Effect.annotateLogs({ cause: String(cause) }))
     ),
     Effect.exit,
-    Effect.repeat(Schedule.spaced(options.retryDelay)),
+    Effect.flatMap(Exit.match({
+      onSuccess: () => Effect.void,
+      onFailure: () => Effect.sleep(options.retryDelay)
+    })),
+    Effect.forever,
     Effect.forkScoped
   )
 

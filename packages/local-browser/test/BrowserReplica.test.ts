@@ -180,28 +180,49 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
   const layerDatabase = SqliteClient.layer({ filename: `${directory}/replica.sqlite` }).pipe(
     Layer.tap(() => Ref.update(databaseOpens, (count) => count + 1))
   )
-  const layerReplica = BrowserReplica.layer({
-    name: "tabs",
-    definition,
-    layerDatabase,
-    layerSync,
-    spaces: [spaceId],
-    profiles: { status: StatusProfile },
-    layerPlatform: kit.layerAll,
-    requestPersistence: false,
-    retryDelay: "100 millis",
-    sharding: environmentOptions.sharding
-  }).pipe(Layer.provide(layerHandlersWith(environmentOptions.runIndex ?? firstRunIndex)))
-  const layerTab = layerReplica.pipe(Layer.provide(Layer.fresh(Reactivity.layer)))
-  const openTab = Effect.gen(function*() {
+  const layerReplicaWith = (visibility: platform.TabVisibilityService) =>
+    BrowserReplica.layer({
+      name: "tabs",
+      definition,
+      layerDatabase,
+      layerSync,
+      spaces: [spaceId],
+      profiles: { status: StatusProfile },
+      layerPlatform: Layer.merge(kit.layerAll, Layer.succeed(platform.TabVisibility, visibility)),
+      requestPersistence: false,
+      retryDelay: "100 millis",
+      sharding: environmentOptions.sharding
+    }).pipe(Layer.provide(layerHandlersWith(environmentOptions.runIndex ?? firstRunIndex)))
+  const layerReplica = Layer.unwrap(
+    testKit.makeMemoryVisibility(true).pipe(Effect.map((visibility) => layerReplicaWith(visibility.service)))
+  )
+  const openTabWith = Effect.fnUntraced(function*(visible: boolean) {
+    const visibility = yield* testKit.makeMemoryVisibility(visible)
+    const layerTab = layerReplicaWith(visibility.service).pipe(Layer.provide(Layer.fresh(Reactivity.layer)))
     const scope = yield* Scope.make()
     const context = yield* settle(Layer.buildWithScope(layerTab, scope))
-    return { scope, context, replica: Context.get(context, Replica.Replica) }
+    return { scope, context, replica: Context.get(context, Replica.Replica), visibility }
   })
-  return { openTab, databaseOpens, layerReplica, traffic: kit.traffic }
+  const openTab = openTabWith(true)
+  return { openTab, openTabWith, databaseOpens, layerReplica, traffic: kit.traffic }
 })
 
 const makeEnvironment = makeEnvironmentWith({})
+
+const makeGatedRunIndex = Effect.gen(function*() {
+  const started = yield* Queue.unbounded<Deferred.Deferred<void>>()
+  let runs = 0
+  const runIndex = Effect.fnUntraced(function*(query: Transaction.Query) {
+    runs += 1
+    const index = runs
+    const gate = yield* Deferred.make<void>()
+    yield* Queue.offer(started, gate)
+    yield* Deferred.await(gate)
+    yield* listTodos(query)
+    return index
+  })
+  return { started, runIndex }
+})
 
 const openStatusSession = (context: Context.Context<EphemeralClient.EphemeralClient>) =>
   Context.get(context, EphemeralClient.EphemeralClient).session(StatusProfile, {
@@ -294,19 +315,8 @@ describe("BrowserReplica", () => {
     "lets a follower's in-flight live query finish when it is invalidated again, then reruns it once",
     Effect.fnUntraced(
       function*() {
-        const started = yield* Queue.unbounded<Deferred.Deferred<void>>()
-        let runs = 0
-        const environment = yield* makeEnvironmentWith({
-          runIndex: Effect.fnUntraced(function*(query) {
-            runs += 1
-            const index = runs
-            const gate = yield* Deferred.make<void>()
-            yield* Queue.offer(started, gate)
-            yield* Deferred.await(gate)
-            yield* listTodos(query)
-            return index
-          })
-        })
+        const { started, runIndex: gatedRunIndex } = yield* makeGatedRunIndex
+        const environment = yield* makeEnvironmentWith({ runIndex: gatedRunIndex })
         yield* environment.openTab
         const graph = ReplicaAtom.make(environment.layerReplica)
         const registry = AtomRegistry.make()
@@ -329,6 +339,104 @@ describe("BrowserReplica", () => {
         yield* Deferred.succeed(yield* settle(Queue.take(started)), undefined)
         assert.strictEqual(yield* settle(AtomRegistry.getResult(registry, runIndex, { suspendOnWaiting: true })), 3)
         assert.deepStrictEqual(shown, [1, 2, 3])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "reruns an invalidated in-flight live query that is remounted before its read completes",
+    Effect.fnUntraced(
+      function*() {
+        const { started, runIndex: gatedRunIndex } = yield* makeGatedRunIndex
+        const environment = yield* makeEnvironmentWith({ runIndex: gatedRunIndex })
+        yield* environment.openTab
+        const graph = ReplicaAtom.make(environment.layerReplica, { idleTTL: 0 })
+        const registry = AtomRegistry.make()
+        yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+        const runIndex = graph.query(spaceId, RunIndex)(undefined)
+        const unmount = registry.mount(runIndex)
+        const reactivityAtom = graph.runtime.atom(Effect.service(Reactivity.Reactivity))
+        const unmountReactivity = registry.mount(reactivityAtom)
+        yield* Effect.addFinalizer(() => Effect.sync(unmountReactivity))
+        const reactivity = yield* settle(AtomRegistry.getResult(registry, reactivityAtom, { suspendOnWaiting: true }))
+        const invalidate = reactivity.invalidate([ReactivityKey.query(spaceId, RunIndex.name, undefined)])
+        yield* Deferred.succeed(yield* settle(Queue.take(started)), undefined)
+        assert.strictEqual(yield* settle(AtomRegistry.getResult(registry, runIndex, { suspendOnWaiting: true })), 1)
+        yield* invalidate
+        const second = yield* settle(Queue.take(started))
+        yield* invalidate
+        const inFlight = Array.from(registry.getNodes().values()).filter((node) => {
+          if (node.atom === runIndex || node.currentState() !== "valid") return false
+          const value = node.value()
+          return AsyncResult.isAsyncResult(value) && AsyncResult.isSuccess(value) && value.waiting && value.value === 1
+        })
+        assert.strictEqual(inFlight.length, 2)
+        const remounted = yield* Deferred.make<() => void>()
+        registry.onNodeRemoved = (node) => {
+          if (!inFlight.includes(node)) return
+          registry.onNodeRemoved = undefined
+          const unmountRemounted = registry.mount(runIndex)
+          Deferred.doneUnsafe(remounted, Effect.succeed(unmountRemounted))
+        }
+        unmount()
+        const unmountAgain = yield* Deferred.await(remounted)
+        yield* Effect.addFinalizer(() => Effect.sync(unmountAgain))
+        yield* Deferred.succeed(second, undefined)
+        const outcome = yield* settle(Effect.raceFirst(
+          Queue.take(started).pipe(Effect.as("reran" as const)),
+          AtomRegistry.getResult(registry, runIndex, { suspendOnWaiting: true }).pipe(
+            Effect.as("settled on the invalidated read" as const)
+          )
+        ))
+        assert.strictEqual(outcome, "reran")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "moves the replica to a visible tab once the leader tab is hidden",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const leader = yield* environment.openTabWith(true)
+        const follower = yield* environment.openTabWith(false)
+        const space = yield* settle(follower.replica.space(spaceId))
+        yield* settle(space.mutate(PutTodo, { id: "1", title: "before the switch" }))
+        yield* settle(leader.visibility.set(false))
+        assert.strictEqual(yield* Ref.get(environment.databaseOpens), 1)
+        yield* follower.visibility.set(true)
+        yield* settle(space.mutate(PutTodo, { id: "2", title: "during the switch" }))
+        assert.strictEqual(yield* Ref.get(environment.databaseOpens), 2)
+        yield* settle(Scope.close(leader.scope, Exit.void))
+        assert.deepStrictEqual(yield* settle(listFrom(follower.replica)), [
+          { id: "1", title: "before the switch" },
+          { id: "2", title: "during the switch" }
+        ])
+        assert.strictEqual(yield* Ref.get(environment.databaseOpens), 2)
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "hands the replica to a visible tab ahead of a hidden tab that asked first",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const first = yield* environment.openTabWith(true)
+        const hidden = yield* environment.openTabWith(false)
+        const visible = yield* environment.openTabWith(true)
+        yield* settle(Scope.close(first.scope, Exit.void))
+        yield* settle(visible.replica.space(spaceId))
+        assert.strictEqual(yield* Ref.get(environment.databaseOpens), 2)
+        yield* settle(Scope.close(hidden.scope, Exit.void))
+        yield* settle(visible.replica.space(spaceId))
+        assert.strictEqual(yield* Ref.get(environment.databaseOpens), 2)
       },
       Effect.scoped,
       provideFileSystem
@@ -628,6 +736,7 @@ describe("BrowserReplica", () => {
       const layerPlatform = Layer.mergeAll(
         Layer.succeed(platform.TabChannel, kit.tabChannel),
         Layer.succeed(platform.WebLocks, kit.webLocks),
+        Layer.succeed(platform.TabVisibility, (yield* testKit.makeMemoryVisibility(true)).service),
         Layer.succeed(platform.ClientIdentityStore, {
           load: () => Effect.succeed("not-a-client-id"),
           store: () => Effect.void

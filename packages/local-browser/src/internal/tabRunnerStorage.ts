@@ -8,14 +8,47 @@ import * as MachineId from "effect/unstable/cluster/MachineId"
 import * as Runner from "effect/unstable/cluster/Runner"
 import * as RunnerAddress from "effect/unstable/cluster/RunnerAddress"
 import * as RunnerStorage from "effect/unstable/cluster/RunnerStorage"
-import type * as ShardId from "effect/unstable/cluster/ShardId"
+import * as ShardId from "effect/unstable/cluster/ShardId"
 import type * as lockNames from "./lockNames.js"
 import type * as platform from "./platform.js"
 
 const machineIdCount = 1024
 
+export interface ShardHosting {
+  readonly hold: (shardIds: ReadonlyArray<ShardId.ShardId>) => void
+  readonly drop: (shardId: ShardId.ShardId) => void
+  readonly dropAll: () => void
+  readonly released: Effect.Effect<void>
+}
+
+export const makeHosting = (): ShardHosting => {
+  const hosted = new Set<string>()
+  let drained = Deferred.makeUnsafe<void>()
+  Deferred.doneUnsafe(drained, Effect.void)
+  const settle = () => {
+    if (hosted.size === 0) Deferred.doneUnsafe(drained, Effect.void)
+  }
+  return {
+    hold: (shardIds) => {
+      if (shardIds.length === 0) return
+      if (hosted.size === 0) drained = Deferred.makeUnsafe<void>()
+      for (const shardId of shardIds) hosted.add(ShardId.toString(shardId))
+    },
+    drop: (shardId) => {
+      hosted.delete(ShardId.toString(shardId))
+      settle()
+    },
+    dropAll: () => {
+      hosted.clear()
+      settle()
+    },
+    released: Effect.suspend(() => Deferred.await(drained))
+  }
+}
+
 export interface Options {
   readonly self: RunnerAddress.RunnerAddress
+  readonly hosting: ShardHosting
   readonly names: lockNames.LockNames
   readonly locks: platform.WebLocksService
   readonly groups: ReadonlyArray<string>
@@ -61,7 +94,9 @@ export const make = Effect.fnUntraced(function*(options: Options) {
   const ownedShards = (address: RunnerAddress.RunnerAddress, shardIds: Iterable<ShardId.ShardId>) =>
     Effect.sync(() => {
       if (!ownsShards(address)) return []
-      return Array.from(shardIds)
+      const owned = Array.from(shardIds)
+      options.hosting.hold(owned)
+      return owned
     })
 
   const ownsShards = (address: RunnerAddress.RunnerAddress) => address.host === self.host && options.isReady()
@@ -95,8 +130,14 @@ export const make = Effect.fnUntraced(function*(options: Options) {
     setRunnerHealth: () => Effect.void,
     acquire: ownedShards,
     refresh: ownedShards,
-    release: () => Effect.void,
-    releaseAll: () => Effect.void
+    release: (address, shardId) =>
+      Effect.sync(() => {
+        if (address.host === self.host) options.hosting.drop(shardId)
+      }),
+    releaseAll: (address) =>
+      Effect.sync(() => {
+        if (address.host === self.host) options.hosting.dropAll()
+      })
   })
 
   const result: TabRunnerStorage = { storage, registered: Deferred.await(registeredLatch) }

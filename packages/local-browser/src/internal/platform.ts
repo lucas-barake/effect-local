@@ -5,6 +5,7 @@ import * as EffectLayer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
 import { BrowserStorageError } from "../BrowserStorageError.js"
 
 export { BrowserStorageError }
@@ -167,6 +168,35 @@ const openBroadcastChannel = Effect.fnUntraced(function*(name: string) {
 export const layerTabChannelBroadcast: EffectLayer.Layer<TabChannel> = EffectLayer.succeed(
   TabChannel,
   { open: openBroadcastChannel }
+)
+
+export interface TabVisibilityService {
+  readonly visible: Effect.Effect<boolean>
+  readonly changes: Stream.Stream<void>
+}
+
+export class TabVisibility extends Context.Service<TabVisibility, TabVisibilityService>()(
+  "@lucas-barake/effect-local-browser/TabVisibility"
+) {}
+
+export const layerTabVisibilityDocument: EffectLayer.Layer<TabVisibility> = EffectLayer.succeed(
+  TabVisibility,
+  {
+    visible: Effect.sync(() => typeof document !== "object" || document.visibilityState !== "hidden"),
+    changes: Stream.callback<void>((queue) => {
+      if (typeof document !== "object") return Queue.offer(queue, undefined)
+      const listener = () => {
+        Queue.offerUnsafe(queue, undefined)
+      }
+      return Effect.acquireRelease(
+        Effect.sync(() => {
+          document.addEventListener("visibilitychange", listener)
+          Queue.offerUnsafe(queue, undefined)
+        }),
+        () => Effect.sync(() => document.removeEventListener("visibilitychange", listener))
+      )
+    }, { bufferSize: 1, strategy: "sliding" })
+  }
 )
 
 export interface ClientIdentityStoreService {

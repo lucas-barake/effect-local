@@ -4,6 +4,7 @@ import * as EffectLayer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
 import * as platform from "../src/internal/platform.js"
 
 interface MemoryConnection {
@@ -40,6 +41,40 @@ export interface MemoryPlatform {
     platform.TabChannel | platform.WebLocks | platform.ClientIdentityStore
   >
 }
+
+export interface MemoryVisibility {
+  readonly service: platform.TabVisibilityService
+  readonly set: (visible: boolean) => Effect.Effect<void>
+}
+
+export const makeMemoryVisibility = (initial: boolean) =>
+  Effect.sync((): MemoryVisibility => {
+    let visible = initial
+    const listeners = new Set<() => void>()
+    const service: platform.TabVisibilityService = {
+      visible: Effect.sync(() => visible),
+      changes: Stream.callback<void>((queue) =>
+        Effect.acquireRelease(
+          Effect.sync(() => {
+            const listener = () => {
+              Queue.offerUnsafe(queue, undefined)
+            }
+            listeners.add(listener)
+            listener()
+            return listener
+          }),
+          (listener) => Effect.sync(() => listeners.delete(listener))
+        ), { bufferSize: 1, strategy: "sliding" })
+    }
+    return {
+      service,
+      set: (next) =>
+        Effect.sync(() => {
+          visible = next
+          for (const listener of listeners) listener()
+        })
+    }
+  })
 
 export const makeMemoryPlatform = Effect.sync((): MemoryPlatform => {
   const channels = new Map<string, Set<MemoryConnection>>()
