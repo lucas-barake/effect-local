@@ -48,11 +48,12 @@ const acquireNavigatorLock = Effect.fnUntraced(function*(
     name,
     lockOptions,
     () => {
-      Deferred.doneUnsafe(granted, Effect.void)
       // oxlint-disable-next-line effect/noNewPromise -- navigator.locks holds the lock exactly as long as the callback's promise stays pending, so the release must be a raw resolver the scope finalizer calls.
-      return new Promise<void>((resolve) => {
+      const held = new Promise<void>((resolve) => {
         releaseLock = resolve
       })
+      Deferred.doneUnsafe(granted, Effect.void)
+      return held
     }
   )
   // The request promise rejects when the grant is aborted or a later `steal`
