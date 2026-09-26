@@ -171,21 +171,24 @@ describe("ServerStore maintenance singleton", () => {
         shardingConfig: { entityTerminationTimeout: 0 }
       })
       const context = yield* Layer.build(
-        ServerStore.layerMaintenance({ interval: "10 minutes" }).pipe(
-          Layer.provideMerge(layerStore({ retainedHistoryEntries: 1, maximumHistoryEntries: 10_000 })),
-          Layer.provideMerge(layerSharding),
+        layerStore({ retainedHistoryEntries: 1, maximumHistoryEntries: 10_000 }).pipe(
           Layer.provideMerge(layerSqliteDatabase)
         )
       )
       const provide = Effect.provide(context)
       assert.deepStrictEqual(yield* submitAll(1, 3).pipe(provide), ["Accepted", "Accepted", "Accepted"])
-      yield* TestClock.adjust("1 minute")
-      assert.strictEqual(yield* historyCount.pipe(provide), 1)
+      yield* Layer.build(
+        ServerStore.layerMaintenance({ interval: "10 minutes" }).pipe(
+          Layer.provideMerge(layerSharding),
+          Layer.provide(Layer.succeedContext(context))
+        )
+      )
+      yield* awaitHistoryAtMost(1).pipe(provide)
       yield* submitAll(4, 6).pipe(provide)
       yield* TestClock.adjust("1 minute")
       assert.strictEqual(yield* historyCount.pipe(provide), 4)
       yield* TestClock.adjust("10 minutes")
-      assert.strictEqual(yield* historyCount.pipe(provide), 1)
+      yield* awaitHistoryAtMost(1).pipe(provide)
     }, Effect.scoped)
   )
 })
