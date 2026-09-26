@@ -88,6 +88,7 @@ const Sidebar = ({ client, me, openId, onOpen }: {
     )
   const knownIds = new Set(summaries.value.map((summary) => summary.conversation.id))
   const newDmUsers = users.filter((user) => user.id !== me && !knownIds.has(dmConversationId(me, user.id)))
+  const settled = synced && !summariesResult.waiting
 
   return (
     <aside className="sidebar" aria-label="Conversations">
@@ -104,9 +105,9 @@ const Sidebar = ({ client, me, openId, onOpen }: {
             onOpen={onOpen}
           />
         ))}
-        {synced && mine.length === 0 && <p className="sidebar-empty">No conversations yet. Start one below.</p>}
+        {settled && mine.length === 0 && <p className="sidebar-empty">No conversations yet. Start one below.</p>}
       </div>
-      {synced && (newDmUsers.length > 0 || !knownIds.has(groupConversationId)) && (
+      {settled && (newDmUsers.length > 0 || !knownIds.has(groupConversationId)) && (
         <div className="sidebar-new">
           <p className="sidebar-new-title">Start a chat</p>
           {newDmUsers.map((user) => (

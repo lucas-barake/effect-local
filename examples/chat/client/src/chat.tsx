@@ -434,7 +434,7 @@ export const ChatView = ({ client, me, conversationId, onBack }: {
             />
           </div>
         ))}
-        {synced && Option.isSome(window_) && rows.length === 0 && (
+        {synced && !windowResult.waiting && Option.isSome(window_) && rows.length === 0 && (
           <p className="chat-empty">No messages yet. Say hello!</p>
         )}
         {Option.isNone(window_) && AsyncResult.isFailure(windowResult) && (
