@@ -329,6 +329,34 @@ const followerMemberUpdatesAfterLeaderCloses = Effect.fnUntraced(
   provideFileSystem
 )
 
+const rapidVisibilityFlips = Effect.fnUntraced(
+  function*() {
+    const environment = yield* makeEnvironment
+    const tabs = [yield* environment.openTabWith(true), yield* environment.openTabWith(false)]
+    const spaces = [
+      yield* settle(tabs[0].replica.space(spaceId)),
+      yield* settle(tabs[1].replica.space(spaceId))
+    ]
+    const suffixes = "abcdefgh"
+    const writes: Array<Fiber.Fiber<Protocol.PendingMutation, ReplicaError.ReplicaError>> = []
+    let visible = 0
+    for (const suffix of suffixes) {
+      const hiding = visible
+      visible = 1 - visible
+      yield* tabs[visible].visibility.set(true)
+      yield* tabs[hiding].visibility.set(false)
+      writes.push(yield* Effect.forkChild(spaces[visible].mutate(AppendTitle, { id: "log", suffix })))
+    }
+    yield* settle(Fiber.joinAll(writes))
+    const [log] = yield* settle(listFrom(tabs[visible].replica))
+    assert.isDefined(log)
+    assert.strictEqual(Array.from(log.title).toSorted().join(""), suffixes)
+    assert.deepStrictEqual(yield* settle(listFrom(tabs[1 - visible].replica)), [log])
+  },
+  Effect.scoped,
+  provideFileSystem
+)
+
 describe("BrowserReplica", () => {
   it.effect(
     "reports the leader replica's first sync to a follower tab through the synced status",
@@ -630,33 +658,7 @@ describe("BrowserReplica", () => {
 
   it.effect(
     "serves the visible tab through rapid visibility flips without losing or repeating a mutation",
-    Effect.fnUntraced(
-      function*() {
-        const environment = yield* makeEnvironment
-        const tabs = [yield* environment.openTabWith(true), yield* environment.openTabWith(false)]
-        const spaces = [
-          yield* settle(tabs[0].replica.space(spaceId)),
-          yield* settle(tabs[1].replica.space(spaceId))
-        ]
-        const suffixes = "abcdefgh"
-        const writes: Array<Fiber.Fiber<Protocol.PendingMutation, ReplicaError.ReplicaError>> = []
-        let visible = 0
-        for (const suffix of suffixes) {
-          const hiding = visible
-          visible = 1 - visible
-          yield* tabs[visible].visibility.set(true)
-          yield* tabs[hiding].visibility.set(false)
-          writes.push(yield* Effect.forkChild(spaces[visible].mutate(AppendTitle, { id: "log", suffix })))
-        }
-        yield* settle(Fiber.joinAll(writes))
-        const [log] = yield* settle(listFrom(tabs[visible].replica))
-        assert.isDefined(log)
-        assert.strictEqual(Array.from(log.title).toSorted().join(""), suffixes)
-        assert.deepStrictEqual(yield* settle(listFrom(tabs[1 - visible].replica)), [log])
-      },
-      Effect.scoped,
-      provideFileSystem
-    )
+    rapidVisibilityFlips
   )
 
   it.effect(
@@ -1124,5 +1126,9 @@ describe("BrowserReplica at small scheduler budgets", () => {
   it.effect(
     "updates a follower's ephemeral member after the leader tab closes at a scheduler budget of 5 operations",
     () => followerMemberUpdatesAfterLeaderCloses().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 5))
+  )
+  it.effect(
+    "serves the visible tab through rapid visibility flips without losing or repeating a mutation at a scheduler budget of 31 operations",
+    () => rapidVisibilityFlips().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 31))
   )
 })

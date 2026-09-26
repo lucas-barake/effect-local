@@ -59,8 +59,8 @@ const FromServer = Schema.Union([
 ])
 
 const Frame = Schema.Union([
-  Schema.TaggedStruct("ToServer", { from: Schema.String, message: FromClient }),
-  Schema.TaggedStruct("ToClient", { from: Schema.String, message: FromServer })
+  Schema.TaggedStruct("ToServer", { from: Schema.String, connection: Schema.Int, message: FromClient }),
+  Schema.TaggedStruct("ToClient", { from: Schema.String, connection: Schema.Int, message: FromServer })
 ])
 type Frame = typeof Frame.Type
 
@@ -116,33 +116,53 @@ export const make = Effect.fnUntraced(function*(options: Options) {
       Effect.flatMap((encoded) => outboxFor(host).pipe(Effect.flatMap((outbox) => outbox.post(encoded))))
     )
 
-  const serverClients = new Map<string, number>()
-  const serverHosts = new Map<number, string>()
+  interface ServerPeer {
+    readonly host: string
+    readonly connection: number
+  }
+
+  const serverClients = new Map<string, Map<number, number>>()
+  const serverPeers = new Map<number, ServerPeer>()
   const serverClientIds = new Set<number>()
   const disconnects = yield* Queue.unbounded<number>()
   let nextClientId = 0
   let writeRequest: (clientId: number, data: RpcMessage.FromClientEncoded) => Effect.Effect<void> = () => Effect.void
 
-  const forgetServerClient = (host: string) =>
+  const forgetServerClient = (clientId: number) => {
+    const peer = serverPeers.get(clientId)
+    if (peer === undefined) return
+    serverPeers.delete(clientId)
+    serverClientIds.delete(clientId)
+    const connections = serverClients.get(peer.host)
+    if (connections === undefined) return
+    connections.delete(peer.connection)
+    if (connections.size === 0) serverClients.delete(peer.host)
+  }
+
+  const forgetServerHost = (host: string) =>
     Effect.suspend(() => {
-      const clientId = serverClients.get(host)
-      if (clientId === undefined) return Effect.void
-      serverClients.delete(host)
-      serverHosts.delete(clientId)
-      serverClientIds.delete(clientId)
-      return Queue.offer(disconnects, clientId)
+      const connections = serverClients.get(host)
+      if (connections === undefined) return Effect.void
+      const clientIds = Array.from(connections.values())
+      for (const clientId of clientIds) forgetServerClient(clientId)
+      return Queue.offerAll(disconnects, clientIds)
     })
 
-  const serverClientFor = (host: string): Effect.Effect<number> =>
+  const serverClientFor = (host: string, connection: number): Effect.Effect<number> =>
     Effect.suspend(() => {
       const known = serverClients.get(host)
-      if (known !== undefined) return Effect.succeed(known)
+      const existing = known?.get(connection)
+      if (existing !== undefined) return Effect.succeed(existing)
       const clientId = nextClientId++
-      serverClients.set(host, clientId)
-      serverHosts.set(clientId, host)
+      serverPeers.set(clientId, { host, connection })
       serverClientIds.add(clientId)
+      if (known !== undefined) {
+        known.set(connection, clientId)
+        return Effect.succeed(clientId)
+      }
+      serverClients.set(host, new Map([[connection, clientId]]))
       return options.locks.released(names.runner(host)).pipe(
-        Effect.andThen(forgetServerClient(host)),
+        Effect.andThen(forgetServerHost(host)),
         Effect.forkIn(transportScope),
         Effect.as(clientId)
       )
@@ -155,14 +175,17 @@ export const make = Effect.fnUntraced(function*(options: Options) {
         disconnects,
         send: (clientId: number, response: RpcMessage.FromServerEncoded) =>
           Effect.suspend(() => {
-            const host = serverHosts.get(clientId)
-            if (host === undefined) return Effect.void
+            const peer = serverPeers.get(clientId)
+            if (peer === undefined) return Effect.void
             if (response._tag === "ClientProtocolError" || response._tag === "Request") {
               return Effect.die(`The tab transport cannot carry a server ${response._tag} message`)
             }
-            return post(host, { _tag: "ToClient", from: self, message: response })
+            return post(peer.host, { _tag: "ToClient", from: self, connection: peer.connection, message: response })
           }),
-        end: () => Effect.void,
+        end: (clientId: number) =>
+          Effect.sync(() => {
+            forgetServerClient(clientId)
+          }),
         clientIds: Effect.sync(() => serverClientIds),
         initialMessage: Effect.succeedNone,
         supportsAck: false,
@@ -174,15 +197,16 @@ export const make = Effect.fnUntraced(function*(options: Options) {
     })
   )
 
-  const targets = new Map<string, (message: ServerMessage) => Effect.Effect<void>>()
+  const targets = new Map<number, (message: ServerMessage) => Effect.Effect<void>>()
+  let nextConnection = 0
 
   const dispatch = (frame: Frame): Effect.Effect<void> => {
     if (frame._tag === "ToServer") {
-      return serverClientFor(frame.from).pipe(
+      return serverClientFor(frame.from, frame.connection).pipe(
         Effect.flatMap((clientId) => writeRequest(clientId, fromClientWire(frame.message)))
       )
     }
-    const target = targets.get(frame.from)
+    const target = targets.get(frame.connection)
     if (target === undefined) return Effect.void
     return target(frame.message)
   }
@@ -206,11 +230,12 @@ export const make = Effect.fnUntraced(function*(options: Options) {
     RpcClient.Protocol.make(Effect.fnUntraced(function*(writeResponse, clientIds) {
       const scope = yield* Effect.scope
       const target = address.host
+      const connection = nextConnection++
       const requestClients = new Map<string | number, number>()
       let failure: RpcClientError | undefined
       const broadcast = (response: RpcMessage.FromServerEncoded) =>
         Effect.forEach(clientIds, (clientId) => writeResponse(clientId, response), { discard: true })
-      targets.set(target, (message) => {
+      targets.set(connection, (message) => {
         const response = fromServerWire(message)
         if (response._tag === "Chunk" || response._tag === "Exit") {
           const clientId = requestClients.get(response.requestId)
@@ -220,7 +245,15 @@ export const make = Effect.fnUntraced(function*(options: Options) {
         }
         return broadcast(response)
       })
-      yield* Scope.addFinalizer(scope, Effect.sync(() => targets.delete(target)))
+      yield* Scope.addFinalizer(
+        scope,
+        Effect.sync(() => targets.delete(connection)).pipe(
+          Effect.andThen(Effect.suspend(() => {
+            if (failure !== undefined) return Effect.void
+            return post(target, { _tag: "ToServer", from: self, connection, message: { _tag: "Eof" } })
+          }))
+        )
+      )
       yield* options.locks.released(names.runner(target)).pipe(
         Effect.andThen(Effect.suspend(() => {
           failure = new RpcClientError({
@@ -237,7 +270,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
             if (failure !== undefined) return Effect.fail(failure)
             if (request._tag === "Request") requestClients.set(request.id, clientId)
             if (request._tag === "Interrupt") requestClients.delete(request.requestId)
-            return post(target, { _tag: "ToServer", from: self, message: request })
+            return post(target, { _tag: "ToServer", from: self, connection, message: request })
           }),
         supportsAck: false,
         supportsTransferables: false,
