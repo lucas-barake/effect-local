@@ -184,7 +184,21 @@ export const make = Effect.fn("ServerIndex.make")(
     )
     yield* sql.withTransaction(Effect.gen(function*() {
       yield* dialect.lockSchema
+      const existing = yield* SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: CatalogRow,
+        execute: () =>
+          sql`SELECT model, index_name, descriptor_hash, table_name, scan_index_name
+          FROM effect_local_server_index_catalog`
+      })(undefined).pipe(
+        Effect.catchTag(
+          "SchemaError",
+          (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
+        )
+      )
+      const created = new Set(existing.map((row) => row.descriptor_hash))
       for (const descriptor of all) {
+        if (created.has(descriptor.hash)) continue
         yield* sql.unsafe(descriptor.tableDdl)
         yield* sql.unsafe(descriptor.scanIndexDdl)
         yield* sql`INSERT INTO effect_local_server_index_catalog
