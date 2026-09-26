@@ -174,7 +174,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
   const layerTab = layerReplica.pipe(Layer.provide(Layer.fresh(Reactivity.layer)))
   const openTab = Effect.gen(function*() {
     const scope = yield* Scope.make()
-    const context = yield* Layer.buildWithScope(layerTab, scope)
+    const context = yield* settle(Layer.buildWithScope(layerTab, scope))
     return { scope, context, replica: Context.get(context, Replica.Replica) }
   })
   return { openTab, databaseOpens, layerReplica, traffic: kit.traffic }
@@ -400,6 +400,45 @@ describe("BrowserReplica", () => {
         }
         yield* TestClock.adjust("5 seconds")
         assert.deepStrictEqual(yield* settle(space.query(ListTodos, undefined)), [])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "answers a follower's repeated space lookups without a leader round trip",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        yield* environment.openTab
+        const follower = yield* environment.openTab
+        yield* settle(follower.replica.space(spaceId))
+        const posted = environment.traffic.posted
+        yield* settle(follower.replica.space(spaceId))
+        assert.strictEqual(environment.traffic.posted, posted)
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "fails a follower's space lookup after the leader tab leaves the space",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const leader = yield* environment.openTab
+        const follower = yield* environment.openTab
+        yield* settle(follower.replica.space(spaceId))
+        yield* settle(leader.replica.leave(spaceId))
+        const outcome = yield* settle(
+          follower.replica.space(spaceId).pipe(
+            Effect.as("joined" as const),
+            Effect.catchTag("SpaceNotJoined", () => Effect.succeed("not joined" as const))
+          )
+        )
+        assert.strictEqual(outcome, "not joined")
       },
       Effect.scoped,
       provideFileSystem

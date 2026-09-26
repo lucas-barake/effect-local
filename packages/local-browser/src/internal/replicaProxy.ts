@@ -192,27 +192,69 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
   const proxyScope = yield* Effect.scope
   const definition = options.definition
   const client = options.client
-  const knownSpaces = new Set<Identity.SpaceId>()
+  const handles = new Map<Identity.SpaceId, Replica.Space>()
+  const joined = new Set<Identity.SpaceId>()
+  let membershipEpoch = 0
+  let invalidationsLive = false
   const mintMutationId = Identity.makeMutationId.pipe(Effect.provideService(Crypto.Crypto, options.crypto))
 
   const fullRefreshKeys = (): Array<string> => {
     const keys: Array<string> = [ReactivityKey.spaces, ReactivityKey.aggregateStatus]
-    for (const spaceId of knownSpaces) keys.push(ReactivityKey.membership(spaceId))
+    for (const spaceId of handles.keys()) keys.push(ReactivityKey.membership(spaceId))
     return keys
   }
 
-  let leaderSession: string | undefined
+  const dropMemberships = () => {
+    membershipEpoch += 1
+    joined.clear()
+  }
+
+  const forgetMemberships = () => {
+    invalidationsLive = false
+    dropMemberships()
+  }
+
+  const forgetInvalidatedMemberships = (keys: ReadonlyArray<string>) => {
+    const invalidated = new Set(keys)
+    for (const spaceId of handles.keys()) {
+      if (!invalidated.has(ReactivityKey.membership(spaceId))) continue
+      membershipEpoch += 1
+      joined.delete(spaceId)
+    }
+  }
+
+  const liveEpoch = (): number | undefined => {
+    if (!invalidationsLive) return undefined
+    return membershipEpoch
+  }
+
+  const rememberJoined = (epoch: number | undefined, spaceIds: ReadonlyArray<Identity.SpaceId>) => {
+    if (epoch === undefined || epoch !== membershipEpoch) return
+    for (const spaceId of spaceIds) joined.add(spaceId)
+  }
+
+  const subscribed = Deferred.makeUnsafe<void>()
+  let resubscribing = false
   yield* client.Invalidations({}).pipe(
     Stream.runForEach((frame) => {
-      if (frame._tag === "Keys") return options.reactivity.invalidate(frame.keys)
-      const previous = leaderSession
-      leaderSession = frame.session
-      if (previous === undefined || previous === frame.session) return Effect.void
-      return options.reactivity.invalidate(fullRefreshKeys())
+      if (frame._tag === "Keys") {
+        forgetInvalidatedMemberships(frame.keys)
+        return options.reactivity.invalidate(frame.keys)
+      }
+      if (frame._tag === "Overflow") {
+        dropMemberships()
+        return options.reactivity.invalidate(fullRefreshKeys())
+      }
+      invalidationsLive = true
+      if (resubscribing) return options.reactivity.invalidate(fullRefreshKeys())
+      resubscribing = true
+      return Deferred.succeed(subscribed, undefined)
     }),
+    Effect.ensuring(Effect.sync(forgetMemberships)),
     (effect) => repeatForever(effect, options.retrySchedule),
     Effect.forkIn(proxyScope)
   )
+  yield* Deferred.await(subscribed)
 
   const settlementsStream = (
     spaceId: Identity.SpaceId,
@@ -257,9 +299,15 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     return open()
   }
 
-  const makeSpace = (spaceId: Identity.SpaceId): Replica.Space => {
-    knownSpaces.add(spaceId)
+  const spaceHandle = (spaceId: Identity.SpaceId): Replica.Space => {
+    const known = handles.get(spaceId)
+    if (known !== undefined) return known
+    const created = makeSpace(spaceId)
+    handles.set(spaceId, created)
+    return created
+  }
 
+  const makeSpace = (spaceId: Identity.SpaceId): Replica.Space => {
     const mutateAny = Effect.fnUntraced(function*(
       mutation: Mutation.Any,
       payload: unknown,
@@ -420,10 +468,31 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
   }
 
   const replica: Replica.Service = {
-    join: (spaceId) => call(client.Join({ spaceId })).pipe(Effect.map(() => makeSpace(spaceId))),
-    leave: (spaceId) => call(client.Leave({ spaceId })),
-    spaces: call(client.Spaces({})).pipe(Effect.map((spaceIds) => spaceIds.map(makeSpace))),
-    space: (spaceId) => call(client.SpaceScope({ spaceId })).pipe(Effect.as(makeSpace(spaceId))),
+    join: (spaceId) => call(client.Join({ spaceId })).pipe(Effect.map(() => spaceHandle(spaceId))),
+    leave: (spaceId) =>
+      call(client.Leave({ spaceId })).pipe(
+        Effect.ensuring(Effect.sync(() => forgetInvalidatedMemberships([ReactivityKey.membership(spaceId)])))
+      ),
+    spaces: Effect.suspend(() => {
+      const epoch = liveEpoch()
+      return call(client.Spaces({})).pipe(
+        Effect.map((spaceIds) => {
+          rememberJoined(epoch, spaceIds)
+          return spaceIds.map(spaceHandle)
+        })
+      )
+    }),
+    space: (spaceId) =>
+      Effect.suspend(() => {
+        if (joined.has(spaceId)) return Effect.succeed(spaceHandle(spaceId))
+        const epoch = liveEpoch()
+        return call(client.SpaceScope({ spaceId })).pipe(
+          Effect.map(() => {
+            rememberJoined(epoch, [spaceId])
+            return spaceHandle(spaceId)
+          })
+        )
+      }),
     status: call(client.AggregateStatus({}))
   }
 

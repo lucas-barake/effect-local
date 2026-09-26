@@ -10,9 +10,9 @@ import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
-import * as PubSub from "effect/PubSub"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
+import type * as InvalidationHub from "./invalidationHub.js"
 import * as replicaWire from "./replicaWire.js"
 import { decodeWith, encodeJson } from "./wireCodec.js"
 
@@ -23,7 +23,7 @@ export interface OwnerResources {
   readonly replica: Replica.Service
   readonly queryReactivity: QueryReactivity.Service
   readonly ephemeral: EphemeralClient.Service
-  readonly invalidations: PubSub.PubSub<ReadonlyArray<string>>
+  readonly invalidations: InvalidationHub.InvalidationHub
 }
 
 export interface HostOptions {
@@ -389,13 +389,11 @@ export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(opti
       ),
     Invalidations: () =>
       Stream.unwrap(
-        PubSub.subscribe(resources.invalidations).pipe(
-          Effect.map((subscription) =>
+        resources.invalidations.subscribe.pipe(
+          Effect.map((batches) =>
             Stream.concat(
-              Stream.succeed<replicaWire.InvalidationFrame>({ _tag: "Session", session: resources.session }),
-              Stream.fromSubscription(subscription).pipe(
-                Stream.map((keys): replicaWire.InvalidationFrame => ({ _tag: "Keys", keys }))
-              )
+              Stream.succeed<replicaWire.InvalidationFrame>({ _tag: "Subscribed" }),
+              batches
             )
           )
         )

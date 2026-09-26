@@ -228,8 +228,9 @@ export class Retain extends Rpc.make("Retain", {
 }) {}
 
 export const InvalidationFrame = Schema.Union([
-  Schema.TaggedStruct("Session", { session: Schema.String }),
-  Schema.TaggedStruct("Keys", { keys: Schema.Array(Schema.String) })
+  Schema.TaggedStruct("Subscribed", {}),
+  Schema.TaggedStruct("Keys", { keys: Schema.Array(Schema.String) }),
+  Schema.TaggedStruct("Overflow", {})
 ])
 export type InvalidationFrame = typeof InvalidationFrame.Type
 

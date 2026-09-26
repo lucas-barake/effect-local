@@ -6,9 +6,9 @@ import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import * as PubSub from "effect/PubSub"
 import * as Schedule from "effect/Schedule"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as InvalidationHub from "./invalidationHub.js"
 import type * as lockNames from "./lockNames.js"
 import type * as platform from "./platform.js"
 import type { OwnerResources } from "./replicaHost.js"
@@ -34,6 +34,8 @@ export class ReplicaOwnerService extends Context.Service<ReplicaOwnerService, Re
   "@lucas-barake/effect-local-browser/ReplicaOwner"
 ) {}
 
+const invalidationBacklogCapacity = 16_384
+
 const stringKeys = (keys: ReadonlyArray<unknown> | Readonly<Record<string, ReadonlyArray<unknown>>>) => {
   const flat: Array<string> = []
   if (Array.isArray(keys)) {
@@ -54,8 +56,8 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
   const lead = Effect.gen(function*() {
     yield* options.locks.acquire(options.names.leader)
     const invalidations = yield* Effect.acquireRelease(
-      PubSub.unbounded<ReadonlyArray<string>>(),
-      PubSub.shutdown
+      Effect.sync(() => InvalidationHub.make(invalidationBacklogCapacity)),
+      (hub) => hub.shutdown
     )
     const base = yield* Reactivity.make
     const reactivity: Reactivity.Reactivity = {
@@ -63,9 +65,7 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
       invalidate: (keys) =>
         base.invalidate(keys).pipe(
           Effect.andThen(Effect.suspend(() => {
-            const flat = stringKeys(keys)
-            if (flat.length === 0) return Effect.void
-            return PubSub.publish(invalidations, flat)
+            return invalidations.publish(stringKeys(keys))
           }))
         )
     }
