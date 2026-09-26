@@ -34,10 +34,13 @@ export interface Options<E extends { readonly _tag: string },> {
 
 export interface ReplicaOwner {
   readonly lease: Effect.Effect<OwnerResources, never, Scope.Scope>
+  readonly drainingLease: Effect.Effect<OwnerResources, never, Scope.Scope>
+  readonly isDraining: () => boolean
 }
 
 interface Holder {
   readonly fiber: Fiber.Fiber<unknown, unknown>
+  readonly interruptOnFence: boolean
 }
 
 interface Term {
@@ -70,6 +73,7 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
   let active: Term | undefined
   const runners = yield* options.channels.open(names.runnersChannel)
   const announceRunners = runners.post(options.host)
+  let draining = false
 
   const settleDrain = (term: Term) => {
     if (term.fenced && term.holders.size === 0) Deferred.doneUnsafe(term.drained, Effect.void)
@@ -79,25 +83,29 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
     Effect.suspend(() => {
       term.fenced = true
       if (active === term) active = undefined
-      const fibers = Array.from(term.holders, (holder) => holder.fiber)
+      const fibers: Array<Fiber.Fiber<unknown, unknown>> = []
+      for (const holder of term.holders) {
+        if (holder.interruptOnFence) fibers.push(holder.fiber)
+      }
       settleDrain(term)
       return Fiber.interruptAll(fibers)
     })
 
-  const lease = Effect.acquireRelease(
-    Effect.withFiber((fiber) => {
-      const term = active
-      if (term === undefined || term.fenced) return Effect.interrupt
-      const holder: Holder = { fiber }
-      term.holders.add(holder)
-      return Effect.succeed({ term, holder })
-    }),
-    ({ holder, term }) =>
-      Effect.sync(() => {
-        term.holders.delete(holder)
-        settleDrain(term)
-      })
-  ).pipe(Effect.map(({ term }) => term.resources))
+  const leaseWith = (interruptOnFence: boolean) =>
+    Effect.acquireRelease(
+      Effect.withFiber((fiber) => {
+        const term = active
+        if (term === undefined || term.fenced) return Effect.interrupt
+        const holder: Holder = { fiber, interruptOnFence }
+        term.holders.add(holder)
+        return Effect.succeed({ term, holder })
+      }),
+      ({ holder, term }) =>
+        Effect.sync(() => {
+          term.holders.delete(holder)
+          settleDrain(term)
+        })
+    ).pipe(Effect.map(({ term }) => term.resources))
 
   const visible = yield* SubscriptionRef.make(yield* options.visibility.visible)
   const announcements = yield* options.channels.open(names.visibilityChannel)
@@ -202,12 +210,24 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
       invalidations
     }
     const term: Term = { resources, drained: yield* Deferred.make<void>(), holders: new Set(), fenced: false }
-    yield* Effect.addFinalizer(() => fence(term).pipe(Effect.andThen(Deferred.await(term.drained))))
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        draining = true
+      }).pipe(
+        Effect.andThen(fence(term)),
+        Effect.andThen(Deferred.await(term.drained)),
+        Effect.andThen(Effect.sync(() => {
+          draining = false
+        })),
+        Effect.andThen(announceRunners)
+      )
+    )
     active = term
     const readyScope = yield* Scope.fork(yield* Effect.scope)
     yield* options.locks.acquire(names.ready(options.host)).pipe(Scope.provide(readyScope))
     yield* announceRunners
     yield* awaitOutranked
+    draining = true
     yield* Scope.close(readyScope, Exit.void)
     yield* options.locks.released(names.ready(options.host))
     yield* announceRunners
@@ -226,6 +246,10 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
     Effect.forkScoped
   )
 
-  const owner: ReplicaOwner = { lease }
+  const owner: ReplicaOwner = {
+    lease: leaseWith(true),
+    drainingLease: leaseWith(false),
+    isDraining: () => draining
+  }
   return owner
 })

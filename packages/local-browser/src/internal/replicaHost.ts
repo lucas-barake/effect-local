@@ -510,16 +510,21 @@ interface Tagged {
 
 export interface FencedOptions {
   readonly lease: Effect.Effect<OwnerResources, never, Scope.Scope>
+  readonly drainingLease: Effect.Effect<OwnerResources, never, Scope.Scope>
   readonly handlersFor: (resources: OwnerResources) => Effect.Effect<TermHandlers>
 }
 
 export const makeFencedHandlers = (options: FencedOptions) => {
-  const unary = <A, E extends Tagged, R,>(f: (handlers: TermHandlers) => Effect.Effect<A, E, R>) =>
-    options.lease.pipe(
-      Effect.flatMap(options.handlersFor),
-      Effect.flatMap(f),
-      Effect.scoped
-    )
+  const leased =
+    (lease: Effect.Effect<OwnerResources, never, Scope.Scope>) =>
+    <A, E extends Tagged, R,>(f: (handlers: TermHandlers) => Effect.Effect<A, E, R>) =>
+      lease.pipe(
+        Effect.flatMap(options.handlersFor),
+        Effect.flatMap(f),
+        Effect.scoped
+      )
+  const unary = leased(options.lease)
+  const draining = leased(options.drainingLease)
   const streaming = <A, E extends Tagged, R,>(f: (handlers: TermHandlers) => Stream.Stream<A, E, R>) =>
     Stream.unwrap(options.lease.pipe(Effect.flatMap(options.handlersFor), Effect.map(f)))
   return replicaWire.ReplicaEntity.of({
@@ -549,7 +554,7 @@ export const makeFencedHandlers = (options: FencedOptions) => {
     Invalidations: () => streaming((handlers) => handlers.Invalidations()),
     EphemeralSession: (request) => streaming((handlers) => handlers.EphemeralSession(request)),
     EphemeralUpdateMember: (request) => unary((handlers) => handlers.EphemeralUpdateMember(request)),
-    EphemeralPublishEvent: (request) => unary((handlers) => handlers.EphemeralPublishEvent(request)),
+    EphemeralPublishEvent: (request) => draining((handlers) => handlers.EphemeralPublishEvent(request)),
     EphemeralPublishState: (request) => unary((handlers) => handlers.EphemeralPublishState(request)),
     EphemeralClear: (request) => unary((handlers) => handlers.EphemeralClear(request)),
     EphemeralRemove: (request) => unary((handlers) => handlers.EphemeralRemove(request))

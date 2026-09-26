@@ -166,6 +166,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     names,
     locks,
     channels,
+    isDraining: owner.isDraining,
     shardingConfig: options.sharding
   })
   const termHandlers = new WeakMap<replicaHost.OwnerResources, replicaHost.TermHandlers>()
@@ -178,7 +179,9 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
       )
     })
   const layerEntity = replicaWire.ReplicaEntity.toLayer(
-    Effect.sync(() => replicaHost.makeFencedHandlers({ lease: owner.lease, handlersFor })),
+    Effect.sync(() =>
+      replicaHost.makeFencedHandlers({ lease: owner.lease, drainingLease: owner.drainingLease, handlersFor })
+    ),
     { concurrency: "unbounded", mailboxCapacity: "unbounded" }
   )
   const shardingContext = yield* Layer.build(layerEntity.pipe(Layer.provideMerge(cluster.layer)))

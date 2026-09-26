@@ -16,6 +16,7 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
+import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
@@ -128,6 +129,7 @@ const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
 })
 
 const StatusProfile = Ephemeral.member({ status: Schema.String })
+const Reaction = Ephemeral.make("reaction", { kind: "event", payload: { emoji: Schema.String } })
 const member = Protocol.EphemeralMember.make({
   clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000401"),
   membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000401")
@@ -204,6 +206,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
       layerSync,
       spaces: [spaceId],
       profiles: { status: StatusProfile },
+      ephemerals: [Reaction],
       layerPlatform: Layer.merge(kit.layerAll, Layer.succeed(platform.TabVisibility, visibility)),
       requestPersistence: false,
       retryDelay: environmentOptions.retryDelay ?? "100 millis",
@@ -239,6 +242,32 @@ const makeGatedRunIndex = Effect.gen(function*() {
   })
   return { started, runIndex }
 })
+
+const makeFenceProbe = Effect.gen(function*() {
+  const holding = yield* Deferred.make<void>()
+  const fenced = yield* Deferred.make<void>()
+  let runs = 0
+  const runIndex = (query: Transaction.Query) =>
+    Effect.suspend(() => {
+      runs += 1
+      if (runs > 1) return listTodos(query).pipe(Effect.as(runs))
+      return Deferred.succeed(holding, undefined).pipe(
+        Effect.andThen(Effect.never),
+        Effect.onInterrupt(() => Deferred.succeed(fenced, undefined))
+      )
+    })
+  return { runIndex, holding: Deferred.await(holding), fenced: Deferred.await(fenced) }
+})
+
+const failureTag = <A, E extends { readonly _tag: string },>(exit: Exit.Exit<A, E>) =>
+  Exit.match(exit, {
+    onSuccess: () => "succeeded",
+    onFailure: (cause) =>
+      Option.match(Cause.findErrorOption(cause), {
+        onNone: () => "interrupted",
+        onSome: (error) => error._tag
+      })
+  })
 
 const openStatusSession = (context: Context.Context<EphemeralClient.EphemeralClient>) =>
   Context.get(context, EphemeralClient.EphemeralClient).session(StatusProfile, {
@@ -537,6 +566,109 @@ describe("BrowserReplica", () => {
         assert.isDefined(log)
         assert.strictEqual(Array.from(log.title).toSorted().join(""), suffixes)
         assert.deepStrictEqual(yield* settle(listFrom(tabs[1 - visible].replica)), [log])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "fails a caller's in-flight query with OwnerUnavailable when its tab's replica closes",
+    Effect.fnUntraced(
+      function*() {
+        const { started, runIndex: gatedRunIndex } = yield* makeGatedRunIndex
+        const environment = yield* makeEnvironmentWith({ runIndex: gatedRunIndex })
+        const leader = yield* environment.openTabWith(true)
+        const space = yield* settle(leader.replica.space(spaceId))
+        const querying = yield* Effect.forkChild(space.query(RunIndex, undefined))
+        yield* settle(Queue.take(started))
+        yield* settle(Scope.close(leader.scope, Exit.void))
+        assert.strictEqual(failureTag(yield* settle(Fiber.await(querying))), "OwnerUnavailable")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "fails a caller's live settlement stream with OwnerUnavailable when its tab's replica closes",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const leader = yield* environment.openTabWith(true)
+        const space = yield* settle(leader.replica.space(spaceId))
+        const streaming = yield* Effect.forkChild(space.settlements({ from: "live" }).pipe(Stream.runDrain))
+        yield* TestClock.adjust("5 seconds")
+        yield* settle(Scope.close(leader.scope, Exit.void))
+        assert.strictEqual(failureTag(yield* settle(Fiber.await(streaming))), "OwnerUnavailable")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "retries a quarantine resubmission that a handover interrupts on the old leader",
+    Effect.fnUntraced(
+      function*() {
+        const probe = yield* makeFenceProbe
+        const environment = yield* makeEnvironmentWith({ runIndex: probe.runIndex })
+        const leader = yield* environment.openTabWith(true)
+        const follower = yield* environment.openTabWith(false)
+        const space = yield* settle(follower.replica.space(spaceId))
+        yield* space.query(RunIndex, undefined).pipe(Effect.forkChild)
+        yield* settle(probe.holding)
+        const resubmitting = yield* Effect.forkChild(
+          space.resubmitQuarantined(mutationId, PutTodo, { id: "q", title: "resubmitted" })
+        )
+        yield* TestClock.adjust("1 second")
+        yield* leader.visibility.set(false)
+        yield* follower.visibility.set(true)
+        yield* settle(probe.fenced)
+        assert.strictEqual(failureTag(yield* settle(Fiber.await(resubmitting))), "ProtocolInvalid")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "publishes an ephemeral event once when a handover starts during its delivery",
+    Effect.fnUntraced(
+      function*() {
+        const probe = yield* makeFenceProbe
+        const publishes = yield* Ref.make(0)
+        const publishing = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const environment = yield* makeEnvironmentWith({
+          runIndex: probe.runIndex,
+          layerEphemeral: Layer.succeed(EphemeralClient.EphemeralClient, {
+            session: () => Effect.never,
+            publish: () =>
+              Ref.update(publishes, (count) => count + 1).pipe(
+                Effect.andThen(Deferred.succeed(publishing, undefined)),
+                Effect.andThen(Deferred.await(release))
+              ),
+            clear: () => Effect.void,
+            remove: () => Effect.void
+          })
+        })
+        const leader = yield* environment.openTabWith(true)
+        const follower = yield* environment.openTabWith(false)
+        const space = yield* settle(follower.replica.space(spaceId))
+        yield* space.query(RunIndex, undefined).pipe(Effect.forkChild)
+        yield* settle(probe.holding)
+        const ephemeral = Context.get(follower.context, EphemeralClient.EphemeralClient)
+        const reacting = yield* Effect.forkChild(
+          ephemeral.publish(Reaction, { spaceId, member, payload: { emoji: "+1" }, ttl: "5 seconds" })
+        )
+        yield* settle(Deferred.await(publishing))
+        yield* leader.visibility.set(false)
+        yield* follower.visibility.set(true)
+        yield* settle(probe.fenced)
+        yield* Deferred.succeed(release, undefined)
+        assert.strictEqual(failureTag(yield* settle(Fiber.await(reacting))), "succeeded")
+        assert.strictEqual(yield* Ref.get(publishes), 1)
       },
       Effect.scoped,
       provideFileSystem

@@ -27,12 +27,13 @@ export interface Options {
   readonly channels: platform.TabChannelService
   readonly groups: ReadonlyArray<string>
   readonly weight: number
+  readonly isDraining: () => boolean
 }
 
 export interface TabRunnerStorage {
   readonly storage: RunnerStorage.RunnerStorage["Service"]
   readonly registered: Effect.Effect<void>
-  readonly awaitRouted: Effect.Effect<void>
+  readonly awaitRouted: Effect.Effect<boolean>
 }
 
 interface Snapshot {
@@ -86,18 +87,19 @@ export const make = Effect.fnUntraced(function*(options: Options) {
         else if (name.startsWith(names.runnerPrefix)) hosts.push(hostOf(names.runnerPrefix, name))
       }
       hosts.sort()
+      const healthy = (host: string) => ready.has(host) || (host === self.host && options.isDraining())
       const runners = hosts.map((host) => {
         const runner = Runner.make({
           address: RunnerAddress.make(host, self.port),
           groups: options.groups,
           weight: options.weight
         })
-        return [runner, ready.has(host)] as const
+        return [runner, healthy(host)] as const
       })
       const others = hosts.filter((host) => host !== self.host)
       return {
         runners,
-        signature: hosts.map((host) => `${host}:${Number(ready.has(host))}`).join(","),
+        signature: hosts.map((host) => `${host}:${Number(healthy(host))}`).join(","),
         others,
         othersReady: others.filter((host) => ready.has(host)),
         hasReady: hosts.some((host) => ready.has(host))
@@ -129,17 +131,21 @@ export const make = Effect.fnUntraced(function*(options: Options) {
     return current.runners
   })
 
+  const closed = yield* Deferred.make<void>()
+  yield* Effect.addFinalizer(() => Deferred.succeed(closed, undefined))
+
   const awaitRouted = Effect.suspend(() => {
     const target = returned.sequence + 1
-    return Queue.offer(wakes, undefined).pipe(
+    const routed = Queue.offer(wakes, undefined).pipe(
       Effect.andThen(
         SubscriptionRef.changes(processed).pipe(
           Stream.filter((delivery) => delivery.sequence >= target && delivery.hasReady),
           Stream.runHead
         )
       ),
-      Effect.asVoid
+      Effect.as(true)
     )
+    return Effect.raceFirst(Deferred.await(closed).pipe(Effect.as(false)), routed)
   })
 
   const register = Effect.gen(function*() {

@@ -32,13 +32,14 @@ export interface Options {
   readonly names: lockNames.LockNames
   readonly locks: platform.WebLocksService
   readonly channels: platform.TabChannelService
+  readonly isDraining: () => boolean
   readonly shardingConfig?: Partial<ShardingConfig.ShardingConfig["Service"]> | undefined
 }
 
 export interface TabCluster {
   readonly layer: Layer.Layer<Sharding.Sharding | Runners.Runners>
   readonly registered: Effect.Effect<void>
-  readonly awaitRouted: Effect.Effect<void>
+  readonly awaitRouted: Effect.Effect<boolean>
 }
 
 export const make = Effect.fnUntraced(function*(options: Options) {
@@ -62,7 +63,8 @@ export const make = Effect.fnUntraced(function*(options: Options) {
     names: options.names,
     locks: options.locks,
     groups: config.assignedShardGroups,
-    weight: config.runnerShardWeight
+    weight: config.runnerShardWeight,
+    isDraining: options.isDraining
   })
   const layer = RunnerServer.layerWithClients.pipe(
     Layer.provide([

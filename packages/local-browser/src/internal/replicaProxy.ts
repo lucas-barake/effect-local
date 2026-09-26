@@ -45,7 +45,7 @@ export interface ProxyOptions {
   readonly reactivity: Reactivity.Reactivity
   readonly crypto: Crypto.Crypto
   readonly retryDelay: Duration.Duration
-  readonly awaitRouted: Effect.Effect<void>
+  readonly awaitRouted: Effect.Effect<boolean>
 }
 
 export interface ReplicaProxy {
@@ -177,11 +177,20 @@ const failureOutsideHandover = <A, E extends Tagged,>(exit: Exit.Exit<A, E>): Ca
 export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
   const proxyScope = yield* Effect.scope
 
-  const retryHandover = <A, E extends Tagged,>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+  const awaitRoutedOrUnavailable = options.awaitRouted.pipe(
+    Effect.flatMap((routed) => {
+      if (routed) return Effect.void
+      return Effect.fail(ownerUnavailable)
+    })
+  )
+
+  const retryHandover = <A, E extends Tagged,>(
+    effect: Effect.Effect<A, E>
+  ): Effect.Effect<A, E | ReplicaError.OwnerUnavailable> =>
     Effect.exit(effect).pipe(
       Effect.flatMap((exit) => {
         if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) {
-          return options.awaitRouted.pipe(Effect.andThen(retryHandover(effect)))
+          return awaitRoutedOrUnavailable.pipe(Effect.andThen(retryHandover(effect)))
         }
         return exit
       })
@@ -195,9 +204,10 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     Effect.exit(effect).pipe(
       Effect.flatMap((exit) => {
         if (failureOutsideHandover(exit) === undefined) return options.awaitRouted
-        return Effect.sleep(options.retryDelay)
+        return Effect.sleep(options.retryDelay).pipe(Effect.as(true))
       }),
-      Effect.forever
+      Effect.repeat({ while: (routed) => routed }),
+      Effect.asVoid
     )
 
   const definition = options.definition
@@ -315,7 +325,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
           return Stream.failCause(cause)
         })
       )
-    const routed = Stream.concat(Stream.succeed(undefined), Stream.fromEffectRepeat(options.awaitRouted))
+    const routed = Stream.concat(Stream.succeed(undefined), Stream.fromEffectRepeat(awaitRoutedOrUnavailable))
     return routed.pipe(Stream.flatMap(session))
   }
 
@@ -449,9 +459,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     > {
       return encodeJson(mutation.payloadSchema, payload).pipe(
         Effect.flatMap((encoded) =>
-          client.ResubmitQuarantined({ spaceId, mutationId, name: mutation.name, payload: encoded }).pipe(
-            mapTransport,
-            dieUnknownDefinition,
+          call(client.ResubmitQuarantined({ spaceId, mutationId, name: mutation.name, payload: encoded })).pipe(
             Effect.catchTag(
               "WireMutationRejection",
               (wire) => decodeWith(mutation.rejectionSchema, wire.rejection).pipe(Effect.flatMap(Effect.fail))
@@ -655,7 +663,14 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       Effect.tap(() => SubscriptionRef.set(handle, Option.none())),
       Effect.flatMap((exit) => {
         const cause = failureOutsideHandover(exit)
-        if (cause === undefined) return options.awaitRouted.pipe(Effect.as(false))
+        if (cause === undefined) {
+          return options.awaitRouted.pipe(
+            Effect.flatMap((routed) => {
+              if (routed) return Effect.succeed(false)
+              return Deferred.fail(opened, ownerUnavailable).pipe(Effect.as(true))
+            })
+          )
+        }
         return Deferred.failCause(opened, cause).pipe(
           Effect.flatMap((openFailed) => {
             if (openFailed) return Effect.succeed(true)
