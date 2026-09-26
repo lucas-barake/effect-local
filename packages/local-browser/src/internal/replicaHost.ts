@@ -11,6 +11,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
+import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import type * as InvalidationHub from "./invalidationHub.js"
 import * as replicaWire from "./replicaWire.js"
@@ -500,3 +501,57 @@ export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(opti
     })
   })
 })
+
+export type TermHandlers = Effect.Success<ReturnType<typeof makeHandlers>>
+
+interface Tagged {
+  readonly _tag: string
+}
+
+export interface FencedOptions {
+  readonly lease: Effect.Effect<OwnerResources, never, Scope.Scope>
+  readonly handlersFor: (resources: OwnerResources) => Effect.Effect<TermHandlers>
+}
+
+export const makeFencedHandlers = (options: FencedOptions) => {
+  const unary = <A, E extends Tagged, R,>(f: (handlers: TermHandlers) => Effect.Effect<A, E, R>) =>
+    options.lease.pipe(
+      Effect.flatMap(options.handlersFor),
+      Effect.flatMap(f),
+      Effect.scoped
+    )
+  const streaming = <A, E extends Tagged, R,>(f: (handlers: TermHandlers) => Stream.Stream<A, E, R>) =>
+    Stream.unwrap(options.lease.pipe(Effect.flatMap(options.handlersFor), Effect.map(f)))
+  return replicaWire.ReplicaEntity.of({
+    Join: (request) => unary((handlers) => handlers.Join(request)),
+    Leave: (request) => unary((handlers) => handlers.Leave(request)),
+    Spaces: () => unary((handlers) => handlers.Spaces()),
+    AggregateStatus: () => unary((handlers) => handlers.AggregateStatus()),
+    SpaceScope: (request) => unary((handlers) => handlers.SpaceScope(request)),
+    SetScope: (request) => unary((handlers) => handlers.SetScope(request)),
+    Activation: (request) => unary((handlers) => handlers.Activation(request)),
+    Activate: (request) => unary((handlers) => handlers.Activate(request)),
+    Deactivate: (request) => unary((handlers) => handlers.Deactivate(request)),
+    SpaceStatus: (request) => unary((handlers) => handlers.SpaceStatus(request)),
+    Mutate: (request) => unary((handlers) => handlers.Mutate(request)),
+    GetEntity: (request) => unary((handlers) => handlers.GetEntity(request)),
+    Query: (request) => unary((handlers) => handlers.Query(request)),
+    ReceiptOf: (request) => unary((handlers) => handlers.ReceiptOf(request)),
+    Pending: (request) => unary((handlers) => handlers.Pending(request)),
+    PendingFor: (request) => unary((handlers) => handlers.PendingFor(request)),
+    ResolveSettlementStart: (request) => unary((handlers) => handlers.ResolveSettlementStart(request)),
+    Settlements: (request) => streaming((handlers) => handlers.Settlements(request)),
+    AcknowledgeSettlements: (request) => unary((handlers) => handlers.AcknowledgeSettlements(request)),
+    QuarantineList: (request) => unary((handlers) => handlers.QuarantineList(request)),
+    DiscardQuarantined: (request) => unary((handlers) => handlers.DiscardQuarantined(request)),
+    ResubmitQuarantined: (request) => unary((handlers) => handlers.ResubmitQuarantined(request)),
+    Retain: (request) => streaming((handlers) => handlers.Retain(request)),
+    Invalidations: () => streaming((handlers) => handlers.Invalidations()),
+    EphemeralSession: (request) => streaming((handlers) => handlers.EphemeralSession(request)),
+    EphemeralUpdateMember: (request) => unary((handlers) => handlers.EphemeralUpdateMember(request)),
+    EphemeralPublishEvent: (request) => unary((handlers) => handlers.EphemeralPublishEvent(request)),
+    EphemeralPublishState: (request) => unary((handlers) => handlers.EphemeralPublishState(request)),
+    EphemeralClear: (request) => unary((handlers) => handlers.EphemeralClear(request)),
+    EphemeralRemove: (request) => unary((handlers) => handlers.EphemeralRemove(request))
+  })
+}

@@ -84,7 +84,6 @@ export const make = Effect.fnUntraced(function*(options: Options) {
   const transportScope = yield* Effect.scope
   const self = options.self.host
   const names = lockNames.make(options.name)
-  const inboxName = (host: string) => `@lucas-barake/effect-local-browser:${options.name}:${host}`
   const outboxes = new Map<string, Deferred.Deferred<platform.TabChannelConnection>>()
 
   const openOutbox = Effect.fnUntraced(function*(
@@ -92,7 +91,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
     opened: Deferred.Deferred<platform.TabChannelConnection>
   ) {
     const scope = yield* Scope.fork(transportScope)
-    const connection = yield* options.channels.open(inboxName(host)).pipe(Scope.provide(scope))
+    const connection = yield* options.channels.open(names.inbox(host)).pipe(Scope.provide(scope))
     yield* Deferred.succeed(opened, connection)
     yield* options.locks.released(names.runner(host)).pipe(
       Effect.andThen(Effect.sync(() => outboxes.delete(host))),
@@ -187,7 +186,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
     return target(frame.message)
   }
 
-  const inbox = yield* options.channels.open(inboxName(self)).pipe(Effect.flatMap((channel) => channel.messages))
+  const inbox = yield* options.channels.open(names.inbox(self)).pipe(Effect.flatMap((channel) => channel.messages))
   yield* Queue.take(inbox).pipe(
     Effect.flatMap((raw) =>
       decodeFrame(raw).pipe(

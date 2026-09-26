@@ -19,7 +19,6 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
-import type * as Schedule from "effect/Schedule"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
@@ -45,7 +44,8 @@ export interface ProxyOptions {
   readonly consumer: string
   readonly reactivity: Reactivity.Reactivity
   readonly crypto: Crypto.Crypto
-  readonly retrySchedule: Schedule.Schedule<unknown>
+  readonly retryDelay: Duration.Duration
+  readonly awaitRouted: Effect.Effect<void>
 }
 
 export interface ReplicaProxy {
@@ -85,18 +85,6 @@ function dieUnknownDefinition(
     Effect.catchTag("WireUnknownSession", (error) => Effect.die(error))
   )
 }
-
-const retryHandover = <A, E extends Tagged,>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
-  Effect.exit(effect).pipe(
-    Effect.flatMap((exit) => {
-      if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) return retryHandover(effect)
-      return exit
-    })
-  )
-
-const call = <A, E extends Tagged,>(
-  effect: Effect.Effect<A, E | TransportError | replicaWire.WireUnknownDefinition | replicaWire.WireUnknownSession>
-) => retryHandover(effect).pipe(mapTransport, dieUnknownDefinition)
 
 const wireMutation = (definition: Definition.Any, name: string) =>
   Effect.suspend(() => {
@@ -181,15 +169,37 @@ function decodeSettlement(
   return decodeAnySettlement(definition, wire)
 }
 
-const repeatForever = <A, E extends Tagged,>(effect: Effect.Effect<A, E>, schedule: Schedule.Schedule<unknown>) =>
-  Effect.exit(effect).pipe(
-    Effect.andThen(Effect.void),
-    Effect.repeat(schedule),
-    Effect.asVoid
-  )
+const failureOutsideHandover = <A, E extends Tagged,>(exit: Exit.Exit<A, E>): Cause.Cause<E> | undefined => {
+  if (Exit.isSuccess(exit) || Cause.hasInterruptsOnly(exit.cause)) return undefined
+  return exit.cause
+}
 
 export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
   const proxyScope = yield* Effect.scope
+
+  const retryHandover = <A, E extends Tagged,>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> =>
+    Effect.exit(effect).pipe(
+      Effect.flatMap((exit) => {
+        if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) {
+          return options.awaitRouted.pipe(Effect.andThen(retryHandover(effect)))
+        }
+        return exit
+      })
+    )
+
+  const call = <A, E extends Tagged,>(
+    effect: Effect.Effect<A, E | TransportError | replicaWire.WireUnknownDefinition | replicaWire.WireUnknownSession>
+  ) => retryHandover(effect).pipe(mapTransport, dieUnknownDefinition)
+
+  const resubscribeAfterHandover = <A, E extends Tagged,>(effect: Effect.Effect<A, E>) =>
+    Effect.exit(effect).pipe(
+      Effect.flatMap((exit) => {
+        if (failureOutsideHandover(exit) === undefined) return options.awaitRouted
+        return Effect.sleep(options.retryDelay)
+      }),
+      Effect.forever
+    )
+
   const definition = options.definition
   const client = options.client
   const handles = new Map<Identity.SpaceId, Replica.Space>()
@@ -255,7 +265,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       return Deferred.succeed(subscribed, undefined)
     }),
     Effect.ensuring(Effect.sync(forgetMemberships)),
-    (effect) => repeatForever(effect, options.retrySchedule),
+    resubscribeAfterHandover,
     Effect.forkIn(proxyScope)
   )
   yield* Deferred.await(subscribed)
@@ -278,7 +288,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         )
       )
     })
-    const open = (): Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError> =>
+    const session = (): Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError> =>
       Stream.unwrap(
         resolveStart.pipe(
           Effect.map((resolved) =>
@@ -301,11 +311,12 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
           })
         ),
         Stream.catchCause((cause) => {
-          if (Cause.hasInterruptsOnly(cause)) return open()
+          if (Cause.hasInterruptsOnly(cause)) return Stream.empty
           return Stream.failCause(cause)
         })
       )
-    return open()
+    const routed = Stream.concat(Stream.succeed(undefined), Stream.fromEffectRepeat(options.awaitRouted))
+    return routed.pipe(Stream.flatMap(session))
   }
 
   const spaceHandle = (spaceId: Identity.SpaceId): Replica.Space => {
@@ -543,7 +554,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
           return options.reactivity.invalidate([key])
         })
       ),
-      (effect) => repeatForever(effect, options.retrySchedule),
+      resubscribeAfterHandover,
       Effect.forkIn(scope)
     )
     yield* Deferred.await(acquired)
@@ -643,10 +654,16 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       Effect.exit,
       Effect.tap(() => SubscriptionRef.set(handle, Option.none())),
       Effect.flatMap((exit) => {
-        if (Exit.isSuccess(exit) || Cause.hasInterruptsOnly(exit.cause)) return Effect.succeed(false)
-        return Deferred.failCause(opened, exit.cause)
+        const cause = failureOutsideHandover(exit)
+        if (cause === undefined) return options.awaitRouted.pipe(Effect.as(false))
+        return Deferred.failCause(opened, cause).pipe(
+          Effect.flatMap((openFailed) => {
+            if (openFailed) return Effect.succeed(true)
+            return Effect.sleep(options.retryDelay).pipe(Effect.as(false))
+          })
+        )
       }),
-      Effect.repeat({ schedule: options.retrySchedule, until: (openFailed) => openFailed }),
+      Effect.repeat({ until: (openFailed) => openFailed }),
       Effect.forkIn(sessionScope)
     )
     yield* Deferred.await(opened)

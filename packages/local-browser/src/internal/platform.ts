@@ -105,7 +105,9 @@ const heldNavigatorLocks: Effect.Effect<ReadonlyArray<string>> = Effect.promise(
 )
 
 const releasedNavigatorLock = (name: string): Effect.Effect<void> =>
-  Effect.promise(() => navigator.locks.request(name, { mode: "shared" }, () => undefined)).pipe(Effect.asVoid)
+  Effect.promise((signal) => navigator.locks.request(name, { mode: "shared", signal }, () => undefined)).pipe(
+    Effect.asVoid
+  )
 
 export const layerWebLocksNavigator: EffectLayer.Layer<WebLocks> = EffectLayer.succeed(
   WebLocks,

@@ -14,7 +14,6 @@ import * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import * as Schedule from "effect/Schedule"
 import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Sharding from "effect/unstable/cluster/Sharding"
@@ -29,7 +28,6 @@ import * as ReplicaOwner from "./internal/replicaOwner.js"
 import * as replicaProxy from "./internal/replicaProxy.js"
 import * as replicaWire from "./internal/replicaWire.js"
 import * as TabCluster from "./internal/tabCluster.js"
-import * as TabRunnerStorage from "./internal/tabRunnerStorage.js"
 import * as TabScheduler from "./internal/tabScheduler.js"
 
 export { BrowserStorageError } from "./BrowserStorageError.js"
@@ -153,14 +151,12 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     layerOwner = Layer.merge(layerStack, layerRequestPersistence)
   }
 
-  const hosting = TabRunnerStorage.makeHosting()
   const owner = yield* ReplicaOwner.make({
     host,
     names,
     locks,
     channels,
     visibility,
-    shardsReleased: hosting.released,
     retryDelay,
     layerOwner
   })
@@ -170,24 +166,22 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     names,
     locks,
     channels,
-    isReady: owner.isReady,
-    hosting,
     shardingConfig: options.sharding
   })
-  const layerEntity = replicaWire.ReplicaEntity.toLayer(
-    ReplicaOwner.ReplicaOwnerService.use((service) => service.current).pipe(
-      Effect.flatMap((resources) =>
-        replicaHost.makeHandlers({ definition: options.definition, ephemerals, profiles, resources })
+  const termHandlers = new WeakMap<replicaHost.OwnerResources, replicaHost.TermHandlers>()
+  const handlersFor = (resources: replicaHost.OwnerResources) =>
+    Effect.suspend(() => {
+      const known = termHandlers.get(resources)
+      if (known !== undefined) return Effect.succeed(known)
+      return replicaHost.makeHandlers({ definition: options.definition, ephemerals, profiles, resources }).pipe(
+        Effect.tap((built) => Effect.sync(() => termHandlers.set(resources, built)))
       )
-    ),
+    })
+  const layerEntity = replicaWire.ReplicaEntity.toLayer(
+    Effect.sync(() => replicaHost.makeFencedHandlers({ lease: owner.lease, handlersFor })),
     { concurrency: "unbounded", mailboxCapacity: "unbounded" }
   )
-  const shardingContext = yield* Layer.build(
-    layerEntity.pipe(
-      Layer.provideMerge(cluster.layer),
-      Layer.provide(Layer.succeed(ReplicaOwner.ReplicaOwnerService, owner))
-    )
-  )
+  const shardingContext = yield* Layer.build(layerEntity.pipe(Layer.provideMerge(cluster.layer)))
   const sharding = Context.get(shardingContext, Sharding.Sharding)
   yield* cluster.registered
   const makeClient = yield* replicaWire.ReplicaEntity.client.pipe(
@@ -200,7 +194,8 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     consumer: host,
     reactivity,
     crypto,
-    retrySchedule: Schedule.spaced(retryDelay)
+    retryDelay: Duration.fromInputUnsafe(retryDelay),
+    awaitRouted: cluster.awaitRouted
   })
   return Context.make(Replica.Replica, proxy.replica).pipe(
     Context.add(QueryReactivity.QueryReactivity, proxy.queryReactivity),

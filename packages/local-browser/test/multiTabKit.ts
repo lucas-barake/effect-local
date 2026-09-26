@@ -198,13 +198,21 @@ export const makeMemoryPlatform = Effect.sync((): MemoryPlatform => {
       }
       return names
     }),
-    released: Effect.fnUntraced(function*(name) {
-      const state = lockState(name)
-      if (state.holder === undefined) return
-      const release = yield* Deferred.make<void>()
-      state.releases.push(release)
-      yield* Deferred.await(release)
-    })
+    released: (name) =>
+      Effect.suspend(() => {
+        const state = lockState(name)
+        if (state.holder === undefined) return Effect.void
+        const release = Deferred.makeUnsafe<void>()
+        state.releases.push(release)
+        return Deferred.await(release).pipe(
+          Effect.onInterrupt(() =>
+            Effect.sync(() => {
+              const index = state.releases.indexOf(release)
+              if (index >= 0) state.releases.splice(index, 1)
+            })
+          )
+        )
+      })
   }
 
   const clientIdentityStore: platform.ClientIdentityStoreService = {

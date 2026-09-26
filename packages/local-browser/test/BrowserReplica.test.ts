@@ -45,12 +45,16 @@ const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-0000000
 const TodoSchema = Schema.Struct({ id: Schema.String, title: Schema.String })
 const Todo = Model.make("Todo", { version: 1, key: Schema.String, schema: TodoSchema })
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema })
+const AppendTitle = Mutation.make("AppendTitle", {
+  version: 1,
+  payload: { id: Schema.String, suffix: Schema.String }
+})
 const ListTodos = Query.make("ListTodos", { success: Schema.Array(Todo.schema) })
 const RunIndex = Query.make("RunIndex", { success: Schema.Number })
 const definition = Definition.make({
   version: 1,
   models: [Todo],
-  mutations: [PutTodo],
+  mutations: [PutTodo, AppendTitle],
   queries: [ListTodos, RunIndex]
 })
 
@@ -70,6 +74,15 @@ type ListTodosError = Effect.Error<ReturnType<typeof listTodos>>
 const layerHandlersWith = (runIndex: (query: Transaction.Query) => Effect.Effect<number, ListTodosError>) =>
   Layer.mergeAll(
     PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload)),
+    AppendTitle.toLayer(({ payload, transaction }) =>
+      transaction.get(Todo, payload.id).pipe(
+        Effect.map(Option.match({
+          onNone: () => payload.suffix,
+          onSome: (todo) => `${todo.title}${payload.suffix}`
+        })),
+        Effect.flatMap((title) => transaction.set(Todo, payload.id, { id: payload.id, title }))
+      )
+    ),
     ListTodos.toLayer(({ query }) => listTodos(query)),
     RunIndex.toLayer(({ query }) => runIndex(query))
   )
@@ -152,12 +165,15 @@ interface EnvironmentOptions {
   readonly submitAllowed?: () => boolean
   readonly sharding?: BrowserReplica.Options<typeof definition, never, never>["sharding"]
   readonly runIndex?: (query: Transaction.Query) => Effect.Effect<number, ListTodosError>
+  readonly name?: string
+  readonly kit?: testKit.MemoryPlatform
+  readonly retryDelay?: BrowserReplica.Options<typeof definition, never, never>["retryDelay"]
 }
 
 const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: EnvironmentOptions) {
   const fs = yield* FileSystem.FileSystem
   const directory = yield* fs.makeTempDirectoryScoped()
-  const kit = yield* testKit.makeMemoryPlatform
+  const kit = environmentOptions.kit ?? (yield* testKit.makeMemoryPlatform)
   const store = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
   const databaseOpens = yield* Ref.make(0)
   const layerSync = Layer.merge(
@@ -182,7 +198,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
   )
   const layerReplicaWith = (visibility: platform.TabVisibilityService) =>
     BrowserReplica.layer({
-      name: "tabs",
+      name: environmentOptions.name ?? "tabs",
       definition,
       layerDatabase,
       layerSync,
@@ -190,7 +206,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
       profiles: { status: StatusProfile },
       layerPlatform: Layer.merge(kit.layerAll, Layer.succeed(platform.TabVisibility, visibility)),
       requestPersistence: false,
-      retryDelay: "100 millis",
+      retryDelay: environmentOptions.retryDelay ?? "100 millis",
       sharding: environmentOptions.sharding
     }).pipe(Layer.provide(layerHandlersWith(environmentOptions.runIndex ?? firstRunIndex)))
   const layerReplica = Layer.unwrap(
@@ -204,7 +220,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
     return { scope, context, replica: Context.get(context, Replica.Replica), visibility }
   })
   const openTab = openTabWith(true)
-  return { openTab, openTabWith, databaseOpens, layerReplica, traffic: kit.traffic }
+  return { openTab, openTabWith, databaseOpens, layerReplica, layerReplicaWith, traffic: kit.traffic }
 })
 
 const makeEnvironment = makeEnvironmentWith({})
@@ -398,6 +414,23 @@ describe("BrowserReplica", () => {
   )
 
   it.effect(
+    "keeps a replica's tabs apart from a replica whose name extends its lock namespace",
+    Effect.fnUntraced(
+      function*() {
+        const kit = yield* testKit.makeMemoryPlatform
+        const neighbour = yield* makeEnvironmentWith({ kit, name: "tabs:visible" })
+        yield* neighbour.openTabWith(true)
+        const environment = yield* makeEnvironmentWith({ kit, name: "tabs" })
+        const tab = yield* environment.openTabWith(false)
+        assert.deepStrictEqual(yield* settle(listFrom(tab.replica)), [])
+        assert.strictEqual(yield* Ref.get(environment.databaseOpens), 1)
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
     "moves the replica to a visible tab once the leader tab is hidden",
     Effect.fnUntraced(
       function*() {
@@ -417,6 +450,93 @@ describe("BrowserReplica", () => {
           { id: "2", title: "during the switch" }
         ])
         assert.strictEqual(yield* Ref.get(environment.databaseOpens), 2)
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "hands the replica over without waiting for shard lock refresh or entity termination timers",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironmentWith({
+          sharding: { shardLockRefreshInterval: "1 hour", entityTerminationTimeout: "1 hour" }
+        })
+        const leader = yield* environment.openTabWith(true)
+        const follower = yield* environment.openTabWith(false)
+        const space = yield* settle(follower.replica.space(spaceId))
+        yield* space.settlements({ from: "live" }).pipe(Stream.runDrain, Effect.forkScoped)
+        yield* settle(space.mutate(PutTodo, { id: "1", title: "before the switch" }))
+        yield* leader.visibility.set(false)
+        yield* follower.visibility.set(true)
+        yield* settle(space.mutate(PutTodo, { id: "2", title: "during the switch" }))
+        assert.strictEqual(yield* Ref.get(environment.databaseOpens), 2)
+        assert.deepStrictEqual(yield* settle(listFrom(follower.replica)), [
+          { id: "1", title: "before the switch" },
+          { id: "2", title: "during the switch" }
+        ])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "resubscribes a follower's live query as soon as a handover completes",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironmentWith({ retryDelay: "1 hour" })
+        const leader = yield* environment.openTabWith(true)
+        const next = yield* environment.openTabWith(false)
+        const hidden = yield* testKit.makeMemoryVisibility(false)
+        const graph = ReplicaAtom.make(environment.layerReplicaWith(hidden.service))
+        const registry = AtomRegistry.make()
+        yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+        const todos = graph.query(spaceId, ListTodos)(undefined)
+        const unmount = registry.mount(todos)
+        yield* Effect.addFinalizer(() => Effect.sync(unmount))
+        assert.deepStrictEqual(yield* settle(AtomRegistry.getResult(registry, todos, { suspendOnWaiting: true })), [])
+        yield* leader.visibility.set(false)
+        yield* next.visibility.set(true)
+        const space = yield* settle(next.replica.space(spaceId))
+        yield* settle(space.mutate(PutTodo, { id: "3", title: "written on the new leader" }))
+        assert.strictEqual(yield* Ref.get(environment.databaseOpens), 2)
+        assert.deepStrictEqual(
+          yield* settle(AtomRegistry.getResult(registry, todos, { suspendOnWaiting: true })),
+          [{ id: "3", title: "written on the new leader" }]
+        )
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "serves the visible tab through rapid visibility flips without losing or repeating a mutation",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const tabs = [yield* environment.openTabWith(true), yield* environment.openTabWith(false)]
+        const spaces = [
+          yield* settle(tabs[0].replica.space(spaceId)),
+          yield* settle(tabs[1].replica.space(spaceId))
+        ]
+        const suffixes = "abcdefgh"
+        const writes: Array<Fiber.Fiber<Protocol.PendingMutation, ReplicaError.ReplicaError>> = []
+        let visible = 0
+        for (const suffix of suffixes) {
+          const hiding = visible
+          visible = 1 - visible
+          yield* tabs[visible].visibility.set(true)
+          yield* tabs[hiding].visibility.set(false)
+          writes.push(yield* Effect.forkChild(spaces[visible].mutate(AppendTitle, { id: "log", suffix })))
+        }
+        yield* settle(Fiber.joinAll(writes))
+        const [log] = yield* settle(listFrom(tabs[visible].replica))
+        assert.isDefined(log)
+        assert.strictEqual(Array.from(log.title).toSorted().join(""), suffixes)
+        assert.deepStrictEqual(yield* settle(listFrom(tabs[1 - visible].replica)), [log])
       },
       Effect.scoped,
       provideFileSystem

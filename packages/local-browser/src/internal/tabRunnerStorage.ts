@@ -1,64 +1,51 @@
 import * as Deferred from "effect/Deferred"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
+import * as SubscriptionRef from "effect/SubscriptionRef"
 import { PersistenceError } from "effect/unstable/cluster/ClusterError"
 import * as MachineId from "effect/unstable/cluster/MachineId"
 import * as Runner from "effect/unstable/cluster/Runner"
 import * as RunnerAddress from "effect/unstable/cluster/RunnerAddress"
 import * as RunnerStorage from "effect/unstable/cluster/RunnerStorage"
-import * as ShardId from "effect/unstable/cluster/ShardId"
+import type * as ShardId from "effect/unstable/cluster/ShardId"
 import type * as lockNames from "./lockNames.js"
 import type * as platform from "./platform.js"
 
 const machineIdCount = 1024
 
-export interface ShardHosting {
-  readonly hold: (shardIds: ReadonlyArray<ShardId.ShardId>) => void
-  readonly drop: (shardId: ShardId.ShardId) => void
-  readonly dropAll: () => void
-  readonly released: Effect.Effect<void>
-}
-
-export const makeHosting = (): ShardHosting => {
-  const hosted = new Set<string>()
-  let drained = Deferred.makeUnsafe<void>()
-  Deferred.doneUnsafe(drained, Effect.void)
-  const settle = () => {
-    if (hosted.size === 0) Deferred.doneUnsafe(drained, Effect.void)
-  }
-  return {
-    hold: (shardIds) => {
-      if (shardIds.length === 0) return
-      if (hosted.size === 0) drained = Deferred.makeUnsafe<void>()
-      for (const shardId of shardIds) hosted.add(ShardId.toString(shardId))
-    },
-    drop: (shardId) => {
-      hosted.delete(ShardId.toString(shardId))
-      settle()
-    },
-    dropAll: () => {
-      hosted.clear()
-      settle()
-    },
-    released: Effect.suspend(() => Deferred.await(drained))
-  }
-}
+const runnersWaitCap = Duration.seconds(2)
 
 export interface Options {
   readonly self: RunnerAddress.RunnerAddress
-  readonly hosting: ShardHosting
   readonly names: lockNames.LockNames
   readonly locks: platform.WebLocksService
+  readonly channels: platform.TabChannelService
   readonly groups: ReadonlyArray<string>
   readonly weight: number
-  readonly isReady: () => boolean
 }
 
 export interface TabRunnerStorage {
   readonly storage: RunnerStorage.RunnerStorage["Service"]
   readonly registered: Effect.Effect<void>
+  readonly awaitRouted: Effect.Effect<void>
+}
+
+interface Snapshot {
+  readonly runners: Array<readonly [Runner.Runner, boolean]>
+  readonly signature: string
+  readonly others: ReadonlyArray<string>
+  readonly othersReady: ReadonlyArray<string>
+  readonly hasReady: boolean
+}
+
+interface Delivery {
+  readonly sequence: number
+  readonly hasReady: boolean
 }
 
 export const make = Effect.fnUntraced(function*(options: Options) {
@@ -79,6 +66,81 @@ export const make = Effect.fnUntraced(function*(options: Options) {
   })
 
   const hostOf = (prefix: string, name: string) => name.slice(prefix.length)
+  const names = options.names
+  const runnersChannel = yield* options.channels.open(names.runnersChannel)
+  const nudges = yield* runnersChannel.messages
+  const wakes = yield* Queue.unbounded<void>()
+  let returned: Delivery & { readonly signature: string | undefined } = {
+    sequence: 0,
+    hasReady: false,
+    signature: undefined
+  }
+  const processed = yield* SubscriptionRef.make<Delivery>({ sequence: 0, hasReady: false })
+
+  const snapshot = options.locks.held.pipe(
+    Effect.map((held): Snapshot => {
+      const ready = new Set<string>()
+      const hosts: Array<string> = []
+      for (const name of held) {
+        if (name.startsWith(names.readyPrefix)) ready.add(hostOf(names.readyPrefix, name))
+        else if (name.startsWith(names.runnerPrefix)) hosts.push(hostOf(names.runnerPrefix, name))
+      }
+      hosts.sort()
+      const runners = hosts.map((host) => {
+        const runner = Runner.make({
+          address: RunnerAddress.make(host, self.port),
+          groups: options.groups,
+          weight: options.weight
+        })
+        return [runner, ready.has(host)] as const
+      })
+      const others = hosts.filter((host) => host !== self.host)
+      return {
+        runners,
+        signature: hosts.map((host) => `${host}:${Number(ready.has(host))}`).join(","),
+        others,
+        othersReady: others.filter((host) => ready.has(host)),
+        hasReady: hosts.some((host) => ready.has(host))
+      }
+    })
+  )
+
+  const awaitChange = (current: Snapshot) =>
+    Effect.raceAll([
+      Queue.take(nudges).pipe(Effect.asVoid),
+      Queue.take(wakes),
+      Effect.sleep(runnersWaitCap),
+      ...current.others.map((host) => options.locks.released(names.runner(host))),
+      ...current.othersReady.map((host) => options.locks.released(names.ready(host)))
+    ]).pipe(
+      Effect.andThen(Queue.clear(nudges)),
+      Effect.andThen(Queue.clear(wakes)),
+      Effect.asVoid
+    )
+
+  const getRunners = Effect.gen(function*() {
+    yield* SubscriptionRef.set(processed, { sequence: returned.sequence, hasReady: returned.hasReady })
+    let current = yield* snapshot
+    if (current.signature === returned.signature) {
+      yield* awaitChange(current)
+      current = yield* snapshot
+    }
+    returned = { sequence: returned.sequence + 1, hasReady: current.hasReady, signature: current.signature }
+    return current.runners
+  })
+
+  const awaitRouted = Effect.suspend(() => {
+    const target = returned.sequence + 1
+    return Queue.offer(wakes, undefined).pipe(
+      Effect.andThen(
+        SubscriptionRef.changes(processed).pipe(
+          Stream.filter((delivery) => delivery.sequence >= target && delivery.hasReady),
+          Stream.runHead
+        )
+      ),
+      Effect.asVoid
+    )
+  })
 
   const register = Effect.gen(function*() {
     if (machineId === undefined) machineId = yield* claimMachineId
@@ -86,6 +148,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
       const scope = yield* Scope.fork(storageScope)
       yield* options.locks.acquire(options.names.runner(self.host)).pipe(Scope.provide(scope))
       registration = scope
+      yield* runnersChannel.post(self.host)
     }
     yield* Deferred.succeed(registeredLatch, undefined)
     return machineId
@@ -93,13 +156,9 @@ export const make = Effect.fnUntraced(function*(options: Options) {
 
   const ownedShards = (address: RunnerAddress.RunnerAddress, shardIds: Iterable<ShardId.ShardId>) =>
     Effect.sync(() => {
-      if (!ownsShards(address)) return []
-      const owned = Array.from(shardIds)
-      options.hosting.hold(owned)
-      return owned
+      if (address.host !== self.host) return []
+      return Array.from(shardIds)
     })
-
-  const ownsShards = (address: RunnerAddress.RunnerAddress) => address.host === self.host && options.isReady()
 
   const storage = RunnerStorage.RunnerStorage.of({
     register: () => register,
@@ -108,38 +167,20 @@ export const make = Effect.fnUntraced(function*(options: Options) {
         const scope = registration
         if (address.host !== self.host || scope === undefined) return Effect.void
         registration = undefined
-        return Scope.close(scope, Exit.void)
+        const released = options.locks.released(names.runner(self.host))
+        return Scope.close(scope, Exit.void).pipe(
+          Effect.andThen(released),
+          Effect.andThen(runnersChannel.post(self.host))
+        )
       }),
-    getRunners: Effect.gen(function*() {
-      const held = yield* options.locks.held
-      const ready = new Set<string>()
-      const hosts: Array<string> = []
-      for (const name of held) {
-        if (name.startsWith(options.names.readyPrefix)) ready.add(hostOf(options.names.readyPrefix, name))
-        else if (name.startsWith(options.names.runnerPrefix)) hosts.push(hostOf(options.names.runnerPrefix, name))
-      }
-      return hosts.map((host) => {
-        const runner = Runner.make({
-          address: RunnerAddress.make(host, self.port),
-          groups: options.groups,
-          weight: options.weight
-        })
-        return [runner, ready.has(host)] as const
-      })
-    }),
+    getRunners,
     setRunnerHealth: () => Effect.void,
     acquire: ownedShards,
     refresh: ownedShards,
-    release: (address, shardId) =>
-      Effect.sync(() => {
-        if (address.host === self.host) options.hosting.drop(shardId)
-      }),
-    releaseAll: (address) =>
-      Effect.sync(() => {
-        if (address.host === self.host) options.hosting.dropAll()
-      })
+    release: () => Effect.void,
+    releaseAll: () => Effect.void
   })
 
-  const result: TabRunnerStorage = { storage, registered: Deferred.await(registeredLatch) }
+  const result: TabRunnerStorage = { storage, registered: Deferred.await(registeredLatch), awaitRouted }
   return result
 })

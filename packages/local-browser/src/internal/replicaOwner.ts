@@ -6,6 +6,7 @@ import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -23,7 +24,6 @@ export interface Options<E extends { readonly _tag: string },> {
   readonly locks: platform.WebLocksService
   readonly channels: platform.TabChannelService
   readonly visibility: platform.TabVisibilityService
-  readonly shardsReleased: Effect.Effect<void>
   readonly retryDelay: Duration.Input
   readonly layerOwner: Layer.Layer<
     Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient,
@@ -33,13 +33,19 @@ export interface Options<E extends { readonly _tag: string },> {
 }
 
 export interface ReplicaOwner {
-  readonly current: Effect.Effect<OwnerResources>
-  readonly isReady: () => boolean
+  readonly lease: Effect.Effect<OwnerResources, never, Scope.Scope>
 }
 
-export class ReplicaOwnerService extends Context.Service<ReplicaOwnerService, ReplicaOwner>()(
-  "@lucas-barake/effect-local-browser/ReplicaOwner"
-) {}
+interface Holder {
+  readonly fiber: Fiber.Fiber<unknown, unknown>
+}
+
+interface Term {
+  readonly resources: OwnerResources
+  readonly drained: Deferred.Deferred<void>
+  readonly holders: Set<Holder>
+  fenced: boolean
+}
 
 const invalidationBacklogCapacity = 16_384
 
@@ -60,9 +66,38 @@ const decodeAnnouncement = Schema.decodeUnknownEffect(Schema.String)
 export const make = Effect.fnUntraced(function*<E extends { readonly _tag: string },>(options: Options<E>) {
   const ownerScope = yield* Effect.scope
   const names = options.names
-  let ready = false
   let terms = 0
-  let term = yield* Deferred.make<OwnerResources>()
+  let active: Term | undefined
+  const runners = yield* options.channels.open(names.runnersChannel)
+  const announceRunners = runners.post(options.host)
+
+  const settleDrain = (term: Term) => {
+    if (term.fenced && term.holders.size === 0) Deferred.doneUnsafe(term.drained, Effect.void)
+  }
+
+  const fence = (term: Term) =>
+    Effect.suspend(() => {
+      term.fenced = true
+      if (active === term) active = undefined
+      const fibers = Array.from(term.holders, (holder) => holder.fiber)
+      settleDrain(term)
+      return Fiber.interruptAll(fibers)
+    })
+
+  const lease = Effect.acquireRelease(
+    Effect.withFiber((fiber) => {
+      const term = active
+      if (term === undefined || term.fenced) return Effect.interrupt
+      const holder: Holder = { fiber }
+      term.holders.add(holder)
+      return Effect.succeed({ term, holder })
+    }),
+    ({ holder, term }) =>
+      Effect.sync(() => {
+        term.holders.delete(holder)
+        settleDrain(term)
+      })
+  ).pipe(Effect.map(({ term }) => term.resources))
 
   const visible = yield* SubscriptionRef.make(yield* options.visibility.visible)
   const announcements = yield* options.channels.open(names.visibilityChannel)
@@ -166,22 +201,16 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
       ephemeral: Context.get(context, EphemeralClient.EphemeralClient),
       invalidations
     }
-    yield* Effect.addFinalizer(() =>
-      Deferred.make<OwnerResources>().pipe(
-        Effect.map((next) => {
-          ready = false
-          term = next
-        })
-      )
-    )
-    yield* Deferred.succeed(term, resources)
+    const term: Term = { resources, drained: yield* Deferred.make<void>(), holders: new Set(), fenced: false }
+    yield* Effect.addFinalizer(() => fence(term).pipe(Effect.andThen(Deferred.await(term.drained))))
+    active = term
     const readyScope = yield* Scope.fork(yield* Effect.scope)
     yield* options.locks.acquire(names.ready(options.host)).pipe(Scope.provide(readyScope))
-    ready = true
+    yield* announceRunners
     yield* awaitOutranked
-    ready = false
     yield* Scope.close(readyScope, Exit.void)
-    yield* options.shardsReleased
+    yield* options.locks.released(names.ready(options.host))
+    yield* announceRunners
   })
 
   yield* Effect.scoped(lead).pipe(
@@ -197,9 +226,6 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
     Effect.forkScoped
   )
 
-  const owner: ReplicaOwner = {
-    current: Effect.suspend(() => Deferred.await(term)),
-    isReady: () => ready
-  }
+  const owner: ReplicaOwner = { lease }
   return owner
 })

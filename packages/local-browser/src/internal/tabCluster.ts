@@ -19,7 +19,8 @@ import * as TabTransport from "./tabTransport.js"
 export const shardingDefaults: Partial<ShardingConfig.ShardingConfig["Service"]> = {
   shardsPerGroup: 16,
   shardLockRefreshInterval: Duration.seconds(1),
-  refreshAssignmentsInterval: Duration.millis(250),
+  refreshAssignmentsInterval: Duration.zero,
+  entityMessagePollInterval: Duration.millis(250),
   sendRetryInterval: Duration.millis(50),
   entityTerminationTimeout: Duration.seconds(1),
   simulateRemoteSerialization: false
@@ -31,14 +32,13 @@ export interface Options {
   readonly names: lockNames.LockNames
   readonly locks: platform.WebLocksService
   readonly channels: platform.TabChannelService
-  readonly isReady: () => boolean
-  readonly hosting: TabRunnerStorage.ShardHosting
   readonly shardingConfig?: Partial<ShardingConfig.ShardingConfig["Service"]> | undefined
 }
 
 export interface TabCluster {
   readonly layer: Layer.Layer<Sharding.Sharding | Runners.Runners>
   readonly registered: Effect.Effect<void>
+  readonly awaitRouted: Effect.Effect<void>
 }
 
 export const make = Effect.fnUntraced(function*(options: Options) {
@@ -58,12 +58,11 @@ export const make = Effect.fnUntraced(function*(options: Options) {
   })
   const storage = yield* TabRunnerStorage.make({
     self,
-    hosting: options.hosting,
+    channels: options.channels,
     names: options.names,
     locks: options.locks,
     groups: config.assignedShardGroups,
-    weight: config.runnerShardWeight,
-    isReady: options.isReady
+    weight: config.runnerShardWeight
   })
   const layer = RunnerServer.layerWithClients.pipe(
     Layer.provide([
@@ -75,6 +74,6 @@ export const make = Effect.fnUntraced(function*(options: Options) {
     ]),
     Layer.provide(Layer.succeed(ShardingConfig.ShardingConfig, config))
   )
-  const cluster: TabCluster = { layer, registered: storage.registered }
+  const cluster: TabCluster = { layer, registered: storage.registered, awaitRouted: storage.awaitRouted }
   return cluster
 })
