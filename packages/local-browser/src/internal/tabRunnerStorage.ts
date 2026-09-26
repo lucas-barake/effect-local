@@ -76,12 +76,14 @@ export const make = Effect.fnUntraced(function*(options: Options) {
         return Scope.close(scope, Exit.void)
       }),
     getRunners: Effect.gen(function*() {
-      const runners = yield* options.locks.held(options.names.runnerPrefix)
-      const ready = new Set(
-        (yield* options.locks.held(options.names.readyPrefix)).map((name) => hostOf(options.names.readyPrefix, name))
-      )
-      return runners.map((name) => {
-        const host = hostOf(options.names.runnerPrefix, name)
+      const held = yield* options.locks.held
+      const ready = new Set<string>()
+      const hosts: Array<string> = []
+      for (const name of held) {
+        if (name.startsWith(options.names.readyPrefix)) ready.add(hostOf(options.names.readyPrefix, name))
+        else if (name.startsWith(options.names.runnerPrefix)) hosts.push(hostOf(options.names.runnerPrefix, name))
+      }
+      return hosts.map((host) => {
         const runner = Runner.make({
           address: RunnerAddress.make(host, self.port),
           groups: options.groups,

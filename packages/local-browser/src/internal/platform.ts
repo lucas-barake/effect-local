@@ -19,7 +19,7 @@ export interface WebLocksService {
     options?: { readonly steal?: boolean }
   ) => Effect.Effect<WebLockHold, never, Scope.Scope>
   readonly tryAcquire: (name: string) => Effect.Effect<Option.Option<WebLockHold>, never, Scope.Scope>
-  readonly held: (prefix: string) => Effect.Effect<ReadonlyArray<string>>
+  readonly held: Effect.Effect<ReadonlyArray<string>>
   readonly released: (name: string) => Effect.Effect<void>
 }
 
@@ -93,18 +93,15 @@ const tryAcquireNavigatorLock = (name: string) =>
     })
   )
 
-const heldNavigatorLocks = (prefix: string): Effect.Effect<ReadonlyArray<string>> =>
-  Effect.promise(() => navigator.locks.query()).pipe(
-    Effect.map((snapshot) => {
-      const names: Array<string> = []
-      for (const lock of snapshot.held ?? []) {
-        if (lock.mode === "exclusive" && lock.name !== undefined && lock.name.startsWith(prefix)) {
-          names.push(lock.name)
-        }
-      }
-      return names
-    })
-  )
+const heldNavigatorLocks: Effect.Effect<ReadonlyArray<string>> = Effect.promise(() => navigator.locks.query()).pipe(
+  Effect.map((snapshot) => {
+    const names: Array<string> = []
+    for (const lock of snapshot.held ?? []) {
+      if (lock.mode === "exclusive" && lock.name !== undefined) names.push(lock.name)
+    }
+    return names
+  })
+)
 
 const releasedNavigatorLock = (name: string): Effect.Effect<void> =>
   Effect.promise(() => navigator.locks.request(name, { mode: "shared" }, () => undefined)).pipe(Effect.asVoid)

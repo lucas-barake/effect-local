@@ -156,14 +156,13 @@ export const makeMemoryPlatform = Effect.sync((): MemoryPlatform => {
       )
       return Option.some<platform.WebLockHold>({ lost: Deferred.await(lost) })
     }),
-    held: (prefix) =>
-      Effect.sync(() => {
-        const names: Array<string> = []
-        for (const [name, state] of locks) {
-          if (state.holder !== undefined && name.startsWith(prefix)) names.push(name)
-        }
-        return names
-      }),
+    held: Effect.sync(() => {
+      const names: Array<string> = []
+      for (const [name, state] of locks) {
+        if (state.holder !== undefined) names.push(name)
+      }
+      return names
+    }),
     released: Effect.fnUntraced(function*(name) {
       const state = lockState(name)
       if (state.holder === undefined) return
