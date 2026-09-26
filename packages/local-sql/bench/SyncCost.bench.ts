@@ -225,6 +225,6 @@ describe("per-message sync cost by space size", () => {
           await environment.runtime.runPromise(syncOneTodo(environment))
         }
       }).run({ iterations, time: 0, warmupIterations: 1, warmupTime: 0, throws: true })
-    })
+    }, 600_000)
   }
 })
