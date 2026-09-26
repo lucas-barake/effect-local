@@ -1,4 +1,6 @@
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -56,8 +58,8 @@ const FromServer = Schema.Union([
 ])
 
 const Frame = Schema.Union([
-  Schema.TaggedStruct("ToServer", { from: Schema.String, to: Schema.String, message: FromClient }),
-  Schema.TaggedStruct("ToClient", { from: Schema.String, to: Schema.String, message: FromServer })
+  Schema.TaggedStruct("ToServer", { from: Schema.String, message: FromClient }),
+  Schema.TaggedStruct("ToClient", { from: Schema.String, message: FromServer })
 ])
 type Frame = typeof Frame.Type
 
@@ -73,7 +75,7 @@ export interface Options {
   readonly name: string
   readonly self: RunnerAddress.RunnerAddress
   readonly locks: platform.WebLocksService
-  readonly channel: platform.TabChannelConnection
+  readonly channels: platform.TabChannelService
 }
 
 type ServerMessage = typeof FromServer.Type
@@ -82,10 +84,36 @@ export const make = Effect.fnUntraced(function*(options: Options) {
   const transportScope = yield* Effect.scope
   const self = options.self.host
   const names = lockNames.make(options.name)
-  const post = (frame: Frame) =>
+  const inboxName = (host: string) => `@lucas-barake/effect-local-browser:${options.name}:${host}`
+  const outboxes = new Map<string, Deferred.Deferred<platform.TabChannelConnection>>()
+
+  const openOutbox = Effect.fnUntraced(function*(
+    host: string,
+    opened: Deferred.Deferred<platform.TabChannelConnection>
+  ) {
+    const scope = yield* Scope.fork(transportScope)
+    const connection = yield* options.channels.open(inboxName(host)).pipe(Scope.provide(scope))
+    yield* Deferred.succeed(opened, connection)
+    yield* options.locks.released(names.runner(host)).pipe(
+      Effect.andThen(Effect.sync(() => outboxes.delete(host))),
+      Effect.andThen(Scope.close(scope, Exit.void)),
+      Effect.forkIn(transportScope)
+    )
+  })
+
+  const outboxFor = (host: string) =>
+    Effect.suspend(() => {
+      const known = outboxes.get(host)
+      if (known !== undefined) return Deferred.await(known)
+      const opened = Deferred.makeUnsafe<platform.TabChannelConnection>()
+      outboxes.set(host, opened)
+      return openOutbox(host, opened).pipe(Effect.uninterruptible, Effect.andThen(Deferred.await(opened)))
+    })
+
+  const post = (host: string, frame: Frame) =>
     encodeFrame(frame).pipe(
-      Effect.flatMap(options.channel.post),
-      Effect.catchTag("SchemaError", (error) => Effect.die(error))
+      Effect.catchTag("SchemaError", (error) => Effect.die(error)),
+      Effect.flatMap((encoded) => outboxFor(host).pipe(Effect.flatMap((outbox) => outbox.post(encoded))))
     )
 
   const serverClients = new Map<string, number>()
@@ -132,7 +160,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
             if (response._tag === "ClientProtocolError" || response._tag === "Request") {
               return Effect.die(`The tab transport cannot carry a server ${response._tag} message`)
             }
-            return post({ _tag: "ToClient", from: self, to: host, message: response })
+            return post(host, { _tag: "ToClient", from: self, message: response })
           }),
         end: () => Effect.void,
         clientIds: Effect.sync(() => serverClientIds),
@@ -149,7 +177,6 @@ export const make = Effect.fnUntraced(function*(options: Options) {
   const targets = new Map<string, (message: ServerMessage) => Effect.Effect<void>>()
 
   const dispatch = (frame: Frame): Effect.Effect<void> => {
-    if (frame.to !== self) return Effect.void
     if (frame._tag === "ToServer") {
       return serverClientFor(frame.from).pipe(
         Effect.flatMap((clientId) => writeRequest(clientId, fromClientWire(frame.message)))
@@ -160,7 +187,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
     return target(frame.message)
   }
 
-  const inbox = yield* options.channel.messages
+  const inbox = yield* options.channels.open(inboxName(self)).pipe(Effect.flatMap((channel) => channel.messages))
   yield* Queue.take(inbox).pipe(
     Effect.flatMap((raw) =>
       decodeFrame(raw).pipe(
@@ -210,7 +237,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
             if (failure !== undefined) return Effect.fail(failure)
             if (request._tag === "Request") requestClients.set(request.id, clientId)
             if (request._tag === "Interrupt") requestClients.delete(request.requestId)
-            return post({ _tag: "ToServer", from: self, to: target, message: request })
+            return post(target, { _tag: "ToServer", from: self, message: request })
           }),
         supportsAck: true,
         supportsTransferables: false,

@@ -130,8 +130,9 @@ const settle = Effect.fnUntraced(function*<A, E extends { readonly _tag: string 
 const provideFileSystem = Effect.provide(NodeFileSystem.layer)
 
 interface EnvironmentOptions {
-  readonly layerEphemeral: Layer.Layer<EphemeralClient.EphemeralClient>
-  readonly submitAllowed: () => boolean
+  readonly layerEphemeral?: Layer.Layer<EphemeralClient.EphemeralClient>
+  readonly submitAllowed?: () => boolean
+  readonly sharding?: BrowserReplica.Options<typeof definition, never, never>["sharding"]
 }
 
 const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: EnvironmentOptions) {
@@ -145,7 +146,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
       waitForCredentialChange: () => Effect.never,
       submit: (request) =>
         Effect.suspend(() => {
-          if (environmentOptions.submitAllowed()) return store.submit(request)
+          if (environmentOptions.submitAllowed?.() ?? true) return store.submit(request)
           return Effect.never
         }),
       discard: (request) => store.discard(request, null),
@@ -153,7 +154,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
       bootstrap: store.bootstrap,
       watch: store.watch
     }),
-    environmentOptions.layerEphemeral
+    environmentOptions.layerEphemeral ?? layerEphemeralInactive
   )
   const layerDatabase = SqliteClient.layer({ filename: `${directory}/replica.sqlite` }).pipe(
     Layer.tap(() => Ref.update(databaseOpens, (count) => count + 1))
@@ -167,7 +168,8 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
     profiles: { status: StatusProfile },
     layerPlatform: kit.layerAll,
     requestPersistence: false,
-    retryDelay: "100 millis"
+    retryDelay: "100 millis",
+    sharding: environmentOptions.sharding
   }).pipe(Layer.provide(layerHandlers))
   const layerTab = layerReplica.pipe(Layer.provide(Layer.fresh(Reactivity.layer)))
   const openTab = Effect.gen(function*() {
@@ -175,10 +177,10 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
     const context = yield* Layer.buildWithScope(layerTab, scope)
     return { scope, context, replica: Context.get(context, Replica.Replica) }
   })
-  return { openTab, databaseOpens, layerReplica }
+  return { openTab, databaseOpens, layerReplica, traffic: kit.traffic }
 })
 
-const makeEnvironment = makeEnvironmentWith({ layerEphemeral: layerEphemeralInactive, submitAllowed: () => true })
+const makeEnvironment = makeEnvironmentWith({})
 
 const openStatusSession = (context: Context.Context<EphemeralClient.EphemeralClient>) =>
   Context.get(context, EphemeralClient.EphemeralClient).session(StatusProfile, {
@@ -285,10 +287,7 @@ describe("BrowserReplica", () => {
     Effect.fnUntraced(
       function*() {
         let submitAllowed = false
-        const environment = yield* makeEnvironmentWith({
-          layerEphemeral: layerEphemeralInactive,
-          submitAllowed: () => submitAllowed
-        })
+        const environment = yield* makeEnvironmentWith({ submitAllowed: () => submitAllowed })
         const leader = yield* environment.openTab
         const follower = yield* environment.openTab
         const space = yield* settle(follower.replica.space(spaceId))
@@ -324,10 +323,7 @@ describe("BrowserReplica", () => {
           })
         )
         const updates = yield* Ref.make<ReadonlyArray<unknown>>([])
-        const environment = yield* makeEnvironmentWith({
-          layerEphemeral: layerEphemeralOpening(opening, updates),
-          submitAllowed: () => true
-        })
+        const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralOpening(opening, updates) })
         const leader = yield* environment.openTab
         const follower = yield* environment.openTab
         const session = yield* settle(openStatusSession(follower.context).pipe(Scope.provide(yield* Effect.scope)))
@@ -355,8 +351,7 @@ describe("BrowserReplica", () => {
           })
         )
         const environment = yield* makeEnvironmentWith({
-          layerEphemeral: layerEphemeralOpening(opening, yield* Ref.make<ReadonlyArray<unknown>>([])),
-          submitAllowed: () => true
+          layerEphemeral: layerEphemeralOpening(opening, yield* Ref.make<ReadonlyArray<unknown>>([]))
         })
         const tab = yield* environment.openTab
         const outcome = yield* settle(
@@ -365,6 +360,46 @@ describe("BrowserReplica", () => {
         assert.isTrue(Exit.isFailure(outcome), String(outcome))
         yield* TestClock.adjust("5 seconds")
         assert.strictEqual(yield* Ref.get(opens), 1)
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "delivers each frame between two tabs only to its recipient",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        yield* environment.openTab
+        const follower = yield* environment.openTab
+        yield* environment.openTab
+        const space = yield* settle(follower.replica.space(spaceId))
+        const posted = environment.traffic.posted
+        const delivered = environment.traffic.delivered
+        yield* settle(space.mutate(PutTodo, { id: "7", title: "one recipient" }))
+        yield* settle(space.query(ListTodos, undefined))
+        assert.isAbove(environment.traffic.posted - posted, 0)
+        assert.strictEqual(environment.traffic.delivered - delivered, environment.traffic.posted - posted)
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "keeps serving a tab while more long-lived streams are open than the entity mailbox holds",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironmentWith({ sharding: { entityMailboxCapacity: 4 } })
+        yield* environment.openTab
+        const follower = yield* environment.openTab
+        const space = yield* settle(follower.replica.space(spaceId))
+        for (let index = 0; index < 4; index++) {
+          yield* space.settlements({ from: "live" }).pipe(Stream.runDrain, Effect.forkScoped)
+        }
+        yield* TestClock.adjust("5 seconds")
+        assert.deepStrictEqual(yield* settle(space.query(ListTodos, undefined)), [])
       },
       Effect.scoped,
       provideFileSystem

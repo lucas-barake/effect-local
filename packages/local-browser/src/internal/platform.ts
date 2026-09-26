@@ -35,6 +35,7 @@ const requestNavigatorLock = Effect.fnUntraced(function*(
   const granted = yield* Deferred.make<boolean>()
   const lost = yield* Deferred.make<void>()
   let releaseLock: () => void = () => {}
+  let closed = false
   const controller = new AbortController()
   let lockOptions: LockOptions
   if (mode.steal === true) {
@@ -52,6 +53,7 @@ const requestNavigatorLock = Effect.fnUntraced(function*(
         Deferred.doneUnsafe(granted, Effect.succeed(false))
         return undefined
       }
+      if (closed) return undefined
       // oxlint-disable-next-line effect/noNewPromise -- navigator.locks holds the lock exactly as long as the callback's promise stays pending, so the release must be a raw resolver the scope finalizer calls.
       const held = new Promise<void>((resolve) => {
         releaseLock = resolve
@@ -69,6 +71,7 @@ const requestNavigatorLock = Effect.fnUntraced(function*(
   yield* Scope.addFinalizer(
     scope,
     Effect.sync(() => {
+      closed = true
       releaseLock()
       controller.abort()
     })
@@ -132,9 +135,19 @@ export class TabChannel extends Context.Service<TabChannel, TabChannelService>()
 const openBroadcastChannel = Effect.fnUntraced(function*(name: string) {
   const scope = yield* Effect.scope
   const channel = new BroadcastChannel(name)
-  yield* Scope.addFinalizer(scope, Effect.sync(() => channel.close()))
+  let closed = false
+  yield* Scope.addFinalizer(
+    scope,
+    Effect.sync(() => {
+      closed = true
+      channel.close()
+    })
+  )
   const connection: TabChannelConnection = {
-    post: (frame) => Effect.sync(() => channel.postMessage(frame)),
+    post: (frame) =>
+      Effect.sync(() => {
+        if (!closed) channel.postMessage(frame)
+      }),
     messages: Effect.gen(function*() {
       const subscriberScope = yield* Effect.scope
       const queue = yield* Queue.make<unknown>()

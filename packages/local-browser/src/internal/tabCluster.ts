@@ -30,7 +30,7 @@ export interface Options {
   readonly host: string
   readonly names: lockNames.LockNames
   readonly locks: platform.WebLocksService
-  readonly channel: platform.TabChannelConnection
+  readonly channels: platform.TabChannelService
   readonly isReady: () => boolean
   readonly shardingConfig?: Partial<ShardingConfig.ShardingConfig["Service"]> | undefined
 }
@@ -53,7 +53,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
     name: options.name,
     self,
     locks: options.locks,
-    channel: options.channel
+    channels: options.channels
   })
   const storage = yield* TabRunnerStorage.make({
     self,

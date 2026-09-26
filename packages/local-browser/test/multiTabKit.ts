@@ -26,7 +26,13 @@ interface MemoryLock {
   readonly releases: Array<Deferred.Deferred<void>>
 }
 
+export interface ChannelTraffic {
+  posted: number
+  delivered: number
+}
+
 export interface MemoryPlatform {
+  readonly traffic: ChannelTraffic
   readonly tabChannel: platform.TabChannelService
   readonly webLocks: platform.WebLocksService
   readonly clientIdentityStore: platform.ClientIdentityStoreService
@@ -39,6 +45,7 @@ export const makeMemoryPlatform = Effect.sync((): MemoryPlatform => {
   const channels = new Map<string, Set<MemoryConnection>>()
   const locks = new Map<string, MemoryLock>()
   const identities = new Map<string, string>()
+  const traffic: ChannelTraffic = { posted: 0, delivered: 0 }
 
   const tabChannel: platform.TabChannelService = {
     open: Effect.fnUntraced(function*(name) {
@@ -55,9 +62,11 @@ export const makeMemoryPlatform = Effect.sync((): MemoryPlatform => {
       return {
         post: (frame) =>
           Effect.sync(() => {
+            traffic.posted += 1
             for (const peer of registered) {
               if (peer === connection) continue
               for (const queue of peer.subscribers) {
+                traffic.delivered += 1
                 Queue.offerUnsafe(queue, frame)
               }
             }
@@ -173,6 +182,7 @@ export const makeMemoryPlatform = Effect.sync((): MemoryPlatform => {
   }
 
   return {
+    traffic,
     tabChannel,
     webLocks,
     clientIdentityStore,

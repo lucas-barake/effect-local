@@ -119,7 +119,6 @@ export const layer = <D extends Definition.Any, ED extends Tagged, ES extends Ta
       locks,
       identities
     )
-    const channel = yield* channels.open(`@lucas-barake/effect-local-browser:${options.name}`)
     const retryDelay = options.retryDelay ?? Duration.seconds(1)
     const profiles = new Map<string, Ephemeral.AnyMember>(Object.entries(options.profiles ?? {}))
     const profileNames = new Map<Ephemeral.AnyMember, string>()
@@ -154,7 +153,7 @@ export const layer = <D extends Definition.Any, ED extends Tagged, ES extends Ta
       host,
       names,
       locks,
-      channel,
+      channels,
       isReady: owner.isReady,
       shardingConfig: options.sharding
     })
@@ -164,7 +163,7 @@ export const layer = <D extends Definition.Any, ED extends Tagged, ES extends Ta
           replicaHost.makeHandlers({ definition: options.definition, ephemerals, profiles, resources })
         )
       ),
-      { concurrency: "unbounded" }
+      { concurrency: "unbounded", mailboxCapacity: "unbounded" }
     )
     const shardingContext = yield* Layer.build(
       layerEntity.pipe(
