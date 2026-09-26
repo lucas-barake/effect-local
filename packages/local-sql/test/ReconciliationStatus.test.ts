@@ -58,6 +58,8 @@ const layerDirectSync = Layer.effect(
     const server = yield* ServerStore.ServerStore
     return SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
       submit: server.submit,
       discard: (request) => server.discard(request, null),
       pull: server.pull,

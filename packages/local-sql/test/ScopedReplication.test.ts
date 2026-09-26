@@ -1804,6 +1804,8 @@ describe("scoped replication", () => {
       const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, "reader"),
           submit: server.submit,
           pull: (request) => server.pullAuthorized(request, "reader"),
@@ -1892,6 +1894,8 @@ describe("scoped replication", () => {
       const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, "reader"),
           submit: (request) => server.admit(request, "reader"),
           pull: (request) => server.pullAuthorized(request, "reader"),

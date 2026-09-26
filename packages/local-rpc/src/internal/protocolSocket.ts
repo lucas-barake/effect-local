@@ -7,6 +7,7 @@ import * as Result from "effect/Result"
 import type * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
+import * as SubscriptionRef from "effect/SubscriptionRef"
 import { RpcClient, RpcClientError, RpcMessage, RpcSerialization } from "effect/unstable/rpc"
 import * as Socket from "effect/unstable/socket/Socket"
 import { reconnectPolicy } from "./configuration.js"
@@ -46,7 +47,25 @@ function fromJsonWire(response: WireFromServer): WireFromServer | RpcMessage.Fro
   return response
 }
 
-export const make = (options?: Options): Effect.Effect<
+export interface ProtocolSocket {
+  readonly protocol: RpcClient.Protocol["Service"]
+  readonly connections: SubscriptionRef.SubscriptionRef<number>
+}
+
+export const make = Effect.fnUntraced(function*(options?: Options): Effect.fn.Return<
+  ProtocolSocket,
+  never,
+  Scope.Scope | RpcSerialization.RpcSerialization | Socket.Socket
+> {
+  const connections = yield* SubscriptionRef.make(0)
+  const protocol = yield* makeProtocol(options, connections)
+  return { protocol, connections }
+})
+
+const makeProtocol = (
+  options: Options | undefined,
+  connections: SubscriptionRef.SubscriptionRef<number>
+): Effect.Effect<
   RpcClient.Protocol["Service"],
   never,
   Scope.Scope | RpcSerialization.RpcSerialization | Socket.Socket
@@ -118,6 +137,7 @@ export const make = (options?: Options): Effect.Effect<
     const readFrames = Effect.gen(function*() {
       const { pull } = yield* socket.reader
       currentError = undefined
+      yield* SubscriptionRef.update(connections, (generation) => generation + 1)
       if (Option.isSome(hooks)) yield* hooks.value.onConnect
       while (true) {
         const frames = yield* pull

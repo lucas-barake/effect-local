@@ -200,6 +200,8 @@ const directSync = (server: ServerStore.Service) =>
     SyncEngine.SyncEngine,
     SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
       submit: server.submit,
       discard: (request) => server.discard(request, null),
       pull: server.pull,
@@ -2281,6 +2283,8 @@ describe("server reconciled mutation log", () => {
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
         submit: (submitted) => {
           const rejected = Protocol.RejectedReceipt.make({
@@ -3055,6 +3059,8 @@ describe("server reconciled mutation log", () => {
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
         submit: Effect.fnUntraced(function*({ envelope: submitted }) {
           submissions++
@@ -3342,6 +3348,8 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: server.pull,
@@ -3389,6 +3397,8 @@ describe("server reconciled mutation log", () => {
       const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
           discard: () => Effect.die("unexpected discard"),
@@ -3449,6 +3459,8 @@ describe("server reconciled mutation log", () => {
       const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
           discard: () => Effect.die("unexpected discard"),
@@ -3504,6 +3516,8 @@ describe("server reconciled mutation log", () => {
       const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(
               Effect.andThen(Deferred.await(credentialChanged))
@@ -3591,6 +3605,8 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: () => Ref.update(pulls, (count) => count + 1).pipe(Effect.andThen(Effect.fail(stale))),
@@ -3636,6 +3652,8 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: (request) =>
@@ -3675,6 +3693,8 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: (request) =>
@@ -3709,6 +3729,8 @@ describe("server reconciled mutation log", () => {
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const syncEngine = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
         submit: () => Effect.die("unexpected submit"),
         pull: server.pull,
@@ -3739,6 +3761,8 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.die("unexpected submit"),
           pull: (request) =>
@@ -3777,6 +3801,8 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: ({ envelope: submitted }) =>
             Effect.suspend(() => {

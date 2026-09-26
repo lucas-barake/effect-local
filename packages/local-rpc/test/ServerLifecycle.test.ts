@@ -15,6 +15,7 @@ import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import type * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
@@ -69,15 +70,18 @@ const layerAuthenticator = Layer.succeed(
 const layerServerAuthentication = Authentication.layerServer.pipe(Layer.provide(layerAuthenticator))
 const layerServerDatabase = (filename: string) =>
   Layer.mergeAll(SqliteClient.layer({ filename }), NodeCrypto.layer, Reactivity.layer)
-type AuthorizeRead = SyncServer.LayerOptions<typeof definition>["authorizeRead"]
+interface ServerBehavior {
+  readonly authorizeRead?: SyncServer.LayerOptions<typeof definition>["authorizeRead"]
+  readonly authorizeMutation?: SyncServer.LayerOptions<typeof definition>["authorizeMutation"]
+}
 
-const layerServer = (filename: string, authorizeRead: AuthorizeRead) =>
+const layerServer = (filename: string, behavior: ServerBehavior) =>
   SyncServer.layer({
     definition,
     store: { acceptedSchemaVersions: 0, readAuthorizationRefreshInterval: "1 minute" },
     authorizeAccess: () => Effect.void,
-    authorizeMutation: () => Effect.void,
-    authorizeRead,
+    authorizeMutation: behavior.authorizeMutation ?? (() => Effect.void),
+    authorizeRead: behavior.authorizeRead ?? (() => Effect.void),
     authorizeEphemeral: () => Effect.void
   }).pipe(
     Layer.provide(RpcServer.layerProtocolSocketServer),
@@ -96,14 +100,20 @@ const layerClientDatabase = Layer.mergeAll(
   Reactivity.layer
 )
 
+interface ReplicaBehavior {
+  readonly initialSpaces?: ReadonlyArray<Identity.SpaceId>
+  readonly retryDelay?: Duration.Input
+  readonly maximumRetryDelay?: Duration.Input
+}
+
 const makeRestartHarness = Effect.fnUntraced(function*() {
   const fs = yield* FileSystem.FileSystem
   const directory = yield* fs.makeTempDirectoryScoped()
   const filename = `${directory}/server.db`
   const currentUrl = MutableRef.make("")
-  const start = Effect.fnUntraced(function*(authorizeRead: AuthorizeRead = () => Effect.void) {
+  const start = Effect.fnUntraced(function*(behavior: ServerBehavior = {}) {
     const serverScope = yield* Scope.make()
-    const context = yield* Layer.buildWithScope(layerServer(filename, authorizeRead), serverScope)
+    const context = yield* Layer.buildWithScope(layerServer(filename, behavior), serverScope)
     const address = Context.get(context, SocketServer.SocketServer).address
     if (address._tag === "UnixPathAddress") return yield* Effect.die("Expected a TCP test server")
     MutableRef.set(currentUrl, `ws://127.0.0.1:${address.port}/sync`)
@@ -125,14 +135,14 @@ const makeRestartHarness = Effect.fnUntraced(function*() {
   const layerReplica = (
     clientId: Identity.ClientId,
     connections: Queue.Queue<void>,
-    initialSpaces: ReadonlyArray<Identity.SpaceId> = [spaceId]
+    behavior: ReplicaBehavior = {}
   ) =>
     SqlReplica.layer({
       definition,
       clientId,
-      initialSpaces,
-      retryDelay: "1 second",
-      maximumRetryDelay: "1 second"
+      initialSpaces: behavior.initialSpaces ?? [spaceId],
+      retryDelay: behavior.retryDelay ?? "1 second",
+      maximumRetryDelay: behavior.maximumRetryDelay ?? "1 second"
     }).pipe(
       Layer.provide(layerHandlers),
       Layer.provideMerge(layerClientDatabase),
@@ -314,9 +324,11 @@ describe("server lifecycle", () => {
     "reports Connecting while a reachable server is slow and Offline only once the transport fails",
     Effect.fnUntraced(function*() {
       const harness = yield* makeRestartHarness()
-      const server = yield* harness.start(() => Effect.never)
+      const server = yield* harness.start({ authorizeRead: () => Effect.never })
       const connections = yield* Queue.unbounded<void>()
-      const context = yield* Layer.build(harness.layerReplica(clientA, connections, [spaceId, secondSpaceId]))
+      const context = yield* Layer.build(
+        harness.layerReplica(clientA, connections, { initialSpaces: [spaceId, secondSpaceId] })
+      )
       const replica = Context.get(context, Replica.Replica)
       const reactivity = Context.get(context, Reactivity.Reactivity)
       const first = yield* replica.space(spaceId)
@@ -336,6 +348,104 @@ describe("server lifecycle", () => {
         awaitStatus(reactivity, second, (status) => status._tag === "Offline")
       ], { concurrency: "unbounded", discard: true })
       assert.strictEqual((yield* replica.status).state, "Offline")
+    })
+  )
+
+  it.effect(
+    "resumes the watch and the pending sync as soon as the transport reconnects instead of waiting out the backoff",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeRestartHarness()
+      const submitting = yield* Deferred.make<void>()
+      const first = yield* harness.start({
+        authorizeMutation: () => Deferred.succeed(submitting, undefined).pipe(Effect.andThen(Effect.never))
+      })
+      const connectionsA = yield* Queue.unbounded<void>()
+      const connectionsB = yield* Queue.unbounded<void>()
+      const longBackoff = { retryDelay: "20 seconds", maximumRetryDelay: "1 minute" } as const
+      const a = yield* openReplica(yield* Layer.build(harness.layerReplica(clientA, connectionsA, longBackoff)))
+      const b = yield* openReplica(yield* Layer.build(harness.layerReplica(clientB, connectionsB, longBackoff)))
+      yield* Effect.all([
+        awaitStatus(a.reactivity, a.space, (status) => status._tag === "Online"),
+        awaitStatus(b.reactivity, b.space, (status) => status._tag === "Online")
+      ], { concurrency: "unbounded", discard: true })
+      yield* Queue.takeAll(connectionsA)
+      yield* Queue.takeAll(connectionsB)
+
+      yield* a.space.mutate(PutTodo, { id: "during-outage", title: "sent by A" })
+      yield* Deferred.await(submitting)
+      const offline = yield* awaitStatus(a.reactivity, a.space, (status) => status._tag === "Offline").pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* harness.stop(first)
+      yield* Fiber.join(offline)
+
+      yield* harness.start()
+      yield* TestClock.adjust("500 millis")
+      yield* Queue.take(connectionsA)
+      yield* Queue.take(connectionsB)
+      const resumed = yield* awaitStatus(
+        a.reactivity,
+        a.space,
+        (status) => status._tag === "Online" && status.pending === 0
+      )
+      let resumedCursor = -1
+      if (resumed._tag === "Online") resumedCursor = resumed.cursor
+
+      const delivered = yield* awaitStatus(
+        a.reactivity,
+        a.space,
+        (status) => status._tag === "Online" && status.cursor > resumedCursor
+      ).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* b.space.mutate(PutTodo, { id: "after-reconnect", title: "sent by B" })
+      yield* Fiber.join(delivered)
+      assert.deepStrictEqual(
+        yield* a.space.get(Todo, "after-reconnect"),
+        Option.some({ id: "after-reconnect", title: "sent by B" })
+      )
+    })
+  )
+
+  it.effect(
+    "retries a background space's pending sync as soon as the transport reconnects",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeRestartHarness()
+      const submissions = yield* Queue.unbounded<void>()
+      const first = yield* harness.start({
+        authorizeMutation: () => Queue.offer(submissions, undefined).pipe(Effect.andThen(Effect.never))
+      })
+      const connectionsA = yield* Queue.unbounded<void>()
+      const connectionsB = yield* Queue.unbounded<void>()
+      const longBackoff = { retryDelay: "20 seconds", maximumRetryDelay: "1 minute" } as const
+      const a = yield* openReplica(yield* Layer.build(harness.layerReplica(clientA, connectionsA, longBackoff)))
+      const b = yield* openReplica(yield* Layer.build(harness.layerReplica(clientB, connectionsB, longBackoff)))
+      yield* Effect.all([
+        awaitStatus(a.reactivity, a.space, (status) => status._tag === "Online"),
+        awaitStatus(b.reactivity, b.space, (status) => status._tag === "Online")
+      ], { concurrency: "unbounded", discard: true })
+      yield* Queue.takeAll(connectionsA)
+      yield* Queue.takeAll(connectionsB)
+
+      yield* a.space.mutate(PutTodo, { id: "from-background", title: "sent by A in the background" })
+      yield* Queue.take(submissions)
+      yield* a.space.deactivate
+      yield* Queue.take(submissions)
+      yield* harness.stop(first)
+
+      yield* harness.start()
+      yield* TestClock.adjust("500 millis")
+      yield* Queue.take(connectionsA)
+      yield* Queue.take(connectionsB)
+      const received = yield* b.reactivity.stream(
+        [`effect-local:space:${spaceId}:status`],
+        b.space.get(Todo, "from-background")
+      ).pipe(
+        Stream.filter(Option.isSome),
+        Stream.runHead
+      )
+      assert.deepStrictEqual(
+        Option.flatten(received),
+        Option.some({ id: "from-background", title: "sent by A in the background" })
+      )
     })
   )
 })

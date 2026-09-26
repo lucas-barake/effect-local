@@ -118,6 +118,8 @@ const directSync = (server: ServerStore.Service) =>
   pipe(
     SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
       submit: server.submit,
       discard: (request) => server.discard(request, null),
       pull: server.pull,
@@ -270,6 +272,8 @@ describe("reconciliation workflow", () => {
       const layerBlockedSync = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: () =>
@@ -317,6 +321,8 @@ describe("reconciliation workflow", () => {
       const layerBlockedSync = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: () =>
@@ -372,6 +378,8 @@ describe("reconciliation workflow", () => {
       const credentialWaitStarted = yield* Deferred.make<void>()
       const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
           discard: () => Effect.die("unexpected discard"),
@@ -435,6 +443,8 @@ describe("reconciliation workflow", () => {
       const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, null),
           submit: server.submit,
           pull: (request) =>
@@ -646,6 +656,8 @@ describe("reconciliation workflow", () => {
         const server = Context.get(serverContext, ServerStore.ServerStore)
         let remote = SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, null),
           submit: server.submit,
           pull: server.pull,
@@ -655,6 +667,8 @@ describe("reconciliation workflow", () => {
         if (definition.hash !== Domain.definition.hash) {
           remote = SyncEngine.SyncEngine.of({
             waitForCredentialChange: () => Effect.never,
+            transportGeneration: Effect.succeed(0),
+            waitForTransportChange: () => Effect.never,
             discard: (request) => server.discard(request, null),
             submit: server.submit,
             pull: (request) => {
@@ -799,6 +813,8 @@ describe("reconciliation workflow", () => {
         const local = Context.get(localContext, LocalStore.Store)
         const remote = SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: (request) =>
@@ -885,6 +901,8 @@ describe("reconciliation workflow", () => {
       const server = Context.get(serverContext, ServerStore.ServerStore)
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
         submit: () =>
           Ref.update(attempts, (count) => count + 1).pipe(
@@ -969,6 +987,8 @@ describe("reconciliation workflow", () => {
       })
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
         submit: () => Effect.die("unexpected submit"),
         pull: () =>

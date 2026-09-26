@@ -49,6 +49,8 @@ const clientHistory = {
 
 const remoteService = SyncEngine.SyncEngine.of({
   waitForCredentialChange: () => Effect.never,
+  transportGeneration: Effect.succeed(0),
+  waitForTransportChange: () => Effect.never,
   submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
   discard: () => Effect.die("unexpected discard"),
   pull: () => Effect.never,
@@ -488,6 +490,8 @@ describe("multi space Replica", () => {
       const watchStarted = yield* Deferred.make<void>()
       const countedRemoteService = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         discard: () => Effect.die("unexpected discard"),
         pull: () => Effect.never,
@@ -805,6 +809,8 @@ describe("multi space Replica", () => {
       const release = yield* Deferred.make<void>()
       const blockedRemoteService = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         discard: () => Effect.die("unexpected discard"),
         pull: () => {
@@ -870,6 +876,8 @@ describe("multi space Replica", () => {
       const release = yield* Deferred.make<void>()
       const blockedRemote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         discard: () => Effect.die("unexpected discard"),
         pull: () =>
@@ -946,6 +954,8 @@ describe("multi space Replica", () => {
       const viewId = Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000001")
       const scheduledRemote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         submit: (request) => {
           if (request.envelope.spaceId !== foregroundSpace) {
             if (!blockBackground) return Effect.fail(new ReplicaError.ServerUnavailable())

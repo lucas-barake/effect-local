@@ -9,6 +9,7 @@ import * as Layer from "effect/Layer"
 import type * as Schedule from "effect/Schedule"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
+import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
@@ -25,10 +26,15 @@ export interface Options extends ProtocolSession.Options {
   readonly rpcTimeout?: Duration.Input
 }
 
+export class Transport extends Context.Service<Transport, {
+  readonly generation: Effect.Effect<number>
+  readonly waitForChange: (observedGeneration: number) => Effect.Effect<void>
+}>()("@lucas-barake/effect-local-rpc/SyncClient/Transport") {}
+
 export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.Layer<
   SyncEngine.SyncEngine,
   ReplicaError.InvalidConfiguration,
-  Authentication.CredentialProvider | ProtocolSession.ProtocolSession
+  Authentication.CredentialProvider | ProtocolSession.ProtocolSession | Transport
 > =>
   Layer.effect(
     SyncEngine.SyncEngine,
@@ -39,10 +45,13 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
       )
       const session = yield* ProtocolSession.ProtocolSession
       const credentialProvider = yield* Authentication.CredentialProvider
+      const transport = yield* Transport
       const client = session.client
       return SyncEngine.SyncEngine.of({
         waitForCredentialChange: (rejectedGeneration) =>
           credentialProvider.awaitChange(rejectedGeneration).pipe(Effect.asVoid),
+        transportGeneration: transport.generation,
+        waitForTransportChange: transport.waitForChange,
         submit: (request) =>
           ProtocolSessionRetry.run(session, (version) =>
             client.Submit({ ...request, protocolVersion: version }).pipe(
@@ -351,7 +360,10 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
 export const layerWithOptions = (options?: Options): Layer.Layer<
   SyncEngine.SyncEngine,
   ReplicaError.InvalidConfiguration,
-  Authentication.CredentialProvider | RpcClient.Protocol | RpcMiddleware.ForClient<Authentication.Authentication>
+  | Authentication.CredentialProvider
+  | RpcClient.Protocol
+  | RpcMiddleware.ForClient<Authentication.Authentication>
+  | Transport
 > => layerFromSession(options).pipe(Layer.provide(ProtocolSession.layerWithOptions(options)))
 
 export const layer = layerFromSession().pipe(Layer.provide(ProtocolSession.layer))
@@ -359,8 +371,20 @@ export const layer = layerFromSession().pipe(Layer.provide(ProtocolSession.layer
 export const layerProtocolSocket = (options?: {
   readonly retryTransientErrors?: boolean
   readonly retryPolicy?: Schedule.Schedule<any, Socket.SocketError>
-}): Layer.Layer<RpcClient.Protocol, never, Socket.Socket | RpcSerialization.RpcSerialization> =>
-  Layer.effect(RpcClient.Protocol, ProtocolSocket.make(options))
+}): Layer.Layer<RpcClient.Protocol | Transport, never, Socket.Socket | RpcSerialization.RpcSerialization> =>
+  Layer.effectContext(Effect.gen(function*() {
+    const { protocol, connections } = yield* ProtocolSocket.make(options)
+    const transport = Transport.of({
+      generation: SubscriptionRef.get(connections),
+      waitForChange: (observedGeneration) =>
+        SubscriptionRef.changes(connections).pipe(
+          Stream.filter((generation) => generation > observedGeneration),
+          Stream.runHead,
+          Effect.asVoid
+        )
+    })
+    return Context.make(RpcClient.Protocol, protocol).pipe(Context.add(Transport, transport))
+  }))
 
 export interface WebSocketOptions<R = never,> extends EphemeralClient.Options {
   readonly url: string | Effect.Effect<string, never, R>
@@ -424,7 +448,7 @@ export const layerWebSocket = <R = never,>(options: WebSocketOptions<R>): Layer.
     Layer.provide(SyncRpc.layerJson(options))
   )
   const layerSession = ProtocolSession.layerWithOptions(options).pipe(
-    Layer.provide(layerProtocol),
+    Layer.provideMerge(layerProtocol),
     Layer.provide(Layer.fresh(Authentication.layerClient))
   )
   return Layer.merge(layerFromSession(options), EphemeralClient.layerFromSession(options)).pipe(

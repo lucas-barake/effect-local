@@ -50,6 +50,8 @@ const layerConnectedSync = Effect.gen(function*() {
   const store = yield* ServerStore.ServerStore
   return SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
+    transportGeneration: Effect.succeed(0),
+    waitForTransportChange: () => Effect.never,
     submit: store.submit,
     discard: (request) => store.discard(request, null),
     pull: store.pull,
@@ -60,6 +62,8 @@ const layerConnectedSync = Effect.gen(function*() {
 
 const layerDisconnectedSync = Layer.succeed(SyncEngine.SyncEngine, {
   waitForCredentialChange: () => Effect.never,
+  transportGeneration: Effect.succeed(0),
+  waitForTransportChange: () => Effect.never,
   submit: () => Effect.never,
   discard: () => Effect.never,
   pull: () => Effect.never,

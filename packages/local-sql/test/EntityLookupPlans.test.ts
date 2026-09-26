@@ -186,6 +186,8 @@ const layers = () => {
     const store = yield* ServerStore.ServerStore
     return SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
       discard: (request) => store.discard(request, "reader"),
       submit: store.submit,
       pull: (request) => store.pullAuthorized(request, "reader"),

@@ -33,6 +33,7 @@ import * as Configuration from "./internal/configuration.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
+import { isTransportFailure } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
@@ -151,6 +152,7 @@ interface RetryWork {
   readonly entry: RememberedEntry
   readonly version: number
   readonly readyAt: number
+  readonly transportGeneration: Option.Option<number>
 }
 
 const RememberedRow = Schema.Struct({
@@ -609,12 +611,38 @@ const makeLayer = <D extends Definition.Any, R,>(
           return Queue.offer(backgroundQueue, { _tag: "Sync", spaceId: entry.spaceId }).pipe(Effect.asVoid)
         })
 
-      const scheduleBackgroundRetry = Effect.fnUntraced(function*(entry: RememberedEntry) {
+      const scheduleBackgroundRetry = Effect.fnUntraced(function*(
+        entry: RememberedEntry,
+        transportGeneration: Option.Option<number>
+      ) {
         if (entries.get(entry.spaceId) !== entry || entry.leaving || entry.foreground) return
         entry.retryAttempt += 1
         entry.retryVersion += 1
         const readyAt = (yield* Clock.currentTimeMillis) + Configuration.retryMillis(retryTiming, entry.retryAttempt)
-        yield* Queue.offer(retryQueue, { entry, version: entry.retryVersion, readyAt })
+        yield* Queue.offer(retryQueue, { entry, version: entry.retryVersion, readyAt, transportGeneration })
+      })
+
+      const releaseTransportRetries = Effect.gen(function*() {
+        const current = yield* remote.transportGeneration
+        const now = yield* Clock.currentTimeMillis
+        for (let index = 0; index < retrySchedule.length; index++) {
+          const work = retrySchedule[index]
+          if (Option.isSome(work.transportGeneration) && work.transportGeneration.value < current) {
+            retrySchedule[index] = { ...work, readyAt: now, transportGeneration: Option.none() }
+          }
+        }
+        retrySchedule.sort((left, right) => left.readyAt - right.readyAt)
+      })
+
+      const awaitTransportRetry = Effect.suspend(() => {
+        let oldest: number | undefined
+        for (const work of retrySchedule) {
+          if (Option.isSome(work.transportGeneration)) {
+            oldest = Math.min(oldest ?? work.transportGeneration.value, work.transportGeneration.value)
+          }
+        }
+        if (oldest === undefined) return Effect.never
+        return remote.waitForTransportChange(oldest)
       })
 
       const retrySchedulerTurn = Effect.suspend(() => {
@@ -644,10 +672,11 @@ const makeLayer = <D extends Definition.Any, R,>(
               ) return Effect.void
               return enqueueBackground(next.entry, false)
             }
-            return Effect.raceFirst(
+            return Effect.raceAllFirst([
               Queue.take(retryQueue).pipe(Effect.map((work) => Option.some(work))),
-              Effect.sleep(Duration.millis(next.readyAt - now)).pipe(Effect.as(Option.none<RetryWork>()))
-            ).pipe(
+              Effect.sleep(Duration.millis(next.readyAt - now)).pipe(Effect.as(Option.none<RetryWork>())),
+              awaitTransportRetry.pipe(Effect.andThen(releaseTransportRetries), Effect.as(Option.none<RetryWork>()))
+            ]).pipe(
               Effect.tap(Option.match({
                 onNone: () => Effect.void,
                 onSome: (work) => {
@@ -1404,7 +1433,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         const work = yield* Queue.take(backgroundQueue)
         if (work._tag === "Deactivate") {
           const result = yield* deactivate(work.entry, false, work.runtime, false).pipe(Effect.result)
-          if (Result.isFailure(result)) yield* scheduleBackgroundRetry(work.entry)
+          if (Result.isFailure(result)) yield* scheduleBackgroundRetry(work.entry, Option.none())
           return
         }
         const spaceId = work.spaceId
@@ -1412,6 +1441,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         const entry = entries.get(spaceId)
         if (entry === undefined || entry.leaving) return
         let activeRuntime: ActiveRuntime | undefined
+        const transportGeneration = yield* remote.transportGeneration
         const result = yield* withLease(entry, false, (runtime) => {
           activeRuntime = runtime
           let sync = runtime.reconciler.sync
@@ -1426,12 +1456,14 @@ const makeLayer = <D extends Definition.Any, R,>(
             Result.isSuccess(result)
           ).pipe(Effect.result)
           if (Result.isFailure(deactivation)) {
-            yield* scheduleBackgroundRetry(entry)
+            yield* scheduleBackgroundRetry(entry, Option.none())
             return
           }
         }
         if (Result.isFailure(result)) {
-          yield* scheduleBackgroundRetry(entry)
+          let retryTransport = Option.none<number>()
+          if (isTransportFailure(result.failure)) retryTransport = Option.some(transportGeneration)
+          yield* scheduleBackgroundRetry(entry, retryTransport)
         } else {
           entry.retryAttempt = 0
           entry.retryVersion += 1

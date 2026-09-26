@@ -163,6 +163,8 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
   const layerSync = Layer.merge(
     Layer.succeed(SyncEngine.SyncEngine, {
       waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
       submit: (request) =>
         Effect.suspend(() => {
           if (environmentOptions.submitAllowed?.() ?? true) return store.submit(request)
@@ -639,6 +641,8 @@ describe("BrowserReplica", () => {
           layerSync: Layer.merge(
             Layer.succeed(SyncEngine.SyncEngine, {
               waitForCredentialChange: () => Effect.never,
+              transportGeneration: Effect.succeed(0),
+              waitForTransportChange: () => Effect.never,
               submit: () => Effect.never,
               discard: () => Effect.never,
               pull: () => Effect.never,

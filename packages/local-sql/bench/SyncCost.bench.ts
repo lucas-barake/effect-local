@@ -97,6 +97,8 @@ const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
     const server = yield* ServerStore.ServerStore
     return SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
       discard: (request) => server.discard(request, "reader"),
       submit: server.submit,
       pull: (request) => server.pullAuthorized(request, "reader"),

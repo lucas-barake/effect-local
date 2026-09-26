@@ -29,6 +29,8 @@ export const layer: Layer.Layer<
     })
     return SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
       submit: Effect.fnUntraced(function*(request) {
         yield* online(request.envelope.spaceId)
         const receipt = yield* server.submit(request)
