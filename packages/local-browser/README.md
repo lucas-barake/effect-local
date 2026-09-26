@@ -41,6 +41,23 @@ Everything else is optional. `replica` forwards `SqlReplica` options, `sharding`
 `BrowserSqlite.layerWorker` spawns and owns a dedicated SQLite WASM worker that is terminated when the Layer's scope
 closes, and `BrowserSqlite.layerMessagePort` adapts an application-owned worker port instead.
 
+Start the worker with `BrowserSqliteWorker.run`. It holds a Web Lock for the database inside the worker for as long as
+the worker lives, so when leadership moves to another tab the new leader waits for the previous worker to close the
+OPFS file instead of opening it concurrently:
+
+```ts
+import * as BrowserSqliteWorker from "@lucas-barake/effect-local-browser/BrowserSqliteWorker"
+import * as Effect from "effect/Effect"
+
+declare const self: DedicatedWorkerGlobalScope
+
+void Effect.runPromise(BrowserSqliteWorker.run({ port: self, dbName: "chat" }))
+```
+
+Leadership follows visibility. Chrome deprioritizes the process of a tab whose pages are hidden, so a hidden leader
+hands the replica to a visible tab, which takes about 150 ms, and a hidden tab does not take leadership while another
+tab is visible.
+
 `ReplicaAtom.make` builds one Atom runtime from that Layer with space-addressed entities, queries, mutations, receipts,
 settlements, lifecycle operations, and ephemera.
 
