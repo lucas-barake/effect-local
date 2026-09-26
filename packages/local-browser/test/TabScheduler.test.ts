@@ -35,4 +35,20 @@ describe("TabScheduler", () => {
       assert.strictEqual(yield* dispatch(scheduler, () => undefined), "ran")
     })
   )
+
+  it.effect(
+    "runs posted work in posting order and skips cancelled work",
+    Effect.fnUntraced(function*() {
+      const scheduler = yield* TabScheduler.make
+      const order: Array<string> = []
+      scheduler.setImmediate(() => order.push("first"))
+      const cancel = scheduler.setImmediate(() => order.push("cancelled"))
+      scheduler.setImmediate(() => order.push("third"))
+      cancel()
+      yield* Effect.callback<void>((resume) => {
+        scheduler.setImmediate(() => resume(Effect.void))
+      })
+      assert.deepStrictEqual(order, ["first", "third"])
+    }, Effect.scoped)
+  )
 })
