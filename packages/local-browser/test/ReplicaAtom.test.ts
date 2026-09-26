@@ -77,6 +77,10 @@ const RangeTodos = Query.make("RangeTodos", {
   payload: { lower: Schema.String, upper: Schema.String },
   success: Schema.Array(Todo.schema)
 })
+const TitlesEcho = Query.make("TitlesEcho", {
+  payload: { titles: Schema.toCodecJson(Schema.ReadonlySet(Schema.String)).annotate({ identifier: "TitleSet" }) },
+  success: Schema.Array(Schema.String)
+})
 const rangeReads = new Map<string, number>()
 const TodoRows = Schema.Struct({ value: Schema.fromJsonString(TodoSchema) })
 const todosVia = (
@@ -96,13 +100,14 @@ const definition = Definition.make({
   version: 1,
   models: [Todo, Numbered],
   mutations: [PutTodo, PutNumbered],
-  queries: [ListTodos, RangeTodos]
+  queries: [ListTodos, RangeTodos, TitlesEcho]
 })
 const layerHandlers = Layer.mergeAll(
   PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
   PutNumbered.toLayer(({ payload, transaction }) =>
     transaction.set(Numbered, payload.id, payload).pipe(Effect.as(payload))
   ),
+  TitlesEcho.toLayer(({ payload }) => Effect.succeed(Array.from(payload.titles))),
   ListTodos.toLayer(({ query }) =>
     todosVia(query, (sql) => sql`SELECT "value" FROM "Todo" ORDER BY "title" ASC LIMIT 100`)
   ),
@@ -645,12 +650,57 @@ describe("Replica Atom graph", () => {
       )
       assert.strictEqual(graph.query(spaceId, ListTodos)(undefined), graph.query(spaceId, ListTodos)(undefined))
       assert.strictEqual(graph.entity(spaceId, Todo)("1"), graph.entity(spaceId, Todo)("1"))
-      assert.strictEqual(graph.mutation(spaceId, PutTodo), graph.mutation(spaceId, PutTodo))
       assert.strictEqual(graph.receipt(spaceId, PutTodo, mutationId), graph.receipt(spaceId, PutTodo, mutationId))
       assert.strictEqual(graph.pendingFor(spaceId, PutTodo), graph.pendingFor(spaceId, PutTodo))
       assert.strictEqual(graph.settlementsFor(spaceId, PutTodo), graph.settlementsFor(spaceId, PutTodo))
       assert.notStrictEqual(graph.pendingFor(spaceId, PutTodo), graph.pendingFor(secondSpaceId, PutTodo))
     })
+  )
+
+  it.effect(
+    "keeps query payloads whose decoded values differ on separate atoms",
+    Effect.fnUntraced(function*() {
+      const graph = BrowserReplica.make(layerReplica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const first = graph.query(spaceId, TitlesEcho)({ titles: new Set(["a"]) })
+      const second = graph.query(spaceId, TitlesEcho)({ titles: new Set(["b"]) })
+      const unmountFirst = registry.mount(first)
+      const unmountSecond = registry.mount(second)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountSecond()
+          unmountFirst()
+        })
+      )
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, first, { suspendOnWaiting: true }), ["a"])
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, second, { suspendOnWaiting: true }), ["b"])
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "resolves each mutation handle with the mutation it submitted",
+    Effect.fnUntraced(function*() {
+      const graph = BrowserReplica.make(layerReplica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const firstRow = graph.mutation(spaceId, PutTodo)
+      const secondRow = graph.mutation(spaceId, PutTodo)
+      const unmountFirst = registry.mount(firstRow)
+      const unmountSecond = registry.mount(secondRow)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountSecond()
+          unmountFirst()
+        })
+      )
+      registry.set(firstRow, { id: "row-1", title: "first" })
+      registry.set(secondRow, { id: "row-2", title: "second" })
+      const firstPending = yield* AtomRegistry.getResult(registry, firstRow, { suspendOnWaiting: true })
+      const secondPending = yield* AtomRegistry.getResult(registry, secondRow, { suspendOnWaiting: true })
+      assert.deepStrictEqual(firstPending.envelope.payload, { id: "row-1", title: "first" })
+      assert.deepStrictEqual(secondPending.envelope.payload, { id: "row-2", title: "second" })
+    }, Effect.scoped)
   )
 
   it.effect(

@@ -28,18 +28,17 @@ class QueryKey implements Equal.Equal {
   readonly spaceId: Identity.SpaceId
   readonly definition: Query.Any
   readonly payload: unknown
-  readonly value: string
   constructor(spaceId: Identity.SpaceId, definition: Query.Any, payload: unknown) {
     this.spaceId = spaceId
     this.definition = definition
     this.payload = payload
-    this.value = `${spaceId}:${definition.name}:${Canonical.hash(payload)}`
   }
   [Equal.symbol](that: unknown): boolean {
-    return that instanceof QueryKey && this.value === that.value && this.definition === that.definition
+    return that instanceof QueryKey && this.spaceId === that.spaceId && this.definition === that.definition &&
+      Equal.equals(this.payload, that.payload)
   }
   [Hash.symbol](): number {
-    return Hash.string(this.value)
+    return Hash.string(`${this.spaceId}:${this.definition.name}`) ^ Hash.hash(this.payload)
   }
 }
 
@@ -412,29 +411,18 @@ export const make = <E,>(
     return (payload) => queryFamily(new QueryKey(spaceId, definition, payload))
   }
 
-  const mutationFamily = Atom.family((key: MutationKey) =>
-    runtime.fn<unknown>()(
+  const mutation = <M extends Mutation.Any,>(spaceId: Identity.SpaceId, definition: M) =>
+    runtime.fn<Mutation.Payload<M>>()(
       (payload) =>
         Effect.yieldNow.pipe(
           Effect.andThen(
             Replica.Replica.use((replica) =>
-              replica.space(key.spaceId).pipe(Effect.flatMap((space) => space.mutate(key.definition, payload)))
+              replica.space(spaceId).pipe(Effect.flatMap((space) => space.mutate(definition, payload)))
             )
           )
         ),
       { concurrent: true }
     )
-  )
-  function mutation<M extends Mutation.Any,>(
-    spaceId: Identity.SpaceId,
-    definition: M
-  ): Atom.AtomResultFn<Mutation.Payload<M>, Protocol.PendingMutation, GraphError | Mutation.Rejection<M>>
-  function mutation(
-    spaceId: Identity.SpaceId,
-    definition: Mutation.Any
-  ): Atom.AtomResultFn<unknown, Protocol.PendingMutation, unknown> {
-    return mutationFamily(new MutationKey(spaceId, definition, ""))
-  }
 
   const receiptFamily = Atom.family((key: MutationKey) =>
     runtime.atom(
