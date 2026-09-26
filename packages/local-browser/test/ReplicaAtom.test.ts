@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import * as ProtocolSession from "@lucas-barake/effect-local-rpc/ProtocolSession"
+import * as Transport from "@lucas-barake/effect-local-rpc/Transport"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -36,6 +37,11 @@ import * as Stream from "effect/Stream"
 import { Atom, AtomRegistry } from "effect/unstable/reactivity"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
+
+const layerTransport = Layer.succeed(
+  Transport.Transport,
+  Transport.Transport.of({ generation: Effect.succeed(0), waitForChange: () => Effect.never })
+)
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
@@ -307,7 +313,8 @@ const makeEphemeralHarness = Effect.fnUntraced(function*(options?: {
     rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
   })
   const layerEphemeralClient = EphemeralClient.layerFromSession().pipe(
-    Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, protocolSession))
+    Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, protocolSession)),
+    Layer.provide(layerTransport)
   )
   return { messages, published, joins, publishGate, layerEphemeralClient }
 })

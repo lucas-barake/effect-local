@@ -21,20 +21,16 @@ import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSocket from "./internal/protocolSocket.js"
 import * as ProtocolSession from "./ProtocolSession.js"
 import * as SyncRpc from "./SyncRpc.js"
+import * as Transport from "./Transport.js"
 
 export interface Options extends ProtocolSession.Options {
   readonly rpcTimeout?: Duration.Input
 }
 
-export class Transport extends Context.Service<Transport, {
-  readonly generation: Effect.Effect<number>
-  readonly waitForChange: (observedGeneration: number) => Effect.Effect<void>
-}>()("@lucas-barake/effect-local-rpc/SyncClient/Transport") {}
-
 export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.Layer<
   SyncEngine.SyncEngine,
   ReplicaError.InvalidConfiguration,
-  Authentication.CredentialProvider | ProtocolSession.ProtocolSession | Transport
+  Authentication.CredentialProvider | ProtocolSession.ProtocolSession | Transport.Transport
 > =>
   Layer.effect(
     SyncEngine.SyncEngine,
@@ -45,7 +41,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
       )
       const session = yield* ProtocolSession.ProtocolSession
       const credentialProvider = yield* Authentication.CredentialProvider
-      const transport = yield* Transport
+      const transport = yield* Transport.Transport
       const client = session.client
       return SyncEngine.SyncEngine.of({
         waitForCredentialChange: (rejectedGeneration) =>
@@ -363,7 +359,7 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
   | Authentication.CredentialProvider
   | RpcClient.Protocol
   | RpcMiddleware.ForClient<Authentication.Authentication>
-  | Transport
+  | Transport.Transport
 > => layerFromSession(options).pipe(Layer.provide(ProtocolSession.layerWithOptions(options)))
 
 export const layer = layerFromSession().pipe(Layer.provide(ProtocolSession.layer))
@@ -371,10 +367,10 @@ export const layer = layerFromSession().pipe(Layer.provide(ProtocolSession.layer
 export const layerProtocolSocket = (options?: {
   readonly retryTransientErrors?: boolean
   readonly retryPolicy?: Schedule.Schedule<any, Socket.SocketError>
-}): Layer.Layer<RpcClient.Protocol | Transport, never, Socket.Socket | RpcSerialization.RpcSerialization> =>
+}): Layer.Layer<RpcClient.Protocol | Transport.Transport, never, Socket.Socket | RpcSerialization.RpcSerialization> =>
   Layer.effectContext(Effect.gen(function*() {
     const { protocol, connections } = yield* ProtocolSocket.make(options)
-    const transport = Transport.of({
+    const transport = Transport.Transport.of({
       generation: SubscriptionRef.get(connections),
       waitForChange: (observedGeneration) =>
         SubscriptionRef.changes(connections).pipe(
@@ -383,7 +379,7 @@ export const layerProtocolSocket = (options?: {
           Effect.asVoid
         )
     })
-    return Context.make(RpcClient.Protocol, protocol).pipe(Context.add(Transport, transport))
+    return Context.make(RpcClient.Protocol, protocol).pipe(Context.add(Transport.Transport, transport))
   }))
 
 export interface WebSocketOptions<R = never,> extends EphemeralClient.Options {

@@ -15,7 +15,9 @@ import * as Hash from "effect/Hash"
 import * as Layer from "effect/Layer"
 import * as Order from "effect/Order"
 import * as PubSub from "effect/PubSub"
+import * as Pull from "effect/Pull"
 import * as RcMap from "effect/RcMap"
+import * as Result from "effect/Result"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -27,6 +29,7 @@ import { positiveFiniteDurationMillis, reconnectPolicy } from "./internal/config
 import { invalidConfiguration } from "./internal/errors.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSession from "./ProtocolSession.js"
+import * as Transport from "./Transport.js"
 
 type JoinInput = Omit<Protocol.EphemeralJoinRequest, "ttlMillis"> & {
   readonly ttl: Duration.Input
@@ -272,6 +275,9 @@ const memberSlice = (view: RawView): ReadonlyArray<Protocol.EphemeralMemberEntry
 
 const noProjection = (): string | undefined => undefined
 
+const isTransportFailure = (error: ReplicaError.ReplicaError) =>
+  error._tag === "ServerUnavailable" || error._tag === "OperationTimeout"
+
 const isTransientFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "ServerUnavailable" ||
   error._tag === "OperationTimeout" ||
@@ -291,7 +297,11 @@ const projectSlice = <A,>(
 
 export const layerFromSession = (
   options?: Pick<Options, "rpcTimeout" | "heartbeatInterval" | "rejoinPolicy">
-): Layer.Layer<EphemeralClient, ReplicaError.InvalidConfiguration, ProtocolSession.ProtocolSession> =>
+): Layer.Layer<
+  EphemeralClient,
+  ReplicaError.InvalidConfiguration,
+  ProtocolSession.ProtocolSession | Transport.Transport
+> =>
   Layer.effect(
     EphemeralClient,
     Effect.gen(function*() {
@@ -308,6 +318,7 @@ export const layerFromSession = (
         ({ input }) => isTransientFailure(input)
       )
       const session = yield* ProtocolSession.ProtocolSession
+      const transport = yield* Transport.Transport
       const client = session.client
       interface ActiveSession {
         readonly owner: object
@@ -564,7 +575,7 @@ export const layerFromSession = (
                   }
                 }))
               )
-            })).pipe(Stream.repeat(Schedule.forever))
+            }))
         ).pipe(
           Stream.withSpan("EphemeralClient.join", {
             attributes: {
@@ -604,13 +615,33 @@ export const layerFromSession = (
               Effect.asVoid
             )
           })
-          yield* joinWire(identity.request, () => memberValue).pipe(
-            Stream.tapError((error) => {
-              if (isTransientFailure(error)) return presentUnknown
-              return Effect.void
-            }),
-            Stream.retry(rejoinPolicy),
-            Stream.runForEach(consume),
+          const joinUntilTerminal = Effect.gen(function*() {
+            let step = yield* Schedule.toStepWithMetadata(rejoinPolicy)
+            while (true) {
+              let joined = false
+              const transportGeneration = yield* transport.generation
+              const attempt = yield* joinWire(identity.request, () => memberValue).pipe(
+                Stream.runForEach((message) => {
+                  joined = true
+                  return consume(message)
+                }),
+                Effect.result
+              )
+              if (joined) step = yield* Schedule.toStepWithMetadata(rejoinPolicy)
+              if (Result.isSuccess(attempt)) continue
+              const error = attempt.failure
+              if (isTransientFailure(error)) yield* presentUnknown
+              let backoff = step(error).pipe(
+                Effect.as(true),
+                Pull.catchDone(() => Effect.succeed(false))
+              )
+              if (isTransportFailure(error)) {
+                backoff = Effect.raceFirst(backoff, transport.waitForChange(transportGeneration).pipe(Effect.as(true)))
+              }
+              if (!(yield* backoff)) return yield* Effect.fail(error)
+            }
+          })
+          yield* joinUntilTerminal.pipe(
             Effect.catchCause((cause) =>
               Deferred.failCause(ready, cause).pipe(
                 Effect.andThen(Deferred.failCause(failure, cause))
@@ -855,7 +886,7 @@ export const layerFromSession = (
 export const layerWithOptions = (options?: Options): Layer.Layer<
   EphemeralClient,
   ReplicaError.InvalidConfiguration,
-  RpcClient.Protocol | RpcMiddleware.ForClient<Authentication.Authentication>
+  RpcClient.Protocol | RpcMiddleware.ForClient<Authentication.Authentication> | Transport.Transport
 > => layerFromSession(options).pipe(Layer.provide(ProtocolSession.layerWithOptions(options)))
 
 export const layer = layerFromSession().pipe(Layer.provide(ProtocolSession.layer))

@@ -19,6 +19,7 @@ import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as EphemeralClient from "../src/EphemeralClient.js"
 import * as ProtocolSession from "../src/ProtocolSession.js"
+import * as Transport from "../src/Transport.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const member = Protocol.EphemeralMember.make({
@@ -36,8 +37,13 @@ const layerFromFakeClient = (
     version: Effect.succeed(Protocol.currentProtocolVersion),
     rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
   })
+  const transport = Transport.Transport.of({
+    generation: Effect.succeed(0),
+    waitForChange: () => Effect.never
+  })
   return EphemeralClient.layerFromSession(options).pipe(
-    Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
+    Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session)),
+    Layer.provide(Layer.succeed(Transport.Transport, transport))
   )
 }
 

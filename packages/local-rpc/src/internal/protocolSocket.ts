@@ -3,8 +3,9 @@ import * as Effect from "effect/Effect"
 import { constVoid } from "effect/Function"
 import * as Latch from "effect/Latch"
 import * as Option from "effect/Option"
+import * as Pull from "effect/Pull"
 import * as Result from "effect/Result"
-import type * as Schedule from "effect/Schedule"
+import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as SubscriptionRef from "effect/SubscriptionRef"
@@ -134,8 +135,10 @@ const makeProtocol = (
       })
     })
 
+    let connected = false
     const readFrames = Effect.gen(function*() {
       const { pull } = yield* socket.reader
+      connected = true
       currentError = undefined
       yield* SubscriptionRef.update(connections, (generation) => generation + 1)
       if (Option.isSome(hooks)) yield* hooks.value.onConnect
@@ -145,7 +148,7 @@ const makeProtocol = (
       }
     })
 
-    yield* Effect.suspend(() => {
+    const connection = Effect.suspend(() => {
       parser = serialization.makeUnsafe()
       pinger.reset()
       return readFrames.pipe(
@@ -183,11 +186,25 @@ const makeProtocol = (
           cause
         })
         return failCurrentSocket(new RpcClientError.RpcClientError({ reason }))
-      }),
-      Effect.retryOrElse(
-        options?.retryPolicy ?? reconnectPolicy,
-        (error) => failCurrentSocket(new RpcClientError.RpcClientError({ reason: error.reason }))
-      ),
+      })
+    )
+    const retryPolicy = options?.retryPolicy ?? reconnectPolicy
+
+    yield* Effect.gen(function*() {
+      let step = yield* Schedule.toStepWithMetadata(retryPolicy)
+      while (true) {
+        connected = false
+        const error = yield* Effect.flip(connection)
+        if (connected) step = yield* Schedule.toStepWithMetadata(retryPolicy)
+        const retrying = yield* step(error).pipe(
+          Effect.as(true),
+          Pull.catchDone(() =>
+            failCurrentSocket(new RpcClientError.RpcClientError({ reason: error.reason })).pipe(Effect.as(false))
+          )
+        )
+        if (!retrying) return
+      }
+    }).pipe(
       Effect.annotateLogs({
         module: "RpcClient",
         method: "makeProtocolSocket"

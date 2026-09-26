@@ -25,6 +25,7 @@ import * as MutableRef from "effect/MutableRef"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Redacted from "effect/Redacted"
+import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
@@ -113,7 +114,7 @@ const makeRestartHarness = Effect.fnUntraced(function*() {
   const currentUrl = MutableRef.make("")
   const start = Effect.fnUntraced(function*(behavior: ServerBehavior = {}) {
     const serverScope = yield* Scope.make()
-    const context = yield* Layer.buildWithScope(layerServer(filename, behavior), serverScope)
+    const context = yield* Layer.buildWithScope(layerServer(filename, behavior), serverScope).pipe(TestClock.withLive)
     const address = Context.get(context, SocketServer.SocketServer).address
     if (address._tag === "UnixPathAddress") return yield* Effect.die("Expected a TCP test server")
     MutableRef.set(currentUrl, `ws://127.0.0.1:${address.port}/sync`)
@@ -121,12 +122,17 @@ const makeRestartHarness = Effect.fnUntraced(function*() {
   })
   const stop = (serverScope: Scope.Closeable) => Scope.close(serverScope, Exit.void)
   const resolveUrl = Effect.sync(() => MutableRef.get(currentUrl))
-  const layerClient = (connections: Queue.Queue<void>) => {
+  const layerClient = (
+    connections: Queue.Queue<void>,
+    rejoinPolicy?: Schedule.Schedule<unknown, ReplicaError.ReplicaError>
+  ) => {
     const hooks = RpcClient.ConnectionHooks.of({
       onConnect: Queue.offer(connections, undefined),
       onDisconnect: Effect.void
     })
-    return SyncClient.layerWebSocket({ url: resolveUrl }).pipe(
+    let options: SyncClient.WebSocketOptions = { url: resolveUrl }
+    if (rejoinPolicy !== undefined) options = { ...options, rejoinPolicy }
+    return SyncClient.layerWebSocket(options).pipe(
       Layer.provide(NodeSocket.layerWebSocketConstructor),
       Layer.provide(layerClientCredentials),
       Layer.provide(Layer.succeed(RpcClient.ConnectionHooks, hooks))
@@ -446,6 +452,56 @@ describe("server lifecycle", () => {
         Option.flatten(received),
         Option.some({ id: "from-background", title: "sent by A in the background" })
       )
+    })
+  )
+
+  it.effect(
+    "rejoins ephemeral presence as soon as the transport reconnects instead of waiting out the rejoin backoff",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeRestartHarness()
+      const first = yield* harness.start()
+      const connectionsA = yield* Queue.unbounded<void>()
+      const connectionsB = yield* Queue.unbounded<void>()
+      const slowRejoin = Schedule.spaced("20 seconds")
+      const ephemeralA = Context.get(
+        yield* Layer.build(harness.layerClient(connectionsA, slowRejoin)),
+        EphemeralClient.EphemeralClient
+      )
+      const ephemeralB = Context.get(
+        yield* Layer.build(harness.layerClient(connectionsB, slowRejoin)),
+        EphemeralClient.EphemeralClient
+      )
+      const sessionA = yield* ephemeralA.session(Presence, {
+        spaceId,
+        member: memberOf(clientA),
+        value: { name: "A" },
+        ttl: "1 minute"
+      })
+      yield* ephemeralB.session(Presence, { spaceId, member: memberOf(clientB), value: { name: "B" }, ttl: "1 minute" })
+      const observations = yield* Queue.unbounded<RosterObservation>()
+      yield* sessionA.members.pipe(
+        Stream.runForEach((entries) =>
+          Queue.offer(observations, {
+            _tag: "Roster",
+            clientIds: entries.map((entry) => entry.member.clientId).toSorted()
+          })
+        ),
+        Effect.exit,
+        Effect.flatMap((exit) => Queue.offer(observations, { _tag: "Ended", exit })),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* nextRoster(observations, [clientA, clientB])
+      yield* Queue.takeAll(connectionsA)
+      yield* Queue.takeAll(connectionsB)
+
+      yield* harness.stop(first)
+      yield* nextRoster(observations, [])
+
+      yield* harness.start()
+      yield* TestClock.adjust("250 millis")
+      yield* Queue.take(connectionsA)
+      yield* Queue.take(connectionsB)
+      yield* nextRoster(observations, [clientA, clientB])
     })
   )
 })

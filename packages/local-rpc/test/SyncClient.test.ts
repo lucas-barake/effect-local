@@ -1,8 +1,10 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
@@ -49,6 +51,58 @@ const failingReader = (
 })
 
 describe("SyncClient", () => {
+  it.effect(
+    "keeps every reconnect delay within the cap and restarts the backoff after a successful connection",
+    Effect.fnUntraced(function*() {
+      const attempts = yield* Queue.unbounded<number>()
+      const disconnects = yield* Queue.unbounded<number>()
+      const count = yield* Ref.make(0)
+      const connectingAttempt = 13
+      const openError = new Socket.SocketError({
+        reason: new Socket.SocketOpenError({ kind: "Unknown", cause: "server unreachable" })
+      })
+      const closeError = new Socket.SocketError({ reason: new Socket.SocketCloseError({ code: 1006 }) })
+      const socket = Socket.make({
+        reader: Effect.gen(function*() {
+          const attempt = yield* Ref.updateAndGet(count, (current) => current + 1)
+          yield* Queue.offer(attempts, yield* Clock.currentTimeMillis)
+          if (attempt !== connectingAttempt) return yield* Effect.fail(openError)
+          return { pull: Effect.fail(closeError), upgrade: () => Effect.void }
+        }),
+        writer: Effect.succeed(noopWriter)
+      })
+      const hooks = RpcClient.ConnectionHooks.of({
+        onConnect: Effect.void,
+        onDisconnect: Clock.currentTimeMillis.pipe(Effect.flatMap((now) => Queue.offer(disconnects, now)))
+      })
+      const layerLive = SyncClient.layerProtocolSocket().pipe(
+        Layer.provide(Layer.succeed(Socket.Socket, socket)),
+        Layer.provide(Layer.succeed(RpcClient.ConnectionHooks, hooks)),
+        Layer.provide(RpcSerialization.layerJson)
+      )
+      yield* Layer.build(layerLive)
+      const clock = yield* TestClock.adjust("100 millis").pipe(
+        Effect.forever,
+        Effect.forkChild({ startImmediately: true })
+      )
+
+      const delays: Array<number> = []
+      let failedAt = yield* Queue.take(disconnects)
+      yield* Queue.take(attempts)
+      for (let attempt = 2; attempt <= connectingAttempt + 1; attempt++) {
+        const attemptedAt = yield* Queue.take(attempts)
+        delays.push(attemptedAt - failedAt)
+        failedAt = yield* Queue.take(disconnects)
+      }
+      yield* Fiber.interrupt(clock)
+
+      const cap = 2_000
+      assert.isTrue(delays.every((delay) => delay <= cap), `delays ${delays.join(",")} exceed the ${cap} ms cap`)
+      assert.isAtLeast(delays[connectingAttempt - 2], cap / 2)
+      assert.isAtMost(delays[connectingAttempt - 1], 250)
+    })
+  )
+
   it.effect(
     "uses the configured socket retry policy",
     Effect.fnUntraced(function*() {
