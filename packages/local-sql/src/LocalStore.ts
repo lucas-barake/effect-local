@@ -1384,6 +1384,7 @@ export const layer = (
       const flushDeferredInvalidations = prepareDeferredInvalidations.pipe(
         Effect.flatMap(notifyDeferredInvalidations)
       )
+      yield* Effect.addFinalizer(() => flushDeferredInvalidations)
 
       const nextProjectionGeneration = (current: number) => {
         if (current >= Number.MAX_SAFE_INTEGER) {
