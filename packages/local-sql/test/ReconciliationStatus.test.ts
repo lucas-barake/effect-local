@@ -10,6 +10,7 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as LocalStore from "../src/LocalStore.js"
@@ -155,5 +156,67 @@ describe("reconciliation status", () => {
       assert.strictEqual(view[0]?.installed, 1)
       assert.strictEqual((yield* Ref.get(reports)).at(-1), true)
     })
+  )
+
+  it.effect(
+    "records one durable reconciliation request for a burst of wakes that arrive during one turn",
+    Effect.fnUntraced(function*() {
+      const clientDatabase = yield* Layer.build(database())
+      const local = Context.get(
+        yield* Layer.build(
+          LocalStore.layer(localOptions).pipe(
+            Layer.provide(layerRuntime),
+            Layer.provide(Layer.succeedContext(clientDatabase))
+          )
+        ),
+        LocalStore.Store
+      )
+      const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
+      const pullEntered = yield* Deferred.make<void>()
+      const pullRelease = yield* Deferred.make<void>()
+      const wakesDrained = yield* Deferred.make<void>()
+      const emitWakes = yield* Deferred.make<void>()
+      const wakes = 20
+      const remote = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
+        submitBatch: (request) => server.admitBatch(request, null),
+        discard: (request) => server.discard(request, null),
+        pull: (request) =>
+          Deferred.succeed(pullEntered, undefined).pipe(
+            Effect.andThen(Deferred.await(pullRelease)),
+            Effect.andThen(server.pull(request))
+          ),
+        bootstrap: server.bootstrap,
+        watch: (request) =>
+          Stream.fromEffect(Deferred.await(emitWakes)).pipe(
+            Stream.flatMap(() =>
+              Stream.fromIterable(Array.from({ length: wakes }, () => ({ spaceId: request.spaceId })))
+            ),
+            Stream.concat(Stream.fromEffect(Deferred.succeed(wakesDrained, undefined)).pipe(Stream.drain)),
+            Stream.concat(Stream.never)
+          )
+      })
+      const reconciliation = Context.get(
+        yield* Layer.build(
+          Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+            Layer.provide(Layer.succeed(LocalStore.Store, local)),
+            Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
+          )
+        ),
+        Reconciler.Reconciliation
+      )
+      const manager = yield* Reconciler.makeManager().pipe(Effect.provideService(SyncEngine.SyncEngine, remote))
+      yield* manager.register({ spaceId, generation: 1, definition: Domain.definition, local, reconciliation })
+      yield* Deferred.await(pullEntered)
+      const observed = yield* local.reconciliationGenerations
+
+      yield* Deferred.succeed(emitWakes, undefined)
+      yield* Deferred.await(wakesDrained)
+
+      assert.strictEqual((yield* local.reconciliationGenerations).requested, observed.requested + 1)
+      yield* Deferred.succeed(pullRelease, undefined)
+    }, Effect.scoped)
   )
 })

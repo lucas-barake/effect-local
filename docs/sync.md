@@ -18,7 +18,8 @@ authorized entities through incremental pull. Narrowing emits `Retract` changes 
 without a full bootstrap.
 
 The reconciler does not trust notification delivery or ordering. A notification only requests another durable
-generation for its space. Every sync pass reads that space's SQLite cursor, catches up, submits pending mutations in
+generation for its space. Notifications that arrive before a turn reads the generations share the request already
+written, so a burst of wakes costs one write per turn. Every sync pass reads that space's SQLite cursor, catches up, submits pending mutations in
 local order, and catches up again. Pending mutations leave in batches of at most `Protocol.maximumSubmitBatchEntries`
 envelopes whose encoded size stays within `Protocol.maximumBatchBytes`, so N pending mutations cost
 `ceil(N / maximumSubmitBatchEntries)` round trips when nothing fails. The client marks a batch as submitting in one
@@ -106,7 +107,9 @@ Receipt reclamation advances a per client expired local sequence watermark. A re
 `Expired`, bound to a covering published snapshot, and never reexecutes. The pending client mutation remains visible
 until that snapshot installs. If the durable cursor already covers the snapshot sequence, the accepted state is
 already canonical and the receipt can settle without replacing state. This preserves at most once execution after the
-full private result was reclaimed.
+full private result was reclaimed. An `Expired` receipt depends on the snapshot current when it was issued, so a later retry of the same mutation can
+return a different one. The client keeps the receipt it already stored when the new `Expired` receipt has the same
+identity and its snapshot covers the stored outcome. Any other difference is a conflicting duplicate.
 
 ## WebSocket RPC
 

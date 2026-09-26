@@ -84,6 +84,7 @@ export class Manager extends Context.Service<Manager, ManagerService>()(
 ) {}
 
 interface ManagedState extends ManagedSpace {
+  readonly requests: ReturnType<typeof makeReconciliationRequests>
   readonly retryDelayMillis: number
   readonly maximumRetryDelayMillis: number
   queued: boolean
@@ -102,6 +103,32 @@ interface Work {
 }
 
 const managedKey = (spaceId: Identity.SpaceId, generation: number) => `${spaceId}:${generation}`
+
+const makeReconciliationRequests = (request: Effect.Effect<number, ReplicaError.ReplicaError>) => {
+  let pending: Deferred.Deferred<boolean> | undefined
+  const run: Effect.Effect<void, ReplicaError.ReplicaError> = Effect.suspend(() => {
+    const shared = pending
+    if (shared !== undefined) {
+      return Deferred.await(shared).pipe(Effect.flatMap((written) => {
+        if (written) return Effect.void
+        return run
+      }))
+    }
+    const own = Deferred.makeUnsafe<boolean>()
+    pending = own
+    return request.pipe(
+      Effect.onExit((exit) => {
+        if (exit._tag === "Failure" && pending === own) pending = undefined
+        return Deferred.succeed(own, exit._tag === "Success")
+      }),
+      Effect.asVoid
+    )
+  })
+  const observe = Effect.sync(() => {
+    pending = undefined
+  })
+  return { run, observe }
+}
 
 const isTransientFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "AuthenticatorUnavailable" ||
@@ -159,7 +186,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       if (current !== space) {
         return yield* new ReplicaError.SpaceNotJoined({ spaceId: space.spaceId })
       }
-      yield* restore(current.local.requestReconciliation)
+      yield* restore(current.requests.run)
       return yield* admit(space)
     }))
 
@@ -337,6 +364,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
   const runTurn = Effect.fnUntraced(function*(space: ManagedState, epoch: number) {
     const transportGeneration = yield* remote.transportGeneration
     const turn = Effect.gen(function*() {
+      yield* space.requests.observe
       const generations = yield* space.local.reconciliationGenerations
       if (generations.completed >= generations.requested) return
       yield* space.reconciliation.sync
@@ -392,6 +420,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       const state: ManagedState = {
         ...space,
         ...retryTiming,
+        requests: makeReconciliationRequests(space.local.requestReconciliation),
         queued: false,
         running: false,
         retryAttempt: 0,
@@ -785,7 +814,8 @@ export const layerInMemoryScheduler = (
       const remote = yield* SyncEngine.SyncEngine
       const wake = yield* Queue.sliding<void>(1)
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
-      const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
+      const requests = makeReconciliationRequests(local.requestReconciliation)
+      const requestAndNotify = requests.run.pipe(Effect.andThen(notify))
       const authenticationPause = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(Option.none())
       let authenticationEpoch = 0
       const awaitAuthenticationChange = Ref.get(authenticationPause).pipe(
@@ -837,7 +867,8 @@ export const layerInMemoryScheduler = (
           return backoff(remote, delay, error, transportGeneration).pipe(Effect.andThen(notify))
         })
       const turn = (transportGeneration: number) =>
-        local.reconciliationGenerations.pipe(
+        requests.observe.pipe(
+          Effect.andThen(local.reconciliationGenerations),
           Effect.flatMap((generations) => {
             if (generations.completed >= generations.requested) return Effect.void
             return reconciliation.sync.pipe(
