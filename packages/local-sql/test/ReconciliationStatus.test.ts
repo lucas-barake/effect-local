@@ -4,9 +4,14 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Queue from "effect/Queue"
+import * as Ref from "effect/Ref"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as LocalStore from "../src/LocalStore.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
@@ -14,6 +19,7 @@ import * as Reconciler from "../src/Reconciler.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
+import { gateStatements } from "./fixtures/SqlGate.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
@@ -70,7 +76,7 @@ const layerDirectSync = Layer.effect(
 ).pipe(Layer.provide(layerServer))
 
 const layerClientDatabase = database()
-const layerLocal = LocalStore.layer({
+const localOptions = {
   definition: Domain.definition,
   spaceId,
   clientId,
@@ -82,7 +88,8 @@ const layerLocal = LocalStore.layer({
   maximumBootstrapBytes: 64 * 1024 * 1024,
   maximumBootstrapPageBytes: 4 * 1024 * 1024,
   migration
-}).pipe(
+} satisfies LocalStore.Options
+const layerLocal = LocalStore.layer(localOptions).pipe(
   Layer.provide(layerRuntime),
   Layer.provide(layerClientDatabase)
 )
@@ -103,6 +110,50 @@ describe("reconciliation status", () => {
 
       yield* reconciliation.sync
       assert.strictEqual((yield* reconciliation.status)._tag, "Online")
+    })
+  )
+
+  it.effect(
+    "reports an installed view even when the pass is interrupted while installing it",
+    Effect.fnUntraced(function*() {
+      const clientDatabase = yield* Layer.build(database())
+      const sql = Context.get(clientDatabase, SqlClient.SqlClient)
+      const gate = yield* gateStatements(sql, (statement) => {
+        if (statement.includes("replication_view_id = ?") && statement.includes("installed_snapshot_id = ?")) {
+          return ["after"]
+        }
+        return []
+      })
+      const reports = yield* Ref.make<ReadonlyArray<boolean>>([])
+      const gatedDatabase = Context.add(clientDatabase, SqlClient.SqlClient, gate.sql)
+      const layerGatedLocal = LocalStore.layer({
+        ...localOptions,
+        onReplicationView: (installed) => Ref.update(reports, (previous) => [...previous, installed])
+      }).pipe(
+        Layer.provide(layerRuntime),
+        Layer.provide(Layer.succeedContext(gatedDatabase))
+      )
+      const reconciliation = Context.get(
+        yield* Layer.build(
+          Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+            Layer.provide(layerGatedLocal),
+            Layer.provide(layerDirectSync)
+          )
+        ),
+        Reconciler.Reconciliation
+      )
+      const pass = yield* reconciliation.sync.pipe(Effect.forkChild({ startImmediately: true }))
+      const installing = yield* Queue.take(gate.pauses)
+      const interrupting = yield* Fiber.interrupt(pass).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.succeed(installing.release, undefined)
+      yield* Fiber.join(interrupting)
+
+      const view = yield* sql<
+        { readonly installed: number }
+      >`SELECT COUNT(*) AS installed FROM effect_local_client_spaces
+        WHERE space_id = ${spaceId} AND replication_view_id IS NOT NULL`
+      assert.strictEqual(view[0]?.installed, 1)
+      assert.strictEqual((yield* Ref.get(reports)).at(-1), true)
     })
   )
 })

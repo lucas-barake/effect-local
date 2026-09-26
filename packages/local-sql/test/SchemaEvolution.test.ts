@@ -14,6 +14,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
@@ -22,6 +23,7 @@ import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -517,6 +519,50 @@ const v1Envelope = Effect.fnUntraced(function*(
 })
 
 describe("client schema evolution", () => {
+  it.effect(
+    "reports a space unsynced once the schema flip clears its view even when activation is interrupted afterwards",
+    Effect.fnUntraced(
+      function*() {
+        const sql = yield* SqlClient.SqlClient
+        const reactivity = yield* Reactivity.Reactivity
+        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1)
+        const v1Scope = yield* Scope.make()
+        const v1 = yield* buildReplica(definitionV1, layerHandlersV1, serverSync(serverV1)).pipe(
+          Scope.provide(v1Scope)
+        )
+        yield* v1.activate
+        yield* v1.mutate(PutTodoV1, { id: "1", title: "synced" })
+        yield* reactivity.stream([ReactivityKey.status(spaceId)], v1.status).pipe(
+          Stream.filter((status) => status._tag === "Online" && status.synced && status.pending === 0),
+          Stream.runHead
+        )
+        yield* Scope.close(v1Scope, Exit.void)
+
+        const gate = yield* gateStatements(sql, (statement) => {
+          if (statement.includes("DELETE FROM effect_local_client_canonical_entities_data WHERE rowid IN")) {
+            return ["before"]
+          }
+          return []
+        })
+        const v2 = yield* buildReplica(definitionV2, layerHandlersV2, unavailableSync, evolution).pipe(
+          Effect.provideService(SqlClient.SqlClient, gate.sql)
+        )
+        assert.strictEqual((yield* v2.status).synced, true)
+        const activating = yield* v2.activate.pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Queue.take(gate.pauses)
+        yield* Fiber.interrupt(activating)
+
+        const view = yield* sql<{ readonly cleared: number }>`SELECT COUNT(*) AS cleared FROM effect_local_client_spaces
+          WHERE space_id = ${spaceId} AND replication_view_id IS NULL`
+        assert.strictEqual(view[0]?.cleared, 1)
+        assert.strictEqual(yield* v2.activation, "Inactive")
+        assert.strictEqual((yield* v2.status).synced, false)
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
   it.effect(
     "rejects same-name mutation descriptors that are not registered in the definition",
     Effect.fnUntraced(

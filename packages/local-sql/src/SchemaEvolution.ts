@@ -537,6 +537,7 @@ export interface ClientOptions {
   readonly batchSize?: number | undefined
   readonly batchBytes?: number | undefined
   readonly afterBatch?: Effect.Effect<void> | undefined
+  readonly onReplicationViewCleared?: Effect.Effect<void> | undefined
 }
 
 export const client = Effect.fn("SchemaEvolution.client")(function*(options: ClientOptions) {
@@ -1327,7 +1328,10 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
               AND active_schema_generation = ${state.source_generation}`
         yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupCanonical'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
-      }))
+      })).pipe(
+        Effect.andThen(options.onReplicationViewCleared ?? Effect.void),
+        Effect.uninterruptible
+      )
     } else if (state.phase === "CleanupCanonical") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)

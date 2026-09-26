@@ -279,6 +279,9 @@ export const layer = (
       if (options.schemaEvolutionBatchBytes !== undefined) {
         evolutionOptions = { ...evolutionOptions, batchBytes: options.schemaEvolutionBatchBytes }
       }
+      if (options.onReplicationView !== undefined) {
+        evolutionOptions = { ...evolutionOptions, onReplicationViewCleared: options.onReplicationView(false) }
+      }
       yield* SchemaEvolution.client(evolutionOptions)
       const projectionGate = yield* Semaphore.make(1)
       const registerLineage = ClientLineage.make(sql, options.spaceId)
@@ -1045,6 +1048,8 @@ export const layer = (
           Effect.tap((deletedSettlements) => updatePendingMetric(-deletedSettlements.length))
         )
       }
+
+      const reportReplicationView = (installed: boolean) => options.onReplicationView?.(installed) ?? Effect.void
 
       const publishSettlements = (settlements: ReadonlyArray<Replica.MutationSettlement>) => {
         if (settlements.length === 0) return Effect.void
@@ -2892,6 +2897,7 @@ export const layer = (
           }),
           sql.withTransaction
         ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        yield* reportReplicationView(true)
         yield* recordBootstrapInstallMetric
         const entities = Array.from(dirty.values())
         yield* rebuildProjection
@@ -2902,11 +2908,9 @@ export const layer = (
         return deletedSettlements
       }, Effect.uninterruptible)
 
-      const reportReplicationView = (installed: boolean) => options.onReplicationView?.(installed) ?? Effect.void
-
       const installBootstrap = (manifest: Protocol.SnapshotManifest) =>
         withProjectionGateThen(installBootstrapInGate(manifest), publishSettlements).pipe(
-          Effect.andThen(reportReplicationView(true)),
+          Effect.asVoid,
           Effect.withSpan("LocalStore.installBootstrap", {
             attributes: { "snapshot.id": manifest.snapshotId, "server.sequence": manifest.sequence }
           })
@@ -3023,12 +3027,12 @@ export const layer = (
             WHERE space_id = ${options.spaceId}`
           yield* requestProjectionReplay(yield* meta)
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        yield* reportReplicationView(false)
         yield* rebuildProjection
         const entities = Array.from(dirty.values())
         yield* invalidate(entities)
       }).pipe(
         Semaphore.withPermit(projectionGate),
-        Effect.andThen(reportReplicationView(false)),
         Effect.uninterruptible,
         Effect.withSpan("LocalStore.revokeReplication")
       )
