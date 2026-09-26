@@ -1,7 +1,6 @@
 import { NodeCrypto, NodeHttpServer, NodeSocket } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
-import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
@@ -50,10 +49,8 @@ class TestAuthorizationError extends Schema.TaggedError<TestAuthorizationError, 
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "../src/Authentication.js"
 import * as EphemeralClient from "../src/EphemeralClient.js"
-import * as EphemeralHub from "../src/EphemeralHub.js"
-import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as ProtocolSession from "../src/ProtocolSession.js"
-import * as SpaceEntity from "../src/SpaceEntity.js"
+import type * as SpaceEntity from "../src/SpaceEntity.js"
 import * as SyncClient from "../src/SyncClient.js"
 import * as SyncRpc from "../src/SyncRpc.js"
 import * as SyncServer from "../src/SyncServer.js"
@@ -129,7 +126,6 @@ const layerHandlers = Layer.mergeAll(
   ReturnHugeResult.toLayer(() => Effect.succeed("x".repeat(SyncRpc.maximumFrameBytes))),
   AssignRoleV2.toLayer(({ payload }) => Effect.succeed(payload.role))
 )
-const layerRuntime = MutationRuntime.layer(definition, evolution).pipe(Layer.provide(layerHandlers))
 const readAuthorized = MutableRef.make(true)
 const layerDatabase = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
@@ -179,11 +175,11 @@ const clientHistory = {
   migration
 }
 
-const layerStore = ServerStore.layer({
-  ...serverHistory,
+const serverOptions: SyncServer.LayerOptions<typeof definition> = {
   definition,
-  evolution,
-  acceptedSchemaVersions: 0,
+  store: { ...serverHistory, evolution, acceptedSchemaVersions: 0 },
+  spaces: entityOptions,
+  authorizeEphemeral: () => Effect.void,
   authorizeAccess: ({ principal, spaceId: requestedSpaceId }) => {
     if (
       principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
@@ -211,7 +207,7 @@ const layerStore = ServerStore.layer({
     }
     return Effect.fail(new TestAuthorizationError({ reason: "forbidden" }))
   }
-}).pipe(Layer.provide(layerRuntime), Layer.provide(layerDatabase))
+}
 
 const layerAuthenticator = Layer.succeed(
   Authentication.Authenticator,
@@ -229,25 +225,23 @@ const revokedBearer = Redacted.make("revoked")
 const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(
   Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
 )
-const layerCluster = SpaceEntity.layer(entityOptions).pipe(
-  Layer.provide(PrincipalAssertion.layerJson),
-  Layer.provide(layerStore),
-  Layer.provide(
-    EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
-  ),
-  Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
-)
-
 const layerWebsocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(
   Layer.provide(HttpRouter.layer)
 )
-const layerWebsocketServer = SyncServer.layer.pipe(
-  Layer.provideMerge(layerWebsocketProtocol),
-  Layer.provide(layerCluster),
-  Layer.provide(layerAuthenticationServer),
-  Layer.provide(PrincipalAssertion.layerJson),
-  Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
-)
+const layerSyncServer = <R,>(
+  options: SyncServer.LayerOptions<typeof definition>,
+  layerAuthentication: Layer.Layer<Authentication.Authentication, never, R>,
+  layerMutationHandlers: typeof layerHandlers
+) =>
+  SyncServer.layer(options).pipe(
+    Layer.provideMerge(layerWebsocketProtocol),
+    Layer.provide(layerAuthentication),
+    Layer.provide(SingleRunner.layer({ runnerStorage: "memory" })),
+    Layer.provide(layerMutationHandlers),
+    Layer.provide(layerDatabase),
+    Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
+  )
+const layerWebsocketServer = layerSyncServer(serverOptions, layerAuthenticationServer, layerHandlers)
 const webSocketConstructions = MutableRef.make(0)
 const liveWebSockets = MutableRef.make(0)
 const countedWebSocketConstructor = Effect.gen(function*() {
@@ -305,12 +299,10 @@ const layerSingleClientLive = layerClient.pipe(
   Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
 )
 
-const layerIncompatibleServer = SyncServer.layerWithOptions({ supportedProtocolVersions: [2] }).pipe(
-  Layer.provideMerge(layerWebsocketProtocol),
-  Layer.provide(layerCluster),
-  Layer.provide(layerAuthenticationServer),
-  Layer.provide(PrincipalAssertion.layerJson),
-  Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
+const layerIncompatibleServer = layerSyncServer(
+  { ...serverOptions, supportedProtocolVersions: [2] },
+  layerAuthenticationServer,
+  layerHandlers
 )
 const layerIncompatibleClient = SyncClient.layerWithOptions({ supportedProtocolVersions: [1] }).pipe(
   Layer.provide(layerClientProtocol),
@@ -367,12 +359,10 @@ const layerObservingAuthenticationServer = Layer.effect(
 ).pipe(
   Layer.provide(layerAuthenticationServer)
 )
-const layerProtocol2Server = SyncServer.layerWithOptions({ supportedProtocolVersions: [1, 2] }).pipe(
-  Layer.provideMerge(layerWebsocketProtocol),
-  Layer.provide(layerCluster),
-  Layer.provide(layerObservingAuthenticationServer),
-  Layer.provide(PrincipalAssertion.layerJson),
-  Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
+const layerProtocol2Server = layerSyncServer(
+  { ...serverOptions, supportedProtocolVersions: [1, 2] },
+  layerObservingAuthenticationServer,
+  layerHandlers
 )
 const layerConfigurableProtocolSession = ProtocolSession.layerWithOptions({ supportedProtocolVersions: [1, 2] })
 const layerConfigurableClient = Layer.merge(SyncClient.layerFromSession(), EphemeralClient.layerFromSession()).pipe(
@@ -384,7 +374,7 @@ const layerConfigurableLive = layerConfigurableClient.pipe(
   Layer.provideMerge(layerProtocol2Server),
   Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
 )
-const layerBootstrapDependencies = Layer.mergeAll(layerLive, layerStore, layerDatabase)
+const layerBootstrapDependencies = Layer.merge(layerLive, layerDatabase)
 const layerRetryDependencies = Layer.merge(layerLive, layerDatabase)
 const provideBootstrapDependencies = Effect.provide(layerBootstrapDependencies)
 const provideConfigurableLive = Effect.provide(layerConfigurableLive)
@@ -486,48 +476,30 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     ReturnHugeResult.toLayer(() => Effect.succeed("x".repeat(SyncRpc.maximumFrameBytes))),
     AssignRoleV2.toLayer(({ payload }) => Effect.succeed(payload.role))
   )
-  const layerLifecycleRuntime = MutationRuntime.layer(definition, evolution).pipe(Layer.provide(layerLifecycleHandlers))
-  const layerLifecycleStore = ServerStore.layer({
-    ...serverHistory,
-    definition,
-    evolution,
-    acceptedSchemaVersions: 0,
-    authorizeAccess: ({ principal, spaceId: requestedSpaceId }) => {
-      if (
-        principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
-        "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
-      ) return Effect.void
-      return Effect.fail(new TestAuthorizationError({ reason: "forbidden" }))
+  const layerLifecycleServer = layerSyncServer(
+    {
+      definition,
+      store: { ...serverHistory, evolution, acceptedSchemaVersions: 0 },
+      spaces: entityOptions,
+      authorizeEphemeral: () => Effect.void,
+      authorizeAccess: ({ principal, spaceId: requestedSpaceId }) => {
+        if (
+          principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
+          "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
+        ) return Effect.void
+        return Effect.fail(new TestAuthorizationError({ reason: "forbidden" }))
+      },
+      authorizeMutation: () => Effect.void,
+      authorizeRead: () => {
+        if (!MutableRef.get(blockPull)) return Effect.void
+        return Deferred.succeed(pullEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(pullRelease)),
+          Effect.ensuring(Deferred.succeed(pullInterrupted, undefined))
+        )
+      }
     },
-    authorizeMutation: () => Effect.void,
-    authorizeRead: () => {
-      if (!MutableRef.get(blockPull)) return Effect.void
-      return Deferred.succeed(pullEntered, undefined).pipe(
-        Effect.andThen(Deferred.await(pullRelease)),
-        Effect.ensuring(Deferred.succeed(pullInterrupted, undefined))
-      )
-    }
-  }).pipe(Layer.provide(layerLifecycleRuntime), Layer.provide(layerDatabase))
-  const layerLifecycleCluster = SpaceEntity.layer(entityOptions).pipe(
-    Layer.provide(PrincipalAssertion.layerJson),
-    Layer.provide(layerLifecycleStore),
-    Layer.provide(
-      EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
-    ),
-    Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
-  )
-  const layerLifecycleWebSocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(
-    Layer.provide(HttpRouter.layer)
-  )
-  const layerLifecycleServer = SyncServer.layer.pipe(
-    Layer.provideMerge(layerLifecycleWebSocketProtocol),
-    Layer.provide(layerLifecycleCluster),
-    Layer.provide(layerObservedAuthenticationServer),
-    Layer.provide(PrincipalAssertion.layerJson),
-    Layer.provide(HttpRouter.serve(layerLifecycleWebSocketProtocol, {
-      disableListenLog: true,
-      disableLogger: true
-    }))
+    layerObservedAuthenticationServer,
+    layerLifecycleHandlers
   )
   const lifecycleWebSocketConstructor = Effect.gen(function*() {
     const makeWebSocket = yield* Socket.WebSocketConstructor

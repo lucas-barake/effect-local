@@ -71,7 +71,7 @@ export class EphemeralHub extends Context.Service<EphemeralHub, Service>()(
 export interface Options {
   readonly capacity?: number
   readonly maximumSpaces?: number
-  readonly maximumWatchersPerSpace: number
+  readonly maximumWatchersPerSpace?: number
   readonly maximumMembersPerSpace?: number
   readonly maximumEventKeysPerMember?: number
   readonly maximumEventKeysPerSpace?: number
@@ -180,7 +180,7 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
   const counts = {
     capacity: options.capacity ?? 1_024,
     maximumSpaces: options.maximumSpaces ?? 1_024,
-    maximumWatchersPerSpace: options.maximumWatchersPerSpace,
+    maximumWatchersPerSpace: options.maximumWatchersPerSpace ?? 1_024,
     maximumMembersPerSpace: options.maximumMembersPerSpace ?? 1_024,
     maximumEventKeysPerMember: options.maximumEventKeysPerMember ?? 64,
     maximumEventKeysPerSpace: options.maximumEventKeysPerSpace ?? 4_096,
