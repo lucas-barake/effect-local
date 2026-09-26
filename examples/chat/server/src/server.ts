@@ -206,6 +206,8 @@ export const makeServerLayer = (options: ChatServerOptions) => {
   const layerDatabase = makeLayerDatabase(options.databaseFile)
   const layerStore = makeLayerStore(layerDatabase)
 
+  const layerSharding = SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase))
+
   const layerCluster = SpaceEntity.layer({
     maximumConcurrentBootstrapAuthorizations: 16,
     maximumConcurrentBootstrapPagesPerSpace: 4,
@@ -216,11 +218,12 @@ export const makeServerLayer = (options: ChatServerOptions) => {
     Layer.provide(PrincipalAssertion.layerJson),
     Layer.provide(layerStore),
     Layer.provide(layerEphemeralHub),
-    Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
+    Layer.provideMerge(layerSharding)
   )
 
-  const layerMaintenance = ServerStore.layerMaintenance({ interval: "1 hour", runOnStart: true }).pipe(
-    Layer.provide(layerStore)
+  const layerMaintenance = ServerStore.layerMaintenance().pipe(
+    Layer.provide(layerStore),
+    Layer.provide(layerCluster)
   )
 
   // The login route and the RPC websocket upgrade share ONE router instance:

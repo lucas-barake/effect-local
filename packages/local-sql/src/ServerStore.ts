@@ -23,6 +23,8 @@ import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
+import type * as Sharding from "effect/unstable/cluster/Sharding"
+import * as Singleton from "effect/unstable/cluster/Singleton"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as AcceptedLog from "./internal/acceptedLog.js"
@@ -45,18 +47,18 @@ import type * as OfflineWake from "./OfflineWake.js"
 import * as SchemaEvolution from "./SchemaEvolution.js"
 
 export interface HistoryOptions {
-  readonly migration: Migrations.Options
-  readonly retainedHistoryEntries: number
-  readonly maximumHistoryEntries: number
-  readonly retainedReceipts: number
-  readonly maximumReceipts: number
-  readonly maximumSnapshotEntities: number
-  readonly maximumSnapshotBytes: number
-  readonly maximumBootstrapPageBytes: number
-  readonly pruneBatchSize: number
-  readonly retainedSnapshots: number
-  readonly maintenanceConcurrency: number
-  readonly maintenanceSpaceBatchSize: number
+  readonly migration?: Migrations.Options | undefined
+  readonly retainedHistoryEntries?: number | undefined
+  readonly maximumHistoryEntries?: number | undefined
+  readonly retainedReceipts?: number | undefined
+  readonly maximumReceipts?: number | undefined
+  readonly maximumSnapshotEntities?: number | undefined
+  readonly maximumSnapshotBytes?: number | undefined
+  readonly maximumBootstrapPageBytes?: number | undefined
+  readonly pruneBatchSize?: number | undefined
+  readonly retainedSnapshots?: number | undefined
+  readonly maintenanceConcurrency?: number | undefined
+  readonly maintenanceSpaceBatchSize?: number | undefined
 }
 
 export interface Service {
@@ -128,12 +130,12 @@ export interface Options<R = never,> extends HistoryOptions {
     readonly principal: typeof Schema.Json.Type
   }) => Effect.Effect<void, AuthorizationRejection, R>
   readonly authorizeRead: (input: ReadAuthorizationInput) => Effect.Effect<void, AuthorizationRejection, R>
-  readonly readAuthorizationRefreshInterval: Duration.Input
+  readonly readAuthorizationRefreshInterval?: Duration.Input | undefined
   readonly wakeCapacity?: number
-  readonly maximumWatchersPerSpace: number
-  readonly maximumConcurrentReadAuthorizations: number
-  readonly maximumPendingReadAuthorizations: number
-  readonly readAuthorizationCacheCapacity: number
+  readonly maximumWatchersPerSpace?: number | undefined
+  readonly maximumConcurrentReadAuthorizations?: number | undefined
+  readonly maximumPendingReadAuthorizations?: number | undefined
+  readonly readAuthorizationCacheCapacity?: number | undefined
   readonly offlineWake?: OfflineWake.Options<R>
 }
 
@@ -164,6 +166,56 @@ interface GlobalSnapshotManifest {
   readonly digest: Protocol.SnapshotDigest
 }
 
+export const defaults = {
+  migration: { retryDelay: "100 millis", maximumAttempts: 8 },
+  retainedHistoryEntries: 256,
+  maximumHistoryEntries: 10_000,
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  maximumSnapshotEntities: 100_000,
+  maximumSnapshotBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: Protocol.maximumBatchBytes,
+  pruneBatchSize: 1_000,
+  retainedSnapshots: 2,
+  maintenanceConcurrency: 1,
+  maintenanceSpaceBatchSize: 128,
+  readAuthorizationRefreshInterval: "30 seconds",
+  maximumWatchersPerSpace: 1_024,
+  maximumConcurrentReadAuthorizations: 64,
+  maximumPendingReadAuthorizations: 4_096,
+  readAuthorizationCacheCapacity: 4_096
+} as const satisfies Partial<Options>
+
+type Defaulted = keyof typeof defaults
+
+type ResolvedOptions<R,> =
+  & Omit<Options<R>, Defaulted>
+  & { readonly [K in Defaulted]-?: Exclude<Options<R>[K], undefined> }
+
+const resolveOptions = <R,>(input: Options<R>): ResolvedOptions<R> => ({
+  ...input,
+  migration: input.migration ?? defaults.migration,
+  retainedHistoryEntries: input.retainedHistoryEntries ?? defaults.retainedHistoryEntries,
+  maximumHistoryEntries: input.maximumHistoryEntries ?? defaults.maximumHistoryEntries,
+  retainedReceipts: input.retainedReceipts ?? defaults.retainedReceipts,
+  maximumReceipts: input.maximumReceipts ?? defaults.maximumReceipts,
+  maximumSnapshotEntities: input.maximumSnapshotEntities ?? defaults.maximumSnapshotEntities,
+  maximumSnapshotBytes: input.maximumSnapshotBytes ?? defaults.maximumSnapshotBytes,
+  maximumBootstrapPageBytes: input.maximumBootstrapPageBytes ?? defaults.maximumBootstrapPageBytes,
+  pruneBatchSize: input.pruneBatchSize ?? defaults.pruneBatchSize,
+  retainedSnapshots: input.retainedSnapshots ?? defaults.retainedSnapshots,
+  maintenanceConcurrency: input.maintenanceConcurrency ?? defaults.maintenanceConcurrency,
+  maintenanceSpaceBatchSize: input.maintenanceSpaceBatchSize ?? defaults.maintenanceSpaceBatchSize,
+  readAuthorizationRefreshInterval: input.readAuthorizationRefreshInterval ?? defaults.readAuthorizationRefreshInterval,
+  maximumWatchersPerSpace: input.maximumWatchersPerSpace ?? defaults.maximumWatchersPerSpace,
+  maximumConcurrentReadAuthorizations: input.maximumConcurrentReadAuthorizations ??
+    defaults.maximumConcurrentReadAuthorizations,
+  maximumPendingReadAuthorizations: input.maximumPendingReadAuthorizations ?? defaults.maximumPendingReadAuthorizations,
+  readAuthorizationCacheCapacity: input.readAuthorizationCacheCapacity ?? defaults.readAuthorizationCacheCapacity
+})
+
+const highWater = (retained: number, maximum: number) => retained + Math.ceil((maximum - retained) / 2)
+
 type NumericHistoryOption = Exclude<keyof HistoryOptions, "migration">
 
 const nonNegativeOptions: ReadonlyArray<NumericHistoryOption> = ["retainedHistoryEntries", "retainedReceipts"]
@@ -179,7 +231,7 @@ const positiveOptions: ReadonlyArray<NumericHistoryOption> = [
   "maintenanceSpaceBatchSize"
 ]
 
-const validateOptions = Effect.fnUntraced(function*(options: HistoryOptions) {
+const validateOptions = Effect.fnUntraced(function*(options: ResolvedOptions<unknown>) {
   for (const option of nonNegativeOptions) {
     if (!Number.isSafeInteger(options[option]) || options[option] < 0) {
       return yield* new ReplicaError.InvalidConfiguration({
@@ -217,7 +269,7 @@ const validateOptions = Effect.fnUntraced(function*(options: HistoryOptions) {
   return yield* Effect.void
 })
 
-export const layer = <R = never,>(options: Options<R>): Layer.Layer<
+export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
   ServerStore,
   ReplicaError.ReplicaError,
   SqlClient.SqlClient | Crypto.Crypto | MutationRuntime.MutationRuntime | R
@@ -225,7 +277,13 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
   Layer.effect(
     ServerStore,
     Effect.gen(function*() {
+      const options = resolveOptions(configured)
       yield* validateOptions(options)
+      const storeScope = yield* Effect.scope
+      const historyHighWater = highWater(options.retainedHistoryEntries, options.maximumHistoryEntries)
+      const receiptHighWater = highWater(options.retainedReceipts, options.maximumReceipts)
+      const crossesHighWater = (space: typeof Rows.ServerMetaRow.Type) =>
+        space.retained_history_count + 1 >= historyHighWater || space.retained_receipt_count + 1 >= receiptHighWater
       const sql = yield* SqlClient.SqlClient
       const crypto = yield* Crypto.Crypto
       const runtime = yield* MutationRuntime.MutationRuntime
@@ -1057,6 +1115,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
       ) {
         const submittedEnvelope = request.envelope
         let wakeChanges: ReadonlyArray<Protocol.EntityChange> | undefined
+        let compactAfterCommit = false
         return yield* Effect.gen(function*() {
           yield* authorizeAccess(submittedEnvelope, principal)
           const callerDefinition = yield* validateCallerSchema(request.schema)
@@ -1186,6 +1245,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 limit: options.maximumHistoryEntries
               })
             }
+            compactAfterCommit = crossesHighWater(storedSpace)
             if (storedSpace.next_terminal_sequence >= Number.MAX_SAFE_INTEGER) {
               return yield* new ReplicaError.CapacityExceeded({
                 resource: "terminal sequence",
@@ -1425,6 +1485,12 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             }
             return recordAdmissionMetrics(receipt)
           }),
+          Effect.tap(() => {
+            if (!compactAfterCommit) {
+              return Effect.void
+            }
+            return compact(submittedEnvelope.spaceId)
+          }),
           Effect.tapError(recordAdmissionFailure),
           Effect.withSpan("ServerStore.submit", {
             attributes: {
@@ -1470,7 +1536,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
             return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
           }
           const mutation = yield* runtime.prepare(envelope)
-          return yield* sql.withTransaction(Effect.gen(function*() {
+          let compactAfterCommit = false
+          const discarded = yield* sql.withTransaction(Effect.gen(function*() {
             yield* sql`INSERT INTO effect_local_server_clients
               (space_id, client_id, membership_incarnation, last_local_sequence, expired_local_sequence)
               VALUES (${envelope.spaceId}, ${envelope.clientId}, ${membershipIncarnation}, 0, 0)
@@ -1538,6 +1605,7 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 limit: Number.MAX_SAFE_INTEGER - 1
               })
             }
+            compactAfterCommit = crossesHighWater(storedSpace)
             const terminalSequence = Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
             const receipt = Protocol.RejectedReceipt.make({
               spaceId: envelope.spaceId,
@@ -1568,6 +1636,8 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
                 AND membership_incarnation = ${membershipIncarnation}`
             return yield* projectReceipt(receipt, callerDefinition)
           }))
+          if (compactAfterCommit) yield* compact(submittedEnvelope.spaceId)
+          return discarded
         },
         (effect, request) =>
           effect.pipe(
@@ -1766,6 +1836,20 @@ export const layer = <R = never,>(options: Options<R>): Layer.Layer<
         )
       const maintain = (spaceId: Identity.SpaceId) =>
         maintainSpace(spaceId).pipe(Effect.ensuring(scheduleMetricDepthRefresh))
+      const compacting = new Set<Identity.SpaceId>()
+      const compact = (spaceId: Identity.SpaceId) =>
+        Effect.suspend(() => {
+          if (compacting.has(spaceId)) return Effect.void
+          compacting.add(spaceId)
+          return maintain(spaceId).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("Space compaction failed").pipe(Effect.annotateLogs({ spaceId, error: error._tag }))
+            ),
+            Effect.ensuring(Effect.sync(() => compacting.delete(spaceId))),
+            Effect.forkIn(storeScope),
+            Effect.asVoid
+          )
+        })
       const maintainAll = Effect.gen(function*() {
         let after = ""
         while (true) {
@@ -2173,37 +2257,29 @@ export const layerTrusted = <R = never,>(
   })
 
 export interface MaintenanceOptions {
-  readonly interval: Duration.Input
-  readonly runOnStart?: boolean
+  readonly interval?: Duration.Input | undefined
 }
 
-export interface MaintenanceService {
-  readonly run: Effect.Effect<void, ReplicaError.ReplicaError>
-}
+export const maintenanceDefaults = {
+  interval: "1 hour"
+} as const satisfies MaintenanceOptions
 
-export class HistoryMaintenance extends Context.Service<HistoryMaintenance, MaintenanceService>()(
-  "@lucas-barake/effect-local-sql/ServerStore/HistoryMaintenance"
-) {}
-
-export const layerMaintenance = (options: MaintenanceOptions): Layer.Layer<
-  HistoryMaintenance,
-  ReplicaError.ReplicaError,
-  ServerStore
-> =>
-  Layer.effect(
-    HistoryMaintenance,
-    Effect.gen(function*() {
-      const store = yield* ServerStore
-      const intervalMillis = yield* Configuration.positiveFiniteDurationMillis(
-        "historyMaintenance.interval",
-        options.interval
+export const layerMaintenance = (
+  options: MaintenanceOptions = {}
+): Layer.Layer<never, ReplicaError.InvalidConfiguration, ServerStore | Sharding.Sharding> =>
+  Layer.unwrap(Effect.gen(function*() {
+    const intervalMillis = yield* Configuration.positiveFiniteDurationMillis(
+      "maintenance.interval",
+      options.interval ?? maintenanceDefaults.interval
+    )
+    const store = yield* ServerStore
+    const sweep = store.maintainAll.pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Server maintenance sweep failed").pipe(Effect.annotateLogs({ error: error._tag }))
       )
-      if (options.runOnStart === true) yield* store.maintainAll
-      yield* Effect.andThen(Effect.sleep(intervalMillis), store.maintainAll).pipe(
-        Effect.catch((error) => Effect.logError("History maintenance failed", error)),
-        Effect.forever,
-        Effect.forkScoped
-      )
-      return HistoryMaintenance.of({ run: store.maintainAll })
-    })
-  )
+    )
+    return Singleton.make(
+      "@lucas-barake/effect-local-sql/ServerStore/maintenance",
+      sweep.pipe(Effect.andThen(Effect.sleep(intervalMillis)), Effect.forever)
+    )
+  }))
