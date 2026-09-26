@@ -17,7 +17,6 @@
     "@effect/sql-sqlite-node": "4.0.0-rc.117",
     "@lucas-barake/effect-local": "workspace:^",
     "@lucas-barake/effect-local-rpc": "workspace:^",
-    "@lucas-barake/effect-local-sql": "workspace:^",
     "effect": "4.0.0-rc.117",
     "tsx": "4.20.6"
   }

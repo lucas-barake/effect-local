@@ -41,8 +41,10 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm -C examples/chat exec playwright install --with-deps chromium
-      - run: pnpm -C examples/chat e2e
+      - run: pnpm exec playwright install --with-deps chromium
+        working-directory: examples/chat
+      - run: pnpm run e2e
+        working-directory: examples/chat
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs"
 
 export type UserId = "alice" | "bob" | "carol" | "dave"
 
-export const names: Record<UserId, string> = { alice: "Alice", bob: "Bob", carol: "Carol", dave: "Dave" }
+const names: Record<UserId, string> = { alice: "Alice", bob: "Bob", carol: "Carol", dave: "Dave" }
 
 export interface Chat {
   readonly signIn: (user: UserId) => Promise<Page>

@@ -20,7 +20,6 @@
     "@lucas-barake/effect-local": "workspace:^",
     "@lucas-barake/effect-local-browser": "workspace:^",
     "@lucas-barake/effect-local-rpc": "workspace:^",
-    "@lucas-barake/effect-local-sql": "workspace:^",
     "effect": "4.0.0-rc.117",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"

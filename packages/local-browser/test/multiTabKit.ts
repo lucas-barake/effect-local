@@ -26,7 +26,7 @@ interface MemoryLock {
   readonly releases: Array<Deferred.Deferred<void>>
 }
 
-export interface ChannelTraffic {
+interface ChannelTraffic {
   posted: number
   delivered: number
 }

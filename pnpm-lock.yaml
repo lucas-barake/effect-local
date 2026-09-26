@@ -140,9 +140,6 @@ importers:
       '@lucas-barake/effect-local-rpc':
         specifier: workspace:^
         version: link:../../../packages/local-rpc
-      '@lucas-barake/effect-local-sql':
-        specifier: workspace:^
-        version: link:../../../packages/local-sql
       effect:
         specifier: 4.0.0-rc.117
         version: 4.0.0-rc.117
@@ -183,9 +180,6 @@ importers:
       '@lucas-barake/effect-local-rpc':
         specifier: workspace:^
         version: link:../../../packages/local-rpc
-      '@lucas-barake/effect-local-sql':
-        specifier: workspace:^
-        version: link:../../../packages/local-sql
       effect:
         specifier: 4.0.0-rc.117
         version: 4.0.0-rc.117
