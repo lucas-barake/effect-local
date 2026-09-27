@@ -16,9 +16,11 @@ by default: app reads, queries, and commits need no extra setup. Reconciliation,
 activation run as `Background`. Waiting foreground work is served before waiting background work, in arrival order
 within each priority, and a background waiter joins the foreground order once it has waited `maximumBackgroundWait`
 (50 milliseconds by default), so sync cannot starve behind a busy UI. The per space projection gate follows the same
-rule, and a background holder of that gate is served as foreground while a foreground commit waits on it. Receipt
-batches commit every `receiptPersistBatchSize` receipts (8 by default) while foreground work is waiting. Code that uses
-`LocalStore.layer` or `QueryExecutor.layer` directly provides one `ConnectionLane.makeLayer()` per database.
+rule, and a background holder of that gate is served as foreground while a foreground commit waits on it. A
+background gate holder keeps one lane turn across the transactions of its gated step until other work has waited
+`maximumBackgroundWait`, so a sync step does not queue again for each of its transactions. Receipt batches commit every
+`receiptPersistBatchSize` receipts (8 by default) while foreground work is waiting. Code that uses `LocalStore.layer`
+or `QueryExecutor.layer` directly provides one `ConnectionLane.makeLayer()` per database.
 
 `Replica.Space.status` reports a `SpaceStatus`. An activated space is `Connecting` until its first sync attempt
 resolves and again while a sync runs. It becomes `Online` once the sync completes, and `Offline` only after an attempt

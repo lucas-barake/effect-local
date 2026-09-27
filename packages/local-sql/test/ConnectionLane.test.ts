@@ -65,7 +65,22 @@ const makeLane = Effect.fnUntraced(function*(options: ConnectionLane.Options = {
     yield* Deferred.await(entered)
     return { holder, release: Deferred.succeed(release, undefined) }
   })
-  return { sql, lane, record, order, hold }
+  const session = Effect.gen(function*() {
+    const between = yield* Deferred.make<void>()
+    const resume = yield* Deferred.make<void>()
+    const fiber = yield* lane.withSession(Effect.gen(function*() {
+      yield* lane.withStatement(Effect.sync(() => order.push("session-1")))
+      yield* Deferred.succeed(between, undefined)
+      yield* Deferred.await(resume)
+      yield* lane.withStatement(Effect.sync(() => order.push("session-2")))
+    })).pipe(
+      Effect.provideService(ConnectionLane.Priority, "Background"),
+      Effect.forkChild({ startImmediately: true })
+    )
+    yield* Deferred.await(between)
+    return { fiber, resume: Deferred.succeed(resume, undefined) }
+  })
+  return { sql, lane, record, order, hold, session }
 })
 
 const receiptFor = (pending: Protocol.PendingMutation): Protocol.Receipt => ({
@@ -223,6 +238,50 @@ describe("ConnectionLane", () => {
       yield* Fiber.join(held.holder)
       const exits = yield* Effect.forEach(queued, Fiber.await)
       assert.isTrue(exits.every(Exit.isSuccess))
+    })
+  )
+
+  it.effect(
+    "keeps a session turn across consecutive work while waiters have waited less than the maximum background wait",
+    Effect.fnUntraced(function*() {
+      const { order, record, session } = yield* makeLane({ maximumBackgroundWait: "100 millis" })
+      const opened = yield* session
+      const foreground = yield* record("foreground", "Foreground")
+      yield* opened.resume
+      yield* Fiber.joinAll([opened.fiber, foreground])
+      assert.deepStrictEqual(order, ["session-1", "session-2", "foreground"])
+    })
+  )
+
+  it.effect(
+    "yields a session turn to a waiter that has waited the maximum background wait",
+    Effect.fnUntraced(function*() {
+      const { order, record, session } = yield* makeLane({ maximumBackgroundWait: "100 millis" })
+      const opened = yield* session
+      const foreground = yield* record("foreground", "Foreground")
+      yield* TestClock.adjust("100 millis")
+      yield* opened.resume
+      yield* Fiber.joinAll([opened.fiber, foreground])
+      assert.deepStrictEqual(order, ["session-1", "foreground", "session-2"])
+    })
+  )
+
+  it.effect(
+    "does not lend a session turn to fibers forked by its owner",
+    Effect.fnUntraced(function*() {
+      const { lane, order } = yield* makeLane()
+      const child = yield* Deferred.make<Fiber.Fiber<void>>()
+      yield* lane.withSession(Effect.gen(function*() {
+        yield* lane.withStatement(Effect.sync(() => order.push("session-1")))
+        const forked = yield* lane.withStatement(Effect.sync(() => order.push("child"))).pipe(
+          Effect.asVoid,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.succeed(child, forked)
+        yield* lane.withStatement(Effect.sync(() => order.push("session-2")))
+      }))
+      yield* Fiber.join(yield* Deferred.await(child))
+      assert.deepStrictEqual(order, ["session-1", "session-2", "child"])
     })
   )
 

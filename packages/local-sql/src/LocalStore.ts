@@ -1826,7 +1826,11 @@ export const layer = (
       })
 
       const inProjectionGate = <A, E extends Mutation.TaggedError, R,>(effect: Effect.Effect<A, E, R>) =>
-        Effect.provideService(effect, PriorityLock.Urgency, projectionGate.foregroundWaiting)
+        Effect.withFiber((fiber) => {
+          let held = effect
+          if (fiber.getRef(ConnectionLane.Priority) === "Background") held = lane.withSession(effect)
+          return Effect.provideService(held, PriorityLock.Urgency, projectionGate.foregroundWaiting)
+        })
 
       const withProjectionPermit = <A, E extends Mutation.TaggedError, R,>(effect: Effect.Effect<A, E, R>) =>
         Effect.withFiber((fiber) =>
@@ -2296,10 +2300,12 @@ export const layer = (
         receipts: ReadonlyArray<Protocol.Receipt>
       ) {
         yield* Effect.annotateCurrentSpan({ "receipt.count": receipts.length })
+        const receiptIds: Array<Identity.MutationId> = []
+        let pendingChanged = false
         let next = 0
-        while (true) {
-          const receiptIds: Array<Identity.MutationId> = []
-          let pendingChanged = false
+        const persistChunk = Effect.gen(function*() {
+          const chunkIds: Array<Identity.MutationId> = []
+          let chunkPendingChanged = false
           const failure = yield* lane.withTransaction(Effect.gen(function*() {
             yield* validateFence(yield* meta)
             while (next < receipts.length) {
@@ -2311,18 +2317,30 @@ export const layer = (
               if (Result.isFailure(persisted)) return Option.some(persisted.failure)
               next += 1
               if (persisted.success.inserted) {
-                receiptIds.push(receipt.mutationId)
-                pendingChanged = true
+                chunkIds.push(receipt.mutationId)
+                chunkPendingChanged = true
               }
-              receiptIds.push(...persisted.success.pruned)
+              chunkIds.push(...persisted.success.pruned)
               if (next % receiptPersistBatchSize === 0 && (yield* lane.foregroundWaiting)) break
             }
             return Option.none()
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-          if (receiptIds.length > 0) yield* invalidate([], receiptIds, pendingChanged)
-          if (Option.isSome(failure)) return yield* failure.value
-          if (next >= receipts.length) return yield* Effect.void
-        }
+          receiptIds.push(...chunkIds)
+          pendingChanged ||= chunkPendingChanged
+          return failure
+        })
+        const invalidateCommitted = Effect.suspend(() => {
+          if (receiptIds.length === 0) return Effect.void
+          return invalidate([], receiptIds, pendingChanged)
+        })
+        const failure = yield* Effect.gen(function*() {
+          while (true) {
+            const chunkFailure = yield* persistChunk
+            if (Option.isSome(chunkFailure) || next >= receipts.length) return chunkFailure
+          }
+        }).pipe(Effect.ensuring(invalidateCommitted))
+        if (Option.isSome(failure)) return yield* failure.value
+        return yield* Effect.void
       })
 
       const prepareSettlementsInGate = Effect.gen(function*() {
