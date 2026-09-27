@@ -42,6 +42,22 @@ const make = (options?: Partial<ReadAuthorization.Options<TestError>>) =>
     ...options
   })
 
+const awaitSnapshot = Effect.fnUntraced(function*(
+  coordinator: ReadAuthorization.Coordinator<Key, string, TestError>,
+  expected: ReadAuthorization.Snapshot
+) {
+  for (let attempt = 0; attempt < 1_000; attempt++) {
+    const snapshot = yield* coordinator.snapshot
+    if (
+      snapshot.pending === expected.pending &&
+      snapshot.requesting === expected.requesting &&
+      snapshot.completed === expected.completed
+    ) return
+    yield* Effect.yieldNow
+  }
+  assert.deepStrictEqual(yield* coordinator.snapshot, expected)
+})
+
 describe("read authorization coordinator", () => {
   it.effect(
     "single flights equal structural keys and shared refreshes",
@@ -210,7 +226,7 @@ describe("read authorization coordinator", () => {
       const second = yield* coordinator.authorize(key("second"), () => Effect.never).pipe(
         Effect.forkChild({ startImmediately: true })
       )
-      assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 2, requesting: 2, completed: 0 })
+      yield* awaitSnapshot(coordinator, { pending: 2, requesting: 2, completed: 0 })
 
       yield* Fiber.interrupt(first)
       yield* Fiber.interrupt(second)
@@ -219,8 +235,7 @@ describe("read authorization coordinator", () => {
       const overflow = yield* coordinator.authorize(key("overflow"), () => Effect.succeed("overflow")).pipe(
         Effect.forkChild({ startImmediately: true })
       )
-      yield* Effect.yieldNow
-      pipe(pendingCapacityError, Exit.fail, (expected) => assert.deepStrictEqual(overflow.pollUnsafe(), expected))
+      assert.deepStrictEqual(yield* Fiber.await(overflow), Exit.fail(pendingCapacityError))
       assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 2, requesting: 0, completed: 0 })
     }, Effect.scoped)
   )
@@ -244,7 +259,7 @@ describe("read authorization coordinator", () => {
             return "queued"
           })
       ).pipe(Effect.forkChild({ startImmediately: true }))
-      assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 2, requesting: 2, completed: 0 })
+      yield* awaitSnapshot(coordinator, { pending: 2, requesting: 2, completed: 0 })
       yield* Effect.yieldNow
 
       yield* TestClock.adjust("2 seconds")
@@ -383,7 +398,7 @@ describe("read authorization coordinator", () => {
       const queued = yield* coordinator.authorize(key("queued"), () => Effect.never).pipe(
         Effect.forkChild({ startImmediately: true })
       )
-      assert.deepStrictEqual(yield* coordinator.snapshot, { pending: 2, requesting: 2, completed: 0 })
+      yield* awaitSnapshot(coordinator, { pending: 2, requesting: 2, completed: 0 })
       yield* Scope.close(owner, Exit.void)
       yield* Deferred.await(interrupted)
       const [callerExit, queuedExit] = yield* pipe([Fiber.await(caller), Fiber.await(queued)], Effect.all)
