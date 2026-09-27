@@ -2383,6 +2383,24 @@ export const layer = (
         return yield* Effect.void
       })
 
+      const projectSettlements = Effect.fnUntraced(function*(
+        page: Option.Option<ReadonlyArray<Protocol.EntityKey>>,
+        settled: ReadonlyArray<Protocol.EntityKey>
+      ) {
+        let entities = settled
+        if (Option.isSome(page)) entities = [...page.value, ...entities]
+        if (Option.isSome(page) || entities.length > 0) {
+          const delta = yield* applyProjectionDeltaInGate
+          if (Option.isSome(delta)) {
+            entities = [...delta.value.entities]
+          } else {
+            yield* rebuildProjection
+          }
+        }
+        if (Option.isSome(page)) yield* flushDeferredInvalidations
+        return entities
+      })
+
       const prepareSettlements = Effect.fnUntraced(function*(
         page: Option.Option<ReadonlyArray<Protocol.EntityKey>>
       ) {
@@ -2469,18 +2487,18 @@ export const layer = (
             )`
           prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
           return yield* Effect.void
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-        let entities = Array.from(touched.values())
-        if (Option.isSome(page)) entities = [...page.value, ...entities]
-        if (Option.isSome(page) || entities.length > 0) {
-          const delta = yield* applyProjectionDeltaInGate
-          if (Option.isSome(delta)) {
-            entities = [...delta.value.entities]
-          } else {
-            yield* rebuildProjection
-          }
-        }
-        if (Option.isSome(page)) yield* flushDeferredInvalidations
+        })).pipe(
+          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.tapError(() => {
+            if (Option.isNone(page)) return Effect.void
+            return projectSettlements(page, []).pipe(
+              Effect.flatMap((entities) => invalidate(entities)),
+              reactivity.withBatch
+            )
+          })
+        )
+        const settled = Array.from(touched.values())
+        const entities = yield* projectSettlements(page, settled)
         let invalidationKeys: ReadonlyArray<unknown> = []
         if (
           Option.isSome(page) || entities.length > 0 || prunedReceiptIds.length > 0 || settlements.length > 0

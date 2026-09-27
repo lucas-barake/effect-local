@@ -7,8 +7,10 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Stream from "effect/Stream"
@@ -374,6 +376,67 @@ describe("reconciliation status", () => {
 
       assert.strictEqual((yield* local.reconciliationGenerations).requested, observed.requested + 1)
       yield* Deferred.succeed(pullRelease, undefined)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "shows pulled server changes when settling a stored receipt fails in the same pass",
+    Effect.fnUntraced(function*() {
+      const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
+      const direct = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
+        submitBatch: (request) => server.admitBatch(request, null),
+        discard: (request) => server.discard(request, null),
+        pull: server.pull,
+        bootstrap: server.bootstrap,
+        watch: server.watch
+      })
+      const undecodableResult = SyncEngine.SyncEngine.of({
+        ...direct,
+        submitBatch: (request) =>
+          server.admitBatch(request, null).pipe(
+            Effect.map((result) => ({
+              ...result,
+              receipts: result.receipts.map((receipt) => {
+                if (receipt._tag !== "Accepted") return receipt
+                return { ...receipt, result: "not a todo" }
+              })
+            }))
+          )
+      })
+      const client = Effect.fnUntraced(function*(id: Identity.ClientId, remote: SyncEngine.Service) {
+        const context = yield* Layer.build(
+          Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+            Layer.provideMerge(
+              LocalStore.layer({ ...localOptions, clientId: id }).pipe(
+                Layer.provide(layerRuntime),
+                Layer.provide(database())
+              )
+            ),
+            Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
+          )
+        )
+        return {
+          local: Context.get(context, LocalStore.Store),
+          reconciliation: Context.get(context, Reconciler.Reconciliation)
+        }
+      })
+      const reader = yield* client(clientId, undecodableResult)
+      const writer = yield* client(Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"), direct)
+      yield* reader.reconciliation.sync
+      yield* writer.reconciliation.sync
+
+      yield* reader.local.mutate(Domain.PutTodo, Domain.todo("mine"))
+      assert.isTrue(Exit.isFailure(yield* reader.reconciliation.sync.pipe(Effect.exit)))
+
+      const theirs = Domain.todo("theirs")
+      yield* writer.local.mutate(Domain.PutTodo, theirs)
+      yield* writer.reconciliation.sync
+      assert.isTrue(Exit.isFailure(yield* reader.reconciliation.sync.pipe(Effect.exit)))
+
+      assert.deepStrictEqual(yield* reader.local.get(Domain.Todo, "theirs"), Option.some(theirs))
     }, Effect.scoped)
   )
 })
