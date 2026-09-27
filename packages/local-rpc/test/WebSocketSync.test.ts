@@ -770,11 +770,11 @@ describe("WebSocket synchronization", () => {
         second.mutate(PutTodo, { id: "shared", title: "second socket" })
       ], { concurrency: "unbounded" })
       const awaitReceipt = Effect.fnUntraced(function*(space: Replica.Space, id: Identity.MutationId) {
-        while (true) {
-          const receipt = yield* space.receipt(PutTodo, id)
-          if (Option.isSome(receipt)) return receipt.value
-          yield* Effect.yieldNow
-        }
+        yield* space.settlementsFor(PutTodo, { from: 0 }).pipe(
+          Stream.filter((settled) => settled.settlement.pending.envelope.mutationId === id),
+          Stream.runHead
+        )
+        return Option.getOrThrow(yield* space.receipt(PutTodo, id))
       })
       const [firstReceipt, secondReceipt] = yield* Effect.all([
         awaitReceipt(first, firstPending.envelope.mutationId),
