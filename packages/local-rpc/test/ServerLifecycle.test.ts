@@ -26,6 +26,7 @@ import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Redacted from "effect/Redacted"
 import * as Schedule from "effect/Schedule"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
@@ -76,6 +77,11 @@ interface ServerBehavior {
   readonly authorizeMutation?: SyncServer.LayerOptions<typeof definition>["authorizeMutation"]
 }
 
+const layerWebSocketServer = Layer.effect(
+  SocketServer.SocketServer,
+  NodeSocketServer.makeWebSocket({ port: 0 }).pipe(Effect.provideService(Scheduler.PreventSchedulerYield, true))
+)
+
 const layerServer = (filename: string, behavior: ServerBehavior) =>
   SyncServer.layer({
     definition,
@@ -90,7 +96,7 @@ const layerServer = (filename: string, behavior: ServerBehavior) =>
     Layer.provide(SingleRunner.layer({ runnerStorage: "memory" })),
     Layer.provide(layerHandlers),
     Layer.provide(layerServerDatabase(filename)),
-    Layer.provideMerge(NodeSocketServer.layerWebSocket({ port: 0 })),
+    Layer.provideMerge(layerWebSocketServer),
     Layer.provide(SyncRpc.layerJson())
   )
 
