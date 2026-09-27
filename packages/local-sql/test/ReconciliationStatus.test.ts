@@ -14,6 +14,7 @@ import * as Ref from "effect/Ref"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as LocalStore from "../src/LocalStore.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
@@ -28,7 +29,7 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000000
 
 const database = () =>
   Layer.mergeAll(
-    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))),
     NodeCrypto.layer,
     Reactivity.layer,
     QueryReactivity.layer

@@ -30,6 +30,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as Codec from "../src/internal/codec.js"
 import * as Rows from "../src/internal/rows.js"
 import * as LocalStore from "../src/LocalStore.js"
@@ -394,7 +395,7 @@ const evolutionV3 = Evolution.make({
 })
 
 const layerDatabase = Layer.mergeAll(
-  SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+  ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))),
   NodeCrypto.layer,
   Reactivity.layer,
   QueryReactivity.layer

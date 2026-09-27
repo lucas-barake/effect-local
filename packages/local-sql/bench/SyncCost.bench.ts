@@ -10,6 +10,7 @@ import * as Option from "effect/Option"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { afterAll, assert, describe, test } from "vitest"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -66,7 +67,13 @@ interface Environment {
 
 const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
   const layerDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
-    (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
+    (sqlite) =>
+      Layer.mergeAll(
+        ConnectionLane.makeLayer().pipe(Layer.provideMerge(sqlite)),
+        NodeCrypto.layer,
+        Reactivity.layer,
+        QueryReactivity.layer
+      )
   )
   const layerMutationRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
   const layerServer = ServerStore.layer({

@@ -22,6 +22,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as Codec from "../src/internal/codec.js"
 import * as Rows from "../src/internal/rows.js"
 import * as LocalStore from "../src/LocalStore.js"
@@ -75,7 +76,12 @@ const clientHistory = {
 }
 
 const withServices = (layerSql: Layer.Layer<SqlClient.SqlClient, SqlError.SqlError>) =>
-  Layer.mergeAll(layerSql, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
+  Layer.mergeAll(
+    ConnectionLane.makeLayer().pipe(Layer.provideMerge(layerSql)),
+    NodeCrypto.layer,
+    Reactivity.layer,
+    QueryReactivity.layer
+  )
 const layerClientDatabase = withServices(sqliteLayer())
 const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
 const provideNodeCrypto = Effect.provide(NodeCrypto.layer)

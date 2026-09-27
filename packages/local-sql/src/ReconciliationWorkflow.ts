@@ -22,6 +22,7 @@ import * as Activity from "effect/unstable/workflow/Activity"
 import * as DurableClock from "effect/unstable/workflow/DurableClock"
 import * as Workflow from "effect/unstable/workflow/Workflow"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as LocalStore from "./LocalStore.js"
@@ -337,7 +338,7 @@ const handler = (
       )
     ))
     return undefined
-  })
+  }, Effect.provideService(ConnectionLane.Priority, "Background"))
 
 const register = Effect.fnUntraced(function*(
   options: Options,
@@ -632,7 +633,9 @@ const layerSchedulerWithConfiguration = (
         }
       })
 
-      const supervisorFiber = yield* Effect.forkScoped(supervise)
+      const supervisorFiber = yield* Effect.forkScoped(
+        Effect.provideService(supervise, ConnectionLane.Priority, "Background")
+      )
       const watch = Effect.gen(function*() {
         let retryAttempt = 0
         while (true) {
@@ -695,7 +698,7 @@ const layerSchedulerWithConfiguration = (
           return
         }
       })
-      const watchFiber = yield* Effect.forkScoped(watch)
+      const watchFiber = yield* Effect.forkScoped(Effect.provideService(watch, ConnectionLane.Priority, "Background"))
       yield* requestAndNotify
       yield* Effect.addFinalizer(() => {
         return Fiber.interruptAll([supervisorFiber, watchFiber]).pipe(

@@ -17,6 +17,7 @@ import * as Ref from "effect/Ref"
 import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
+import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import { backoff } from "./internal/transport.js"
@@ -413,7 +414,11 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     )
     yield* Fiber.await(fiber)
   }))
-  yield* Effect.forEach(Array.from({ length: concurrency }), () => Effect.forkScoped(worker), { discard: true })
+  yield* Effect.forEach(
+    Array.from({ length: concurrency }),
+    () => Effect.forkScoped(Effect.provideService(worker, ConnectionLane.Priority, "Background")),
+    { discard: true }
+  )
 
   const register = Effect.fnUntraced(
     function*(space: ManagedSpace) {
@@ -489,7 +494,11 @@ export const makeManager = Effect.fnUntraced(function*(options: {
               )
           ))
         })
-      yield* FiberMap.run(watches, managedKey(space.spaceId, space.generation), watch())
+      yield* FiberMap.run(
+        watches,
+        managedKey(space.spaceId, space.generation),
+        watch().pipe(Effect.provideService(ConnectionLane.Priority, "Background"))
+      )
       return yield* enqueue(state)
     },
     (effect, space) => effect.pipe(Effect.onError(() => unregister(space.spaceId, space.generation)))
@@ -932,7 +941,7 @@ export const layerInMemoryScheduler = (
         Effect.flatMap(turn),
         Effect.forever()
       )
-      const workerFiber = yield* Effect.forkScoped(worker)
+      const workerFiber = yield* Effect.forkScoped(Effect.provideService(worker, ConnectionLane.Priority, "Background"))
       let watchAttempt = 0
       const watch = (): Effect.Effect<void, never, Scope.Scope> =>
         Effect.suspend(() => {
@@ -992,7 +1001,10 @@ export const layerInMemoryScheduler = (
             )
           )
         })
-      const watchFiber = yield* Effect.forkScoped(watch())
+      const watchFiber = yield* watch().pipe(
+        Effect.provideService(ConnectionLane.Priority, "Background"),
+        Effect.forkScoped
+      )
       yield* requestAndNotify
       yield* Effect.addFinalizer(() => {
         return Fiber.interruptAll([workerFiber, watchFiber]).pipe(

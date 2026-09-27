@@ -19,6 +19,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Statement from "effect/unstable/sql/Statement"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as Rows from "../src/internal/rows.js"
 import * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -26,7 +27,9 @@ import * as ServerStore from "../src/ServerStore.js"
 import * as Domain from "./Domain.js"
 import { postgresDatabaseUrl, postgresLayer, serverDatabases } from "./fixtures/ServerDatabase.js"
 
-const layerDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
+const layerDatabase = ConnectionLane.makeLayer().pipe(
+  Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
+)
 const provideDatabase = Effect.provide(layerDatabase)
 const provideNodeFileSystemAndReactivity = Effect.provide([NodeFileSystem.layer, Reactivity.layer])
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")

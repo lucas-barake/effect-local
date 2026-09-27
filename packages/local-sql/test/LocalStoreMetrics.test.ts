@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -41,7 +42,7 @@ const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide
 const database = () => {
   const layerSqlite = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
   return Layer.mergeAll(
-    layerSqlite,
+    ConnectionLane.makeLayer().pipe(Layer.provideMerge(layerSqlite)),
     NodeCrypto.layer,
     Reactivity.layer,
     QueryReactivity.layer
@@ -170,7 +171,7 @@ describe("LocalStore metrics", () => {
           }
         })
         const layerInfrastructure = Layer.mergeAll(
-          Layer.succeed(SqlClient.SqlClient, observedSql),
+          ConnectionLane.makeLayer().pipe(Layer.provideMerge(Layer.succeed(SqlClient.SqlClient, observedSql))),
           NodeCrypto.layer,
           Reactivity.layer,
           QueryReactivity.layer

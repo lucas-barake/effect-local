@@ -15,6 +15,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import type * as Statement from "effect/unstable/sql/Statement"
+import * as ConnectionLane from "./ConnectionLane.js"
 import * as Codec from "./internal/codec.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as SqlTransaction from "./internal/transaction.js"
@@ -73,11 +74,16 @@ const modelColumns = (model: Model.Any): ReadonlyArray<string> => {
 export const layer = <D extends Definition.Any,>(
   definition: D,
   spaceId: Identity.SpaceId
-): Layer.Layer<QueryExecutor, never, SqlClient.SqlClient | Handlers<D> | QueryReactivity.QueryReactivity> =>
+): Layer.Layer<
+  QueryExecutor,
+  never,
+  SqlClient.SqlClient | ConnectionLane.ConnectionLane | Handlers<D> | QueryReactivity.QueryReactivity
+> =>
   Layer.effect(
     QueryExecutor,
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
+      const lane = yield* ConnectionLane.ConnectionLane
       const queryReactivity = yield* QueryReactivity.QueryReactivity
       const context = yield* Effect.context<Handlers<D>>()
       for (const query of definition.queries) {
@@ -229,7 +235,7 @@ export const layer = <D extends Definition.Any,>(
         ReplicaError.ReplicaError | ReplicaError.QueryFailed | Q["errorSchema"]["Type"]
       > => {
         const key = ReactivityKey.query(spaceId, query.name, payload)
-        return sql.withTransaction(Effect.gen(function*() {
+        return lane.withTransaction(Effect.gen(function*() {
           const fence = yield* findFence(undefined).pipe(Effect.mapError(StorageUnavailable.make))
           if (
             fence.schema_version !== definition.schemaIdentity.version ||

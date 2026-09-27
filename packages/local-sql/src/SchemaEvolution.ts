@@ -10,6 +10,7 @@ import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as ConnectionLane from "./ConnectionLane.js"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as Codec from "./internal/codec.js"
 import * as Dialect from "./internal/dialect.js"
@@ -543,8 +544,13 @@ export interface ClientOptions {
 export const client = Effect.fn("SchemaEvolution.client")(function*(options: ClientOptions) {
   yield* Effect.annotateCurrentSpan({ "space.id": options.spaceId, "client.id": options.clientId })
   const sql = yield* SqlClient.SqlClient
+  const lane = yield* ConnectionLane.ConnectionLane
   const withTransaction = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
-    sql.withTransaction(effect)
+    lane.withTransaction(effect)
+  const onLane = <I, A, E extends { readonly _tag: string }, R,>(
+    query: (request: I) => Effect.Effect<A, E, R>
+  ) =>
+  (request: I) => lane.withStatement(query(request))
   const runtime = yield* MutationRuntime
   if (!sameIdentity(options.definition.schemaIdentity, options.evolution.current.schemaIdentity)) {
     return yield* new ReplicaError.InvalidConfiguration({
@@ -576,7 +582,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
     })
   }
 
-  const readMeta = SqlSchema.findOne({
+  const readMeta = onLane(SqlSchema.findOne({
     Request: Schema.Void,
     Result: MetaRow,
     execute: () =>
@@ -584,8 +590,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         active_projection_generation,
         target_schema_version, target_schema_hash, migration_hash
         FROM effect_local_client_spaces WHERE space_id = ${options.spaceId}`
-  })
-  const readProgress = SqlSchema.findOneOption({
+  }))
+  const readProgress = onLane(SqlSchema.findOneOption({
     Request: Schema.Void,
     Result: ProgressRow,
     execute: () =>
@@ -594,43 +600,43 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         target_projection_generation, phase,
         cursor_model, cursor_key, cursor_sequence
         FROM effect_local_client_evolution WHERE space_id = ${options.spaceId}`
-  })
-  const countCanonicalGeneration = SqlSchema.findOne({
+  }))
+  const countCanonicalGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
     execute: (generation) =>
       sql`SELECT COUNT(*) AS count FROM effect_local_client_canonical_entities_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}`
-  })
-  const countVisibleGeneration = SqlSchema.findOne({
+  }))
+  const countVisibleGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
     execute: (generation) =>
       sql`SELECT COUNT(*) AS count FROM effect_local_client_visible_entities_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}`
-  })
-  const countReceiptGeneration = SqlSchema.findOne({
+  }))
+  const countReceiptGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
     execute: (generation) =>
       sql`SELECT COUNT(*) AS count FROM effect_local_client_receipts_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}`
-  })
-  const countPendingGeneration = SqlSchema.findOne({
+  }))
+  const countPendingGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
     execute: (generation) =>
       sql`SELECT COUNT(*) AS count FROM effect_local_client_pending_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}`
-  })
-  const countRetractionGeneration = SqlSchema.findOne({
+  }))
+  const countRetractionGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
     execute: (generation) =>
       sql`SELECT COUNT(*) AS count FROM effect_local_client_retractions
         WHERE space_id = ${options.spaceId} AND generation = ${generation}`
-  })
-  const beginPromotion = SqlSchema.findOneOption({
+  }))
+  const beginPromotion = onLane(SqlSchema.findOneOption({
     Request: Schema.Struct({
       expectedGeneration: NonNegativeInt,
       generation: Identity.SchemaVersion,
@@ -647,8 +653,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
           WHERE space_id = ${options.spaceId} AND schema_generation = ${expectedGeneration}
             AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL
           RETURNING schema_generation`
-  })
-  const initialEntityMetadata = SqlSchema.findAll({
+  }))
+  const initialEntityMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, limit: Schema.Number }),
     Result: EntityBytesRow,
     execute: ({ generation, limit }) =>
@@ -657,8 +663,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_canonical_entities_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const continuingEntityMetadata = SqlSchema.findAll({
+  }))
+  const continuingEntityMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({
       generation: NonNegativeInt,
       model: Schema.String,
@@ -673,8 +679,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const initialEntityBatch = SqlSchema.findAll({
+  }))
+  const initialEntityBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, limit: Schema.Number }),
     Result: EntityBatchRow,
     execute: ({ generation, limit }) =>
@@ -682,8 +688,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_canonical_entities_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const continuingEntityBatch = SqlSchema.findAll({
+  }))
+  const continuingEntityBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({
       generation: NonNegativeInt,
       model: Schema.String,
@@ -697,8 +703,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const initialRetractionMetadata = SqlSchema.findAll({
+  }))
+  const initialRetractionMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, limit: Schema.Number }),
     Result: EntityBytesRow,
     execute: ({ generation, limit }) =>
@@ -706,8 +712,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_retractions
         WHERE space_id = ${options.spaceId} AND generation = ${generation}
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const continuingRetractionMetadata = SqlSchema.findAll({
+  }))
+  const continuingRetractionMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({
       generation: NonNegativeInt,
       model: Schema.String,
@@ -721,16 +727,16 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         WHERE space_id = ${options.spaceId} AND generation = ${generation}
           AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const initialRetractionBatch = SqlSchema.findAll({
+  }))
+  const initialRetractionBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, limit: Schema.Number }),
     Result: RetractionBatchRow,
     execute: ({ generation, limit }) =>
       sql`SELECT model, model_version, entity_key FROM effect_local_client_retractions
         WHERE space_id = ${options.spaceId} AND generation = ${generation}
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const continuingRetractionBatch = SqlSchema.findAll({
+  }))
+  const continuingRetractionBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({
       generation: NonNegativeInt,
       model: Schema.String,
@@ -743,16 +749,16 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         WHERE space_id = ${options.spaceId} AND generation = ${generation}
           AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const logMetadata = SqlSchema.findAll({
+  }))
+  const logMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ after: NonNegativeInt, limit: Schema.Number }),
     Result: SequenceBytesRow,
     execute: ({ after, limit }) =>
       sql`SELECT server_sequence, length(CAST(entry_json AS BLOB)) AS row_bytes
         FROM effect_local_server_log WHERE space_id = ${options.spaceId} AND server_sequence > ${after}
         ORDER BY server_sequence LIMIT ${limit}`
-  })
-  const logBatch = SqlSchema.findAll({
+  }))
+  const logBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ after: NonNegativeInt, limit: Schema.Number }),
     Result: LogBatchRow,
     execute: ({ after, limit }) =>
@@ -760,8 +766,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         source_schema_version, source_schema_hash FROM effect_local_server_log
         WHERE space_id = ${options.spaceId} AND server_sequence > ${after}
         ORDER BY server_sequence LIMIT ${limit}`
-  })
-  const receiptBatch = SqlSchema.findAll({
+  }))
+  const receiptBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, after: NonNegativeInt, limit: Schema.Number }),
     Result: ReceiptBatchRow,
     execute: ({ generation, after, limit }) =>
@@ -771,8 +777,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_receipts_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND local_sequence > ${after} ORDER BY local_sequence LIMIT ${limit}`
-  })
-  const receiptMetadata = SqlSchema.findAll({
+  }))
+  const receiptMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, after: NonNegativeInt, limit: Schema.Number }),
     Result: LocalSequenceBytesRow,
     execute: ({ generation, after, limit }) =>
@@ -780,8 +786,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_receipts_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND local_sequence > ${after} ORDER BY local_sequence LIMIT ${limit}`
-  })
-  const pendingBatch = SqlSchema.findAll({
+  }))
+  const pendingBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, after: NonNegativeInt, limit: Schema.Number }),
     Result: PendingBatchRow,
     execute: ({ generation, after, limit }) =>
@@ -795,8 +801,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         WHERE p.space_id = ${options.spaceId} AND p.schema_generation = ${generation}
           AND p.local_sequence > ${after}
         ORDER BY local_sequence LIMIT ${limit}`
-  })
-  const pendingMetadata = SqlSchema.findAll({
+  }))
+  const pendingMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, after: NonNegativeInt, limit: Schema.Number }),
     Result: LocalSequenceBytesRow,
     execute: ({ generation, after, limit }) =>
@@ -805,7 +811,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_pending_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND local_sequence > ${after} ORDER BY local_sequence LIMIT ${limit}`
-  })
+  }))
   const registerLineage = ClientLineage.make(sql, options.spaceId)
 
   const validateBatch = Effect.fnUntraced(function*(state: typeof ProgressRow.Type) {

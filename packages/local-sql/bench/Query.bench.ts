@@ -13,6 +13,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import { afterAll, assert, beforeAll, test } from "vitest"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as Codec from "../src/internal/codec.js"
 import * as Migrations from "../src/Migrations.js"
 import * as QueryExecutor from "../src/QueryExecutor.js"
@@ -101,7 +102,8 @@ const layerHandlers = Indexed.toLayer(({ payload, query }) =>
       )
     ).pipe((multiColumn) => Layer.mergeAll(indexed, multiColumn))
 )
-const layerDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
+const layerDatabase = ConnectionLane.makeLayer().pipe(
+  Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
   Layer.merge(Reactivity.layer)
 )
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")

@@ -20,6 +20,7 @@ import * as Scheduler from "effect/Scheduler"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as LocalStore from "../src/LocalStore.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
@@ -110,7 +111,13 @@ const localStore = Effect.fnUntraced(function*(
   reactivity: Layer.Layer<Reactivity.Reactivity>,
   onMutationsCommitted: LocalStore.Options["onMutationsCommitted"] = () => Effect.void
 ) {
-  const database = yield* Layer.build(Layer.mergeAll(layerMemoryDatabase, NodeCrypto.layer, reactivity))
+  const database = yield* Layer.build(
+    Layer.mergeAll(
+      ConnectionLane.makeLayer().pipe(Layer.provideMerge(layerMemoryDatabase)),
+      NodeCrypto.layer,
+      reactivity
+    )
+  )
   const layerLocalStore = LocalStore.layer({
     definition: Domain.definition,
     spaceId,

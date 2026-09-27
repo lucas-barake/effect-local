@@ -10,6 +10,16 @@ runtimes and `foregroundActiveSpaces` reserves capacity for addressed work. `for
 reserves foreground turns within the total `reconciliationConcurrency`. Active logical watches share the one
 `SyncEngine` and RPC WebSocket.
 
+Every local transaction and statement goes through one `ConnectionLane` per database, so the lane decides who uses the
+single SQLite connection next. Work runs at the `ConnectionLane.Priority` of the calling fiber, which is `Foreground`
+by default: app reads, queries, and commits need no extra setup. Reconciliation, settlement, bootstrap, and background
+activation run as `Background`. Waiting foreground work is served before waiting background work, in arrival order
+within each priority, and a background waiter joins the foreground order once it has waited `maximumBackgroundWait`
+(50 milliseconds by default), so sync cannot starve behind a busy UI. The per space projection gate follows the same
+rule, and a background holder of that gate is served as foreground while a foreground commit waits on it. Receipt
+batches commit every `receiptPersistBatchSize` receipts (8 by default) while foreground work is waiting. Code that uses
+`LocalStore.layer` or `QueryExecutor.layer` directly provides one `ConnectionLane.makeLayer()` per database.
+
 `Replica.Space.status` reports a `SpaceStatus`. An activated space is `Connecting` until its first sync attempt
 resolves and again while a sync runs. It becomes `Online` once the sync completes, and `Offline` only after an attempt
 failed or the transport reports that it cannot connect. Inactive spaces report `Offline`. Every status carries

@@ -4,12 +4,14 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import { identity } from "effect/Function"
 import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Dialect from "./internal/dialect.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
@@ -121,10 +123,20 @@ const ledger = (table: string, text: string) =>
   applied_at ${text} NOT NULL DEFAULT CURRENT_TIMESTAMP
 )`
 
-export const runCatalog = Effect.fn("Migrations.runCatalog")(function*(
+interface Access {
+  readonly withTransaction: <A, E extends { readonly _tag: string }, R,>(
+    effect: Effect.Effect<A, E, R>
+  ) => Effect.Effect<A, E | SqlError.SqlError, R>
+  readonly withStatement: <A, E extends { readonly _tag: string }, R,>(
+    effect: Effect.Effect<A, E, R>
+  ) => Effect.Effect<A, E, R>
+}
+
+const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
+  access: Access,
   catalog: Catalog,
   migrations: ReadonlyArray<Migration>,
-  options: Options = defaultOptions
+  options: Options
 ) {
   yield* Effect.annotateCurrentSpan({
     "migration.catalog": catalog,
@@ -159,8 +171,8 @@ export const runCatalog = Effect.fn("Migrations.runCatalog")(function*(
   let appliedAtAttempt = 0
   const migrate = Effect.gen(function*() {
     const ledgerStatement = ledger(ledgerTable, dialect.text)
-    yield* sql.withTransaction(dialect.lockSchema.pipe(Effect.andThen(sql.unsafe(ledgerStatement))))
-    yield* sql.withTransaction(Effect.gen(function*() {
+    yield* access.withTransaction(dialect.lockSchema.pipe(Effect.andThen(sql.unsafe(ledgerStatement))))
+    yield* access.withTransaction(Effect.gen(function*() {
       yield* dialect.lockSchema
       let read = readServer
       if (catalog === "Client") read = readClient
@@ -219,7 +231,7 @@ export const runCatalog = Effect.fn("Migrations.runCatalog")(function*(
     ) {
       let read = readServer
       if (catalog === "Client") read = readClient
-      const applied = yield* read(undefined).pipe(
+      const applied = yield* access.withStatement(read(undefined)).pipe(
         Effect.mapError((cause) => {
           if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
           return new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause })
@@ -250,6 +262,13 @@ export const runCatalog = Effect.fn("Migrations.runCatalog")(function*(
     yield* Effect.sleep(retryDelayMillis)
   }
 })
+
+export const runCatalog = (catalog: Catalog, migrations: ReadonlyArray<Migration>, options: Options = defaultOptions) =>
+  Effect.flatMap(
+    SqlClient.SqlClient,
+    (sql) =>
+      runCatalogWith({ withTransaction: sql.withTransaction, withStatement: identity }, catalog, migrations, options)
+  )
 
 const clientV1 = makeMigration({
   id: 1,
@@ -2208,34 +2227,41 @@ export const client = Effect.fnUntraced(function*(options: {
   readonly migration?: Options
 }) {
   const sql = yield* SqlClient.SqlClient
-  yield* sql.unsafe("PRAGMA foreign_keys = ON")
-  const pragma = yield* SqlSchema.findOne({
-    Request: Schema.Void,
-    Result: PragmaEnabledRow,
-    execute: () => sql`PRAGMA foreign_keys`
-  })(undefined).pipe(Effect.mapError((cause) => {
+  const lane = yield* ConnectionLane.ConnectionLane
+  yield* lane.withStatement(sql.unsafe("PRAGMA foreign_keys = ON"))
+  const pragma = yield* lane.withStatement(
+    SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: PragmaEnabledRow,
+      execute: () => sql`PRAGMA foreign_keys`
+    })(undefined)
+  ).pipe(Effect.mapError((cause) => {
     if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
     return new ReplicaError.StorageCorrupt({ message: "SQLite foreign key state is unreadable", cause })
   }))
   if (pragma.foreign_keys !== 1) {
     return yield* new ReplicaError.StorageCorrupt({ message: "SQLite foreign keys could not be enabled" })
   }
-  const metaExists = yield* SqlSchema.findOne({
-    Request: Schema.Void,
-    Result: CountRow,
-    execute: () =>
-      sql`SELECT COUNT(*) AS count FROM sqlite_master
+  const metaExists = yield* lane.withStatement(
+    SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: CountRow,
+      execute: () =>
+        sql`SELECT COUNT(*) AS count FROM sqlite_master
         WHERE type = 'table' AND name = 'effect_local_client_meta'`
-  })(undefined).pipe(Effect.mapError((cause) => {
+    })(undefined)
+  ).pipe(Effect.mapError((cause) => {
     if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
     return new ReplicaError.StorageCorrupt({ message: "Client metadata catalog is unreadable", cause })
   }))
   if (metaExists.count !== 0) {
-    const beforeMigration = yield* SqlSchema.findOneOption({
-      Request: Schema.Void,
-      Result: ClientIdentityRow,
-      execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
-    })(undefined).pipe(Effect.mapError((cause) => {
+    const beforeMigration = yield* lane.withStatement(
+      SqlSchema.findOneOption({
+        Request: Schema.Void,
+        Result: ClientIdentityRow,
+        execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
+      })(undefined)
+    ).pipe(Effect.mapError((cause) => {
       if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
       return new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
     }))
@@ -2246,12 +2272,14 @@ export const client = Effect.fnUntraced(function*(options: {
       })
     }
   }
-  yield* runCatalog("Client", clientCatalog, options.migration)
-  const existing = yield* SqlSchema.findOneOption({
-    Request: Schema.Void,
-    Result: ClientIdentityRow,
-    execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
-  })(undefined).pipe(
+  yield* runCatalogWith(lane, "Client", clientCatalog, options.migration ?? defaultOptions)
+  const existing = yield* lane.withStatement(
+    SqlSchema.findOneOption({
+      Request: Schema.Void,
+      Result: ClientIdentityRow,
+      execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
+    })(undefined)
+  ).pipe(
     Effect.mapError((cause) => {
       if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
       return new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
@@ -2263,11 +2291,11 @@ export const client = Effect.fnUntraced(function*(options: {
       actualClientId: existing.value.client_id
     })
   }
-  yield* sql`INSERT INTO effect_local_client_meta
+  yield* lane.withStatement(sql`INSERT INTO effect_local_client_meta
     (singleton, client_id) VALUES (1, ${options.clientId})
-    ON CONFLICT (singleton) DO NOTHING`
+    ON CONFLICT (singleton) DO NOTHING`)
   if (options.spaceId !== undefined) {
-    yield* sql`INSERT INTO effect_local_client_spaces
+    yield* lane.withStatement(sql`INSERT INTO effect_local_client_spaces
         (space_id, membership_incarnation, definition_hash, schema_version, schema_hash, schema_generation,
           active_schema_generation, active_projection_generation, projection_schema_generation,
           next_local_sequence, server_cursor, visible_revision, requested_generation, completed_generation,
@@ -2279,7 +2307,7 @@ export const client = Effect.fnUntraced(function*(options: {
             lower(hex(randomblob(6)))), ${options.definition.hash},
           ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash}, 0, 0, 0, 0,
           1, 0, 0, 0, 0, 0, 0)
-        ON CONFLICT (space_id) DO NOTHING`
+        ON CONFLICT (space_id) DO NOTHING`)
   }
   return undefined
 }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))

@@ -13,26 +13,29 @@ import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
-import { pipe } from "effect/Function"
+import { constFalse, pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
 import * as Queue from "effect/Queue"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
-import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as ConnectionLane from "./ConnectionLane.js"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as ClientMetrics from "./internal/clientMetrics.js"
 import * as Codec from "./internal/codec.js"
+import * as Configuration from "./internal/configuration.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
+import * as PriorityLock from "./internal/priorityLock.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as TerminalRejection from "./internal/TerminalRejection.js"
@@ -52,6 +55,8 @@ export interface Options {
   readonly schemaEvolutionBatchSize?: number
   readonly schemaEvolutionBatchBytes?: number
   readonly projectionReplayBatchSize?: number
+  readonly receiptPersistBatchSize?: number
+  readonly maximumBackgroundWait?: Duration.Input
   readonly retainedReceipts: number
   readonly maximumReceipts: number
   readonly retainedHistoryEntries: number
@@ -217,6 +222,7 @@ export const layer = (
   Store,
   ReplicaError.ReplicaError,
   | SqlClient.SqlClient
+  | ConnectionLane.ConnectionLane
   | Crypto.Crypto
   | MutationRuntime.MutationRuntime
   | Reactivity.Reactivity
@@ -226,6 +232,7 @@ export const layer = (
     Store,
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
+      const lane = yield* ConnectionLane.ConnectionLane
       const crypto = yield* Crypto.Crypto
       const runtime = yield* MutationRuntime.MutationRuntime
       const reactivity = yield* Reactivity.Reactivity
@@ -311,6 +318,14 @@ export const layer = (
           message: "projectionReplayBatchSize must be a positive safe integer"
         })
       }
+      const receiptPersistBatchSize = yield* Configuration.positiveSafeInteger(
+        "receiptPersistBatchSize",
+        options.receiptPersistBatchSize ?? 8
+      )
+      const maximumBackgroundWaitMillis = yield* Configuration.positiveFiniteDurationMillis(
+        "maximumBackgroundWait",
+        options.maximumBackgroundWait ?? ConnectionLane.defaultMaximumBackgroundWait
+      )
       yield* Migrations.client(options)
       const evolution = options.evolution ?? Evolution.make({ current: options.definition })
       let evolutionOptions: SchemaEvolution.ClientOptions = {
@@ -329,7 +344,7 @@ export const layer = (
         evolutionOptions = { ...evolutionOptions, onReplicationViewCleared: options.onReplicationView(false) }
       }
       yield* SchemaEvolution.client(evolutionOptions)
-      const projectionGate = yield* Semaphore.make(1)
+      const projectionGate = PriorityLock.make(maximumBackgroundWaitMillis)
       const registerLineage = ClientLineage.make(sql, options.spaceId)
 
       const migrateEntryChanges = (entry: Protocol.AcceptedMutation) =>
@@ -859,7 +874,7 @@ export const layer = (
             SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})`
       })
 
-      const meta = findMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+      const meta = lane.withStatement(findMeta(undefined)).pipe(Effect.mapError(StorageUnavailable.make))
       const normalizedScope = yield* Protocol.validateReplicationScope(options.definition, options.scope)
       const desiredScopeJson = yield* Codec.stringify(normalizedScope)
       const desiredScopeDigest = yield* Protocol.replicationScopeDigest(normalizedScope).pipe(
@@ -882,7 +897,7 @@ export const layer = (
             limit: Number.MAX_SAFE_INTEGER
           })
         }
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* lane.withTransaction(Effect.gen(function*() {
           yield* sql`UPDATE effect_local_client_spaces SET desired_scope_json = ${desiredScopeJson},
             desired_scope_digest = ${desiredScopeDigest}, scope_generation = scope_generation + 1
             WHERE space_id = ${options.spaceId}`
@@ -895,9 +910,9 @@ export const layer = (
       const schemaGeneration = initializedMeta.schema_generation
       const activeGeneration = initializedMeta.active_schema_generation
       const metrics = yield* ClientMetrics.make
-      yield* sql`UPDATE effect_local_client_pending_data SET submission_state = 'Retrying'
+      yield* lane.withStatement(sql`UPDATE effect_local_client_pending_data SET submission_state = 'Retrying'
         WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
-          AND submission_state = 'Submitting'`.pipe(
+          AND submission_state = 'Submitting'`).pipe(
         Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
       )
       const validateFence = (current: typeof Rows.ClientMetaRow.Type) => {
@@ -937,7 +952,7 @@ export const layer = (
         }
         return Effect.void
       }
-      const readPendingCount = sql.withTransaction(Effect.gen(function*() {
+      const readPendingCount = lane.withTransaction(Effect.gen(function*() {
         yield* validateFence(yield* meta)
         return (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
       })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
@@ -1151,7 +1166,7 @@ export const layer = (
       const deleteSettledPending = (settlements: ReadonlyArray<Replica.MutationSettlement>) => {
         if (settlements.length === 0) return Effect.succeed<ReadonlyArray<Replica.MutationSettlement>>([])
         const mutationIds = settlements.map((settlement) => settlement.pending.envelope.mutationId)
-        return sql.withTransaction(Effect.gen(function*() {
+        return lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
           const deletedRows = yield* deletePendingByMutationIds(mutationIds).pipe(
             Effect.mapError(StorageUnavailable.make)
@@ -1235,7 +1250,9 @@ export const layer = (
       }
 
       const resolveSettlementStart = Effect.fnUntraced(function*(from: Replica.SettlementStart) {
-        const state = yield* findSettlementState(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        const state = yield* lane.withStatement(findSettlementState(undefined)).pipe(
+          Effect.mapError(StorageUnavailable.make)
+        )
         if (from === "live") return state.next_settled_sequence - 1
         if (from === "acknowledged") return state.settlement_floor
         if (!Number.isSafeInteger(from) || from < 0) {
@@ -1250,7 +1267,7 @@ export const layer = (
         readonly after: number
         readonly mutationName?: string | undefined
       }) =>
-        sql.withTransaction(Effect.gen(function*() {
+        lane.withTransaction(Effect.gen(function*() {
           const mark = yield* readPruneMark(readOptions.mutationName)
           if (readOptions.after < mark) {
             return yield* new ReplicaError.SettlementReplayTruncated({
@@ -1297,9 +1314,9 @@ export const layer = (
             })
           )
         }
-        return sql`UPDATE effect_local_client_spaces
+        return lane.withStatement(sql`UPDATE effect_local_client_spaces
             SET settlement_floor = MAX(settlement_floor, MIN(${sequence}, next_settled_sequence - 1))
-            WHERE space_id = ${options.spaceId}`.pipe(
+            WHERE space_id = ${options.spaceId}`).pipe(
           Effect.asVoid,
           Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
         )
@@ -1351,7 +1368,7 @@ export const layer = (
         } satisfies Quarantine.QuarantinedMutation
       })
 
-      const pendingToSubmit = sql.withTransaction(Effect.gen(function*() {
+      const pendingToSubmit = lane.withTransaction(Effect.gen(function*() {
         yield* validateFence(yield* meta)
         return yield* findPendingToSubmit(undefined).pipe(
           Effect.mapError(StorageUnavailable.make),
@@ -1359,7 +1376,7 @@ export const layer = (
         )
       })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
-      const pending = sql.withTransaction(Effect.gen(function*() {
+      const pending = lane.withTransaction(Effect.gen(function*() {
         yield* validateFence(yield* meta)
         return yield* findAllPending(undefined).pipe(
           Effect.mapError(StorageUnavailable.make),
@@ -1368,7 +1385,7 @@ export const layer = (
       })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const markSubmitting = Effect.fnUntraced(function*(mutationIds: ReadonlyArray<Identity.MutationId>) {
-        const marked = yield* sql.withTransaction(Effect.gen(function*() {
+        const marked = yield* lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
           const exhausted = yield* findExhaustedSubmissions(mutationIds).pipe(Effect.mapError(StorageUnavailable.make))
           if (exhausted.length > 0) {
@@ -1383,14 +1400,14 @@ export const layer = (
       })
 
       const markRetrying = Effect.fnUntraced(function*(mutationIds: ReadonlyArray<Identity.MutationId>) {
-        const marked = yield* sql.withTransaction(Effect.gen(function*() {
+        const marked = yield* lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
           return yield* updateRetrying(mutationIds).pipe(Effect.mapError(StorageUnavailable.make))
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         if (marked.length > 0) yield* invalidate([], [], true)
       })
 
-      const quarantine = sql.withTransaction(Effect.gen(function*() {
+      const quarantine = lane.withTransaction(Effect.gen(function*() {
         yield* validateFence(yield* meta)
         return yield* findQuarantine(undefined).pipe(
           Effect.mapError(StorageUnavailable.make),
@@ -1399,7 +1416,7 @@ export const layer = (
       })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const quarantineByMutation = (mutationId: Identity.MutationId) =>
-        sql.withTransaction(Effect.gen(function*() {
+        lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
           const found = yield* findQuarantineByMutation(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
           if (Option.isNone(found)) return Option.none()
@@ -1407,7 +1424,7 @@ export const layer = (
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
       const quarantineCancellation = (mutationId: Identity.MutationId) =>
-        sql.withTransaction(Effect.gen(function*() {
+        lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
           const continuation = yield* findQuarantineCancellationByRoot(mutationId).pipe(
             Effect.mapError(StorageUnavailable.make)
@@ -1623,7 +1640,7 @@ export const layer = (
             return Effect.succeed(executionResult.success)
           })
         )
-        const result = yield* Effect.map(sql.withTransaction(execution), Result.succeed).pipe(
+        const result = yield* Effect.map(lane.withTransaction(execution), Result.succeed).pipe(
           Effect.catchTag("TerminalRejection", ({ rejection }) => Effect.succeed(Result.fail(rejection)))
         )
         if (Result.isSuccess(result)) {
@@ -1660,15 +1677,13 @@ export const layer = (
       })
 
       const rebuildProjection = Effect.gen(function*() {
-        let current = yield* sql.withTransaction(meta).pipe(
-          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
-        )
+        let current = yield* meta
         if (current.projection_replay_generation === null) return yield* Effect.void
         yield* validateFence(current)
         let target = current.projection_replay_generation
         if (target === current.active_projection_generation) {
           target = yield* nextProjectionGeneration(current.active_projection_generation)
-          yield* sql.withTransaction(sql`UPDATE effect_local_client_spaces
+          yield* lane.withTransaction(sql`UPDATE effect_local_client_spaces
             SET projection_replay_generation = ${target}, projection_replay_cursor = NULL
             WHERE space_id = ${options.spaceId}`).pipe(
             Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
@@ -1680,7 +1695,7 @@ export const layer = (
 
         if (cursor === null) {
           while (true) {
-            const deleted = yield* sql.withTransaction(Effect.gen(function*() {
+            const deleted = yield* lane.withTransaction(Effect.gen(function*() {
               const row = yield* meta
               yield* validateFence(row)
               if (row.projection_replay_generation !== target || row.projection_replay_cursor !== null) {
@@ -1709,7 +1724,7 @@ export const layer = (
 
         if (cursor === "canonical") {
           while (true) {
-            const copied = yield* sql.withTransaction(Effect.gen(function*() {
+            const copied = yield* lane.withTransaction(Effect.gen(function*() {
               const row = yield* meta
               yield* validateFence(row)
               if (row.projection_replay_generation !== target || row.projection_replay_cursor !== "canonical") {
@@ -1746,7 +1761,7 @@ export const layer = (
           return yield* new ReplicaError.StorageCorrupt({ message: "Projection replay cursor is invalid" })
         }
         while (true) {
-          const replayed = yield* sql.withTransaction(Effect.gen(function*() {
+          const replayed = yield* lane.withTransaction(Effect.gen(function*() {
             const row = yield* meta
             yield* validateFence(row)
             if (
@@ -1770,7 +1785,7 @@ export const layer = (
           yield* Effect.yieldNow
         }
 
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* lane.withTransaction(Effect.gen(function*() {
           const row = yield* meta
           yield* validateFence(row)
           if (
@@ -1792,7 +1807,7 @@ export const layer = (
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
         while (true) {
-          const deleted = yield* sql.withTransaction(Effect.gen(function*() {
+          const deleted = yield* lane.withTransaction(Effect.gen(function*() {
             const ids = yield* findProjectionRowIds({
               schemaGeneration: replaySchemaGeneration,
               projectionGeneration: target,
@@ -1810,8 +1825,20 @@ export const layer = (
         return yield* Effect.void
       })
 
+      const inProjectionGate = <A, E extends Mutation.TaggedError, R,>(effect: Effect.Effect<A, E, R>) =>
+        Effect.provideService(effect, PriorityLock.Urgency, projectionGate.foregroundWaiting)
+
+      const withProjectionPermit = <A, E extends Mutation.TaggedError, R,>(effect: Effect.Effect<A, E, R>) =>
+        Effect.withFiber((fiber) =>
+          projectionGate.withPermit(
+            fiber.getRef(ConnectionLane.Priority) === "Foreground",
+            constFalse,
+            inProjectionGate(effect)
+          )
+        )
+
       const withProjectionGate = <A, E extends Mutation.TaggedError, R,>(effect: Effect.Effect<A, E, R>) =>
-        projectionGate.withPermit(rebuildProjection.pipe(
+        withProjectionPermit(rebuildProjection.pipe(
           Effect.andThen(flushDeferredInvalidations),
           Effect.andThen(effect)
         ))
@@ -1826,17 +1853,18 @@ export const layer = (
         effect: Effect.Effect<A, E, R>,
         then: (value: A) => Effect.Effect<unknown, E2, R2>
       ) =>
-        Effect.uninterruptibleMask(Effect.fnUntraced(function*(restore) {
-          const acquire = restore(projectionGate.take(1))
-          return yield* Effect.acquireUseRelease(
-            acquire,
-            () => effect,
-            Effect.fnUntraced(function*(_, result) {
-              yield* projectionGate.release(1)
-              if (result._tag === "Success") yield* then(result.value)
-            })
+        Effect.uninterruptibleMask((restore) =>
+          Effect.withFiber((fiber) =>
+            Effect.acquireUseRelease(
+              projectionGate.take(fiber.getRef(ConnectionLane.Priority) === "Foreground", constFalse, restore),
+              () => inProjectionGate(effect),
+              Effect.fnUntraced(function*(_, result) {
+                yield* projectionGate.release
+                if (result._tag === "Success") yield* then(result.value)
+              })
+            )
           )
-        }))
+        )
 
       const withProjectionGateThen = <
         A,
@@ -1949,7 +1977,7 @@ export const layer = (
         return true
       })
 
-      const applyProjectionDeltaInGate = sql.withTransaction(Effect.gen(function*() {
+      const applyProjectionDeltaInGate = lane.withTransaction(Effect.gen(function*() {
         const current = yield* meta
         yield* validateFence(current)
         if (current.projection_replay_generation !== null) {
@@ -2268,34 +2296,40 @@ export const layer = (
         receipts: ReadonlyArray<Protocol.Receipt>
       ) {
         yield* Effect.annotateCurrentSpan({ "receipt.count": receipts.length })
-        const receiptIds: Array<Identity.MutationId> = []
-        let pendingChanged = false
-        const failure = yield* sql.withTransaction(Effect.gen(function*() {
-          yield* validateFence(yield* meta)
-          for (const receipt of receipts) {
-            const persisted = yield* sql.withTransaction(persistReceiptInTransaction(receipt)).pipe(
-              Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
-              Effect.result
-            )
-            if (Result.isFailure(persisted)) return Option.some(persisted.failure)
-            if (persisted.success.inserted) {
-              receiptIds.push(receipt.mutationId)
-              pendingChanged = true
+        let next = 0
+        while (true) {
+          const receiptIds: Array<Identity.MutationId> = []
+          let pendingChanged = false
+          const failure = yield* lane.withTransaction(Effect.gen(function*() {
+            yield* validateFence(yield* meta)
+            while (next < receipts.length) {
+              const receipt = receipts[next]
+              const persisted = yield* lane.withTransaction(persistReceiptInTransaction(receipt)).pipe(
+                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+                Effect.result
+              )
+              if (Result.isFailure(persisted)) return Option.some(persisted.failure)
+              next += 1
+              if (persisted.success.inserted) {
+                receiptIds.push(receipt.mutationId)
+                pendingChanged = true
+              }
+              receiptIds.push(...persisted.success.pruned)
+              if (next % receiptPersistBatchSize === 0 && (yield* lane.foregroundWaiting)) break
             }
-            receiptIds.push(...persisted.success.pruned)
-          }
-          return Option.none()
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-        if (receiptIds.length > 0) yield* invalidate([], receiptIds, pendingChanged)
-        if (Option.isSome(failure)) return yield* failure.value
-        return yield* Effect.void
+            return Option.none()
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          if (receiptIds.length > 0) yield* invalidate([], receiptIds, pendingChanged)
+          if (Option.isSome(failure)) return yield* failure.value
+          if (next >= receipts.length) return yield* Effect.void
+        }
       })
 
       const prepareSettlementsInGate = Effect.gen(function*() {
         const touched = new Map<string, Protocol.EntityKey>()
         const settlements: Array<Replica.MutationSettlement> = []
         let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* lane.withTransaction(Effect.gen(function*() {
           const installed = yield* meta
           yield* validateFence(installed)
           let after = 0
@@ -2426,7 +2460,7 @@ export const layer = (
         yield* settleReceipts
       })
 
-      const replicationState = sql.withTransaction(Effect.gen(function*() {
+      const replicationState = lane.withTransaction(Effect.gen(function*() {
         const current = yield* meta
         yield* validateFence(current)
         const scope = yield* Codec.parse(current.desired_scope_json).pipe(
@@ -2463,7 +2497,7 @@ export const layer = (
         const scopeDigest = yield* Protocol.replicationScopeDigest(normalized).pipe(
           Effect.provideService(Crypto.Crypto, crypto)
         )
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* lane.withTransaction(Effect.gen(function*() {
           const current = yield* meta
           yield* validateFence(current)
           if (
@@ -2492,7 +2526,7 @@ export const layer = (
       const resolveQuarantine = (receipt: Protocol.Receipt, disposition: QuarantineDisposition = "Resubmit") =>
         withProjectionGateThen(
           Effect.gen(function*() {
-            const transactionResult = yield* sql.withTransaction(Effect.gen(function*() {
+            const transactionResult = yield* lane.withTransaction(Effect.gen(function*() {
               yield* validateFence(yield* meta)
               const found = yield* findQuarantineByMutation(receipt.mutationId).pipe(
                 Effect.mapError(StorageUnavailable.make)
@@ -2772,7 +2806,7 @@ export const layer = (
       ) {
         yield* Effect.annotateCurrentSpan({ "snapshot.id": manifest.snapshotId })
         yield* validateManifest(manifest)
-        return yield* sql.withTransaction(Effect.gen(function*() {
+        return yield* lane.withTransaction(Effect.gen(function*() {
           const current = yield* findScopedBootstrap(undefined).pipe(Effect.mapError(StorageUnavailable.make))
           if (Option.isSome(current) && bootstrapMatches(current.value, manifest)) {
             return current.value.next_ordinal - 1
@@ -2806,7 +2840,7 @@ export const layer = (
             limit: options.maximumBootstrapPageBytes
           })
         }
-        return yield* sql.withTransaction(Effect.gen(function*() {
+        return yield* lane.withTransaction(Effect.gen(function*() {
           const found = yield* findScopedBootstrap(undefined).pipe(Effect.mapError(StorageUnavailable.make))
           if (Option.isNone(found) || !bootstrapMatches(found.value, page.manifest)) {
             return yield* new ReplicaError.ProtocolInvalid({
@@ -3113,7 +3147,7 @@ export const layer = (
             prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
             return yield* Effect.void
           }),
-          sql.withTransaction
+          lane.withTransaction
         ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         return yield* Effect.gen(function*() {
           yield* recordBootstrapInstallMetric
@@ -3137,7 +3171,7 @@ export const layer = (
 
       const applyViewPageInGate = Effect.fnUntraced(function*(page: Protocol.PullPage) {
         const touched = new Map<string, Protocol.EntityKey>()
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* lane.withTransaction(Effect.gen(function*() {
           const current = yield* meta
           yield* validateFence(current)
           if (page.scopeGeneration !== current.scope_generation) {
@@ -3219,7 +3253,7 @@ export const layer = (
 
       const revokeReplication = Effect.gen(function*() {
         const dirty = new Map<string, Protocol.EntityKey>()
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* lane.withTransaction(Effect.gen(function*() {
           const current = yield* meta
           yield* validateFence(current)
           const identities = yield* findEntityIdentities(undefined).pipe(Effect.mapError(StorageUnavailable.make))
@@ -3251,12 +3285,12 @@ export const layer = (
         const entities = Array.from(dirty.values())
         yield* invalidate(entities)
       }).pipe(
-        Semaphore.withPermit(projectionGate),
+        withProjectionPermit,
         Effect.uninterruptible,
         Effect.withSpan("LocalStore.revokeReplication")
       )
 
-      const reconciliationGenerations = sql.withTransaction(Effect.gen(function*() {
+      const reconciliationGenerations = lane.withTransaction(Effect.gen(function*() {
         const row = yield* meta
         yield* validateFence(row)
         return { requested: row.requested_generation, completed: row.completed_generation }
@@ -3272,7 +3306,7 @@ export const layer = (
         return requested + 1
       })
 
-      const requestReconciliation = sql.withTransaction(Effect.gen(function*() {
+      const requestReconciliation = lane.withTransaction(Effect.gen(function*() {
         const current = yield* meta
         yield* validateFence(current)
         const requested = yield* nextReconciliationGeneration(current.requested_generation)
@@ -3292,7 +3326,7 @@ export const layer = (
             message: "Reconciliation generation must be a nonnegative safe integer"
           })
         }
-        yield* sql.withTransaction(Effect.gen(function*() {
+        yield* lane.withTransaction(Effect.gen(function*() {
           const current = yield* meta
           yield* validateFence(current)
           if (generation > current.requested_generation) {
@@ -3448,7 +3482,7 @@ export const layer = (
         payload: Mutation.Payload<M>
       ) =>
         withProjectionGate(Effect.gen(function*() {
-          const result = yield* sql.withTransaction(Effect.gen(function*() {
+          const result = yield* lane.withTransaction(Effect.gen(function*() {
             const quarantined = yield* findQuarantineByMutation(mutationId).pipe(
               Effect.mapError(StorageUnavailable.make)
             )
@@ -3519,7 +3553,7 @@ export const layer = (
         }))
 
       const restoreProjection = pipe(
-        sql.withTransaction(Effect.gen(function*() {
+        lane.withTransaction(Effect.gen(function*() {
           const dirty = yield* findDirtyEntities(undefined).pipe(Effect.mapError(StorageUnavailable.make))
           if (dirty.length > 0) {
             const current = yield* meta
@@ -3529,11 +3563,11 @@ export const layer = (
         Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
         Effect.andThen(rebuildProjection)
       )
-      yield* projectionGate.withPermit(restoreProjection)
+      yield* withProjectionPermit(restoreProjection)
       yield* initializePendingMetric(yield* readPendingCount)
 
       const receipt = (mutationId: Identity.MutationId) =>
-        sql.withTransaction(Effect.gen(function*() {
+        lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
           const row = yield* findReceipt(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
           if (Option.isNone(row)) return Option.none<Protocol.Receipt>()
@@ -3592,7 +3626,7 @@ export const layer = (
         if (claimed.length === 0) return []
         let aborted: { readonly index: number; readonly outcome: AppliedMutation } | undefined
         const exit = yield* withProjectionGate(Effect.gen(function*() {
-          const committed = yield* sql.withTransaction(Effect.gen(function*() {
+          const committed = yield* lane.withTransaction(Effect.gen(function*() {
             while (claimed.length < maximumCommitBatch) {
               const next = yield* Queue.poll(commitQueue)
               if (Option.isNone(next)) break
@@ -3665,6 +3699,7 @@ export const layer = (
         restore(LosslessQueue.take(commitQueue)).pipe(Effect.flatMap((first) => commitAll([first])))
       ).pipe(
         Effect.forever,
+        Effect.provideService(ConnectionLane.Priority, "Foreground"),
         Effect.forkScoped
       )
 
@@ -3686,7 +3721,7 @@ export const layer = (
         const request: QueuedMutation = {
           ticket: admittedCommits + 1,
           withdrawn: false,
-          apply: sql.withTransaction(Effect.gen(function*() {
+          apply: lane.withTransaction(Effect.gen(function*() {
             if (requestedMutationId !== undefined) {
               const recorded = yield* recordedMutation(mutation, payloadValue, requestedMutationId)
               if (Option.isSome(recorded)) {
@@ -3739,7 +3774,7 @@ export const layer = (
         schema: options.definition.schemaIdentity,
         mutate,
         get: (model, key) =>
-          sql.withTransaction(Effect.gen(function*() {
+          lane.withTransaction(Effect.gen(function*() {
             const current = yield* meta
             yield* validateFence(current)
             return yield* SqlTransaction.local({
@@ -3775,7 +3810,7 @@ export const layer = (
               onSome: (found) => decodeClientReceipt(mutation, found).pipe(Effect.map(Option.some))
             }))
           ),
-        cursor: sql.withTransaction(Effect.gen(function*() {
+        cursor: lane.withTransaction(Effect.gen(function*() {
           const row = yield* meta
           yield* validateFence(row)
           return Identity.ServerSequence.make(row.server_cursor)
@@ -3789,7 +3824,7 @@ export const layer = (
             yield* validateFence(yield* meta)
             return (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
           }),
-          sql.withTransaction
+          lane.withTransaction
         ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
         reconciliationGenerations,
         requestReconciliation,
@@ -3812,7 +3847,7 @@ export const layer = (
               const settledReceiptIds: Array<Identity.MutationId> = []
               const pageSettlements: Array<Replica.MutationSettlement> = []
               let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
-              yield* sql.withTransaction(Effect.gen(function*() {
+              yield* lane.withTransaction(Effect.gen(function*() {
                 const currentMeta = yield* meta
                 yield* validateFence(currentMeta)
                 let cursor = currentMeta.server_cursor

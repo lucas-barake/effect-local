@@ -33,6 +33,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as Rows from "../src/internal/rows.js"
 import * as LocalStore from "../src/LocalStore.js"
 import * as Migrations from "../src/Migrations.js"
@@ -97,7 +98,12 @@ const envelope = Effect.fnUntraced(function*(
 })
 
 const withServices = (layerSql: Layer.Layer<SqlClient.SqlClient, SqlError.SqlError>) =>
-  Layer.mergeAll(layerSql, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
+  Layer.mergeAll(
+    ConnectionLane.makeLayer().pipe(Layer.provideMerge(layerSql)),
+    NodeCrypto.layer,
+    Reactivity.layer,
+    QueryReactivity.layer
+  )
 const clientDatabase = () => withServices(sqliteLayer())
 
 const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
@@ -1016,7 +1022,9 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         })
       })
       const layerClientDatabase = Layer.mergeAll(
-        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        ConnectionLane.makeLayer().pipe(
+          Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
+        ),
         NodeCrypto.layer,
         Reactivity.layer,
         Layer.succeed(QueryReactivity.QueryReactivity, blockedQueryReactivity)
@@ -1112,7 +1120,9 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         })
       })
       const layerClientDatabase = Layer.mergeAll(
-        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        ConnectionLane.makeLayer().pipe(
+          Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
+        ),
         NodeCrypto.layer,
         Reactivity.layer,
         Layer.succeed(QueryReactivity.QueryReactivity, queryReactivity)
@@ -1165,7 +1175,9 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         })
       })
       const layerClientDatabase = Layer.mergeAll(
-        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        ConnectionLane.makeLayer().pipe(
+          Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
+        ),
         NodeCrypto.layer,
         Reactivity.layer,
         Layer.succeed(QueryReactivity.QueryReactivity, queryReactivity)
@@ -1813,8 +1825,13 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           QueryReactivity.QueryReactivity,
           Context.get(databaseContext, QueryReactivity.QueryReactivity)
         )
+        const layerLane = Layer.succeed(
+          ConnectionLane.ConnectionLane,
+          Context.get(databaseContext, ConnectionLane.ConnectionLane)
+        )
         const layerServices = Layer.mergeAll(
           Layer.succeed(SqlClient.SqlClient, sql),
+          layerLane,
           layerCrypto,
           layerReactivity,
           layerQueryReactivity
@@ -1858,7 +1875,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const filename = `${directory}/bootstrap-resume.sqlite`
         const persistentDatabase = () =>
           Layer.mergeAll(
-            SqliteClient.layer({ filename, disableWAL: true }),
+            ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename, disableWAL: true }))),
             NodeCrypto.layer,
             Reactivity.layer,
             QueryReactivity.layer
@@ -2358,7 +2375,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const databaseContext = yield* Layer.build(clientDatabase())
       const sql = Context.get(databaseContext, SqlClient.SqlClient)
       yield* Migrations.client({ definition: Domain.definition, spaceId, clientId, migration }).pipe(
-        Effect.provideService(SqlClient.SqlClient, sql)
+        Effect.provideContext(databaseContext)
       )
       const layerCrypto = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
       const layerReactivity = Layer.succeed(
@@ -2369,8 +2386,13 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         QueryReactivity.QueryReactivity,
         Context.get(databaseContext, QueryReactivity.QueryReactivity)
       )
+      const layerLane = Layer.succeed(
+        ConnectionLane.ConnectionLane,
+        Context.get(databaseContext, ConnectionLane.ConnectionLane)
+      )
       const layerServices = Layer.mergeAll(
         Layer.succeed(SqlClient.SqlClient, sql),
+        layerLane,
         layerCrypto,
         layerReactivity,
         layerQueryReactivity
@@ -2506,7 +2528,12 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           layerQueryReactivity: QueryReactivity.layer
         },
         ({ layerCrypto, layerQueryReactivity, layerReactivity, layerSql }) =>
-          Layer.mergeAll(layerSql, layerCrypto, layerReactivity, layerQueryReactivity)
+          Layer.mergeAll(
+            ConnectionLane.makeLayer().pipe(Layer.provideMerge(layerSql)),
+            layerCrypto,
+            layerReactivity,
+            layerQueryReactivity
+          )
       )
       const layerLive = LocalStore.layer({
         ...clientHistory,
@@ -4222,7 +4249,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       )
       const pairDatabase = (readonly: boolean) =>
         Layer.mergeAll(
-          SqliteClient.layer({ filename, readonly }),
+          ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename, readonly }))),
           NodeCrypto.layer,
           Reactivity.layer,
           QueryReactivity.layer
@@ -4704,7 +4731,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const filename = `${directory}/replica.db`
         const persistentDatabase = () =>
           Layer.mergeAll(
-            SqliteClient.layer({ filename, disableWAL: true }),
+            ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename, disableWAL: true }))),
             NodeCrypto.layer,
             Reactivity.layer,
             QueryReactivity.layer
@@ -4747,7 +4774,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const filename = `${directory}/submitting-recovery.db`
         const persistentDatabase = () =>
           Layer.mergeAll(
-            SqliteClient.layer({ filename, disableWAL: true }),
+            ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename, disableWAL: true }))),
             NodeCrypto.layer,
             Reactivity.layer,
             QueryReactivity.layer

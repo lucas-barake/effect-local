@@ -28,6 +28,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as ConnectionLane from "./ConnectionLane.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
@@ -66,6 +67,8 @@ export interface Options<D extends Definition.Any,> {
   readonly retainedMutationIds?: number
   readonly migration?: Migrations.Options
   readonly pageSize?: number
+  readonly receiptPersistBatchSize?: number
+  readonly maximumBackgroundWait?: Duration.Input
   readonly reconciliationConcurrency?: number
   readonly foregroundReconciliationConcurrency?: number
   readonly retryDelay?: Duration.Input
@@ -223,10 +226,15 @@ const makeLayer = <D extends Definition.Any, R,>(
     Replica.Replica,
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
+      const lane = yield* ConnectionLane.make({ maximumBackgroundWait: options.maximumBackgroundWait })
       const reactivity = yield* Reactivity.Reactivity
       const remote = yield* SyncEngine.SyncEngine
       const parentScope = yield* Effect.scope
-      const rootContext = yield* Effect.context<BaseRequirements<D> | QueryReactivity.QueryReactivity | R>()
+      const rootContext = Context.add(
+        yield* Effect.context<BaseRequirements<D> | QueryReactivity.QueryReactivity | R>(),
+        ConnectionLane.ConnectionLane,
+        lane
+      )
       const entries = new Map<Identity.SpaceId, RememberedEntry>()
       const joining = new Map<Identity.SpaceId, Deferred.Deferred<void>>()
       const foregroundResidents = new Map<Identity.SpaceId, RememberedEntry>()
@@ -308,7 +316,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         definition: options.definition,
         clientId: options.clientId,
         migration: options.migration
-      })
+      }).pipe(Effect.provideService(ConnectionLane.ConnectionLane, lane))
 
       const normalizedDefaultScope = yield* Protocol.validateReplicationScope(
         options.definition,
@@ -769,7 +777,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             yield* result
             return false
           }
-          const count = yield* pendingCount(entry.spaceId).pipe(
+          const count = yield* lane.withStatement(pendingCount(entry.spaceId)).pipe(
             Effect.catchTags({
               SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
               SchemaError: (cause) =>
@@ -874,7 +882,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (retiring !== undefined) {
             start = retiring.operationGate.withPermits(operationPermits)(Scope.close(retiring.scope, Exit.void)).pipe(
               Effect.andThen(restore(
-                pendingCount(entry.spaceId).pipe(
+                lane.withStatement(pendingCount(entry.spaceId)).pipe(
                   Effect.catchTags({
                     SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
                     SchemaError: (cause) =>
@@ -1205,7 +1213,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                 Effect.map(([status, pending]) => addressedStatus(entry.spaceId, entry.synced, { ...status, pending }))
               )
             }
-            return pendingCount(entry.spaceId).pipe(
+            return lane.withStatement(pendingCount(entry.spaceId)).pipe(
               Effect.catchTags({
                 SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
                 SchemaError: (cause) =>
@@ -1339,10 +1347,10 @@ const makeLayer = <D extends Definition.Any, R,>(
             const completion = yield* Deferred.make<void>()
             joining.set(spaceId, completion)
             const result = yield* restore(
-              sql.withTransaction(insertMembership(spaceId)).pipe(
+              lane.withTransaction(insertMembership(spaceId)).pipe(
                 Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
                 Effect.andThen(
-                  readMembership(spaceId).pipe(
+                  lane.withStatement(readMembership(spaceId)).pipe(
                     Effect.catchTags({
                       SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
                       SchemaError: (cause) =>
@@ -1394,7 +1402,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           }
           if (current === undefined) {
             return yield* restore(
-              sql.withTransaction(
+              lane.withTransaction(
                 sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
               ).pipe(
                 Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
@@ -1408,7 +1416,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
             Effect.andThen(deactivate(current, true)),
             Effect.andThen(
-              sql.withTransaction(
+              lane.withTransaction(
                 sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
               ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
             ),
@@ -1498,12 +1506,21 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       yield* Effect.forEach(
         Array.from({ length: backgroundConcurrency }),
-        () => backgroundTurn.pipe(Effect.forever, Effect.forkScoped({ startImmediately: true })),
+        () =>
+          backgroundTurn.pipe(
+            Effect.forever,
+            Effect.provideService(ConnectionLane.Priority, "Background"),
+            Effect.forkScoped({ startImmediately: true })
+          ),
         { discard: true }
       )
-      yield* retrySchedulerTurn.pipe(Effect.forever, Effect.forkScoped({ startImmediately: true }))
+      yield* retrySchedulerTurn.pipe(
+        Effect.forever,
+        Effect.provideService(ConnectionLane.Priority, "Background"),
+        Effect.forkScoped({ startImmediately: true })
+      )
 
-      const restored = yield* readMemberships(undefined).pipe(
+      const restored = yield* lane.withStatement(readMemberships(undefined)).pipe(
         Effect.catchTags({
           SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
           SchemaError: (cause) =>
