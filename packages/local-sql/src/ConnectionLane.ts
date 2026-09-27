@@ -37,15 +37,19 @@ export interface Service {
 }
 
 interface Session {
-  readonly lock: PriorityLock.PriorityLock
-  readonly owner: Fiber.Fiber<unknown, unknown>
   holding: boolean
   since: number
 }
 
-const CurrentSession = Context.Reference<Session | undefined>(
-  "@lucas-barake/effect-local-sql/ConnectionLane/CurrentSession",
-  { defaultValue: () => undefined }
+interface Turn {
+  readonly lock: PriorityLock.PriorityLock
+  readonly owner: Fiber.Fiber<unknown, unknown>
+  readonly session: Session | undefined
+}
+
+const CurrentTurns = Context.Reference<ReadonlyArray<Turn>>(
+  "@lucas-barake/effect-local-sql/ConnectionLane/CurrentTurns",
+  { defaultValue: () => [] }
 )
 
 const now = (fiber: Fiber.Fiber<unknown, unknown>) => fiber.getRef(Clock.Clock).currentTimeMillisUnsafe()
@@ -65,11 +69,16 @@ export const make = Effect.fnUntraced(function*(
   const lock = PriorityLock.make(maximumBackgroundWaitMillis)
   const inTransaction = (fiber: Fiber.Fiber<unknown, unknown>) =>
     Option.isSome(Context.getOption(fiber.context, sql.transactionService))
-  const ownedSession = (fiber: Fiber.Fiber<unknown, unknown>) => {
-    const session = fiber.getRef(CurrentSession)
-    if (session === undefined || session.lock !== lock || session.owner !== fiber) return undefined
-    return session
+  const ownedTurn = (fiber: Fiber.Fiber<unknown, unknown>) => {
+    const turn = fiber.getRef(CurrentTurns).findLast((candidate) => candidate.lock === lock)
+    if (turn === undefined || turn.owner !== fiber) return undefined
+    return turn
   }
+  const withTurn = <A, E extends { readonly _tag: string }, R,>(
+    fiber: Fiber.Fiber<unknown, unknown>,
+    session: Session | undefined,
+    effect: Effect.Effect<A, E, R>
+  ) => Effect.provideService(effect, CurrentTurns, [...fiber.getRef(CurrentTurns), { lock, owner: fiber, session }])
   const takeTurn = (fiber: Fiber.Fiber<unknown, unknown>, restore: PriorityLock.Restore) =>
     lock.take(fiber.getRef(Priority) === "Foreground", fiber.getRef(PriorityLock.Urgency), restore)
   const inSession = <A, E extends { readonly _tag: string }, R,>(
@@ -100,23 +109,27 @@ export const make = Effect.fnUntraced(function*(
   ): Effect.Effect<A, E, R> =>
     Effect.withFiber((fiber) => {
       if (inTransaction(fiber)) return effect
-      const session = ownedSession(fiber)
-      if (session !== undefined) return inSession(session, fiber, effect)
-      const foreground = fiber.getRef(Priority) === "Foreground"
-      return lock.withPermit(foreground, fiber.getRef(PriorityLock.Urgency), effect)
+      const turn = ownedTurn(fiber)
+      const held = withTurn(fiber, undefined, effect)
+      if (turn === undefined) {
+        const foreground = fiber.getRef(Priority) === "Foreground"
+        return lock.withPermit(foreground, fiber.getRef(PriorityLock.Urgency), held)
+      }
+      if (turn.session === undefined) return effect
+      return inSession(turn.session, fiber, held)
     })
   const withSession = <A, E extends { readonly _tag: string }, R,>(
     effect: Effect.Effect<A, E, R>
   ): Effect.Effect<A, E, R> =>
     Effect.withFiber((fiber) => {
-      if (inTransaction(fiber) || ownedSession(fiber) !== undefined) return effect
-      const session: Session = { lock, owner: fiber, holding: false, since: 0 }
+      if (inTransaction(fiber) || ownedTurn(fiber) !== undefined) return effect
+      const session: Session = { holding: false, since: 0 }
       const end = Effect.suspend(() => {
         if (!session.holding) return Effect.void
         session.holding = false
         return lock.release
       })
-      return effect.pipe(Effect.provideService(CurrentSession, session), Effect.ensuring(end))
+      return withTurn(fiber, session, effect).pipe(Effect.ensuring(end))
     })
   return ConnectionLane.of({
     withTransaction: (effect) => withStatement(sql.withTransaction(effect)),

@@ -303,6 +303,34 @@ describe("ConnectionLane", () => {
       assert.deepStrictEqual(rows.map((row) => row.name), ["savepoint", "statement"])
     })
   )
+
+  it.effect(
+    "runs statements, transactions, and sessions nested in a statement on the fiber that holds the turn",
+    Effect.fnUntraced(function*() {
+      const { lane, sql } = yield* makeLane()
+      const nested = yield* Effect.all([
+        lane.withStatement(lane.withStatement(sql`SELECT 1`)),
+        lane.withStatement(lane.withTransaction(sql`SELECT 2`)),
+        lane.withStatement(sql`SELECT 3`).pipe(lane.withSession, lane.withStatement)
+      ]).pipe(Effect.timeoutOption("1 second"), Effect.forkChild({ startImmediately: true }))
+      yield* TestClock.adjust("1 second")
+      assert.isTrue(Option.isSome(yield* Fiber.join(nested)))
+    })
+  )
+
+  it.effect(
+    "keeps a session turn on one lane while its owner opens a session on another lane",
+    Effect.fnUntraced(function*() {
+      const first = yield* makeLane()
+      const second = yield* makeLane()
+      const nested = yield* first.lane.withSession(Effect.gen(function*() {
+        yield* first.lane.withStatement(first.sql`SELECT 1`)
+        yield* second.lane.withSession(first.lane.withStatement(first.sql`SELECT 2`))
+      })).pipe(Effect.timeoutOption("1 second"), Effect.forkChild({ startImmediately: true }))
+      yield* TestClock.adjust("1 second")
+      assert.isTrue(Option.isSome(yield* Fiber.join(nested)))
+    })
+  )
 })
 
 describe("LocalStore on a connection lane", () => {
