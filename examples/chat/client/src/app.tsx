@@ -18,7 +18,7 @@ import { useState } from "react"
 import { Avatar } from "./avatar.js"
 import { ChatView } from "./chat.js"
 import type { Connection } from "./connection.js"
-import { type ChatClient, clientFor, logoutAtom } from "./replica.js"
+import { type ChatClient, clientFor, logoutAtom, reloadAtom } from "./replica.js"
 import { formatTime } from "./time.js"
 
 const conversationPeer = (conversation: Conversation, me: UserId): ChatUser | undefined => {
@@ -35,6 +35,7 @@ const conversationColor = (conversation: Conversation, me: UserId): string =>
 
 const StatusBanner = ({ connection }: { readonly connection: Connection }) => {
   const logout = useAtomSet(logoutAtom)
+  const reload = useAtomSet(reloadAtom)
   return Match.value(connection).pipe(
     Match.when("online", () => null),
     Match.when("connecting", () => null),
@@ -51,6 +52,14 @@ const StatusBanner = ({ connection }: { readonly connection: Connection }) => {
       "failed",
       () => <div className="banner banner-error" role="status">Sync failed — local data remains available.</div>
     ),
+    Match.when("superseded", () => (
+      <div className="banner banner-warning" role="status">
+        This app was updated in another tab.{" "}
+        <button type="button" className="banner-action" onClick={() => reload(undefined)}>
+          Reload
+        </button>
+      </div>
+    )),
     Match.when("offline", () => (
       <div className="banner banner-warning" role="status">
         Offline — messages send and receipts advance when the connection returns.

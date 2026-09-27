@@ -7,7 +7,7 @@ const names: Record<UserId, string> = { alice: "Alice", bob: "Bob", carol: "Caro
 
 export interface Chat {
   readonly signIn: (user: UserId) => Promise<Page>
-  readonly openTab: (page: Page, label: string) => Promise<Page>
+  readonly openTab: (page: Page, label: string, path?: string) => Promise<Page>
   readonly openLoginPage: () => Promise<Page>
 }
 
@@ -48,10 +48,10 @@ const newContext = async (browser: Browser): Promise<BrowserContext> => {
   return context
 }
 
-const openTab = async (page: Page, label: string, lines: Array<string>): Promise<Page> => {
+const openTab = async (page: Page, label: string, path: string, lines: Array<string>): Promise<Page> => {
   const tab = await page.context().newPage()
   capture(tab, label, lines)
-  await tab.goto("/")
+  await tab.goto(path)
   return tab
 }
 
@@ -80,7 +80,7 @@ export const test = base.extend<{ readonly chat: Chat }>({
     const lines: Array<string> = []
     await use({
       signIn: (user) => signIn(browser, user, lines),
-      openTab: (page, label) => openTab(page, label, lines),
+      openTab: (page, label, path = "/") => openTab(page, label, path, lines),
       openLoginPage: () => openLoginPage(browser, lines)
     })
     if (testInfo.status === testInfo.expectedStatus) return

@@ -125,6 +125,32 @@ test("tabs of one user share one replica and keep working after the leader tab c
   expect(await falseStates(follower)).toEqual([])
 })
 
+test("a tab from a newer deploy takes over the replica and the older tab asks for a reload", async ({ chat }) => {
+  const older = await chat.signIn("alice")
+  await chat.signIn("bob")
+  await expectOnline(older, "bob")
+  await openDirectMessage(older, "bob")
+  const text = uniqueText("before the deploy")
+  await send(older, text)
+  await expect(outgoing(older, text).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible({
+    timeout: 3_000
+  })
+  const newer = await chat.openTab(older, "alice-newer-deploy", "/next/")
+  await expect(newer.locator(".sidebar-me")).toHaveText("Alice")
+  await expect(older.getByRole("status").filter({ hasText: "This app was updated in another tab." })).toBeVisible({
+    timeout: 5_000
+  })
+  await expect(older.getByRole("button", { name: "Reload" })).toBeVisible()
+  await openDirectMessage(newer, "bob")
+  await expect(outgoing(newer, text)).toBeVisible({ timeout: 5_000 })
+  const after = uniqueText("after the deploy")
+  await send(newer, after)
+  await expect(outgoing(newer, after).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible({
+    timeout: 5_000
+  })
+  expect(await falseStates(newer)).toEqual([])
+})
+
 test("a wrong or empty password shows the typed login failure", async ({ chat }) => {
   const page = await chat.openLoginPage()
   await page.locator(".login-user", { hasText: "Alice" }).click()

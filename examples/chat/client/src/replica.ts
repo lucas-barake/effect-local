@@ -116,6 +116,8 @@ export const logoutAtom = pageRuntime.fn<void>()(() =>
   )
 )
 
+export const reloadAtom = pageRuntime.fn<void>()(() => Effect.sync(() => location.reload()))
+
 export const followStoredSessionAtom = Atom.make(
   Stream.fromEventListener<StorageEvent>(window, "storage").pipe(
     Stream.filter((event) => event.storageArea === localStorage && (event.key === sessionKey || event.key === null)),

@@ -34,7 +34,11 @@ export default defineConfig({
       stdout: "pipe"
     },
     {
-      command: `pnpm exec vite build && pnpm exec vite preview --port ${clientPort} --strictPort`,
+      command: [
+        "pnpm exec vite build",
+        "pnpm exec vite build --config vite.e2e-next.config.ts",
+        `pnpm exec vite preview --port ${clientPort} --strictPort`
+      ].join(" && "),
       cwd: "../client",
       port: clientPort,
       reuseExistingServer: false,

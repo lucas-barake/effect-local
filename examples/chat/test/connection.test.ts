@@ -25,6 +25,9 @@ const connectingStatus: StatusResult = AsyncResult.success({ spaceId, synced: tr
 const offlineStatus: StatusResult = AsyncResult.success({ spaceId, synced: true, _tag: "Offline", pending: 0 })
 const idleStatus: StatusResult = AsyncResult.success({ spaceId, synced: true, _tag: "Idle", pending: 1 })
 const unreadable: StatusResult = AsyncResult.fail(new ReplicaError.OwnerUnavailable({ reason: "takeover" }))
+const superseded: StatusResult = AsyncResult.fail(
+  new ReplicaError.BuildSuperseded({ version: 1, supersedingVersion: 2 })
+)
 
 const withoutYield = Effect.provideService(Scheduler.PreventSchedulerYield, true)
 
@@ -92,6 +95,16 @@ describe("chat connection", () => {
       assert.deepStrictEqual(yield* connection.untilOnline, ["online"])
       yield* connection.report(unreadable)
       assert.strictEqual(yield* connection.next, "failed")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "reports a tab whose build another tab superseded as superseded, not failed",
+    Effect.fnUntraced(function*() {
+      const connection = yield* observe
+      assert.deepStrictEqual(yield* connection.untilOnline, ["online"])
+      yield* connection.report(superseded)
+      assert.strictEqual(yield* connection.next, "superseded")
     }, Effect.scoped)
   )
 })

@@ -101,6 +101,12 @@ test/     domain.test.ts — tick-state derivation matrix, branded id invariants
 - **Multi-tab out of the box.** `MultiTab.layer` elects one leader tab per
   user; followers proxy the replica over `BroadcastChannel`. Reload or open
   another tab and everything keeps working.
+- **Deploys with tabs still open.** When a tab from a newer deploy opens, it
+  takes the replica over and every tab of the older build shows "This app was
+  updated in another tab" with a Reload button, driven by the typed
+  `BuildSuperseded` failure of the space status. The Playwright suite builds
+  the client twice, the second build under `/next/` with a bumped tab wire
+  protocol (`client/vite.e2e-next.config.ts`), and drives both on one origin.
 - **WhatsApp-style failure UX.** A message whose mutation fails terminally
   (rejected by the server) rolls back out of the durable window and reappears
   from a client-only failed overlay with a red warning icon; retry re-issues
