@@ -238,6 +238,12 @@ const makeLayer = <D extends Definition.Any, R,>(
       const entries = new Map<Identity.SpaceId, RememberedEntry>()
       const joining = new Map<Identity.SpaceId, Deferred.Deferred<void>>()
       const foregroundResidents = new Map<Identity.SpaceId, RememberedEntry>()
+      const foregroundAdmitted = new Set<Identity.SpaceId>()
+      const dropForegroundReservation = (entry: RememberedEntry) => {
+        entry.foreground = false
+        foregroundResidents.delete(entry.spaceId)
+        foregroundAdmitted.delete(entry.spaceId)
+      }
       const aggregate = yield* Ref.make(aggregateStatus(0, 0, {
         offline: 0,
         connecting: 0,
@@ -762,8 +768,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           const completion = Deferred.makeUnsafe<void, ReplicaError.ReplicaError>()
           entry.activation = "Deactivating"
           entry.transition = completion
-          entry.foreground = false
-          foregroundResidents.delete(entry.spaceId)
+          dropForegroundReservation(entry)
           yield* invalidateActivation(entry.spaceId)
           const shutdown = Scope.close(runtime.scope, Exit.void)
           const result = yield* runtime.operationGate.withPermits(operationPermits)(shutdown).pipe(Effect.exit)
@@ -810,25 +815,30 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const ensureForegroundCapacity = (entry: RememberedEntry): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.suspend(() => {
-          if (hasForegroundRuntime(entry) || foregroundResidents.size <= options.foregroundActiveSpaces) {
-            return Effect.void
-          }
+          if (hasForegroundRuntime(entry)) return Effect.void
+          let admitted = 0
           let victim: RememberedEntry | undefined
           for (const candidate of foregroundResidents.values()) {
-            if (candidate !== entry && candidate.activation === "Active" && candidate.leases === 0) {
+            if (candidate === entry || !foregroundAdmitted.has(candidate.spaceId)) continue
+            admitted += 1
+            if (victim === undefined && candidate.activation === "Active" && candidate.leases === 0) {
               victim = candidate
-              break
             }
           }
-          if (victim !== undefined) return deactivate(victim, false).pipe(Effect.asVoid)
+          if (admitted < options.foregroundActiveSpaces) {
+            foregroundAdmitted.add(entry.spaceId)
+            return Effect.void
+          }
+          if (victim !== undefined) {
+            return deactivate(victim, false).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
+          }
           const changed = capacityChanged
           return Deferred.await(changed).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
         })
 
       const releaseForegroundReservation = (entry: RememberedEntry) =>
         Effect.suspend(() => {
-          entry.foreground = false
-          foregroundResidents.delete(entry.spaceId)
+          dropForegroundReservation(entry)
           const runtime = entry.runtime
           if (entry.activation !== "Active" || runtime === undefined || runtime.foreground || entry.leases > 0) {
             return signalCapacity
@@ -918,8 +928,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           }
           entry.activation = "Inactive"
           entry.transition = undefined
-          entry.foreground = false
-          foregroundResidents.delete(entry.spaceId)
+          dropForegroundReservation(entry)
           yield* modifyContribution(entry, (current) => ({ _tag: "Offline", pending: current.pending }))
           if (Exit.hasInterrupts(result)) yield* Deferred.succeed(completion, undefined)
           else yield* Deferred.done(completion, result)

@@ -18,6 +18,7 @@ import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Scheduler from "effect/Scheduler"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -927,6 +928,33 @@ describe("multi space Replica", () => {
       assert.isAtMost(yield* Ref.get(maximum), 2)
       yield* Deferred.succeed(release, undefined)
     }, Effect.scoped)
+  )
+
+  it.effect(
+    "admits foreground activations that reserve capacity together before any becomes active",
+    Effect.fnUntraced(function*() {
+      const spaces = Array.from({ length: 3 }, (_, index) => {
+        const suffix = String(index + 1).padStart(12, "0")
+        return Identity.SpaceId.make(`spc_00000000-0000-4000-8000-${suffix}`)
+      })
+      const layerReplica = SqlReplica.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        clientId,
+        initialSpaces: spaces
+      }).pipe(
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(layerRemote),
+        Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(Reactivity.layer)
+      )
+      const replica = Context.get(yield* Layer.build(layerReplica), Replica.Replica)
+      const handles = yield* Effect.forEach(spaces, replica.space)
+      yield* Effect.forEach(handles, (space) => space.activate, { concurrency: "unbounded", discard: true })
+      const activations = yield* Effect.forEach(handles, (space) => space.activation)
+      assert.strictEqual(activations.filter((activation) => activation === "Active").length, 2)
+    }, (effect) => effect.pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 5), Effect.scoped))
   )
 
   it.effect(
