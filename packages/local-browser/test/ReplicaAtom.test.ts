@@ -36,6 +36,7 @@ import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import { Atom, AtomRegistry } from "effect/unstable/reactivity"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
 
 const layerTransport = Layer.succeed(
@@ -447,10 +448,10 @@ describe("Replica Atom graph", () => {
       yield* Effect.addFinalizer(() => Effect.sync(unmountPublish))
       registry.set(publishTyping, { payload: { active: true }, ttl: "1 second" })
       registry.set(publishTyping, { payload: { active: false }, ttl: "1 second" })
-      const first = yield* Queue.take(harness.published)
+      const first = yield* LosslessQueue.take(harness.published)
       yield* Deferred.succeed(harness.publishGate, undefined)
       yield* AtomRegistry.getResult(registry, publishTyping, { suspendOnWaiting: true })
-      const second = yield* Queue.take(harness.published)
+      const second = yield* LosslessQueue.take(harness.published)
       const values = [first, second].map((request) => {
         assert.strictEqual(request.request._tag, "Event")
         if (request.request._tag !== "Event") return undefined
@@ -472,7 +473,7 @@ describe("Replica Atom graph", () => {
         ttl: "30 seconds"
       })
       yield* AtomRegistry.getResult(registry, publishRead, { suspendOnWaiting: true })
-      const state = yield* Queue.take(harness.published)
+      const state = yield* LosslessQueue.take(harness.published)
       assert.strictEqual(state.request._tag, "SetState")
       if (state.request._tag === "SetState") {
         assert.strictEqual(state.request.channel, "read")
@@ -516,7 +517,7 @@ describe("Replica Atom graph", () => {
       yield* Effect.addFinalizer(() => Effect.sync(unmountRemove))
       registry.set(removeRead, { key: "conversation-1" })
       yield* AtomRegistry.getResult(registry, removeRead, { suspendOnWaiting: true })
-      const removed = yield* Queue.take(harness.published)
+      const removed = yield* LosslessQueue.take(harness.published)
       assert.strictEqual(removed.request._tag, "RemoveState")
       if (removed.request._tag === "RemoveState") {
         assert.strictEqual(removed.request.channel, "read")
