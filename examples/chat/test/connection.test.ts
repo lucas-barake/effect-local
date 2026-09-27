@@ -4,8 +4,10 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Channel from "effect/Channel"
 import * as Effect from "effect/Effect"
 import * as Queue from "effect/Queue"
+import * as Scheduler from "effect/Scheduler"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
@@ -23,22 +25,26 @@ const connectingStatus: StatusResult = AsyncResult.success({ spaceId, synced: tr
 const offlineStatus: StatusResult = AsyncResult.success({ spaceId, synced: true, _tag: "Offline", pending: 0 })
 const unreadable: StatusResult = AsyncResult.fail(new ReplicaError.OwnerUnavailable({ reason: "takeover" }))
 
+const withoutYield = Effect.provideService(Scheduler.PreventSchedulerYield, true)
+
 const observe = Effect.gen(function*() {
   const statuses = yield* Queue.unbounded<StatusResult>()
   const connections = yield* Queue.unbounded<Connection>()
-  yield* connectionChanges(Stream.fromQueue(statuses)).pipe(
+  const statusStream = Queue.takeAll(statuses).pipe(withoutYield, Effect.succeed, Channel.fromPull, Stream.fromChannel)
+  const nextConnection = withoutYield(Queue.take(connections))
+  yield* connectionChanges(statusStream).pipe(
     Stream.runForEach((connection) => Queue.offer(connections, connection)),
     Effect.forkScoped
   )
   const untilOnline = Effect.gen(function*() {
     const seen: Array<Connection> = []
     yield* Queue.offer(statuses, online)
-    while (seen.at(-1) !== "online") seen.push(yield* Queue.take(connections))
+    while (seen.at(-1) !== "online") seen.push(yield* nextConnection)
     return seen
   })
   return {
     report: (status: StatusResult) => Queue.offer(statuses, status),
-    next: Queue.take(connections),
+    next: nextConnection,
     untilOnline
   }
 })
