@@ -186,7 +186,14 @@ export class AuthorizationDenied extends Schema.TaggedError<AuthorizationDenied>
 export class OwnerUnavailable extends Schema.TaggedError<OwnerUnavailable>(
   "@lucas-barake/effect-local/OwnerUnavailable"
 )("OwnerUnavailable", {
-  reason: Schema.Literals(["transport", "takeover", "promotion-failed", "protocol-mismatch"])
+  reason: Schema.Literals(["transport", "takeover", "promotion-failed"])
+}) {}
+
+export class BuildSuperseded extends Schema.TaggedError<BuildSuperseded>(
+  "@lucas-barake/effect-local/BuildSuperseded"
+)("BuildSuperseded", {
+  version: positiveInt,
+  supersedingVersion: positiveInt
 }) {}
 
 export const StorageError = Schema.Union([StorageUnavailable, StorageCorrupt, CanonicalEncodeError])
@@ -229,6 +236,7 @@ export const ReplicaError = Schema.Union([
   AuthenticatorUnavailable,
   OperationTimeout,
   AuthorizationDenied,
-  OwnerUnavailable
+  OwnerUnavailable,
+  BuildSuperseded
 ])
 export type ReplicaError = typeof ReplicaError.Type
