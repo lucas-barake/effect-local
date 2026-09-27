@@ -275,6 +275,44 @@ describe("EphemeralHub", () => {
   )
 
   it.effect(
+    "ends a replaced session at its next pull while the space keeps publishing",
+    Effect.fnUntraced(function*() {
+      return yield* Effect.gen(function*() {
+        const hub = yield* EphemeralHub.EphemeralHub
+        const publisher = yield* startJoin(hub, joinRequest(spaceA, memberB))
+        const pull = yield* hub.join(joinRequest(spaceA, memberA), null).pipe(Stream.toPull)
+        let snapshotSeen = false
+        while (!snapshotSeen) {
+          snapshotSeen = (yield* pull).some((message) => message._tag === "Snapshot")
+        }
+        const replacement = yield* startJoin(hub, joinRequest(spaceA, memberA))
+        const delivered: Array<string> = []
+        let ended: string | undefined
+        for (let message = 1; message <= 3 && ended === undefined; message++) {
+          yield* hub.publish(
+            Protocol.EphemeralSetStateRequest.make({
+              spaceId: spaceA,
+              member: memberB,
+              channel: "read",
+              key: "conversation-1",
+              value: { message },
+              ttlMillis: 30_000
+            }),
+            publisher.session.sessionToken,
+            null
+          )
+          const result = yield* Effect.result(pull)
+          if (Result.isFailure(result)) ended = result.failure._tag
+          else delivered.push(...result.success.map((entry) => entry._tag))
+        }
+        assert.deepStrictEqual(delivered, [])
+        assert.strictEqual(ended, "EphemeralSessionUnavailable")
+        yield* Fiber.interruptAll([publisher.fiber, replacement.fiber])
+      }).pipe(Effect.scoped, Effect.provide(layerTrusted(options)))
+    })
+  )
+
+  it.effect(
     "delivers live events, clears them at server expiry, and never replays them",
     Effect.fnUntraced(function*() {
       return yield* Effect.gen(function*() {

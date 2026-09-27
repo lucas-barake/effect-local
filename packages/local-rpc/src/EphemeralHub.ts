@@ -638,7 +638,7 @@ export const layer = <R = never,>(
               Effect.forkScoped({ startImmediately: true })
             )
             const ended = Deferred.await(departed).pipe(Effect.andThen(Cause.done()))
-            const pull = PubSub.takeAll(acquired.subscription).pipe(Effect.raceFirst(ended))
+            const pull = ended.pipe(Effect.raceFirst(PubSub.takeAll(acquired.subscription)))
             return Stream.concat(
               Stream.make(acquired.started, acquired.snapshot),
               Effect.succeed(pull).pipe(
