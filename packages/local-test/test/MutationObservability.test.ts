@@ -17,12 +17,12 @@ import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
-import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as FaultInjection from "../src/FaultInjection.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as TestReplica from "../src/TestReplica.js"
 import * as TestServer from "../src/TestServer.js"
 
@@ -226,7 +226,7 @@ describe("mutation observability", () => {
       const collectThroughBarrier = Effect.fnUntraced(function*(collector: typeof firstCollector) {
         const settlements: Array<Replica.SettledMutation<typeof PutTodo>> = []
         while (true) {
-          const settled = yield* Queue.take(collector)
+          const settled = yield* LosslessQueue.take(collector)
           settlements.push(settled)
           if (settled.settlement.pending.envelope.mutationId === barrier.envelope.mutationId) return settlements
         }
