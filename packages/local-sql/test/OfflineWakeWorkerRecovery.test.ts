@@ -10,13 +10,18 @@ import * as Exit from "effect/Exit"
 import * as Logger from "effect/Logger"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as OfflineWakeRuntime from "../src/internal/offlineWake.js"
+import * as Rows from "../src/internal/rows.js"
 import * as Migrations from "../src/Migrations.js"
 import type * as OfflineWake from "../src/OfflineWake.js"
+import * as VirtualTime from "./fixtures/VirtualTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
@@ -42,23 +47,39 @@ const options = {
 const withSqlDefect = (
   actualSql: SqlClient.SqlClient,
   shouldFail: (source: string) => boolean
-): { readonly sql: SqlClient.SqlClient; readonly injected: () => boolean } => {
-  let pending = true
+): { readonly sql: SqlClient.SqlClient; readonly injected: Deferred.Deferred<void> } => {
+  const injected = Deferred.makeUnsafe<void>()
   const sql = new Proxy(actualSql, {
     apply: (target, thisArg, args: Parameters<SqlClient.SqlClient>) => {
       const rawSource: unknown = args[0]
       let source: string
       if (Array.isArray(rawSource)) source = rawSource.join("")
       else source = String(rawSource)
-      if (pending && shouldFail(source)) {
-        pending = false
+      if (!Deferred.isDoneUnsafe(injected) && shouldFail(source)) {
+        Deferred.doneUnsafe(injected, Exit.void)
         return Effect.die("injected SQL defect")
       }
       return Reflect.apply(target, thisArg, args)
     }
   })
-  return { sql, injected: () => !pending }
+  return { sql, injected }
 }
+
+const runtimeLeaseThrough = (sql: SqlClient.SqlClient) => (expiresAt: number) =>
+  SqlSchema.findOne({
+    Request: Schema.Void,
+    Result: Rows.CountRow,
+    execute: () =>
+      sql`SELECT COUNT(*) AS count FROM effect_local_server_watch_runtimes WHERE expires_at >= ${expiresAt}`
+  })(undefined).pipe(Effect.repeat({ until: (row) => row.count > 0 }))
+
+const awaitExpandedThrough = (sql: SqlClient.SqlClient, sequence: number) =>
+  SqlSchema.findOne({
+    Request: Schema.Void,
+    Result: Schema.Struct({ expanded_sequence: Rows.integer(Schema.Int) }),
+    execute: () =>
+      sql`SELECT expanded_sequence FROM effect_local_server_offline_wake_spaces WHERE space_id = ${spaceId}`
+  })(undefined).pipe(Effect.repeat({ until: (row) => row.expanded_sequence >= sequence }))
 
 const makeMigratedSql = Effect.fnUntraced(function*(owner: Scope.Scope) {
   const sql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
@@ -117,8 +138,8 @@ describe("offline wake worker recovery", () => {
         )
 
         yield* service.enqueue(spaceId, Identity.ServerSequence.make(1))
+        yield* TestClock.adjust(options.coalescingWindow)
         yield* service.notify
-        yield* TestClock.adjust("2 seconds")
         yield* Deferred.await(cycleCompleted)
         const captured = yield* Queue.takeAll(logs)
         assert.isTrue(captured.some((log) => log.includes("Offline wake delivery failed")))
@@ -153,7 +174,7 @@ describe("offline wake worker recovery", () => {
         yield* service.notify
         yield* TestClock.adjust("2 seconds")
         const delivery = yield* Queue.take(deliveries)
-        assert.isTrue(fault.injected())
+        assert.isTrue(yield* Deferred.isDone(fault.injected))
         assert.strictEqual(delivery.clientId, clientId)
         yield* Scope.close(owner, Exit.void)
       },
@@ -179,14 +200,13 @@ describe("offline wake worker recovery", () => {
         const watchScope = yield* Scope.make()
         yield* service.registerWatch(spaceId, clientId).pipe(Scope.provide(watchScope))
 
-        yield* TestClock.adjust("10 seconds")
+        yield* VirtualTime.advanceGuardedUntil(runtimeLeaseThrough(actualSql), Deferred.await(fault.injected))
         yield* service.enqueue(spaceId, Identity.ServerSequence.make(1))
         yield* service.notify
-        yield* TestClock.adjust("25 seconds")
+        yield* VirtualTime.advanceGuarded(runtimeLeaseThrough(actualSql), "25 seconds")
         const rows = yield* actualSql<{ readonly count: number }>`SELECT COUNT(*) AS count
           FROM effect_local_server_watch_runtimes WHERE expires_at > 30_000`
         assert.deepStrictEqual(rows, [{ count: 1 }])
-        assert.isTrue(fault.injected())
         assert.strictEqual(yield* Queue.size(deliveries), 0)
         yield* Scope.close(watchScope, Exit.void)
         yield* Scope.close(owner, Exit.void)
@@ -229,15 +249,15 @@ describe("offline wake worker recovery", () => {
         yield* service.registerWatch(spaceId, clientId).pipe(Scope.provide(watchScope))
         const closed = yield* Scope.close(watchScope, Exit.void).pipe(Effect.exit)
         assert.isTrue(Exit.isFailure(closed))
-        assert.isTrue(fault.injected())
+        assert.isTrue(yield* Deferred.isDone(fault.injected))
 
         yield* service.enqueue(spaceId, Identity.ServerSequence.make(1))
+        yield* TestClock.adjust(options.coalescingWindow)
         yield* service.notify
-        yield* TestClock.adjust("2 seconds")
         yield* Deferred.await(cycleCompleted)
         assert.strictEqual(yield* Queue.size(targetDeliveries), 0)
-        yield* TestClock.adjust("10 seconds")
-        assert.strictEqual(yield* Queue.size(targetDeliveries), 1)
+        const delivery = yield* VirtualTime.advanceUntil(LosslessQueue.take(targetDeliveries))
+        assert.strictEqual(delivery.clientId, clientId)
         yield* Scope.close(owner, Exit.void)
       },
       provideNodeCrypto,
@@ -295,23 +315,24 @@ describe("offline wake worker recovery", () => {
         const second = yield* make(secondOwner)
 
         yield* first.enqueue(spaceId, Identity.ServerSequence.make(1))
+        yield* TestClock.adjust(options.coalescingWindow)
         yield* first.notify
-        yield* TestClock.adjust("2 seconds")
         yield* Deferred.await(firstStarted)
         yield* Ref.set(membership, false)
         yield* Deferred.succeed(decideFirst, undefined)
         yield* Deferred.await(firstDecided)
         yield* Ref.set(membership, true)
         yield* second.enqueue(spaceId, Identity.ServerSequence.make(2))
+        yield* TestClock.adjust(options.coalescingWindow)
+        yield* first.notify
         yield* second.notify
-        yield* TestClock.adjust("2 seconds")
+        yield* awaitExpandedThrough(sql, 2)
         const rows = yield* sql<{ readonly high_water_sequence: number }>`SELECT high_water_sequence
           FROM effect_local_server_offline_wakes
           WHERE space_id = ${spaceId} AND client_id = ${clientId}`
         assert.deepStrictEqual(rows, [{ high_water_sequence: 2 }])
         yield* Deferred.succeed(finishFirst, undefined)
-        yield* TestClock.adjust("2 seconds")
-        const delivery = yield* Queue.take(laterDelivery)
+        const delivery = yield* VirtualTime.advanceUntil(LosslessQueue.take(laterDelivery))
         assert.strictEqual(delivery.clientId, clientId)
         yield* Scope.close(firstOwner, Exit.void)
         yield* Scope.close(secondOwner, Exit.void)

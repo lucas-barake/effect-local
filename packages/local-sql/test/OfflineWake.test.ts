@@ -29,6 +29,7 @@ import * as QueryReactivity from "../src/QueryReactivity.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as Domain from "./Domain.js"
 import { serverDatabases, type SharedDatabase } from "./fixtures/ServerDatabase.js"
+import * as VirtualTime from "./fixtures/VirtualTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const writerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
@@ -207,40 +208,13 @@ const awaitReaderLeaseThrough = (sql: SqlClient.SqlClient, expiresAt: number) =>
           AND runtime.expires_at >= ${expiresAt}`
   })(undefined).pipe(Effect.repeat({ until: (row) => row.count > 0 }))
 
-const clockStep = 100
-
-const advanceWithinReaderLease = Effect.fnUntraced(function*(sql: SqlClient.SqlClient, duration: Duration.Input) {
-  const target = (yield* Clock.currentTimeMillis) + Duration.toMillis(Duration.fromInputUnsafe(duration))
-  while ((yield* Clock.currentTimeMillis) < target) {
-    const now = yield* Clock.currentTimeMillis
-    yield* awaitReaderLeaseThrough(sql, now + 2 * clockStep + 1)
-    yield* TestClock.setTime(Math.min(target, now + clockStep))
-    yield* Effect.yieldNow
-  }
-})
-
-const leaseGuardedStep = Effect.fnUntraced(function*(sql: SqlClient.SqlClient) {
-  const now = yield* Clock.currentTimeMillis
-  yield* awaitReaderLeaseThrough(sql, now + 2 * clockStep + 1)
-  yield* TestClock.setTime(now + clockStep)
-  yield* Effect.yieldNow
-})
+const advanceWithinReaderLease = (sql: SqlClient.SqlClient, duration: Duration.Input) =>
+  VirtualTime.advanceGuarded((through) => awaitReaderLeaseThrough(sql, through), duration)
 
 const advanceWithinReaderLeaseUntil = <A, E extends { readonly _tag: string },>(
   sql: SqlClient.SqlClient,
   awaited: Effect.Effect<A, E>
-) => {
-  const steps = Effect.forever(leaseGuardedStep(sql))
-  return Effect.raceFirst(awaited, steps)
-}
-
-const advanceUntil = <A, E extends { readonly _tag: string },>(
-  awaited: Effect.Effect<A, E>,
-  step: Duration.Input = clockStep
-) => {
-  const tick = TestClock.adjust(step).pipe(Effect.andThen(Effect.yieldNow))
-  return Effect.raceFirst(awaited, Effect.forever(tick))
-}
+) => VirtualTime.advanceGuardedUntil((through) => awaitReaderLeaseThrough(sql, through), awaited)
 
 const readerPresence = (sql: SqlClient.SqlClient) =>
   SqlSchema.findOne({
@@ -286,7 +260,7 @@ describe.each(serverDatabases)("offline wake delivery ($dialect)", (database) =>
       const submitted = yield* envelope(1).pipe(Effect.provide(NodeCrypto.layer))
       const receipt = yield* server.submit(submitted)
       assert.strictEqual(receipt._tag, "Accepted")
-      const delivered = yield* advanceUntil(Queue.take(deliveries))
+      const delivered = yield* VirtualTime.advanceUntil(Queue.take(deliveries))
       assert.strictEqual(delivered.spaceId, spaceId)
       assert.strictEqual(delivered.clientId, readerId)
       const deliveryKeys = Object.keys(delivered)
@@ -322,7 +296,7 @@ describe.each(serverDatabases)("offline wake delivery ($dialect)", (database) =>
         const recoveringScope = yield* Scope.make()
         const layerRecoveringDatabase = withServices(shared.layer())
         yield* makeServerInScope(offlineWake, layerRecoveringDatabase, recoveringScope)
-        const recovered = yield* advanceUntil(Deferred.await(delivery))
+        const recovered = yield* VirtualTime.advanceUntil(Deferred.await(delivery))
         assert.strictEqual(recovered.clientId, readerId)
         yield* Scope.close(recoveringScope, Exit.void)
       },
@@ -345,7 +319,7 @@ describe.each(serverDatabases)("offline wake delivery ($dialect)", (database) =>
       const server = yield* makeServer(offlineWake, serverServices())
       const receipt = yield* submit(server, 1)
       assert.strictEqual(receipt._tag, "Accepted")
-      const delivered = yield* advanceUntil(Deferred.await(delivery), "1 millis")
+      const delivered = yield* VirtualTime.advanceUntil(Deferred.await(delivery), "1 millis")
       assert.strictEqual(delivered.clientId, readerId)
     }, Effect.scoped)
   )
@@ -371,10 +345,10 @@ describe.each(serverDatabases)("offline wake delivery ($dialect)", (database) =>
 
       const receipt = yield* submit(server, 1)
       assert.strictEqual(receipt._tag, "Accepted")
-      const first = yield* advanceUntil(Queue.take(attempts))
+      const first = yield* VirtualTime.advanceUntil(Queue.take(attempts))
       assert.strictEqual(yield* Ref.get(attemptCount), 1)
 
-      const second = yield* advanceUntil(Queue.take(attempts))
+      const second = yield* VirtualTime.advanceUntil(Queue.take(attempts))
       assert.deepStrictEqual(second, first)
       assert.strictEqual(yield* Ref.get(attemptCount), 2)
     }, Effect.scoped)
@@ -406,7 +380,7 @@ describe.each(serverDatabases)("offline wake delivery ($dialect)", (database) =>
           const receipt = yield* submit(server, sequence)
           assert.strictEqual(receipt._tag, "Accepted")
         }
-        yield* advanceUntil(Deferred.await(cycleCompleted))
+        yield* VirtualTime.advanceUntil(Deferred.await(cycleCompleted))
         yield* Queue.take(deliveries)
         const inspectionSql = yield* shared.client
         assert.deepStrictEqual(yield* fences(inspectionSql), [{ high_water_sequence: 3, notified_sequence: 3 }])
@@ -504,7 +478,7 @@ describe.each(serverDatabases)("offline wake delivery ($dialect)", (database) =>
         assert.isAbove(pending[0].next_attempt_at, now)
 
         yield* Fiber.interrupt(watcher)
-        const delivered = yield* advanceUntil(Queue.take(deliveries))
+        const delivered = yield* VirtualTime.advanceUntil(Queue.take(deliveries))
         assert.strictEqual(delivered.clientId, readerId)
       },
       provideNodeFileSystem,
@@ -625,12 +599,12 @@ describe.each(serverDatabases)("offline wake delivery ($dialect)", (database) =>
       const server = yield* makeServer(offlineWake, serverServices())
       const receipt = yield* submit(server, 1)
       assert.strictEqual(receipt._tag, "Accepted")
-      yield* advanceUntil(Queue.take(attempts))
+      yield* VirtualTime.advanceUntil(Queue.take(attempts))
 
       yield* Ref.set(member, false)
-      yield* advanceUntil(Deferred.await(sentinelFailed))
-      yield* advanceUntil(Deferred.await(membershipDecided))
-      yield* advanceUntil(Deferred.await(retryCompleted))
+      yield* VirtualTime.advanceUntil(Deferred.await(sentinelFailed))
+      yield* VirtualTime.advanceUntil(Deferred.await(membershipDecided))
+      yield* VirtualTime.advanceUntil(Deferred.await(retryCompleted))
       assert.strictEqual(yield* Queue.size(attempts), 0)
       assert.strictEqual(yield* Ref.get(attemptCount), 2)
     }, Effect.scoped)
