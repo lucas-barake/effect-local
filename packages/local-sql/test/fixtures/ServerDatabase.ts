@@ -9,7 +9,7 @@ import type * as PlatformError from "effect/PlatformError"
 import * as Redacted from "effect/Redacted"
 import type * as Scope from "effect/Scope"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import type * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import { inject } from "vitest"
 
@@ -70,10 +70,12 @@ export const sqliteLayer = (): Layer.Layer<SqlClient.SqlClient, SqlError.SqlErro
 const sharedSqlite = Effect.gen(function*() {
   const fs = yield* FileSystem.FileSystem
   const directory = yield* fs.makeTempDirectoryScoped()
-  const filename = `${directory}/server.sqlite`
+  const client = yield* SqliteClient.make({ filename: `${directory}/server.sqlite`, disableWAL: true }).pipe(
+    Effect.provide(Reactivity.layer)
+  )
   return {
-    layer: () => SqliteClient.layer({ filename, disableWAL: true }),
-    client: SqliteClient.make({ filename }).pipe(Effect.provide(Reactivity.layer))
+    layer: () => Layer.succeed(SqlClient.SqlClient, client),
+    client: Effect.succeed(client)
   } satisfies SharedDatabase
 })
 
