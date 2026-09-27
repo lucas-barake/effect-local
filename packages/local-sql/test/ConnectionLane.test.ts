@@ -211,6 +211,22 @@ describe("ConnectionLane", () => {
   )
 
   it.effect(
+    "serves a deep queue of transactions on a synchronous driver without exhausting the stack",
+    Effect.fnUntraced(function*() {
+      const { hold, lane, sql } = yield* makeLane()
+      const held = yield* hold
+      const queued = yield* Effect.forEach(
+        Array.from({ length: 3000 }, (_, index) => index),
+        (index) => lane.withTransaction(sql`SELECT ${index} AS n`).pipe(Effect.forkChild({ startImmediately: true }))
+      )
+      yield* held.release
+      yield* Fiber.join(held.holder)
+      const exits = yield* Effect.forEach(queued, Fiber.await)
+      assert.isTrue(exits.every(Exit.isSuccess))
+    })
+  )
+
+  it.effect(
     "runs nested transactions and statements inside a transaction without taking another turn",
     Effect.fnUntraced(function*() {
       const { lane, sql } = yield* makeLane()

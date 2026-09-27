@@ -18,7 +18,9 @@ interface Waiter {
   resume: ((effect: Effect.Effect<void>) => void) | undefined
 }
 
-type Restore = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>
+export type Restore = <A, E extends { readonly _tag: string }, R,>(
+  effect: Effect.Effect<A, E, R>
+) => Effect.Effect<A, E, R>
 
 export interface PriorityLock {
   readonly take: (foreground: boolean, urgent: (now: number) => boolean, restore: Restore) => Effect.Effect<void>
@@ -31,10 +33,13 @@ export interface PriorityLock {
   readonly foregroundWaiting: (now: number) => boolean
 }
 
+const synchronousHandoffLimit = 16
+
 const now = (fiber: Fiber.Fiber<unknown, unknown>) => fiber.getRef(Clock.Clock).currentTimeMillisUnsafe()
 
 export const make = (maximumBackgroundWaitMillis: number): PriorityLock => {
   let held = false
+  let handoffDepth = 0
   const waiters: Array<Waiter> = []
   const preferred = (waiter: Waiter, at: number) =>
     waiter.foreground || waiter.urgent(at) || at - waiter.since >= maximumBackgroundWaitMillis
@@ -50,7 +55,14 @@ export const make = (maximumBackgroundWaitMillis: number): PriorityLock => {
     }
     waiters.splice(index, 1)
     next.granted = true
-    next.resume?.(Effect.void)
+    if (next.resume === undefined) return
+    if (handoffDepth >= synchronousHandoffLimit) {
+      next.resume(Effect.yieldNow)
+      return
+    }
+    handoffDepth += 1
+    next.resume(Effect.void)
+    handoffDepth -= 1
   }
 
   const release = Effect.withFiber((fiber) => {
