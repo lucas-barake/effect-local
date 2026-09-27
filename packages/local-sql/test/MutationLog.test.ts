@@ -4135,9 +4135,8 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
       yield* scheduler.notify
       yield* Deferred.await(firstAttempt)
-      yield* Effect.yieldNow
       yield* scheduler.notify
-      yield* TestClock.adjust("1 second")
+      for (let step = 0; step < 20; step++) yield* TestClock.adjust("100 millis")
       yield* Deferred.await(secondAttempt)
 
       assert.strictEqual(attempts, 2)
