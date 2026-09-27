@@ -24,6 +24,7 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
 import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as Codec from "../src/internal/codec.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as Rows from "../src/internal/rows.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
@@ -1131,11 +1132,11 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
         ),
         Effect.flatMap(Effect.forkChild({ startImmediately: true }))
       )
-      assert.deepStrictEqual(yield* Queue.take(wakes), { spaceId })
-      const periodicWake = yield* Queue.take(wakes).pipe(
+      assert.deepStrictEqual(yield* LosslessQueue.take(wakes), { spaceId })
+      const periodicWake = yield* LosslessQueue.take(wakes).pipe(
         Effect.forkChild({ startImmediately: true })
       )
-      yield* TestClock.adjust("1 second")
+      for (let step = 0; step < 15; step++) yield* TestClock.adjust("100 millis")
       assert.deepStrictEqual(yield* Fiber.join(periodicWake), { spaceId })
       yield* Fiber.interrupt(watcher)
     }, provideNodeCrypto)
