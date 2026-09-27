@@ -1351,6 +1351,35 @@ describe("BrowserReplica across builds", () => {
   )
 
   it.effect(
+    "fails a member update with BuildSuperseded when the tab is superseded while its session reopens",
+    Effect.fnUntraced(
+      function*() {
+        const opens = yield* Ref.make(0)
+        const reopened = yield* Deferred.make<void>()
+        const opening = Ref.getAndUpdate(opens, (count) => count + 1).pipe(
+          Effect.flatMap((count) => {
+            if (count === 0) return Effect.void
+            return Deferred.await(reopened)
+          })
+        )
+        const updates = yield* Ref.make<ReadonlyArray<unknown>>([])
+        const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralOpening(opening, updates) })
+        const leader = yield* environment.openTab
+        const follower = yield* environment.openTab
+        const session = yield* settle(openStatusSession(follower.context).pipe(Scope.provide(yield* Effect.scope)))
+        yield* settle(Scope.close(leader.scope, Exit.void))
+        yield* environment.openBuild(nextVersionBuild)
+        assert.strictEqual(yield* settledOutcome(listFrom(follower.replica)), "BuildSuperseded")
+        yield* Deferred.succeed(reopened, undefined)
+        assert.strictEqual(yield* settledOutcome(session.updateMember({ status: "away" })), "BuildSuperseded")
+        assert.deepStrictEqual(yield* Ref.get(updates), [])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
     "moves a superseded tab's status atoms to a BuildSuperseded failure",
     Effect.fnUntraced(
       function*() {

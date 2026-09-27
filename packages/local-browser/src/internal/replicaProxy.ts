@@ -644,7 +644,8 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     const opened = yield* Deferred.make<void, ReplicaError.ReplicaError | Ephemeral.EncodeError>()
 
     const updateRemote = (value: Json) =>
-      SubscriptionRef.get(handle).pipe(
+      ensureCurrent.pipe(
+        Effect.andThen(SubscriptionRef.get(handle)),
         Effect.flatMap(Option.match({
           onNone: () => Effect.void,
           onSome: (current) =>
