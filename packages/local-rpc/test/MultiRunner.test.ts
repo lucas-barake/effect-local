@@ -45,6 +45,7 @@ import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as Authentication from "../src/Authentication.js"
 import * as EphemeralClient from "../src/EphemeralClient.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
 import * as SyncClient from "../src/SyncClient.js"
 import * as SyncRpc from "../src/SyncRpc.js"
@@ -91,6 +92,7 @@ const authorizePrincipal = (principal: typeof Schema.Json.Type) => {
 }
 
 const maintenanceInterval = "3 seconds"
+const maintenanceClockStep = "100 millis"
 const serverOptions = {
   definition,
   authorizeAccess: ({ principal }) => authorizePrincipal(principal),
@@ -439,7 +441,7 @@ const endedSpans = (cluster: Cluster, name: string, spaceId: Identity.SpaceId) =
   )
 
 const nextEndedSpan = (cluster: Cluster, name: string, spaceId: Identity.SpaceId) =>
-  Stream.fromQueue(cluster.spans).pipe(
+  LosslessQueue.stream(cluster.spans).pipe(
     Stream.filter((span) => span.name === name && span.spaceId === spaceId),
     Stream.runHead,
     Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
@@ -516,12 +518,12 @@ const wakesAcrossRunners = (
       Stream.runForEach((wake) => Queue.offer(wakes, wake)),
       Effect.forkChild({ startImmediately: true })
     )
-    yield* Queue.take(wakes)
+    yield* LosslessQueue.take(wakes)
 
     const receipt = yield* submitOne(viaB.sync, yield* putTodo(spaceId, 1, "written through B"))
 
     assert.strictEqual(receipt._tag, "Accepted")
-    assert.deepStrictEqual(yield* Queue.take(wakes), { spaceId })
+    assert.deepStrictEqual(yield* LosslessQueue.take(wakes), { spaceId })
     yield* Fiber.interrupt(watching)
     const served = yield* nextEndedSpan(cluster, `${SpaceEntity.Space.type}(${spaceId}).Watch`, spaceId)
     assert.strictEqual(served.runner, "B")
@@ -589,10 +591,10 @@ const maintainsOnSingletonOwner = (layerSerialization: Layer.Layer<RpcSerializat
       .filter((runner) => runner.sharding.hasShardId(singletonShard))
       .map((runner) => runner.name)
 
-    yield* TestClock.adjust(maintenanceInterval)
-    const first = yield* nextEndedSpan(cluster, "ServerStore.maintain", spaceId)
-    yield* TestClock.adjust(maintenanceInterval)
-    const second = yield* nextEndedSpan(cluster, "ServerStore.maintain", spaceId)
+    const advanceClock = TestClock.adjust(maintenanceClockStep).pipe(Effect.forever)
+    const nextSweep = nextEndedSpan(cluster, "ServerStore.maintain", spaceId).pipe(Effect.raceFirst(advanceClock))
+    const first = yield* nextSweep
+    const second = yield* nextSweep
 
     assert.deepStrictEqual(owners, [first.runner])
     assert.strictEqual(second.runner, first.runner)
