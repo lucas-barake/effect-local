@@ -151,6 +151,14 @@ const makeServices = Effect.gen(function*() {
   return { faults, replica }
 })
 
+const advanceClockUntil = Effect.fnUntraced(
+  function*<A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) {
+    const fiber = yield* Effect.forkChild(effect, { startImmediately: true })
+    while (fiber.pollUnsafe() === undefined) yield* TestClock.adjust("1 millis")
+    return yield* Fiber.join(fiber)
+  }
+)
+
 const subscribe = <A, E,>(stream: Stream.Stream<A, E>) =>
   stream.pipe(
     Stream.runHead,
@@ -200,8 +208,7 @@ describe("mutation observability", () => {
       assert.strictEqual(firstCommitted.receipt.mutationId, pending.envelope.mutationId)
       assert.strictEqual(dropped.receipt.mutationId, pending.envelope.mutationId)
       yield* faults.holdNextReceipt(spaceId)
-      yield* TestClock.adjust("1 millis")
-      const secondCommitted = yield* faults.awaitReceiptCommitted(spaceId)
+      const secondCommitted = yield* advanceClockUntil(faults.awaitReceiptCommitted(spaceId))
       assert.deepStrictEqual(secondCommitted.receipt, firstCommitted.receipt)
       const barrier = yield* space.mutate(PutTodo, { id: "trigger", title: "next reconciliation" })
       yield* faults.partitionAfterNextReceipt(spaceId)
@@ -209,8 +216,7 @@ describe("mutation observability", () => {
       const firstReturned = yield* faults.awaitReceiptReturned(spaceId)
       yield* faults.awaitRequestRejectedOffline(spaceId)
       yield* faults.heal(spaceId)
-      yield* TestClock.adjust("2 millis")
-      const duplicateReturned = yield* faults.awaitReceiptReturned(spaceId)
+      const duplicateReturned = yield* advanceClockUntil(faults.awaitReceiptReturned(spaceId))
       assert.strictEqual(firstReturned.receipt.mutationId, pending.envelope.mutationId)
       assert.strictEqual(duplicateReturned.receipt.mutationId, pending.envelope.mutationId)
       assert.deepStrictEqual(duplicateReturned.receipt, firstReturned.receipt)
