@@ -6,6 +6,7 @@ import * as Option from "effect/Option"
 import * as Pull from "effect/Pull"
 import * as Result from "effect/Result"
 import * as Schedule from "effect/Schedule"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as SubscriptionRef from "effect/SubscriptionRef"
@@ -137,7 +138,7 @@ const makeProtocol = (
 
     let connected = false
     const readFrames = Effect.gen(function*() {
-      const { pull } = yield* socket.reader
+      const { pull } = yield* socket.reader.pipe(Effect.provideService(Scheduler.PreventSchedulerYield, true))
       currentError = undefined
       if (Option.isSome(hooks)) yield* hooks.value.onConnect
       yield* writer.write(parser.encode(RpcMessage.constPing)!)

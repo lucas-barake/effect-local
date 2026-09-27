@@ -6,9 +6,12 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as FiberSet from "effect/FiberSet"
 import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import * as Schedule from "effect/Schedule"
+import * as Scheduler from "effect/Scheduler"
+import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import * as Socket from "effect/unstable/socket/Socket"
 import * as Authentication from "../src/Authentication.js"
 import type * as EphemeralClient from "../src/EphemeralClient.js"
@@ -61,7 +64,62 @@ const buildAndDial = (
   reached: Deferred.Deferred<void>
 ) => Layer.build(layer).pipe(Effect.andThen(Deferred.await(reached)), Effect.scoped)
 
+type WebSocketEventType = "open" | "message" | "error" | "close"
+
+class OpensAfterFirstStateRead implements Socket.WebSocketLike {
+  readonly listeners = new Map<WebSocketEventType, Set<(event: Socket.WebSocketEvent) => void>>()
+  state = 0
+  openScheduled = false
+
+  constructor(readonly deliver: (effect: Effect.Effect<void>) => unknown) {}
+
+  get readyState(): number {
+    if (!this.openScheduled) {
+      this.openScheduled = true
+      this.deliver(Effect.yieldNow.pipe(Effect.andThen(Effect.sync(() => {
+        this.state = 1
+        for (const listener of Array.from(this.listeners.get("open") ?? [])) listener({ type: "open" })
+      }))))
+    }
+    return this.state
+  }
+
+  addEventListener(type: WebSocketEventType, listener: (event: Socket.WebSocketEvent) => void): void {
+    const listeners = this.listeners.get(type) ?? new Set()
+    listeners.add(listener)
+    this.listeners.set(type, listeners)
+  }
+
+  removeEventListener(type: WebSocketEventType, listener: (event: Socket.WebSocketEvent) => void): void {
+    this.listeners.get(type)?.delete(listener)
+  }
+
+  close(): void {}
+  send(): void {}
+}
+
+const connectsWhenOpenArrivesDuringAcquisition = Effect.fnUntraced(function*() {
+  const connected = yield* Deferred.make<void>()
+  const deliver = yield* FiberSet.makeRuntime()
+  const hooks = RpcClient.ConnectionHooks.of({
+    onConnect: Deferred.succeed(connected, undefined),
+    onDisconnect: Effect.void
+  })
+  const layer = SyncClient.layerWebSocket({ url: "ws://127.0.0.1:1/sync" }).pipe(
+    Layer.provide(Layer.succeed(Socket.WebSocketConstructor, () => new OpensAfterFirstStateRead(deliver))),
+    Layer.provide(Layer.succeed(RpcClient.ConnectionHooks, hooks)),
+    Layer.provide(layerStaticCredential)
+  )
+  yield* Layer.build(layer)
+  yield* Deferred.await(connected)
+}, Effect.scoped)
+
 describe("SyncClient.layerWebSocket", () => {
+  it.effect(
+    "connects when the socket opens while the reader is still being acquired",
+    () => connectsWhenOpenArrivesDuringAcquisition().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 5))
+  )
+
   it.live(
     "re-runs an Effect url on every reconnect instead of pinning the first address",
     Effect.fnUntraced(function*() {
