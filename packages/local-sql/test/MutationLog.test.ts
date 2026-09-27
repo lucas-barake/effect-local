@@ -329,6 +329,21 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       Layer.provide(serverDatabase())
     )
   }
+  const refusePruning = Effect.fnUntraced(function*(
+    sql: SqlClient.SqlClient,
+    table: "effect_local_authoritative_log" | "effect_local_server_receipts"
+  ) {
+    if (database.dialect === "pg") {
+      yield* sql.unsafe(`CREATE FUNCTION refuse_pruning() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'pruning refused'; END $$`)
+      yield* sql.unsafe(`CREATE TRIGGER refuse_pruning BEFORE DELETE ON ${table}
+        FOR EACH ROW EXECUTE FUNCTION refuse_pruning()`)
+      return sql.unsafe(`DROP TRIGGER refuse_pruning ON ${table}`).pipe(Effect.asVoid)
+    }
+    yield* sql.unsafe(`CREATE TRIGGER refuse_pruning BEFORE DELETE ON ${table}
+      BEGIN SELECT RAISE(ABORT, 'pruning refused'); END`)
+    return sql.unsafe(`DROP TRIGGER refuse_pruning`).pipe(Effect.asVoid)
+  })
 
   it.effect(
     "does not scale SQL writes or transactions with watcher fanout",
@@ -1550,12 +1565,16 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           retainedReceipts: 1,
           maximumReceipts: 3
         }
-        const server = yield* service(
-          ServerStore.ServerStore,
-          ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-            Layer.provide(layerRuntime),
-            Layer.provide(serverDatabase())
-          )
+        const layerServerDatabase = serverDatabase()
+        const layerLive = ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
+        const server = Context.get(context, ServerStore.ServerStore)
+        const allowPruning = yield* refusePruning(
+          Context.get(context, SqlClient.SqlClient),
+          "effect_local_authoritative_log"
         )
         for (let sequence = 1; sequence <= 2; sequence++) {
           yield* server.submit(
@@ -1577,6 +1596,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         )
         const blocked = yield* server.submit(third).pipe(Effect.flip)
         assert.strictEqual(blocked._tag, "CapacityExceeded")
+        yield* allowPruning
         yield* server.maintain(spaceId)
         assert.strictEqual((yield* server.submit(third))._tag, "Accepted")
       },
@@ -1635,18 +1655,22 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           retainedReceipts: 0,
           maximumReceipts: 2
         }
-        const server = yield* service(
-          ServerStore.ServerStore,
-          ServerStore.layer({
-            ...bounded,
-            definition: Domain.definition,
-            authorizeAccess: () => Effect.void,
-            authorizeMutation: () => Effect.fail(new TestAuthorizationError({ reason: "denied" })),
-            authorizeRead: () => Effect.void
-          }).pipe(
-            Layer.provide(layerRuntime),
-            Layer.provide(serverDatabase())
-          )
+        const layerServerDatabase = serverDatabase()
+        const layerLive = ServerStore.layer({
+          ...bounded,
+          definition: Domain.definition,
+          authorizeAccess: () => Effect.void,
+          authorizeMutation: () => Effect.fail(new TestAuthorizationError({ reason: "denied" })),
+          authorizeRead: () => Effect.void
+        }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
+        const server = Context.get(context, ServerStore.ServerStore)
+        const allowPruning = yield* refusePruning(
+          Context.get(context, SqlClient.SqlClient),
+          "effect_local_server_receipts"
         )
         const submitted: Array<Protocol.MutationEnvelope> = []
         for (let sequence = 1; sequence <= 3; sequence++) {
@@ -1667,6 +1691,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const blocked = yield* server.submit(submitted[2]).pipe(Effect.flip)
         assert.strictEqual(blocked._tag, "CapacityExceeded")
 
+        yield* allowPruning
         yield* server.maintain(spaceId)
 
         assert.strictEqual((yield* server.submit(submitted[2]))._tag, "Rejected")
