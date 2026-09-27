@@ -1029,8 +1029,8 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const blockedQueryReactivity = QueryReactivity.QueryReactivity.of({
         retain: () => Effect.succeed(Effect.void),
         record: () => Effect.void,
-        affected: Effect.fnUntraced(function*() {
-          if (!(yield* Ref.get(blockInvalidation))) return []
+        affected: Effect.fnUntraced(function*(changes: QueryReactivity.Changes) {
+          if (!(yield* Ref.get(blockInvalidation)) || changes.models.size === 0) return []
           yield* Deferred.succeed(invalidateStarted, undefined)
           yield* Deferred.await(releaseInvalidation)
           return []
