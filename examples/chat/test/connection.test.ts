@@ -76,39 +76,22 @@ describe("chat connection", () => {
   )
 
   it.effect(
-    "does not report offline for an Offline that turns Connecting within the grace",
-    Effect.fnUntraced(function*() {
-      const connection = yield* observe
-      yield* connection.report(offlineStatus)
-      assert.strictEqual(yield* connection.next, "connecting")
-      yield* TestClock.adjust("1 second")
-      yield* connection.report(connectingStatus)
-      yield* TestClock.adjust("1 minute")
-      assert.notInclude(yield* connection.untilOnline, "offline")
-    }, Effect.scoped)
-  )
-
-  it.effect(
-    "reports offline once the replica stays Offline for the grace",
+    "reports offline as soon as the replica reports Offline",
     Effect.fnUntraced(function*() {
       const connection = yield* observe
       assert.deepStrictEqual(yield* connection.untilOnline, ["online"])
       yield* connection.report(offlineStatus)
-      assert.strictEqual(yield* connection.next, "connecting")
-      yield* TestClock.adjust("2 seconds")
       assert.strictEqual(yield* connection.next, "offline")
     }, Effect.scoped)
   )
 
   it.effect(
-    "reports offline once the status stays unreadable for the grace",
+    "reports an unreadable status as failed, not offline",
     Effect.fnUntraced(function*() {
       const connection = yield* observe
       assert.deepStrictEqual(yield* connection.untilOnline, ["online"])
       yield* connection.report(unreadable)
-      assert.strictEqual(yield* connection.next, "connecting")
-      yield* TestClock.adjust("2 seconds")
-      assert.strictEqual(yield* connection.next, "offline")
+      assert.strictEqual(yield* connection.next, "failed")
     }, Effect.scoped)
   )
 })

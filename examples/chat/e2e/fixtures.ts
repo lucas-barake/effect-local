@@ -21,6 +21,7 @@ const recordFalseStates = () => {
   const falseState = (line: string) =>
     line === "offline" ||
     line.startsWith("Offline") ||
+    line.startsWith("Sync failed") ||
     line.startsWith("No conversations yet") ||
     line.startsWith("No messages yet. Say hello!")
   const scan = () => {
