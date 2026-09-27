@@ -65,7 +65,7 @@ const historyCount = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
 
 const settle = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
   for (let attempt = 0; attempt < 10_000; attempt++) {
-    if ((yield* historyCount(spaceId)) <= 3) return
+    if ((yield* historyCount(spaceId).pipe(Effect.provideService(Scheduler.PreventSchedulerYield, true))) <= 3) return
     yield* Effect.yieldNow
   }
 })
