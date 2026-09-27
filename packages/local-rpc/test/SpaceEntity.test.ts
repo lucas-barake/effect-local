@@ -27,6 +27,7 @@ import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as EphemeralHub from "../src/EphemeralHub.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
 
@@ -403,18 +404,19 @@ describe("SpaceEntity", () => {
           Effect.forkChild({ startImmediately: true })
         )
       const first = yield* start(member, firstReady)
-      yield* Queue.take(entered)
-      const second = yield* joinClient.JoinEphemeral({
+      yield* LosslessQueue.take(entered)
+      const secondResult = yield* joinClient.JoinEphemeral({
         request: { spaceId: spaceA, member: secondMember, value: null, ttlMillis: 5_000 },
         assertion
       }).pipe(
         Stream.runDrain,
-        Effect.timeout("1 second"),
         Effect.result,
-        Effect.forkChild({ startImmediately: true })
+        Effect.raceFirst(
+          LosslessQueue.take(entered).pipe(
+            Effect.andThen(Effect.die("a second join entered verification past the bound"))
+          )
+        )
       )
-      yield* TestClock.adjust("1 second")
-      const secondResult = yield* Fiber.join(second)
       assert.isTrue(Result.isFailure(secondResult))
       if (Result.isFailure(secondResult)) {
         assert.strictEqual(secondResult.failure._tag, "CapacityExceeded")

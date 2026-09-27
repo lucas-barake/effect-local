@@ -9,6 +9,10 @@ import * as Stream from "effect/Stream"
 
 const withoutYield = Effect.provideService(Scheduler.PreventSchedulerYield, true)
 
+export const take = <A, E extends { readonly _tag: string } = never,>(
+  queue: Queue.Dequeue<A, E>
+): Effect.Effect<A, E> => Effect.suspend(() => Queue.takeUnsafe(queue) ?? withoutYield(Queue.take(queue)))
+
 export const stream = <A, E extends { readonly _tag: string },>(
   queue: Queue.Dequeue<A, E>
 ): Stream.Stream<A, Exclude<E, Cause.Done>> =>
@@ -38,7 +42,7 @@ const mergeHalting = <A, E extends { readonly _tag: string }, R,>(
         Effect.forkIn(forkedScope)
       )
     }
-    return Effect.suspend(() => Queue.takeUnsafe(queue) ?? withoutYield(Queue.take(queue)))
+    return take(queue)
   })
   return Stream.fromChannel(Channel.fromTransformBracket(transform))
 }
