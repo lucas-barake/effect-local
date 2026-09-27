@@ -35,6 +35,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as ConnectionLane from "../src/ConnectionLane.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as Rows from "../src/internal/rows.js"
 import * as LocalStore from "../src/LocalStore.js"
 import * as Migrations from "../src/Migrations.js"
@@ -402,12 +403,12 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
             Stream.runForEach((wake) => Queue.offer(queue, wake)),
             Effect.forkChild({ startImmediately: true })
           ))
-        yield* Effect.forEach(watcherQueues, Queue.take)
+        yield* Effect.forEach(watcherQueues, LosslessQueue.take)
         yield* Ref.set(transactionCalls, 0)
         yield* observedSql`DELETE FROM space_update_probe`
 
         assert.strictEqual((yield* submit(3))._tag, "Accepted")
-        const wakes = yield* Effect.forEach(watcherQueues, Queue.take)
+        const wakes = yield* Effect.forEach(watcherQueues, LosslessQueue.take)
         assert.deepStrictEqual(wakes, Array.from({ length: 4 }, () => ({ spaceId })))
         assert.strictEqual(yield* Ref.get(transactionCalls), baselineTransactions)
         assert.strictEqual((yield* countUpdates(undefined)).count, baselineUpdates)
@@ -894,7 +895,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           Stream.runForEach((wake) => Queue.offer(wakes, wake)),
           Effect.forkChild({ startImmediately: true })
         )
-        yield* Queue.take(wakes)
+        yield* LosslessQueue.take(wakes)
         assert.strictEqual(
           (yield* server.submit(
             yield* envelope(
@@ -906,7 +907,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           ))._tag,
           "Accepted"
         )
-        yield* Queue.take(wakes)
+        yield* LosslessQueue.take(wakes)
         yield* server.maintain(spaceId)
         yield* TestClock.adjust("20 millis")
         yield* Effect.yieldNow.pipe(
@@ -2730,14 +2731,14 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         Stream.runForEach((wake) => Queue.offer(wakes, wake)),
         Effect.forkChild({ startImmediately: true })
       )
-      yield* Queue.take(wakes)
+      yield* LosslessQueue.take(wakes)
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("retry-wake"))
       const first = yield* server.submit(pending.envelope)
       assert.strictEqual(first._tag, "Accepted")
-      yield* Queue.take(wakes)
+      yield* LosslessQueue.take(wakes)
 
       assert.deepStrictEqual(yield* server.submit(pending.envelope), first)
-      assert.deepStrictEqual(yield* Queue.take(wakes), Protocol.Wake.make({ spaceId }))
+      assert.deepStrictEqual(yield* LosslessQueue.take(wakes), Protocol.Wake.make({ spaceId }))
       yield* Fiber.interrupt(watcher)
     }, Effect.scoped))
   )
