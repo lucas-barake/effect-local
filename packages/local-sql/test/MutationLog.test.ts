@@ -4279,6 +4279,42 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
 
+  it.effect(
+    "delivers a wake published before the watch starts merging its sources",
+    pipe(Effect.fnUntraced(
+      function*() {
+        const server = yield* service(ServerStore.ServerStore, serverLayer())
+        const initial = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        let first = true
+        const wakes = yield* server.watch(watchRequest()).pipe(
+          Stream.tap(() => {
+            if (!first) return Effect.void
+            first = false
+            return Deferred.succeed(initial, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          }),
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild
+        )
+        yield* Deferred.await(initial)
+        yield* server.submit(
+          yield* envelope(
+            Domain.PutTodo.name,
+            Domain.todo("preempted-wake"),
+            1,
+            Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000071")
+          )
+        )
+        yield* Deferred.succeed(release, undefined)
+        assert.strictEqual((yield* Fiber.join(wakes)).length, 2)
+      },
+      Effect.provide(NodeCrypto.layer),
+      Effect.scoped,
+      Effect.provideService(Scheduler.MaxOpsBeforeYield, 22)
+    ))
+  )
+
   it.effect("runs multi-read queries against one committed visible snapshot", () =>
     Effect.scoped(Effect.gen(function*() {
       const fs = yield* FileSystem.FileSystem
