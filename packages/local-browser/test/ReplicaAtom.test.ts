@@ -33,8 +33,8 @@ import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
-import * as Stream from "effect/Stream"
 import { Atom, AtomRegistry } from "effect/unstable/reactivity"
+import type * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
@@ -348,6 +348,30 @@ const makeEphemeralHarness = Effect.fnUntraced(function*(options?: {
   return { messages, published, joins, publishGate, layerEphemeralClient }
 })
 
+const awaitSuccess = <A, E extends { readonly _tag: string },>(
+  registry: AtomRegistry.AtomRegistry,
+  atom: Atom.Atom<AsyncResult.AsyncResult<A, E>>,
+  predicate: (value: A) => boolean
+): Effect.Effect<A, E> =>
+  Effect.callback<A, E>((resume) => {
+    const settle = (result: AsyncResult.AsyncResult<A, E>) => {
+      if (result._tag === "Failure") {
+        resume(Effect.failCause(result.cause))
+        return true
+      }
+      if (result._tag === "Success" && predicate(result.value)) {
+        resume(Effect.succeed(result.value))
+        return true
+      }
+      return false
+    }
+    if (settle(registry.get(atom))) return Effect.void
+    const cancel = registry.subscribe(atom, (result) => {
+      if (settle(result)) cancel()
+    })
+    return Effect.sync(cancel)
+  })
+
 const statusSessionOptions = {
   spaceId,
   member: memberA,
@@ -395,9 +419,11 @@ describe("Replica Atom graph", () => {
       assert.deepStrictEqual(entries, [
         { member: memberA, key: "conversation-1", value: { message: 42 }, expiresAtMillis: 10_000 }
       ])
-      const memberVisible = yield* AtomRegistry.toStreamResult(registry, membersAtom).pipe(
-        Stream.filter((current) => current.some((entry) => entry.member.clientId === memberB.clientId)),
-        Stream.runHead,
+      const memberVisible = yield* awaitSuccess(
+        registry,
+        membersAtom,
+        (current) => current.some((entry) => entry.member.clientId === memberB.clientId)
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* Queue.offer(
@@ -409,17 +435,17 @@ describe("Replica Atom graph", () => {
         })
       )
       yield* Fiber.join(memberVisible)
-      const eventVisible = yield* AtomRegistry.toStreamResult(registry, eventsAtom).pipe(
-        Stream.filter((envelope) => envelope.payload.active),
-        Stream.runHead,
+      const eventVisible = yield* awaitSuccess(registry, eventsAtom, (envelope) => envelope.payload.active).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* Queue.offer(harness.messages, typingEvent(3, { active: true }, memberB))
-      const envelope = Option.getOrThrow(yield* Fiber.join(eventVisible))
+      const envelope = yield* Fiber.join(eventVisible)
       assert.deepStrictEqual(envelope, { member: memberB, payload: { active: true } })
-      const stateVisible = yield* AtomRegistry.toStreamResult(registry, stateAtom).pipe(
-        Stream.filter((current) => current.some((entry) => entry.key === "conversation-2")),
-        Stream.runHead,
+      const stateVisible = yield* awaitSuccess(
+        registry,
+        stateAtom,
+        (current) => current.some((entry) => entry.key === "conversation-2")
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* Queue.offer(harness.messages, readStateSet(4, "conversation-2", { message: 7 }))
@@ -549,9 +575,11 @@ describe("Replica Atom graph", () => {
       if (Result.isFailure(poisoned)) {
         assert.strictEqual(poisoned.failure._tag, "EphemeralDecodeError")
       }
-      const stateVisible = yield* AtomRegistry.toStreamResult(registry, stateAtom).pipe(
-        Stream.filter((current) => current.some((entry) => entry.key === "conversation-1")),
-        Stream.runHead,
+      const stateVisible = yield* awaitSuccess(
+        registry,
+        stateAtom,
+        (current) => current.some((entry) => entry.key === "conversation-1")
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* Queue.offer(harness.messages, readStateSet(3, "conversation-1", { message: 1 }))
@@ -589,14 +617,14 @@ describe("Replica Atom graph", () => {
       yield* Effect.addFinalizer(() => Effect.sync(unmountState))
       const entries = yield* AtomRegistry.getResult(registry, stateAtom)
       assert.strictEqual(entries.length, 1)
-      const replacedMembers = yield* AtomRegistry.toStreamResult(registry, membersAtom).pipe(
-        Stream.filter((current) => current.length === 1 && current[0]?.member.clientId === memberB.clientId),
-        Stream.runHead,
+      const replacedMembers = yield* awaitSuccess(
+        registry,
+        membersAtom,
+        (current) => current.length === 1 && current[0]?.member.clientId === memberB.clientId
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
-      const clearedState = yield* AtomRegistry.toStreamResult(registry, stateAtom).pipe(
-        Stream.filter((current) => current.length === 0),
-        Stream.runHead,
+      const clearedState = yield* awaitSuccess(registry, stateAtom, (current) => current.length === 0).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* Queue.offer(
@@ -632,30 +660,33 @@ describe("Replica Atom graph", () => {
 
       const id = `pending-atom-${Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")}`
       yield* faults.holdNextReceipt(spaceId)
-      const submitted = yield* AtomRegistry.toStreamResult(registry, pending).pipe(
-        Stream.filter((items) =>
+      const submitted = yield* awaitSuccess(
+        registry,
+        pending,
+        (items) =>
           items.some((item) => item.payload.id === id && item.submissionState === "Submitting" && item.attempts > 0)
-        ),
-        Stream.runHead,
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       registry.set(mutation, { id, title: "0-pending" })
       yield* faults.awaitReceiptCommitted(spaceId)
-      const pendingItems = Option.getOrThrow(yield* Fiber.join(submitted))
+      const pendingItems = yield* Fiber.join(submitted)
       const item = pendingItems.find((candidate) => candidate.payload.id === id)
       assert.isDefined(item)
       assert.deepStrictEqual(item.payload, { id, title: "0-pending" })
       assert.strictEqual(item.submissionState, "Submitting")
       assert.strictEqual(item.attempts, 1)
 
-      const settled = yield* AtomRegistry.toStreamResult(registry, pending).pipe(
-        Stream.filter((items) => !items.some((candidate) => candidate.payload.id === id)),
-        Stream.runHead,
+      const settled = yield* awaitSuccess(
+        registry,
+        pending,
+        (items) => !items.some((candidate) => candidate.payload.id === id)
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* faults.releaseHeldReceipt(spaceId)
       yield* faults.awaitReceiptReturned(spaceId)
-      const settledItems = Option.getOrThrow(yield* Fiber.join(settled))
+      const settledItems = yield* Fiber.join(settled)
       assert.isFalse(settledItems.some((candidate) => candidate.payload.id === id))
     }, Effect.scoped)
   )
@@ -1067,12 +1098,7 @@ describe("Replica Atom graph", () => {
       )
       assert.strictEqual(pending.envelope.name, PutTodo.name)
       const receipt = graph.receipt(spaceId, PutTodo, pending.envelope.mutationId)
-      const accepted = Option.getOrThrow(Option.getOrThrow(
-        yield* AtomRegistry.toStreamResult(registry, receipt).pipe(
-          Stream.filter(Option.isSome),
-          Stream.runHead
-        )
-      ))
+      const accepted = Option.getOrThrow(yield* awaitSuccess(registry, receipt, Option.isSome))
       assert.strictEqual(accepted._tag, "Accepted")
       pipe(
         (yield* AtomRegistry.getResult(registry, query)).filter((todo) => todo.id === "1"),
@@ -1146,10 +1172,7 @@ describe("Replica Atom graph", () => {
       )
 
       const awaitReceipt = (address: Identity.SpaceId, mutationId: Identity.MutationId) =>
-        AtomRegistry.toStreamResult(registry, graph.receipt(address, PutTodo, mutationId)).pipe(
-          Stream.filter(Option.isSome),
-          Stream.runHead,
-          Effect.map(Option.getOrThrow),
+        awaitSuccess(registry, graph.receipt(address, PutTodo, mutationId), Option.isSome).pipe(
           Effect.map(Option.getOrThrow)
         )
       const [firstReceipt, secondReceipt] = yield* Effect.all([
@@ -1163,20 +1186,18 @@ describe("Replica Atom graph", () => {
       assert.strictEqual((yield* AtomRegistry.getResult(registry, graph.aggregateStatus)).spaces, 2)
 
       registry.set(graph.join, thirdSpaceId)
-      const joinedSpaces = Option.getOrThrow(
-        yield* AtomRegistry.toStreamResult(registry, graph.spaces).pipe(
-          Stream.filter((spaces) => spaces.some((space) => space.spaceId === thirdSpaceId)),
-          Stream.runHead
-        )
+      const joinedSpaces = yield* awaitSuccess(
+        registry,
+        graph.spaces,
+        (spaces) => spaces.some((space) => space.spaceId === thirdSpaceId)
       )
       assert.deepStrictEqual(joinedSpaces.map((space) => space.spaceId), [spaceId, secondSpaceId, thirdSpaceId])
 
       registry.set(graph.leave, secondSpaceId)
-      const remainingSpaces = Option.getOrThrow(
-        yield* AtomRegistry.toStreamResult(registry, graph.spaces).pipe(
-          Stream.filter((spaces) => !spaces.some((space) => space.spaceId === secondSpaceId)),
-          Stream.runHead
-        )
+      const remainingSpaces = yield* awaitSuccess(
+        registry,
+        graph.spaces,
+        (spaces) => !spaces.some((space) => space.spaceId === secondSpaceId)
       )
       assert.deepStrictEqual(remainingSpaces.map((space) => space.spaceId), [spaceId, thirdSpaceId])
       const error = yield* AtomRegistry.getResult(registry, secondEntity).pipe(Effect.flip)
