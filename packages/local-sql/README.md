@@ -22,15 +22,21 @@ background gate holder keeps one lane turn across the transactions of its gated 
 `receiptPersistBatchSize` receipts (8 by default) while foreground work is waiting. Code that uses `LocalStore.layer`
 or `QueryExecutor.layer` directly provides one `ConnectionLane.makeLayer()` per database.
 
-`Replica.Space.status` reports a `SpaceStatus`. An activated space is `Connecting` until its first sync attempt
-resolves and again while a sync runs. It becomes `Online` once the sync completes, and `Offline` only after an attempt
-failed or the transport reports that it cannot connect. Inactive spaces report `Offline`. Every status carries
-`synced`, which is `true` once the space has an installed replication view, meaning a bootstrap completed at least
-once, and `false` before that. It is read from durable storage, so a synced space stays `synced` after an offline
-reload. It returns to `false` only when the view is cleared: after leaving and rejoining the space, after the server
-revokes read access, or after a schema migration that requires a fresh bootstrap. A scope change keeps the installed
-view until the next bootstrap replaces it. An app can show an empty state when `synced` is `true` and a loading state
-while it is `false`.
+`Replica.Space.status` reports a `SpaceStatus`. A remembered space that is not active is `Idle`, with its pending
+count: before its first activation, after deactivation or eviction, and between background syncs. `Idle` says nothing
+about the transport. An activated space is `Connecting` until its first sync attempt resolves. It becomes `Online`
+once a sync completes, and `Offline` only after an attempt failed or the transport reports that it cannot connect.
+Later syncs keep the last outcome until they resolve. Every status carries `synced`, which is `true` once the space
+has an installed replication view, meaning a bootstrap completed at least once, and `false` before that. It is read
+from durable storage, so a synced space stays `synced` after an offline reload. It returns to `false` only when the
+view is cleared: after leaving and rejoining the space, after the server revokes read access, or after a schema
+migration that requires a fresh bootstrap. A scope change keeps the installed view until the next bootstrap replaces
+it. An app can show an empty state when `synced` is `true` and a loading state while it is `false`.
+
+`Replica.status` summarizes every remembered space. `counts` holds one count per category, idle included, and
+`totalPending` sums every space. `state` is computed from the active spaces only: `Idle` when none is active, `Failed`
+or `NeedsAuthentication` when any active space is, `Online` or `Offline` when every active space is, `Connecting` when
+any active space is still connecting, and `Degraded` otherwise.
 
 `SqlReplica.layerWorkflow` uses the same store, query executor, and idempotent reconciliation pass with finite Effect
 Workflow generations. Local SQLite stores canonical entities, visible entities, pending mutations, bounded terminal

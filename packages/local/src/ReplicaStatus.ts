@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema"
 import * as Identity from "./Identity.js"
 
+export const Idle = Schema.TaggedStruct("Idle", { pending: Schema.Int })
 export const Offline = Schema.TaggedStruct("Offline", { pending: Schema.Int })
 export const Connecting = Schema.TaggedStruct("Connecting", { pending: Schema.Int })
 export const Online = Schema.TaggedStruct("Online", {
@@ -15,6 +16,7 @@ export const SchemaUpdateAvailable = Schema.TaggedStruct("SchemaUpdateAvailable"
 export const NeedsAuthentication = Schema.TaggedStruct("NeedsAuthentication", { pending: Schema.Int })
 export const Failed = Schema.TaggedStruct("Failed", { pending: Schema.Int, message: Schema.String })
 export const ReplicaStatus = Schema.Union([
+  Idle,
   Offline,
   Connecting,
   Online,
@@ -25,6 +27,7 @@ export const ReplicaStatus = Schema.Union([
 export type ReplicaStatus = typeof ReplicaStatus.Type
 
 export const SpaceStatus = Schema.Union([
+  Schema.Struct({ spaceId: Identity.SpaceId, synced: Schema.Boolean, ...Idle.fields }),
   Schema.Struct({ spaceId: Identity.SpaceId, synced: Schema.Boolean, ...Offline.fields }),
   Schema.Struct({ spaceId: Identity.SpaceId, synced: Schema.Boolean, ...Connecting.fields }),
   Schema.Struct({ spaceId: Identity.SpaceId, synced: Schema.Boolean, ...Online.fields }),
@@ -50,6 +53,7 @@ export const Aggregate = Schema.Struct({
   spaces: Schema.Int,
   totalPending: Schema.Int,
   counts: Schema.Struct({
+    idle: Schema.Int,
     offline: Schema.Int,
     connecting: Schema.Int,
     online: Schema.Int,

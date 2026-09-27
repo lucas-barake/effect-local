@@ -38,6 +38,7 @@ const StatusBanner = ({ connection }: { readonly connection: Connection }) => {
   return Match.value(connection).pipe(
     Match.when("online", () => null),
     Match.when("connecting", () => null),
+    Match.when("idle", () => null),
     Match.when("needsAuthentication", () => (
       <div className="banner banner-warning" role="status">
         Session expired.{" "}

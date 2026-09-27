@@ -183,6 +183,7 @@ type AggregateCategory = keyof AggregateCounts
 const statusCategories: {
   readonly [Tag in ReplicaStatus.ReplicaStatus["_tag"]]: AggregateCategory
 } = {
+  Idle: "idle",
   Offline: "offline",
   Connecting: "connecting",
   Online: "online",
@@ -198,12 +199,13 @@ const aggregateStatus = (
   totalPending: number,
   counts: AggregateCounts
 ): ReplicaStatus.Aggregate => {
+  const synchronizing = spaces - counts.idle
   let state: ReplicaStatus.AggregateState = "Degraded"
-  if (spaces === 0) state = "Idle"
+  if (synchronizing === 0) state = "Idle"
   else if (counts.failed > 0) state = "Failed"
   else if (counts.needsAuthentication > 0) state = "NeedsAuthentication"
-  else if (counts.online === spaces) state = "Online"
-  else if (counts.offline === spaces) state = "Offline"
+  else if (counts.online === synchronizing) state = "Online"
+  else if (counts.offline === synchronizing) state = "Offline"
   else if (counts.connecting > 0) state = "Connecting"
   return { state, spaces, totalPending, counts }
 }
@@ -245,6 +247,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         foregroundAdmitted.delete(entry.spaceId)
       }
       const aggregate = yield* Ref.make(aggregateStatus(0, 0, {
+        idle: 0,
         offline: 0,
         connecting: 0,
         online: 0,
@@ -805,7 +808,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               return Effect.void
             })
           )
-          yield* updateContribution(entry, { _tag: "Offline", pending: count.count })
+          yield* updateContribution(entry, { _tag: "Idle", pending: count.count })
           if (enqueuePending && count.count > 0 && !entry.leaving) yield* enqueueBackground(entry)
           return true
         }))
@@ -929,7 +932,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.activation = "Inactive"
           entry.transition = undefined
           dropForegroundReservation(entry)
-          yield* modifyContribution(entry, (current) => ({ _tag: "Offline", pending: current.pending }))
+          yield* modifyContribution(entry, (current) => ({ _tag: "Idle", pending: current.pending }))
           if (Exit.hasInterrupts(result)) yield* Deferred.succeed(completion, undefined)
           else yield* Deferred.done(completion, result)
           yield* invalidateActivation(entry.spaceId)
@@ -1244,7 +1247,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                 if (entry.activation === "Activating") {
                   return addressedStatus(entry.spaceId, entry.synced, { _tag: "Connecting", pending: row.count })
                 }
-                return addressedStatus(entry.spaceId, entry.synced, { _tag: "Offline", pending: row.count })
+                return addressedStatus(entry.spaceId, entry.synced, { _tag: "Idle", pending: row.count })
               })
             )
           })
@@ -1271,7 +1274,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           leaving: false,
           leaveCompletion: undefined,
           workflowRegistration: undefined,
-          summaryStatus: { _tag: "Offline", pending: row.count },
+          summaryStatus: { _tag: "Idle", pending: row.count },
           synced: row.replication_view_id !== null,
           retryAttempt: 0,
           retryVersion: 0

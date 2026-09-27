@@ -23,6 +23,7 @@ const online: StatusResult = AsyncResult.success({
 })
 const connectingStatus: StatusResult = AsyncResult.success({ spaceId, synced: true, _tag: "Connecting", pending: 0 })
 const offlineStatus: StatusResult = AsyncResult.success({ spaceId, synced: true, _tag: "Offline", pending: 0 })
+const idleStatus: StatusResult = AsyncResult.success({ spaceId, synced: true, _tag: "Idle", pending: 1 })
 const unreadable: StatusResult = AsyncResult.fail(new ReplicaError.OwnerUnavailable({ reason: "takeover" }))
 
 const withoutYield = Effect.provideService(Scheduler.PreventSchedulerYield, true)
@@ -57,6 +58,18 @@ describe("chat connection", () => {
       assert.deepStrictEqual(yield* connection.untilOnline, ["online"])
       yield* connection.report(connectingStatus)
       assert.strictEqual(yield* connection.next, "connecting")
+      yield* TestClock.adjust("1 minute")
+      assert.deepStrictEqual(yield* connection.untilOnline, ["online"])
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "keeps a remembered space that is not being synchronized out of the offline state",
+    Effect.fnUntraced(function*() {
+      const connection = yield* observe
+      assert.deepStrictEqual(yield* connection.untilOnline, ["online"])
+      yield* connection.report(idleStatus)
+      assert.strictEqual(yield* connection.next, "idle")
       yield* TestClock.adjust("1 minute")
       assert.deepStrictEqual(yield* connection.untilOnline, ["online"])
     }, Effect.scoped)

@@ -25,6 +25,7 @@ import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
+const otherSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 
 const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
@@ -110,8 +111,12 @@ const layerDatabase = Layer.mergeAll(
   QueryReactivity.layer
 )
 
-const layerReplica = (remote: SyncEngine.Service) =>
+const layerReplica = (
+  remote: SyncEngine.Service,
+  capacity?: Pick<SqlReplica.Options<typeof Domain.definition>, "maximumActiveSpaces" | "foregroundActiveSpaces">
+) =>
   SqlReplica.layer({
+    ...capacity,
     definition: Domain.definition,
     clientId,
     initialSpaces: [spaceId],
@@ -140,6 +145,128 @@ const awaitStatus = (
     Stream.runHead,
     Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
   )
+
+const awaitAggregate = (
+  reactivity: Reactivity.Reactivity,
+  replica: Replica.Service,
+  predicate: (aggregate: ReplicaStatus.Aggregate) => boolean
+) =>
+  reactivity.stream([ReactivityKey.aggregateStatus], replica.status).pipe(
+    Stream.filter(predicate),
+    Stream.runHead,
+    Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
+  )
+
+const noCounts = { idle: 0, offline: 0, connecting: 0, online: 0, needsAuthentication: 0, failed: 0 }
+
+describe("space activity status", () => {
+  it.effect(
+    "reports a remembered space that is not being synchronized as Idle, before activation and after deactivation",
+    Effect.fnUntraced(function*() {
+      const remote = yield* makeRemote()
+      const database = yield* Layer.build(layerDatabase)
+      const reactivity = Context.get(database, Reactivity.Reactivity)
+      const replica = Context.get(
+        yield* Layer.build(layerReplica(remote.remote).pipe(Layer.provide(Layer.succeedContext(database)))),
+        Replica.Replica
+      )
+      const space = yield* replica.space(spaceId)
+      const idleAggregate = { state: "Idle", spaces: 1, totalPending: 0, counts: { ...noCounts, idle: 1 } }
+
+      assert.deepStrictEqual(yield* space.status, { spaceId, synced: false, _tag: "Idle", pending: 0 })
+      assert.deepStrictEqual(yield* replica.status, idleAggregate)
+
+      yield* space.activate
+      yield* awaitStatus(reactivity, space, (status) => status._tag === "Online")
+      yield* space.deactivate
+
+      assert.deepStrictEqual(yield* space.status, { spaceId, synced: true, _tag: "Idle", pending: 0 })
+      assert.deepStrictEqual(yield* replica.status, idleAggregate)
+    })
+  )
+
+  it.effect(
+    "computes the aggregate state from the spaces being synchronized and counts idle spaces apart",
+    Effect.fnUntraced(function*() {
+      const remote = yield* makeRemote()
+      const database = yield* Layer.build(layerDatabase)
+      const reactivity = Context.get(database, Reactivity.Reactivity)
+      const replica = Context.get(
+        yield* Layer.build(layerReplica(remote.remote).pipe(Layer.provide(Layer.succeedContext(database)))),
+        Replica.Replica
+      )
+      yield* replica.join(otherSpaceId)
+      const space = yield* replica.space(spaceId)
+      yield* space.activate
+
+      const online = yield* awaitAggregate(reactivity, replica, (aggregate) => aggregate.counts.online === 1)
+      assert.deepStrictEqual(online, {
+        state: "Online",
+        spaces: 2,
+        totalPending: 0,
+        counts: { ...noCounts, online: 1, idle: 1 }
+      })
+
+      MutableRef.set(remote.mode, "Unreachable")
+      yield* space.mutate(Domain.PutTodo, Domain.todo("unreachable"))
+      const offline = yield* awaitAggregate(
+        reactivity,
+        replica,
+        (aggregate) => aggregate.totalPending === 1 && aggregate.counts.online === 0
+      )
+      assert.deepStrictEqual(offline, {
+        state: "Offline",
+        spaces: 2,
+        totalPending: 1,
+        counts: { ...noCounts, offline: 1, idle: 1 }
+      })
+    })
+  )
+
+  it.effect(
+    "keeps the pending count of a queued idle space while a background sync of another space runs",
+    Effect.fnUntraced(function*() {
+      const remote = yield* makeRemote()
+      MutableRef.set(remote.mode, "Unreachable")
+      const database = yield* Layer.build(layerDatabase)
+      const firstScope = yield* Scope.make()
+      const first = Context.get(
+        yield* Layer.buildWithScope(
+          layerReplica(remote.remote).pipe(Layer.provide(Layer.succeedContext(database))),
+          firstScope
+        ),
+        Replica.Replica
+      )
+      yield* first.join(otherSpaceId)
+      for (const id of [spaceId, otherSpaceId]) {
+        const space = yield* first.space(id)
+        yield* space.mutate(Domain.PutTodo, Domain.todo(id))
+      }
+      yield* Scope.close(firstScope, Exit.void)
+
+      MutableRef.set(remote.mode, "Gated")
+      const replica = Context.get(
+        yield* Layer.build(
+          layerReplica(remote.remote, { maximumActiveSpaces: 2, foregroundActiveSpaces: 1 }).pipe(
+            Layer.provide(Layer.succeedContext(database))
+          )
+        ),
+        Replica.Replica
+      )
+      yield* Deferred.await(remote.pullEntered)
+      const queued = yield* replica.space(otherSpaceId)
+
+      assert.strictEqual(yield* queued.activation, "Inactive")
+      assert.deepStrictEqual(yield* queued.status, { spaceId: otherSpaceId, synced: false, _tag: "Idle", pending: 1 })
+      assert.deepStrictEqual(yield* replica.status, {
+        state: "Connecting",
+        spaces: 2,
+        totalPending: 2,
+        counts: { ...noCounts, connecting: 1, idle: 1 }
+      })
+    })
+  )
+})
 
 describe("space synced status", () => {
   it.effect(

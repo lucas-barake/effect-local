@@ -5,7 +5,7 @@ import * as Match from "effect/Match"
 import * as Stream from "effect/Stream"
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 
-export type Connection = "online" | "connecting" | "offline" | "needsAuthentication" | "failed"
+export type Connection = "online" | "connecting" | "idle" | "offline" | "needsAuthentication" | "failed"
 
 type Reported = Connection | "disconnected"
 
@@ -22,7 +22,8 @@ const reportedOf = (status: AsyncResult.AsyncResult<ReplicaStatus.SpaceStatus, u
       NeedsAuthentication: (): Reported => "needsAuthentication",
       Failed: (): Reported => "failed",
       Offline: (): Reported => "disconnected",
-      Connecting: (): Reported => connecting
+      Connecting: (): Reported => connecting,
+      Idle: (): Reported => "idle"
     })
   )
 }

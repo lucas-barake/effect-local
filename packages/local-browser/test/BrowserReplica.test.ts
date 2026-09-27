@@ -817,6 +817,53 @@ describe("BrowserReplica", () => {
   )
 
   it.effect(
+    "never reports Offline to a follower's status atom across a leader handover while the server is reachable",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const leader = yield* environment.openTab
+        yield* environment.openTab
+        const hidden = yield* testKit.makeMemoryVisibility(false)
+        const graph = ReplicaAtom.make(environment.layerReplicaWith(hidden.service))
+        const registry = AtomRegistry.make()
+        yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+        const todos = graph.query(spaceId, ListTodos)(undefined)
+        const status = graph.status(spaceId)
+        const beforeHandover: Array<string> = []
+        const afterHandover: Array<string> = []
+        let observed = beforeHandover
+        let online = yield* Deferred.make<void>()
+        const unmountTodos = registry.mount(todos)
+        const unsubscribe = registry.subscribe(status, (result) => {
+          if (AsyncResult.isInitial(result)) return
+          if (AsyncResult.isFailure(result)) {
+            observed.push("Failure")
+            return
+          }
+          observed.push(result.value._tag)
+          if (result.value._tag === "Online" && !result.waiting) Deferred.doneUnsafe(online, Exit.void)
+        }, { immediate: true })
+        yield* Effect.addFinalizer(() => Effect.sync(() => [unsubscribe(), unmountTodos()]))
+        assert.deepStrictEqual(yield* settle(AtomRegistry.getResult(registry, todos, { suspendOnWaiting: true })), [])
+        yield* settle(Deferred.await(online))
+
+        observed = afterHandover
+        online = yield* Deferred.make<void>()
+        yield* settle(Scope.close(leader.scope, Exit.void))
+        yield* settle(Deferred.await(online))
+
+        assert.strictEqual(yield* Ref.get(environment.databaseOpens), 2)
+        assert.notInclude(afterHandover, "Offline")
+        assert.notInclude(beforeHandover, "Offline")
+        assert.notInclude(afterHandover, "Failure")
+        assert.strictEqual(afterHandover.at(-1), "Online")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
     "keeps serving the same replica from the follower after the leader tab closes",
     Effect.fnUntraced(
       function*() {
