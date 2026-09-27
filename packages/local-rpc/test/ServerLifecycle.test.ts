@@ -38,6 +38,7 @@ import * as RpcServer from "effect/unstable/rpc/RpcServer"
 import * as SocketServer from "effect/unstable/socket/SocketServer"
 import * as Authentication from "../src/Authentication.js"
 import * as EphemeralClient from "../src/EphemeralClient.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as SyncClient from "../src/SyncClient.js"
 import * as SyncRpc from "../src/SyncRpc.js"
 import * as SyncServer from "../src/SyncServer.js"
@@ -168,7 +169,9 @@ const awaitStatus = (
   space: Replica.Space,
   predicate: (status: ReplicaStatus.SpaceStatus) => boolean
 ) =>
-  reactivity.stream([`effect-local:space:${space.spaceId}:status`], space.status).pipe(
+  reactivity.query([`effect-local:space:${space.spaceId}:status`], space.status).pipe(
+    Effect.map(LosslessQueue.stream),
+    Stream.unwrap,
     Stream.filter(predicate),
     Stream.runHead,
     Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
@@ -188,9 +191,9 @@ const nextRoster = Effect.fnUntraced(function*(
   observations: Queue.Queue<RosterObservation>,
   expected: ReadonlyArray<Identity.ClientId>
 ) {
-  let observation = yield* Queue.take(observations)
+  let observation = yield* LosslessQueue.take(observations)
   while (observation._tag === "Roster" && observation.clientIds.join(",") !== expected.join(",")) {
-    observation = yield* Queue.take(observations)
+    observation = yield* LosslessQueue.take(observations)
   }
   assert.deepStrictEqual(observation, { _tag: "Roster", clientIds: expected })
 })
@@ -259,8 +262,8 @@ describe("server lifecycle", () => {
         Effect.forkChild({ startImmediately: true })
       )
       yield* TestClock.adjust("500 millis")
-      yield* Queue.take(connectionsA)
-      yield* Queue.take(connectionsB)
+      yield* LosslessQueue.take(connectionsA)
+      yield* LosslessQueue.take(connectionsB)
       yield* TestClock.adjust("1 second")
       const resumed = yield* Fiber.join(online)
       assert.strictEqual(resumed._tag, "Online")
@@ -325,8 +328,8 @@ describe("server lifecycle", () => {
 
       yield* harness.start()
       yield* TestClock.adjust("500 millis")
-      yield* Queue.take(connectionsA)
-      yield* Queue.take(connectionsB)
+      yield* LosslessQueue.take(connectionsA)
+      yield* LosslessQueue.take(connectionsB)
       yield* TestClock.adjust("1 second")
       yield* nextRoster(observations, [clientA, clientB])
     })
@@ -393,8 +396,8 @@ describe("server lifecycle", () => {
 
       yield* harness.start()
       yield* TestClock.adjust("500 millis")
-      yield* Queue.take(connectionsA)
-      yield* Queue.take(connectionsB)
+      yield* LosslessQueue.take(connectionsA)
+      yield* LosslessQueue.take(connectionsB)
       const resumed = yield* awaitStatus(
         a.reactivity,
         a.space,
@@ -438,19 +441,21 @@ describe("server lifecycle", () => {
       yield* Queue.takeAll(connectionsB)
 
       yield* a.space.mutate(PutTodo, { id: "from-background", title: "sent by A in the background" })
-      yield* Queue.take(submissions)
+      yield* LosslessQueue.take(submissions)
       yield* a.space.deactivate
-      yield* Queue.take(submissions)
+      yield* LosslessQueue.take(submissions)
       yield* harness.stop(first)
 
       yield* harness.start()
       yield* TestClock.adjust("500 millis")
-      yield* Queue.take(connectionsA)
-      yield* Queue.take(connectionsB)
-      const received = yield* b.reactivity.stream(
+      yield* LosslessQueue.take(connectionsA)
+      yield* LosslessQueue.take(connectionsB)
+      const received = yield* b.reactivity.query(
         [`effect-local:space:${spaceId}:status`],
         b.space.get(Todo, "from-background")
       ).pipe(
+        Effect.map(LosslessQueue.stream),
+        Stream.unwrap,
         Stream.filter(Option.isSome),
         Stream.runHead
       )
@@ -505,8 +510,8 @@ describe("server lifecycle", () => {
 
       yield* harness.start()
       yield* TestClock.adjust("250 millis")
-      yield* Queue.take(connectionsA)
-      yield* Queue.take(connectionsB)
+      yield* LosslessQueue.take(connectionsA)
+      yield* LosslessQueue.take(connectionsB)
       yield* nextRoster(observations, [clientA, clientB])
     })
   )
