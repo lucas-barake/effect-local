@@ -2204,7 +2204,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           )
           const outputWakes = Option.none<PublishedWake>().pipe(
             Stream.succeed,
-            Stream.concat(Stream.merge(mutations, refreshes)),
+            Stream.concat(LosslessQueue.merge(mutations, refreshes)),
             Stream.filterEffect((signal) => {
               if (Option.isNone(signal)) return Effect.succeed(true)
               return signal.value.visibility.evaluate(
@@ -2274,7 +2274,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           yield* Effect.forkScoped(monitor(authorized))
           return Deferred.await(revoked).pipe(
             Stream.fromEffect,
-            (revocation) => Stream.merge(outputWakes, revocation)
+            (revocation) => LosslessQueue.merge(outputWakes, revocation)
           )
         }))
 

@@ -568,8 +568,7 @@ export const layerFromSession = (
                   )
                 })
               )
-              return visible.pipe(
-                Stream.mergeEffect(heartbeatLoop),
+              return LosslessQueue.mergeEffect(visible, heartbeatLoop).pipe(
                 Stream.ensuring(Effect.sync(() => {
                   if (sessions.get(sessionKey(request))?.owner === owner) {
                     sessions.delete(sessionKey(request))
@@ -682,6 +681,8 @@ export const layerFromSession = (
         runtime: SessionRuntime
       ): Session<M> => {
         const failureStream = Stream.fromEffect(Deferred.await(runtime.failure))
+        const orFailure = <A, E extends { readonly _tag: string },>(stream: Stream.Stream<A, E>) =>
+          LosslessQueue.merge(stream, failureStream)
         const events = (definition: Ephemeral.AnyEvent) =>
           Stream.fromPubSub(runtime.events).pipe(
             Stream.filter((entry) => entry.channel === definition.name),
@@ -692,7 +693,7 @@ export const layerFromSession = (
                 Effect.map((payload) => ({ member: entry.member, payload }))
               )
             ),
-            Stream.merge(failureStream)
+            orFailure
           )
         const state = (definition: Ephemeral.AnyState) =>
           Stream.fromPubSub(runtime.views).pipe(
@@ -719,7 +720,7 @@ export const layerFromSession = (
                 }))
               )
             )),
-            Stream.merge(failureStream)
+            orFailure
           )
         const members = Stream.fromPubSub(runtime.views).pipe(
           Stream.mapAccum(
@@ -738,7 +739,7 @@ export const layerFromSession = (
               }))
             )
           )),
-          Stream.merge(failureStream)
+          orFailure
         )
         const updateMember = (value: Ephemeral.Payload<M>) =>
           Schema.encodeEffect(profile.payloadSchema)(value).pipe(

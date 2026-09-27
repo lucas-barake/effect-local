@@ -13,6 +13,7 @@ import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
@@ -927,6 +928,47 @@ describe("EphemeralClient projection work", () => {
         assert.strictEqual(yield* Ref.get(harness.joins), 2)
       })
       yield* program.pipe(Effect.provide(harness.layerClient), Effect.scoped)
+    })
+  )
+
+  it.effect(
+    "delivers every event to a projection whose fibers are preempted between queue checks",
+    Effect.fnUntraced(function*() {
+      const deliver = Effect.fnUntraced(function*(maxOpsBeforeYield: number, spacing: number) {
+        const harness = yield* makeTypedHarness()
+        yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
+        yield* Queue.offer(harness.messagesA, snapshot(spaceId, 1))
+        yield* Effect.gen(function*() {
+          const client = yield* EphemeralClient.EphemeralClient
+          const session = yield* client.session(Profile, sessionOptions)
+          const subscribed = yield* Deferred.make<void>()
+          const received = yield* session.events(Pings).pipe(
+            Stream.tap(() => Deferred.succeed(subscribed, undefined)),
+            Stream.filter((event) => event.payload.count >= 0),
+            Stream.take(6),
+            Stream.runCollect,
+            Effect.forkChild({ startImmediately: true })
+          )
+          let revision = 2
+          while (!(yield* Deferred.isDone(subscribed))) {
+            yield* Queue.offer(harness.messagesA, eventMessage(spaceId, revision++, "Pings", { count: -1 }))
+            yield* Effect.yieldNow
+          }
+          for (let count = 0; count < 6; count++) {
+            for (let turn = 0; turn < spacing; turn++) yield* Effect.yieldNow
+            yield* Queue.offer(harness.messagesA, eventMessage(spaceId, revision++, "Pings", { count }))
+          }
+          const events = yield* Fiber.join(received)
+          assert.deepStrictEqual(events.map((event) => event.payload.count), [0, 1, 2, 3, 4, 5])
+        }).pipe(
+          Effect.provide(harness.layerClient),
+          Effect.provideService(Scheduler.MaxOpsBeforeYield, maxOpsBeforeYield),
+          Effect.scoped
+        )
+      })
+      for (const maxOpsBeforeYield of [7, 8, 12]) {
+        for (let spacing = 0; spacing < 6; spacing++) yield* deliver(maxOpsBeforeYield, spacing)
+      }
     })
   )
 })

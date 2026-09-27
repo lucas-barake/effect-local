@@ -14,6 +14,7 @@ import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import type * as InvalidationHub from "./invalidationHub.js"
+import * as LosslessQueue from "./losslessQueue.js"
 import * as replicaWire from "./replicaWire.js"
 import { decodeWith, encodeJson } from "./wireCodec.js"
 
@@ -284,7 +285,7 @@ export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(opti
         }))
       )
     })
-    return Stream.mergeAll([members, ...projections], { concurrency: "unbounded" }).pipe(
+    return LosslessQueue.mergeAll([members, ...projections]).pipe(
       Stream.catchTag(
         "EphemeralDecodeError",
         () => Stream.fail(new replicaWire.WireUnknownDefinition({ kind: "ephemeral", name: entry.profileName }))

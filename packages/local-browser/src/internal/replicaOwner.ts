@@ -174,7 +174,7 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
       ),
       Stream.filter((valid) => valid)
     )
-    yield* Stream.merge(SubscriptionRef.changes(visible), announced).pipe(
+    yield* LosslessQueue.merge(SubscriptionRef.changes(visible), announced).pipe(
       Stream.mapEffect(() => outranked),
       Stream.filter((yieldLeadership) => yieldLeadership),
       Stream.runHead

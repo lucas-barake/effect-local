@@ -18,6 +18,7 @@ import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
 import { capacityExceeded, invalidConfiguration } from "./internal/errors.js"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 
 export const JoinAuthorization = Schema.TaggedStruct("Join", {
   spaceId: Identity.SpaceId,
@@ -637,13 +638,15 @@ export const layer = <R = never,>(
                 Stream.map(({ message }) => message)
               )
             ).pipe(
-              Stream.interruptWhen(Deferred.await(departed)),
-              Stream.mergeEffect(
-                Effect.sleep(resolved.authorizationRefreshIntervalMillis).pipe(
-                  Effect.andThen(refreshAuthorization),
-                  Effect.forever
+              (stream) => LosslessQueue.interruptWhen(stream, Deferred.await(departed)),
+              (stream) =>
+                LosslessQueue.mergeEffect(
+                  stream,
+                  Effect.sleep(resolved.authorizationRefreshIntervalMillis).pipe(
+                    Effect.andThen(refreshAuthorization),
+                    Effect.forever
+                  )
                 )
-              )
             )
           })).pipe(
             Stream.withSpan("EphemeralHub.join", {
