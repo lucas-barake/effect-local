@@ -14,6 +14,7 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
@@ -146,6 +147,8 @@ const inBackground = <A, E extends { readonly _tag: string }, R,>(effect: Effect
     Effect.provideService(ConnectionLane.Priority, "Background"),
     Effect.forkChild({ startImmediately: true })
   )
+
+const atGateRaceBudget = Effect.provideService(Scheduler.MaxOpsBeforeYield, 49)
 
 const inForeground = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(
@@ -454,17 +457,18 @@ describe("LocalStore on a connection lane", () => {
       )
       yield* Deferred.await(entered)
       observing = true
-      const gateHolder = yield* inBackground(local.applyEntries([]))
-      const query = yield* inForeground(
-        queries.execute(Domain.ReadCountIndex, readCounts).pipe(
-          Effect.ensuring(Effect.sync(() => started.push("query")))
-        )
+      const queued = Effect.provideService(Scheduler.PreventSchedulerYield, true)
+      const gateHolder = yield* inBackground(local.applyEntries([])).pipe(queued)
+      const query = yield* queries.execute(Domain.ReadCountIndex, readCounts).pipe(
+        Effect.ensuring(Effect.sync(() => started.push("query"))),
+        inForeground,
+        queued
       )
-      const gateWaiter = yield* inForeground(local.revokeReplication)
+      const gateWaiter = yield* inForeground(local.revokeReplication).pipe(queued)
       yield* Deferred.succeed(release, undefined)
       yield* Fiber.joinAll([holder, gateHolder, query, gateWaiter])
       assert.deepStrictEqual(started.slice(0, 2), ["gate holder", "query"])
-    })
+    }, atGateRaceBudget)
   )
 })
 
