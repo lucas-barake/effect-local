@@ -13,6 +13,7 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
@@ -49,11 +50,13 @@ class TestAuthorizationError extends Schema.TaggedError<TestAuthorizationError, 
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "../src/Authentication.js"
 import * as EphemeralClient from "../src/EphemeralClient.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as ProtocolSession from "../src/ProtocolSession.js"
 import type * as SpaceEntity from "../src/SpaceEntity.js"
 import * as SyncClient from "../src/SyncClient.js"
 import * as SyncRpc from "../src/SyncRpc.js"
 import * as SyncServer from "../src/SyncServer.js"
+import * as RecordingClock from "./fixtures/recordingClock.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
@@ -396,7 +399,9 @@ const awaitStatus = (
   space: Replica.Space,
   tag: "Online" | "Offline" | "NeedsAuthentication"
 ) =>
-  reactivity.stream([`effect-local:space:${space.spaceId}:status`], space.status).pipe(
+  reactivity.query([`effect-local:space:${space.spaceId}:status`], space.status).pipe(
+    Effect.map(LosslessQueue.stream),
+    Stream.unwrap,
     Stream.filter((status) => status._tag === tag),
     Stream.runHead,
     Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
@@ -537,7 +542,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     Layer.provideMerge(layerLifecycleServer),
     Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
   )
-  const replicaLayer = (maximumRetryDelay: Duration.Input) =>
+  const replicaLayer = (maximumRetryDelay: Duration.Input, layerReplicaClock: Layer.Layer<never> = Layer.empty) =>
     SqlReplica.layer({
       ...clientHistory,
       definition,
@@ -547,6 +552,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
       retryDelay: "1 second",
       maximumRetryDelay
     }).pipe(
+      Layer.provide(layerReplicaClock),
       Layer.provide(layerLifecycleHandlers),
       Layer.provideMerge(layerDatabase),
       Layer.provide(layerLifecycleLive)
@@ -642,7 +648,9 @@ describe("WebSocket synchronization", () => {
     "backs off an unavailable authenticator and recovers",
     Effect.fnUntraced(function*() {
       const harness = yield* makeLifecycleHarness()
-      const replicaContext = yield* Layer.build(harness.replicaLayer("2 seconds"))
+      const recording = yield* RecordingClock.make
+      const layerRecordingClock = Layer.succeed(Clock.Clock, recording.clock)
+      const replicaContext = yield* Layer.build(harness.replicaLayer("2 seconds", layerRecordingClock))
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
@@ -658,25 +666,28 @@ describe("WebSocket synchronization", () => {
       )
       MutableRef.set(harness.mode, "Unavailable")
       yield* space.mutate(PutTodo, { id: "outage", title: "backoff" })
-      assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
+      assert.deepInclude(yield* LosslessQueue.take(harness.attempts), { mode: "Unavailable" })
       assert.strictEqual((yield* Fiber.join(offline))._tag, "Offline")
 
-      yield* TestClock.adjust("999 millis")
+      const firstBackoff = yield* recording.nextSleep((request) => request.millis === 1_000)
+      yield* recording.advanceTo(firstBackoff.deadline - 1)
       assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
-      yield* TestClock.adjust("1 millis")
-      assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
+      yield* recording.advanceTo(firstBackoff.deadline)
+      assert.deepInclude(yield* LosslessQueue.take(harness.attempts), { mode: "Unavailable" })
 
-      yield* TestClock.adjust("1999 millis")
+      const secondBackoff = yield* recording.nextSleep((request) => request.millis === 2_000)
+      yield* recording.advanceTo(secondBackoff.deadline - 1)
       assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
-      yield* TestClock.adjust("1 millis")
-      assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
+      yield* recording.advanceTo(secondBackoff.deadline)
+      assert.deepInclude(yield* LosslessQueue.take(harness.attempts), { mode: "Unavailable" })
 
+      const recoveryBackoff = yield* recording.nextSleep((request) => request.millis === 2_000)
       const online = yield* awaitStatus(reactivity, space, "Online").pipe(
         Effect.forkChild({ startImmediately: true })
       )
       MutableRef.set(harness.mode, "Available")
-      yield* TestClock.adjust("2 seconds")
-      assert.strictEqual(yield* Queue.take(harness.applications), "outage")
+      yield* recording.advanceTo(recoveryBackoff.deadline)
+      assert.strictEqual(yield* LosslessQueue.take(harness.applications), "outage")
       assert.strictEqual((yield* Fiber.join(online))._tag, "Online")
     })
   )
