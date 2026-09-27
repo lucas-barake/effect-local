@@ -914,9 +914,10 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           Effect.andThen(Metric.snapshot),
           Effect.repeat({
             until: (snapshots) =>
-              snapshots.some((snapshot) =>
-                snapshot.id === "effect_local_server_history_depth" && snapshot.type === "Gauge" &&
-                snapshot.state.value !== 0
+              ["effect_local_server_history_depth", "effect_local_server_receipt_depth"].every((id) =>
+                snapshots.some((snapshot) =>
+                  snapshot.id === id && snapshot.type === "Gauge" && snapshot.state.value !== 0
+                )
               )
           })
         )
