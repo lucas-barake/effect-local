@@ -1208,6 +1208,7 @@ describe("multi space Replica", () => {
       const backgroundEntered = yield* Deferred.make<void>()
       const releaseBackground = yield* Deferred.make<void>()
       const activeWatches = yield* Ref.make(0)
+      const watchOpened = yield* Deferred.make<void>()
       let gateFirstAttempt = true
       const attempt = () => {
         if (!gateFirstAttempt) return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -1224,7 +1225,10 @@ describe("multi space Replica", () => {
         bootstrap: attempt,
         watch: () =>
           Effect.acquireRelease(
-            Ref.update(activeWatches, (count) => count + 1).pipe(Effect.as(Stream.never)),
+            Ref.update(activeWatches, (count) => count + 1).pipe(
+              Effect.andThen(Deferred.succeed(watchOpened, undefined)),
+              Effect.as(Stream.never)
+            ),
             () => Ref.update(activeWatches, (count) => count - 1)
           ).pipe(Stream.unwrap)
       })
@@ -1236,7 +1240,7 @@ describe("multi space Replica", () => {
       yield* Effect.yieldNow
       yield* Deferred.succeed(releaseBackground, undefined)
       yield* Fiber.join(promotion)
-      yield* Effect.yieldNow
+      yield* Deferred.await(watchOpened)
 
       assert.strictEqual(yield* space.activation, "Active")
       assert.strictEqual(yield* Ref.get(activeWatches), 1)
@@ -1252,11 +1256,15 @@ describe("multi space Replica", () => {
         return Identity.SpaceId.make(`spc_00000000-0000-4000-8000-${suffix}`)
       })
       const activeWatches = yield* Ref.make(0)
+      const watchOpened = yield* Deferred.make<void>()
       const countedRemote = SyncEngine.SyncEngine.of({
         ...remoteService,
         watch: () =>
           Effect.acquireRelease(
-            Ref.update(activeWatches, (count) => count + 1).pipe(Effect.as(Stream.never)),
+            Ref.update(activeWatches, (count) => count + 1).pipe(
+              Effect.andThen(Deferred.succeed(watchOpened, undefined)),
+              Effect.as(Stream.never)
+            ),
             () => Ref.update(activeWatches, (count) => count - 1)
           ).pipe(Stream.unwrap)
       })
@@ -1285,7 +1293,7 @@ describe("multi space Replica", () => {
       assert.strictEqual(yield* activeChildFibers, baselineFibers)
       assert.isTrue(activations.every((activation) => activation === "Inactive"))
       yield* remembered[0].activate
-      yield* Effect.yieldNow
+      yield* Deferred.await(watchOpened)
       assert.strictEqual(yield* Ref.get(activeWatches), 1)
       yield* remembered[0].deactivate
       assert.strictEqual(yield* Ref.get(activeWatches), 0)
@@ -1359,7 +1367,16 @@ describe("multi space Replica", () => {
       const spaceC = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
       const firstPin = yield* makePin
       const secondPin = yield* makePin
-      const remote = pinnedRemote(new Map([[spaceA, firstPin], [spaceB, secondPin]]))
+      const pinned = pinnedRemote(new Map([[spaceA, firstPin], [spaceB, secondPin]]))
+      const firstRetried = yield* Deferred.make<void>()
+      let firstPulls = 0
+      const remote = SyncEngine.SyncEngine.of({
+        ...pinned,
+        pull: (request) => {
+          if (request.spaceId === spaceA && ++firstPulls === 2) Deferred.doneUnsafe(firstRetried, Effect.void)
+          return pinned.pull(request)
+        }
+      })
       const { layer: layerServices } = yield* probedServices(() => undefined)
       const layerReplica = SqlReplica.layerWorkflow({
         ...clientHistory,
@@ -1382,7 +1399,9 @@ describe("multi space Replica", () => {
       yield* Deferred.await(firstPin.entered)
       yield* Deferred.await(secondPin.entered)
 
-      const blocked = yield* Effect.forkChild(third.get(Domain.Todo, "blocked"), { startImmediately: true })
+      const blocked = yield* Effect.forkChild(third.get(Domain.Todo, "blocked"), { startImmediately: true }).pipe(
+        Effect.provideService(Scheduler.PreventSchedulerYield, true)
+      )
       yield* Effect.yieldNow
       assert.strictEqual(yield* third.activation, "Inactive")
       yield* Fiber.interrupt(blocked)
@@ -1390,6 +1409,8 @@ describe("multi space Replica", () => {
 
       yield* Deferred.succeed(firstPin.release, undefined)
       assert.isTrue(Option.isNone(yield* third.get(Domain.Todo, "after")))
+      yield* Deferred.await(firstRetried)
+      yield* first.activation.pipe(Effect.repeat({ until: (activation) => activation === "Inactive" }))
       assert.strictEqual(yield* first.activation, "Inactive")
       assert.strictEqual(yield* second.activation, "Active")
       assert.strictEqual(yield* third.activation, "Active")
@@ -1432,7 +1453,11 @@ describe("multi space Replica", () => {
         )
 
       const seedScope = yield* Scope.make()
-      const seedContext = yield* Layer.buildWithScope(replicaLayer(remoteService), seedScope)
+      const unavailableRemote = SyncEngine.SyncEngine.of({
+        ...remoteService,
+        pull: () => Effect.fail(new ReplicaError.ServerUnavailable())
+      })
+      const seedContext = yield* Layer.buildWithScope(replicaLayer(unavailableRemote), seedScope)
       const seedSpace = yield* Context.get(seedContext, Replica.Replica).space(spaceC)
       yield* seedSpace.mutate(Domain.PutTodo, Domain.todo("background"))
       yield* seedSpace.deactivate
@@ -1452,7 +1477,9 @@ describe("multi space Replica", () => {
       yield* Deferred.await(firstPin.entered)
       yield* Deferred.await(secondPin.entered)
 
-      const promotion = yield* Effect.forkChild(third.activate, { startImmediately: true })
+      const promotion = yield* Effect.forkChild(third.activate, { startImmediately: true }).pipe(
+        Effect.provideService(Scheduler.PreventSchedulerYield, true)
+      )
       yield* Effect.yieldNow
       yield* Fiber.interrupt(promotion)
       assert.isTrue(Exit.hasInterrupts(yield* Fiber.await(promotion)))
@@ -1511,7 +1538,9 @@ describe("multi space Replica", () => {
       const replica = Context.get(yield* Layer.build(replicaLayer(remote)), Replica.Replica)
       yield* Deferred.await(pullEntered)
       const space = yield* replica.space(spaceA)
-      const promotion = yield* Effect.forkChild(space.activate, { startImmediately: true })
+      const promotion = yield* Effect.forkChild(space.activate, { startImmediately: true }).pipe(
+        Effect.provideService(Scheduler.PreventSchedulerYield, true)
+      )
       yield* Fiber.interrupt(promotion)
       yield* Deferred.await(pullInterrupted)
 
