@@ -1380,6 +1380,33 @@ describe("BrowserReplica across builds", () => {
   )
 
   it.effect(
+    "yields to a newer build whose presence lock name carries fields this build does not know",
+    Effect.fnUntraced(
+      function*() {
+        const kit = yield* testKit.makeMemoryPlatform
+        const environment = yield* makeEnvironmentWith({ kit })
+        const current = yield* environment.openTab
+        const base = "@lucas-barake/effect-local-browser:tabs:presence"
+        yield* kit.webLocks.acquire(`${base}:9:2:0123456789abcdef:future-host:future-field`)
+        const nudges = yield* kit.tabChannel.open(base)
+        yield* nudges.post("future-host")
+        const superseded = yield* settle(
+          listFrom(current.replica).pipe(
+            Effect.as(undefined),
+            Effect.catchTag(
+              "BuildSuperseded",
+              (error) => Effect.succeed({ version: error.version, supersedingVersion: error.supersedingVersion })
+            )
+          )
+        )
+        assert.deepStrictEqual(superseded, { version: 1, supersedingVersion: 2 })
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
     "moves a superseded tab's status atoms to a BuildSuperseded failure",
     Effect.fnUntraced(
       function*() {

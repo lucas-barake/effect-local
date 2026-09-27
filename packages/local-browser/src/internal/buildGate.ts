@@ -23,7 +23,9 @@ export interface BuildGate {
 
 const Counter = Schema.FiniteFromString.check(Schema.isInt())
 
-const PresenceParts = Schema.Tuple([Counter, Counter, Schema.String, Schema.String])
+const PresenceParts = Schema.TupleWithRest(Schema.Tuple([Counter, Counter, Schema.String, Schema.String]), [
+  Schema.String
+])
 
 const decodePresence = Schema.decodeUnknownEffect(PresenceParts)
 

@@ -72,7 +72,15 @@ When two builds meet, the newest one owns the database:
   its SQLite worker, and releases the database. An older tab opened next to a newer build never opens the database.
 - Equal versions with different fingerprints, such as a library upgrade or a changed query or ephemeral definition,
   are resolved in favor of the tab that started last. A freshly loaded page is the best evidence of what the server
-  currently deploys, and reloading the other tabs loads that same build, so the origin converges on it.
+  currently deploys, and reloading the other tabs loads that same build, so the origin converges on it. Arrival order
+  comes from a sequence each tab derives from the tabs already present, so two tabs that start at the same instant can
+  draw the same sequence. That tie goes to the tab with the larger random host id: every tab computes the same winner,
+  but which one wins is arbitrary.
+
+The coordination between builds uses only a presence lock per tab, named
+`@lucas-barake/effect-local-browser:<name>:presence:<sequence>:<version>:<fingerprint>:<host>`, the shared leader lock,
+and a channel on which arriving tabs post a wake-up. Those names are the one contract every library version must keep.
+A future version may append fields to the presence name, and older tabs still read the first four.
 
 Every tab of the losing build is superseded for the rest of its life, even after the winning tabs close, because the
 winner may already have migrated the database. From then on each call, stream, live query, and ephemeral session of
