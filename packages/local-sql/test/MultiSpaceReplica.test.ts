@@ -1418,6 +1418,49 @@ describe("multi space Replica", () => {
   )
 
   it.effect(
+    "wakes a get waiting for foreground capacity after reservations withdraw concurrently",
+    Effect.fnUntraced(function*() {
+      const spaces = Array.from({ length: 5 }, (_, index) => {
+        const suffix = String(index + 1).padStart(12, "0")
+        return Identity.SpaceId.make(`spc_00000000-0000-4000-8000-${suffix}`)
+      })
+      const firstPin = yield* makePin
+      const secondPin = yield* makePin
+      const remote = pinnedRemote(new Map([[spaces[0], firstPin], [spaces[1], secondPin]]))
+      const layerReplica = SqlReplica.layerWorkflow({
+        ...clientHistory,
+        definition: Domain.definition,
+        clientId,
+        initialSpaces: spaces,
+        foregroundReconciliationConcurrency: 2
+      }).pipe(
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+        Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(Reactivity.layer),
+        Layer.provide(WorkflowEngine.layerMemory)
+      )
+      const replica = Context.get(yield* Layer.build(layerReplica), Replica.Replica)
+      const handles = yield* Effect.forEach(spaces, replica.space)
+      yield* handles[0].mutate(Domain.PutTodo, Domain.todo("pinned"))
+      yield* handles[1].mutate(Domain.PutTodo, Domain.todo("pinned"))
+      yield* Deferred.await(firstPin.entered)
+      yield* Deferred.await(secondPin.entered)
+
+      const waiting = yield* Effect.forkChild(handles[2].get(Domain.Todo, "waiting"), { startImmediately: true })
+      const withdrawn = yield* Effect.forEach(
+        handles.slice(3),
+        (space) => Effect.forkChild(space.activate, { startImmediately: true })
+      )
+      for (let step = 0; step < 20; step++) yield* Effect.yieldNow
+      yield* Fiber.interruptAll(withdrawn)
+      yield* Deferred.succeed(firstPin.release, undefined)
+      assert.isTrue(Option.isNone(yield* Fiber.join(waiting)))
+    }, (effect) => effect.pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 4), Effect.scoped))
+  )
+
+  it.effect(
     "keeps a waiting get alive when the get initializing the same space is interrupted",
     Effect.fnUntraced(function*() {
       yield* abandonActivation((space) => space.get(Domain.Todo, "abandoned"))

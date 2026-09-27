@@ -441,10 +441,10 @@ const makeLayer = <D extends Definition.Any, R,>(
           Effect.flatMap((value) => Protocol.validateReplicationScope(options.definition, value))
         )
 
-      const signalCapacity = Effect.gen(function*() {
+      const signalCapacity = Effect.sync(() => {
         const previous = capacityChanged
-        capacityChanged = yield* Deferred.make<void>()
-        yield* Deferred.succeed(previous, undefined)
+        capacityChanged = Deferred.makeUnsafe<void>()
+        Deferred.doneUnsafe(previous, Exit.void)
       })
 
       const recordReplicationView = (entry: RememberedEntry, installed: boolean) =>
