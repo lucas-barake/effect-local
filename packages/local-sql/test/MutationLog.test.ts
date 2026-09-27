@@ -4273,9 +4273,8 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         Layer.provide(layerGate),
         Layer.provide(pairDatabase(true))
       )
-      const context = yield* Layer.build(Layer.merge(layerLocal, layerQueries))
-      const store = Context.get(context, LocalStore.Store)
-      const queryExecutor = Context.get(context, QueryExecutor.QueryExecutor)
+      const store = Context.get(yield* Layer.build(layerLocal), LocalStore.Store)
+      const queryExecutor = Context.get(yield* Layer.build(layerQueries), QueryExecutor.QueryExecutor)
       yield* store.mutate(PutPair, { left: 0, right: 0 })
       const query = yield* queryExecutor.execute(ReadPair, undefined).pipe(Effect.forkChild)
       yield* Deferred.await(reached)
