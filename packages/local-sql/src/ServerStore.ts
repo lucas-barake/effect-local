@@ -2229,9 +2229,12 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           )
           if (authorization === undefined || authorized === undefined) return outputWakes
           const revoked = yield* Deferred.make<never, ReplicaError.ReplicaError>()
+          const closeWatch = Scope.close(childScope, Exit.void).pipe(
+            Effect.forkIn(parentScope, { uninterruptible: true })
+          )
           const failClosed = (error: ReplicaError.AuthorizationDenied) =>
             Deferred.fail(revoked, error).pipe(
-              Effect.tap(() => Scope.close(childScope, Exit.void).pipe(Effect.forkIn(parentScope))),
+              Effect.tap(() => closeWatch),
               Effect.asVoid
             )
           const monitor = Effect.fnUntraced(function*(
@@ -2260,7 +2263,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
             )
             if (Exit.isFailure(refreshed)) {
               return yield* Deferred.failCause(revoked, refreshed.cause).pipe(
-                Effect.tap(() => Scope.close(childScope, Exit.void).pipe(Effect.forkIn(parentScope))),
+                Effect.tap(() => closeWatch),
                 Effect.asVoid
               )
             }

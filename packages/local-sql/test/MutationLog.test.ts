@@ -26,6 +26,7 @@ import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
@@ -621,6 +622,50 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       },
       Effect.provide(NodeCrypto.layer),
       Effect.scoped
+    ))
+  )
+
+  it.effect(
+    "releases the sync watcher slot when a failed refresh ends the watch before its teardown finishes",
+    pipe(Effect.fnUntraced(
+      function*() {
+        let lookups = 0
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => {
+              lookups++
+              if (lookups === 1) return Effect.void
+              return Effect.die("refresh defect")
+            }
+          }).pipe(
+            Layer.provide(layerRuntime),
+            Layer.provide(serverDatabase())
+          )
+        )
+        const initial = yield* Deferred.make<void>()
+        const watching = yield* server.watchAuthorized(watchRequest(), "reader").pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.tap(() => Deferred.succeed(initial, undefined)),
+              Stream.runDrain
+            )
+          ),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(initial)
+        yield* TestClock.adjust("500 millis")
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(watching)))
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+      },
+      Effect.provide(NodeCrypto.layer),
+      Effect.scoped,
+      Effect.provideService(Scheduler.MaxOpsBeforeYield, 33)
     ))
   )
 
