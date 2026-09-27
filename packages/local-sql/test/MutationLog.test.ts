@@ -1783,7 +1783,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const store = Context.get(context, LocalStore.Store)
         yield* Context.get(context, Reconciler.Reconciliation).sync
 
-        assert.strictEqual(yield* store.cursor, 4)
+        assert.strictEqual((yield* store.progress).cursor, 4)
         for (let sequence = 1; sequence <= 4; sequence++) {
           assert.deepStrictEqual(
             Option.getOrThrow(yield* store.get(Domain.Todo, `bootstrap-${sequence}`)),
@@ -1859,7 +1859,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
         const copied = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM projection_insert_probe`
         assert.strictEqual(copied[0].count, 4)
-        assert.strictEqual(yield* local.cursor, 4)
+        assert.strictEqual((yield* local.progress).cursor, 4)
       },
       Effect.provide(NodeCrypto.layer),
       Effect.scoped
@@ -1929,7 +1929,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           const finalPage = yield* server.bootstrap(bootstrapRequest(first.manifest, 0, 1))
           assert.isTrue(yield* local.stageBootstrapPage(finalPage))
           yield* local.installBootstrap(finalPage.manifest)
-          assert.strictEqual(yield* local.cursor, 2)
+          assert.strictEqual((yield* local.progress).cursor, 2)
           assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "resume-1")), Domain.todo("resume-1"))
           assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "resume-2")), Domain.todo("resume-2"))
         }))
@@ -1987,7 +1987,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           serverSchema: page.serverSchema
         })).pipe(expectedFailure)
         assert.strictEqual(stalled._tag, "ProtocolInvalid")
-        assert.strictEqual(yield* local.cursor, 0)
+        assert.strictEqual((yield* local.progress).cursor, 0)
         assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "corrupt-bootstrap")))
       },
       Effect.provide(NodeCrypto.layer),
@@ -2220,7 +2220,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const error = yield* local.installBootstrap(page.manifest).pipe(expectedFailure)
 
         assert.strictEqual(error._tag, "StorageCorrupt")
-        assert.strictEqual(yield* local.cursor, 1)
+        assert.strictEqual((yield* local.progress).cursor, 1)
         assert.strictEqual(
           Option.getOrThrow(yield* local.get(Domain.Todo, "staged-corruption")).title,
           "old"
@@ -2302,7 +2302,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
         assert.strictEqual(error._tag, "StorageCorrupt")
         assert.strictEqual(yield* local.pendingCount, 2)
-        assert.strictEqual(yield* local.cursor, 0)
+        assert.strictEqual((yield* local.progress).cursor, 0)
       },
       Effect.provide(NodeCrypto.layer),
       Effect.scoped
@@ -2436,7 +2436,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "1")), Domain.todo("1"))
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(pending.envelope.mutationId))._tag, "Accepted")
     }, Effect.scoped))
   )
@@ -2841,7 +2841,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       yield* local.applyReceipt(receipt)
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "1")))
-      assert.strictEqual(yield* local.cursor, 0)
+      assert.strictEqual((yield* local.progress).cursor, 0)
     }, Effect.scoped))
   )
 
@@ -3139,7 +3139,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const changes: ReadonlyArray<Protocol.ViewChange> = []
         return Protocol.PullPage.make({
           ...page,
-          serverSequence: yield* local.cursor,
+          serverSequence: (yield* local.progress).cursor,
           changes,
           contentBytes: yield* Protocol.encodedBytesEffect(changes),
           digest: yield* Protocol.viewChangesDigest(changes),
@@ -3521,7 +3521,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       })
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(rename.envelope.mutationId))._tag, "Rejected")
       assert.strictEqual(yield* local.pendingCount, 0)
-      assert.strictEqual(yield* local.cursor, 2)
+      assert.strictEqual((yield* local.progress).cursor, 2)
     }, Effect.scoped))
   )
 
@@ -3549,7 +3549,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       if (receipt._tag !== "Accepted") assert.fail("expected accepted receipt")
       const entry = acceptedMutation(first, receipt)
       yield* local.applyEntries([entry, entry])
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
       assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "1")), Domain.todo("1"))
     }, Effect.scoped))
   )
@@ -3566,7 +3566,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
       const error = yield* local.applyEntries([{ ...entry, changes: [] }]).pipe(expectedFailure)
       assert.strictEqual(error._tag, "ProtocolInvalid")
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
     })))
 
   it.effect(
@@ -3585,7 +3585,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
       assert.strictEqual(error._tag, "ProtocolInvalid")
       assert.strictEqual(yield* local.pendingCount, 1)
-      assert.strictEqual(yield* local.cursor, 0)
+      assert.strictEqual((yield* local.progress).cursor, 0)
     }, Effect.scoped))
   )
 
@@ -4390,8 +4390,8 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
       assert.strictEqual(Option.getOrThrow(yield* first.get(Domain.Todo, "1")).count, 3)
       assert.strictEqual(Option.getOrThrow(yield* second.get(Domain.Todo, "1")).count, 3)
-      assert.strictEqual(yield* first.cursor, 3)
-      assert.strictEqual(yield* second.cursor, 3)
+      assert.strictEqual((yield* first.progress).cursor, 3)
+      assert.strictEqual((yield* second.progress).cursor, 3)
     }, Effect.scoped))
   )
 
@@ -4788,7 +4788,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const mutationId = yield* Effect.scoped(Effect.gen(function*() {
           const local = yield* service(LocalStore.Store, makeLocal())
           const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("submitting-recovery"))
-          yield* local.markSubmitting([pending.envelope.mutationId])
+          yield* local.claimSubmitBatch({ after: 0, through: undefined })
           const submitting = (yield* local.pending)[0]
           assert.strictEqual(submitting.submissionState, "Submitting")
           assert.strictEqual(submitting.attempts, 1)

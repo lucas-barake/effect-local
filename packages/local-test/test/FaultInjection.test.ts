@@ -280,7 +280,7 @@ describe("test synchronization faults", () => {
       yield* local.applyViewPage(page)
       yield* local.settleReceipts
       assert.strictEqual(yield* local.pendingCount, 0)
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
     })
   )
 
@@ -322,7 +322,7 @@ describe("test synchronization faults", () => {
       assert.deepStrictEqual(page.changes.map((change) => change._tag), ["Upsert", "Upsert"])
       yield* local.applyViewPage(page)
       yield* local.settleReceipts
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
       assert.strictEqual(yield* local.pendingCount, 0)
     })
   )
@@ -352,7 +352,7 @@ describe("test synchronization faults", () => {
       const receipts = yield* Effect.forEach(pending, (mutation) => local.receipt(mutation.envelope.mutationId))
       const sequences = receipts.map(Option.map(acceptedSequence))
       assert.deepStrictEqual(sequences, [Option.some(1), Option.some(2), Option.some(3)])
-      assert.strictEqual(yield* local.cursor, 3)
+      assert.strictEqual((yield* local.progress).cursor, 3)
       assert.strictEqual(yield* local.pendingCount, 0)
     })
   )

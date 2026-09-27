@@ -1495,7 +1495,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
       assert.isTrue(yield* local.stageBootstrapPage(bootstrap))
       yield* local.installBootstrap(required.manifest)
       const before = yield* local.replicationState
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
 
       const changes: ReadonlyArray<Protocol.ViewChange> = []
       const invalid = Protocol.PullPage.make({
@@ -1517,7 +1517,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
       if (Result.isFailure(result)) {
         assert.strictEqual(result.failure._tag, "ProtocolInvalid")
       }
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
       assert.deepStrictEqual(yield* local.replicationState, before)
     }, provideNodeCrypto)
   )

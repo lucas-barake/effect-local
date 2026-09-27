@@ -340,7 +340,7 @@ describe("LocalStore metrics", () => {
       )
 
       assert.strictEqual(error._tag, "StorageUnavailable", "bootstrap installation must fail during projection replay")
-      assert.strictEqual(yield* store.cursor, 1)
+      assert.strictEqual((yield* store.progress).cursor, 1)
       assert.strictEqual(yield* bootstrapInstallCount, 1)
       assert.strictEqual(yield* pendingCount, 1)
       yield* Scope.close(scope, Exit.void)

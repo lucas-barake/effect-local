@@ -591,8 +591,7 @@ export const layerOnePass = (
       const watchFailed = (error: ReplicaError.ReplicaError) => reportFailure(error, true)
       const succeeded = Effect.gen(function*() {
         if (!syncAttempted || failedSinceSyncStarted) return
-        const pending = yield* local.pendingCount
-        const cursor = yield* local.cursor
+        const { cursor, pending } = yield* local.progress
         const serverSchema = yield* Ref.get(updateAvailable)
         const current = yield* Ref.get(status)
         if (serverSchema !== undefined) {
@@ -718,25 +717,6 @@ export const layerOnePass = (
         }
       }).pipe(Effect.tapErrorTag("AuthorizationDenied", () => local.revokeReplication))
 
-      const takeSubmitBatch = Effect.fnUntraced(function*(
-        pending: ReadonlyArray<Protocol.PendingMutation>,
-        offset: number
-      ) {
-        const envelopes: Array<Protocol.MutationEnvelope> = []
-        let requestBytes = 1
-        for (
-          let index = offset;
-          index < pending.length && envelopes.length < Protocol.maximumSubmitBatchEntries;
-          index++
-        ) {
-          const envelope = pending[index].envelope
-          requestBytes += (yield* Protocol.encodedBytesEffect(envelope)) + 1
-          if (envelopes.length > 0 && requestBytes > Protocol.maximumBatchBytes) break
-          envelopes.push(envelope)
-        }
-        return envelopes
-      })
-
       const validateBatchReceipts = (
         envelopes: ReadonlyArray<Protocol.MutationEnvelope>,
         receipts: ReadonlyArray<Protocol.Receipt>
@@ -761,16 +741,18 @@ export const layerOnePass = (
       }
 
       const submitPending = Effect.gen(function*() {
-        yield* local.settleReceipts
         while (true) {
-          const pending = yield* local.pendingToSubmit
           let installedExpiredSnapshot = false
-          let offset = 0
-          while (offset < pending.length && !installedExpiredSnapshot) {
-            const envelopes = yield* takeSubmitBatch(pending, offset)
+          let after = 0
+          let through: number | undefined
+          let more = true
+          while (more && !installedExpiredSnapshot) {
+            const claim = yield* local.claimSubmitBatch({ after, through })
+            through = claim.through
+            const envelopes = claim.envelopes
+            if (envelopes.length === 0) break
             const mutationIds = envelopes.map((envelope) => envelope.mutationId)
             const receipts = yield* Effect.gen(function*() {
-              yield* local.markSubmitting(mutationIds)
               const result = yield* remote.submitBatch({ envelopes, schema: options.definition.schemaIdentity })
               yield* validateBatchReceipts(envelopes, result.receipts)
               yield* local.persistReceipts(result.receipts)
@@ -779,7 +761,8 @@ export const layerOnePass = (
               }
               return result.receipts
             }).pipe(Effect.tapError(() => local.markRetrying(mutationIds)))
-            offset += receipts.length
+            after = envelopes[receipts.length - 1].localSequence
+            more = claim.more || receipts.length < envelopes.length
             for (const receipt of receipts) {
               if (receipt._tag !== "Expired") continue
               yield* local.settleReceipts
@@ -806,7 +789,6 @@ export const layerOnePass = (
           yield* catchUp
           yield* submitPending
           yield* catchUp
-          yield* local.settleReceipts
           syncing = false
           yield* succeeded
         }).pipe(

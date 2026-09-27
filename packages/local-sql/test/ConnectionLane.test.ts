@@ -27,6 +27,7 @@ import * as LocalStore from "../src/LocalStore.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryExecutor from "../src/QueryExecutor.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
+import * as Reconciler from "../src/Reconciler.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 import * as SyncEngine from "../src/SyncEngine.js"
@@ -582,6 +583,82 @@ describe("SqlReplica priorities", () => {
       yield* submitted
       assert.isAbove(priorities.length, 1)
       assert.deepStrictEqual(new Set(priorities), new Set(["Background"]))
+    })
+  )
+})
+
+const countTransactions = (actual: SqlClient.SqlClient) => {
+  const state = { counting: false, transactions: 0 }
+  const sql = new Proxy(actual, {
+    get: (target, property, receiver) => {
+      const value: unknown = Reflect.get(target, property, receiver)
+      if (property !== "withTransaction") return value
+      return <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
+        Effect.withFiber((fiber) => {
+          const outermost = Option.isNone(Context.getOption(fiber.context, target.transactionService))
+          if (state.counting && outermost) state.transactions += 1
+          return target.withTransaction(effect)
+        })
+    }
+  })
+  return { sql, state }
+}
+
+describe("Reconciliation on a connection lane", () => {
+  it.effect(
+    "submits, settles, and reports one local mutation in a bounded number of local transactions",
+    Effect.fnUntraced(function*() {
+      const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
+      const remote = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
+        submitBatch: (request) => server.admitBatch(request, null),
+        discard: (request) => server.discard(request, null),
+        pull: server.pull,
+        bootstrap: server.bootstrap,
+        watch: server.watch
+      })
+      const actual = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
+        Effect.provide(Reactivity.layer)
+      )
+      const counted = countTransactions(actual)
+      const layerDatabase = Layer.mergeAll(
+        ConnectionLane.makeLayer().pipe(Layer.provideMerge(Layer.succeed(SqlClient.SqlClient, counted.sql))),
+        NodeCrypto.layer,
+        Reactivity.layer,
+        QueryReactivity.layer,
+        Layer.succeed(SyncEngine.SyncEngine, remote)
+      )
+      const layerLocal = LocalStore.layer({
+        definition: Domain.definition,
+        spaceId,
+        clientId,
+        scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
+        retainedReceipts: 256,
+        maximumReceipts: 10_000,
+        retainedHistoryEntries: 256,
+        maximumBootstrapEntities: 10_000,
+        maximumBootstrapBytes: 64 * 1024 * 1024,
+        maximumBootstrapPageBytes: 4 * 1024 * 1024,
+        migration
+      }).pipe(Layer.provide(layerRuntime))
+      const context = yield* Layer.build(
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provideMerge(layerLocal),
+          Layer.provideMerge(layerDatabase)
+        )
+      )
+      const local = Context.get(context, LocalStore.Store)
+      const reconciliation = Context.get(context, Reconciler.Reconciliation)
+      yield* reconciliation.sync
+      yield* local.mutate(Domain.PutTodo, Domain.todo("counted"))
+      counted.state.counting = true
+      yield* reconciliation.sync
+      counted.state.counting = false
+      assert.deepStrictEqual(yield* local.pending, [])
+      assert.strictEqual((yield* reconciliation.status)._tag, "Online")
+      assert.isAtMost(counted.state.transactions, 13)
     })
   )
 })

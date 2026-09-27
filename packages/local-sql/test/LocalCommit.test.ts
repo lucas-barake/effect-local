@@ -359,4 +359,35 @@ describe("local commit", () => {
       assert.deepStrictEqual(payloads, [Domain.todo("running"), Domain.todo("before")])
     }, Effect.scoped)
   )
+
+  it.effect(
+    "claims submit batches after the acknowledged prefix and within the snapshot of the pass that started them",
+    Effect.fnUntraced(function*() {
+      const { local } = yield* localStore(Reactivity.layer)
+      const first = yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* local.mutate(Domain.PutTodo, Domain.todo("second"))
+      const third = yield* local.mutate(Domain.PutTodo, Domain.todo("third"))
+      const opening = yield* local.claimSubmitBatch({ after: 0, through: undefined })
+      assert.strictEqual(opening.through, third.envelope.localSequence)
+      assert.isFalse(opening.more)
+      assert.deepStrictEqual(opening.envelopes.map((envelope) => envelope.payload), [
+        Domain.todo("first"),
+        Domain.todo("second"),
+        Domain.todo("third")
+      ])
+      yield* local.mutate(Domain.PutTodo, Domain.todo("after the snapshot"))
+      const tail = yield* local.claimSubmitBatch({ after: first.envelope.localSequence, through: opening.through })
+      assert.deepStrictEqual(tail.envelopes.map((envelope) => envelope.payload), [
+        Domain.todo("second"),
+        Domain.todo("third")
+      ])
+      const pending = yield* local.pending
+      assert.deepStrictEqual(pending.map((item) => [item.submissionState, item.attempts]), [
+        ["Submitting", 1],
+        ["Submitting", 2],
+        ["Submitting", 2],
+        ["Queued", 0]
+      ])
+    }, Effect.scoped)
+  )
 })

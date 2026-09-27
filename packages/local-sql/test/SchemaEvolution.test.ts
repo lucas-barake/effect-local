@@ -661,7 +661,7 @@ describe("client schema evolution", () => {
           title: "pending",
           done: false
         })
-        assert.strictEqual(yield* v2.cursor, 1)
+        assert.strictEqual((yield* v2.progress).cursor, 1)
         assert.strictEqual((yield* v1.get(TodoV1, "1").pipe(Effect.flip))._tag, "SchemaGenerationConflict")
       },
       Effect.scoped,
@@ -713,7 +713,7 @@ describe("client schema evolution", () => {
         const sql = yield* SqlClient.SqlClient
         const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "90", title: "optimistic" })
-        yield* v1.markSubmitting([pending.envelope.mutationId])
+        yield* v1.claimSubmitBatch({ after: 0, through: undefined })
         yield* v1.applyEntries([Protocol.AcceptedMutation.make({
           sequence: Identity.ServerSequence.make(1),
           spaceId,
@@ -758,7 +758,7 @@ describe("client schema evolution", () => {
         const sql = yield* SqlClient.SqlClient
         const v1 = yield* buildStore(definitionV1, layerHandlersV1)
         const pending = yield* v1.mutate(PutTodoV1, { id: "92", title: "receipt-backed" })
-        yield* v1.markSubmitting([pending.envelope.mutationId])
+        yield* v1.claimSubmitBatch({ after: 0, through: undefined })
         const encodedRejection = yield* Schema.encodeEffect(SchemaPolicyRejectedError)(
           new SchemaPolicyRejectedError({ reason: "server-rejected" })
         )
@@ -858,7 +858,7 @@ describe("client schema evolution", () => {
           Option.getOrThrow(yield* v2.get(TodoV2, 20)),
           (todo) => assert.deepStrictEqual(todo, { id: 20, title: "remote", done: true })
         )
-        assert.strictEqual(yield* v2.cursor, 1)
+        assert.strictEqual((yield* v2.progress).cursor, 1)
       },
       Effect.scoped,
       provideDatabase
@@ -945,7 +945,7 @@ describe("client schema evolution", () => {
         const collisionResult = yield* v2.applyEntries([collision]).pipe(Effect.result)
         const collisionError = expectFailure(collisionResult)
         assert.strictEqual(collisionError._tag, "SchemaKeyCollision")
-        assert.strictEqual(yield* v2.cursor, 1)
+        assert.strictEqual((yield* v2.progress).cursor, 1)
         pipe(
           Option.getOrThrow(yield* v2.get(TodoV2, 1)),
           (todo) => assert.deepStrictEqual(todo, { id: 1, title: "original", done: false })
