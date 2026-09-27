@@ -1370,9 +1370,9 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         const bounded = {
           ...serverHistory,
           retainedHistoryEntries: 1,
-          maximumHistoryEntries: 4,
+          maximumHistoryEntries: 8,
           retainedReceipts: 1,
-          maximumReceipts: 4
+          maximumReceipts: 8
         }
         const layerLive = ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
           Layer.provide(layerRuntime),
