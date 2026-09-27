@@ -3871,6 +3871,8 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const subscriptions = yield* Ref.make(0)
       const pulls = yield* Ref.make(0)
       const subscribed = yield* Deferred.make<void>()
+      const pulled = yield* Deferred.make<void>()
+      const reportedFailed = yield* Deferred.make<void>()
       const stale = new ReplicaError.StaleSchema({
         expectedVersion: 2,
         expectedHash: "expected",
@@ -3885,7 +3887,11 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
           submitBatch: () => Effect.die("unexpected submit"),
-          pull: () => Ref.update(pulls, (count) => count + 1).pipe(Effect.andThen(Effect.fail(stale))),
+          pull: () =>
+            Ref.update(pulls, (count) => count + 1).pipe(
+              Effect.andThen(Deferred.succeed(pulled, undefined)),
+              Effect.andThen(Effect.fail(stale))
+            ),
           bootstrap: () => Effect.fail(stale),
           watch: () =>
             Stream.unwrap(
@@ -3899,16 +3905,20 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const layerReconciliation = Reconciler.layer({
         definition: Domain.definition,
         spaceId,
-        retryDelay: "1 second"
+        retryDelay: "1 second",
+        onStatusChange: (status) => {
+          if (status._tag !== "Failed") return Effect.void
+          return Deferred.succeed(reportedFailed, undefined).pipe(Effect.asVoid)
+        }
       }).pipe(
         Layer.provide(localLayer()),
         Layer.provide(layerRemote)
       )
       const scheduler = yield* service(Reconciler.Reconciler, layerReconciliation)
       yield* Deferred.await(subscribed)
-      yield* Effect.yieldNow
-      yield* TestClock.adjust("5 seconds")
-      yield* Effect.yieldNow
+      yield* Deferred.await(pulled)
+      for (let step = 0; step < 50; step++) yield* TestClock.adjust("100 millis")
+      yield* Deferred.await(reportedFailed)
 
       assert.strictEqual(yield* Ref.get(subscriptions), 1)
       assert.strictEqual(yield* Ref.get(pulls), 1)
