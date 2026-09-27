@@ -2,6 +2,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
+import * as Channel from "effect/Channel"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
@@ -18,7 +19,6 @@ import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
 import { capacityExceeded, invalidConfiguration } from "./internal/errors.js"
-import * as LosslessQueue from "./internal/losslessQueue.js"
 
 export const JoinAuthorization = Schema.TaggedStruct("Join", {
   spaceId: Identity.SpaceId,
@@ -113,7 +113,10 @@ interface MemberRecord {
   readonly entryBytes: number
   readonly token: object
   readonly sessionToken: Identity.EphemeralSessionToken
-  readonly departed: Deferred.Deferred<void, ReplicaError.EphemeralSessionUnavailable>
+  readonly departed: Deferred.Deferred<
+    void,
+    ReplicaError.EphemeralSessionUnavailable | ReplicaError.AuthorizationDenied
+  >
   readonly leaseMillis: number
 }
 
@@ -525,7 +528,10 @@ export const layer = <R = never,>(
               Effect.provideService(Crypto.Crypto, crypto),
               Effect.catch(() => Effect.fail(new ReplicaError.ServerUnavailable()))
             )
-            const departed = yield* Deferred.make<void, ReplicaError.EphemeralSessionUnavailable>()
+            const departed = yield* Deferred.make<
+              void,
+              ReplicaError.EphemeralSessionUnavailable | ReplicaError.AuthorizationDenied
+            >()
             const acquireJoin = withGate(
               runtime,
               Effect.gen(function*() {
@@ -622,9 +628,22 @@ export const layer = <R = never,>(
               member: request.member,
               principal
             }))
+            yield* Effect.sleep(resolved.authorizationRefreshIntervalMillis).pipe(
+              Effect.andThen(refreshAuthorization),
+              Effect.forever,
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+                return Deferred.failCause(departed, cause)
+              }),
+              Effect.forkScoped({ startImmediately: true })
+            )
+            const ended = Deferred.await(departed).pipe(Effect.andThen(Cause.done()))
+            const pull = PubSub.takeAll(acquired.subscription).pipe(Effect.raceFirst(ended))
             return Stream.concat(
               Stream.make(acquired.started, acquired.snapshot),
-              Stream.fromSubscription(acquired.subscription).pipe(
+              Effect.succeed(pull).pipe(
+                Channel.fromPull,
+                Stream.fromChannel,
                 Stream.filter((message) => message.revision > acquired.snapshot.revision),
                 Stream.mapAccum(
                   () => acquired.snapshot.revision,
@@ -637,16 +656,6 @@ export const layer = <R = never,>(
                 Stream.takeUntil(({ contiguous }) => !contiguous, { excludeLast: true }),
                 Stream.map(({ message }) => message)
               )
-            ).pipe(
-              (stream) => LosslessQueue.interruptWhen(stream, Deferred.await(departed)),
-              (stream) =>
-                LosslessQueue.mergeEffect(
-                  stream,
-                  Effect.sleep(resolved.authorizationRefreshIntervalMillis).pipe(
-                    Effect.andThen(refreshAuthorization),
-                    Effect.forever
-                  )
-                )
             )
           })).pipe(
             Stream.withSpan("EphemeralHub.join", {

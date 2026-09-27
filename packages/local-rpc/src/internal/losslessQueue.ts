@@ -58,9 +58,3 @@ export const mergeEffect = <A, E extends { readonly _tag: string }, R, X, E2 ext
   effect: Effect.Effect<X, E2, R2>
 ): Stream.Stream<A, E | E2, R | R2> =>
   mergeHalting<A, E | E2, R | R2>([self, Stream.drain(Stream.fromEffect(effect))], (side) => side === 0)
-
-export const interruptWhen = <A, E extends { readonly _tag: string }, R, X, E2 extends { readonly _tag: string }, R2,>(
-  self: Stream.Stream<A, E, R>,
-  effect: Effect.Effect<X, E2, R2>
-): Stream.Stream<A, E | E2, R | R2> =>
-  mergeHalting<A, E | E2, R | R2>([self, Stream.drain(Stream.fromEffect(effect))], () => true)
