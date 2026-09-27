@@ -14,8 +14,12 @@ import * as TestClock from "effect/testing/TestClock"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as Socket from "effect/unstable/socket/Socket"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as SyncClient from "../src/SyncClient.js"
 import * as Transport from "../src/Transport.js"
+import * as RecordingClock from "./fixtures/recordingClock.js"
+
+const keepalivePingMillis = 5_000
 
 const noopWriter: Socket.Writer = { write: () => Effect.void, writeAll: () => Effect.void }
 const pong = RpcSerialization.json.makeUnsafe().encode({ _tag: "Pong" })
@@ -91,21 +95,19 @@ describe("SyncClient", () => {
         Layer.provide(Layer.succeed(RpcClient.ConnectionHooks, hooks)),
         Layer.provide(RpcSerialization.layerJson)
       )
-      yield* Layer.build(layerLive)
-      const clock = yield* TestClock.adjust("100 millis").pipe(
-        Effect.forever,
-        Effect.forkChild({ startImmediately: true })
-      )
+      const recording = yield* RecordingClock.make
+      yield* Layer.build(layerLive).pipe(Effect.provideService(Clock.Clock, recording.clock))
 
       const delays: Array<number> = []
-      let failedAt = yield* Queue.take(disconnects)
-      yield* Queue.take(attempts)
+      let failedAt = yield* LosslessQueue.take(disconnects)
+      yield* LosslessQueue.take(attempts)
       for (let attempt = 2; attempt <= connectingAttempt + 1; attempt++) {
-        const attemptedAt = yield* Queue.take(attempts)
+        const reconnect = yield* recording.nextSleep((request) => request.millis !== keepalivePingMillis)
+        yield* recording.advanceTo(reconnect.deadline)
+        const attemptedAt = yield* LosslessQueue.take(attempts)
         delays.push(attemptedAt - failedAt)
-        failedAt = yield* Queue.take(disconnects)
+        failedAt = yield* LosslessQueue.take(disconnects)
       }
-      yield* Fiber.interrupt(clock)
 
       const cap = 2_000
       assert.isTrue(delays.every((delay) => delay <= cap), `delays ${delays.join(",")} exceed the ${cap} ms cap`)
@@ -163,6 +165,7 @@ describe("SyncClient", () => {
     Effect.fnUntraced(function*() {
       const attempts = yield* Ref.make(0)
       const firstAttempt = yield* Deferred.make<void>()
+      const secondAttemptAt = yield* Deferred.make<number>()
       const openError = new Socket.SocketError({
         reason: new Socket.SocketOpenError({
           kind: "Unknown",
@@ -173,6 +176,9 @@ describe("SyncClient", () => {
         reader: Ref.updateAndGet(attempts, (attempt) => attempt + 1).pipe(
           Effect.tap((attempt) => {
             if (attempt === 1) return Deferred.succeed(firstAttempt, undefined)
+            if (attempt === 2) {
+              return Clock.currentTimeMillis.pipe(Effect.flatMap((now) => Deferred.succeed(secondAttemptAt, now)))
+            }
             return Effect.void
           }),
           Effect.andThen(Effect.fail(openError))
@@ -180,20 +186,24 @@ describe("SyncClient", () => {
         writer: Effect.succeed(noopWriter)
       })
       const layerLive = SyncClient.layerProtocolSocket({
-        retryPolicy: Schedule.spaced("5 seconds")
+        retryPolicy: Schedule.spaced("7 seconds")
       }).pipe(
         Layer.provide(Layer.succeed(Socket.Socket, socket)),
         Layer.provide(RpcSerialization.layerJson)
       )
+      const recording = yield* RecordingClock.make
 
-      yield* Layer.build(layerLive)
+      yield* Layer.build(layerLive).pipe(Effect.provideService(Clock.Clock, recording.clock))
       yield* Deferred.await(firstAttempt)
+      const retry = yield* recording.nextSleep((request) => request.millis === 7_000)
+      assert.strictEqual(retry.deadline, 7_000)
       assert.strictEqual(yield* Ref.get(attempts), 1)
 
-      yield* TestClock.adjust("4999 millis")
+      yield* recording.advanceTo(retry.deadline - 1)
       assert.strictEqual(yield* Ref.get(attempts), 1)
 
-      yield* TestClock.adjust("1 millis")
+      yield* recording.advanceTo(retry.deadline)
+      assert.strictEqual(yield* Deferred.await(secondAttemptAt), retry.deadline)
       assert.strictEqual(yield* Ref.get(attempts), 2)
     })
   )
