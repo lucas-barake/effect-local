@@ -48,6 +48,7 @@ export interface ProxyOptions {
   readonly crypto: Crypto.Crypto
   readonly retryDelay: Duration.Duration
   readonly awaitRouted: Effect.Effect<boolean>
+  readonly superseded: Deferred.Deferred<never, ReplicaError.BuildSuperseded>
 }
 
 export interface ReplicaProxy {
@@ -202,9 +203,22 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       })
     )
 
+  const awaitSuperseded = Deferred.await(options.superseded)
+  const supersededSignal = awaitSuperseded.pipe(Effect.ignore)
+
+  const ensureCurrent = Deferred.isDone(options.superseded).pipe(
+    Effect.flatMap((done) => {
+      if (done) return awaitSuperseded
+      return Effect.void
+    })
+  )
+
+  const guard = <A, E extends Tagged,>(effect: Effect.Effect<A, E>) =>
+    ensureCurrent.pipe(Effect.andThen(Effect.raceFirst(effect, awaitSuperseded)))
+
   const call = <A, E extends Tagged,>(
     effect: Effect.Effect<A, E | TransportError | replicaWire.WireUnknownDefinition | replicaWire.WireUnknownSession>
-  ) => retryHandover(effect).pipe(mapTransport, dieUnknownDefinition)
+  ) => guard(retryHandover(effect)).pipe(mapTransport, dieUnknownDefinition)
 
   const resubscribeAfterHandover = <A, E extends Tagged,>(effect: Effect.Effect<A, E>) =>
     Effect.exit(effect).pipe(
@@ -282,9 +296,17 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     }),
     Effect.ensuring(Effect.sync(forgetMemberships)),
     resubscribeAfterHandover,
+    Effect.raceFirst(supersededSignal),
     Effect.forkIn(proxyScope)
   )
-  yield* Deferred.await(subscribed)
+  yield* supersededSignal.pipe(
+    Effect.andThen(Effect.suspend(() => {
+      forgetMemberships()
+      return options.reactivity.invalidate(fullRefreshKeys())
+    })),
+    Effect.forkIn(proxyScope)
+  )
+  yield* Effect.raceFirst(Deferred.await(subscribed), supersededSignal)
 
   const settlementsStream = (
     spaceId: Identity.SpaceId,
@@ -336,7 +358,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         })
       )
     const routed = Stream.concat(Stream.succeed(undefined), Stream.fromEffectRepeat(awaitRoutedOrUnavailable))
-    return routed.pipe(Stream.flatMap(session))
+    return routed.pipe(Stream.flatMap(session), Stream.interruptWhen(awaitSuperseded))
   }
 
   const spaceHandle = (spaceId: Identity.SpaceId): Replica.Space => {
@@ -557,7 +579,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     const existing = leases.get(key)
     if (existing !== undefined) {
       existing.count += 1
-      yield* Deferred.await(existing.acquired)
+      yield* Effect.raceFirst(Deferred.await(existing.acquired), supersededSignal)
       return releaseLease(key)
     }
     const acquired = Deferred.makeUnsafe<void>()
@@ -573,9 +595,10 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         })
       ),
       resubscribeAfterHandover,
+      Effect.raceFirst(supersededSignal),
       Effect.forkIn(scope)
     )
-    yield* Deferred.await(acquired)
+    yield* Effect.raceFirst(Deferred.await(acquired), supersededSignal)
     return releaseLease(key)
   })
 
@@ -626,6 +649,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
           onNone: () => Effect.void,
           onSome: (current) =>
             retryHandover(client.EphemeralUpdateMember({ handle: current, value })).pipe(
+              guard,
               Effect.catchTag("WireUnknownSession", () => Effect.void),
               mapTransport,
               dieUnknownDefinition
@@ -689,9 +713,10 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         )
       }),
       Effect.repeat({ until: (openFailed) => openFailed }),
+      Effect.raceFirst(supersededSignal),
       Effect.forkIn(sessionScope)
     )
-    yield* Deferred.await(opened)
+    yield* Effect.raceFirst(Deferred.await(opened), awaitSuperseded)
 
     function eventsOf<D extends Ephemeral.AnyEvent,>(
       definitionArg: D
@@ -708,7 +733,8 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
           decodeWith(definitionArg.payloadSchema, frame.payload).pipe(
             Effect.map((payload) => ({ member: frame.member, payload }))
           )
-        )
+        ),
+        Stream.interruptWhen(awaitSuperseded)
       )
     }
 
@@ -736,7 +762,8 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
               expiresAtMillis: frame.expiresAtMillis
             }))
           )
-        ))
+        )),
+        Stream.interruptWhen(awaitSuperseded)
       )
     }
 
@@ -752,7 +779,8 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
           decodeWith(profile.payloadSchema, frame.value).pipe(
             Effect.map((value) => ({ member: frame.member, value, expiresAtMillis: frame.expiresAtMillis }))
           )
-        ))
+        )),
+        Stream.interruptWhen(awaitSuperseded)
       ),
       updateMember: (value) =>
         encodeJson(profile.payloadSchema, value).pipe(

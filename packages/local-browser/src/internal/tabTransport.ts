@@ -11,7 +11,7 @@ import { RpcClientDefect, RpcClientError } from "effect/unstable/rpc/RpcClientEr
 import type * as RpcMessage from "effect/unstable/rpc/RpcMessage"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
-import * as lockNames from "./lockNames.js"
+import type * as lockNames from "./lockNames.js"
 import * as LosslessQueue from "./losslessQueue.js"
 import type * as platform from "./platform.js"
 
@@ -58,7 +58,7 @@ const FromServer = Schema.Union([
   Schema.Struct({ _tag: Schema.Literal("Pong") })
 ])
 
-const Frame = Schema.Union([
+export const Frame = Schema.Union([
   Schema.TaggedStruct("ToServer", { from: Schema.String, connection: Schema.Int, message: FromClient }),
   Schema.TaggedStruct("ToClient", { from: Schema.String, connection: Schema.Int, message: FromServer })
 ])
@@ -73,7 +73,7 @@ export interface TabTransport {
 }
 
 export interface Options {
-  readonly name: string
+  readonly names: lockNames.LockNames
   readonly self: RunnerAddress.RunnerAddress
   readonly locks: platform.WebLocksService
   readonly channels: platform.TabChannelService
@@ -84,7 +84,7 @@ type ServerMessage = typeof FromServer.Type
 export const make = Effect.fnUntraced(function*(options: Options) {
   const transportScope = yield* Effect.scope
   const self = options.self.host
-  const names = lockNames.make(options.name)
+  const names = options.names
   const outboxes = new Map<string, Deferred.Deferred<platform.TabChannelConnection>>()
 
   const openOutbox = Effect.fnUntraced(function*(

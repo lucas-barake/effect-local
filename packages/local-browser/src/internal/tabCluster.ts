@@ -41,7 +41,6 @@ const layerRunners = Layer.effect(
 ).pipe(Layer.provide(Snowflake.layerGenerator))
 
 export interface Options {
-  readonly name: string
   readonly host: string
   readonly names: lockNames.LockNames
   readonly locks: platform.WebLocksService
@@ -66,7 +65,7 @@ export const make = Effect.fnUntraced(function*(options: Options) {
     runnerListenAddress: Option.none()
   }
   const transport = yield* TabTransport.make({
-    name: options.name,
+    names: options.names,
     self,
     locks: options.locks,
     channels: options.channels

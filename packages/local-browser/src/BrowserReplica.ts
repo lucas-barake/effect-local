@@ -21,6 +21,8 @@ import type * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import { BrowserStorageError } from "./BrowserStorageError.js"
+import * as BuildGate from "./internal/buildGate.js"
+import * as BuildIdentity from "./internal/buildIdentity.js"
 import * as lockNames from "./internal/lockNames.js"
 import * as platform from "./internal/platform.js"
 import * as replicaHost from "./internal/replicaHost.js"
@@ -121,7 +123,12 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
   const channels = Context.get(platformContext, platform.TabChannel)
   const visibility = Context.get(platformContext, platform.TabVisibility)
   const identities = Context.get(platformContext, platform.ClientIdentityStore)
-  const names = lockNames.make(options.name)
+  const profiles = new Map<string, Ephemeral.AnyMember>(Object.entries(options.profiles ?? {}))
+  const profileNames = new Map<Ephemeral.AnyMember, string>()
+  for (const [name, profile] of profiles) profileNames.set(profile, name)
+  const ephemerals = options.ephemerals ?? []
+  const identity = BuildIdentity.make({ definition: options.definition, ephemerals, profiles })
+  const names = lockNames.make(options.name, identity.fingerprint)
   const host = yield* randomUuid
   const clientId = yield* loadClientId(
     names,
@@ -130,10 +137,6 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     identities
   )
   const retryDelay = options.retryDelay ?? Duration.seconds(1)
-  const profiles = new Map<string, Ephemeral.AnyMember>(Object.entries(options.profiles ?? {}))
-  const profileNames = new Map<Ephemeral.AnyMember, string>()
-  for (const [name, profile] of profiles) profileNames.set(profile, name)
-  const ephemerals = options.ephemerals ?? []
 
   const layerStack = SqlReplica.layer({
     ...options.replica,
@@ -151,6 +154,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     layerOwner = Layer.merge(layerStack, layerRequestPersistence)
   }
 
+  const gate = yield* BuildGate.make({ host, build: identity, names, locks, channels })
   const owner = yield* ReplicaOwner.make({
     host,
     names,
@@ -158,10 +162,10 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     channels,
     visibility,
     retryDelay,
+    gate,
     layerOwner
   })
   const cluster = yield* TabCluster.make({
-    name: options.name,
     host,
     names,
     locks,
@@ -198,7 +202,8 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     reactivity,
     crypto,
     retryDelay: Duration.fromInputUnsafe(retryDelay),
-    awaitRouted: cluster.awaitRouted
+    awaitRouted: cluster.awaitRouted,
+    superseded: gate.superseded
   })
   return Context.make(Replica.Replica, proxy.replica).pipe(
     Context.add(QueryReactivity.QueryReactivity, proxy.queryReactivity),

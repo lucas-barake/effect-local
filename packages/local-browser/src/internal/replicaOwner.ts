@@ -13,6 +13,7 @@ import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
+import type * as BuildGate from "./buildGate.js"
 import * as InvalidationHub from "./invalidationHub.js"
 import type * as lockNames from "./lockNames.js"
 import * as LosslessQueue from "./losslessQueue.js"
@@ -26,6 +27,7 @@ export interface Options<E extends { readonly _tag: string },> {
   readonly channels: platform.TabChannelService
   readonly visibility: platform.TabVisibilityService
   readonly retryDelay: Duration.Input
+  readonly gate: BuildGate.BuildGate
   readonly layerOwner: Layer.Layer<
     Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient,
     E,
@@ -112,6 +114,13 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
   const announcements = yield* options.channels.open(names.visibilityChannel)
   let marker: Scope.Closeable | undefined
 
+  const releaseMarker = Effect.suspend(() => {
+    if (marker === undefined) return Effect.void
+    const released = marker
+    marker = undefined
+    return Scope.close(released, Exit.void)
+  })
+
   const syncMarker = Effect.gen(function*() {
     const now = yield* options.visibility.visible
     yield* SubscriptionRef.set(visible, now)
@@ -120,15 +129,17 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
       marker = markerScope
       yield* options.locks.acquire(names.visible(options.host)).pipe(Scope.provide(markerScope))
       yield* announcements.post(options.host)
-    } else if (!now && marker !== undefined) {
-      const released = marker
-      marker = undefined
-      yield* Scope.close(released, Exit.void)
+    } else if (!now) {
+      yield* releaseMarker
     }
   })
 
+  const superseded = Deferred.await(options.gate.superseded).pipe(Effect.ignore)
+
   yield* options.visibility.changes.pipe(
     Stream.runForEach(() => syncMarker),
+    Effect.raceFirst(superseded),
+    Effect.andThen(releaseMarker),
     Effect.forkScoped
   )
 
@@ -184,7 +195,7 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
   const lead = Effect.gen(function*() {
     yield* awaitCandidacy
     yield* options.locks.acquire(names.leader)
-    if (yield* outranked) return
+    if ((yield* options.gate.check) || (yield* outranked)) return
     const invalidations = yield* Effect.acquireRelease(
       Effect.sync(() => InvalidationHub.make(invalidationBacklogCapacity)),
       (hub) => hub.shutdown
@@ -244,6 +255,7 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
       onFailure: () => Effect.sleep(options.retryDelay)
     })),
     Effect.forever,
+    Effect.raceFirst(superseded),
     Effect.forkScoped
   )
 

@@ -1,3 +1,10 @@
+export interface Presence {
+  readonly sequence: number
+  readonly version: number
+  readonly fingerprint: string
+  readonly host: string
+}
+
 export interface LockNames {
   readonly runner: (host: string) => string
   readonly runnerPrefix: string
@@ -11,13 +18,18 @@ export interface LockNames {
   readonly machine: (id: number) => string
   readonly leader: string
   readonly clientIdentity: string
+  readonly presence: (presence: Presence) => string
+  readonly presencePrefix: string
+  readonly presenceChannel: string
 }
 
-export const make = (name: string): LockNames => {
+export const make = (name: string, fingerprint: string): LockNames => {
   const base = `@lucas-barake/effect-local-browser:${encodeURIComponent(name)}`
-  const runnerPrefix = `${base}:runner:`
-  const readyPrefix = `${base}:ready:`
-  const visiblePrefix = `${base}:visible:`
+  const build = `${base}:build:${fingerprint}`
+  const runnerPrefix = `${build}:runner:`
+  const readyPrefix = `${build}:ready:`
+  const visiblePrefix = `${build}:visible:`
+  const presencePrefix = `${base}:presence:`
   return {
     runner: (host) => `${runnerPrefix}${host}`,
     runnerPrefix,
@@ -25,11 +37,15 @@ export const make = (name: string): LockNames => {
     readyPrefix,
     visible: (host) => `${visiblePrefix}${host}`,
     visiblePrefix,
-    visibilityChannel: `${base}:visibility`,
-    runnersChannel: `${base}:runners`,
-    inbox: (host) => `${base}:inbox:${host}`,
-    machine: (id) => `${base}:machine:${id}`,
+    visibilityChannel: `${build}:visibility`,
+    runnersChannel: `${build}:runners`,
+    inbox: (host) => `${build}:inbox:${host}`,
+    machine: (id) => `${build}:machine:${id}`,
     leader: `${base}:leader`,
-    clientIdentity: `${base}:client-identity`
+    clientIdentity: `${base}:client-identity`,
+    presence: (presence) =>
+      `${presencePrefix}${presence.sequence}:${presence.version}:${presence.fingerprint}:${presence.host}`,
+    presencePrefix,
+    presenceChannel: `${base}:presence`
   }
 }

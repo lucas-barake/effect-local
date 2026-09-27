@@ -60,6 +60,12 @@ const definition = Definition.make({
   mutations: [PutTodo, AppendTitle],
   queries: [ListTodos, RunIndex]
 })
+const definitionNext = Definition.make({
+  version: 2,
+  models: [Todo],
+  mutations: [PutTodo, AppendTitle],
+  queries: [ListTodos, RunIndex]
+})
 
 const TodoRow = Schema.Struct({ value: Schema.fromJsonString(TodoSchema) })
 const listTodos = (query: Transaction.Query) =>
@@ -132,6 +138,17 @@ const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
 
 const StatusProfile = Ephemeral.member({ status: Schema.String })
 const Reaction = Ephemeral.make("reaction", { kind: "event", payload: { emoji: Schema.String } })
+const Wave = Ephemeral.make("wave", { kind: "event", payload: { hand: Schema.String } })
+
+interface Build {
+  readonly definition: typeof definition
+  readonly ephemerals: ReadonlyArray<Ephemeral.Any>
+  readonly database: string
+}
+
+const currentBuild: Build = { definition, ephemerals: [Reaction], database: "replica" }
+const nextVersionBuild: Build = { definition: definitionNext, ephemerals: [Reaction], database: "replica-next" }
+const sameVersionRebuild: Build = { definition, ephemerals: [Reaction, Wave], database: "replica" }
 const member = Protocol.EphemeralMember.make({
   clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000401"),
   membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000401")
@@ -204,18 +221,26 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
     }),
     environmentOptions.layerEphemeral ?? layerEphemeralInactive
   )
-  const layerDatabase = SqliteClient.layer({ filename: `${directory}/replica.sqlite` }).pipe(
-    Layer.tap(() => Ref.update(databaseOpens, (count) => count + 1))
-  )
-  const layerReplicaWith = (visibility: platform.TabVisibilityService) =>
+  const databaseLog = yield* Ref.make<ReadonlyArray<string>>([])
+  const layerDatabaseLifecycle = (database: string) =>
+    Effect.acquireRelease(
+      Ref.update(databaseLog, (log) => [...log, `open:${database}`]),
+      () => Ref.update(databaseLog, (log) => [...log, `close:${database}`])
+    ).pipe(Layer.effectDiscard)
+  const layerDatabaseFor = (database: string) =>
+    SqliteClient.layer({ filename: `${directory}/${database}.sqlite` }).pipe(
+      Layer.provideMerge(layerDatabaseLifecycle(database)),
+      Layer.tap(() => Ref.update(databaseOpens, (count) => count + 1))
+    )
+  const layerReplicaWith = (visibility: platform.TabVisibilityService, build: Build = currentBuild) =>
     BrowserReplica.layer({
       name: environmentOptions.name ?? "tabs",
-      definition,
-      layerDatabase,
+      definition: build.definition,
+      layerDatabase: layerDatabaseFor(build.database),
       layerSync,
       spaces: [spaceId],
       profiles: { status: StatusProfile },
-      ephemerals: [Reaction],
+      ephemerals: build.ephemerals,
       layerPlatform: Layer.merge(kit.layerAll, Layer.succeed(platform.TabVisibility, visibility)),
       requestPersistence: false,
       retryDelay: environmentOptions.retryDelay ?? "100 millis",
@@ -224,15 +249,27 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
   const layerReplica = Layer.unwrap(
     testKit.makeMemoryVisibility(true).pipe(Effect.map((visibility) => layerReplicaWith(visibility.service)))
   )
-  const openTabWith = Effect.fnUntraced(function*(visible: boolean) {
+  const openTabWith = Effect.fnUntraced(function*(visible: boolean, build: Build = currentBuild) {
     const visibility = yield* testKit.makeMemoryVisibility(visible)
-    const layerTab = layerReplicaWith(visibility.service).pipe(Layer.provideMerge(Layer.fresh(Reactivity.layer)))
+    const layerTab = layerReplicaWith(visibility.service, build).pipe(
+      Layer.provideMerge(Layer.fresh(Reactivity.layer))
+    )
     const scope = yield* Scope.make()
     const context = yield* settle(Layer.buildWithScope(layerTab, scope))
     return { scope, context, replica: Context.get(context, Replica.Replica), visibility }
   })
   const openTab = openTabWith(true)
-  return { openTab, openTabWith, databaseOpens, layerReplica, layerReplicaWith, traffic: kit.traffic }
+  const openBuild = (build: Build) => openTabWith(true, build)
+  return {
+    openTab,
+    openTabWith,
+    openBuild,
+    databaseOpens,
+    databaseLog,
+    layerReplica,
+    layerReplicaWith,
+    traffic: kit.traffic
+  }
 })
 
 const makeEnvironment = makeEnvironmentWith({})
@@ -277,6 +314,19 @@ const failureTag = <A, E extends { readonly _tag: string },>(exit: Exit.Exit<A, 
         onSome: (error) => error._tag
       })
   })
+
+const settledOutcome = Effect.fnUntraced(
+  function*<A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) {
+    const fiber = yield* Effect.forkChild(effect)
+    for (let step = 0; step < 100; step++) yield* TestClock.adjust("50 millis")
+    const exit = fiber.pollUnsafe()
+    if (exit === undefined) {
+      yield* Fiber.interrupt(fiber)
+      return "pending"
+    }
+    return failureTag(exit)
+  }
+)
 
 const openStatusSession = (context: Context.Context<EphemeralClient.EphemeralClient>) =>
   Context.get(context, EphemeralClient.EphemeralClient).session(StatusProfile, {
@@ -1177,5 +1227,200 @@ describe("BrowserReplica at small scheduler budgets", () => {
   it.effect(
     "serves the visible tab through rapid visibility flips without losing or repeating a mutation at a scheduler budget of 31 operations",
     () => rapidVisibilityFlips().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 31))
+  )
+})
+
+describe("BrowserReplica across builds", () => {
+  it.effect(
+    "hands the database to a newer build's tab and fails every older build tab with BuildSuperseded",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const leader = yield* environment.openTabWith(true)
+        const follower = yield* environment.openTabWith(false)
+        const next = yield* environment.openBuild(nextVersionBuild)
+        const space = yield* settle(next.replica.space(spaceId))
+        yield* settle(space.mutate(PutTodo, { id: "1", title: "from the newer build" }))
+        assert.deepStrictEqual(yield* settle(listFrom(next.replica)), [{ id: "1", title: "from the newer build" }])
+        assert.strictEqual(yield* settledOutcome(listFrom(leader.replica)), "BuildSuperseded")
+        assert.strictEqual(yield* settledOutcome(listFrom(follower.replica)), "BuildSuperseded")
+        assert.deepStrictEqual(yield* Ref.get(environment.databaseLog), [
+          "open:replica",
+          "close:replica",
+          "open:replica-next"
+        ])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "keeps an older build's tab opened beside a newer leader away from the database",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const next = yield* environment.openBuild(nextVersionBuild)
+        const older = yield* environment.openTab
+        const failure = yield* settledOutcome(listFrom(older.replica))
+        assert.strictEqual(failure, "BuildSuperseded")
+        const superseded = yield* settle(
+          listFrom(older.replica).pipe(
+            Effect.as(undefined),
+            Effect.catchTag(
+              "BuildSuperseded",
+              (error) => Effect.succeed({ version: error.version, supersedingVersion: error.supersedingVersion })
+            )
+          )
+        )
+        assert.deepStrictEqual(superseded, { version: 1, supersedingVersion: 2 })
+        assert.deepStrictEqual(yield* settle(listFrom(next.replica)), [])
+        yield* settle(Scope.close(next.scope, Exit.void))
+        assert.strictEqual(yield* settledOutcome(listFrom(older.replica)), "BuildSuperseded")
+        assert.deepStrictEqual(yield* Ref.get(environment.databaseLog), ["open:replica-next", "close:replica-next"])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "lets the latest started build of an equal definition version take over the shared database",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const first = yield* environment.openTab
+        const firstSpace = yield* settle(first.replica.space(spaceId))
+        yield* settle(firstSpace.mutate(PutTodo, { id: "1", title: "from the first build" }))
+        const rebuilt = yield* environment.openBuild(sameVersionRebuild)
+        const space = yield* settle(rebuilt.replica.space(spaceId))
+        yield* settle(space.mutate(PutTodo, { id: "2", title: "from the rebuilt build" }))
+        assert.deepStrictEqual(yield* settle(listFrom(rebuilt.replica)), [
+          { id: "1", title: "from the first build" },
+          { id: "2", title: "from the rebuilt build" }
+        ])
+        assert.strictEqual(yield* settledOutcome(listFrom(first.replica)), "BuildSuperseded")
+        assert.deepStrictEqual(yield* Ref.get(environment.databaseLog), [
+          "open:replica",
+          "close:replica",
+          "open:replica"
+        ])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "fails an older build's in-flight query and live settlement stream with BuildSuperseded",
+    Effect.fnUntraced(
+      function*() {
+        const probe = yield* makeFenceProbe
+        const environment = yield* makeEnvironmentWith({ runIndex: probe.runIndex })
+        yield* environment.openTabWith(true)
+        const follower = yield* environment.openTabWith(false)
+        const space = yield* settle(follower.replica.space(spaceId))
+        const querying = yield* Effect.forkChild(space.query(RunIndex, undefined))
+        const streaming = yield* Effect.forkChild(space.settlements({ from: "live" }).pipe(Stream.runDrain))
+        yield* settle(probe.holding)
+        yield* environment.openBuild(nextVersionBuild)
+        yield* settle(probe.fenced)
+        assert.strictEqual(yield* settledOutcome(Fiber.join(querying)), "BuildSuperseded")
+        assert.strictEqual(yield* settledOutcome(Fiber.join(streaming)), "BuildSuperseded")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "fails an older build tab's ephemeral session projections with BuildSuperseded",
+    Effect.fnUntraced(
+      function*() {
+        const updates = yield* Ref.make<ReadonlyArray<unknown>>([])
+        const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralOpening(Effect.void, updates) })
+        const leader = yield* environment.openTab
+        const session = yield* settle(openStatusSession(leader.context).pipe(Scope.provide(yield* Effect.scope)))
+        const members = yield* Effect.forkChild(session.members.pipe(Stream.runDrain))
+        yield* environment.openBuild(nextVersionBuild)
+        assert.strictEqual(yield* settledOutcome(Fiber.join(members)), "BuildSuperseded")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "moves a superseded tab's status atoms to a BuildSuperseded failure",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        yield* environment.openTab
+        const graph = ReplicaAtom.make(environment.layerReplica)
+        const registry = AtomRegistry.make()
+        yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+        const status = graph.status(spaceId)
+        const aggregate = graph.aggregateStatus
+        const unmountStatus = registry.mount(status)
+        const unmountAggregate = registry.mount(aggregate)
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            unmountStatus()
+            unmountAggregate()
+          })
+        )
+        yield* settle(AtomRegistry.getResult(registry, status, { suspendOnWaiting: true }))
+        yield* settle(AtomRegistry.getResult(registry, aggregate, { suspendOnWaiting: true }))
+        yield* environment.openBuild(nextVersionBuild)
+        assert.strictEqual(
+          yield* settledOutcome(AtomRegistry.getResult(registry, status, { suspendOnWaiting: true })),
+          "BuildSuperseded"
+        )
+        assert.strictEqual(
+          yield* settledOutcome(AtomRegistry.getResult(registry, aggregate, { suspendOnWaiting: true })),
+          "BuildSuperseded"
+        )
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "lets a hidden tab lead when the only visible tab of its build was superseded earlier",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const superseded = yield* environment.openTab
+        const firstSpace = yield* settle(superseded.replica.space(spaceId))
+        yield* settle(firstSpace.mutate(PutTodo, { id: "1", title: "from the first tab" }))
+        yield* environment.openBuild(sameVersionRebuild)
+        assert.strictEqual(yield* settledOutcome(listFrom(superseded.replica)), "BuildSuperseded")
+        const hidden = yield* environment.openTabWith(false)
+        assert.strictEqual(yield* settledOutcome(listFrom(hidden.replica)), "succeeded")
+        assert.strictEqual(yield* settledOutcome(listFrom(superseded.replica)), "BuildSuperseded")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "leaves tabs of the same build serving one another when another tab of that build opens",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        const leader = yield* environment.openTab
+        const follower = yield* environment.openTabWith(false)
+        const space = yield* settle(follower.replica.space(spaceId))
+        yield* settle(space.mutate(PutTodo, { id: "1", title: "before" }))
+        const late = yield* environment.openTabWith(false)
+        assert.deepStrictEqual(yield* settle(listFrom(late.replica)), [{ id: "1", title: "before" }])
+        assert.deepStrictEqual(yield* settle(listFrom(leader.replica)), [{ id: "1", title: "before" }])
+        assert.deepStrictEqual(yield* Ref.get(environment.databaseLog), ["open:replica"])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
   )
 })

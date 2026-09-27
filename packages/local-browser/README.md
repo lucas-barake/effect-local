@@ -58,6 +58,41 @@ Leadership follows visibility. Chrome deprioritizes the process of a tab whose p
 hands the replica to a visible tab, which takes about 150 ms, and a hidden tab does not take leadership while another
 tab is visible.
 
+### Deploys and mixed builds
+
+After a deploy, a user can have tabs from the old build and the new build open at once. Each tab derives a build
+fingerprint from the library's tab wire protocol, the definition's `hash`, and the `ephemerals` and `profiles` it was
+given. Only tabs with the same fingerprint join one cluster, so a tab never has to decode a frame or an entity message
+from another build. The database still has one owner per origin and `name`: every build contends for the same leader
+lock.
+
+When two builds meet, the newest one owns the database:
+
+- A higher `Definition.make` `version` always wins. A newer tab takes over from an older leader, which steps down, closes
+  its SQLite worker, and releases the database. An older tab opened next to a newer build never opens the database.
+- Equal versions with different fingerprints, such as a library upgrade or a changed query or ephemeral definition,
+  are resolved in favor of the tab that started last. A freshly loaded page is the best evidence of what the server
+  currently deploys, and reloading the other tabs loads that same build, so the origin converges on it.
+
+Every tab of the losing build is superseded for the rest of its life, even after the winning tabs close, because the
+winner may already have migrated the database. From then on each call, stream, live query, and ephemeral session of
+that tab fails with the typed `ReplicaError.BuildSuperseded`, carrying the tab's `version` and the `supersedingVersion`.
+In-flight calls end the same way, so a superseded tab never waits on a leader that will not come back. The tab's
+status atoms are refreshed when it is superseded, so the app can show a reload prompt from `graph.status(spaceId)` or
+`graph.aggregateStatus`:
+
+```ts
+import * as Option from "effect/Option"
+import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
+
+const status = registry.get(graph.status(spaceId))
+const superseded = AsyncResult.isFailure(status) &&
+  Option.exists(AsyncResult.error(status), (error) => error._tag === "BuildSuperseded")
+```
+
+A reload is the only recovery. A mutation that was in flight when its tab was superseded may still have been recorded
+by the old leader, so read pending mutations or receipts after the reload rather than assuming it failed.
+
 `ReplicaAtom.make` builds one Atom runtime from that Layer with space-addressed entities, queries, mutations, receipts,
 settlements, lifecycle operations, and ephemera.
 
