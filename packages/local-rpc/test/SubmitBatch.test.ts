@@ -6,7 +6,6 @@ import * as LocalStore from "@lucas-barake/effect-local-sql/LocalStore"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
 import * as Reconciler from "@lucas-barake/effect-local-sql/Reconciler"
-import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -92,7 +91,6 @@ const layerClientProtocol = SyncClient.layerProtocolSocket().pipe(
 )
 
 interface Submission {
-  readonly tag: "Submit" | "SubmitBatch"
   readonly version: Protocol.ProtocolVersion
   readonly size: number
 }
@@ -110,11 +108,7 @@ const LogRow = Schema.Struct({ server_sequence: Schema.Number, mutation_id: Sche
 const ReceiptRow = Schema.Struct({ mutation_id: Schema.String })
 const CountRow = Schema.Struct({ count: Schema.Number })
 
-const makeHarness = Effect.fnUntraced(function*(options: {
-  readonly serverVersions?: ReadonlyArray<number>
-  readonly clientVersions?: ReadonlyArray<number>
-  readonly staleBatchVersion?: boolean
-} = {}) {
+const makeHarness = Effect.fnUntraced(function*() {
   const submissions: Array<Submission> = []
   const gateArmed = MutableRef.make(false)
   const gateEntered = yield* Deferred.make<void>()
@@ -128,16 +122,14 @@ const makeHarness = Effect.fnUntraced(function*(options: {
         Effect.sync(() => {
           const payload = rpcOptions.payload
           if (rpcOptions.rpc._tag === "SubmitBatch" && Schema.is(Protocol.VersionedSubmitBatchRequest)(payload)) {
-            submissions.push({ tag: "SubmitBatch", version: payload.protocolVersion, size: payload.envelopes.length })
-          } else if (rpcOptions.rpc._tag === "Submit" && Schema.is(Protocol.VersionedSubmitRequest)(payload)) {
-            submissions.push({ tag: "Submit", version: payload.protocolVersion, size: 1 })
+            submissions.push({ version: payload.protocolVersion, size: payload.envelopes.length })
           }
         }).pipe(Effect.andThen(authenticate(effect, rpcOptions)))
       )
     })
   ).pipe(Layer.provide(layerAuthenticationServer))
 
-  let serverOptions: SyncServer.LayerOptions<typeof definition> = {
+  const serverOptions: SyncServer.LayerOptions<typeof definition> = {
     definition,
     store: { migration },
     authorizeEphemeral: () => Effect.void,
@@ -152,9 +144,6 @@ const makeHarness = Effect.fnUntraced(function*(options: {
       return Effect.void
     }
   }
-  if (options.serverVersions !== undefined) {
-    serverOptions = { ...serverOptions, supportedProtocolVersions: options.serverVersions }
-  }
   const layerServerDatabase = Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
@@ -168,25 +157,8 @@ const makeHarness = Effect.fnUntraced(function*(options: {
     Layer.provideMerge(layerServerDatabase),
     Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
   )
-  let sessionOptions: ProtocolSession.Options = {}
-  if (options.clientVersions !== undefined) sessionOptions = { supportedProtocolVersions: options.clientVersions }
-  const layerNegotiatedSession = ProtocolSession.layerWithOptions(sessionOptions)
-  let layerSession = layerNegotiatedSession
-  if (options.staleBatchVersion === true) {
-    layerSession = Layer.effect(
-      ProtocolSession.ProtocolSession,
-      Effect.gen(function*() {
-        const negotiated = yield* ProtocolSession.ProtocolSession
-        return ProtocolSession.ProtocolSession.of({
-          client: negotiated.client,
-          version: Effect.succeed(Protocol.submitBatchProtocolVersion),
-          rejected: () => negotiated.version
-        })
-      })
-    ).pipe(Layer.provide(layerNegotiatedSession))
-  }
   const layerRemote = SyncClient.layerFromSession().pipe(
-    Layer.provideMerge(layerSession),
+    Layer.provideMerge(ProtocolSession.layer),
     Layer.provide(layerClientProtocol),
     Layer.provide(layerAuthenticationClient)
   )
@@ -237,7 +209,6 @@ const makeHarness = Effect.fnUntraced(function*(options: {
     gateRelease,
     local,
     reconciliation: Context.get(client, Reconciler.Reconciliation),
-    session: Context.get(live, ProtocolSession.ProtocolSession),
     put: (id: string, title = id) => local.mutate(PutTodo, { id, title }),
     serverLog: SqlSchema.findAll({
       Request: Schema.Void,
@@ -270,71 +241,42 @@ const range = (count: number) => Array.from({ length: count }, (_, index) => ind
 const mutationIds = (pending: ReadonlyArray<Protocol.PendingMutation>) =>
   pending.map((mutation) => mutation.envelope.mutationId)
 
-const PreBatchRpcs = SyncRpc.Rpcs.omit("SubmitBatch")
-
-const makePreBatchServer = Effect.fnUntraced(function*(advertisedVersion: number) {
-  const submits = MutableRef.make(0)
-  const layerStoreDatabase = Layer.mergeAll(
-    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
-    NodeCrypto.layer,
-    Reactivity.layer
-  )
-  const layerStore = ServerStore.layerTrusted({ definition, migration }).pipe(
-    Layer.provide(layerRuntime),
-    Layer.provide(layerStoreDatabase)
-  )
-  const layerPreBatchHandlers = PreBatchRpcs.toLayer(Effect.gen(function*() {
-    const store = yield* ServerStore.ServerStore
-    const negotiated = Protocol.ProtocolVersion.make(advertisedVersion)
-    return PreBatchRpcs.of({
-      Negotiate: () => Effect.succeed({ version: negotiated }),
-      Submit: ({ protocolVersion, ...request }) => {
-        if (protocolVersion !== negotiated) {
-          return Effect.fail(
-            new ReplicaError.ProtocolVersionRejected({ version: protocolVersion, serverVersions: [negotiated] })
-          )
-        }
-        MutableRef.update(submits, (count) => count + 1)
-        return store.submit(request)
-      },
-      Discard: () => Effect.die("unused"),
-      Pull: () => Effect.die("unused"),
-      Bootstrap: () => Effect.die("unused"),
-      Watch: () => Stream.die("unused"),
-      JoinEphemeral: () => Stream.die("unused"),
-      PublishEphemeral: () => Effect.die("unused"),
-      HeartbeatEphemeral: () => Effect.die("unused")
-    })
-  })).pipe(Layer.provide(layerStore))
-  const layerServer = RpcServer.layer(PreBatchRpcs, { disableFatalDefects: true }).pipe(
-    Layer.provide(layerPreBatchHandlers),
+const makeDefectingServer = Effect.fnUntraced(function*() {
+  const negotiations = MutableRef.make(0)
+  const submissions = MutableRef.make(0)
+  const layerDefectingHandlers = SyncRpc.Rpcs.toLayer(SyncRpc.Rpcs.of({
+    Negotiate: () =>
+      Effect.sync(() => MutableRef.update(negotiations, (count) => count + 1)).pipe(
+        Effect.as({ version: Protocol.currentProtocolVersion })
+      ),
+    SubmitBatch: () =>
+      Effect.sync(() => MutableRef.update(submissions, (count) => count + 1)).pipe(
+        Effect.andThen(Effect.die("SubmitBatch handler defect"))
+      ),
+    Discard: () => Effect.die("unused"),
+    Pull: () => Effect.die("unused"),
+    Bootstrap: () => Effect.die("unused"),
+    Watch: () => Stream.die("unused"),
+    JoinEphemeral: () => Stream.die("unused"),
+    PublishEphemeral: () => Effect.die("unused"),
+    HeartbeatEphemeral: () => Effect.die("unused")
+  }))
+  const layerServer = RpcServer.layer(SyncRpc.Rpcs, { disableFatalDefects: true }).pipe(
+    Layer.provide(layerDefectingHandlers),
     Layer.provideMerge(layerWebsocketProtocol),
     Layer.provide(layerAuthenticationServer),
     Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
   )
-  const layerCachedVersion2Session = Layer.effect(
-    ProtocolSession.ProtocolSession,
-    Effect.gen(function*() {
-      const negotiated = yield* ProtocolSession.ProtocolSession
-      const cached = MutableRef.make(Protocol.submitBatchProtocolVersion)
-      return ProtocolSession.ProtocolSession.of({
-        client: negotiated.client,
-        version: Effect.sync(() => MutableRef.get(cached)),
-        rejected: () =>
-          negotiated.version.pipe(Effect.tap((version) => Effect.sync(() => MutableRef.set(cached, version))))
-      })
-    })
-  ).pipe(Layer.provide(ProtocolSession.layer))
   const live = yield* Layer.build(
     SyncClient.layerFromSession().pipe(
-      Layer.provide(layerCachedVersion2Session),
+      Layer.provide(ProtocolSession.layer),
       Layer.provide(layerClientProtocol),
       Layer.provide(layerAuthenticationClient),
       Layer.provideMerge(layerServer),
       Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
     )
   )
-  return { engine: Context.get(live, SyncEngine.SyncEngine), submits }
+  return { engine: Context.get(live, SyncEngine.SyncEngine), negotiations, submissions }
 })
 
 const envelopeAt = Effect.fnUntraced(function*(localSequence: number) {
@@ -354,33 +296,18 @@ const envelopeAt = Effect.fnUntraced(function*(localSequence: number) {
   return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
 })
 
-describe("batched submission against a server built before SubmitBatch", () => {
+describe("batched submission against a defecting server", () => {
   it.effect(
-    "renegotiates and submits one mutation at a time when a cached version 2 reaches a server without SubmitBatch",
+    "fails with ProtocolInvalid instead of a defect when the server answers SubmitBatch with a defect",
     Effect.fnUntraced(function*() {
-      const { engine, submits } = yield* makePreBatchServer(1)
-      const envelopes = [yield* envelopeAt(1), yield* envelopeAt(2)]
-
-      const result = yield* engine.submitBatch({ envelopes, schema: definition.schemaIdentity })
-
-      assert.deepStrictEqual(
-        result.receipts.map((receipt) => [receipt._tag, receipt.mutationId]),
-        envelopes.map((envelope) => ["Accepted", envelope.mutationId])
-      )
-      assert.strictEqual(MutableRef.get(submits), 2)
-    }, (effect) => effect.pipe(Effect.provide(NodeCrypto.layer), Effect.scoped))
-  )
-
-  it.effect(
-    "fails with ProtocolInvalid instead of a defect when the server answers with a defect at an unchanged version",
-    Effect.fnUntraced(function*() {
-      const { engine, submits } = yield* makePreBatchServer(2)
+      const { engine, negotiations, submissions } = yield* makeDefectingServer()
       const envelopes = [yield* envelopeAt(1)]
 
       const failure = yield* failureOf(engine.submitBatch({ envelopes, schema: definition.schemaIdentity }))
 
       assert.strictEqual(failure._tag, "ProtocolInvalid")
-      assert.strictEqual(MutableRef.get(submits), 0)
+      assert.strictEqual(MutableRef.get(submissions), 1)
+      assert.strictEqual(MutableRef.get(negotiations), 1)
     }, (effect) => effect.pipe(Effect.provide(NodeCrypto.layer), Effect.scoped))
   )
 })
@@ -398,9 +325,9 @@ describe("batched submission over the WebSocket protocol", () => {
 
       const batch = Protocol.maximumSubmitBatchEntries
       assert.deepStrictEqual(harness.submissions, [
-        { tag: "SubmitBatch", version: Protocol.submitBatchProtocolVersion, size: batch },
-        { tag: "SubmitBatch", version: Protocol.submitBatchProtocolVersion, size: batch },
-        { tag: "SubmitBatch", version: Protocol.submitBatchProtocolVersion, size: 130 - 2 * batch }
+        { version: Protocol.currentProtocolVersion, size: batch },
+        { version: Protocol.currentProtocolVersion, size: batch },
+        { version: Protocol.currentProtocolVersion, size: 130 - 2 * batch }
       ])
       assert.strictEqual(harness.submissions.length, Math.ceil(130 / batch))
       assert.deepStrictEqual(yield* harness.clientReceipts, mutationIds(pending))
@@ -424,7 +351,7 @@ describe("batched submission over the WebSocket protocol", () => {
       yield* harness.reconciliation.sync
 
       assert.deepStrictEqual(harness.submissions, [
-        { tag: "SubmitBatch", version: Protocol.submitBatchProtocolVersion, size: 5 }
+        { version: Protocol.currentProtocolVersion, size: 5 }
       ])
       assert.deepStrictEqual(yield* harness.receiptTags(pending), [
         "Accepted",
@@ -462,7 +389,6 @@ describe("batched submission over the WebSocket protocol", () => {
       yield* harness.reconciliation.sync
 
       assert.isAtLeast(harness.submissions.length, 2)
-      assert.isTrue(harness.submissions.every((submission) => submission.tag === "SubmitBatch"))
       assert.strictEqual(harness.submissions[0]?.size, 6)
       assert.deepStrictEqual(
         yield* harness.serverLog,
@@ -472,75 +398,6 @@ describe("batched submission over the WebSocket protocol", () => {
       assert.deepStrictEqual(yield* harness.clientReceipts, mutationIds(pending))
       assert.deepStrictEqual(yield* harness.receiptTags(pending), pending.map(() => "Accepted"))
       assert.strictEqual(yield* harness.local.pendingCount, 0)
-    })
-  )
-
-  it.effect(
-    "falls back to one Submit per mutation when the server only supports protocol version 1",
-    Effect.fnUntraced(function*() {
-      const harness = yield* makeHarness({ serverVersions: [1] })
-      yield* harness.reconciliation.sync
-      const pending = yield* Effect.forEach(range(3), (index) => harness.put(`todo-${index}`))
-      harness.submissions.length = 0
-
-      yield* harness.reconciliation.sync
-
-      assert.deepStrictEqual(
-        harness.submissions,
-        pending.map(() => ({ tag: "Submit", version: Protocol.ProtocolVersion.make(1), size: 1 }))
-      )
-      assert.deepStrictEqual(yield* harness.clientReceipts, mutationIds(pending))
-      assert.strictEqual(yield* harness.local.pendingCount, 0)
-    })
-  )
-
-  it.effect(
-    "serves a client that only supports protocol version 1 with one Submit per mutation",
-    Effect.fnUntraced(function*() {
-      const harness = yield* makeHarness({ clientVersions: [1] })
-      yield* harness.reconciliation.sync
-      const pending = yield* Effect.forEach(range(3), (index) => harness.put(`todo-${index}`))
-      harness.submissions.length = 0
-
-      yield* harness.reconciliation.sync
-
-      assert.deepStrictEqual(
-        harness.submissions,
-        pending.map(() => ({ tag: "Submit", version: Protocol.ProtocolVersion.make(1), size: 1 }))
-      )
-      assert.deepStrictEqual(yield* harness.clientReceipts, mutationIds(pending))
-    })
-  )
-
-  it.effect(
-    "renegotiates and falls back to Submit when the server rejects a cached batch protocol version",
-    Effect.fnUntraced(function*() {
-      const harness = yield* makeHarness({ serverVersions: [1], staleBatchVersion: true })
-      const pending = yield* Effect.forEach(range(3), (index) => harness.put(`todo-${index}`))
-
-      yield* harness.reconciliation.sync
-
-      assert.deepStrictEqual(harness.submissions, [
-        { tag: "SubmitBatch", version: Protocol.submitBatchProtocolVersion, size: 3 },
-        ...pending.map(() => ({ tag: "Submit" as const, version: Protocol.ProtocolVersion.make(1), size: 1 }))
-      ])
-      assert.deepStrictEqual(yield* harness.clientReceipts, mutationIds(pending))
-      assert.strictEqual(yield* harness.local.pendingCount, 0)
-    })
-  )
-
-  it.effect(
-    "rejects a SubmitBatch that carries a protocol version without batch support",
-    Effect.fnUntraced(function*() {
-      const harness = yield* makeHarness()
-      const pending = yield* harness.put("todo-1")
-      const failure = yield* failureOf(harness.session.client.SubmitBatch({
-        envelopes: [pending.envelope],
-        schema: definition.schemaIdentity,
-        protocolVersion: Protocol.ProtocolVersion.make(1)
-      }))
-      assert.strictEqual(failure._tag, "ProtocolInvalid")
-      assert.deepStrictEqual(yield* harness.serverLog, [])
     })
   )
 })

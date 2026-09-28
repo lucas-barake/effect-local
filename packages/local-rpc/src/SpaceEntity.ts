@@ -24,15 +24,6 @@ const volatileAnnotations = Context.make(ClusterSchema.Persisted, false).pipe(
   Context.add(ClusterSchema.Uninterruptible, false)
 )
 
-export class Submit extends Rpc.make("Submit", {
-  payload: {
-    request: Protocol.SubmitRequest,
-    assertion: PrincipalAssertion.PrincipalAssertion
-  },
-  success: Protocol.Receipt,
-  error: ReplicaError.ReplicaError
-}).annotateMerge(volatileAnnotations) {}
-
 export class SubmitBatch extends Rpc.make("SubmitBatch", {
   payload: {
     request: Protocol.SubmitBatchRequest,
@@ -105,7 +96,6 @@ export class HeartbeatEphemeral extends Rpc.make("HeartbeatEphemeral", {
 }).annotateMerge(volatileAnnotations) {}
 
 export const Space = Entity.make("EffectLocal/Space", [
-  Submit,
   SubmitBatch,
   Discard,
   Pull,
@@ -117,11 +107,6 @@ export const Space = Entity.make("EffectLocal/Space", [
 ])
 
 export interface ClientService {
-  readonly submit: (
-    spaceId: Identity.SpaceId,
-    request: Protocol.SubmitRequest,
-    assertion: PrincipalAssertion.PrincipalAssertion
-  ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
   readonly submitBatch: (
     spaceId: Identity.SpaceId,
     request: Protocol.SubmitBatchRequest,
@@ -171,15 +156,6 @@ export class Client extends Context.Service<Client, ClientService>()(
 ) {}
 
 const mapClient = (makeClient: Effect.Success<typeof Space.client>): ClientService => ({
-  submit: (spaceId, request, assertion) =>
-    makeClient(spaceId).Submit({ request, assertion }).pipe(
-      Effect.catchTags({
-        MailboxFull: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-        AlreadyProcessingMessage: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-        EntityNotAssignedToRunner: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-        PersistenceError: (error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error.cause }))
-      })
-    ),
   submitBatch: (spaceId, request, assertion) =>
     makeClient(spaceId).SubmitBatch({ request, assertion }).pipe(
       Effect.catchTags({
@@ -322,13 +298,6 @@ export const layerHandlers = (options: HandlerOptions = {}) =>
           const misrouted = new ReplicaError.ProtocolInvalid({ message: "The routed space does not match the payload" })
 
           return Space.of({
-            Submit: ({ payload }) => {
-              if (!routed(payload.request.envelope.spaceId)) return Effect.fail(misrouted)
-              return verifier.verify(payload.assertion).pipe(
-                Effect.flatMap((principal) => store.admit(payload.request, principal)),
-                admission.withPermits(1)
-              )
-            },
             SubmitBatch: ({ payload }) => {
               if (!payload.request.envelopes.every((envelope) => routed(envelope.spaceId))) {
                 return Effect.fail(misrouted)

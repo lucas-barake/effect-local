@@ -568,7 +568,7 @@ describe("domain contracts", () => {
       const scopeGeneration = 1
       const cursor = null
       const operations = [
-        [Protocol.VersionedSubmitRequest, { envelope, schema }],
+        [Protocol.VersionedSubmitBatchRequest, { envelopes: [envelope], schema }],
         [Protocol.VersionedDiscardRequest, { envelope, schema }],
         [Protocol.VersionedPullRequest, {
           spaceId,

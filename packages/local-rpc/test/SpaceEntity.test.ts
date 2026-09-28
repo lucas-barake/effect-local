@@ -162,8 +162,12 @@ describe("SpaceEntity", () => {
         assert.deepStrictEqual(yield* Queue.take(wakes), { spaceId: spaceA })
         const submitted = yield* envelope(spaceA)
         const writer = yield* assertionOf({ subject: "writer" })
-        const receipt = yield* client.submit(spaceA, { envelope: submitted, schema: definition.schemaIdentity }, writer)
-        assert.strictEqual(receipt._tag, "Accepted")
+        const result = yield* client.submitBatch(
+          spaceA,
+          { envelopes: [submitted], schema: definition.schemaIdentity },
+          writer
+        )
+        assert.deepStrictEqual(result.receipts.map((receipt) => receipt._tag), ["Accepted"])
         const pullA = yield* client.pull(spaceA, { ...watchRequest, limit: 10 }, reader)
         assert.isTrue("_tag" in pullA)
         const pullB = yield* client.pull(spaceB, { ...watchRequest, spaceId: spaceB, limit: 10 }, reader)
@@ -226,11 +230,11 @@ describe("SpaceEntity", () => {
 
       const submitted = yield* envelope(spaceA)
       const submitAssertion = yield* assertionOf({ subject: "writer" })
-      const receipt = yield* admissionClient.Submit({
-        request: { envelope: submitted, schema: definition.schemaIdentity },
+      const result = yield* admissionClient.SubmitBatch({
+        request: { envelopes: [submitted], schema: definition.schemaIdentity },
         assertion: submitAssertion
       })
-      assert.strictEqual(receipt._tag, "Accepted")
+      assert.deepStrictEqual(result.receipts.map((receipt) => receipt._tag), ["Accepted"])
       assert.deepStrictEqual(yield* Queue.take(wakes), {
         spaceId: spaceA
       })
@@ -453,8 +457,8 @@ describe("SpaceEntity", () => {
         const submitted = yield* envelope(spaceB)
 
         const submitAssertion = yield* assertionOf(null)
-        const submitResult = yield* admissionClient.Submit({
-          request: { envelope: submitted, schema: definition.schemaIdentity },
+        const submitResult = yield* admissionClient.SubmitBatch({
+          request: { envelopes: [submitted], schema: definition.schemaIdentity },
           assertion: submitAssertion
         }).pipe(Effect.result)
         if (!Result.isFailure(submitResult)) assert.fail("expected submit protocol failure")
@@ -523,7 +527,7 @@ describe("SpaceEntity", () => {
     )
   )
 
-  it.effect("completes Submit while a Bootstrap page is paused", () =>
+  it.effect("completes SubmitBatch while a Bootstrap page is paused", () =>
     Effect.scoped(Effect.gen(function*() {
       const actual = yield* Layer.build(layerStore).pipe(
         Effect.map(Context.get(ServerStore.ServerStore))
@@ -531,7 +535,9 @@ describe("SpaceEntity", () => {
       const firstEntered = yield* Deferred.make<void>()
       const releaseFirst = yield* Deferred.make<void>()
       const submitEntered = yield* Deferred.make<void>()
-      const submitCompleted = yield* Deferred.make<Exit.Exit<Protocol.Receipt, ReplicaError.ReplicaError>>()
+      const submitCompleted = yield* Deferred.make<
+        Exit.Exit<Protocol.SubmitBatchResult, ReplicaError.ReplicaError>
+      >()
       const snapshotId = Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000001")
       const page = Protocol.BootstrapPage.make({
         manifest: {
@@ -558,9 +564,9 @@ describe("SpaceEntity", () => {
       })
       const wrapped = ServerStore.ServerStore.of({
         ...actual,
-        admit: (request, principal) =>
+        admitBatch: (request, principal) =>
           Deferred.succeed(submitEntered, undefined).pipe(
-            Effect.andThen(actual.admit(request, principal)),
+            Effect.andThen(actual.admitBatch(request, principal)),
             Effect.onExit((exit) => Deferred.succeed(submitCompleted, exit))
           ),
         prepareBootstrapAuthorized: () => {
@@ -607,9 +613,9 @@ describe("SpaceEntity", () => {
         yield* Deferred.await(firstEntered)
         const submitted = yield* envelope(spaceA)
         const submitAssertion = yield* assertionOf(null)
-        const submit = yield* client.submit(
+        const submit = yield* client.submitBatch(
           spaceA,
-          { envelope: submitted, schema: definition.schemaIdentity },
+          { envelopes: [submitted], schema: definition.schemaIdentity },
           submitAssertion
         ).pipe(Effect.forkChild({ startImmediately: true }))
 
@@ -618,7 +624,7 @@ describe("SpaceEntity", () => {
         if (Exit.isFailure(submitExit)) {
           assert.fail(Cause.pretty(submitExit.cause))
         }
-        assert.strictEqual(submitExit.value._tag, "Accepted")
+        assert.deepStrictEqual(submitExit.value.receipts.map((receipt) => receipt._tag), ["Accepted"])
 
         yield* Deferred.succeed(releaseFirst, undefined)
         yield* Fiber.join(first)

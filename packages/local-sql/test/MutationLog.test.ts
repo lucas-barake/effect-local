@@ -2772,12 +2772,21 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           1,
           Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000041")
         )
-        const request = Protocol.SubmitRequest.make({ envelope: submitted, schema: Domain.definition.schemaIdentity })
-        assert.strictEqual((yield* server.admit(request, { subject: "test" }))._tag, "Accepted")
+        const request = Protocol.SubmitBatchRequest.make({
+          envelopes: [submitted],
+          schema: Domain.definition.schemaIdentity
+        })
+        const admitted = yield* server.admitBatch(request, { subject: "test" })
+        assert.deepStrictEqual(admitted.receipts.map((receipt) => receipt._tag), ["Accepted"])
         yield* Ref.set(access, false)
 
-        const error = yield* server.admit(request, { subject: "test" }).pipe(Effect.flip)
-        assert.strictEqual(error._tag, "AuthorizationDenied")
+        const denied = yield* server.admitBatch(request, { subject: "test" }).pipe(
+          Effect.matchEffect({
+            onFailure: (error) => Effect.succeed(error._tag),
+            onSuccess: () => Effect.succeed("Admitted")
+          })
+        )
+        assert.strictEqual(denied, "AuthorizationDenied")
       },
       Effect.provide(NodeCrypto.layer),
       Effect.scoped

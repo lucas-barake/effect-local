@@ -194,12 +194,12 @@ const layerFanoutBench = Layer.effect(
         const envelope = submissions[nextSubmission++]
         if (envelope === undefined) yield* Effect.die("Fanout benchmark exhausted its prepared submissions")
         for (const wake of wakes) assert.strictEqual(Queue.sizeUnsafe(wake), 0)
-        const receipt = yield* client.submit(
+        const result = yield* client.submitBatch(
           fixture.spaceId,
-          { envelope, schema: definition.schemaIdentity },
+          { envelopes: [envelope], schema: definition.schemaIdentity },
           assertion
         )
-        assert(receipt._tag === "Accepted")
+        assert(result.receipts.length === 1 && result.receipts[0]?._tag === "Accepted")
         const expected = {
           spaceId: fixture.spaceId
         }

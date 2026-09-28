@@ -2107,9 +2107,13 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
           { id: "42", title: "mixed-version" }
         )
 
-        const receipt = yield* server.admit({ envelope, schema: definitionV1.schemaIdentity }, "principal")
-        assert.strictEqual(receipt._tag, "Accepted")
-        if (receipt._tag === "Accepted") {
+        const admitted = yield* server.admitBatch(
+          { envelopes: [envelope], schema: definitionV1.schemaIdentity },
+          "principal"
+        )
+        const receipt = admitted.receipts[0]
+        assert.strictEqual(receipt?._tag, "Accepted")
+        if (receipt?._tag === "Accepted") {
           assert.deepStrictEqual(receipt.sourceSchema, definitionV1.schemaIdentity)
           assert.strictEqual(receipt.mutationVersion, PutTodoV1.version)
           assert.deepStrictEqual(receipt.result, { id: "42", title: "mixed-version" })
@@ -2868,8 +2872,11 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
           Layer.build,
           Effect.map(Context.get(ServerStore.ServerStore))
         )
-        const receipt = yield* server.admit({ envelope: offline, schema: definitionV2.schemaIdentity }, "principal")
-        assert.strictEqual(receipt._tag, "Accepted")
+        const admitted = yield* server.admitBatch(
+          { envelopes: [offline], schema: definitionV2.schemaIdentity },
+          "principal"
+        )
+        assert.deepStrictEqual(admitted.receipts.map((receipt) => receipt._tag), ["Accepted"])
         assert.deepStrictEqual(yield* Ref.get(authorizedPayload), { id: 10, title: "authorized", done: false })
       },
       Effect.scoped,

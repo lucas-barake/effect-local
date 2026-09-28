@@ -116,13 +116,6 @@ export const layerJson = (options?: {
     })
   )
 
-export class Submit extends Rpc.make("Submit", {
-  payload: Protocol.VersionedSubmitRequest.fields,
-  success: Protocol.Receipt,
-  error: ReplicaError.ReplicaError,
-  defect: RemoteDefect
-}) {}
-
 export class SubmitBatch extends Rpc.make("SubmitBatch", {
   payload: Protocol.VersionedSubmitBatchRequest.fields,
   success: Protocol.SubmitBatchResult,
@@ -190,7 +183,6 @@ export class HeartbeatEphemeral extends Rpc.make("HeartbeatEphemeral", {
 
 export const Rpcs = RpcGroup.make(
   Negotiate,
-  Submit,
   SubmitBatch,
   Discard,
   Pull,

@@ -67,10 +67,6 @@ export interface Service {
   readonly submit: (
     request: Protocol.SubmitRequest | Protocol.MutationEnvelope
   ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
-  readonly admit: (
-    request: Protocol.SubmitRequest,
-    principal: typeof Schema.Json.Type
-  ) => Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError>
   readonly admitBatch: (
     request: Protocol.SubmitBatchRequest,
     principal: typeof Schema.Json.Type
@@ -2329,7 +2325,6 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
 
       return ServerStore.of({
         submit: (request) => admit(trustedSubmitRequest(request), null),
-        admit,
         admitBatch,
         discard,
         pull: (input) => {

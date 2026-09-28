@@ -1,5 +1,5 @@
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
-import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
@@ -7,7 +7,6 @@ import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
-import * as Result from "effect/Result"
 import type * as Schedule from "effect/Schedule"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
@@ -47,71 +46,6 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
       const credentialProvider = yield* Authentication.CredentialProvider
       const transport = yield* Transport.Transport
       const client = session.client
-      const submitOne = (request: Protocol.SubmitRequest, version: Protocol.ProtocolVersion) =>
-        client.Submit({ ...request, protocolVersion: version }).pipe(
-          Effect.catchReasons(
-            "RpcClientError",
-            {
-              WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-              WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-              WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-              WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-              SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-              SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-              SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-              SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-              SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-              HttpError: (reason, error) => {
-                if (reason.kind === "TransportError") {
-                  return Effect.fail(new ReplicaError.ServerUnavailable())
-                }
-                return Effect.fail(
-                  new ReplicaError.ProtocolInvalid({
-                    message: "The Submit RPC failed",
-                    cause: error
-                  })
-                )
-              },
-              RpcClientDefect: (_, error) =>
-                Effect.fail(
-                  new ReplicaError.ProtocolInvalid({
-                    message: "The Submit RPC failed",
-                    cause: error
-                  })
-                )
-            },
-            (_, error) => Effect.die(error)
-          ),
-          Effect.catchCause((cause) => {
-            if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
-            return Effect.failCause(cause)
-          }),
-          Effect.timeoutOrElse({
-            duration: rpcTimeoutMillis,
-            orElse: () =>
-              Effect.fail(
-                new ReplicaError.OperationTimeout({
-                  operation: "Submit",
-                  timeoutMillis: rpcTimeoutMillis
-                })
-              )
-          })
-        )
-      const submitEach = Effect.fnUntraced(function*(
-        request: Protocol.SubmitBatchRequest,
-        version: Protocol.ProtocolVersion
-      ) {
-        const receipts: Array<Protocol.Receipt> = []
-        for (const envelope of request.envelopes) {
-          const submitted = yield* submitOne({ envelope, schema: request.schema }, version).pipe(Effect.result)
-          if (Result.isFailure(submitted)) {
-            if (receipts.length === 0) return yield* submitted.failure
-            break
-          }
-          receipts.push(submitted.success)
-        }
-        return Protocol.SubmitBatchResult.make({ receipts })
-      })
       const submitBatch = (request: Protocol.SubmitBatchRequest, version: Protocol.ProtocolVersion) =>
         client.SubmitBatch({ ...request, protocolVersion: version }).pipe(
           Effect.catchReasons(
@@ -168,10 +102,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
         transportGeneration: transport.generation,
         waitForTransportChange: transport.waitForChange,
         submitBatch: (request) =>
-          ProtocolSessionRetry.run(session, (version) => {
-            if (version < Protocol.submitBatchProtocolVersion) return submitEach(request, version)
-            return submitBatch(request, version)
-          }).pipe(
+          ProtocolSessionRetry.run(session, (version) => submitBatch(request, version)).pipe(
             Effect.catchCause((cause) => {
               if (!hasRemoteDefect(cause)) return Effect.failCause(cause)
               return Effect.fail(

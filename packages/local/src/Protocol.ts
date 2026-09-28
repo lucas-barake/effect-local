@@ -26,12 +26,8 @@ export const maximumSubmitBatchEntries = 64
 
 export const ProtocolVersion = Schema.Int.check(Schema.isGreaterThan(0))
 export type ProtocolVersion = typeof ProtocolVersion.Type
-export const currentProtocolVersion = ProtocolVersion.make(2)
-export const submitBatchProtocolVersion = ProtocolVersion.make(2)
-export const supportedProtocolVersions: ReadonlyArray<ProtocolVersion> = [
-  currentProtocolVersion,
-  ProtocolVersion.make(1)
-]
+export const currentProtocolVersion = ProtocolVersion.make(1)
+export const supportedProtocolVersions: ReadonlyArray<ProtocolVersion> = [currentProtocolVersion]
 const withProtocolVersion = Schema.fieldsAssign({ protocolVersion: ProtocolVersion })
 export const NegotiateRequest = Schema.Struct({
   supportedVersions: Schema.Array(ProtocolVersion).check(Schema.isMinLength(1))
@@ -80,7 +76,6 @@ export const SubmitRequest = Schema.Struct({
   schema: Identity.SchemaIdentity
 })
 export type SubmitRequest = typeof SubmitRequest.Type
-export const VersionedSubmitRequest = SubmitRequest.pipe(withProtocolVersion)
 
 export const SubmitBatchRequest = Schema.Struct({
   envelopes: Schema.Array(MutationEnvelope).check(

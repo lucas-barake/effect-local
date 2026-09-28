@@ -50,24 +50,11 @@ const makeHandlers = Effect.fnUntraced(function*(options: {
       if (version !== undefined) return Effect.succeed({ version })
       return Effect.fail(new ReplicaError.UpgradeRequired({ clientVersions, serverVersions: supportedVersions }))
     },
-    Submit: (request) =>
-      requireVersion(request.protocolVersion).pipe(
-        Effect.andThen(issueAssertion),
-        Effect.flatMap((assertion) => client.submit(request.envelope.spaceId, request, assertion))
-      ),
-    SubmitBatch: ({ protocolVersion, ...request }) => {
-      if (protocolVersion < Protocol.submitBatchProtocolVersion) {
-        return Effect.fail(
-          new ReplicaError.ProtocolInvalid({
-            message: `SubmitBatch requires protocol version ${Protocol.submitBatchProtocolVersion} or later`
-          })
-        )
-      }
-      return requireVersion(protocolVersion).pipe(
+    SubmitBatch: ({ protocolVersion, ...request }) =>
+      requireVersion(protocolVersion).pipe(
         Effect.andThen(issueAssertion),
         Effect.flatMap((assertion) => client.submitBatch(request.envelopes[0].spaceId, request, assertion))
-      )
-    },
+      ),
     Discard: (request) =>
       requireVersion(request.protocolVersion).pipe(
         Effect.andThen(issueAssertion),
