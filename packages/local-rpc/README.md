@@ -43,7 +43,7 @@ The four authorization callbacks are required. Every limit has a default: `store
 application can call `invalidateReadAuthorization` after a permission change or `maintain` from an admin task.
 
 Each space is served by one `EffectLocal/Space` entity, so an active space costs one resident entity. The entity
-serializes Submit, SubmitBatch, and Discard behind one admission permit and serves Pull, Bootstrap, Watch, and ephemeral operations
+serializes SubmitBatch and Discard behind one admission permit and serves Pull, Bootstrap, Watch, and ephemeral operations
 concurrently. Bootstrap authorizations, bootstrap pages per space, and ephemeral join verifications have fail-fast
 bounds, and ephemeral publish and heartbeat requests queue behind their own per-space bound. Saturation reports typed `CapacityExceeded` with resource
 `bootstrap authorizations`, `bootstrap pages`, or `ephemeral join verifications`.
@@ -223,10 +223,9 @@ export const layerClientRpc = Layer.merge(
 The actual heartbeat interval is no longer than half the server-accepted member lease. Negotiation selects the highest shared
 version. A peer rejection causes one renegotiation and retry. No common version returns terminal `UpgradeRequired`.
 
-`ProtocolSession` and `SyncServer` default to `Protocol.supportedProtocolVersions`, which is `[2, 1]`. Version 2 adds
-`SubmitBatch`, which carries up to `Protocol.maximumSubmitBatchEntries` envelopes of one space and returns their receipts
-in order. `SyncEngine.submitBatch` sends one `SubmitBatch` when the session selected version 2 and one `Submit` per
-envelope when it selected version 1, so the reconciler behaves the same against either server. The server admits a batch
+`ProtocolSession` and `SyncServer` default to `Protocol.supportedProtocolVersions`, which is `[1]`. `SyncEngine.submitBatch`
+sends one `SubmitBatch`, which carries up to `Protocol.maximumSubmitBatchEntries` envelopes of one space and returns their
+receipts in order. The server admits a batch
 one SQL transaction per envelope and returns a shorter prefix when the response would exceed `Protocol.maximumBatchBytes`
 or the batch has run for the store's `maximumSubmitBatchDuration`, default 1 second. The client resubmits the rest.
 

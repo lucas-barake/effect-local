@@ -284,14 +284,13 @@ matters. `space.settlements()` is a durable Stream of `{ sequence, settlement }`
 the terminal `{ pending, receipt }` pair, delivered only after rollback and pending replay have completed. The default
 `from: "live"` starts at the current tail; `from: "acknowledged"` resumes from the durable acknowledgement floor, and
 `from: n` replays everything after sequence `n`, so a settlement recorded while no subscriber was attached, or before
-an app restart, is still observed. `space.settlementsFor(PutTask)` filters by mutation in the durable read and includes
-legacy receipts. `space.acknowledgeSettlements(sequence)` advances the retention floor: pruning prefers acknowledged
+an app restart, is still observed. `space.settlementsFor(PutTask)` filters by mutation in the durable read. `space.acknowledgeSettlements(sequence)` advances the retention floor: pruning prefers acknowledged
 settlements, but the retained receipt budget is always enforced, so an app that never subscribes or never acknowledges
 keeps syncing. A replay that falls behind the prune horizon fails with `SettlementReplayTruncated` carrying the oldest
 available sequence instead of silently skipping. `space.resolveSettlementStart(from)` turns `"live"` or
 `"acknowledged"` into the numeric sequence a consumer can persist and resume from. Consumers read at their own pace from SQLite and can never
 backpressure reconciliation or the local `mutate` commit. Mutation rejections from either surface are decoded through
-`PutTask.rejectionSchema`; authorization, capacity, legacy, and quarantine rejections remain distinct origin tagged
+`PutTask.rejectionSchema`; authorization, capacity, and quarantine rejections remain distinct origin tagged
 JSON branches.
 
 Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect Workflow. Supply
@@ -475,7 +474,7 @@ before retry receipt lookup. Mutation admission rejection consumes the client's 
 retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted` is the explicit allow all Layer for
 tests and already trusted processes.
 
-`SyncRpc.Rpcs` multiplexes submit, batch submit, pull, bootstrap, watch, and ephemera on one Effect RPC WebSocket. The server uses
+`SyncRpc.Rpcs` multiplexes negotiation, batch submit, discard, pull, bootstrap, watch, and ephemera on one Effect RPC WebSocket. The server uses
 `Authentication.layerServer`. The client uses `Authentication.layerClient` with an application supplied
 `CredentialProvider`. Its `acquire` Effect runs for every RPC and returns a redacted bearer credential plus its
 nonnegative generation. `awaitChange(rejectedGeneration)` signals when `acquire` can return a different generation.
@@ -497,7 +496,7 @@ It also remains responsible for its HTTP server, WebSocket path, TLS, Origin pol
 tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. A
 reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
 
-Each space is one entity. It serializes Submit, SubmitBatch, and Discard behind one admission permit and serves Pull, Bootstrap,
+Each space is one entity. It serializes SubmitBatch and Discard behind one admission permit and serves Pull, Bootstrap,
 Watch, and ephemeral operations concurrently, so a paused Bootstrap page or a full join population cannot block
 mutation admission. A Layer wide fail fast allowance bounds Bootstrap assertion verification and preparation, and a
 per space allowance bounds immutable page reads and ephemeral join verification. Saturated work fails with typed
@@ -687,8 +686,7 @@ out. Application schema compatibility and wire protocol compatibility are separa
 determines which old domain definitions can still sync. Protocol negotiation determines whether two library versions
 can speak the same wire format.
 
-Deploy the compatible server first. A new client cannot negotiate with a server that does not expose the negotiation
-RPC, and an old client needs the new server to project current data back to its schema.
+Deploy the compatible server first. An old client needs the new server to project current data back to its schema.
 
 ### Define both migration directions
 
@@ -832,14 +830,12 @@ export const layerClientRpc = Layer.merge(
 )
 ```
 
-Negotiation selects the highest shared version. A rolling peer that rejects a cached version causes one renegotiation
-and retry. If there is no common version, the client receives terminal `UpgradeRequired` instead of retrying a decode
+Negotiation selects the highest shared version. A peer that rejects a cached version causes one renegotiation and
+retry. If there is no common version, the client receives terminal `UpgradeRequired` instead of retrying a decode
 failure forever.
 
-Both sides default to `Protocol.supportedProtocolVersions`, which is `[2, 1]`. Version 2 submits up to
-`Protocol.maximumSubmitBatchEntries` pending mutations of one space in one round trip. A session that selected version 1
-submits one mutation per round trip with identical receipts. A reconnect that reaches a server built before version 2
-gets a defect for the batch, renegotiates to version 1, and resubmits the same mutations one at a time.
+Both sides default to `Protocol.supportedProtocolVersions`, which is `[1]`. Each `SubmitBatch` round trip carries up to
+`Protocol.maximumSubmitBatchEntries` pending mutations of one space.
 
 ### Prompt compatible old clients to reload
 
@@ -898,11 +894,10 @@ and restart.
 
 The complete deployment sequence is:
 
-1. Deploy a server that accepts the old schema and advertises both protocol versions.
-2. Deploy the new client bundle with the same evolution catalog and protocol overlap.
+1. Deploy a server that accepts the old schema.
+2. Deploy the new client bundle with the same evolution catalog.
 3. Prompt compatible old clients to reload and monitor their remaining usage.
 4. Reduce `acceptedSchemaVersions` only after the application deprecation horizon.
-5. Remove the old protocol version only after no deployed client requires it.
 
 ## Guarantees and limits
 
@@ -929,7 +924,5 @@ The complete deployment sequence is:
   a runner starts again.
 - The server is an authority, not a peer. Conflict behavior is arrival order unless a handler explicitly applies field
   semantics.
-- SQL storage schemas advance through an ordered checksum validated migration catalog. A lifecycle migration still
-  requires old server writers to stop before they can issue a legacy SQL write shape. This is separate from the
-  supported mixed application schema and wire protocol window. There is no backward SQL migration, encryption
-  layer, or stable v1 compatibility promise yet.
+- SQL storage schemas advance through an ordered checksum validated migration catalog. There is no backward SQL
+  migration, encryption layer, or stable v1 compatibility promise yet.

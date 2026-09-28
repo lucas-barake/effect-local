@@ -74,14 +74,13 @@ retries its stable identity. A later exact receipt resolves whether the original
 
 Every durable JSON column is parsed and Schema decoded before use. The definition hash prevents a database from being
 opened with a different domain. The local database validates its singleton client identity while membership rows
-define the joined spaces. Envelopes have a canonical SHA 256 digest. Version 3 binds the membership incarnation into
-that digest. Unknown mutation names, malformed payloads, cursor gaps, identity conflicts, and capacity violations are
+define the joined spaces. Envelopes have a canonical SHA 256 digest that binds the membership incarnation. Unknown mutation names, malformed payloads, cursor gaps, identity conflicts, and capacity violations are
 typed failures.
 
 Client and server storage schemas advance through a package owned ordered migration catalog. Each stored descriptor includes
 its id, name, and checksum. Migration acquires a database writer mutex before catalog reads, validates the complete
 stored prefix, and retries only SQLite lock timeouts within the configured attempt bound. Bodies and catalog inserts
-share one transaction. There is no backward storage migration path before v1.
+share one transaction. There is no backward storage migration path.
 
 Domain schema evolution is forward only and crash resumable. It copies log provenance, entities, receipts, pending
 mutations, and retraction keys into an inactive generation in bounded batches. The client flips generations only after
@@ -90,6 +89,3 @@ server activates the new entity generation and logically invalidates every scope
 constant work transaction. It then deletes old snapshot entries, snapshots, outstanding pages, view members, and views
 child first in bounded resumable phases. A compatible `Evolution` catalog therefore upgrades an existing database. A
 changed definition without a matching evolution path is rejected.
-
-Server migration requires a quiesced writer rollout. The migrated tables reject the legacy insert shape explicitly,
-so an old process cannot continue writing without terminal sequences and retention metadata.

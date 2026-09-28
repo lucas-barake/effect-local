@@ -114,7 +114,7 @@ Workflow payload contains only definition, space, client, membership incarnation
 idempotent reconciliation operation as the in memory scheduler.
 
 The server front door is an authenticated WebSocket RPC facade. It routes every operation by space to one Effect
-Cluster entity, `EffectLocal/Space`, so an active space costs one resident entity. The entity runs Submit and Discard
+Cluster entity, `EffectLocal/Space`, so an active space costs one resident entity. The entity runs SubmitBatch and Discard
 sequentially behind one admission permit and serves Pull, immutable snapshot Bootstrap pages, sync watches, joined
 ephemeral streams, publications, and heartbeats concurrently. Join authorization precedes the Hub watcher bound.
 Because only admission is serialized, a full join population or a paused Bootstrap page cannot occupy mutation

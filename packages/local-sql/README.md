@@ -228,8 +228,8 @@ const layerStore = ServerStore.layer(options).pipe(
 )
 ```
 
-PostgreSQL has its own migration catalog. Migration 1, `postgres-baseline`, creates the current server schema
-directly. Later server migrations are appended to both catalogs. Sequences, counts, byte sizes, generations, and epoch
+PostgreSQL has its own migration catalog. Migration 1, `postgres-baseline`, creates the server schema from the same
+table definitions as the SQLite catalog's `server-baseline`. Later server migrations are appended to both catalogs. Sequences, counts, byte sizes, generations, and epoch
 milliseconds are `BIGINT`, and 0 or 1 flags are `SMALLINT`, so every integer decodes to the same JavaScript number as
 on SQLite. JSON columns stay `TEXT`, compared byte for byte. Every `TEXT` column uses `COLLATE "C"`, so ordering,
 cursors, and window membership follow UTF-8 byte order exactly like SQLite `BINARY`, whatever the database locale.
