@@ -133,7 +133,7 @@ const envelope = Effect.fnUntraced(function*(id: string, sequence: number, title
     basis: Identity.ServerSequence.make(0),
     name: Domain.PutTodo.name,
     payload: Domain.todo(id, title),
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: Domain.definition.schemaIdentity,
     mutationVersion: Domain.PutTodo.version
@@ -152,7 +152,7 @@ const deleteEnvelope = Effect.fnUntraced(function*(id: string, sequence: number)
     basis: Identity.ServerSequence.make(0),
     name: Domain.DeleteTodo.name,
     payload: { id },
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: Domain.definition.schemaIdentity,
     mutationVersion: Domain.DeleteTodo.version
@@ -171,7 +171,7 @@ const putManyEnvelope = Effect.fnUntraced(function*(count: number, sequence: num
     basis: Identity.ServerSequence.make(0),
     name: Domain.PutManyTodos.name,
     payload: { count },
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: Domain.definition.schemaIdentity,
     mutationVersion: Domain.PutManyTodos.version
@@ -617,7 +617,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
           basis: Identity.ServerSequence.make(0),
           name: Domain.PutMessage.name,
           payload: { id, chatId, sentAt, body: `body-${id}` },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation,
           sourceSchema: Domain.definition.schemaIdentity,
           mutationVersion: Domain.PutMessage.version
@@ -703,7 +703,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
           basis: Identity.ServerSequence.make(0),
           name: Domain.PutMessage.name,
           payload: { id, chatId, sentAt, body: `body-${id}` },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation,
           sourceSchema: Domain.definition.schemaIdentity,
           mutationVersion: Domain.PutMessage.version
@@ -782,7 +782,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
           basis: Identity.ServerSequence.make(0),
           name: Domain.PutMessage.name,
           payload: { id, chatId, sentAt, body: `body-${id}` },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation,
           sourceSchema: Domain.definition.schemaIdentity,
           mutationVersion: Domain.PutMessage.version
@@ -848,7 +848,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
           basis: Identity.ServerSequence.make(0),
           name: Domain.PutMessage.name,
           payload: { id, chatId: "chat-a", sentAt, body: id },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation,
           sourceSchema: Domain.definition.schemaIdentity,
           mutationVersion: Domain.PutMessage.version
@@ -891,7 +891,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
           basis: Identity.ServerSequence.make(0),
           name: Domain.PutMessage.name,
           payload: { id, chatId: "chat-a", sentAt, body: id },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation,
           sourceSchema: Domain.definition.schemaIdentity,
           mutationVersion: Domain.PutMessage.version
@@ -1063,7 +1063,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
           basis: Identity.ServerSequence.make(0),
           name: Domain.PutMessage.name,
           payload: { id, chatId: "chat-a", sentAt, body },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation,
           sourceSchema: Domain.definition.schemaIdentity,
           mutationVersion: Domain.PutMessage.version

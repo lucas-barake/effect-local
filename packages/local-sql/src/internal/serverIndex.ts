@@ -89,7 +89,7 @@ const makeDescriptor = (
   index: SecondaryIndex.Any
 ): Descriptor => {
   const hash = Canonical.hash({
-    format: 3,
+    format: 1,
     model: model.name,
     index: indexName,
     version: index.version,

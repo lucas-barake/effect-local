@@ -91,7 +91,7 @@ const envelope = Effect.fnUntraced(function*(
     basis: Identity.ServerSequence.make(0),
     name,
     payload,
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: Domain.definition.schemaIdentity,
     mutationVersion: Domain.definition.mutationByName.get(name)?.version ?? Identity.SchemaVersion.make(1)
@@ -1576,7 +1576,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
             basis: Identity.ServerSequence.make(0),
             name: Domain.PutTodo.name,
             payload: Domain.todo(`maintain-${index}`),
-            digestVersion: 3,
+            digestVersion: 1,
             membershipIncarnation: defaultMembershipIncarnation,
             sourceSchema: Domain.definition.schemaIdentity,
             mutationVersion: Domain.PutTodo.version
@@ -4264,7 +4264,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
             localSequence: Identity.LocalSequence.make(localSequence),
             basis: Identity.ServerSequence.make(0),
             payload: Domain.todo(`${targetSpaceId}:${localSequence}`),
-            digestVersion: 3 as const,
+            digestVersion: 1 as const,
             membershipIncarnation: defaultMembershipIncarnation,
             ...putTodoProvenance
           }

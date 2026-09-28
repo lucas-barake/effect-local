@@ -648,7 +648,7 @@ describe.each(serverDatabases)("server catalog counters ($dialect)", (database) 
       yield* sql`INSERT INTO effect_local_server_receipts
         (space_id, client_id, membership_incarnation, local_sequence, mutation_id, digest, receipt_json,
           digest_version, terminal_sequence)
-        VALUES (${spaceId}, ${clientId}, 'incarnation', 1, 'mutation-1', 'digest', '{}', 3, 1)`
+        VALUES (${spaceId}, ${clientId}, 'incarnation', 1, 'mutation-1', 'digest', '{}', 1, 1)`
       yield* sql`DELETE FROM effect_local_authoritative_log WHERE space_id = ${spaceId} AND server_sequence = 1`
       for (const [generation, key, bytes] of [[0, "a", 10], [0, "b", 20], [1, "c", 40]] as const) {
         yield* sql`INSERT INTO effect_local_server_entities_data

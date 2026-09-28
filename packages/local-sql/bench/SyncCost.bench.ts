@@ -48,7 +48,7 @@ const envelope = Effect.fnUntraced(
       basis: Identity.ServerSequence.make(0),
       name,
       payload,
-      digestVersion: 3 as const,
+      digestVersion: 1 as const,
       membershipIncarnation,
       sourceSchema: Domain.definition.schemaIdentity,
       mutationVersion: Identity.SchemaVersion.make(1)

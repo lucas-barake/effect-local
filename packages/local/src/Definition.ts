@@ -77,7 +77,7 @@ export function make(options: {
     hash: Identity.SchemaHash.make(Canonical.hash({ format: 1, models, mutations }))
   })
   const hash = Canonical.hash({
-    format: 2,
+    format: 1,
     schemaIdentity,
     queries: queries.map((query) => ({
       name: query.name,

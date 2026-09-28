@@ -46,7 +46,7 @@ export const encodedBytesEffect = (
 export const MutationDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
 export type MutationDigest = typeof MutationDigest.Type
 
-export const MutationDigestVersion = Schema.Literal(3)
+export const MutationDigestVersion = Schema.Literal(1)
 export type MutationDigestVersion = typeof MutationDigestVersion.Type
 
 const MutationIdentity = {

@@ -177,7 +177,7 @@ const layerFanoutBench = Layer.effect(
           basis: Identity.ServerSequence.make(sequence - 1),
           name: PutTodo.name,
           payload: { id: `${fixture.watcherCount}-${sequence}`, title: "fanout" },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation: fixture.membershipIncarnation,
           sourceSchema: definition.schemaIdentity,
           mutationVersion: PutTodo.version

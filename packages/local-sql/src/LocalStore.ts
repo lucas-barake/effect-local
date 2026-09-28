@@ -3492,7 +3492,7 @@ export const layer = (
           basis: storedMeta.server_cursor,
           name: mutation.name,
           payload: payloadJsonValue,
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation: storedMeta.membership_incarnation,
           sourceSchema: options.definition.schemaIdentity,
           mutationVersion: mutation.version

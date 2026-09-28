@@ -79,7 +79,7 @@ const envelope = Effect.fnUntraced(function*(
     basis: Identity.ServerSequence.make(0),
     name: mutation.name,
     payload,
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: definition.schemaIdentity,
     mutationVersion: mutation.version

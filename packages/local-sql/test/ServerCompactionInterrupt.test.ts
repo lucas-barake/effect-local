@@ -33,7 +33,7 @@ const envelope = Effect.fnUntraced(function*(spaceId: Identity.SpaceId, index: n
     basis: Identity.ServerSequence.make(0),
     name: Domain.PutTodo.name,
     payload: Domain.todo(`todo-${localSequence}`),
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: Domain.definition.schemaIdentity,
     mutationVersion: Domain.PutTodo.version

@@ -511,7 +511,7 @@ const v1Envelope = Effect.fnUntraced(function*(
     basis: Identity.ServerSequence.make(0),
     name: PutTodoV1.name,
     payload,
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: definitionV1.schemaIdentity,
     mutationVersion: PutTodoV1.version
@@ -2240,7 +2240,7 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
             basis: Identity.ServerSequence.make(sequence - 1),
             name: PutExpanded.name,
             payload: { id: String(sequence), compact: "x".repeat(30_000) },
-            digestVersion: 3 as const,
+            digestVersion: 1 as const,
             membershipIncarnation,
             sourceSchema: expandedDefinitionV2.schemaIdentity,
             mutationVersion: PutExpanded.version
@@ -2294,7 +2294,7 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
             basis: Identity.ServerSequence.make(sequence - 1),
             name: PutLarge.name,
             payload: { id: String(sequence) },
-            digestVersion: 3 as const,
+            digestVersion: 1 as const,
             membershipIncarnation,
             sourceSchema: largeDefinitionV2.schemaIdentity,
             mutationVersion: PutLarge.version
@@ -2339,7 +2339,7 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
             basis: Identity.ServerSequence.make(sequence - 1),
             name: PutTodoV2.name,
             payload: { id: sequence, title: `collision-${sequence}`, done: false },
-            digestVersion: 3 as const,
+            digestVersion: 1 as const,
             membershipIncarnation,
             sourceSchema: definitionV2.schemaIdentity,
             mutationVersion: PutTodoV2.version
