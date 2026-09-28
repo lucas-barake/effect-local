@@ -46,26 +46,12 @@ export type RejectedReceipt<M extends Mutation.Any,> =
 export type Receipt<M extends Mutation.Any,> =
   | AcceptedReceipt<M>
   | RejectedReceipt<M>
-  | Protocol.LegacyReceipt
   | Protocol.ExpiredReceipt
 
-export type MutationSettlement<M extends Mutation.Any = Mutation.Any,> =
-  | {
-    readonly pending: PendingMutation<M>
-    readonly receipt: Exclude<Receipt<M>, Protocol.LegacyReceipt>
-  }
-  | {
-    readonly pending: Protocol.PendingMutation
-    readonly receipt: Protocol.LegacyReceipt
-  }
-
-export type LegacySettlement = Extract<MutationSettlement, { readonly receipt: Protocol.LegacyReceipt }>
-
-// The two settlement variants differ by receipt tag; narrowing on the nested
-// tag alone does not narrow `pending`, so the refinement carries it.
-export const isLegacySettlement = <M extends Mutation.Any,>(
-  settlement: MutationSettlement<M>
-): settlement is LegacySettlement => settlement.receipt._tag === "Legacy"
+export interface MutationSettlement<M extends Mutation.Any = Mutation.Any,> {
+  readonly pending: PendingMutation<M>
+  readonly receipt: Receipt<M>
+}
 
 export type SettledMutation<M extends Mutation.Any = Mutation.Any,> = {
   readonly sequence: Identity.SettlementSequence

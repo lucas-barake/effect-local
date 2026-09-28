@@ -145,18 +145,7 @@ const decodeAnySettlement = Effect.fnUntraced(function*(
   wire: replicaWire.WireSettlement
 ) {
   const pending = yield* decodePending(definition, wire.pending)
-  if (wire.receipt._tag === "Legacy") {
-    const settled: Replica.SettledMutation = {
-      sequence: wire.sequence,
-      settlement: { pending: wire.pending, receipt: wire.receipt }
-    }
-    return settled
-  }
   const receipt = yield* decodeReceipt(definition, wire.receipt)
-  if (receipt._tag === "Legacy") {
-    const settled: Replica.SettledMutation = { sequence: wire.sequence, settlement: { pending: wire.pending, receipt } }
-    return settled
-  }
   const settled: Replica.SettledMutation = { sequence: wire.sequence, settlement: { pending, receipt } }
   return settled
 })

@@ -740,7 +740,7 @@ describe("reconciliation workflow", () => {
         return local
       })
 
-      const legacy = yield* register(Domain.definition)
+      const previous = yield* register(Domain.definition)
       const registrationEntered = yield* Deferred.make<void>()
       const interruptedEngine = new Proxy(engine, {
         get: (target, property, receiver) => {
@@ -754,20 +754,20 @@ describe("reconciliation workflow", () => {
       yield* Deferred.await(registrationEntered)
       yield* Fiber.interrupt(interruptedRegistration)
 
-      const retainedGeneration = yield* legacy.requestReconciliation
+      const retainedGeneration = yield* previous.requestReconciliation
       const retainedPayload = ReconciliationWorkflow.Payload.make({
         scope: clientHistory.scope,
         scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
-        membershipIncarnation: legacy.membershipIncarnation,
+        membershipIncarnation: previous.membershipIncarnation,
         generation: retainedGeneration
       })
       yield* ReconciliationWorkflow.make(retainedPayload).execute(retainedPayload).pipe(
         Effect.provideService(WorkflowEngine.WorkflowEngine, engine)
       )
-      assert.deepStrictEqual(yield* legacy.reconciliationGenerations, {
+      assert.deepStrictEqual(yield* previous.reconciliationGenerations, {
         requested: retainedGeneration,
         completed: retainedGeneration
       })
@@ -792,17 +792,17 @@ describe("reconciliation workflow", () => {
         completed: generation
       })
 
-      const legacyGeneration = yield* legacy.requestReconciliation
-      const legacyPayload = ReconciliationWorkflow.Payload.make({
+      const previousGeneration = yield* previous.requestReconciliation
+      const previousPayload = ReconciliationWorkflow.Payload.make({
         scope: clientHistory.scope,
         scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
-        membershipIncarnation: legacy.membershipIncarnation,
-        generation: legacyGeneration
+        membershipIncarnation: previous.membershipIncarnation,
+        generation: previousGeneration
       })
-      const result = yield* ReconciliationWorkflow.make(legacyPayload).execute(legacyPayload).pipe(
+      const result = yield* ReconciliationWorkflow.make(previousPayload).execute(previousPayload).pipe(
         Effect.provideService(WorkflowEngine.WorkflowEngine, engine),
         Effect.exit
       )

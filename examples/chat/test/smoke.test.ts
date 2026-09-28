@@ -200,7 +200,6 @@ const startConversation = Effect.fnUntraced(function*(from: BootedUser) {
     awaitHead(
       from.space.settlementsFor(StartConversation).pipe(
         Stream.filter((settled) =>
-          !Replica.isLegacySettlement(settled.settlement) &&
           settled.settlement.pending.payload.id === conversationId &&
           settled.settlement.receipt._tag === "Accepted"
         )
@@ -269,7 +268,6 @@ describe("chat sync", () => {
         awaitHead(
           fromAlice.space.settlementsFor(SendMessage).pipe(
             Stream.filter((settled) =>
-              !Replica.isLegacySettlement(settled.settlement) &&
               settled.settlement.pending.payload.id === message.id &&
               settled.settlement.receipt._tag === "Accepted"
             )
@@ -413,7 +411,6 @@ describe("chat sync", () => {
         awaitHead(
           fromAlice.space.settlementsFor(SendMessage).pipe(
             Stream.filter((settled) =>
-              !Replica.isLegacySettlement(settled.settlement) &&
               settled.settlement.pending.payload.id === forged.id &&
               settled.settlement.receipt._tag === "Rejected"
             )
@@ -506,9 +503,7 @@ describe("chat sync", () => {
       const settled = yield* Effect.forkChild(
         awaitHead(
           fromAlice.space.settlementsFor(StartConversation).pipe(
-            Stream.filter((entry) =>
-              !Replica.isLegacySettlement(entry.settlement) && entry.settlement.pending.payload.id === forged.id
-            )
+            Stream.filter((entry) => entry.settlement.pending.payload.id === forged.id)
           )
         ),
         { startImmediately: true }
@@ -601,9 +596,7 @@ describe("chat sync", () => {
       }
       const probe = yield* Effect.forkChild(
         space.settlementsFor(SendMessage, { from: "acknowledged" }).pipe(
-          Stream.filter((entry) =>
-            Replica.isLegacySettlement(entry.settlement) || entry.settlement.pending.payload.id !== forged.id
-          ),
+          Stream.filter((entry) => entry.settlement.pending.payload.id !== forged.id),
           awaitHead
         ),
         { startImmediately: true }
@@ -611,9 +604,7 @@ describe("chat sync", () => {
       yield* space.mutate(SendMessage, followUp)
       const first = yield* Fiber.join(probe)
       assert.strictEqual(first.settlement.receipt._tag, "Accepted")
-      if (!Replica.isLegacySettlement(first.settlement)) {
-        assert.strictEqual(first.settlement.pending.payload.id, followUp.id)
-      }
+      assert.strictEqual(first.settlement.pending.payload.id, followUp.id)
     })
   )
 })

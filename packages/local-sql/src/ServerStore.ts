@@ -689,8 +689,6 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         let receiptSequenceMismatch = row.server_sequence !== null
         if (receipt._tag === "Accepted") {
           receiptSequenceMismatch = row.server_sequence === null || receipt.serverSequence !== row.server_sequence
-        } else if (receipt._tag === "Legacy") {
-          receiptSequenceMismatch = receipt.serverSequence !== row.server_sequence
         }
         if (
           row.space_id !== envelope.spaceId ||
@@ -705,9 +703,8 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           receipt.mutationId !== row.mutation_id ||
           receipt.sourceSchema.version !== row.source_schema_version ||
           receipt.sourceSchema.hash !== row.source_schema_hash ||
-          (receipt._tag !== "Legacy" && (
-            receipt.mutationVersion !== row.mutation_version || receipt.name !== row.mutation_name
-          )) ||
+          receipt.mutationVersion !== row.mutation_version ||
+          receipt.name !== row.mutation_name ||
           ((receipt._tag === "Accepted" || receipt._tag === "Rejected") &&
             receipt.terminalSequence !== undefined && receipt.terminalSequence !== row.terminal_sequence) ||
           receiptSequenceMismatch
@@ -847,9 +844,8 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
 
       const projectReceipt = Effect.fnUntraced(function*(receipt: Protocol.Receipt, target: Definition.Any) {
         if (
-          receipt._tag === "Legacy" ||
-          (receipt.sourceSchema.version === target.schemaIdentity.version &&
-            receipt.sourceSchema.hash === target.schemaIdentity.hash)
+          receipt.sourceSchema.version === target.schemaIdentity.version &&
+          receipt.sourceSchema.hash === target.schemaIdentity.hash
         ) return receipt
         const mutation = target.mutationByName.get(receipt.name)
         if (mutation === undefined) {

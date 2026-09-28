@@ -74,12 +74,7 @@ const oneToTwo = Evolution.step({
 })
 const evolution = Evolution.make({
   current: definitionV2,
-  steps: [oneToTwo],
-  legacyBaselines: [Evolution.legacyBaseline({
-    id: "mutation-log-v1",
-    hash: "0123456789abcdef",
-    definition: definitionV1
-  })]
+  steps: [oneToTwo]
 })
 
 describe("schema evolution", () => {
@@ -119,7 +114,6 @@ describe("schema evolution", () => {
         }),
       /does not terminate/
     )
-    assert.strictEqual(evolution.legacyBaselineByHash.get("0123456789abcdef")?.definition, definitionV1)
   })
 
   it.effect(

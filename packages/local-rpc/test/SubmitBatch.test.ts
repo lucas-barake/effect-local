@@ -289,7 +289,7 @@ const envelopeAt = Effect.fnUntraced(function*(localSequence: number) {
     name: PutTodo.name,
     payload: { id: `todo-${localSequence}`, title: `todo-${localSequence}` },
     digestVersion: 1 as const,
-    membershipIncarnation: Identity.legacyMembershipIncarnation,
+    membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000901"),
     sourceSchema: definition.schemaIdentity,
     mutationVersion: PutTodo.version
   }

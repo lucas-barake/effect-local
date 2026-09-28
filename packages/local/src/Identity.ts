@@ -21,10 +21,6 @@ export type ClientId = typeof ClientId.Type
 export const MembershipIncarnation = identifier("MembershipIncarnation", "inc")
 export type MembershipIncarnation = typeof MembershipIncarnation.Type
 
-export const legacyMembershipIncarnation = MembershipIncarnation.make(
-  "inc_00000000-0000-4000-8000-000000000000"
-)
-
 export const MutationId = identifier("MutationId", "mut")
 export type MutationId = typeof MutationId.Type
 

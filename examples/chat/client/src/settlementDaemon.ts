@@ -33,12 +33,6 @@ export const makeSettlementDaemonBody = (failedMessages: FailedMessages) => (get
       space.settlementsFor(SendMessage, { from: "acknowledged" }),
       Effect.fnUntraced(function*(settled) {
         const settlement = settled.settlement
-        // Legacy receipts belong to pre-evolution schema versions and carry
-        // no typed payload; the demo only has v1, so they never occur.
-        if (Replica.isLegacySettlement(settlement)) {
-          yield* space.acknowledgeSettlements(settled.sequence)
-          return
-        }
         const pending = settlement.pending
         // Write the overlay before acknowledging: if the daemon is torn down
         // between the two, replay from the acknowledged floor re-emits the

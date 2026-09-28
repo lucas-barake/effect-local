@@ -383,18 +383,15 @@ const register = Effect.fnUntraced(function*(
   if (registered === undefined || registered.version < options.definition.schemaIdentity.version) {
     registrationState.schemas.set(replicaKey, options.definition.schemaIdentity)
   }
-  const legacySchemas = new Map<string, Definition.Any>()
+  const previousSchemas = new Map<string, Definition.Any>()
   for (const step of evolution.steps) {
-    legacySchemas.set(schemaIdentityKey(step.from), step.from)
+    previousSchemas.set(schemaIdentityKey(step.from), step.from)
   }
-  for (const baseline of evolution.legacyBaselines) {
-    legacySchemas.set(schemaIdentityKey(baseline.definition), baseline.definition)
-  }
-  legacySchemas.delete(schemaIdentityKey(options.definition))
-  for (const [legacyIdentity, definition] of legacySchemas) {
+  previousSchemas.delete(schemaIdentityKey(options.definition))
+  for (const [previousIdentity, definition] of previousSchemas) {
     yield* engine.register(
       make({
-        schemaIdentity: legacyIdentity,
+        schemaIdentity: previousIdentity,
         spaceId: options.spaceId,
         clientId: options.clientId,
         membershipIncarnation

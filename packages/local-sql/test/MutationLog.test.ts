@@ -9,7 +9,7 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
-import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
@@ -150,7 +150,7 @@ const localLayer = (overrides: Partial<LocalStore.Options> = {}) =>
     Layer.provide(clientDatabase())
   )
 
-const legacyRejection = (item: Protocol.PendingMutation) =>
+const authorizationRejection = (item: Protocol.PendingMutation) =>
   Protocol.RejectedReceipt.make({
     spaceId,
     clientId,
@@ -160,20 +160,20 @@ const legacyRejection = (item: Protocol.PendingMutation) =>
     name: item.envelope.name,
     sourceSchema: item.envelope.sourceSchema,
     mutationVersion: item.envelope.mutationVersion,
-    origin: "Legacy",
+    origin: "Authorization",
     terminalSequence: Identity.TerminalSequence.make(item.envelope.localSequence),
     rejection: "denied"
   })
 
 const settleTodo = Effect.fnUntraced(function*(local: LocalStore.Service, id: string) {
   const pending = yield* local.mutate(Domain.PutTodo, Domain.todo(id))
-  yield* local.applyReceipt(legacyRejection(pending))
+  yield* local.applyReceipt(authorizationRejection(pending))
   return pending
 })
 
 const settleMessage = Effect.fnUntraced(function*(local: LocalStore.Service, id: string) {
   const pending = yield* local.mutate(Domain.PutMessage, { id, chatId: "chat", sentAt: 1, body: "hello" })
-  yield* local.applyReceipt(legacyRejection(pending))
+  yield* local.applyReceipt(authorizationRejection(pending))
   return pending
 })
 
@@ -1009,7 +1009,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         localSequence: pending.envelope.localSequence,
         membershipIncarnation: pending.envelope.membershipIncarnation,
         ...putTodoProvenance,
-        origin: "Legacy",
+        origin: "Authorization",
         terminalSequence: Identity.TerminalSequence.make(1),
         rejection: "denied"
       })])
@@ -1054,7 +1054,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         ["settlement-a", "settlement-b", "settlement-c", "settlement-d"],
         (id) => local.mutate(Domain.PutTodo, Domain.todo(id))
       )
-      yield* local.applyReceipts(pending.map(legacyRejection))
+      yield* local.applyReceipts(pending.map(authorizationRejection))
       assert.strictEqual(yield* local.pendingCount, 0)
 
       const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
@@ -1101,7 +1101,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("commit-to-publish"))
       yield* Ref.set(blockInvalidation, true)
       const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
-      const settling = yield* local.applyReceipt(legacyRejection(pending)).pipe(Effect.forkChild)
+      const settling = yield* local.applyReceipt(authorizationRejection(pending)).pipe(Effect.forkChild)
 
       yield* Deferred.await(invalidateStarted)
       const interruptionStarted = yield* Deferred.make<void>()
@@ -1323,7 +1323,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         localSequence: rejectedPending.envelope.localSequence,
         membershipIncarnation: rejectedPending.envelope.membershipIncarnation,
         ...putTodoProvenance,
-        origin: "Legacy",
+        origin: "Authorization",
         terminalSequence: Identity.TerminalSequence.make(2),
         rejection: "denied"
       })])
@@ -2339,7 +2339,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           mutationId: first.envelope.mutationId,
           localSequence: first.envelope.localSequence,
           ...putTodoProvenance,
-          origin: "Legacy",
+          origin: "Authorization",
           terminalSequence: Identity.TerminalSequence.make(1),
           rejection: "denied"
         })])
@@ -2350,7 +2350,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           mutationId: second.envelope.mutationId,
           localSequence: second.envelope.localSequence,
           ...putTodoProvenance,
-          origin: "Legacy",
+          origin: "Authorization",
           terminalSequence: Identity.TerminalSequence.make(1),
           rejection: "denied"
         })
@@ -2382,10 +2382,10 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
   )
 
   it.effect(
-    "settles a durable legacy rejection before resubmitting pending work",
+    "settles a durable authorization rejection before resubmitting pending work",
     pipe(Effect.fnUntraced(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
-      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("legacy-rejection"))
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("authorization-rejection"))
       yield* local.persistReceipts([Protocol.RejectedReceipt.make({
         spaceId,
         clientId,
@@ -2393,7 +2393,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         mutationId: pending.envelope.mutationId,
         localSequence: pending.envelope.localSequence,
         ...putTodoProvenance,
-        origin: "Legacy",
+        origin: "Authorization",
         rejection: "Rejected"
       })])
       const submissions = yield* Ref.make(0)
@@ -2412,7 +2412,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
               mutationId: submitted.mutationId,
               localSequence: submitted.localSequence,
               ...putTodoProvenance,
-              origin: "Legacy",
+              origin: "Authorization",
               terminalSequence: Identity.TerminalSequence.make(1),
               rejection: "Rejected"
             })
@@ -2437,7 +2437,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
       assert.strictEqual(yield* Ref.get(submissions), 0)
       assert.strictEqual(yield* local.pendingCount, 0)
-      assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "legacy-rejection")))
+      assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "authorization-rejection")))
     }, Effect.scoped))
   )
 
@@ -5123,7 +5123,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       )
       const small = yield* settleTodo(local, "small-snapshot")
       const bulk = yield* local.mutate(Domain.PutManyMessages, { count: 40, chats: 2 })
-      yield* local.applyReceipt(legacyRejection(bulk))
+      yield* local.applyReceipt(authorizationRejection(bulk))
 
       const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
       const observed: Array<Replica.SettledMutation> = []
@@ -5211,7 +5211,7 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       for (let index = 0; index < 6; index++) {
         pendings.push(yield* local.mutate(Domain.PutTodo, Domain.todo(`concurrent-${index}`)))
       }
-      yield* Effect.forEach(pendings, (item) => local.applyReceipt(legacyRejection(item)), {
+      yield* Effect.forEach(pendings, (item) => local.applyReceipt(authorizationRejection(item)), {
         concurrency: "unbounded"
       })
       assert.strictEqual(yield* local.pendingCount, 0)
@@ -5223,22 +5223,11 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
   )
 
   it.effect(
-    "filters a named settlement replay in the durable backlog and keeps legacy receipts",
+    "filters a named settlement replay in the durable backlog",
     pipe(Effect.fnUntraced(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
       const todoPending = yield* local.mutate(Domain.PutTodo, Domain.todo("named-todo"))
-      const legacyReceipt = Protocol.LegacyReceipt.make({
-        spaceId,
-        clientId,
-        mutationId: todoPending.envelope.mutationId,
-        localSequence: todoPending.envelope.localSequence,
-        membershipIncarnation: todoPending.envelope.membershipIncarnation,
-        sourceSchema: Domain.definition.schemaIdentity,
-        outcome: "Rejected",
-        serverSequence: null,
-        body: "legacy-denied"
-      })
-      yield* local.applyReceipt(legacyReceipt)
+      yield* local.applyReceipt(authorizationRejection(todoPending))
       yield* settleMessage(local, "named-message")
 
       const pull = yield* Stream.toPull(
@@ -5249,26 +5238,15 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         named.map((settled) => settled.settlement.pending.envelope.mutationId),
         [todoPending.envelope.mutationId]
       )
-      assert.strictEqual(named[0].settlement.receipt._tag, "Legacy")
+      assert.strictEqual(named[0].settlement.receipt._tag, "Rejected")
 
-      // The refinement partitions the durable backlog: the legacy receipt exposes its outcome,
-      // every other settlement exposes the typed pending payload.
       const allPull = yield* Stream.toPull(local.settlements({ from: 0 }))
       const observed: Array<Replica.SettledMutation> = []
       while (observed.length < 2) observed.push(...(yield* allPull))
-      let legacy = 0
-      let typed = 0
-      for (const settled of observed) {
-        if (Replica.isLegacySettlement(settled.settlement)) {
-          legacy += 1
-          assert.strictEqual(settled.settlement.receipt.outcome, "Rejected")
-        } else {
-          typed += 1
-          assert.isDefined(settled.settlement.pending.payload)
-        }
-      }
-      assert.strictEqual(legacy, 1)
-      assert.strictEqual(typed, 1)
+      assert.deepStrictEqual(
+        observed.map((settled) => settled.settlement.pending.envelope.name),
+        [Domain.PutTodo.name, Domain.PutMessage.name]
+      )
     }, Effect.scoped))
   )
 })

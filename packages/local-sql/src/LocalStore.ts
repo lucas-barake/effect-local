@@ -220,9 +220,6 @@ const expiryCovers = (stored: Protocol.Receipt, expired: Protocol.ExpiredReceipt
     stored.localSequence !== expired.localSequence ||
     stored.membershipIncarnation !== expired.membershipIncarnation
   ) return false
-  if (stored._tag === "Legacy") {
-    return stored.serverSequence === null || stored.serverSequence <= expired.snapshotSequence
-  }
   if (stored.name !== expired.name) return false
   if (stored._tag === "Expired") {
     return stored.snapshotSequence <= expired.snapshotSequence &&
@@ -1066,10 +1063,10 @@ export const layer = (
         }
       })
 
-      const decodeNamedClientReceipt = Effect.fnUntraced(function*<M extends Mutation.Any,>(
+      const decodeClientReceipt = Effect.fnUntraced(function*<M extends Mutation.Any,>(
         mutation: M,
-        receipt: Exclude<Protocol.Receipt, Protocol.LegacyReceipt>
-      ): Effect.fn.Return<Exclude<Replica.Receipt<M>, Protocol.LegacyReceipt>, ReplicaError.ReplicaError> {
+        receipt: Protocol.Receipt
+      ): Effect.fn.Return<Replica.Receipt<M>, ReplicaError.ReplicaError> {
         if (receipt.name !== mutation.name) {
           return yield* new ReplicaError.ProtocolInvalid({
             message: `Receipt ${receipt.mutationId} names ${receipt.name} instead of ${mutation.name}`
@@ -1098,16 +1095,8 @@ export const layer = (
         } satisfies Replica.RejectedReceipt<M>
       })
 
-      const decodeClientReceipt = <M extends Mutation.Any,>(
-        mutation: M,
+      const validateReceiptProvenance = (
         receipt: Protocol.Receipt
-      ): Effect.Effect<Replica.Receipt<M>, ReplicaError.ReplicaError> => {
-        if (receipt._tag === "Legacy") return Effect.succeed(receipt)
-        return decodeNamedClientReceipt(mutation, receipt)
-      }
-
-      const validateNamedReceiptProvenance = (
-        receipt: Exclude<Protocol.Receipt, Protocol.LegacyReceipt>
       ): Effect.Effect<void, ReplicaError.ProtocolInvalid> => {
         const mutation = options.definition.mutationByName.get(receipt.name)
         if (
@@ -1127,9 +1116,6 @@ export const layer = (
         pending: Protocol.PendingMutation,
         receipt: Protocol.Receipt
       ) {
-        if (receipt._tag === "Legacy") {
-          return { pending, receipt } satisfies Replica.MutationSettlement
-        }
         const mutation = options.definition.mutationByName.get(pending.envelope.name)
         if (mutation === undefined) {
           return yield* new ReplicaError.StorageCorrupt({
@@ -1138,7 +1124,7 @@ export const layer = (
         }
         return {
           pending: yield* decodeClientPending(pending),
-          receipt: yield* decodeNamedClientReceipt(mutation, receipt)
+          receipt: yield* decodeClientReceipt(mutation, receipt)
         } satisfies Replica.MutationSettlement
       })
 
@@ -1616,7 +1602,7 @@ export const layer = (
         receipt.membershipIncarnation === row.membership_incarnation &&
         receipt.mutationId === row.mutation_id &&
         receipt.localSequence === row.local_sequence &&
-        (receipt._tag === "Legacy" || receipt.name === row.name)
+        receipt.name === row.name
 
       const receiptTerminallyReady = (receipt: Protocol.Receipt, installed: typeof Rows.ClientMetaRow.Type) => {
         if (receipt._tag === "Accepted") {
@@ -2233,22 +2219,15 @@ export const layer = (
         envelope: Protocol.MutationEnvelope
       ) {
         let receiptSchema = receipt.sourceSchema
-        if (receipt._tag === "Expired") receiptSchema = envelope.sourceSchema
-        let receiptMutationVersion: Identity.SchemaVersion | null = null
-        if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
-          receiptMutationVersion = receipt.mutationVersion
-        } else if (receipt._tag === "Expired") {
+        let receiptMutationVersion = receipt.mutationVersion
+        let receiptName = receipt.name
+        if (receipt._tag === "Expired") {
+          receiptSchema = envelope.sourceSchema
           receiptMutationVersion = envelope.mutationVersion
-        }
-        let receiptName: string | null = null
-        if (receipt._tag === "Accepted" || receipt._tag === "Rejected") {
-          receiptName = receipt.name
-        } else if (receipt._tag === "Expired") {
           receiptName = envelope.name
         }
-        let rejectionOrigin: string | null = null
+        let rejectionOrigin: Protocol.RejectionOrigin | null = null
         if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
-        else if (receipt._tag === "Legacy") rejectionOrigin = "Legacy"
         yield* sql`INSERT INTO effect_local_client_receipts_data
             (space_id, schema_generation, membership_incarnation, mutation_id, local_sequence, receipt_json,
               source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin)
@@ -2277,7 +2256,7 @@ export const layer = (
             message: "Receipt incarnation does not match this membership"
           })
         }
-        if (receipt._tag !== "Legacy") yield* validateNamedReceiptProvenance(receipt)
+        yield* validateReceiptProvenance(receipt)
         const storedReceipt = yield* findReceipt(receipt.mutationId).pipe(
           Effect.mapError(StorageUnavailable.make)
         )
@@ -2315,7 +2294,7 @@ export const layer = (
         const pendingMutation = yield* decodePendingRow(storedPending.value)
         if (
           pendingMutation.envelope.localSequence !== receipt.localSequence ||
-          (receipt._tag !== "Legacy" && receipt.name !== pendingMutation.envelope.name)
+          receipt.name !== pendingMutation.envelope.name
         ) {
           return yield* new ReplicaError.ProtocolInvalid({
             message: `Receipt does not match pending mutation ${receipt.mutationId}`
@@ -2431,7 +2410,7 @@ export const layer = (
                 message: `Receipt does not match pending mutation ${receipt.mutationId}`
               })
             }
-            if (receipt._tag !== "Legacy" && receipt.name !== pendingMutation.envelope.name) {
+            if (receipt.name !== pendingMutation.envelope.name) {
               return yield* new ReplicaError.ProtocolInvalid({
                 message:
                   `Receipt ${receipt.mutationId} names ${receipt.name} instead of ${pendingMutation.envelope.name}`
@@ -2630,14 +2609,12 @@ export const layer = (
                   message: `Receipt does not match quarantined mutation ${receipt.mutationId}`
                 })
               }
-              if (receipt._tag !== "Legacy") {
-                if (receipt.name !== item.envelope.name) {
-                  return yield* new ReplicaError.ProtocolInvalid({
-                    message: `Receipt ${receipt.mutationId} names ${receipt.name} instead of ${item.envelope.name}`
-                  })
-                }
-                yield* validateNamedReceiptProvenance(receipt)
+              if (receipt.name !== item.envelope.name) {
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message: `Receipt ${receipt.mutationId} names ${receipt.name} instead of ${item.envelope.name}`
+                })
               }
+              yield* validateReceiptProvenance(receipt)
               const canceledTouched = new Map<string, Protocol.EntityKey>()
               let pendingDelta = 0
               let canceledReplacement: Option.Option<Quarantine.QuarantinedMutation> = Option.none()
@@ -3154,7 +3131,7 @@ export const layer = (
                   message: `Receipt does not match durable pending mutation ${row.mutation_id}`
                 })
               }
-              if (receipt._tag !== "Legacy" && receipt.name !== pendingMutation.envelope.name) {
+              if (receipt.name !== pendingMutation.envelope.name) {
                 return yield* new ReplicaError.StorageCorrupt({
                   message:
                     `Receipt ${receipt.mutationId} names ${receipt.name} instead of ${pendingMutation.envelope.name}`

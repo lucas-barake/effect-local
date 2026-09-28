@@ -52,21 +52,13 @@ export interface Step {
   readonly hash: Identity.SchemaHash
 }
 
-export interface LegacyBaseline {
-  readonly id: string
-  readonly hash: Identity.SchemaHash
-  readonly definition: Definition.Any
-}
-
 export interface Evolution {
   readonly current: Definition.Any
   readonly steps: ReadonlyArray<Step>
-  readonly legacyBaselines: ReadonlyArray<LegacyBaseline>
   readonly migrationHash: Identity.SchemaHash
   readonly definitionByIdentity: ReadonlyMap<string, Definition.Any>
   readonly stepBySourceIdentity: ReadonlyMap<string, Step>
   readonly stepByTargetIdentity: ReadonlyMap<string, Step>
-  readonly legacyBaselineByHash: ReadonlyMap<string, LegacyBaseline>
 }
 
 export interface ModelAlias {
@@ -94,12 +86,6 @@ const identityKey = (identity: Identity.SchemaIdentity): string => `${identity.v
 const byName = <A extends { readonly name: string },>(left: A, right: A): number => {
   if (left.name < right.name) return -1
   if (left.name > right.name) return 1
-  return 0
-}
-
-const byId = <A extends { readonly id: string },>(left: A, right: A): number => {
-  if (left.id < right.id) return -1
-  if (left.id > right.id) return 1
   return 0
 }
 
@@ -381,23 +367,9 @@ export const step = (options: {
   })
 }
 
-export const legacyBaseline = (options: {
-  readonly id: string
-  readonly hash: string
-  readonly definition: Definition.Any
-}): LegacyBaseline => {
-  assertStableId("legacy baseline", options.id)
-  return Object.freeze({
-    id: options.id,
-    hash: Identity.SchemaHash.make(options.hash),
-    definition: options.definition
-  })
-}
-
 export const make = (options: {
   readonly current: Definition.Any
   readonly steps?: ReadonlyArray<Step> | undefined
-  readonly legacyBaselines?: ReadonlyArray<LegacyBaseline> | undefined
 }): Evolution => {
   const steps = [...(options.steps ?? [])].toSorted((left, right) => left.from.version - right.from.version)
   const stepIds = new Set<string>()
@@ -440,39 +412,18 @@ export const make = (options: {
   if (steps.length > 0 && !sameIdentity(steps[steps.length - 1].to.schemaIdentity, options.current.schemaIdentity)) {
     return Defect.invalid("Schema evolution chain does not terminate at the current definition")
   }
-  const legacyBaselines = [...(options.legacyBaselines ?? [])]
-  const legacyBaselineByHash = new Map<string, LegacyBaseline>()
-  const baselineIds = new Set<string>()
-  for (const baseline of legacyBaselines) {
-    if (baselineIds.has(baseline.id)) return Defect.invalid(`Duplicate legacy baseline id: ${baseline.id}`)
-    if (legacyBaselineByHash.has(baseline.hash)) {
-      return Defect.invalid(`Duplicate legacy baseline hash: ${baseline.hash}`)
-    }
-    if (!definitionByIdentity.has(identityKey(baseline.definition.schemaIdentity))) {
-      return Defect.invalid(`Legacy baseline ${baseline.id} does not map to a definition in the evolution chain`)
-    }
-    baselineIds.add(baseline.id)
-    legacyBaselineByHash.set(baseline.hash, baseline)
-  }
   const migrationHash = Canonical.hash({
     format: 1,
     current: options.current.schemaIdentity,
-    steps: steps.map((entry) => ({ id: entry.id, hash: entry.hash })),
-    legacyBaselines: legacyBaselines.map((entry) => ({
-      id: entry.id,
-      hash: entry.hash,
-      schemaIdentity: entry.definition.schemaIdentity
-    })).toSorted(byId)
+    steps: steps.map((entry) => ({ id: entry.id, hash: entry.hash }))
   })
   return Object.freeze({
     current: options.current,
     steps: Object.freeze(steps),
-    legacyBaselines: Object.freeze(legacyBaselines),
     migrationHash: Identity.SchemaHash.make(migrationHash),
     definitionByIdentity,
     stepBySourceIdentity,
-    stepByTargetIdentity,
-    legacyBaselineByHash
+    stepByTargetIdentity
   })
 }
 

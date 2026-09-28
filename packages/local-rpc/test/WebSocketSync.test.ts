@@ -849,7 +849,7 @@ describe("WebSocket synchronization", () => {
             name: PutTodo.name,
             payload: { id: `bootstrap-${sequence}`, title: "s".repeat(250) },
             digestVersion: 1,
-            membershipIncarnation: Identity.legacyMembershipIncarnation,
+            membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000901"),
             sourceSchema: definition.schemaIdentity,
             mutationVersion: PutTodo.version
           }
@@ -916,7 +916,7 @@ describe("WebSocket synchronization", () => {
           name: PutTodo.name,
           payload: { id: "1", title: "socket" },
           digestVersion: 1 as const,
-          membershipIncarnation: Identity.legacyMembershipIncarnation,
+          membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000901"),
           sourceSchema: definition.schemaIdentity,
           mutationVersion: PutTodo.version
         }
@@ -1018,7 +1018,7 @@ describe("WebSocket synchronization", () => {
           name: AssignRoleV1.name,
           payload: { account: "victim" },
           digestVersion: 1 as const,
-          membershipIncarnation: Identity.legacyMembershipIncarnation,
+          membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000901"),
           sourceSchema: definitionV1.schemaIdentity,
           mutationVersion: AssignRoleV1.version
         }
@@ -1091,7 +1091,7 @@ describe("WebSocket synchronization", () => {
           name: ReturnHugeResult.name,
           payload: null,
           digestVersion: 1 as const,
-          membershipIncarnation: Identity.legacyMembershipIncarnation,
+          membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000901"),
           sourceSchema: definition.schemaIdentity,
           mutationVersion: ReturnHugeResult.version
         }

@@ -385,7 +385,7 @@ export const AcceptedReceipt = Schema.TaggedStruct("Accepted", {
 })
 export type AcceptedReceipt = typeof AcceptedReceipt.Type
 
-export const RejectionOrigin = Schema.Literals(["Mutation", "Authorization", "Capacity", "Legacy", "Quarantine"])
+export const RejectionOrigin = Schema.Literals(["Mutation", "Authorization", "Capacity", "Quarantine"])
 export type RejectionOrigin = typeof RejectionOrigin.Type
 
 export const RejectedReceipt = Schema.TaggedStruct("Rejected", {
@@ -399,15 +399,6 @@ export const RejectedReceipt = Schema.TaggedStruct("Rejected", {
 })
 export type RejectedReceipt = typeof RejectedReceipt.Type
 
-export const LegacyReceipt = Schema.TaggedStruct("Legacy", {
-  ...ReceiptIdentity,
-  sourceSchema: Identity.SchemaIdentity,
-  outcome: Schema.Literals(["Accepted", "Rejected"]),
-  serverSequence: Schema.NullOr(Identity.ServerSequence),
-  body: Schema.Json
-})
-export type LegacyReceipt = typeof LegacyReceipt.Type
-
 export const ExpiredReceipt = Schema.TaggedStruct("Expired", {
   ...ReceiptIdentity,
   name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
@@ -419,7 +410,7 @@ export const ExpiredReceipt = Schema.TaggedStruct("Expired", {
 })
 export type ExpiredReceipt = typeof ExpiredReceipt.Type
 
-export const Receipt = Schema.Union([AcceptedReceipt, RejectedReceipt, LegacyReceipt, ExpiredReceipt])
+export const Receipt = Schema.Union([AcceptedReceipt, RejectedReceipt, ExpiredReceipt])
 export type Receipt = typeof Receipt.Type
 
 export const SubmitBatchResult = Schema.Struct({
