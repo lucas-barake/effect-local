@@ -4,6 +4,7 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
@@ -15,7 +16,9 @@ import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Scheduler from "effect/Scheduler"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
@@ -47,7 +50,9 @@ const clientHistory = {
 
 const remoteService = SyncEngine.SyncEngine.of({
   waitForCredentialChange: () => Effect.never,
-  submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+  transportGeneration: Effect.succeed(0),
+  waitForTransportChange: () => Effect.never,
+  submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
   discard: () => Effect.die("unexpected discard"),
   pull: () => Effect.never,
   bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -75,6 +80,197 @@ const activeChildFibers = Metric.snapshot.pipe(
     return Number(active.state.value)
   })
 )
+
+const restartWithStalledBackgroundPull = Effect.fnUntraced(function*(constructor: "layer" | "layerWorkflow") {
+  const databaseContext = yield* Layer.mergeAll(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer,
+    Reactivity.layer,
+    WorkflowEngine.layerMemory
+  ).pipe(Layer.build)
+  const backgroundPullStarted = yield* Deferred.make<void>()
+  let observePull = false
+  const stalledRemote = SyncEngine.SyncEngine.of({
+    ...remoteService,
+    pull: () => {
+      if (!observePull) return Effect.never
+      return Deferred.succeed(backgroundPullStarted, undefined).pipe(Effect.andThen(Effect.never))
+    }
+  })
+  const layerServices = Layer.mergeAll(
+    Domain.layerHandlers,
+    Layer.succeed(SyncEngine.SyncEngine, stalledRemote),
+    Layer.succeedContext(databaseContext)
+  )
+  const options = { ...clientHistory, definition: Domain.definition, clientId }
+  let layerReplica = SqlReplica.layer(options).pipe(Layer.provide(layerServices))
+  if (constructor === "layerWorkflow") {
+    layerReplica = SqlReplica.layerWorkflow(options).pipe(Layer.provide(layerServices))
+  }
+
+  const firstScope = yield* Scope.make()
+  const first = Context.get(yield* Layer.buildWithScope(layerReplica, firstScope), Replica.Replica)
+  yield* (yield* first.join(spaceA)).mutate(Domain.PutTodo, Domain.todo("restart", "retained"))
+  yield* Scope.close(firstScope, Exit.void)
+
+  observePull = true
+  const second = Context.get(yield* Layer.build(layerReplica), Replica.Replica)
+  yield* Deferred.await(backgroundPullStarted)
+  return second
+})
+
+const settledReadSource = "SELECT receipt_json, settled_pending_json, settled_sequence"
+const projectionDirtySource = "SELECT model, model_version, entity_key FROM effect_local_client_projection_dirty"
+
+const probedServices = Effect.fnUntraced(function*(
+  probe: (source: string, values: ReadonlyArray<unknown>) => Effect.Effect<never> | undefined
+) {
+  const databaseContext = yield* Layer.mergeAll(
+    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    NodeCrypto.layer,
+    Reactivity.layer
+  ).pipe(Layer.build)
+  const sql = Context.get(databaseContext, SqlClient.SqlClient)
+  const probedSql = new Proxy(sql, {
+    apply: (target, thisArg, args: Parameters<typeof sql>) => {
+      const rawSource: unknown = args[0]
+      let source: string
+      if (Array.isArray(rawSource)) source = rawSource.join("")
+      else source = String(rawSource)
+      const replacement = probe(source, args.slice(1))
+      if (replacement === undefined) return Reflect.apply(target, thisArg, args)
+      return replacement
+    }
+  })
+  const crypto = Context.get(databaseContext, Crypto.Crypto)
+  const reactivity = Context.get(databaseContext, Reactivity.Reactivity)
+  const layer = Layer.mergeAll(
+    Layer.succeed(SqlClient.SqlClient, probedSql),
+    Layer.succeed(Crypto.Crypto, crypto),
+    Layer.succeed(Reactivity.Reactivity, reactivity)
+  )
+  return { layer, sql, crypto, reactivity }
+})
+
+const viewPage = (
+  crypto: Crypto.Crypto,
+  viewId: Identity.ReplicationViewId,
+  request: Parameters<SyncEngine.SyncEngine["Service"]["pull"]>[0],
+  changes: ReadonlyArray<Protocol.ViewChange>,
+  hasMore: boolean,
+  serverSequence = 1
+) =>
+  Protocol.viewChangesDigest(changes).pipe(
+    Effect.map((digest) =>
+      Protocol.PullPage.make({
+        scopeGeneration: request.scopeGeneration,
+        cursor: Protocol.ReplicationCursor.make({
+          viewId,
+          revision: Identity.ReplicationViewRevision.make((request.cursor?.revision ?? 0) + 1)
+        }),
+        serverSequence: Identity.ServerSequence.make(serverSequence),
+        changes,
+        contentBytes: Protocol.encodedBytes(changes),
+        digest,
+        hasMore,
+        serverSchema: Domain.definition.schemaIdentity
+      })
+    ),
+    Effect.provideService(Crypto.Crypto, crypto)
+  )
+
+const acceptSubmission: SyncEngine.SyncEngine["Service"]["submitBatch"] = (request) =>
+  Effect.succeed(Protocol.SubmitBatchResult.make({
+    receipts: request.envelopes.map((envelope) =>
+      Protocol.AcceptedReceipt.make({
+        ...envelope,
+        serverSequence: Identity.ServerSequence.make(1),
+        result: Domain.todo(envelope.mutationId, "accepted")
+      })
+    )
+  }))
+
+const awaitNoPending = Effect.fnUntraced(function*(
+  replica: Replica.Replica["Service"],
+  reactivity: Reactivity.Reactivity
+) {
+  const changes = yield* Queue.unbounded<void>()
+  yield* Effect.acquireRelease(
+    Effect.sync(() =>
+      reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+        Queue.offerUnsafe(changes, undefined)
+      })
+    ),
+    (unregister) => Effect.sync(unregister)
+  )
+  while ((yield* replica.status).totalPending > 0) yield* Queue.take(changes)
+})
+
+const settlementReadProbe = (reads: ReadonlyMap<Identity.SpaceId, Deferred.Deferred<void>>) =>
+(
+  source: string,
+  values: ReadonlyArray<unknown>
+) => {
+  if (!source.includes(settledReadSource)) return undefined
+  for (const [spaceId, read] of reads) {
+    if (values.includes(spaceId)) Deferred.doneUnsafe(read, Effect.void)
+  }
+  return undefined
+}
+
+const makePin = Effect.all({ entered: Deferred.make<void>(), release: Deferred.make<void>() })
+
+type Pin = Effect.Success<typeof makePin>
+
+const pinnedRemote = (pins: ReadonlyMap<Identity.SpaceId, Pin>) => {
+  const attempt = (spaceId: Identity.SpaceId) => {
+    const pin = pins.get(spaceId)
+    if (pin === undefined) return Effect.fail(new ReplicaError.ServerUnavailable())
+    return Deferred.succeed(pin.entered, undefined).pipe(
+      Effect.andThen(Deferred.await(pin.release)),
+      Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
+    )
+  }
+  return SyncEngine.SyncEngine.of({
+    ...remoteService,
+    submitBatch: (request) => attempt(request.envelopes[0].spaceId),
+    pull: (request) => attempt(request.spaceId),
+    bootstrap: (request) => attempt(request.spaceId)
+  })
+}
+
+const abandonActivation = Effect.fnUntraced(function*(
+  begin: (space: Replica.Space) => Effect.Effect<unknown, ReplicaError.ReplicaError>
+) {
+  const initializing = yield* Deferred.make<void>()
+  let gateInitialization = false
+  const { layer: layerServices } = yield* probedServices((source, values) => {
+    if (!gateInitialization || !source.includes(projectionDirtySource) || !values.includes(spaceA)) return undefined
+    gateInitialization = false
+    return Deferred.succeed(initializing, undefined).pipe(Effect.andThen(Effect.never))
+  })
+  const layerReplica = SqlReplica.layer({
+    ...clientHistory,
+    definition: Domain.definition,
+    clientId,
+    initialSpaces: [spaceA]
+  }).pipe(
+    Layer.provide(Domain.layerHandlers),
+    Layer.provide(layerRemote),
+    Layer.provide(layerServices)
+  )
+  const replica = Context.get(yield* Layer.build(layerReplica), Replica.Replica)
+  const space = yield* replica.space(spaceA)
+  gateInitialization = true
+  const abandoned = yield* Effect.forkChild(begin(space), { startImmediately: true })
+  yield* Deferred.await(initializing)
+  const waiting = yield* Effect.forkChild(space.get(Domain.Todo, "waiting"), { startImmediately: true })
+  yield* Fiber.interrupt(abandoned)
+
+  const waited = yield* Fiber.await(waiting)
+  assert.strictEqual(waited._tag, "Success")
+  assert.strictEqual(yield* space.activation, "Active")
+})
 
 describe("multi space Replica", () => {
   it.effect(
@@ -178,6 +374,27 @@ describe("multi space Replica", () => {
     }, Effect.scoped)
   )
 
+  it.effect.each(["layer", "layerWorkflow"] as const)(
+    "serves a restored space while its background reconciliation waits on the remote with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const replica = yield* restartWithStalledBackgroundPull(constructor)
+      const restored = yield* replica.space(spaceA)
+      assert.strictEqual(Option.getOrThrow(yield* restored.get(Domain.Todo, "restart")).title, "retained")
+      assert.strictEqual(yield* restored.activation, "Active")
+    }, Effect.scoped)
+  )
+
+  it.effect.each(["layer", "layerWorkflow"] as const)(
+    "leaves a restored space while its background reconciliation waits on the remote with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const replica = yield* restartWithStalledBackgroundPull(constructor)
+      yield* replica.leave(spaceA)
+      const missing = yield* replica.space(spaceA).pipe(Effect.result)
+      assert.strictEqual(missing._tag, "Failure")
+      if (missing._tag === "Failure") assert.strictEqual(missing.failure._tag, "SpaceNotJoined")
+    }, Effect.scoped)
+  )
+
   it.effect(
     "releases a workflow registration reservation when its owner is interrupted",
     Effect.fnUntraced(function*() {
@@ -278,7 +495,9 @@ describe("multi space Replica", () => {
       const watchStarted = yield* Deferred.make<void>()
       const countedRemoteService = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
-        submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
+        submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         discard: () => Effect.die("unexpected discard"),
         pull: () => Effect.never,
         bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -545,7 +764,7 @@ describe("multi space Replica", () => {
       }
       const retryingRemote = SyncEngine.SyncEngine.of({
         ...remoteService,
-        submit: observeAttempt,
+        submitBatch: observeAttempt,
         pull: observeAttempt,
         bootstrap: observeAttempt
       })
@@ -595,7 +814,9 @@ describe("multi space Replica", () => {
       const release = yield* Deferred.make<void>()
       const blockedRemoteService = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
-        submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
+        submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         discard: () => Effect.die("unexpected discard"),
         pull: () => {
           const acquire = Ref.updateAndGet(current, (count) => count + 1).pipe(
@@ -660,7 +881,9 @@ describe("multi space Replica", () => {
       const release = yield* Deferred.make<void>()
       const blockedRemote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
-        submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
+        submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
         discard: () => Effect.die("unexpected discard"),
         pull: () =>
           Effect.acquireUseRelease(
@@ -708,6 +931,33 @@ describe("multi space Replica", () => {
   )
 
   it.effect(
+    "admits foreground activations that reserve capacity together before any becomes active",
+    Effect.fnUntraced(function*() {
+      const spaces = Array.from({ length: 3 }, (_, index) => {
+        const suffix = String(index + 1).padStart(12, "0")
+        return Identity.SpaceId.make(`spc_00000000-0000-4000-8000-${suffix}`)
+      })
+      const layerReplica = SqlReplica.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        clientId,
+        initialSpaces: spaces
+      }).pipe(
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(layerRemote),
+        Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(Reactivity.layer)
+      )
+      const replica = Context.get(yield* Layer.build(layerReplica), Replica.Replica)
+      const handles = yield* Effect.forEach(spaces, replica.space)
+      yield* Effect.forEach(handles, (space) => space.activate, { concurrency: "unbounded", discard: true })
+      const activations = yield* Effect.forEach(handles, (space) => space.activation)
+      assert.strictEqual(activations.filter((activation) => activation === "Active").length, 2)
+    }, (effect) => effect.pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 5), Effect.scoped))
+  )
+
+  it.effect(
     "settles a foreground mutation while the background lane is saturated",
     Effect.fnUntraced(function*() {
       const backgroundSpaces = Array.from({ length: 3 }, (_, index) => {
@@ -736,24 +986,34 @@ describe("multi space Replica", () => {
       const viewId = Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000001")
       const scheduledRemote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
-        submit: (request) => {
-          if (request.envelope.spaceId !== foregroundSpace) {
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
+        submitBatch: (request) => {
+          if (request.envelopes[0].spaceId !== foregroundSpace) {
             if (!blockBackground) return Effect.fail(new ReplicaError.ServerUnavailable())
             return Ref.updateAndGet(activeBackground, (count) => count + 1).pipe(
               Effect.tap(() => Deferred.succeed(backgroundEntered, undefined)),
               Effect.andThen(Deferred.await(releaseBackground)),
-              Effect.as(Protocol.AcceptedReceipt.make({
-                ...request.envelope,
-                serverSequence: Identity.ServerSequence.make(1),
-                result: Domain.todo(request.envelope.spaceId, "background settled")
+              Effect.as(Protocol.SubmitBatchResult.make({
+                receipts: request.envelopes.map((envelope) =>
+                  Protocol.AcceptedReceipt.make({
+                    ...envelope,
+                    serverSequence: Identity.ServerSequence.make(1),
+                    result: Domain.todo(envelope.spaceId, "background settled")
+                  })
+                )
               })),
               Effect.ensuring(Ref.update(activeBackground, (count) => count - 1))
             )
           }
-          return Effect.succeed(Protocol.AcceptedReceipt.make({
-            ...request.envelope,
-            serverSequence: Identity.ServerSequence.make(1),
-            result: Domain.todo("foreground", "settled")
+          return Effect.succeed(Protocol.SubmitBatchResult.make({
+            receipts: request.envelopes.map((envelope) =>
+              Protocol.AcceptedReceipt.make({
+                ...envelope,
+                serverSequence: Identity.ServerSequence.make(1),
+                result: Domain.todo("foreground", "settled")
+              })
+            )
           }))
         },
         discard: () => Effect.die("unexpected discard"),
@@ -894,7 +1154,7 @@ describe("multi space Replica", () => {
       }
       const failingRemote = SyncEngine.SyncEngine.of({
         ...remoteService,
-        submit: (request) => observeAttempt(request.envelope.spaceId),
+        submitBatch: (request) => observeAttempt(request.envelopes[0].spaceId),
         pull: (request) => observeAttempt(request.spaceId),
         bootstrap: (request) => observeAttempt(request.spaceId)
       })
@@ -948,6 +1208,7 @@ describe("multi space Replica", () => {
       const backgroundEntered = yield* Deferred.make<void>()
       const releaseBackground = yield* Deferred.make<void>()
       const activeWatches = yield* Ref.make(0)
+      const watchOpened = yield* Deferred.make<void>()
       let gateFirstAttempt = true
       const attempt = () => {
         if (!gateFirstAttempt) return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -959,12 +1220,15 @@ describe("multi space Replica", () => {
       }
       const blockedRemote = SyncEngine.SyncEngine.of({
         ...remoteService,
-        submit: attempt,
+        submitBatch: attempt,
         pull: attempt,
         bootstrap: attempt,
         watch: () =>
           Effect.acquireRelease(
-            Ref.update(activeWatches, (count) => count + 1).pipe(Effect.as(Stream.never)),
+            Ref.update(activeWatches, (count) => count + 1).pipe(
+              Effect.andThen(Deferred.succeed(watchOpened, undefined)),
+              Effect.as(Stream.never)
+            ),
             () => Ref.update(activeWatches, (count) => count - 1)
           ).pipe(Stream.unwrap)
       })
@@ -976,7 +1240,7 @@ describe("multi space Replica", () => {
       yield* Effect.yieldNow
       yield* Deferred.succeed(releaseBackground, undefined)
       yield* Fiber.join(promotion)
-      yield* Effect.yieldNow
+      yield* Deferred.await(watchOpened)
 
       assert.strictEqual(yield* space.activation, "Active")
       assert.strictEqual(yield* Ref.get(activeWatches), 1)
@@ -992,11 +1256,15 @@ describe("multi space Replica", () => {
         return Identity.SpaceId.make(`spc_00000000-0000-4000-8000-${suffix}`)
       })
       const activeWatches = yield* Ref.make(0)
+      const watchOpened = yield* Deferred.make<void>()
       const countedRemote = SyncEngine.SyncEngine.of({
         ...remoteService,
         watch: () =>
           Effect.acquireRelease(
-            Ref.update(activeWatches, (count) => count + 1).pipe(Effect.as(Stream.never)),
+            Ref.update(activeWatches, (count) => count + 1).pipe(
+              Effect.andThen(Deferred.succeed(watchOpened, undefined)),
+              Effect.as(Stream.never)
+            ),
             () => Ref.update(activeWatches, (count) => count - 1)
           ).pipe(Stream.unwrap)
       })
@@ -1025,7 +1293,7 @@ describe("multi space Replica", () => {
       assert.strictEqual(yield* activeChildFibers, baselineFibers)
       assert.isTrue(activations.every((activation) => activation === "Inactive"))
       yield* remembered[0].activate
-      yield* Effect.yieldNow
+      yield* Deferred.await(watchOpened)
       assert.strictEqual(yield* Ref.get(activeWatches), 1)
       yield* remembered[0].deactivate
       assert.strictEqual(yield* Ref.get(activeWatches), 0)
@@ -1090,6 +1358,468 @@ describe("multi space Replica", () => {
       assert.strictEqual(yield* first.activation, "Active")
       assert.strictEqual(yield* second.activation, "Inactive")
       assert.strictEqual(yield* third.activation, "Active")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "interrupts a get waiting for foreground capacity held by in-flight reconciliation",
+    Effect.fnUntraced(function*() {
+      const spaceC = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
+      const firstPin = yield* makePin
+      const secondPin = yield* makePin
+      const pinned = pinnedRemote(new Map([[spaceA, firstPin], [spaceB, secondPin]]))
+      const firstRetried = yield* Deferred.make<void>()
+      let firstPulls = 0
+      const remote = SyncEngine.SyncEngine.of({
+        ...pinned,
+        pull: (request) => {
+          if (request.spaceId === spaceA && ++firstPulls === 2) Deferred.doneUnsafe(firstRetried, Effect.void)
+          return pinned.pull(request)
+        }
+      })
+      const { layer: layerServices } = yield* probedServices(() => undefined)
+      const layerReplica = SqlReplica.layerWorkflow({
+        ...clientHistory,
+        definition: Domain.definition,
+        clientId,
+        initialSpaces: [spaceA, spaceB, spaceC],
+        foregroundReconciliationConcurrency: 2
+      }).pipe(
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+        Layer.provide(layerServices),
+        Layer.provide(WorkflowEngine.layerMemory)
+      )
+      const replica = Context.get(yield* Layer.build(layerReplica), Replica.Replica)
+      const first = yield* replica.space(spaceA)
+      const second = yield* replica.space(spaceB)
+      const third = yield* replica.space(spaceC)
+      yield* first.mutate(Domain.PutTodo, Domain.todo("pinned"))
+      yield* second.mutate(Domain.PutTodo, Domain.todo("pinned"))
+      yield* Deferred.await(firstPin.entered)
+      yield* Deferred.await(secondPin.entered)
+
+      const blocked = yield* Effect.forkChild(third.get(Domain.Todo, "blocked"), { startImmediately: true }).pipe(
+        Effect.provideService(Scheduler.PreventSchedulerYield, true)
+      )
+      yield* Effect.yieldNow
+      assert.strictEqual(yield* third.activation, "Inactive")
+      yield* Fiber.interrupt(blocked)
+      assert.isTrue(Exit.hasInterrupts(yield* Fiber.await(blocked)))
+
+      yield* Deferred.succeed(firstPin.release, undefined)
+      assert.isTrue(Option.isNone(yield* third.get(Domain.Todo, "after")))
+      yield* Deferred.await(firstRetried)
+      yield* first.activation.pipe(Effect.repeat({ until: (activation) => activation === "Inactive" }))
+      assert.strictEqual(yield* first.activation, "Inactive")
+      assert.strictEqual(yield* second.activation, "Active")
+      assert.strictEqual(yield* third.activation, "Active")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "wakes a get waiting for foreground capacity after reservations withdraw concurrently",
+    Effect.fnUntraced(function*() {
+      const spaces = Array.from({ length: 5 }, (_, index) => {
+        const suffix = String(index + 1).padStart(12, "0")
+        return Identity.SpaceId.make(`spc_00000000-0000-4000-8000-${suffix}`)
+      })
+      const firstPin = yield* makePin
+      const secondPin = yield* makePin
+      const remote = pinnedRemote(new Map([[spaces[0], firstPin], [spaces[1], secondPin]]))
+      const layerReplica = SqlReplica.layerWorkflow({
+        ...clientHistory,
+        definition: Domain.definition,
+        clientId,
+        initialSpaces: spaces,
+        foregroundReconciliationConcurrency: 2
+      }).pipe(
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+        Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
+        Layer.provide(NodeCrypto.layer),
+        Layer.provide(Reactivity.layer),
+        Layer.provide(WorkflowEngine.layerMemory)
+      )
+      const replica = Context.get(yield* Layer.build(layerReplica), Replica.Replica)
+      const handles = yield* Effect.forEach(spaces, replica.space)
+      yield* handles[0].mutate(Domain.PutTodo, Domain.todo("pinned"))
+      yield* handles[1].mutate(Domain.PutTodo, Domain.todo("pinned"))
+      yield* Deferred.await(firstPin.entered)
+      yield* Deferred.await(secondPin.entered)
+
+      const waiting = yield* Effect.forkChild(handles[2].get(Domain.Todo, "waiting"), { startImmediately: true })
+      const withdrawn = yield* Effect.forEach(
+        handles.slice(3),
+        (space) => Effect.forkChild(space.activate, { startImmediately: true })
+      )
+      for (let step = 0; step < 20; step++) yield* Effect.yieldNow
+      yield* Fiber.interruptAll(withdrawn)
+      yield* Deferred.succeed(firstPin.release, undefined)
+      assert.isTrue(Option.isNone(yield* Fiber.join(waiting)))
+    }, (effect) => effect.pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 4), Effect.scoped))
+  )
+
+  it.effect(
+    "keeps a waiting get alive when the get initializing the same space is interrupted",
+    Effect.fnUntraced(function*() {
+      yield* abandonActivation((space) => space.get(Domain.Todo, "abandoned"))
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "keeps a waiting get alive when the activation initializing the same space is interrupted",
+    Effect.fnUntraced(function*() {
+      yield* abandonActivation((space) => space.activate)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "releases the foreground reservation of an interrupted promotion from background",
+    Effect.fnUntraced(function*() {
+      const spaceC = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
+      const { layer: layerServices } = yield* probedServices(() => undefined)
+      const replicaLayer = (remote: SyncEngine.SyncEngine["Service"]) =>
+        SqlReplica.layerWorkflow({
+          ...clientHistory,
+          definition: Domain.definition,
+          clientId,
+          initialSpaces: [spaceA, spaceB, spaceC],
+          foregroundReconciliationConcurrency: 2,
+          retryDelay: "1 hour",
+          maximumRetryDelay: "1 hour"
+        }).pipe(
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+          Layer.provide(layerServices),
+          Layer.provide(WorkflowEngine.layerMemory)
+        )
+
+      const seedScope = yield* Scope.make()
+      const unavailableRemote = SyncEngine.SyncEngine.of({
+        ...remoteService,
+        pull: () => Effect.fail(new ReplicaError.ServerUnavailable())
+      })
+      const seedContext = yield* Layer.buildWithScope(replicaLayer(unavailableRemote), seedScope)
+      const seedSpace = yield* Context.get(seedContext, Replica.Replica).space(spaceC)
+      yield* seedSpace.mutate(Domain.PutTodo, Domain.todo("background"))
+      yield* seedSpace.deactivate
+      yield* Scope.close(seedScope, Exit.void)
+
+      const firstPin = yield* makePin
+      const secondPin = yield* makePin
+      const backgroundPin = yield* makePin
+      const remote = pinnedRemote(new Map([[spaceA, firstPin], [spaceB, secondPin], [spaceC, backgroundPin]]))
+      const replica = Context.get(yield* Layer.build(replicaLayer(remote)), Replica.Replica)
+      yield* Deferred.await(backgroundPin.entered)
+      const first = yield* replica.space(spaceA)
+      const second = yield* replica.space(spaceB)
+      const third = yield* replica.space(spaceC)
+      yield* first.mutate(Domain.PutTodo, Domain.todo("pinned"))
+      yield* second.mutate(Domain.PutTodo, Domain.todo("pinned"))
+      yield* Deferred.await(firstPin.entered)
+      yield* Deferred.await(secondPin.entered)
+
+      const promotion = yield* Effect.forkChild(third.activate, { startImmediately: true }).pipe(
+        Effect.provideService(Scheduler.PreventSchedulerYield, true)
+      )
+      yield* Effect.yieldNow
+      yield* Fiber.interrupt(promotion)
+      assert.isTrue(Exit.hasInterrupts(yield* Fiber.await(promotion)))
+
+      yield* Deferred.succeed(firstPin.release, undefined)
+      yield* third.get(Domain.Todo, "background")
+      assert.strictEqual(yield* first.activation, "Inactive")
+      assert.strictEqual(yield* second.activation, "Active")
+      assert.strictEqual(yield* third.activation, "Active")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "resumes background reconciliation after an interrupted promotion preempts it",
+    Effect.fnUntraced(function*() {
+      const services = yield* probedServices(() => undefined)
+      const viewId = Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000002")
+      const replicaLayer = (remote: SyncEngine.SyncEngine["Service"]) =>
+        SqlReplica.layer({
+          ...clientHistory,
+          definition: Domain.definition,
+          clientId,
+          initialSpaces: [spaceA],
+          retryDelay: "1 hour",
+          maximumRetryDelay: "1 hour"
+        }).pipe(
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+          Layer.provide(services.layer)
+        )
+
+      const seedScope = yield* Scope.make()
+      const seedContext = yield* Layer.buildWithScope(replicaLayer(remoteService), seedScope)
+      const seedSpace = yield* Context.get(seedContext, Replica.Replica).space(spaceA)
+      yield* seedSpace.mutate(Domain.PutTodo, Domain.todo("resumed"))
+      yield* seedSpace.deactivate
+      yield* Scope.close(seedScope, Exit.void)
+      yield* services.sql`UPDATE effect_local_client_spaces
+        SET replication_view_id = ${viewId}, replication_view_revision = 0`
+
+      const pullEntered = yield* Deferred.make<void>()
+      const pullInterrupted = yield* Deferred.make<void>()
+      let pulls = 0
+      const remote = SyncEngine.SyncEngine.of({
+        ...remoteService,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          pulls += 1
+          if (pulls > 1) return viewPage(services.crypto, viewId, request, [], false)
+          return Deferred.succeed(pullEntered, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() => Deferred.succeed(pullInterrupted, undefined))
+          )
+        }
+      })
+      const replica = Context.get(yield* Layer.build(replicaLayer(remote)), Replica.Replica)
+      yield* Deferred.await(pullEntered)
+      const space = yield* replica.space(spaceA)
+      const promotion = yield* Effect.forkChild(space.activate, { startImmediately: true }).pipe(
+        Effect.provideService(Scheduler.PreventSchedulerYield, true)
+      )
+      yield* Fiber.interrupt(promotion)
+      yield* Deferred.await(pullInterrupted)
+
+      yield* awaitNoPending(replica, services.reactivity)
+      const aggregate = yield* replica.status
+      assert.strictEqual(aggregate.totalPending, 0)
+      assert.strictEqual(aggregate.counts.connecting, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "invalidates entities from a partial catch up page when promotion preempts the rest",
+    Effect.fnUntraced(function*() {
+      const services = yield* probedServices(() => undefined)
+      const viewId = Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000003")
+      const replicaLayer = (remote: SyncEngine.SyncEngine["Service"]) =>
+        SqlReplica.layer({
+          ...clientHistory,
+          definition: Domain.definition,
+          clientId,
+          initialSpaces: [spaceA],
+          retryDelay: "1 hour",
+          maximumRetryDelay: "1 hour"
+        }).pipe(
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+          Layer.provide(services.layer)
+        )
+
+      const seedScope = yield* Scope.make()
+      const seedContext = yield* Layer.buildWithScope(replicaLayer(remoteService), seedScope)
+      const seedSpace = yield* Context.get(seedContext, Replica.Replica).space(spaceA)
+      yield* seedSpace.mutate(Domain.PutTodo, Domain.todo("local"))
+      yield* seedSpace.deactivate
+      yield* Scope.close(seedScope, Exit.void)
+      yield* services.sql`UPDATE effect_local_client_spaces
+        SET replication_view_id = ${viewId}, replication_view_revision = 0`
+
+      const remoteChange = Protocol.Upsert.make({
+        entity: Protocol.EntityKey.make({
+          model: Domain.Todo.name,
+          modelVersion: Domain.Todo.version,
+          key: "remote"
+        }),
+        value: Domain.todo("remote", "from server")
+      })
+      const secondPullEntered = yield* Deferred.make<void>()
+      let pulls = 0
+      const remote = SyncEngine.SyncEngine.of({
+        ...remoteService,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          pulls += 1
+          if (pulls === 1) return viewPage(services.crypto, viewId, request, [remoteChange], true)
+          if (pulls === 2) return Deferred.succeed(secondPullEntered, undefined).pipe(Effect.andThen(Effect.never))
+          return viewPage(services.crypto, viewId, request, [], false)
+        }
+      })
+      let invalidations = 0
+      const remoteKey = ReactivityKey.entity(spaceA, Domain.Todo.name, "remote")
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          services.reactivity.registerUnsafe([remoteKey], () => {
+            invalidations += 1
+          })
+        ),
+        (unregister) => Effect.sync(unregister)
+      )
+      const replica = Context.get(yield* Layer.build(replicaLayer(remote)), Replica.Replica)
+      yield* Deferred.await(secondPullEntered)
+      const space = yield* replica.space(spaceA)
+      yield* space.get(Domain.Todo, "local")
+
+      yield* awaitNoPending(replica, services.reactivity)
+      const synced = yield* space.get(Domain.Todo, "remote")
+      assert.strictEqual(Option.getOrThrow(synced).title, "from server")
+      assert.isAbove(invalidations, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "serves a get on another space while settlement streams stay open on every foreground slot",
+    Effect.fnUntraced(function*() {
+      const spaceC = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
+      const reads = new Map([
+        [spaceA, yield* Deferred.make<void>()],
+        [spaceB, yield* Deferred.make<void>()]
+      ])
+      const { layer: layerServices } = yield* probedServices(settlementReadProbe(reads))
+      const layerReplica = SqlReplica.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        clientId,
+        initialSpaces: [spaceA, spaceB, spaceC]
+      }).pipe(
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(layerRemote),
+        Layer.provide(layerServices)
+      )
+      const replica = Context.get(yield* Layer.build(layerReplica), Replica.Replica)
+      const first = yield* replica.space(spaceA)
+      const second = yield* replica.space(spaceB)
+      const third = yield* replica.space(spaceC)
+      const firstStream = yield* first.settlements().pipe(
+        Stream.runDrain,
+        Effect.forkChild({ startImmediately: true })
+      )
+      const secondStream = yield* second.settlements().pipe(
+        Stream.runDrain,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Effect.forEach(reads.values(), Deferred.await, { discard: true })
+
+      assert.isTrue(Option.isNone(yield* third.get(Domain.Todo, "free")))
+      assert.strictEqual(yield* third.activation, "Active")
+      assert.isUndefined(firstStream.pollUnsafe())
+      assert.isUndefined(secondStream.pollUnsafe())
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "delivers settlements to one live stream across background, foreground, and re-activated runtimes",
+    Effect.fnUntraced(function*() {
+      const spaceC = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
+      const reads = new Map([[spaceA, yield* Deferred.make<void>()]])
+      const services = yield* probedServices(settlementReadProbe(reads))
+      const viewId = Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000004")
+      const replicaLayer = (remote: SyncEngine.SyncEngine["Service"]) =>
+        SqlReplica.layer({
+          ...clientHistory,
+          definition: Domain.definition,
+          clientId,
+          initialSpaces: [spaceA, spaceB, spaceC],
+          retryDelay: "1 hour",
+          maximumRetryDelay: "1 hour"
+        }).pipe(
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+          Layer.provide(services.layer)
+        )
+
+      const seedScope = yield* Scope.make()
+      const seedContext = yield* Layer.buildWithScope(replicaLayer(remoteService), seedScope)
+      const seedSpace = yield* Context.get(seedContext, Replica.Replica).space(spaceA)
+      const background = yield* seedSpace.mutate(Domain.PutTodo, Domain.todo("background"))
+      yield* seedSpace.deactivate
+      yield* Scope.close(seedScope, Exit.void)
+      yield* services.sql`UPDATE effect_local_client_spaces
+        SET replication_view_id = ${viewId}, replication_view_revision = 0`
+
+      const backgroundSubmitted = yield* Deferred.make<void>()
+      const releaseBackground = yield* Deferred.make<void>()
+      let serverSequence = 0
+      let submissions = 0
+      const remote = SyncEngine.SyncEngine.of({
+        ...remoteService,
+        submitBatch: (request) => {
+          submissions += 1
+          const accept = Effect.sync(() =>
+            Protocol.SubmitBatchResult.make({
+              receipts: request.envelopes.map((envelope) => {
+                serverSequence += 1
+                return Protocol.AcceptedReceipt.make({
+                  ...envelope,
+                  serverSequence: Identity.ServerSequence.make(serverSequence),
+                  result: Domain.todo(envelope.mutationId, "accepted")
+                })
+              })
+            })
+          )
+          if (submissions > 1) return accept
+          return Deferred.succeed(backgroundSubmitted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseBackground)),
+            Effect.andThen(accept)
+          )
+        },
+        pull: (request) => viewPage(services.crypto, viewId, request, [], false, serverSequence)
+      })
+      const replica = Context.get(yield* Layer.build(replicaLayer(remote)), Replica.Replica)
+      yield* Deferred.await(backgroundSubmitted)
+      const first = yield* replica.space(spaceA)
+      const second = yield* replica.space(spaceB)
+      const third = yield* replica.space(spaceC)
+      const received = yield* Queue.unbounded<Replica.SettledMutation>()
+      yield* first.settlements().pipe(
+        Stream.runForEach((settled) => Queue.offer(received, settled)),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Effect.forEach(reads.values(), Deferred.await, { discard: true })
+
+      yield* Deferred.succeed(releaseBackground, undefined)
+      const fromBackground = yield* Queue.take(received)
+      assert.strictEqual(fromBackground.settlement.pending.envelope.mutationId, background.envelope.mutationId)
+
+      const foreground = yield* first.mutate(Domain.PutTodo, Domain.todo("foreground"))
+      const fromForeground = yield* Queue.take(received)
+      assert.strictEqual(fromForeground.settlement.pending.envelope.mutationId, foreground.envelope.mutationId)
+
+      yield* second.get(Domain.Todo, "evict")
+      yield* third.get(Domain.Todo, "evict")
+      assert.strictEqual(yield* first.activation, "Inactive")
+
+      const reactivated = yield* first.mutate(Domain.PutTodo, Domain.todo("reactivated"))
+      const fromReactivated = yield* Queue.take(received)
+      assert.strictEqual(fromReactivated.settlement.pending.envelope.mutationId, reactivated.envelope.mutationId)
+      assert.deepStrictEqual(
+        [fromBackground.sequence, fromForeground.sequence, fromReactivated.sequence],
+        [fromBackground.sequence, fromBackground.sequence + 1, fromBackground.sequence + 2]
+      )
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "fails a live settlement stream with SpaceUnavailable when its space is left",
+    Effect.fnUntraced(function*() {
+      const reads = new Map([[spaceA, yield* Deferred.make<void>()]])
+      const { layer: layerServices } = yield* probedServices(settlementReadProbe(reads))
+      const layerReplica = SqlReplica.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        clientId,
+        initialSpaces: [spaceA]
+      }).pipe(
+        Layer.provide(Domain.layerHandlers),
+        Layer.provide(layerRemote),
+        Layer.provide(layerServices)
+      )
+      const replica = Context.get(yield* Layer.build(layerReplica), Replica.Replica)
+      const space = yield* replica.space(spaceA)
+      const stream = yield* space.settlements().pipe(Stream.runDrain, Effect.forkChild({ startImmediately: true }))
+      yield* Effect.forEach(reads.values(), Deferred.await, { discard: true })
+
+      yield* replica.leave(spaceA)
+      const outcome = yield* Fiber.join(stream).pipe(Effect.result)
+      assert.strictEqual(outcome._tag, "Failure")
+      if (outcome._tag === "Failure") assert.strictEqual(outcome.failure._tag, "SpaceUnavailable")
     }, Effect.scoped)
   )
 })

@@ -28,11 +28,14 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as ConnectionLane from "./ConnectionLane.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
+import { isTransportFailure } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
@@ -45,30 +48,66 @@ import * as SyncEngine from "./SyncEngine.js"
 export interface Options<D extends Definition.Any,> {
   readonly definition: D
   readonly clientId: Identity.ClientId
-  readonly defaultScope: Protocol.ReplicationScope
-  readonly maximumActiveSpaces: number
-  readonly foregroundActiveSpaces: number
+  readonly defaultScope?: Protocol.ReplicationScope
+  readonly maximumActiveSpaces?: number
+  readonly foregroundActiveSpaces?: number
   readonly initialSpaces?: Iterable<Identity.SpaceId>
   readonly spaceId?: Identity.SpaceId
   readonly maximumPendingMutations?: number
   readonly evolution?: Evolution.Evolution
   readonly schemaEvolutionBatchSize?: number
   readonly schemaEvolutionBatchBytes?: number
-  readonly retainedReceipts: number
-  readonly maximumReceipts: number
-  readonly retainedHistoryEntries: number
-  readonly maximumBootstrapEntities: number
-  readonly maximumBootstrapBytes: number
-  readonly maximumBootstrapPageBytes: number
+  readonly retainedReceipts?: number
+  readonly maximumReceipts?: number
+  readonly retainedHistoryEntries?: number
+  readonly maximumBootstrapEntities?: number
+  readonly maximumBootstrapBytes?: number
+  readonly maximumBootstrapPageBytes?: number
   readonly maximumSettlementSnapshotBytes?: number
-  readonly migration: Migrations.Options
+  readonly retainedMutationIds?: number
+  readonly migration?: Migrations.Options
   readonly pageSize?: number
+  readonly receiptPersistBatchSize?: number
+  readonly maximumBackgroundWait?: Duration.Input
   readonly reconciliationConcurrency?: number
   readonly foregroundReconciliationConcurrency?: number
   readonly retryDelay?: Duration.Input
   readonly maximumRetryDelay?: Duration.Input
   readonly maximumAttempts?: number
 }
+
+type ResolvedOptions<D extends Definition.Any,> =
+  & Options<D>
+  & {
+    readonly defaultScope: Protocol.ReplicationScope
+    readonly maximumActiveSpaces: number
+    readonly foregroundActiveSpaces: number
+    readonly retainedReceipts: number
+    readonly maximumReceipts: number
+    readonly retainedHistoryEntries: number
+    readonly maximumBootstrapEntities: number
+    readonly maximumBootstrapBytes: number
+    readonly maximumBootstrapPageBytes: number
+    readonly migration: Migrations.Options
+  }
+
+export const defaults = {
+  maximumActiveSpaces: 16,
+  foregroundActiveSpaces: 4,
+  retainedReceipts: 256,
+  maximumReceipts: 10_000,
+  retainedHistoryEntries: 256,
+  maximumBootstrapEntities: 100_000,
+  maximumBootstrapBytes: 64 * 1024 * 1024,
+  maximumBootstrapPageBytes: Protocol.maximumBatchBytes,
+  migration: { retryDelay: "100 millis", maximumAttempts: 8 }
+} as const satisfies Partial<Options<Definition.Any>>
+
+const resolveOptions = <D extends Definition.Any,>(input: Options<D>): ResolvedOptions<D> => ({
+  ...defaults,
+  defaultScope: Protocol.ReplicationScope.make({ models: input.definition.models.map((model) => model.name) }),
+  ...input
+})
 
 type BaseRequirements<D extends Definition.Any,> =
   | SqlClient.SqlClient
@@ -78,10 +117,14 @@ type BaseRequirements<D extends Definition.Any,> =
   | MutationRuntime.Handlers<D>
   | QueryExecutor.Handlers<D>
 
+const operationPermits = Number.MAX_SAFE_INTEGER
+
 interface ActiveRuntime {
   readonly foreground: boolean
   readonly scope: Scope.Closeable
   readonly operationGate: Semaphore.Semaphore
+  readonly quarantineGate: Semaphore.Semaphore
+  readonly preemption: Deferred.Deferred<void>
   readonly local: LocalStore.Service
   readonly queries: QueryExecutor.Service
   readonly reconciler: Reconciler.Service
@@ -97,11 +140,14 @@ interface RememberedEntry {
   runtime: ActiveRuntime | undefined
   transition: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
   foreground: boolean
+  foregroundDemand: number
+  settlementsRecorded: Deferred.Deferred<void>
   leases: number
   leaving: boolean
   leaveCompletion: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
   workflowRegistration: ReconciliationWorkflow.RegistrationService | undefined
   summaryStatus: ReplicaStatus.ReplicaStatus
+  synced: boolean
   retryAttempt: number
   retryVersion: number
 }
@@ -114,19 +160,22 @@ interface RetryWork {
   readonly entry: RememberedEntry
   readonly version: number
   readonly readyAt: number
+  readonly transportGeneration: Option.Option<number>
 }
 
 const RememberedRow = Schema.Struct({
   space_id: Identity.SpaceId,
   membership_incarnation: Identity.MembershipIncarnation,
   desired_scope_json: Schema.String,
+  replication_view_id: Schema.NullOr(Identity.ReplicationViewId),
   count: Schema.Int
 })
 
 const addressedStatus = (
   spaceId: Identity.SpaceId,
+  synced: boolean,
   status: ReplicaStatus.ReplicaStatus
-): ReplicaStatus.SpaceStatus => ({ spaceId, ...status })
+): ReplicaStatus.SpaceStatus => ({ spaceId, synced, ...status })
 
 type AggregateCounts = ReplicaStatus.Aggregate["counts"]
 type AggregateCategory = keyof AggregateCounts
@@ -134,6 +183,7 @@ type AggregateCategory = keyof AggregateCounts
 const statusCategories: {
   readonly [Tag in ReplicaStatus.ReplicaStatus["_tag"]]: AggregateCategory
 } = {
+  Idle: "idle",
   Offline: "offline",
   Connecting: "connecting",
   Online: "online",
@@ -149,12 +199,13 @@ const aggregateStatus = (
   totalPending: number,
   counts: AggregateCounts
 ): ReplicaStatus.Aggregate => {
+  const synchronizing = spaces - counts.idle
   let state: ReplicaStatus.AggregateState = "Degraded"
-  if (spaces === 0) state = "Idle"
+  if (synchronizing === 0) state = "Idle"
   else if (counts.failed > 0) state = "Failed"
   else if (counts.needsAuthentication > 0) state = "NeedsAuthentication"
-  else if (counts.online === spaces) state = "Online"
-  else if (counts.offline === spaces) state = "Offline"
+  else if (counts.online === synchronizing) state = "Online"
+  else if (counts.offline === synchronizing) state = "Offline"
   else if (counts.connecting > 0) state = "Connecting"
   return { state, spaces, totalPending, counts }
 }
@@ -164,26 +215,39 @@ const settledFor =
     settled.settlement.pending.envelope.name === mutation.name
 
 const makeLayer = <D extends Definition.Any, R,>(
-  options: Options<D>,
+  input: Options<D>,
   workflowEngine: Effect.Effect<WorkflowEngine.WorkflowEngine["Service"] | undefined, never, R>
 ): Layer.Layer<
   Replica.Replica | QueryReactivity.QueryReactivity,
   ReplicaError.ReplicaError,
   BaseRequirements<D> | R
 > => {
+  const options = resolveOptions(input)
   const layerQueryReactivity = QueryReactivity.makeLayer()
   return Layer.effect(
     Replica.Replica,
     Effect.gen(function*() {
       const sql = yield* SqlClient.SqlClient
+      const lane = yield* ConnectionLane.make({ maximumBackgroundWait: options.maximumBackgroundWait })
       const reactivity = yield* Reactivity.Reactivity
       const remote = yield* SyncEngine.SyncEngine
       const parentScope = yield* Effect.scope
-      const rootContext = yield* Effect.context<BaseRequirements<D> | QueryReactivity.QueryReactivity | R>()
+      const rootContext = Context.add(
+        yield* Effect.context<BaseRequirements<D> | QueryReactivity.QueryReactivity | R>(),
+        ConnectionLane.ConnectionLane,
+        lane
+      )
       const entries = new Map<Identity.SpaceId, RememberedEntry>()
       const joining = new Map<Identity.SpaceId, Deferred.Deferred<void>>()
       const foregroundResidents = new Map<Identity.SpaceId, RememberedEntry>()
+      const foregroundAdmitted = new Set<Identity.SpaceId>()
+      const dropForegroundReservation = (entry: RememberedEntry) => {
+        entry.foreground = false
+        foregroundResidents.delete(entry.spaceId)
+        foregroundAdmitted.delete(entry.spaceId)
+      }
       const aggregate = yield* Ref.make(aggregateStatus(0, 0, {
+        idle: 0,
         offline: 0,
         connecting: 0,
         online: 0,
@@ -261,7 +325,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         definition: options.definition,
         clientId: options.clientId,
         migration: options.migration
-      })
+      }).pipe(Effect.provideService(ConnectionLane.ConnectionLane, lane))
 
       const normalizedDefaultScope = yield* Protocol.validateReplicationScope(
         options.definition,
@@ -344,23 +408,25 @@ const makeLayer = <D extends Definition.Any, R,>(
         Request: Schema.Void,
         Result: RememberedRow,
         execute: () =>
-          sql`SELECT s.space_id, s.membership_incarnation, s.desired_scope_json, COUNT(p.mutation_id) AS count
+          sql`SELECT s.space_id, s.membership_incarnation, s.desired_scope_json, s.replication_view_id,
+            COUNT(p.mutation_id) AS count
           FROM effect_local_client_spaces AS s
           LEFT JOIN effect_local_client_pending_data AS p
             ON p.space_id = s.space_id AND p.schema_generation = s.active_schema_generation
-          GROUP BY s.space_id, s.membership_incarnation, s.desired_scope_json
+          GROUP BY s.space_id, s.membership_incarnation, s.desired_scope_json, s.replication_view_id
           ORDER BY s.space_id`
       })
       const readMembership = SqlSchema.findOneOption({
         Request: Identity.SpaceId,
         Result: RememberedRow,
         execute: (spaceId) =>
-          sql`SELECT s.space_id, s.membership_incarnation, s.desired_scope_json, COUNT(p.mutation_id) AS count
+          sql`SELECT s.space_id, s.membership_incarnation, s.desired_scope_json, s.replication_view_id,
+            COUNT(p.mutation_id) AS count
           FROM effect_local_client_spaces AS s
           LEFT JOIN effect_local_client_pending_data AS p
             ON p.space_id = s.space_id AND p.schema_generation = s.active_schema_generation
           WHERE s.space_id = ${spaceId}
-          GROUP BY s.space_id, s.membership_incarnation, s.desired_scope_json`
+          GROUP BY s.space_id, s.membership_incarnation, s.desired_scope_json, s.replication_view_id`
       })
       const pendingCount = SqlSchema.findOne({
         Request: Identity.SpaceId,
@@ -378,11 +444,25 @@ const makeLayer = <D extends Definition.Any, R,>(
           Effect.flatMap((value) => Protocol.validateReplicationScope(options.definition, value))
         )
 
-      const signalCapacity = Effect.gen(function*() {
+      const signalCapacity = Effect.sync(() => {
         const previous = capacityChanged
-        capacityChanged = yield* Deferred.make<void>()
-        yield* Deferred.succeed(previous, undefined)
+        capacityChanged = Deferred.makeUnsafe<void>()
+        Deferred.doneUnsafe(previous, Exit.void)
       })
+
+      const recordReplicationView = (entry: RememberedEntry, installed: boolean) =>
+        Effect.suspend(() => {
+          if (entry.synced === installed) return Effect.void
+          entry.synced = installed
+          return reactivity.invalidate([ReactivityKey.status(entry.spaceId)])
+        })
+
+      const publishSettlements = (entry: RememberedEntry) =>
+        Effect.suspend(() => {
+          const recorded = entry.settlementsRecorded
+          entry.settlementsRecorded = Deferred.makeUnsafe<void>()
+          return Deferred.succeed(recorded, undefined)
+        }).pipe(Effect.asVoid)
 
       const invalidateActivation = (spaceId: Identity.SpaceId) =>
         reactivity.invalidate([
@@ -397,146 +477,174 @@ const makeLayer = <D extends Definition.Any, R,>(
           return Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId }))
         })
 
-      const initialize = Effect.fnUntraced(function*(
+      const buildRuntime = Effect.fnUntraced(function*(
         entry: RememberedEntry,
         generation: number,
-        foreground: boolean
+        foreground: boolean,
+        childScope: Scope.Closeable
       ) {
         const spaceId = entry.spaceId
-        const childScope = yield* Scope.fork(parentScope)
-        return yield* Effect.gen(function*() {
-          if (!foreground) {
-            yield* Effect.acquireRelease(
-              backgroundActiveSpaces.take(1),
-              () => backgroundActiveSpaces.release(1)
-            ).pipe(Scope.provide(childScope))
-          }
-          const layerMutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
-          const layerLocalStore = LocalStore.layer({
-            ...options,
-            scope: entry.replicationScope,
-            spaceId
-          }).pipe(Layer.provide(layerMutationRuntime))
-          const layerQueryExecutor = QueryExecutor.layer(options.definition, spaceId)
-          let local: LocalStore.Service
-          let queries: QueryExecutor.Service
-          let reconciler: Reconciler.Service
-          let reconciliation: Reconciler.ReconciliationService
-          let cancelReconciliation = Effect.void
-          if (workflow !== undefined) {
-            const workflowContext = Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow)
-            const layerReconciliation = Reconciler.layerOnePass({
-              ...options,
-              spaceId,
-              onStatusChange: (status) => updateContribution(entry, status)
-            }).pipe(
-              Layer.provide(layerLocalStore)
+        if (!foreground) {
+          yield* Effect.acquireRelease(
+            backgroundActiveSpaces.take(1),
+            () => backgroundActiveSpaces.release(1),
+            { interruptible: true }
+          ).pipe(Scope.provide(childScope))
+        }
+        const layerMutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
+        const reconcilerReady = yield* Deferred.make<Reconciler.Service>()
+        const layerLocalStore = LocalStore.layer({
+          ...options,
+          scope: entry.replicationScope,
+          spaceId,
+          onSettlementsRecorded: publishSettlements(entry),
+          onReplicationView: (installed) => recordReplicationView(entry, installed),
+          onMutationsCommitted: (pending) =>
+            updatePendingContribution(entry, pending).pipe(
+              Effect.andThen(Deferred.await(reconcilerReady)),
+              Effect.flatMap((ready) => ready.schedule)
             )
-            const runtime = yield* Layer.mergeAll(
-              layerLocalStore,
-              layerQueryExecutor,
-              layerReconciliation
-            ).pipe(
+        }).pipe(Layer.provide(layerMutationRuntime))
+        const layerQueryExecutor = QueryExecutor.layer(options.definition, spaceId)
+        let local: LocalStore.Service
+        let queries: QueryExecutor.Service
+        let reconciler: Reconciler.Service
+        let reconciliation: Reconciler.ReconciliationService
+        let cancelReconciliation = Effect.void
+        if (workflow !== undefined) {
+          const workflowContext = Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow)
+          const layerReconciliation = Reconciler.layerOnePass({
+            ...options,
+            spaceId,
+            onStatusChange: (status) => updateContribution(entry, status)
+          }).pipe(
+            Layer.provide(layerLocalStore)
+          )
+          const runtime = yield* Layer.mergeAll(
+            layerLocalStore,
+            layerQueryExecutor,
+            layerReconciliation
+          ).pipe(
+            Layer.buildWithScope(childScope),
+            Effect.provide(workflowContext),
+            Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
+          )
+          local = Context.get(runtime, LocalStore.Store)
+          queries = Context.get(runtime, QueryExecutor.QueryExecutor)
+          reconciliation = Context.get(runtime, Reconciler.Reconciliation)
+          if (foreground) {
+            if (entry.workflowRegistration === undefined) {
+              return yield* Effect.die("Workflow registration was not initialized")
+            }
+            const scheduler = yield* ReconciliationWorkflow.layerScheduler({ ...options, spaceId }).pipe(
+              Layer.provide(Layer.succeed(LocalStore.Store, local)),
+              Layer.provide(Layer.succeed(Reconciler.Reconciliation, reconciliation)),
+              Layer.provide(
+                Layer.succeed(ReconciliationWorkflow.Registration, entry.workflowRegistration)
+              ),
               Layer.buildWithScope(childScope),
               Effect.provide(workflowContext),
               Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
             )
-            local = Context.get(runtime, LocalStore.Store)
-            queries = Context.get(runtime, QueryExecutor.QueryExecutor)
-            reconciliation = Context.get(runtime, Reconciler.Reconciliation)
-            if (foreground) {
-              if (entry.workflowRegistration === undefined) {
-                return yield* Effect.die("Workflow registration was not initialized")
-              }
-              const scheduler = yield* ReconciliationWorkflow.layerScheduler({ ...options, spaceId }).pipe(
-                Layer.provide(Layer.succeed(LocalStore.Store, local)),
-                Layer.provide(Layer.succeed(Reconciler.Reconciliation, reconciliation)),
-                Layer.provide(
-                  Layer.succeed(ReconciliationWorkflow.Registration, entry.workflowRegistration)
-                ),
-                Layer.buildWithScope(childScope),
-                Effect.provide(workflowContext),
-                Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
-              )
-              reconciler = Context.get(scheduler, Reconciler.Reconciler)
-            } else {
-              reconciler = Reconciler.Reconciler.of({
-                sync: reconciliation.sync,
-                notify: local.requestReconciliation.pipe(Effect.asVoid),
-                status: reconciliation.status,
-                shutdown: Effect.void
-              })
-            }
-            cancelReconciliation = reconciler.shutdown
+            reconciler = Context.get(scheduler, Reconciler.Reconciler)
           } else {
-            if (manager === undefined) return yield* Effect.die("Reconciler manager was not initialized")
-            const runtime = yield* Layer.mergeAll(
-              layerLocalStore,
-              layerQueryExecutor,
-              Reconciler.layerOnePass({
-                ...options,
-                spaceId,
-                onStatusChange: (status) => updateContribution(entry, status)
-              }).pipe(Layer.provide(layerLocalStore))
-            ).pipe(
-              Layer.buildWithScope(childScope),
-              Effect.provide(rootContext),
-              Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
-            )
-            local = Context.get(runtime, LocalStore.Store)
-            queries = Context.get(runtime, QueryExecutor.QueryExecutor)
-            reconciliation = Context.get(runtime, Reconciler.Reconciliation)
-            if (foreground) {
-              let managedSpace: Reconciler.ManagedSpace = {
-                spaceId,
-                generation,
-                definition: options.definition,
-                local,
-                reconciliation
-              }
-              if (options.retryDelay !== undefined) {
-                managedSpace = { ...managedSpace, retryDelay: options.retryDelay }
-              }
-              if (options.maximumRetryDelay !== undefined) {
-                managedSpace = { ...managedSpace, maximumRetryDelay: options.maximumRetryDelay }
-              }
-              yield* Effect.acquireRelease(
-                manager.register(managedSpace),
-                () => manager.unregister(spaceId, generation)
-              ).pipe(Scope.provide(childScope))
-              reconciler = Reconciler.Reconciler.of({
-                sync: manager.sync(spaceId),
-                notify: manager.notify(spaceId),
-                status: manager.status(spaceId),
-                shutdown: Effect.void
-              })
-            } else {
-              reconciler = Reconciler.Reconciler.of({
-                sync: reconciliation.sync,
-                notify: local.requestReconciliation.pipe(Effect.asVoid),
-                status: reconciliation.status,
-                shutdown: Effect.void
-              })
-            }
+            reconciler = Reconciler.Reconciler.of({
+              sync: reconciliation.sync,
+              notify: local.requestReconciliation.pipe(Effect.asVoid),
+              schedule: Effect.void,
+              status: reconciliation.status,
+              shutdown: Effect.void
+            })
           }
-          const operationGate = yield* Semaphore.make(1)
-          return {
-            foreground,
-            scope: childScope,
-            operationGate,
-            local,
-            queries,
-            reconciler,
-            reconciliation,
-            cancelReconciliation
-          } satisfies ActiveRuntime
-        }).pipe(
-          Effect.onExit((exit) => {
-            if (Exit.isFailure(exit)) return Scope.close(childScope, exit)
-            return Effect.void
-          })
-        )
+          cancelReconciliation = reconciler.shutdown
+        } else {
+          if (manager === undefined) return yield* Effect.die("Reconciler manager was not initialized")
+          const runtime = yield* Layer.mergeAll(
+            layerLocalStore,
+            layerQueryExecutor,
+            Reconciler.layerOnePass({
+              ...options,
+              spaceId,
+              onStatusChange: (status) => updateContribution(entry, status)
+            }).pipe(Layer.provide(layerLocalStore))
+          ).pipe(
+            Layer.buildWithScope(childScope),
+            Effect.provide(rootContext),
+            Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
+          )
+          local = Context.get(runtime, LocalStore.Store)
+          queries = Context.get(runtime, QueryExecutor.QueryExecutor)
+          reconciliation = Context.get(runtime, Reconciler.Reconciliation)
+          if (foreground) {
+            let managedSpace: Reconciler.ManagedSpace = {
+              spaceId,
+              generation,
+              definition: options.definition,
+              local,
+              reconciliation
+            }
+            if (options.retryDelay !== undefined) {
+              managedSpace = { ...managedSpace, retryDelay: options.retryDelay }
+            }
+            if (options.maximumRetryDelay !== undefined) {
+              managedSpace = { ...managedSpace, maximumRetryDelay: options.maximumRetryDelay }
+            }
+            yield* Effect.acquireRelease(
+              manager.register(managedSpace),
+              () => manager.unregister(spaceId, generation)
+            ).pipe(Scope.provide(childScope))
+            reconciler = Reconciler.Reconciler.of({
+              sync: manager.sync(spaceId),
+              notify: manager.notify(spaceId),
+              schedule: manager.schedule(spaceId),
+              status: manager.status(spaceId),
+              shutdown: Effect.void
+            })
+          } else {
+            reconciler = Reconciler.Reconciler.of({
+              sync: reconciliation.sync,
+              notify: local.requestReconciliation.pipe(Effect.asVoid),
+              schedule: Effect.void,
+              status: reconciliation.status,
+              shutdown: Effect.void
+            })
+          }
+        }
+        yield* Deferred.succeed(reconcilerReady, reconciler)
+        const operationGate = yield* Semaphore.make(operationPermits)
+        const quarantineGate = yield* Semaphore.make(1)
+        const preemption = yield* Deferred.make<void>()
+        return {
+          foreground,
+          scope: childScope,
+          operationGate,
+          quarantineGate,
+          preemption,
+          local,
+          queries,
+          reconciler,
+          reconciliation,
+          cancelReconciliation
+        } satisfies ActiveRuntime
       })
+
+      const initialize = (
+        entry: RememberedEntry,
+        generation: number,
+        foreground: boolean
+      ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
+        Effect.uninterruptibleMask((restore) =>
+          Scope.fork(parentScope).pipe(
+            Effect.flatMap((childScope) =>
+              restore(buildRuntime(entry, generation, foreground, childScope)).pipe(
+                Effect.onExit((exit) => {
+                  if (Exit.isFailure(exit)) return Scope.close(childScope, exit)
+                  return Effect.void
+                })
+              )
+            )
+          )
+        )
 
       const enqueueBackground = (entry: RememberedEntry, resetRetry = true) =>
         Effect.suspend(() => {
@@ -549,12 +657,38 @@ const makeLayer = <D extends Definition.Any, R,>(
           return Queue.offer(backgroundQueue, { _tag: "Sync", spaceId: entry.spaceId }).pipe(Effect.asVoid)
         })
 
-      const scheduleBackgroundRetry = Effect.fnUntraced(function*(entry: RememberedEntry) {
+      const scheduleBackgroundRetry = Effect.fnUntraced(function*(
+        entry: RememberedEntry,
+        transportGeneration: Option.Option<number>
+      ) {
         if (entries.get(entry.spaceId) !== entry || entry.leaving || entry.foreground) return
         entry.retryAttempt += 1
         entry.retryVersion += 1
         const readyAt = (yield* Clock.currentTimeMillis) + Configuration.retryMillis(retryTiming, entry.retryAttempt)
-        yield* Queue.offer(retryQueue, { entry, version: entry.retryVersion, readyAt })
+        yield* Queue.offer(retryQueue, { entry, version: entry.retryVersion, readyAt, transportGeneration })
+      })
+
+      const releaseTransportRetries = Effect.gen(function*() {
+        const current = yield* remote.transportGeneration
+        const now = yield* Clock.currentTimeMillis
+        for (let index = 0; index < retrySchedule.length; index++) {
+          const work = retrySchedule[index]
+          if (Option.isSome(work.transportGeneration) && work.transportGeneration.value < current) {
+            retrySchedule[index] = { ...work, readyAt: now, transportGeneration: Option.none() }
+          }
+        }
+        retrySchedule.sort((left, right) => left.readyAt - right.readyAt)
+      })
+
+      const awaitTransportRetry = Effect.suspend(() => {
+        let oldest: number | undefined
+        for (const work of retrySchedule) {
+          if (Option.isSome(work.transportGeneration)) {
+            oldest = Math.min(oldest ?? work.transportGeneration.value, work.transportGeneration.value)
+          }
+        }
+        if (oldest === undefined) return Effect.never
+        return remote.waitForTransportChange(oldest)
       })
 
       const retrySchedulerTurn = Effect.suspend(() => {
@@ -563,7 +697,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           retrySchedule.sort((left, right) => left.readyAt - right.readyAt)
         }
         if (retrySchedule.length === 0) {
-          return Queue.take(retryQueue).pipe(
+          return LosslessQueue.take(retryQueue).pipe(
             Effect.tap((work) => {
               insert(work)
               return Effect.void
@@ -584,10 +718,11 @@ const makeLayer = <D extends Definition.Any, R,>(
               ) return Effect.void
               return enqueueBackground(next.entry, false)
             }
-            return Effect.raceFirst(
-              Queue.take(retryQueue).pipe(Effect.map((work) => Option.some(work))),
-              Effect.sleep(Duration.millis(next.readyAt - now)).pipe(Effect.as(Option.none<RetryWork>()))
-            ).pipe(
+            return Effect.raceAllFirst([
+              LosslessQueue.take(retryQueue).pipe(Effect.map((work) => Option.some(work))),
+              Effect.sleep(Duration.millis(next.readyAt - now)).pipe(Effect.as(Option.none<RetryWork>())),
+              awaitTransportRetry.pipe(Effect.andThen(releaseTransportRetries), Effect.as(Option.none<RetryWork>()))
+            ]).pipe(
               Effect.tap(Option.match({
                 onNone: () => Effect.void,
                 onSome: (work) => {
@@ -613,8 +748,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           }
           if (entry.activation === "Inactive") return false
           if (entry.activation === "Activating" || entry.activation === "Deactivating") {
-            const transition = entry.transition
-            if (transition !== undefined) yield* restore(Deferred.await(transition))
+            const pending = entry.transition
+            if (pending !== undefined) yield* restore(Deferred.await(pending))
             return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
           }
           const runtime = entry.runtime
@@ -629,19 +764,17 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (entry.leases > 0) {
             if (!explicit) return false
             const changed = capacityChanged
+            yield* Deferred.succeed(runtime.preemption, undefined)
             yield* restore(Deferred.await(changed))
             return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
           }
-          const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
+          const completion = Deferred.makeUnsafe<void, ReplicaError.ReplicaError>()
           entry.activation = "Deactivating"
           entry.transition = completion
-          entry.foreground = false
-          foregroundResidents.delete(entry.spaceId)
+          dropForegroundReservation(entry)
           yield* invalidateActivation(entry.spaceId)
           const shutdown = Scope.close(runtime.scope, Exit.void)
-          const result = yield* restore(
-            runtime.operationGate.withPermit(shutdown)
-          ).pipe(Effect.exit)
+          const result = yield* runtime.operationGate.withPermits(operationPermits)(shutdown).pipe(Effect.exit)
           entry.runtime = undefined
           entry.activation = "Inactive"
           entry.transition = undefined
@@ -652,7 +785,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             yield* result
             return false
           }
-          const count = yield* pendingCount(entry.spaceId).pipe(
+          const count = yield* lane.withStatement(pendingCount(entry.spaceId)).pipe(
             Effect.catchTags({
               SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
               SchemaError: (cause) =>
@@ -675,27 +808,48 @@ const makeLayer = <D extends Definition.Any, R,>(
               return Effect.void
             })
           )
-          yield* updateContribution(entry, { _tag: "Offline", pending: count.count })
+          yield* updateContribution(entry, { _tag: "Idle", pending: count.count })
           if (enqueuePending && count.count > 0 && !entry.leaving) yield* enqueueBackground(entry)
           return true
         }))
 
+      const hasForegroundRuntime = (entry: RememberedEntry) =>
+        entry.activation === "Active" && entry.runtime !== undefined && entry.runtime.foreground
+
       const ensureForegroundCapacity = (entry: RememberedEntry): Effect.Effect<void, ReplicaError.ReplicaError> =>
         Effect.suspend(() => {
-          if (foregroundResidents.size <= options.foregroundActiveSpaces) return Effect.void
+          if (hasForegroundRuntime(entry)) return Effect.void
+          let admitted = 0
           let victim: RememberedEntry | undefined
           for (const candidate of foregroundResidents.values()) {
-            if (candidate !== entry && candidate.activation === "Active" && candidate.leases === 0) {
+            if (candidate === entry || !foregroundAdmitted.has(candidate.spaceId)) continue
+            admitted += 1
+            if (victim === undefined && candidate.activation === "Active" && candidate.leases === 0) {
               victim = candidate
-              break
             }
           }
-          if (victim !== undefined) return deactivate(victim, false).pipe(Effect.asVoid)
+          if (admitted < options.foregroundActiveSpaces) {
+            foregroundAdmitted.add(entry.spaceId)
+            return Effect.void
+          }
+          if (victim !== undefined) {
+            return deactivate(victim, false).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
+          }
           const changed = capacityChanged
           return Deferred.await(changed).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
         })
 
-      const activate = (
+      const releaseForegroundReservation = (entry: RememberedEntry) =>
+        Effect.suspend(() => {
+          dropForegroundReservation(entry)
+          const runtime = entry.runtime
+          if (entry.activation !== "Active" || runtime === undefined || runtime.foreground || entry.leases > 0) {
+            return signalCapacity
+          }
+          return signalCapacity.pipe(Effect.andThen(enqueueBackground(entry)))
+        })
+
+      const transition = (
         entry: RememberedEntry,
         foreground: boolean
       ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
@@ -703,45 +857,69 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (entries.get(entry.spaceId) !== entry || entry.leaving) {
             return yield* new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId })
           }
-          if (foreground && !entry.foreground) {
+          if (foreground && !hasForegroundRuntime(entry)) {
             entry.foreground = true
             foregroundResidents.delete(entry.spaceId)
             foregroundResidents.set(entry.spaceId, entry)
-            yield* restore(ensureForegroundCapacity(entry)).pipe(
-              Effect.onExit((exit) => {
-                if (Exit.isSuccess(exit) || entry.activation === "Active") return Effect.void
-                entry.foreground = false
-                foregroundResidents.delete(entry.spaceId)
-                return signalCapacity
-              })
-            )
+            yield* restore(ensureForegroundCapacity(entry))
           }
           if (foreground) {
             foregroundResidents.delete(entry.spaceId)
             foregroundResidents.set(entry.spaceId, entry)
           }
+          let retiring: ActiveRuntime | undefined
           if (entry.activation === "Active" && entry.runtime !== undefined) {
             if (!foreground || entry.runtime.foreground) return entry.runtime
             if (entry.leases > 0) {
               const changed = capacityChanged
+              yield* Deferred.succeed(entry.runtime.preemption, undefined)
               yield* restore(Deferred.await(changed))
-              return yield* activate(entry, foreground)
+              return yield* transition(entry, foreground)
             }
-            yield* restore(deactivate(entry, false))
-            entry.foreground = true
-            return yield* activate(entry, foreground)
+            retiring = entry.runtime
+          } else if (entry.activation === "Activating" || entry.activation === "Deactivating") {
+            const pending = entry.transition
+            if (pending !== undefined) yield* restore(Deferred.await(pending))
+            return yield* transition(entry, foreground)
           }
-          if (entry.activation === "Activating" || entry.activation === "Deactivating") {
-            const transition = entry.transition
-            if (transition !== undefined) yield* restore(Deferred.await(transition))
-            return yield* activate(entry, foreground)
-          }
-          const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
+          if (foreground && !entry.foreground) return yield* transition(entry, foreground)
+          const completion = Deferred.makeUnsafe<void, ReplicaError.ReplicaError>()
           const generation = ++nextGeneration
           entry.activation = "Activating"
           entry.transition = completion
+          entry.runtime = undefined
+          yield* modifyContribution(entry, (current) => ({ _tag: "Connecting", pending: current.pending }))
           yield* invalidateActivation(entry.spaceId)
-          const result = yield* restore(initialize(entry, generation, foreground)).pipe(Effect.exit)
+          const startRuntime = restore(initialize(entry, generation, foreground))
+          let start = startRuntime
+          if (retiring !== undefined) {
+            start = retiring.operationGate.withPermits(operationPermits)(Scope.close(retiring.scope, Exit.void)).pipe(
+              Effect.andThen(restore(
+                lane.withStatement(pendingCount(entry.spaceId)).pipe(
+                  Effect.catchTags({
+                    SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                    SchemaError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.StorageCorrupt({
+                          message: "Client membership row is corrupt",
+                          cause
+                        })
+                      ),
+                    NoSuchElementError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.StorageCorrupt({
+                          message: "Client membership row is missing",
+                          cause
+                        })
+                      )
+                  }),
+                  Effect.flatMap((count) => updateContribution(entry, { _tag: "Connecting", pending: count.count }))
+                )
+              )),
+              Effect.andThen(startRuntime)
+            )
+          }
+          const result = yield* start.pipe(Effect.exit)
           if (Exit.isSuccess(result)) {
             entry.runtime = result.value
             entry.activation = "Active"
@@ -751,28 +929,57 @@ const makeLayer = <D extends Definition.Any, R,>(
             yield* signalCapacity
             return result.value
           }
-          entry.runtime = undefined
           entry.activation = "Inactive"
           entry.transition = undefined
-          entry.foreground = false
-          foregroundResidents.delete(entry.spaceId)
-          yield* Deferred.done(completion, result)
+          dropForegroundReservation(entry)
+          yield* modifyContribution(entry, (current) => ({ _tag: "Idle", pending: current.pending }))
+          if (Exit.hasInterrupts(result)) yield* Deferred.succeed(completion, undefined)
+          else yield* Deferred.done(completion, result)
           yield* invalidateActivation(entry.spaceId)
           yield* signalCapacity
+          if (retiring !== undefined) yield* enqueueBackground(entry)
           return yield* result
         }))
 
-      const acquire = (entry: RememberedEntry, foreground: boolean) =>
-        activate(entry, foreground).pipe(
-          Effect.tap(() =>
-            Effect.sync(() => {
-              entry.leases += 1
-              if (foreground) {
-                foregroundResidents.delete(entry.spaceId)
-                foregroundResidents.set(entry.spaceId, entry)
-              }
+      const activate = (
+        entry: RememberedEntry,
+        foreground: boolean
+      ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> => {
+        if (!foreground) return transition(entry, false)
+        return Effect.uninterruptibleMask((restore) => {
+          entry.foregroundDemand += 1
+          return restore(transition(entry, true)).pipe(
+            Effect.onExit((exit) => {
+              entry.foregroundDemand -= 1
+              if (
+                Exit.isSuccess(exit) ||
+                entry.foregroundDemand > 0 ||
+                !entry.foreground ||
+                hasForegroundRuntime(entry)
+              ) return Effect.void
+              return releaseForegroundReservation(entry)
             })
           )
+        })
+      }
+
+      const acquire = (
+        entry: RememberedEntry,
+        foreground: boolean,
+        restore: (
+          effect: Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError>
+        ) => Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError>
+      ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
+        restore(activate(entry, foreground)).pipe(
+          Effect.flatMap((runtime) => {
+            if (entry.activation !== "Active" || entry.runtime !== runtime) return acquire(entry, foreground, restore)
+            entry.leases += 1
+            if (foreground) {
+              foregroundResidents.delete(entry.spaceId)
+              foregroundResidents.set(entry.spaceId, entry)
+            }
+            return Effect.succeed(runtime)
+          })
         )
 
       const release = (entry: RememberedEntry) =>
@@ -780,17 +987,75 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.leases = Math.max(0, entry.leases - 1)
         }).pipe(Effect.andThen(signalCapacity))
 
+      const withLease = <A, E extends { readonly _tag: string },>(
+        entry: RememberedEntry,
+        foreground: boolean,
+        use: (runtime: ActiveRuntime) => Effect.Effect<A, E>
+      ): Effect.Effect<A, E | ReplicaError.ReplicaError> =>
+        Effect.uninterruptibleMask((restore) =>
+          acquire(entry, foreground, restore).pipe(
+            Effect.flatMap((runtime) => restore(use(runtime)).pipe(Effect.ensuring(release(entry))))
+          )
+        )
+
       const withActive = <A, E extends { readonly _tag: string },>(
         entry: RememberedEntry,
         use: (runtime: ActiveRuntime) => Effect.Effect<A, E>
       ): Effect.Effect<A, E | ReplicaError.ReplicaError> =>
-        Effect.acquireUseRelease(
-          acquire(entry, true),
-          (runtime) => {
-            const operation = checkRuntime(entry, runtime).pipe(Effect.andThen(use(runtime)))
-            return runtime.operationGate.withPermit(operation)
-          },
-          () => release(entry)
+        withLease(entry, true, (runtime) => {
+          const operation = checkRuntime(entry, runtime).pipe(Effect.andThen(use(runtime)))
+          return runtime.operationGate.withPermit(operation)
+        })
+
+      const withResidentRuntime = <A, E extends { readonly _tag: string },>(
+        entry: RememberedEntry,
+        use: (runtime: ActiveRuntime) => Effect.Effect<A, E>
+      ): Effect.Effect<A, E | ReplicaError.ReplicaError> =>
+        Effect.suspend(() => {
+          const runtime = entry.runtime
+          if (
+            entries.get(entry.spaceId) !== entry || entry.leaving || entry.activation !== "Active" ||
+            runtime === undefined
+          ) return withActive(entry, use)
+          return runtime.operationGate.withPermit(Effect.suspend(() => {
+            if (entry.activation !== "Active" || entry.runtime !== runtime || entry.leaving) {
+              return Effect.succeed(Option.none<A>())
+            }
+            return use(runtime).pipe(Effect.map(Option.some))
+          })).pipe(
+            Effect.flatMap(Option.match({
+              onNone: () => withResidentRuntime(entry, use),
+              onSome: Effect.succeed
+            }))
+          )
+        })
+
+      const settledStream = (
+        entry: RememberedEntry,
+        from: Replica.SettlementStart,
+        mutationName?: string
+      ): Stream.Stream<Replica.SettledMutation, ReplicaError.ReplicaError> =>
+        Stream.unwrap(
+          withResidentRuntime(entry, (runtime) => runtime.local.resolveSettlementStart(from)).pipe(
+            Effect.map((start) =>
+              Stream.paginate(
+                start,
+                Effect.fnUntraced(function*(cursor: number) {
+                  while (true) {
+                    const recorded = entry.settlementsRecorded
+                    const settled = yield* withResidentRuntime(
+                      entry,
+                      (runtime) => runtime.local.readSettlements({ after: cursor, mutationName })
+                    )
+                    if (settled.length > 0) {
+                      return [settled, Option.some<number>(settled[settled.length - 1].sequence)] as const
+                    }
+                    yield* Deferred.await(recorded)
+                  }
+                })
+              )
+            )
+          )
         )
 
       const continueCancellation = Effect.fnUntraced(function*(
@@ -822,7 +1087,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         )
 
       const makeHandle = (entry: RememberedEntry): Replica.Space => {
-        const runtimeLease = Effect.acquireRelease(acquire(entry, true), () => release(entry))
         return {
           spaceId: entry.spaceId,
           scope: Effect.suspend(() => {
@@ -854,16 +1118,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           }),
           activate: activate(entry, true).pipe(Effect.asVoid),
           deactivate: deactivate(entry, true).pipe(Effect.asVoid),
-          mutate: (mutation, payload) =>
-            withActive(entry, (runtime) =>
-              runtime.local.mutate(mutation, payload).pipe(
-                Effect.tap(() =>
-                  runtime.local.pendingCount.pipe(
-                    Effect.flatMap((pending) => updatePendingContribution(entry, pending))
-                  )
-                ),
-                Effect.tap(() => runtime.reconciler.notify)
-              )),
+          mutate: (mutation, payload, mutateOptions) =>
+            withActive(entry, (runtime) => runtime.local.mutate(mutation, payload, mutateOptions)),
           get: (model, key) => withActive(entry, (runtime) => runtime.local.get(model, key)),
           query: (query, payload) => withActive(entry, (runtime) => runtime.queries.execute(query, payload)),
           receipt: (mutation, mutationId) =>
@@ -880,44 +1136,40 @@ const makeLayer = <D extends Definition.Any, R,>(
                   })
                 )
               )),
-          settlements: (settlementOptions) =>
-            Stream.scoped(
-              Stream.fromEffect(runtimeLease).pipe(
-                Stream.flatMap((runtime) => runtime.local.settlements({ from: settlementOptions?.from ?? "live" }))
-              )
-            ),
+          settlements: (settlementOptions) => settledStream(entry, settlementOptions?.from ?? "live"),
           settlementsFor: (mutation, settlementOptions) =>
-            Stream.scoped(
-              Stream.fromEffect(runtimeLease).pipe(
-                Stream.tap(() => MutationDescriptor.validate(options.definition, mutation)),
-                Stream.flatMap((runtime) =>
-                  runtime.local.settlements({
-                    from: settlementOptions?.from ?? "live",
-                    mutationName: mutation.name
-                  }).pipe(Stream.filter(settledFor(mutation)))
+            Stream.unwrap(
+              MutationDescriptor.validate(options.definition, mutation).pipe(
+                Effect.as(
+                  settledStream(entry, settlementOptions?.from ?? "live", mutation.name).pipe(
+                    Stream.filter(settledFor(mutation))
+                  )
                 )
               )
             ),
+          resolveSettlementStart: (from) => withActive(entry, (runtime) => runtime.local.resolveSettlementStart(from)),
           acknowledgeSettlements: (sequence) =>
             withActive(entry, (runtime) => runtime.local.acknowledgeSettlements(sequence)),
           quarantine: withActive(entry, (runtime) => runtime.local.quarantine),
           discardQuarantined: (mutationId) =>
             withActive(entry, (runtime) =>
-              Effect.fnUntraced(function*() {
-                const found = yield* runtime.local.quarantineByMutation(mutationId)
-                if (Option.isNone(found)) {
-                  const continuation = yield* runtime.local.quarantineCancellation(mutationId)
-                  yield* continueCancellation(runtime, continuation)
-                  return yield* findReceipt(runtime, mutationId)
-                }
-                const receipt = yield* remote.discard({
-                  envelope: found.value.envelope,
-                  schema: runtime.local.schema
-                })
-                const canceled = yield* runtime.local.resolveQuarantine(receipt, "Discard")
-                yield* continueCancellation(runtime, canceled)
-                return receipt
-              })().pipe(
+              runtime.quarantineGate.withPermit(
+                Effect.fnUntraced(function*() {
+                  const found = yield* runtime.local.quarantineByMutation(mutationId)
+                  if (Option.isNone(found)) {
+                    const continuation = yield* runtime.local.quarantineCancellation(mutationId)
+                    yield* continueCancellation(runtime, continuation)
+                    return yield* findReceipt(runtime, mutationId)
+                  }
+                  const receipt = yield* remote.discard({
+                    envelope: found.value.envelope,
+                    schema: runtime.local.schema
+                  })
+                  const canceled = yield* runtime.local.resolveQuarantine(receipt, "Discard")
+                  yield* continueCancellation(runtime, canceled)
+                  return receipt
+                })()
+              ).pipe(
                 Effect.exit,
                 Effect.flatMap((exit) =>
                   runtime.local.pendingCount.pipe(
@@ -933,28 +1185,30 @@ const makeLayer = <D extends Definition.Any, R,>(
             payload: Mutation.Payload<M>
           ) =>
             withActive(entry, (runtime) =>
-              Effect.fnUntraced(function*() {
-                const found = yield* runtime.local.quarantineByMutation(mutationId)
-                if (Option.isNone(found)) {
-                  const continuation = yield* runtime.local.quarantineCancellation(mutationId)
-                  yield* continueCancellation(runtime, continuation)
-                  return Quarantine.AlreadyResolved.make({ receipt: yield* findReceipt(runtime, mutationId) })
-                }
-                const item = found.value
-                if (mutation.name !== item.envelope.name) {
-                  return yield* new ReplicaError.ProtocolInvalid({
-                    message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
-                  })
-                }
-                const pending = yield* runtime.local.ensureQuarantineResubmission(mutationId, mutation, payload)
-                const receipt = yield* remote.discard({ envelope: item.envelope, schema: runtime.local.schema })
-                const canceled = yield* runtime.local.resolveQuarantine(receipt, "Resubmit")
-                yield* continueCancellation(runtime, canceled)
-                if (receipt._tag !== "Rejected" || receipt.origin !== "Quarantine") {
-                  return Quarantine.AlreadyResolved.make({ receipt })
-                }
-                return Quarantine.Resubmitted.make({ pending })
-              })().pipe(
+              runtime.quarantineGate.withPermit(
+                Effect.fnUntraced(function*() {
+                  const found = yield* runtime.local.quarantineByMutation(mutationId)
+                  if (Option.isNone(found)) {
+                    const continuation = yield* runtime.local.quarantineCancellation(mutationId)
+                    yield* continueCancellation(runtime, continuation)
+                    return Quarantine.AlreadyResolved.make({ receipt: yield* findReceipt(runtime, mutationId) })
+                  }
+                  const item = found.value
+                  if (mutation.name !== item.envelope.name) {
+                    return yield* new ReplicaError.ProtocolInvalid({
+                      message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
+                    })
+                  }
+                  const pending = yield* runtime.local.ensureQuarantineResubmission(mutationId, mutation, payload)
+                  const receipt = yield* remote.discard({ envelope: item.envelope, schema: runtime.local.schema })
+                  const canceled = yield* runtime.local.resolveQuarantine(receipt, "Resubmit")
+                  yield* continueCancellation(runtime, canceled)
+                  if (receipt._tag !== "Rejected" || receipt.origin !== "Quarantine") {
+                    return Quarantine.AlreadyResolved.make({ receipt })
+                  }
+                  return Quarantine.Resubmitted.make({ pending })
+                })()
+              ).pipe(
                 Effect.exit,
                 Effect.flatMap((exit) =>
                   runtime.local.pendingCount.pipe(
@@ -968,10 +1222,10 @@ const makeLayer = <D extends Definition.Any, R,>(
             const runtime = entry.runtime
             if (entry.activation === "Active" && runtime !== undefined) {
               return Effect.all([runtime.reconciler.status, runtime.local.pendingCount]).pipe(
-                Effect.map(([status, pending]) => addressedStatus(entry.spaceId, { ...status, pending }))
+                Effect.map(([status, pending]) => addressedStatus(entry.spaceId, entry.synced, { ...status, pending }))
               )
             }
-            return pendingCount(entry.spaceId).pipe(
+            return lane.withStatement(pendingCount(entry.spaceId)).pipe(
               Effect.catchTags({
                 SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
                 SchemaError: (cause) =>
@@ -989,7 +1243,12 @@ const makeLayer = <D extends Definition.Any, R,>(
                     })
                   )
               }),
-              Effect.map((row) => addressedStatus(entry.spaceId, { _tag: "Offline", pending: row.count }))
+              Effect.map((row) => {
+                if (entry.activation === "Activating") {
+                  return addressedStatus(entry.spaceId, entry.synced, { _tag: "Connecting", pending: row.count })
+                }
+                return addressedStatus(entry.spaceId, entry.synced, { _tag: "Idle", pending: row.count })
+              })
             )
           })
         }
@@ -1009,11 +1268,14 @@ const makeLayer = <D extends Definition.Any, R,>(
           runtime: undefined,
           transition: undefined,
           foreground: false,
+          foregroundDemand: 0,
+          settlementsRecorded: Deferred.makeUnsafe<void>(),
           leases: 0,
           leaving: false,
           leaveCompletion: undefined,
           workflowRegistration: undefined,
-          summaryStatus: { _tag: "Offline", pending: row.count },
+          summaryStatus: { _tag: "Idle", pending: row.count },
+          synced: row.replication_view_id !== null,
           retryAttempt: 0,
           retryVersion: 0
         }
@@ -1021,13 +1283,17 @@ const makeLayer = <D extends Definition.Any, R,>(
           const lease = ReconciliationWorkflow.RuntimeLease.of({
             acquire: Effect.gen(function*() {
               const foreground = entry.foreground
-              const leaseRuntime = yield* Effect.acquireRelease(
-                acquire(entry, foreground),
-                (runtime) =>
-                  release(entry).pipe(
-                    Effect.andThen(Queue.offer(backgroundQueue, { _tag: "Deactivate", entry, runtime })),
-                    Effect.asVoid
+              const leaseRuntime = yield* Effect.uninterruptibleMask((restore) =>
+                acquire(entry, foreground, restore).pipe(
+                  Effect.tap((runtime) =>
+                    Effect.addFinalizer(() =>
+                      release(entry).pipe(
+                        Effect.andThen(Queue.offer(backgroundQueue, { _tag: "Deactivate", entry, runtime })),
+                        Effect.asVoid
+                      )
+                    )
                   )
+                )
               )
               return {
                 local: leaseRuntime.local,
@@ -1093,10 +1359,10 @@ const makeLayer = <D extends Definition.Any, R,>(
             const completion = yield* Deferred.make<void>()
             joining.set(spaceId, completion)
             const result = yield* restore(
-              sql.withTransaction(insertMembership(spaceId)).pipe(
+              lane.withTransaction(insertMembership(spaceId)).pipe(
                 Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
                 Effect.andThen(
-                  readMembership(spaceId).pipe(
+                  lane.withStatement(readMembership(spaceId)).pipe(
                     Effect.catchTags({
                       SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
                       SchemaError: (cause) =>
@@ -1148,7 +1414,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           }
           if (current === undefined) {
             return yield* restore(
-              sql.withTransaction(
+              lane.withTransaction(
                 sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
               ).pipe(
                 Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
@@ -1162,13 +1428,14 @@ const makeLayer = <D extends Definition.Any, R,>(
           const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
             Effect.andThen(deactivate(current, true)),
             Effect.andThen(
-              sql.withTransaction(
+              lane.withTransaction(
                 sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
               ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
             ),
             Effect.tap(() =>
               removeContribution(current).pipe(
-                Effect.andThen(Effect.sync(() => entries.delete(spaceId)))
+                Effect.andThen(Effect.sync(() => entries.delete(spaceId))),
+                Effect.andThen(publishSettlements(current))
               )
             ),
             Effect.tap(() =>
@@ -1209,10 +1476,10 @@ const makeLayer = <D extends Definition.Any, R,>(
       const status = Ref.get(aggregate)
 
       const backgroundTurn = Effect.gen(function*() {
-        const work = yield* Queue.take(backgroundQueue)
+        const work = yield* LosslessQueue.take(backgroundQueue)
         if (work._tag === "Deactivate") {
           const result = yield* deactivate(work.entry, false, work.runtime, false).pipe(Effect.result)
-          if (Result.isFailure(result)) yield* scheduleBackgroundRetry(work.entry)
+          if (Result.isFailure(result)) yield* scheduleBackgroundRetry(work.entry, Option.none())
           return
         }
         const spaceId = work.spaceId
@@ -1220,17 +1487,13 @@ const makeLayer = <D extends Definition.Any, R,>(
         const entry = entries.get(spaceId)
         if (entry === undefined || entry.leaving) return
         let activeRuntime: ActiveRuntime | undefined
-        const result = yield* Effect.acquireUseRelease(
-          acquire(entry, false).pipe(Effect.tap((runtime) => {
-            activeRuntime = runtime
-            return Effect.void
-          })),
-          (runtime) => {
-            if (workflow === undefined) return runtime.reconciler.sync
-            return backgroundWorkflowTurns.withPermit(runtime.reconciler.sync)
-          },
-          () => release(entry)
-        ).pipe(Effect.result)
+        const transportGeneration = yield* remote.transportGeneration
+        const result = yield* withLease(entry, false, (runtime) => {
+          activeRuntime = runtime
+          let sync = runtime.reconciler.sync
+          if (workflow !== undefined) sync = backgroundWorkflowTurns.withPermit(sync)
+          return Effect.raceFirst(sync, Deferred.await(runtime.preemption))
+        }).pipe(Effect.result)
         if (activeRuntime !== undefined) {
           const deactivation = yield* deactivate(
             entry,
@@ -1239,12 +1502,14 @@ const makeLayer = <D extends Definition.Any, R,>(
             Result.isSuccess(result)
           ).pipe(Effect.result)
           if (Result.isFailure(deactivation)) {
-            yield* scheduleBackgroundRetry(entry)
+            yield* scheduleBackgroundRetry(entry, Option.none())
             return
           }
         }
         if (Result.isFailure(result)) {
-          yield* scheduleBackgroundRetry(entry)
+          let retryTransport = Option.none<number>()
+          if (isTransportFailure(result.failure)) retryTransport = Option.some(transportGeneration)
+          yield* scheduleBackgroundRetry(entry, retryTransport)
         } else {
           entry.retryAttempt = 0
           entry.retryVersion += 1
@@ -1253,12 +1518,21 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       yield* Effect.forEach(
         Array.from({ length: backgroundConcurrency }),
-        () => backgroundTurn.pipe(Effect.forever, Effect.forkScoped({ startImmediately: true })),
+        () =>
+          backgroundTurn.pipe(
+            Effect.forever,
+            Effect.provideService(ConnectionLane.Priority, "Background"),
+            Effect.forkScoped({ startImmediately: true })
+          ),
         { discard: true }
       )
-      yield* retrySchedulerTurn.pipe(Effect.forever, Effect.forkScoped({ startImmediately: true }))
+      yield* retrySchedulerTurn.pipe(
+        Effect.forever,
+        Effect.provideService(ConnectionLane.Priority, "Background"),
+        Effect.forkScoped({ startImmediately: true })
+      )
 
-      const restored = yield* readMemberships(undefined).pipe(
+      const restored = yield* lane.withStatement(readMemberships(undefined)).pipe(
         Effect.catchTags({
           SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
           SchemaError: (cause) =>

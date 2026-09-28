@@ -1,24 +1,31 @@
+import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
+import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
+import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
+import * as Encoding from "effect/Encoding"
 import * as Layer from "effect/Layer"
+import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
+import type * as Sharding from "effect/unstable/cluster/Sharding"
 import type * as HttpRouter from "effect/unstable/http/HttpRouter"
 import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as RpcServer from "effect/unstable/rpc/RpcServer"
+import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "./Authentication.js"
+import * as EphemeralHub from "./EphemeralHub.js"
 import { invalidConfiguration } from "./internal/errors.js"
 import * as PrincipalAssertion from "./PrincipalAssertion.js"
 import * as SpaceEntity from "./SpaceEntity.js"
 import * as SyncRpc from "./SyncRpc.js"
 
-export interface Options {
-  readonly supportedProtocolVersions?: ReadonlyArray<number>
-}
-
-const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
-  const configured = options?.supportedProtocolVersions ?? [Protocol.currentProtocolVersion]
+const makeHandlers = Effect.fnUntraced(function*(options: {
+  readonly supportedProtocolVersions?: ReadonlyArray<number> | undefined
+}) {
+  const configured = options.supportedProtocolVersions ?? Protocol.supportedProtocolVersions
   const decoded = yield* Schema.decodeUnknownEffect(Protocol.NegotiateRequest)({
     supportedVersions: configured
   }).pipe(
@@ -43,10 +50,10 @@ const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
       if (version !== undefined) return Effect.succeed({ version })
       return Effect.fail(new ReplicaError.UpgradeRequired({ clientVersions, serverVersions: supportedVersions }))
     },
-    Submit: (request) =>
-      requireVersion(request.protocolVersion).pipe(
+    SubmitBatch: ({ protocolVersion, ...request }) =>
+      requireVersion(protocolVersion).pipe(
         Effect.andThen(issueAssertion),
-        Effect.flatMap((assertion) => client.submit(request.envelope.spaceId, request, assertion))
+        Effect.flatMap((assertion) => client.submitBatch(request.envelopes[0].spaceId, request, assertion))
       ),
     Discard: (request) =>
       requireVersion(request.protocolVersion).pipe(
@@ -113,19 +120,73 @@ const makeHandlers = Effect.fnUntraced(function*(options?: Options) {
   })
 })
 
-const makeLayerHandlers = (options?: Options) => SyncRpc.Rpcs.toLayer(makeHandlers(options))
+export interface LayerOptions<D extends Definition.Any, R = never,> {
+  readonly definition: D
+  readonly authorizeAccess: ServerStore.Options<R>["authorizeAccess"]
+  readonly authorizeMutation: ServerStore.Options<R>["authorizeMutation"]
+  readonly authorizeRead: ServerStore.Options<R>["authorizeRead"]
+  readonly authorizeEphemeral: (
+    input: EphemeralHub.AuthorizationInput
+  ) => Effect.Effect<void, ReplicaError.AuthorizationDenied, R>
+  readonly assertionSecret?: Redacted.Redacted | undefined
+  readonly store?:
+    | Omit<ServerStore.Options<R>, "definition" | "authorizeAccess" | "authorizeMutation" | "authorizeRead">
+    | undefined
+  readonly ephemeral?: EphemeralHub.Options | undefined
+  readonly spaces?: SpaceEntity.HandlerOptions | undefined
+  readonly maintenance?: ServerStore.MaintenanceOptions | undefined
+  readonly supportedProtocolVersions?: ReadonlyArray<number> | undefined
+}
 
-export const layerHandlers = makeLayerHandlers()
-export const layerHandlersWithOptions = (options: Options) => makeLayerHandlers(options)
+const assertionSecretBytes = 32
 
-export const layer = RpcServer.layer(SyncRpc.Rpcs, { disableFatalDefects: true }).pipe(
-  Layer.provide(layerHandlers)
+const randomAssertionSecret = Crypto.Crypto.use((crypto) => crypto.randomBytes(assertionSecretBytes)).pipe(
+  Effect.map((bytes) => Redacted.make(Encoding.encodeBase64Url(bytes))),
+  Effect.catchTag("PlatformError", (error) => Effect.die(error))
 )
 
-export const layerWithOptions = (options: Options) =>
-  RpcServer.layer(SyncRpc.Rpcs, { disableFatalDefects: true }).pipe(
-    Layer.provide(layerHandlersWithOptions(options))
+export const layer = <D extends Definition.Any, R = never,>(
+  options: LayerOptions<D, R>
+): Layer.Layer<
+  ServerStore.ServerStore,
+  ReplicaError.ReplicaError,
+  | Sharding.Sharding
+  | SqlClient.SqlClient
+  | Crypto.Crypto
+  | Authentication.Authentication
+  | RpcServer.Protocol
+  | MutationRuntime.Handlers<D>
+  | R
+> => {
+  const layerAssertions = Layer.unwrap(Effect.gen(function*() {
+    const secret = options.assertionSecret ?? (yield* randomAssertionSecret)
+    return PrincipalAssertion.layerHmac({ secret })
+  }))
+  const layerStore = ServerStore.layer({
+    ...options.store,
+    definition: options.definition,
+    authorizeAccess: options.authorizeAccess,
+    authorizeMutation: options.authorizeMutation,
+    authorizeRead: options.authorizeRead
+  }).pipe(Layer.provide(MutationRuntime.layer(options.definition, options.store?.evolution)))
+  const layerHub = EphemeralHub.layer({ ...options.ephemeral, authorize: options.authorizeEphemeral })
+  const layerEntities = SpaceEntity.layer(options.spaces).pipe(
+    Layer.provide(layerAssertions),
+    Layer.provide(layerStore),
+    Layer.provide(layerHub)
   )
+  const layerGatewayHandlers = SyncRpc.Rpcs.toLayer(makeHandlers(options))
+  const layerGateway = RpcServer.layer(SyncRpc.Rpcs, { disableFatalDefects: true }).pipe(
+    Layer.provide(layerGatewayHandlers),
+    Layer.provide(layerEntities),
+    Layer.provide(layerAssertions)
+  )
+  return Layer.mergeAll(
+    layerGateway,
+    ServerStore.layerMaintenance(options.maintenance).pipe(Layer.provide(layerStore)),
+    layerStore
+  )
+}
 
 export const layerProtocolWebSocket = (options: {
   readonly path: HttpRouter.PathInput

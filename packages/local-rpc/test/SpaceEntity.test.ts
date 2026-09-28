@@ -27,6 +27,7 @@ import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as EphemeralHub from "../src/EphemeralHub.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
 
@@ -105,11 +106,6 @@ const layerShardingConfig = ShardingConfig.layer({
 const provideShardingConfig = Effect.provide(layerShardingConfig)
 const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
 const handlerOptions = {
-  admissionMailboxCapacity: 32,
-  readMailboxCapacity: 32,
-  watchMailboxCapacity: 32,
-  ephemeralJoinMailboxCapacity: 32,
-  ephemeralCommandMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 4,
   maximumConcurrentBootstrapPagesPerSpace: 1,
   maximumConcurrentEphemeralJoinVerificationsPerSpace: 4,
@@ -125,7 +121,7 @@ const envelope = (spaceId: Identity.SpaceId) => {
     basis: Identity.ServerSequence.make(0),
     name: PutTodo.name,
     payload: { id: "1", title: "cluster" },
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001"),
     sourceSchema: definition.schemaIdentity,
     mutationVersion: PutTodo.version
@@ -134,6 +130,51 @@ const envelope = (spaceId: Identity.SpaceId) => {
 }
 
 describe("SpaceEntity", () => {
+  it.effect("serves watch, submit and pull of a space from a single resident entity", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const layerCluster = SpaceEntity.layer(handlerOptions).pipe(
+        Layer.provide(layerAssertionVerifier),
+        Layer.provide(layerStore),
+        Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
+        Layer.provide(
+          SingleRunner.layer({
+            runnerStorage: "memory",
+            shardingConfig: { maxResidentEntities: 2, entityTerminationTimeout: 0, sendRetryInterval: 100 }
+          }).pipe(Layer.provide(layerDatabase))
+        )
+      )
+      yield* Effect.gen(function*() {
+        const client = yield* SpaceEntity.Client
+        const reader = yield* assertionOf({ subject: "reader" })
+        const watchRequest = {
+          spaceId: spaceA,
+          clientId,
+          schema: definition.schemaIdentity,
+          scope,
+          scopeGeneration,
+          cursor: null
+        }
+        const wakes = yield* Queue.unbounded<Protocol.Wake>()
+        yield* client.watch(spaceA, watchRequest, reader).pipe(
+          Stream.runForEach((wake) => Queue.offer(wakes, wake)),
+          Effect.forkChild({ startImmediately: true })
+        )
+        assert.deepStrictEqual(yield* Queue.take(wakes), { spaceId: spaceA })
+        const submitted = yield* envelope(spaceA)
+        const writer = yield* assertionOf({ subject: "writer" })
+        const result = yield* client.submitBatch(
+          spaceA,
+          { envelopes: [submitted], schema: definition.schemaIdentity },
+          writer
+        )
+        assert.deepStrictEqual(result.receipts.map((receipt) => receipt._tag), ["Accepted"])
+        const pullA = yield* client.pull(spaceA, { ...watchRequest, limit: 10 }, reader)
+        assert.isTrue("_tag" in pullA)
+        const pullB = yield* client.pull(spaceB, { ...watchRequest, spaceId: spaceB, limit: 10 }, reader)
+        assert.isTrue("_tag" in pullB)
+      }).pipe(Effect.provide(layerCluster))
+    })).pipe(TestClock.withLive, provideShardingConfig, provideNodeCrypto))
+
   it.effect("routes synchronization and ephemera through the split space boundaries", () =>
     Effect.scoped(Effect.gen(function*() {
       const ephemeralReady = yield* Deferred.make<void>()
@@ -155,11 +196,11 @@ describe("SpaceEntity", () => {
         Layer.provide(Layer.succeed(ServerStore.ServerStore, actualStore)),
         Layer.provide(Layer.succeed(EphemeralHub.EphemeralHub, actualEphemeral))
       )
-      const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, layerEntityHandlers)
-      const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerEntityHandlers)
-      const makeWatchClient = yield* Entity.makeTestClient(SpaceEntity.SpaceWatchEntity, layerEntityHandlers)
+      const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerEntityHandlers)
+      const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerEntityHandlers)
+      const makeWatchClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerEntityHandlers)
       const makeEphemeralClient = yield* Entity.makeTestClient(
-        SpaceEntity.SpaceEphemeralJoinEntity,
+        SpaceEntity.Space,
         layerEntityHandlers
       )
       const admissionClient = yield* makeAdmissionClient(spaceA)
@@ -189,11 +230,11 @@ describe("SpaceEntity", () => {
 
       const submitted = yield* envelope(spaceA)
       const submitAssertion = yield* assertionOf({ subject: "writer" })
-      const receipt = yield* admissionClient.Submit({
-        request: { envelope: submitted, schema: definition.schemaIdentity },
+      const result = yield* admissionClient.SubmitBatch({
+        request: { envelopes: [submitted], schema: definition.schemaIdentity },
         assertion: submitAssertion
       })
-      assert.strictEqual(receipt._tag, "Accepted")
+      assert.deepStrictEqual(result.receipts.map((receipt) => receipt._tag), ["Accepted"])
       assert.deepStrictEqual(yield* Queue.take(wakes), {
         spaceId: spaceA
       })
@@ -277,19 +318,18 @@ describe("SpaceEntity", () => {
         EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 8 })
       ).pipe(Effect.map(Context.get(EphemeralHub.EphemeralHub)))
       const layerEntityHandlers = SpaceEntity.layerHandlers({
-        ...handlerOptions,
-        ephemeralCommandMailboxCapacity: 1
+        ...handlerOptions
       }).pipe(
         Layer.provide(layerAssertionVerifier),
         Layer.provide(layerStore),
         Layer.provide(Layer.succeed(EphemeralHub.EphemeralHub, actualEphemeral))
       )
       const makeJoinClient = yield* Entity.makeTestClient(
-        SpaceEntity.SpaceEphemeralJoinEntity,
+        SpaceEntity.Space,
         layerEntityHandlers
       )
       const makeCommandClient = yield* Entity.makeTestClient(
-        SpaceEntity.SpaceEphemeralCommandEntity,
+        SpaceEntity.Space,
         layerEntityHandlers
       )
       const joinClient = yield* makeJoinClient(spaceA)
@@ -342,7 +382,6 @@ describe("SpaceEntity", () => {
       )
       const layerEntityHandlers = SpaceEntity.layerHandlers({
         ...handlerOptions,
-        ephemeralJoinMailboxCapacity: 2,
         maximumConcurrentEphemeralJoinVerificationsPerSpace: 1
       }).pipe(
         Layer.provide(layerBlockingVerifier),
@@ -350,7 +389,7 @@ describe("SpaceEntity", () => {
         Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 8 }))
       )
       const makeJoinClient = yield* Entity.makeTestClient(
-        SpaceEntity.SpaceEphemeralJoinEntity,
+        SpaceEntity.Space,
         layerEntityHandlers
       )
       const joinClient = yield* makeJoinClient(spaceA)
@@ -369,18 +408,19 @@ describe("SpaceEntity", () => {
           Effect.forkChild({ startImmediately: true })
         )
       const first = yield* start(member, firstReady)
-      yield* Queue.take(entered)
-      const second = yield* joinClient.JoinEphemeral({
+      yield* LosslessQueue.take(entered)
+      const secondResult = yield* joinClient.JoinEphemeral({
         request: { spaceId: spaceA, member: secondMember, value: null, ttlMillis: 5_000 },
         assertion
       }).pipe(
         Stream.runDrain,
-        Effect.timeout("1 second"),
         Effect.result,
-        Effect.forkChild({ startImmediately: true })
+        Effect.raceFirst(
+          LosslessQueue.take(entered).pipe(
+            Effect.andThen(Effect.die("a second join entered verification past the bound"))
+          )
+        )
       )
-      yield* TestClock.adjust("1 second")
-      const secondResult = yield* Fiber.join(second)
       assert.isTrue(Result.isFailure(secondResult))
       if (Result.isFailure(secondResult)) {
         assert.strictEqual(secondResult.failure._tag, "CapacityExceeded")
@@ -405,10 +445,10 @@ describe("SpaceEntity", () => {
           Layer.provide(layerStore),
           Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }))
         )
-        const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.SpaceAdmissionEntity, layerEntityHandlers)
-        const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerEntityHandlers)
+        const makeAdmissionClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerEntityHandlers)
+        const makeReadClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerEntityHandlers)
         const makeEphemeralClient = yield* Entity.makeTestClient(
-          SpaceEntity.SpaceEphemeralCommandEntity,
+          SpaceEntity.Space,
           layerEntityHandlers
         )
         const admissionClient = yield* makeAdmissionClient(spaceA)
@@ -417,8 +457,8 @@ describe("SpaceEntity", () => {
         const submitted = yield* envelope(spaceB)
 
         const submitAssertion = yield* assertionOf(null)
-        const submitResult = yield* admissionClient.Submit({
-          request: { envelope: submitted, schema: definition.schemaIdentity },
+        const submitResult = yield* admissionClient.SubmitBatch({
+          request: { envelopes: [submitted], schema: definition.schemaIdentity },
           assertion: submitAssertion
         }).pipe(Effect.result)
         if (!Result.isFailure(submitResult)) assert.fail("expected submit protocol failure")
@@ -487,7 +527,7 @@ describe("SpaceEntity", () => {
     )
   )
 
-  it.effect("completes Submit while a Bootstrap page is paused", () =>
+  it.effect("completes SubmitBatch while a Bootstrap page is paused", () =>
     Effect.scoped(Effect.gen(function*() {
       const actual = yield* Layer.build(layerStore).pipe(
         Effect.map(Context.get(ServerStore.ServerStore))
@@ -495,7 +535,9 @@ describe("SpaceEntity", () => {
       const firstEntered = yield* Deferred.make<void>()
       const releaseFirst = yield* Deferred.make<void>()
       const submitEntered = yield* Deferred.make<void>()
-      const submitCompleted = yield* Deferred.make<Exit.Exit<Protocol.Receipt, ReplicaError.ReplicaError>>()
+      const submitCompleted = yield* Deferred.make<
+        Exit.Exit<Protocol.SubmitBatchResult, ReplicaError.ReplicaError>
+      >()
       const snapshotId = Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000001")
       const page = Protocol.BootstrapPage.make({
         manifest: {
@@ -522,9 +564,9 @@ describe("SpaceEntity", () => {
       })
       const wrapped = ServerStore.ServerStore.of({
         ...actual,
-        admit: (request, principal) =>
+        admitBatch: (request, principal) =>
           Deferred.succeed(submitEntered, undefined).pipe(
-            Effect.andThen(actual.admit(request, principal)),
+            Effect.andThen(actual.admitBatch(request, principal)),
             Effect.onExit((exit) => Deferred.succeed(submitCompleted, exit))
           ),
         prepareBootstrapAuthorized: () => {
@@ -571,9 +613,9 @@ describe("SpaceEntity", () => {
         yield* Deferred.await(firstEntered)
         const submitted = yield* envelope(spaceA)
         const submitAssertion = yield* assertionOf(null)
-        const submit = yield* client.submit(
+        const submit = yield* client.submitBatch(
           spaceA,
-          { envelope: submitted, schema: definition.schemaIdentity },
+          { envelopes: [submitted], schema: definition.schemaIdentity },
           submitAssertion
         ).pipe(Effect.forkChild({ startImmediately: true }))
 
@@ -582,7 +624,7 @@ describe("SpaceEntity", () => {
         if (Exit.isFailure(submitExit)) {
           assert.fail(Cause.pretty(submitExit.cause))
         }
-        assert.strictEqual(submitExit.value._tag, "Accepted")
+        assert.deepStrictEqual(submitExit.value.receipts.map((receipt) => receipt._tag), ["Accepted"])
 
         yield* Deferred.succeed(releaseFirst, undefined)
         yield* Fiber.join(first)

@@ -1,5 +1,6 @@
 node_modules
 dist
+dist-web
 coverage
 .DS_Store
 *.tsbuildinfo
@@ -7,3 +8,5 @@ test-results
 playwright-report
 .vite
 AGENTS.local.md
+examples/chat/server/chat.db*
+examples/chat/chat.db*

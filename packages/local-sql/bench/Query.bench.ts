@@ -12,7 +12,8 @@ import * as SchemaGetter from "effect/SchemaGetter"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import { afterAll, assert, beforeAll, bench } from "vitest"
+import { afterAll, assert, beforeAll, test } from "vitest"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as Codec from "../src/internal/codec.js"
 import * as Migrations from "../src/Migrations.js"
 import * as QueryExecutor from "../src/QueryExecutor.js"
@@ -101,7 +102,8 @@ const layerHandlers = Indexed.toLayer(({ payload, query }) =>
       )
     ).pipe((multiColumn) => Layer.mergeAll(indexed, multiColumn))
 )
-const layerDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
+const layerDatabase = ConnectionLane.makeLayer().pipe(
+  Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
   Layer.merge(Reactivity.layer)
 )
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
@@ -145,44 +147,50 @@ afterAll(async () => {
   await runtime.dispose()
 })
 
-bench("selective raw SQL page decodes only its rows", async () => {
-  decodedRows = 0
-  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
-  const result = await runtime.runPromise(
-    QueryExecutor.QueryExecutor.use((service) => service.execute(Indexed, { minimum: 9_900 }))
-  )
-  assert.strictEqual(result.length, 25)
-  assert.strictEqual(decodedRows, 50)
-}, { iterations: 20, time: 0, warmupIterations: 3, warmupTime: 0, throws: true })
+test("selective raw SQL page decodes only its rows", async ({ bench }) => {
+  await bench("selective raw SQL page decodes only its rows", async () => {
+    decodedRows = 0
+    // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
+    const result = await runtime.runPromise(
+      QueryExecutor.QueryExecutor.use((service) => service.execute(Indexed, { minimum: 9_900 }))
+    )
+    assert.strictEqual(result.length, 25)
+    assert.strictEqual(decodedRows, 50)
+  }).run({ iterations: 20, time: 0, warmupIterations: 3, warmupTime: 0, throws: true })
+})
 
-bench("multicolumn offset pagination returns a stable second page", async () => {
-  decodedRows = 0
-  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
-  const result = await runtime.runPromise(
-    QueryExecutor.QueryExecutor.use((service) => service.execute(MultiColumn, undefined))
-  )
-  assert.strictEqual(result.length, 25)
-  assert.strictEqual(decodedRows, 50)
-}, { iterations: 20, time: 0, warmupIterations: 3, warmupTime: 0, throws: true })
+test("multicolumn offset pagination returns a stable second page", async ({ bench }) => {
+  await bench("multicolumn offset pagination returns a stable second page", async () => {
+    decodedRows = 0
+    // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
+    const result = await runtime.runPromise(
+      QueryExecutor.QueryExecutor.use((service) => service.execute(MultiColumn, undefined))
+    )
+    assert.strictEqual(result.length, 25)
+    assert.strictEqual(decodedRows, 50)
+  }).run({ iterations: 20, time: 0, warmupIterations: 3, warmupTime: 0, throws: true })
+})
 
-bench("explicit unindexed scan decodes the complete model", async () => {
-  decodedRows = 0
-  // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
-  const result = await runtime.runPromise(Effect.gen(function*() {
-    const sql = yield* SqlClient.SqlClient
-    const rows = yield* SqlSchema.findAll({
-      Request: Schema.Void,
-      Result: Schema.Struct({ value_json: Schema.String }),
-      execute: () =>
-        sql`SELECT value_json FROM effect_local_client_visible_entities_data
+test("explicit unindexed scan decodes the complete model", async ({ bench }) => {
+  await bench("explicit unindexed scan decodes the complete model", async () => {
+    decodedRows = 0
+    // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
+    const result = await runtime.runPromise(Effect.gen(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const rows = yield* SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: Schema.Struct({ value_json: Schema.String }),
+        execute: () =>
+          sql`SELECT value_json FROM effect_local_client_visible_entities_data
         WHERE space_id = ${spaceId} AND schema_generation = 0 AND projection_generation = 0
           AND model = ${Item.name} ORDER BY entity_key`
-    })(undefined)
-    return yield* Effect.forEach(rows, (row) =>
-      Codec.parse(row.value_json).pipe(
-        Effect.flatMap((encoded) => Codec.decode(Item.schema, encoded))
-      ))
-  }))
-  assert.strictEqual(result.length, 10_000)
-  assert.strictEqual(decodedRows, 10_000)
-}, { iterations: 5, time: 0, warmupIterations: 1, warmupTime: 0, throws: true })
+      })(undefined)
+      return yield* Effect.forEach(rows, (row) =>
+        Codec.parse(row.value_json).pipe(
+          Effect.flatMap((encoded) => Codec.decode(Item.schema, encoded))
+        ))
+    }))
+    assert.strictEqual(result.length, 10_000)
+    assert.strictEqual(decodedRows, 10_000)
+  }).run({ iterations: 5, time: 0, warmupIterations: 1, warmupTime: 0, throws: true })
+})

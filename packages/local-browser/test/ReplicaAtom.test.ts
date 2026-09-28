@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import * as ProtocolSession from "@lucas-barake/effect-local-rpc/ProtocolSession"
+import * as Transport from "@lucas-barake/effect-local-rpc/Transport"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -32,10 +33,16 @@ import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
-import * as Stream from "effect/Stream"
 import { Atom, AtomRegistry } from "effect/unstable/reactivity"
+import type * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import * as BrowserReplica from "../src/BrowserReplica.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
+import * as ReplicaAtom from "../src/ReplicaAtom.js"
+
+const layerTransport = Layer.succeed(
+  Transport.Transport,
+  Transport.Transport.of({ generation: Effect.succeed(0), waitForChange: () => Effect.never })
+)
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
@@ -77,6 +84,10 @@ const RangeTodos = Query.make("RangeTodos", {
   payload: { lower: Schema.String, upper: Schema.String },
   success: Schema.Array(Todo.schema)
 })
+const TitlesEcho = Query.make("TitlesEcho", {
+  payload: { titles: Schema.toCodecJson(Schema.ReadonlySet(Schema.String)).annotate({ identifier: "TitleSet" }) },
+  success: Schema.Array(Schema.String)
+})
 const rangeReads = new Map<string, number>()
 const TodoRows = Schema.Struct({ value: Schema.fromJsonString(TodoSchema) })
 const todosVia = (
@@ -96,13 +107,14 @@ const definition = Definition.make({
   version: 1,
   models: [Todo, Numbered],
   mutations: [PutTodo, PutNumbered],
-  queries: [ListTodos, RangeTodos]
+  queries: [ListTodos, RangeTodos, TitlesEcho]
 })
 const layerHandlers = Layer.mergeAll(
   PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
   PutNumbered.toLayer(({ payload, transaction }) =>
     transaction.set(Numbered, payload.id, payload).pipe(Effect.as(payload))
   ),
+  TitlesEcho.toLayer(({ payload }) => Effect.succeed(Array.from(payload.titles))),
   ListTodos.toLayer(({ query }) =>
     todosVia(query, (sql) => sql`SELECT "value" FROM "Todo" ORDER BY "title" ASC LIMIT 100`)
   ),
@@ -164,7 +176,9 @@ const layerSync = Effect.gen(function*() {
   const store = yield* ServerStore.ServerStore
   return SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
-    submit: store.submit,
+    transportGeneration: Effect.succeed(0),
+    waitForTransportChange: () => Effect.never,
+    submitBatch: (request) => store.admitBatch(request, null),
     discard: (request) => store.discard(request, null),
     pull: store.pull,
     bootstrap: store.bootstrap,
@@ -194,6 +208,34 @@ const layerReplica = Layer.merge(
   ),
   layerEphemeralInactive
 )
+
+const layerReplicaWithHeldQuery = (probe: {
+  readonly armed: Ref.Ref<boolean>
+  readonly entered: Deferred.Deferred<void>
+  readonly release: Deferred.Deferred<void>
+}) =>
+  Layer.effectContext(Effect.gen(function*() {
+    const context = yield* Layer.build(layerReplica)
+    const replica = Context.get(context, Replica.Replica)
+    const holdResult = Ref.getAndSet(probe.armed, false).pipe(
+      Effect.flatMap((armed) => {
+        if (!armed) return Effect.void
+        return Deferred.succeed(probe.entered, undefined).pipe(Effect.andThen(Deferred.await(probe.release)))
+      })
+    )
+    return Context.add(
+      context,
+      Replica.Replica,
+      Replica.Replica.of({
+        ...replica,
+        space: (id) =>
+          replica.space(id).pipe(Effect.map((space) => ({
+            ...space,
+            query: (query, payload) => space.query(query, payload).pipe(Effect.tap(() => holdResult))
+          })))
+      })
+    )
+  }))
 
 const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) => {
   const layerFaults = FaultInjection.layer.pipe(
@@ -300,10 +342,35 @@ const makeEphemeralHarness = Effect.fnUntraced(function*(options?: {
     rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
   })
   const layerEphemeralClient = EphemeralClient.layerFromSession().pipe(
-    Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, protocolSession))
+    Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, protocolSession)),
+    Layer.provide(layerTransport)
   )
   return { messages, published, joins, publishGate, layerEphemeralClient }
 })
+
+const awaitSuccess = <A, E extends { readonly _tag: string },>(
+  registry: AtomRegistry.AtomRegistry,
+  atom: Atom.Atom<AsyncResult.AsyncResult<A, E>>,
+  predicate: (value: A) => boolean
+): Effect.Effect<A, E> =>
+  Effect.callback<A, E>((resume) => {
+    const settle = (result: AsyncResult.AsyncResult<A, E>) => {
+      if (result._tag === "Failure") {
+        resume(Effect.failCause(result.cause))
+        return true
+      }
+      if (result._tag === "Success" && predicate(result.value)) {
+        resume(Effect.succeed(result.value))
+        return true
+      }
+      return false
+    }
+    if (settle(registry.get(atom))) return Effect.void
+    const cancel = registry.subscribe(atom, (result) => {
+      if (settle(result)) cancel()
+    })
+    return Effect.sync(cancel)
+  })
 
 const statusSessionOptions = {
   spaceId,
@@ -330,7 +397,7 @@ describe("Replica Atom graph", () => {
           }]
         })
       )
-      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const graph = ReplicaAtom.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const session = graph.ephemeral(StatusProfile, statusSessionOptions)
@@ -352,9 +419,11 @@ describe("Replica Atom graph", () => {
       assert.deepStrictEqual(entries, [
         { member: memberA, key: "conversation-1", value: { message: 42 }, expiresAtMillis: 10_000 }
       ])
-      const memberVisible = yield* AtomRegistry.toStreamResult(registry, membersAtom).pipe(
-        Stream.filter((current) => current.some((entry) => entry.member.clientId === memberB.clientId)),
-        Stream.runHead,
+      const memberVisible = yield* awaitSuccess(
+        registry,
+        membersAtom,
+        (current) => current.some((entry) => entry.member.clientId === memberB.clientId)
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* Queue.offer(
@@ -366,17 +435,17 @@ describe("Replica Atom graph", () => {
         })
       )
       yield* Fiber.join(memberVisible)
-      const eventVisible = yield* AtomRegistry.toStreamResult(registry, eventsAtom).pipe(
-        Stream.filter((envelope) => envelope.payload.active),
-        Stream.runHead,
+      const eventVisible = yield* awaitSuccess(registry, eventsAtom, (envelope) => envelope.payload.active).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* Queue.offer(harness.messages, typingEvent(3, { active: true }, memberB))
-      const envelope = Option.getOrThrow(yield* Fiber.join(eventVisible))
+      const envelope = yield* Fiber.join(eventVisible)
       assert.deepStrictEqual(envelope, { member: memberB, payload: { active: true } })
-      const stateVisible = yield* AtomRegistry.toStreamResult(registry, stateAtom).pipe(
-        Stream.filter((current) => current.some((entry) => entry.key === "conversation-2")),
-        Stream.runHead,
+      const stateVisible = yield* awaitSuccess(
+        registry,
+        stateAtom,
+        (current) => current.some((entry) => entry.key === "conversation-2")
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* Queue.offer(harness.messages, readStateSet(4, "conversation-2", { message: 7 }))
@@ -391,7 +460,7 @@ describe("Replica Atom graph", () => {
       const harness = yield* makeEphemeralHarness({ gatePublishes: 1 })
       yield* Queue.offer(harness.messages, ephemeralStarted)
       yield* Queue.offer(harness.messages, ephemeralSnapshot(1))
-      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const graph = ReplicaAtom.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const session = graph.ephemeral(StatusProfile, statusSessionOptions)
@@ -405,10 +474,10 @@ describe("Replica Atom graph", () => {
       yield* Effect.addFinalizer(() => Effect.sync(unmountPublish))
       registry.set(publishTyping, { payload: { active: true }, ttl: "1 second" })
       registry.set(publishTyping, { payload: { active: false }, ttl: "1 second" })
-      const first = yield* Queue.take(harness.published)
+      const first = yield* LosslessQueue.take(harness.published)
       yield* Deferred.succeed(harness.publishGate, undefined)
       yield* AtomRegistry.getResult(registry, publishTyping, { suspendOnWaiting: true })
-      const second = yield* Queue.take(harness.published)
+      const second = yield* LosslessQueue.take(harness.published)
       const values = [first, second].map((request) => {
         assert.strictEqual(request.request._tag, "Event")
         if (request.request._tag !== "Event") return undefined
@@ -430,7 +499,7 @@ describe("Replica Atom graph", () => {
         ttl: "30 seconds"
       })
       yield* AtomRegistry.getResult(registry, publishRead, { suspendOnWaiting: true })
-      const state = yield* Queue.take(harness.published)
+      const state = yield* LosslessQueue.take(harness.published)
       assert.strictEqual(state.request._tag, "SetState")
       if (state.request._tag === "SetState") {
         assert.strictEqual(state.request.channel, "read")
@@ -455,12 +524,41 @@ describe("Replica Atom graph", () => {
   )
 
   it.effect(
+    "removes typed ephemeral state through a memoized atom fn",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeEphemeralHarness()
+      yield* Queue.offer(harness.messages, ephemeralStarted)
+      yield* Queue.offer(harness.messages, ephemeralSnapshot(1))
+      const graph = ReplicaAtom.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const session = graph.ephemeral(StatusProfile, statusSessionOptions)
+      const membersAtom = graph.ephemeralMembers(session)
+      const unmount = registry.mount(membersAtom)
+      yield* Effect.addFinalizer(() => Effect.sync(unmount))
+      yield* AtomRegistry.getResult(registry, membersAtom)
+      const removeRead = graph.removeEphemeral(ReadChannel, { spaceId, member: memberA })
+      assert.strictEqual(graph.removeEphemeral(ReadChannel, { spaceId, member: memberA }), removeRead)
+      const unmountRemove = registry.mount(removeRead)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountRemove))
+      registry.set(removeRead, { key: "conversation-1" })
+      yield* AtomRegistry.getResult(registry, removeRead, { suspendOnWaiting: true })
+      const removed = yield* LosslessQueue.take(harness.published)
+      assert.strictEqual(removed.request._tag, "RemoveState")
+      if (removed.request._tag === "RemoveState") {
+        assert.strictEqual(removed.request.channel, "read")
+        assert.strictEqual(removed.request.key, "conversation-1")
+      }
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "isolates a malformed typed payload to its projection atom",
     Effect.fnUntraced(function*() {
       const harness = yield* makeEphemeralHarness()
       yield* Queue.offer(harness.messages, ephemeralStarted)
       yield* Queue.offer(harness.messages, ephemeralSnapshot(1))
-      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const graph = ReplicaAtom.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const session = graph.ephemeral(StatusProfile, statusSessionOptions)
@@ -477,9 +575,11 @@ describe("Replica Atom graph", () => {
       if (Result.isFailure(poisoned)) {
         assert.strictEqual(poisoned.failure._tag, "EphemeralDecodeError")
       }
-      const stateVisible = yield* AtomRegistry.toStreamResult(registry, stateAtom).pipe(
-        Stream.filter((current) => current.some((entry) => entry.key === "conversation-1")),
-        Stream.runHead,
+      const stateVisible = yield* awaitSuccess(
+        registry,
+        stateAtom,
+        (current) => current.some((entry) => entry.key === "conversation-1")
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* Queue.offer(harness.messages, readStateSet(3, "conversation-1", { message: 1 }))
@@ -505,7 +605,7 @@ describe("Replica Atom graph", () => {
           }]
         })
       )
-      const graph = BrowserReplica.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const graph = ReplicaAtom.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const session = graph.ephemeral(StatusProfile, statusSessionOptions)
@@ -517,14 +617,14 @@ describe("Replica Atom graph", () => {
       yield* Effect.addFinalizer(() => Effect.sync(unmountState))
       const entries = yield* AtomRegistry.getResult(registry, stateAtom)
       assert.strictEqual(entries.length, 1)
-      const replacedMembers = yield* AtomRegistry.toStreamResult(registry, membersAtom).pipe(
-        Stream.filter((current) => current.length === 1 && current[0]?.member.clientId === memberB.clientId),
-        Stream.runHead,
+      const replacedMembers = yield* awaitSuccess(
+        registry,
+        membersAtom,
+        (current) => current.length === 1 && current[0]?.member.clientId === memberB.clientId
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
-      const clearedState = yield* AtomRegistry.toStreamResult(registry, stateAtom).pipe(
-        Stream.filter((current) => current.length === 0),
-        Stream.runHead,
+      const clearedState = yield* awaitSuccess(registry, stateAtom, (current) => current.length === 0).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* Queue.offer(
@@ -542,7 +642,7 @@ describe("Replica Atom graph", () => {
     "reacts to pending mutation submission and settlement",
     Effect.fnUntraced(function*() {
       const faultsReady = yield* Deferred.make<FaultInjection.Service>()
-      const graph = BrowserReplica.make(faultedReplica(faultsReady))
+      const graph = ReplicaAtom.make(faultedReplica(faultsReady))
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const pending = graph.pendingFor(spaceId, PutTodo)
@@ -560,31 +660,115 @@ describe("Replica Atom graph", () => {
 
       const id = `pending-atom-${Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")}`
       yield* faults.holdNextReceipt(spaceId)
-      const submitted = yield* AtomRegistry.toStreamResult(registry, pending).pipe(
-        Stream.filter((items) =>
+      const submitted = yield* awaitSuccess(
+        registry,
+        pending,
+        (items) =>
           items.some((item) => item.payload.id === id && item.submissionState === "Submitting" && item.attempts > 0)
-        ),
-        Stream.runHead,
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       registry.set(mutation, { id, title: "0-pending" })
       yield* faults.awaitReceiptCommitted(spaceId)
-      const pendingItems = Option.getOrThrow(yield* Fiber.join(submitted))
+      const pendingItems = yield* Fiber.join(submitted)
       const item = pendingItems.find((candidate) => candidate.payload.id === id)
       assert.isDefined(item)
       assert.deepStrictEqual(item.payload, { id, title: "0-pending" })
       assert.strictEqual(item.submissionState, "Submitting")
       assert.strictEqual(item.attempts, 1)
 
-      const settled = yield* AtomRegistry.toStreamResult(registry, pending).pipe(
-        Stream.filter((items) => !items.some((candidate) => candidate.payload.id === id)),
-        Stream.runHead,
+      const settled = yield* awaitSuccess(
+        registry,
+        pending,
+        (items) => !items.some((candidate) => candidate.payload.id === id)
+      ).pipe(
         Effect.forkScoped({ startImmediately: true })
       )
       yield* faults.releaseHeldReceipt(spaceId)
       yield* faults.awaitReceiptReturned(spaceId)
-      const settledItems = Option.getOrThrow(yield* Fiber.join(settled))
+      const settledItems = yield* Fiber.join(settled)
       assert.isFalse(settledItems.some((candidate) => candidate.payload.id === id))
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "settles a derived atom that looks up its query while reading",
+    Effect.fnUntraced(function*() {
+      rangeReads.clear()
+      const graph = ReplicaAtom.make(layerReplica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const upper = Atom.make("m")
+      const window = Atom.readable((get) => get(graph.query(spaceId, RangeTodos)({ lower: "a", upper: get(upper) })))
+      const unmount = registry.mount(window)
+      yield* Effect.addFinalizer(() => Effect.sync(unmount))
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, window), [])
+      yield* Effect.yieldNow.pipe(Effect.repeat({ times: 64 }))
+      assert.strictEqual(rangeReads.get("a:m"), 1)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "returns the same atom for equal arguments from every graph accessor",
+    Effect.fnUntraced(function*() {
+      const graph = ReplicaAtom.make(layerReplica)
+      const mutationId = Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000001")
+      assert.strictEqual(
+        graph.query(spaceId, RangeTodos)({ lower: "a", upper: "m" }),
+        graph.query(spaceId, RangeTodos)({ lower: "a", upper: "m" })
+      )
+      assert.strictEqual(graph.query(spaceId, ListTodos)(undefined), graph.query(spaceId, ListTodos)(undefined))
+      assert.strictEqual(graph.entity(spaceId, Todo)("1"), graph.entity(spaceId, Todo)("1"))
+      assert.strictEqual(graph.receipt(spaceId, PutTodo, mutationId), graph.receipt(spaceId, PutTodo, mutationId))
+      assert.strictEqual(graph.pendingFor(spaceId, PutTodo), graph.pendingFor(spaceId, PutTodo))
+      assert.strictEqual(graph.settlementsFor(spaceId, PutTodo), graph.settlementsFor(spaceId, PutTodo))
+      assert.notStrictEqual(graph.pendingFor(spaceId, PutTodo), graph.pendingFor(secondSpaceId, PutTodo))
+    })
+  )
+
+  it.effect(
+    "keeps query payloads whose decoded values differ on separate atoms",
+    Effect.fnUntraced(function*() {
+      const graph = ReplicaAtom.make(layerReplica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const first = graph.query(spaceId, TitlesEcho)({ titles: new Set(["a"]) })
+      const second = graph.query(spaceId, TitlesEcho)({ titles: new Set(["b"]) })
+      const unmountFirst = registry.mount(first)
+      const unmountSecond = registry.mount(second)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountSecond()
+          unmountFirst()
+        })
+      )
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, first, { suspendOnWaiting: true }), ["a"])
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, second, { suspendOnWaiting: true }), ["b"])
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "resolves each mutation handle with the mutation it submitted",
+    Effect.fnUntraced(function*() {
+      const graph = ReplicaAtom.make(layerReplica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const firstRow = graph.mutation(spaceId, PutTodo)
+      const secondRow = graph.mutation(spaceId, PutTodo)
+      const unmountFirst = registry.mount(firstRow)
+      const unmountSecond = registry.mount(secondRow)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountSecond()
+          unmountFirst()
+        })
+      )
+      registry.set(firstRow, { id: "row-1", title: "first" })
+      registry.set(secondRow, { id: "row-2", title: "second" })
+      const firstPending = yield* AtomRegistry.getResult(registry, firstRow, { suspendOnWaiting: true })
+      const secondPending = yield* AtomRegistry.getResult(registry, secondRow, { suspendOnWaiting: true })
+      assert.deepStrictEqual(firstPending.envelope.payload, { id: "row-1", title: "first" })
+      assert.deepStrictEqual(secondPending.envelope.payload, { id: "row-2", title: "second" })
     }, Effect.scoped)
   )
 
@@ -592,7 +776,7 @@ describe("Replica Atom graph", () => {
     "reruns raw-SQL queries of the written model and keeps every window correct",
     Effect.fnUntraced(function*() {
       rangeReads.clear()
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const related = graph.query(spaceId, RangeTodos)({ lower: "a", upper: "m" })
@@ -628,9 +812,41 @@ describe("Replica Atom graph", () => {
   )
 
   it.effect(
+    "publishes a query result outdated by an invalidation during its run as waiting",
+    Effect.fnUntraced(function*() {
+      const probe = {
+        armed: yield* Ref.make(true),
+        entered: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>()
+      }
+      const graph = ReplicaAtom.make(layerReplicaWithHeldQuery(probe))
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const todos = graph.query(spaceId, ListTodos)(undefined)
+      const mutation = graph.mutation(spaceId, PutTodo)
+      const unmountTodos = registry.mount(todos)
+      const unmountMutation = registry.mount(mutation)
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          unmountMutation()
+          unmountTodos()
+        })
+      )
+      yield* Deferred.await(probe.entered)
+      registry.set(mutation, { id: "held", title: "written during the read" })
+      yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      const firstSettled = yield* AtomRegistry.getResult(registry, todos, { suspendOnWaiting: true }).pipe(
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Deferred.succeed(probe.release, undefined)
+      assert.deepStrictEqual(yield* Fiber.join(firstSettled), [{ id: "held", title: "written during the read" }])
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "refreshes an entity atom when its key has a different encoded representation",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const entity = graph.entity(spaceId, Numbered)(1)
@@ -679,7 +895,7 @@ describe("Replica Atom graph", () => {
         Layer.effect(Replica.Replica),
         Layer.provideMerge(layerReplica)
       )
-      const graph = BrowserReplica.make(layerObserved)
+      const graph = ReplicaAtom.make(layerObserved)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const changed = graph.entity(spaceId, Todo)("changed")
@@ -746,7 +962,7 @@ describe("Replica Atom graph", () => {
         Layer.effect(Replica.Replica),
         Layer.provideMerge(layerReplica)
       )
-      const graph = BrowserReplica.make(layerObserved)
+      const graph = ReplicaAtom.make(layerObserved)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const membership = graph.spaces
@@ -775,7 +991,7 @@ describe("Replica Atom graph", () => {
   it.effect(
     "reacts to per-space scope and activation commands",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const scopeAtom = graph.scope(spaceId)
@@ -812,11 +1028,11 @@ describe("Replica Atom graph", () => {
   )
 
   it("uses the shared runtime factory by default and preserves an explicit factory", () => {
-    const graph = BrowserReplica.make(layerReplica)
+    const graph = ReplicaAtom.make(layerReplica)
     assert.strictEqual(graph.factory, Atom.runtime)
 
     const factory = Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
-    const customGraph = BrowserReplica.make(layerReplica, { factory })
+    const customGraph = ReplicaAtom.make(layerReplica, { factory })
     assert.strictEqual(customGraph.factory, factory)
   })
 
@@ -828,7 +1044,7 @@ describe("Replica Atom graph", () => {
         return 17
       }
     } satisfies Duration.Input
-    const graph = BrowserReplica.make(layerReplica, { idleTTL })
+    const graph = ReplicaAtom.make(layerReplica, { idleTTL })
     const readsAfterConstruction = reads
 
     assert.isAbove(readsAfterConstruction, 0)
@@ -846,7 +1062,7 @@ describe("Replica Atom graph", () => {
   it.live(
     "runs mutation, entity, query, receipt, and status state through one reactive runtime",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica, {
+      const graph = ReplicaAtom.make(layerReplica, {
         factory: Atom.context({ memoMap: Layer.makeMemoMapUnsafe() })
       })
       const registry = AtomRegistry.make()
@@ -882,12 +1098,7 @@ describe("Replica Atom graph", () => {
       )
       assert.strictEqual(pending.envelope.name, PutTodo.name)
       const receipt = graph.receipt(spaceId, PutTodo, pending.envelope.mutationId)
-      const accepted = Option.getOrThrow(Option.getOrThrow(
-        yield* AtomRegistry.toStreamResult(registry, receipt).pipe(
-          Stream.filter(Option.isSome),
-          Stream.runHead
-        )
-      ))
+      const accepted = Option.getOrThrow(yield* awaitSuccess(registry, receipt, Option.isSome))
       assert.strictEqual(accepted._tag, "Accepted")
       pipe(
         (yield* AtomRegistry.getResult(registry, query)).filter((todo) => todo.id === "1"),
@@ -895,13 +1106,14 @@ describe("Replica Atom graph", () => {
       )
       const status = yield* AtomRegistry.getResult(registry, graph.status(spaceId))
       assert.strictEqual(status._tag, "Online")
+      assert.strictEqual(status.synced, true)
     })
   )
 
   it.effect(
     "keeps addressed atoms isolated and shares membership through one runtime",
     Effect.fnUntraced(function*() {
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const firstEntity = graph.entity(spaceId, Todo)("shared")
@@ -960,10 +1172,7 @@ describe("Replica Atom graph", () => {
       )
 
       const awaitReceipt = (address: Identity.SpaceId, mutationId: Identity.MutationId) =>
-        AtomRegistry.toStreamResult(registry, graph.receipt(address, PutTodo, mutationId)).pipe(
-          Stream.filter(Option.isSome),
-          Stream.runHead,
-          Effect.map(Option.getOrThrow),
+        awaitSuccess(registry, graph.receipt(address, PutTodo, mutationId), Option.isSome).pipe(
           Effect.map(Option.getOrThrow)
         )
       const [firstReceipt, secondReceipt] = yield* Effect.all([
@@ -977,20 +1186,18 @@ describe("Replica Atom graph", () => {
       assert.strictEqual((yield* AtomRegistry.getResult(registry, graph.aggregateStatus)).spaces, 2)
 
       registry.set(graph.join, thirdSpaceId)
-      const joinedSpaces = Option.getOrThrow(
-        yield* AtomRegistry.toStreamResult(registry, graph.spaces).pipe(
-          Stream.filter((spaces) => spaces.some((space) => space.spaceId === thirdSpaceId)),
-          Stream.runHead
-        )
+      const joinedSpaces = yield* awaitSuccess(
+        registry,
+        graph.spaces,
+        (spaces) => spaces.some((space) => space.spaceId === thirdSpaceId)
       )
       assert.deepStrictEqual(joinedSpaces.map((space) => space.spaceId), [spaceId, secondSpaceId, thirdSpaceId])
 
       registry.set(graph.leave, secondSpaceId)
-      const remainingSpaces = Option.getOrThrow(
-        yield* AtomRegistry.toStreamResult(registry, graph.spaces).pipe(
-          Stream.filter((spaces) => !spaces.some((space) => space.spaceId === secondSpaceId)),
-          Stream.runHead
-        )
+      const remainingSpaces = yield* awaitSuccess(
+        registry,
+        graph.spaces,
+        (spaces) => !spaces.some((space) => space.spaceId === secondSpaceId)
       )
       assert.deepStrictEqual(remainingSpaces.map((space) => space.spaceId), [spaceId, thirdSpaceId])
       const error = yield* AtomRegistry.getResult(registry, secondEntity).pipe(Effect.flip)

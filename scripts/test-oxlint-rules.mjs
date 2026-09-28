@@ -994,7 +994,7 @@ import * as Schema from "effect/Schema"
 import type { unhandled as EffectUnhandled } from "effect/Types"
 import * as Socket from "effect/unstable/socket/Socket"
 
-class Tagged extends Schema.TaggedErrorClass<Tagged>()("Tagged", {}) {}
+class Tagged extends Schema.TaggedError<Tagged>()("Tagged", {}) {}
 interface OptionalTag { readonly _tag?: "OptionalTag" }
 interface unhandled { readonly _: unique symbol }
 interface PublicService {

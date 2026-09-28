@@ -22,10 +22,12 @@ export const maximumEphemeralMemberTtlMillis = 60_000
 export const maximumEphemeralEventTtlMillis = 60_000
 export const maximumEphemeralStateTtlMillis = 7 * 24 * 60 * 60 * 1_000
 export const maximumBootstrapEntries = 1_000
+export const maximumSubmitBatchEntries = 64
 
 export const ProtocolVersion = Schema.Int.check(Schema.isGreaterThan(0))
 export type ProtocolVersion = typeof ProtocolVersion.Type
 export const currentProtocolVersion = ProtocolVersion.make(1)
+export const supportedProtocolVersions: ReadonlyArray<ProtocolVersion> = [currentProtocolVersion]
 const withProtocolVersion = Schema.fieldsAssign({ protocolVersion: ProtocolVersion })
 export const NegotiateRequest = Schema.Struct({
   supportedVersions: Schema.Array(ProtocolVersion).check(Schema.isMinLength(1))
@@ -44,7 +46,7 @@ export const encodedBytesEffect = (
 export const MutationDigest = Schema.String.check(Schema.isPattern(/^[0-9a-f]{64}$/))
 export type MutationDigest = typeof MutationDigest.Type
 
-export const MutationDigestVersion = Schema.Literal(3)
+export const MutationDigestVersion = Schema.Literal(1)
 export type MutationDigestVersion = typeof MutationDigestVersion.Type
 
 const MutationIdentity = {
@@ -74,7 +76,16 @@ export const SubmitRequest = Schema.Struct({
   schema: Identity.SchemaIdentity
 })
 export type SubmitRequest = typeof SubmitRequest.Type
-export const VersionedSubmitRequest = SubmitRequest.pipe(withProtocolVersion)
+
+export const SubmitBatchRequest = Schema.Struct({
+  envelopes: Schema.Array(MutationEnvelope).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(maximumSubmitBatchEntries)
+  ),
+  schema: Identity.SchemaIdentity
+})
+export type SubmitBatchRequest = typeof SubmitBatchRequest.Type
+export const VersionedSubmitBatchRequest = SubmitBatchRequest.pipe(withProtocolVersion)
 
 export const DiscardRequest = Schema.Struct({
   envelope: MutationEnvelope,
@@ -374,7 +385,7 @@ export const AcceptedReceipt = Schema.TaggedStruct("Accepted", {
 })
 export type AcceptedReceipt = typeof AcceptedReceipt.Type
 
-export const RejectionOrigin = Schema.Literals(["Mutation", "Authorization", "Capacity", "Legacy", "Quarantine"])
+export const RejectionOrigin = Schema.Literals(["Mutation", "Authorization", "Capacity", "Quarantine"])
 export type RejectionOrigin = typeof RejectionOrigin.Type
 
 export const RejectedReceipt = Schema.TaggedStruct("Rejected", {
@@ -388,15 +399,6 @@ export const RejectedReceipt = Schema.TaggedStruct("Rejected", {
 })
 export type RejectedReceipt = typeof RejectedReceipt.Type
 
-export const LegacyReceipt = Schema.TaggedStruct("Legacy", {
-  ...ReceiptIdentity,
-  sourceSchema: Identity.SchemaIdentity,
-  outcome: Schema.Literals(["Accepted", "Rejected"]),
-  serverSequence: Schema.NullOr(Identity.ServerSequence),
-  body: Schema.Json
-})
-export type LegacyReceipt = typeof LegacyReceipt.Type
-
 export const ExpiredReceipt = Schema.TaggedStruct("Expired", {
   ...ReceiptIdentity,
   name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
@@ -408,8 +410,16 @@ export const ExpiredReceipt = Schema.TaggedStruct("Expired", {
 })
 export type ExpiredReceipt = typeof ExpiredReceipt.Type
 
-export const Receipt = Schema.Union([AcceptedReceipt, RejectedReceipt, LegacyReceipt, ExpiredReceipt])
+export const Receipt = Schema.Union([AcceptedReceipt, RejectedReceipt, ExpiredReceipt])
 export type Receipt = typeof Receipt.Type
+
+export const SubmitBatchResult = Schema.Struct({
+  receipts: Schema.Array(Receipt).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(maximumSubmitBatchEntries)
+  )
+})
+export type SubmitBatchResult = typeof SubmitBatchResult.Type
 
 export const AcceptedMutation = Schema.Struct({
   sequence: Identity.ServerSequence,

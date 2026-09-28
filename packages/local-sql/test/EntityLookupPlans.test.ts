@@ -8,6 +8,7 @@ import * as Layer from "effect/Layer"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { DatabaseSync } from "node:sqlite"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -137,7 +138,7 @@ const envelope = Effect.fnUntraced(function*(
     basis: Identity.ServerSequence.make(0),
     name,
     payload,
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: Domain.definition.schemaIdentity,
     mutationVersion: Identity.SchemaVersion.make(1)
@@ -152,7 +153,7 @@ const windowedScope = Protocol.ReplicationScope.make({
 
 const layers = () => {
   const layerDatabase = Layer.mergeAll(
-    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))),
     NodeCrypto.layer,
     Reactivity.layer,
     QueryReactivity.layer
@@ -186,8 +187,10 @@ const layers = () => {
     const store = yield* ServerStore.ServerStore
     return SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
       discard: (request) => store.discard(request, "reader"),
-      submit: store.submit,
+      submitBatch: (request) => store.admitBatch(request, null),
       pull: (request) => store.pullAuthorized(request, "reader"),
       bootstrap: (request) => store.bootstrapAuthorized(request, "reader"),
       watch: (request) => store.watchAuthorized(request, "reader").pipe(Stream.unwrap)

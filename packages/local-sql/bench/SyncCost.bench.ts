@@ -9,7 +9,8 @@ import * as ManagedRuntime from "effect/ManagedRuntime"
 import * as Option from "effect/Option"
 import * as Stream from "effect/Stream"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import { afterAll, assert, bench, describe } from "vitest"
+import { afterAll, assert, describe, test } from "vitest"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -47,7 +48,7 @@ const envelope = Effect.fnUntraced(
       basis: Identity.ServerSequence.make(0),
       name,
       payload,
-      digestVersion: 3 as const,
+      digestVersion: 1 as const,
       membershipIncarnation,
       sourceSchema: Domain.definition.schemaIdentity,
       mutationVersion: Identity.SchemaVersion.make(1)
@@ -66,7 +67,13 @@ interface Environment {
 
 const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
   const layerDatabase = SqliteClient.layer({ filename: ":memory:", disableWAL: true }).pipe(
-    (sqlite) => Layer.mergeAll(sqlite, NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
+    (sqlite) =>
+      Layer.mergeAll(
+        ConnectionLane.makeLayer().pipe(Layer.provideMerge(sqlite)),
+        NodeCrypto.layer,
+        Reactivity.layer,
+        QueryReactivity.layer
+      )
   )
   const layerMutationRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
   const layerServer = ServerStore.layer({
@@ -97,8 +104,10 @@ const makeEnvironment = (scope: Protocol.ReplicationScope): Environment => {
     const server = yield* ServerStore.ServerStore
     return SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
       discard: (request) => server.discard(request, "reader"),
-      submit: server.submit,
+      submitBatch: (request) => server.admitBatch(request, null),
       pull: (request) => server.pullAuthorized(request, "reader"),
       bootstrap: (request) => server.bootstrapAuthorized(request, "reader"),
       watch: (request) => server.watchAuthorized(request, "reader").pipe(Stream.unwrap)
@@ -203,26 +212,28 @@ afterAll(async () => {
 describe("per-message sync cost by space size", () => {
   for (const { entityCount, iterations, label, scope } of configurations) {
     const windowed = scope === windowedScope
-    bench(label, async () => {
-      let environment = environments.get(label)
-      if (environment === undefined) {
-        environment = makeEnvironment(scope)
-        environments.set(label, environment)
+    test(label, async ({ bench }) => {
+      await bench(label, async () => {
+        let environment = environments.get(label)
+        if (environment === undefined) {
+          environment = makeEnvironment(scope)
+          environments.set(label, environment)
+          if (windowed) {
+            // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
+            await environment.runtime.runPromise(seedMessages(environment, entityCount))
+          } else {
+            // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
+            await environment.runtime.runPromise(seedTodos(environment, entityCount))
+          }
+        }
         if (windowed) {
           // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
-          await environment.runtime.runPromise(seedMessages(environment, entityCount))
+          await environment.runtime.runPromise(syncOneMessage(environment))
         } else {
           // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
-          await environment.runtime.runPromise(seedTodos(environment, entityCount))
+          await environment.runtime.runPromise(syncOneTodo(environment))
         }
-      }
-      if (windowed) {
-        // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
-        await environment.runtime.runPromise(syncOneMessage(environment))
-      } else {
-        // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest owns this benchmark execution boundary.
-        await environment.runtime.runPromise(syncOneTodo(environment))
-      }
-    }, { iterations, time: 0, warmupIterations: 1, warmupTime: 0, throws: true })
+      }).run({ iterations, time: 0, warmupIterations: 1, warmupTime: 0, throws: true })
+    }, 600_000)
   }
 })

@@ -1,5 +1,6 @@
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
@@ -45,7 +46,7 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
         "sessionAcquisitionTimeout",
         options?.sessionAcquisitionTimeout ?? "10 seconds"
       )
-      const configured = options?.supportedProtocolVersions ?? [Protocol.currentProtocolVersion]
+      const configured = options?.supportedProtocolVersions ?? Protocol.supportedProtocolVersions
       const request = yield* Schema.decodeUnknownEffect(Protocol.NegotiateRequest)({
         supportedVersions: configured
       }).pipe(
@@ -74,6 +75,7 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
               SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
               SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
               SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
               HttpError: (reason, error) => {
                 if (reason.kind === "TransportError") {
                   return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -95,6 +97,10 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
             },
             (_, error) => Effect.die(error)
           ),
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+            return Effect.failCause(cause)
+          }),
           Effect.withSpan("ProtocolSession.negotiate")
         )
         yield* Ref.set(selected, negotiated.version)

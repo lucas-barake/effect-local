@@ -21,7 +21,8 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { setFlagsFromString } from "node:v8"
 import { runInNewContext } from "node:vm"
-import { assert, bench, describe } from "vitest"
+import { assert, describe, test } from "vitest"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as Codec from "../src/internal/codec.js"
 import * as Migrations from "../src/Migrations.js"
 import * as SqlReplica from "../src/SqlReplica.js"
@@ -60,7 +61,9 @@ const collectGarbage = Effect.promise(() => exposedGc({ execution: "async" }))
 const layerReplica = (onWatchCount: (change: number) => void, layerServices: Layer.Layer<any>) => {
   const remote = SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
-    submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+    transportGeneration: Effect.succeed(0),
+    waitForTransportChange: () => Effect.never,
+    submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
     discard: () => Effect.fail(new ReplicaError.ServerUnavailable()),
     pull: () => Effect.never,
     bootstrap: () => Effect.fail(new ReplicaError.ServerUnavailable()),
@@ -136,7 +139,7 @@ const measure = async (spaceCount: Scale): Promise<Measurement> => {
           definition: Domain.definition,
           clientId,
           migration: { retryDelay: "1 millis", maximumAttempts: 8 }
-        }).pipe(Effect.provideService(SqlClient.SqlClient, sql))
+        }).pipe(Effect.provide(ConnectionLane.makeLayer()), Effect.provideService(SqlClient.SqlClient, sql))
         const scopeJson = yield* Codec.stringify(defaultScope)
         const scopeDigest = yield* Protocol.replicationScopeDigest(defaultScope).pipe(
           Effect.provideService(Crypto.Crypto, crypto)
@@ -213,20 +216,22 @@ switch (requestedScale) {
 }
 
 describe("remembered space runtime scale", () => {
-  bench(`${selectedScale} remembered spaces`, async () => {
-    const current = await measure(selectedScale)
-    const baseline = eagerBaselineAtE999e1c[selectedScale]
-    // oxlint-disable-next-line no-console -- Resource measurements are the benchmark result.
-    console.table([{
-      spaces: selectedScale,
-      baselineFibers: baseline.fibers,
-      currentFibers: current.fibers,
-      baselineWatches: baseline.watches,
-      currentWatches: current.watches,
-      baselineHeapMiB: baseline.heapBytes / 1024 / 1024,
-      currentHeapMiB: current.heapBytes / 1024 / 1024,
-      baselineStartupMillis: baseline.startupMillis,
-      currentStartupMillis: current.startupMillis
-    }])
-  }, { iterations: 1, time: 0, warmupIterations: 0, warmupTime: 0, throws: true })
+  test(`${selectedScale} remembered spaces`, async ({ bench }) => {
+    await bench(`${selectedScale} remembered spaces`, async () => {
+      const current = await measure(selectedScale)
+      const baseline = eagerBaselineAtE999e1c[selectedScale]
+      // oxlint-disable-next-line no-console -- Resource measurements are the benchmark result.
+      console.table([{
+        spaces: selectedScale,
+        baselineFibers: baseline.fibers,
+        currentFibers: current.fibers,
+        baselineWatches: baseline.watches,
+        currentWatches: current.watches,
+        baselineHeapMiB: baseline.heapBytes / 1024 / 1024,
+        currentHeapMiB: current.heapBytes / 1024 / 1024,
+        baselineStartupMillis: baseline.startupMillis,
+        currentStartupMillis: current.startupMillis
+      }])
+    }).run({ iterations: 1, time: 0, warmupIterations: 0, warmupTime: 0, throws: true })
+  })
 })

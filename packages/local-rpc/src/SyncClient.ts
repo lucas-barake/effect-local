@@ -1,20 +1,30 @@
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
+import type * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
+import * as Context from "effect/Context"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import type * as Schedule from "effect/Schedule"
+import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
+import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as RpcClient from "effect/unstable/rpc/RpcClient"
 import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import type * as Socket from "effect/unstable/socket/Socket"
+import * as Socket from "effect/unstable/socket/Socket"
 import * as Authentication from "./Authentication.js"
+import * as EphemeralClient from "./EphemeralClient.js"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSocket from "./internal/protocolSocket.js"
+import { hasRemoteDefect } from "./internal/remoteDefect.js"
 import * as ProtocolSession from "./ProtocolSession.js"
+import * as SyncRpc from "./SyncRpc.js"
+import * as Transport from "./Transport.js"
 
 export interface Options extends ProtocolSession.Options {
   readonly rpcTimeout?: Duration.Input
@@ -23,7 +33,7 @@ export interface Options extends ProtocolSession.Options {
 export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.Layer<
   SyncEngine.SyncEngine,
   ReplicaError.InvalidConfiguration,
-  Authentication.CredentialProvider | ProtocolSession.ProtocolSession
+  Authentication.CredentialProvider | ProtocolSession.ProtocolSession | Transport.Transport
 > =>
   Layer.effect(
     SyncEngine.SyncEngine,
@@ -34,63 +44,81 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
       )
       const session = yield* ProtocolSession.ProtocolSession
       const credentialProvider = yield* Authentication.CredentialProvider
+      const transport = yield* Transport.Transport
       const client = session.client
+      const submitBatch = (request: Protocol.SubmitBatchRequest, version: Protocol.ProtocolVersion) =>
+        client.SubmitBatch({ ...request, protocolVersion: version }).pipe(
+          Effect.catchReasons(
+            "RpcClientError",
+            {
+              WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+              HttpError: (reason, error) => {
+                if (reason.kind === "TransportError") {
+                  return Effect.fail(new ReplicaError.ServerUnavailable())
+                }
+                return Effect.fail(
+                  new ReplicaError.ProtocolInvalid({
+                    message: "The SubmitBatch RPC failed",
+                    cause: error
+                  })
+                )
+              },
+              RpcClientDefect: (_, error) =>
+                Effect.fail(
+                  new ReplicaError.ProtocolInvalid({
+                    message: "The SubmitBatch RPC failed",
+                    cause: error
+                  })
+                )
+            },
+            (_, error) => Effect.die(error)
+          ),
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+            return Effect.failCause(cause)
+          }),
+          Effect.timeoutOrElse({
+            duration: rpcTimeoutMillis,
+            orElse: () =>
+              Effect.fail(
+                new ReplicaError.OperationTimeout({
+                  operation: "SubmitBatch",
+                  timeoutMillis: rpcTimeoutMillis
+                })
+              )
+          })
+        )
       return SyncEngine.SyncEngine.of({
         waitForCredentialChange: (rejectedGeneration) =>
           credentialProvider.awaitChange(rejectedGeneration).pipe(Effect.asVoid),
-        submit: (request) =>
-          ProtocolSessionRetry.run(session, (version) =>
-            client.Submit({ ...request, protocolVersion: version }).pipe(
-              Effect.catchReasons(
-                "RpcClientError",
-                {
-                  WorkerSpawnError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  WorkerSendError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  WorkerReceiveError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  WorkerUnknownError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketReadError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
-                  HttpError: (reason, error) => {
-                    if (reason.kind === "TransportError") {
-                      return Effect.fail(new ReplicaError.ServerUnavailable())
-                    }
-                    return Effect.fail(
-                      new ReplicaError.ProtocolInvalid({
-                        message: "The Submit RPC failed",
-                        cause: error
-                      })
-                    )
-                  },
-                  RpcClientDefect: (_, error) =>
-                    Effect.fail(
-                      new ReplicaError.ProtocolInvalid({
-                        message: "The Submit RPC failed",
-                        cause: error
-                      })
-                    )
-                },
-                (_, error) => Effect.die(error)
-              ),
-              Effect.timeoutOrElse({
-                duration: rpcTimeoutMillis,
-                orElse: () =>
-                  Effect.fail(
-                    new ReplicaError.OperationTimeout({
-                      operation: "Submit",
-                      timeoutMillis: rpcTimeoutMillis
-                    })
-                  )
-              })
-            )).pipe(
-              Effect.withSpan("SyncClient.submit", {
-                attributes: {
-                  "space.id": request.envelope.spaceId,
-                  "mutation.id": request.envelope.mutationId
-                }
-              })
-            ),
+        transportGeneration: transport.generation,
+        waitForTransportChange: transport.waitForChange,
+        submitBatch: (request) =>
+          ProtocolSessionRetry.run(session, (version) => submitBatch(request, version)).pipe(
+            Effect.catchCause((cause) => {
+              if (!hasRemoteDefect(cause)) return Effect.failCause(cause)
+              return Effect.fail(
+                new ReplicaError.ProtocolInvalid({
+                  message: "The SubmitBatch RPC failed on the server",
+                  cause: Cause.squash(cause)
+                })
+              )
+            }),
+            Effect.withSpan("SyncClient.submitBatch", {
+              attributes: {
+                "space.id": request.envelopes[0].spaceId,
+                "batch.size": request.envelopes.length
+              }
+            })
+          ),
         discard: (request) =>
           ProtocolSessionRetry.run(session, (version) =>
             client.Discard({ ...request, protocolVersion: version }).pipe(
@@ -105,6 +133,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                   SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   HttpError: (reason, error) => {
                     if (reason.kind === "TransportError") {
                       return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -126,6 +155,10 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                 },
                 (_, error) => Effect.die(error)
               ),
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+                return Effect.failCause(cause)
+              }),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
                 orElse: () =>
@@ -137,6 +170,15 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                   )
               })
             )).pipe(
+              Effect.catchCause((cause) => {
+                if (!hasRemoteDefect(cause)) return Effect.failCause(cause)
+                return Effect.fail(
+                  new ReplicaError.ProtocolInvalid({
+                    message: "The Discard RPC failed on the server",
+                    cause: Cause.squash(cause)
+                  })
+                )
+              }),
               Effect.withSpan("SyncClient.discard", {
                 attributes: {
                   "space.id": request.envelope.spaceId,
@@ -158,6 +200,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                   SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   HttpError: (reason, error) => {
                     if (reason.kind === "TransportError") {
                       return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -179,6 +222,10 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                 },
                 (_, error) => Effect.die(error)
               ),
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+                return Effect.failCause(cause)
+              }),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
                 orElse: () =>
@@ -191,6 +238,15 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
               })
             ))
             .pipe(
+              Effect.catchCause((cause) => {
+                if (!hasRemoteDefect(cause)) return Effect.failCause(cause)
+                return Effect.fail(
+                  new ReplicaError.ProtocolInvalid({
+                    message: "The Pull RPC failed on the server",
+                    cause: Cause.squash(cause)
+                  })
+                )
+              }),
               Effect.withSpan("SyncClient.pull", {
                 attributes: {
                   "space.id": request.spaceId,
@@ -213,6 +269,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                   SocketWriteError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketOpenError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   SocketCloseError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+                  SocketUpgradeError: () => Effect.fail(new ReplicaError.ServerUnavailable()),
                   HttpError: (reason, error) => {
                     if (reason.kind === "TransportError") {
                       return Effect.fail(new ReplicaError.ServerUnavailable())
@@ -234,6 +291,10 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                 },
                 (_, error) => Effect.die(error)
               ),
+              Effect.catchCause((cause) => {
+                if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
+                return Effect.failCause(cause)
+              }),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
                 orElse: () =>
@@ -245,6 +306,15 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                   )
               })
             )).pipe(
+              Effect.catchCause((cause) => {
+                if (!hasRemoteDefect(cause)) return Effect.failCause(cause)
+                return Effect.fail(
+                  new ReplicaError.ProtocolInvalid({
+                    message: "The Bootstrap RPC failed on the server",
+                    cause: Cause.squash(cause)
+                  })
+                )
+              }),
               Effect.withSpan("SyncClient.bootstrap", {
                 attributes: { "space.id": request.spaceId, "snapshot.id": request.snapshotId }
               })
@@ -273,7 +343,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                     }),
                     Effect.ensuring(Fiber.interrupt(acquisition))
                   )
-                  return Stream.fromQueue(queue).pipe(
+                  return LosslessQueue.stream(queue).pipe(
                     Stream.catchReasons(
                       "RpcClientError",
                       {
@@ -285,6 +355,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                         SocketWriteError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
                         SocketOpenError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
                         SocketCloseError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                        SocketUpgradeError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
                         HttpError: (reason, error) => {
                           if (reason.kind === "TransportError") {
                             return Stream.fail(new ReplicaError.ServerUnavailable())
@@ -305,11 +376,24 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                           )
                       },
                       (_, error) => Stream.die(error)
-                    )
+                    ),
+                    Stream.catchCause((cause) => {
+                      if (Cause.hasInterruptsOnly(cause)) return Stream.fail(new ReplicaError.ServerUnavailable())
+                      return Stream.failCause(cause)
+                    })
                   )
                 })
               )
           ).pipe(
+            Stream.catchCause((cause) => {
+              if (!hasRemoteDefect(cause)) return Stream.failCause(cause)
+              return Stream.fail(
+                new ReplicaError.ProtocolInvalid({
+                  message: "The Watch RPC failed on the server",
+                  cause: Cause.squash(cause)
+                })
+              )
+            }),
             Stream.withSpan("SyncClient.watch", {
               attributes: { "space.id": request.spaceId }
             })
@@ -321,7 +405,10 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
 export const layerWithOptions = (options?: Options): Layer.Layer<
   SyncEngine.SyncEngine,
   ReplicaError.InvalidConfiguration,
-  Authentication.CredentialProvider | RpcClient.Protocol | RpcMiddleware.ForClient<Authentication.Authentication>
+  | Authentication.CredentialProvider
+  | RpcClient.Protocol
+  | RpcMiddleware.ForClient<Authentication.Authentication>
+  | Transport.Transport
 > => layerFromSession(options).pipe(Layer.provide(ProtocolSession.layerWithOptions(options)))
 
 export const layer = layerFromSession().pipe(Layer.provide(ProtocolSession.layer))
@@ -329,5 +416,87 @@ export const layer = layerFromSession().pipe(Layer.provide(ProtocolSession.layer
 export const layerProtocolSocket = (options?: {
   readonly retryTransientErrors?: boolean
   readonly retryPolicy?: Schedule.Schedule<any, Socket.SocketError>
-}): Layer.Layer<RpcClient.Protocol, never, Socket.Socket | RpcSerialization.RpcSerialization> =>
-  Layer.effect(RpcClient.Protocol, ProtocolSocket.make(options))
+}): Layer.Layer<RpcClient.Protocol | Transport.Transport, never, Socket.Socket | RpcSerialization.RpcSerialization> =>
+  Layer.effectContext(Effect.gen(function*() {
+    const { protocol, connections } = yield* ProtocolSocket.make(options)
+    const transport = Transport.Transport.of({
+      generation: SubscriptionRef.get(connections),
+      waitForChange: (observedGeneration) =>
+        SubscriptionRef.changes(connections).pipe(
+          Stream.filter((generation) => generation > observedGeneration),
+          Stream.runHead,
+          Effect.asVoid
+        )
+    })
+    return Context.make(RpcClient.Protocol, protocol).pipe(Context.add(Transport.Transport, transport))
+  }))
+
+export interface WebSocketOptions<R = never,> extends EphemeralClient.Options {
+  readonly url: string | Effect.Effect<string, never, R>
+  readonly maximumFrameBytes?: number
+  readonly retryTransientErrors?: boolean
+  readonly retryPolicy?: Schedule.Schedule<any, Socket.SocketError>
+  readonly socket?: {
+    readonly openTimeout?: Duration.Input | undefined
+    readonly protocols?: string | Array<string> | undefined
+  }
+}
+
+/**
+ * One WebSocket carrying both the sync engine and the ephemeral client over a
+ * shared protocol session. The credential middleware is built fresh per call
+ * so two clients with different providers under one memo map never share it.
+ */
+export const layerWebSocket = <R = never,>(options: WebSocketOptions<R>): Layer.Layer<
+  SyncEngine.SyncEngine | EphemeralClient.EphemeralClient,
+  ReplicaError.InvalidConfiguration,
+  Authentication.CredentialProvider | Socket.WebSocketConstructor | R
+> => {
+  // The url Effect is resolved per connection rather than once while the Layer
+  // builds, because an address that rotates (failover host, signed url) must not
+  // be pinned to the first build. `Socket.fromWebSocket` is used instead of
+  // `Socket.makeWebSocket` because the latter types the url Effect as
+  // infallible, which would let a crash while resolving the address escape the
+  // reconnect loop as a defect and stop the client dialling forever.
+  const layerSocket = Layer.effect(
+    Socket.Socket,
+    Effect.gen(function*() {
+      const url = options.url
+      if (typeof url === "string") return yield* Socket.makeWebSocket(url, options.socket)
+      const construct = yield* Socket.WebSocketConstructor
+      const context = yield* Effect.context<R>()
+      // The url Effect cannot fail, so only a defect can surface here; it is
+      // mapped to an open error so the socket retry policy treats it like any
+      // other failed dial, while interruption passes through untouched.
+      const resolveUrl = Effect.flatMap(
+        Effect.scope,
+        (scope) => Effect.provideContext(url, Context.add(context, Scope.Scope, scope))
+      ).pipe(
+        Effect.catchDefect((cause) =>
+          Effect.fail(
+            new Socket.SocketError({
+              reason: new Socket.SocketOpenError({ kind: "Unknown", cause })
+            })
+          )
+        )
+      )
+      const openWebSocket = Effect.map(
+        resolveUrl,
+        (resolved) => construct(resolved, options.socket?.protocols)
+      )
+      const acquire = Effect.acquireRelease(openWebSocket, (ws) => Effect.sync(() => ws.close(1000)))
+      return yield* Socket.fromWebSocket(acquire, options.socket)
+    })
+  )
+  const layerProtocol = layerProtocolSocket(options).pipe(
+    Layer.provide(layerSocket),
+    Layer.provide(SyncRpc.layerJson(options))
+  )
+  const layerSession = ProtocolSession.layerWithOptions(options).pipe(
+    Layer.provideMerge(layerProtocol),
+    Layer.provide(Layer.fresh(Authentication.layerClient))
+  )
+  return Layer.merge(layerFromSession(options), EphemeralClient.layerFromSession(options)).pipe(
+    Layer.provide(layerSession)
+  )
+}

@@ -26,12 +26,16 @@ import * as Metric from "effect/Metric"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as ConnectionLane from "../src/ConnectionLane.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as Rows from "../src/internal/rows.js"
 import * as LocalStore from "../src/LocalStore.js"
 import * as Migrations from "../src/Migrations.js"
@@ -42,6 +46,7 @@ import * as Reconciler from "../src/Reconciler.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
+import { installSpaceUpdateProbe, serverDatabases, sqliteLayer } from "./fixtures/ServerDatabase.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
@@ -56,7 +61,7 @@ const putTodoProvenance = {
   mutationVersion: Domain.PutTodo.version
 }
 
-class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationError, Schema.JsonObject>(
+class TestAuthorizationError extends Schema.TaggedError<TestAuthorizationError, Schema.JsonObject>(
   "@lucas-barake/effect-local-sql/test/TestAuthorizationError"
 )("TestAuthorizationError", { reason: Schema.String }) {
 }
@@ -86,7 +91,7 @@ const envelope = Effect.fnUntraced(function*(
     basis: Identity.ServerSequence.make(0),
     name,
     payload,
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: Domain.definition.schemaIdentity,
     mutationVersion: Domain.definition.mutationByName.get(name)?.version ?? Identity.SchemaVersion.make(1)
@@ -94,13 +99,14 @@ const envelope = Effect.fnUntraced(function*(
   return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
 })
 
-const database = () =>
+const withServices = (layerSql: Layer.Layer<SqlClient.SqlClient, SqlError.SqlError>) =>
   Layer.mergeAll(
-    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    ConnectionLane.makeLayer().pipe(Layer.provideMerge(layerSql)),
     NodeCrypto.layer,
     Reactivity.layer,
     QueryReactivity.layer
   )
+const clientDatabase = () => withServices(sqliteLayer())
 
 const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
 
@@ -141,10 +147,10 @@ const serverHistory = {
 const localLayer = (overrides: Partial<LocalStore.Options> = {}) =>
   LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId, ...overrides }).pipe(
     Layer.provide(layerRuntime),
-    Layer.provide(database())
+    Layer.provide(clientDatabase())
   )
 
-const legacyRejection = (item: Protocol.PendingMutation) =>
+const authorizationRejection = (item: Protocol.PendingMutation) =>
   Protocol.RejectedReceipt.make({
     spaceId,
     clientId,
@@ -154,41 +160,22 @@ const legacyRejection = (item: Protocol.PendingMutation) =>
     name: item.envelope.name,
     sourceSchema: item.envelope.sourceSchema,
     mutationVersion: item.envelope.mutationVersion,
-    origin: "Legacy",
+    origin: "Authorization",
     terminalSequence: Identity.TerminalSequence.make(item.envelope.localSequence),
     rejection: "denied"
   })
 
 const settleTodo = Effect.fnUntraced(function*(local: LocalStore.Service, id: string) {
   const pending = yield* local.mutate(Domain.PutTodo, Domain.todo(id))
-  yield* local.applyReceipt(legacyRejection(pending))
+  yield* local.applyReceipt(authorizationRejection(pending))
   return pending
 })
 
 const settleMessage = Effect.fnUntraced(function*(local: LocalStore.Service, id: string) {
   const pending = yield* local.mutate(Domain.PutMessage, { id, chatId: "chat", sentAt: 1, body: "hello" })
-  yield* local.applyReceipt(legacyRejection(pending))
+  yield* local.applyReceipt(authorizationRejection(pending))
   return pending
 })
-
-const serverLayer = (
-  authorizeMutation?: ServerStore.Options["authorizeMutation"]
-) => {
-  let layerServer = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition })
-  if (authorizeMutation !== undefined) {
-    layerServer = ServerStore.layer({
-      definition: Domain.definition,
-      ...serverHistory,
-      authorizeAccess: () => Effect.void,
-      authorizeMutation,
-      authorizeRead: () => Effect.void
-    })
-  }
-  return layerServer.pipe(
-    Layer.provide(layerRuntime),
-    Layer.provide(database())
-  )
-}
 
 const service = <I, S, E extends { readonly _tag: string }, R,>(
   tag: Context.Service<I, S>,
@@ -200,7 +187,9 @@ const directSync = (server: ServerStore.Service) =>
     SyncEngine.SyncEngine,
     SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
-      submit: server.submit,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
+      submitBatch: (request) => server.admitBatch(request, null),
       discard: (request) => server.discard(request, null),
       pull: server.pull,
       bootstrap: server.bootstrap,
@@ -322,14 +311,47 @@ const clientServices = (id: Identity.ClientId, server: ServerStore.Service) => {
   return Layer.merge(layerLocal, layerReconciliation)
 }
 
-describe("server reconciled mutation log", () => {
+describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (database) => {
+  const serverDatabase = () => withServices(database.layer())
+  const serverLayer = (
+    authorizeMutation?: ServerStore.Options["authorizeMutation"]
+  ) => {
+    let layerServer = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition })
+    if (authorizeMutation !== undefined) {
+      layerServer = ServerStore.layer({
+        definition: Domain.definition,
+        ...serverHistory,
+        authorizeAccess: () => Effect.void,
+        authorizeMutation,
+        authorizeRead: () => Effect.void
+      })
+    }
+    return layerServer.pipe(
+      Layer.provide(layerRuntime),
+      Layer.provide(serverDatabase())
+    )
+  }
+  const refusePruning = Effect.fnUntraced(function*(
+    sql: SqlClient.SqlClient,
+    table: "effect_local_authoritative_log" | "effect_local_server_receipts"
+  ) {
+    if (database.dialect === "pg") {
+      yield* sql.unsafe(`CREATE FUNCTION refuse_pruning() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'pruning refused'; END $$`)
+      yield* sql.unsafe(`CREATE TRIGGER refuse_pruning BEFORE DELETE ON ${table}
+        FOR EACH ROW EXECUTE FUNCTION refuse_pruning()`)
+      return sql.unsafe(`DROP TRIGGER refuse_pruning ON ${table}`).pipe(Effect.asVoid)
+    }
+    yield* sql.unsafe(`CREATE TRIGGER refuse_pruning BEFORE DELETE ON ${table}
+      BEGIN SELECT RAISE(ABORT, 'pruning refused'); END`)
+    return sql.unsafe(`DROP TRIGGER refuse_pruning`).pipe(Effect.asVoid)
+  })
+
   it.effect(
     "does not scale SQL writes or transactions with watcher fanout",
     pipe(Effect.fnUntraced(
       function*() {
-        const actualSql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
-          Effect.provide(Reactivity.layer)
-        )
+        const actualSql = yield* database.client
         const transactionCalls = yield* Ref.make(0)
         const observedSql = new Proxy(actualSql, {
           get: (target, property, receiver) => {
@@ -352,12 +374,10 @@ describe("server reconciled mutation log", () => {
             Layer.provide(layerInfrastructure)
           )
         )
-        yield* observedSql`CREATE TABLE space_update_probe (count INTEGER NOT NULL)`
-        yield* observedSql`CREATE TRIGGER count_space_updates AFTER UPDATE ON effect_local_server_spaces
-          BEGIN INSERT INTO space_update_probe (count) VALUES (1); END`
+        yield* installSpaceUpdateProbe(observedSql, database.dialect)
         const countUpdates = SqlSchema.findOne({
           Request: Schema.Void,
-          Result: Schema.Struct({ count: Schema.Number }),
+          Result: Rows.CountRow,
           execute: () => observedSql`SELECT COUNT(*) AS count FROM space_update_probe`
         })
         const submit = (localSequence: number) =>
@@ -383,12 +403,12 @@ describe("server reconciled mutation log", () => {
             Stream.runForEach((wake) => Queue.offer(queue, wake)),
             Effect.forkChild({ startImmediately: true })
           ))
-        yield* Effect.forEach(watcherQueues, Queue.take)
+        yield* Effect.forEach(watcherQueues, LosslessQueue.take)
         yield* Ref.set(transactionCalls, 0)
         yield* observedSql`DELETE FROM space_update_probe`
 
         assert.strictEqual((yield* submit(3))._tag, "Accepted")
-        const wakes = yield* Effect.forEach(watcherQueues, Queue.take)
+        const wakes = yield* Effect.forEach(watcherQueues, LosslessQueue.take)
         assert.deepStrictEqual(wakes, Array.from({ length: 4 }, () => ({ spaceId })))
         assert.strictEqual(yield* Ref.get(transactionCalls), baselineTransactions)
         assert.strictEqual((yield* countUpdates(undefined)).count, baselineUpdates)
@@ -411,7 +431,7 @@ describe("server reconciled mutation log", () => {
             maximumWatchersPerSpace: 1
           }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const ready = yield* Deferred.make<void>()
@@ -457,7 +477,7 @@ describe("server reconciled mutation log", () => {
             maximumWatchersPerSpace: 2
           }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const firstReady = yield* Deferred.make<void>()
@@ -505,7 +525,7 @@ describe("server reconciled mutation log", () => {
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const admissionMetric = Metric.counter("effect_local_server_admission", { incremental: true }).pipe(
@@ -576,7 +596,7 @@ describe("server reconciled mutation log", () => {
             }
           }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const initial = yield* Deferred.make<void>()
@@ -607,6 +627,50 @@ describe("server reconciled mutation log", () => {
   )
 
   it.effect(
+    "releases the sync watcher slot when a failed refresh ends the watch before its teardown finishes",
+    pipe(Effect.fnUntraced(
+      function*() {
+        let lookups = 0
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 1,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => {
+              lookups++
+              if (lookups === 1) return Effect.void
+              return Effect.die("refresh defect")
+            }
+          }).pipe(
+            Layer.provide(layerRuntime),
+            Layer.provide(serverDatabase())
+          )
+        )
+        const initial = yield* Deferred.make<void>()
+        const watching = yield* server.watchAuthorized(watchRequest(), "reader").pipe(
+          Effect.flatMap((stream) =>
+            stream.pipe(
+              Stream.tap(() => Deferred.succeed(initial, undefined)),
+              Stream.runDrain
+            )
+          ),
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(initial)
+        yield* TestClock.adjust("500 millis")
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(watching)))
+        assert.isTrue(Option.isSome(yield* server.watch(watchRequest()).pipe(Stream.runHead)))
+      },
+      Effect.provide(NodeCrypto.layer),
+      Effect.scoped,
+      Effect.provideService(Scheduler.MaxOpsBeforeYield, 33)
+    ))
+  )
+
+  it.effect(
     "preserves a refresh policy denial and releases the sync watcher slot",
     pipe(Effect.fnUntraced(
       function*() {
@@ -627,7 +691,7 @@ describe("server reconciled mutation log", () => {
             }
           }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const initial = yield* Deferred.make<void>()
@@ -673,7 +737,7 @@ describe("server reconciled mutation log", () => {
             }
           }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const initial = yield* Deferred.make<void>()
@@ -720,7 +784,7 @@ describe("server reconciled mutation log", () => {
               )
           }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const pending = yield* server.watchAuthorized(watchRequest(), "first").pipe(
@@ -761,7 +825,7 @@ describe("server reconciled mutation log", () => {
             }
           }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const principal: { subject: string } = { subject: "allowed" }
@@ -795,7 +859,7 @@ describe("server reconciled mutation log", () => {
             }
           }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const ready = yield* Deferred.make<void>()
@@ -823,7 +887,7 @@ describe("server reconciled mutation log", () => {
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const wakes = yield* Queue.unbounded<Protocol.Wake>()
@@ -831,7 +895,7 @@ describe("server reconciled mutation log", () => {
           Stream.runForEach((wake) => Queue.offer(wakes, wake)),
           Effect.forkChild({ startImmediately: true })
         )
-        yield* Queue.take(wakes)
+        yield* LosslessQueue.take(wakes)
         assert.strictEqual(
           (yield* server.submit(
             yield* envelope(
@@ -843,9 +907,20 @@ describe("server reconciled mutation log", () => {
           ))._tag,
           "Accepted"
         )
-        yield* Queue.take(wakes)
+        yield* LosslessQueue.take(wakes)
         yield* server.maintain(spaceId)
         yield* TestClock.adjust("20 millis")
+        yield* Effect.yieldNow.pipe(
+          Effect.andThen(Metric.snapshot),
+          Effect.repeat({
+            until: (snapshots) =>
+              ["effect_local_server_history_depth", "effect_local_server_receipt_depth"].every((id) =>
+                snapshots.some((snapshot) =>
+                  snapshot.id === id && snapshot.type === "Gauge" && snapshot.state.value !== 0
+                )
+              )
+          })
+        )
 
         const snapshots = yield* Metric.snapshot
         const find = (id: string, attributes?: Readonly<Record<string, string>>) =>
@@ -898,7 +973,7 @@ describe("server reconciled mutation log", () => {
   it.effect(
     "settles past a malformed canonical row and surfaces the corruption at read time",
     pipe(Effect.fnUntraced(function*() {
-      const layerClientDatabase = database()
+      const layerClientDatabase = clientDatabase()
       const layerLive = LocalStore.layer({
         ...clientHistory,
         definition: Domain.definition,
@@ -927,17 +1002,17 @@ describe("server reconciled mutation log", () => {
         (space_id, schema_generation, model, model_version, entity_key, value_json)
         VALUES (${spaceId}, ${meta.active_schema_generation}, ${Domain.Todo.name}, ${Domain.Todo.version},
           ${Canonical.stringify("corrupt-index-refresh")}, 'not json')`
-      yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+      yield* local.persistReceipts([Protocol.RejectedReceipt.make({
         spaceId,
         clientId,
         mutationId: pending.envelope.mutationId,
         localSequence: pending.envelope.localSequence,
         membershipIncarnation: pending.envelope.membershipIncarnation,
         ...putTodoProvenance,
-        origin: "Legacy",
+        origin: "Authorization",
         terminalSequence: Identity.TerminalSequence.make(1),
         rejection: "denied"
-      }))
+      })])
 
       // Nothing decodes entity values on the settlement path anymore (the index maintenance that
       // did is gone), so the malformed bytes settle cleanly and fail typed only when a read
@@ -972,14 +1047,14 @@ describe("server reconciled mutation log", () => {
           clientId
         }).pipe(
           Layer.provide(layerRuntime),
-          Layer.provide(database())
+          Layer.provide(clientDatabase())
         )
       )
       const pending = yield* Effect.forEach(
         ["settlement-a", "settlement-b", "settlement-c", "settlement-d"],
         (id) => local.mutate(Domain.PutTodo, Domain.todo(id))
       )
-      yield* local.applyReceipts(pending.map(legacyRejection))
+      yield* local.applyReceipts(pending.map(authorizationRejection))
       assert.strictEqual(yield* local.pendingCount, 0)
 
       const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
@@ -1001,15 +1076,17 @@ describe("server reconciled mutation log", () => {
       const blockedQueryReactivity = QueryReactivity.QueryReactivity.of({
         retain: () => Effect.succeed(Effect.void),
         record: () => Effect.void,
-        affected: Effect.fnUntraced(function*() {
-          if (!(yield* Ref.get(blockInvalidation))) return []
+        affected: Effect.fnUntraced(function*(changes: QueryReactivity.Changes) {
+          if (!(yield* Ref.get(blockInvalidation)) || changes.models.size === 0) return []
           yield* Deferred.succeed(invalidateStarted, undefined)
           yield* Deferred.await(releaseInvalidation)
           return []
         })
       })
       const layerClientDatabase = Layer.mergeAll(
-        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        ConnectionLane.makeLayer().pipe(
+          Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
+        ),
         NodeCrypto.layer,
         Reactivity.layer,
         Layer.succeed(QueryReactivity.QueryReactivity, blockedQueryReactivity)
@@ -1024,7 +1101,7 @@ describe("server reconciled mutation log", () => {
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("commit-to-publish"))
       yield* Ref.set(blockInvalidation, true)
       const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
-      const settling = yield* local.applyReceipt(legacyRejection(pending)).pipe(Effect.forkChild)
+      const settling = yield* local.applyReceipt(authorizationRejection(pending)).pipe(Effect.forkChild)
 
       yield* Deferred.await(invalidateStarted)
       const interruptionStarted = yield* Deferred.make<void>()
@@ -1055,7 +1132,7 @@ describe("server reconciled mutation log", () => {
         ServerStore.ServerStore,
         ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
           Layer.provide(layerRuntime),
-          Layer.provide(database())
+          Layer.provide(serverDatabase())
         )
       )
       yield* installFreshView(local, server)
@@ -1066,7 +1143,7 @@ describe("server reconciled mutation log", () => {
       )
       const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
 
-      yield* local.persistReceipt(receipt)
+      yield* local.persistReceipts([receipt])
       yield* local.applyViewPage({ ...page, hasMore: true })
       yield* server.maintain(spaceId)
       const required = yield* server.pull(pullRequest())
@@ -1105,7 +1182,9 @@ describe("server reconciled mutation log", () => {
         })
       })
       const layerClientDatabase = Layer.mergeAll(
-        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        ConnectionLane.makeLayer().pipe(
+          Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
+        ),
         NodeCrypto.layer,
         Reactivity.layer,
         Layer.succeed(QueryReactivity.QueryReactivity, queryReactivity)
@@ -1129,7 +1208,7 @@ describe("server reconciled mutation log", () => {
         Effect.forkScoped({ startImmediately: true })
       )
 
-      yield* local.persistReceipt(receipt)
+      yield* local.persistReceipts([receipt])
       yield* Ref.set(failPreparation, true)
       const failed = yield* local.applyViewPage(page).pipe(Effect.exit)
 
@@ -1158,7 +1237,9 @@ describe("server reconciled mutation log", () => {
         })
       })
       const layerClientDatabase = Layer.mergeAll(
-        SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+        ConnectionLane.makeLayer().pipe(
+          Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
+        ),
         NodeCrypto.layer,
         Reactivity.layer,
         Layer.succeed(QueryReactivity.QueryReactivity, queryReactivity)
@@ -1234,18 +1315,18 @@ describe("server reconciled mutation log", () => {
       const rejectedPending = yield* local.mutate(Domain.PutTodo, Domain.todo("rejected-covered"))
       const accepted = yield* server.submit(acceptedPending.envelope)
 
-      yield* local.persistReceipt(accepted)
-      yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+      yield* local.persistReceipts([accepted])
+      yield* local.persistReceipts([Protocol.RejectedReceipt.make({
         spaceId,
         clientId,
         mutationId: rejectedPending.envelope.mutationId,
         localSequence: rejectedPending.envelope.localSequence,
         membershipIncarnation: rejectedPending.envelope.membershipIncarnation,
         ...putTodoProvenance,
-        origin: "Legacy",
+        origin: "Authorization",
         terminalSequence: Identity.TerminalSequence.make(2),
         rejection: "denied"
-      }))
+      })])
       yield* local.settleReceipts
 
       assert.deepStrictEqual(
@@ -1264,7 +1345,7 @@ describe("server reconciled mutation log", () => {
         Layer.provide(layerRuntime)
       )
       const layerQueries = QueryExecutor.layer(Domain.definition, spaceId).pipe(Layer.provide(Domain.layerHandlers))
-      const context = yield* Layer.build(Layer.merge(layerLocal, layerQueries).pipe(Layer.provide(database())))
+      const context = yield* Layer.build(Layer.merge(layerLocal, layerQueries).pipe(Layer.provide(clientDatabase())))
       const store = Context.get(context, LocalStore.Store)
       const executor = Context.get(context, QueryExecutor.QueryExecutor)
       for (const [id, count] of [["low", 1], ["middle", 3], ["high", 5], ["highest", 7]] as const) {
@@ -1300,7 +1381,7 @@ describe("server reconciled mutation log", () => {
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const first = yield* envelope(
@@ -1347,13 +1428,13 @@ describe("server reconciled mutation log", () => {
     "publishes a snapshot before bounding history and receipts",
     pipe(Effect.fnUntraced(
       function*() {
-        const layerServerDatabase = database()
+        const layerServerDatabase = serverDatabase()
         const bounded = {
           ...serverHistory,
           retainedHistoryEntries: 1,
-          maximumHistoryEntries: 4,
+          maximumHistoryEntries: 8,
           retainedReceipts: 1,
-          maximumReceipts: 4
+          maximumReceipts: 8
         }
         const layerLive = ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
           Layer.provide(layerRuntime),
@@ -1376,24 +1457,44 @@ describe("server reconciled mutation log", () => {
           assert.strictEqual((yield* server.submit(item))._tag, "Accepted")
         }
 
-        yield* sql`CREATE TRIGGER require_snapshot_before_history_delete
-          BEFORE DELETE ON effect_local_authoritative_log
-          WHEN NOT EXISTS (
-            SELECT 1 FROM effect_local_server_snapshots WHERE space_id = OLD.space_id
-          )
-          BEGIN SELECT RAISE(ABORT, 'snapshot required before history delete'); END`
-        yield* sql`CREATE TRIGGER require_snapshot_before_receipt_delete
-          BEFORE DELETE ON effect_local_server_receipts
-          WHEN NOT EXISTS (
-            SELECT 1 FROM effect_local_server_snapshots WHERE space_id = OLD.space_id
-          )
-          BEGIN SELECT RAISE(ABORT, 'snapshot required before receipt delete'); END`
+        if (database.dialect === "pg") {
+          yield* sql.unsafe(`CREATE FUNCTION require_snapshot_before_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+              IF NOT EXISTS (SELECT 1 FROM effect_local_server_snapshots WHERE space_id = OLD.space_id) THEN
+                RAISE EXCEPTION 'snapshot required before delete';
+              END IF;
+              RETURN OLD;
+            END $$`)
+          yield* sql`CREATE TRIGGER require_snapshot_before_history_delete
+            BEFORE DELETE ON effect_local_authoritative_log
+            FOR EACH ROW EXECUTE FUNCTION require_snapshot_before_delete()`
+          yield* sql`CREATE TRIGGER require_snapshot_before_receipt_delete
+            BEFORE DELETE ON effect_local_server_receipts
+            FOR EACH ROW EXECUTE FUNCTION require_snapshot_before_delete()`
+        } else {
+          yield* sql`CREATE TRIGGER require_snapshot_before_history_delete
+            BEFORE DELETE ON effect_local_authoritative_log
+            WHEN NOT EXISTS (
+              SELECT 1 FROM effect_local_server_snapshots WHERE space_id = OLD.space_id
+            )
+            BEGIN SELECT RAISE(ABORT, 'snapshot required before history delete'); END`
+          yield* sql`CREATE TRIGGER require_snapshot_before_receipt_delete
+            BEFORE DELETE ON effect_local_server_receipts
+            WHEN NOT EXISTS (
+              SELECT 1 FROM effect_local_server_snapshots WHERE space_id = OLD.space_id
+            )
+            BEGIN SELECT RAISE(ABORT, 'snapshot required before receipt delete'); END`
+        }
 
         yield* server.maintain(spaceId)
 
         const countRows = SqlSchema.findOne({
           Request: Schema.String,
-          Result: Schema.Struct({ history: Schema.Int, receipts: Schema.Int, snapshots: Schema.Int }),
+          Result: Schema.Struct({
+            history: Rows.integer(Schema.Int),
+            receipts: Rows.integer(Schema.Int),
+            snapshots: Rows.integer(Schema.Int)
+          }),
           execute: (requestedSpace) =>
             sql`SELECT
             (SELECT COUNT(*) FROM effect_local_authoritative_log WHERE space_id = ${requestedSpace}) AS history,
@@ -1449,7 +1550,7 @@ describe("server reconciled mutation log", () => {
     "pages every space during global history maintenance",
     pipe(Effect.fnUntraced(
       function*() {
-        const layerServerDatabase = database()
+        const layerServerDatabase = serverDatabase()
         const layerLive = ServerStore.layerTrusted({
           ...serverHistory,
           definition: Domain.definition,
@@ -1475,7 +1576,7 @@ describe("server reconciled mutation log", () => {
             basis: Identity.ServerSequence.make(0),
             name: Domain.PutTodo.name,
             payload: Domain.todo(`maintain-${index}`),
-            digestVersion: 3,
+            digestVersion: 1,
             membershipIncarnation: defaultMembershipIncarnation,
             sourceSchema: Domain.definition.schemaIdentity,
             mutationVersion: Domain.PutTodo.version
@@ -1488,9 +1589,12 @@ describe("server reconciled mutation log", () => {
 
         yield* server.maintainAll
 
-        const rows = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
-          FROM effect_local_server_snapshots`
-        assert.strictEqual(rows[0].count, 3)
+        const snapshots = yield* SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: Rows.CountRow,
+          execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_server_snapshots`
+        })(undefined)
+        assert.strictEqual(snapshots.count, 3)
       },
       Effect.provide(NodeCrypto.layer),
       Effect.scoped
@@ -1508,12 +1612,16 @@ describe("server reconciled mutation log", () => {
           retainedReceipts: 1,
           maximumReceipts: 3
         }
-        const server = yield* service(
-          ServerStore.ServerStore,
-          ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
-            Layer.provide(layerRuntime),
-            Layer.provide(database())
-          )
+        const layerServerDatabase = serverDatabase()
+        const layerLive = ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
+        const server = Context.get(context, ServerStore.ServerStore)
+        const allowPruning = yield* refusePruning(
+          Context.get(context, SqlClient.SqlClient),
+          "effect_local_authoritative_log"
         )
         for (let sequence = 1; sequence <= 2; sequence++) {
           yield* server.submit(
@@ -1535,6 +1643,7 @@ describe("server reconciled mutation log", () => {
         )
         const blocked = yield* server.submit(third).pipe(Effect.flip)
         assert.strictEqual(blocked._tag, "CapacityExceeded")
+        yield* allowPruning
         yield* server.maintain(spaceId)
         assert.strictEqual((yield* server.submit(third))._tag, "Accepted")
       },
@@ -1547,7 +1656,7 @@ describe("server reconciled mutation log", () => {
     "rejects corrupted retained row counters before admission",
     pipe(Effect.fnUntraced(
       function*() {
-        const layerServerDatabase = database()
+        const layerServerDatabase = serverDatabase()
         const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
           Layer.provide(layerRuntime),
           Layer.provide(layerServerDatabase)
@@ -1593,18 +1702,22 @@ describe("server reconciled mutation log", () => {
           retainedReceipts: 0,
           maximumReceipts: 2
         }
-        const server = yield* service(
-          ServerStore.ServerStore,
-          ServerStore.layer({
-            ...bounded,
-            definition: Domain.definition,
-            authorizeAccess: () => Effect.void,
-            authorizeMutation: () => Effect.fail(new TestAuthorizationError({ reason: "denied" })),
-            authorizeRead: () => Effect.void
-          }).pipe(
-            Layer.provide(layerRuntime),
-            Layer.provide(database())
-          )
+        const layerServerDatabase = serverDatabase()
+        const layerLive = ServerStore.layer({
+          ...bounded,
+          definition: Domain.definition,
+          authorizeAccess: () => Effect.void,
+          authorizeMutation: () => Effect.fail(new TestAuthorizationError({ reason: "denied" })),
+          authorizeRead: () => Effect.void
+        }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
+        const server = Context.get(context, ServerStore.ServerStore)
+        const allowPruning = yield* refusePruning(
+          Context.get(context, SqlClient.SqlClient),
+          "effect_local_server_receipts"
         )
         const submitted: Array<Protocol.MutationEnvelope> = []
         for (let sequence = 1; sequence <= 3; sequence++) {
@@ -1625,6 +1738,7 @@ describe("server reconciled mutation log", () => {
         const blocked = yield* server.submit(submitted[2]).pipe(Effect.flip)
         assert.strictEqual(blocked._tag, "CapacityExceeded")
 
+        yield* allowPruning
         yield* server.maintain(spaceId)
 
         assert.strictEqual((yield* server.submit(submitted[2]))._tag, "Rejected")
@@ -1642,7 +1756,7 @@ describe("server reconciled mutation log", () => {
     "terminally rejects state that cannot fit a future snapshot",
     pipe(Effect.fnUntraced(
       function*() {
-        const layerServerDatabase = database()
+        const layerServerDatabase = serverDatabase()
         const bounded = {
           ...serverHistory,
           maximumSnapshotBytes: 1
@@ -1673,7 +1787,7 @@ describe("server reconciled mutation log", () => {
 
         const count = yield* SqlSchema.findOne({
           Request: Schema.Void,
-          Result: Schema.Struct({ entities: Schema.Int, history: Schema.Int }),
+          Result: Schema.Struct({ entities: Rows.integer(Schema.Int), history: Rows.integer(Schema.Int) }),
           execute: () =>
             sql`SELECT
               (SELECT COUNT(*) FROM effect_local_server_entities) AS entities,
@@ -1702,7 +1816,7 @@ describe("server reconciled mutation log", () => {
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         for (let sequence = 1; sequence <= 4; sequence++) {
@@ -1727,7 +1841,7 @@ describe("server reconciled mutation log", () => {
           clientId: freshClientId
         }).pipe(
           Layer.provide(layerRuntime),
-          Layer.provide(database())
+          Layer.provide(clientDatabase())
         )
         const layerReconciliation = Reconciler.layerOnePass({
           definition: Domain.definition,
@@ -1741,7 +1855,7 @@ describe("server reconciled mutation log", () => {
         const store = Context.get(context, LocalStore.Store)
         yield* Context.get(context, Reconciler.Reconciliation).sync
 
-        assert.strictEqual(yield* store.cursor, 4)
+        assert.strictEqual((yield* store.progress).cursor, 4)
         for (let sequence = 1; sequence <= 4; sequence++) {
           assert.deepStrictEqual(
             Option.getOrThrow(yield* store.get(Domain.Todo, `bootstrap-${sequence}`)),
@@ -1772,7 +1886,7 @@ describe("server reconciled mutation log", () => {
           )
         }
 
-        const databaseContext = yield* Layer.build(database())
+        const databaseContext = yield* Layer.build(clientDatabase())
         const sql = Context.get(databaseContext, SqlClient.SqlClient)
         const layerCrypto = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
         const layerReactivity = Layer.succeed(
@@ -1783,8 +1897,13 @@ describe("server reconciled mutation log", () => {
           QueryReactivity.QueryReactivity,
           Context.get(databaseContext, QueryReactivity.QueryReactivity)
         )
+        const layerLane = Layer.succeed(
+          ConnectionLane.ConnectionLane,
+          Context.get(databaseContext, ConnectionLane.ConnectionLane)
+        )
         const layerServices = Layer.mergeAll(
           Layer.succeed(SqlClient.SqlClient, sql),
+          layerLane,
           layerCrypto,
           layerReactivity,
           layerQueryReactivity
@@ -1812,7 +1931,7 @@ describe("server reconciled mutation log", () => {
 
         const copied = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count FROM projection_insert_probe`
         assert.strictEqual(copied[0].count, 4)
-        assert.strictEqual(yield* local.cursor, 4)
+        assert.strictEqual((yield* local.progress).cursor, 4)
       },
       Effect.provide(NodeCrypto.layer),
       Effect.scoped
@@ -1828,7 +1947,7 @@ describe("server reconciled mutation log", () => {
         const filename = `${directory}/bootstrap-resume.sqlite`
         const persistentDatabase = () =>
           Layer.mergeAll(
-            SqliteClient.layer({ filename, disableWAL: true }),
+            ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename, disableWAL: true }))),
             NodeCrypto.layer,
             Reactivity.layer,
             QueryReactivity.layer
@@ -1849,7 +1968,7 @@ describe("server reconciled mutation log", () => {
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         for (let sequence = 1; sequence <= 2; sequence++) {
@@ -1882,7 +2001,7 @@ describe("server reconciled mutation log", () => {
           const finalPage = yield* server.bootstrap(bootstrapRequest(first.manifest, 0, 1))
           assert.isTrue(yield* local.stageBootstrapPage(finalPage))
           yield* local.installBootstrap(finalPage.manifest)
-          assert.strictEqual(yield* local.cursor, 2)
+          assert.strictEqual((yield* local.progress).cursor, 2)
           assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "resume-1")), Domain.todo("resume-1"))
           assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "resume-2")), Domain.todo("resume-2"))
         }))
@@ -1908,7 +2027,7 @@ describe("server reconciled mutation log", () => {
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const item = yield* envelope(
@@ -1940,7 +2059,7 @@ describe("server reconciled mutation log", () => {
           serverSchema: page.serverSchema
         })).pipe(expectedFailure)
         assert.strictEqual(stalled._tag, "ProtocolInvalid")
-        assert.strictEqual(yield* local.cursor, 0)
+        assert.strictEqual((yield* local.progress).cursor, 0)
         assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "corrupt-bootstrap")))
       },
       Effect.provide(NodeCrypto.layer),
@@ -1963,10 +2082,10 @@ describe("server reconciled mutation log", () => {
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
-        const layerClientDatabase = database()
+        const layerClientDatabase = clientDatabase()
         const layerLocalLayerWithDatabase = LocalStore.layer({
           ...clientHistory,
           retainedReceipts: 1,
@@ -1998,7 +2117,7 @@ describe("server reconciled mutation log", () => {
         const expired = yield* server.submit(increment.envelope)
         assert.strictEqual(expired._tag, "Expired")
         if (expired._tag !== "Expired") assert.fail("expected expired receipt")
-        yield* local.persistReceipt(expired)
+        yield* local.persistReceipts([expired])
         yield* local.settleReceipts
 
         assert.strictEqual(yield* local.pendingCount, 1)
@@ -2067,7 +2186,7 @@ describe("server reconciled mutation log", () => {
             authorizeRead: () => Effect.void
           }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
         const layerLocalLive = LocalStore.layer({
@@ -2078,7 +2197,7 @@ describe("server reconciled mutation log", () => {
           clientId
         }).pipe(
           Layer.provide(layerRuntime),
-          Layer.provide(database())
+          Layer.provide(clientDatabase())
         )
         const layerReconciliationLive = Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
           Layer.provide(layerLocalLive),
@@ -2131,10 +2250,10 @@ describe("server reconciled mutation log", () => {
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
-        const layerClientDatabase = database()
+        const layerClientDatabase = clientDatabase()
         const layerLocalLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId })
           .pipe(
             Layer.provide(layerRuntime),
@@ -2173,7 +2292,7 @@ describe("server reconciled mutation log", () => {
         const error = yield* local.installBootstrap(page.manifest).pipe(expectedFailure)
 
         assert.strictEqual(error._tag, "StorageCorrupt")
-        assert.strictEqual(yield* local.cursor, 1)
+        assert.strictEqual((yield* local.progress).cursor, 1)
         assert.strictEqual(
           Option.getOrThrow(yield* local.get(Domain.Todo, "staged-corruption")).title,
           "old"
@@ -2199,10 +2318,10 @@ describe("server reconciled mutation log", () => {
           ServerStore.ServerStore,
           ServerStore.layerTrusted({ ...bounded, definition: Domain.definition }).pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
         )
-        const layerClientDatabase = database()
+        const layerClientDatabase = clientDatabase()
         const layerLocalLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId })
           .pipe(
             Layer.provide(layerRuntime),
@@ -2213,17 +2332,17 @@ describe("server reconciled mutation log", () => {
         const sql = Context.get(context, SqlClient.SqlClient)
         const first = yield* local.mutate(Domain.PutTodo, Domain.todo("receipt-a"))
         const second = yield* local.mutate(Domain.PutTodo, Domain.todo("receipt-b"))
-        yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+        yield* local.persistReceipts([Protocol.RejectedReceipt.make({
           spaceId,
           clientId,
           membershipIncarnation: first.envelope.membershipIncarnation,
           mutationId: first.envelope.mutationId,
           localSequence: first.envelope.localSequence,
           ...putTodoProvenance,
-          origin: "Legacy",
+          origin: "Authorization",
           terminalSequence: Identity.TerminalSequence.make(1),
           rejection: "denied"
-        }))
+        })])
         const corrupt = Protocol.RejectedReceipt.make({
           spaceId,
           clientId,
@@ -2231,7 +2350,7 @@ describe("server reconciled mutation log", () => {
           mutationId: second.envelope.mutationId,
           localSequence: second.envelope.localSequence,
           ...putTodoProvenance,
-          origin: "Legacy",
+          origin: "Authorization",
           terminalSequence: Identity.TerminalSequence.make(1),
           rejection: "denied"
         })
@@ -2255,7 +2374,7 @@ describe("server reconciled mutation log", () => {
 
         assert.strictEqual(error._tag, "StorageCorrupt")
         assert.strictEqual(yield* local.pendingCount, 2)
-        assert.strictEqual(yield* local.cursor, 0)
+        assert.strictEqual((yield* local.progress).cursor, 0)
       },
       Effect.provide(NodeCrypto.layer),
       Effect.scoped
@@ -2263,38 +2382,44 @@ describe("server reconciled mutation log", () => {
   )
 
   it.effect(
-    "settles a durable legacy rejection before resubmitting pending work",
+    "settles a durable authorization rejection before resubmitting pending work",
     pipe(Effect.fnUntraced(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
-      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("legacy-rejection"))
-      yield* local.persistReceipt(Protocol.RejectedReceipt.make({
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("authorization-rejection"))
+      yield* local.persistReceipts([Protocol.RejectedReceipt.make({
         spaceId,
         clientId,
         membershipIncarnation: pending.envelope.membershipIncarnation,
         mutationId: pending.envelope.mutationId,
         localSequence: pending.envelope.localSequence,
         ...putTodoProvenance,
-        origin: "Legacy",
+        origin: "Authorization",
         rejection: "Rejected"
-      }))
+      })])
       const submissions = yield* Ref.make(0)
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
-        submit: (submitted) => {
-          const rejected = Protocol.RejectedReceipt.make({
-            spaceId,
-            clientId,
-            membershipIncarnation: submitted.envelope.membershipIncarnation,
-            mutationId: submitted.envelope.mutationId,
-            localSequence: submitted.envelope.localSequence,
-            ...putTodoProvenance,
-            origin: "Legacy",
-            terminalSequence: Identity.TerminalSequence.make(1),
-            rejection: "Rejected"
-          })
-          return Ref.update(submissions, (count) => count + 1).pipe(Effect.as(rejected))
+        submitBatch: (request) => {
+          const receipts = request.envelopes.map((submitted) =>
+            Protocol.RejectedReceipt.make({
+              spaceId,
+              clientId,
+              membershipIncarnation: submitted.membershipIncarnation,
+              mutationId: submitted.mutationId,
+              localSequence: submitted.localSequence,
+              ...putTodoProvenance,
+              origin: "Authorization",
+              terminalSequence: Identity.TerminalSequence.make(1),
+              rejection: "Rejected"
+            })
+          )
+          return Ref.update(submissions, (count) => count + 1).pipe(
+            Effect.as(Protocol.SubmitBatchResult.make({ receipts }))
+          )
         },
         pull: server.pull,
         bootstrap: server.bootstrap,
@@ -2312,17 +2437,17 @@ describe("server reconciled mutation log", () => {
 
       assert.strictEqual(yield* Ref.get(submissions), 0)
       assert.strictEqual(yield* local.pendingCount, 0)
-      assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "legacy-rejection")))
+      assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "authorization-rejection")))
     }, Effect.scoped))
   )
 
   it.effect(
     "rejects inconsistent durable replication scope metadata",
     pipe(Effect.fnUntraced(function*() {
-      const databaseContext = yield* Layer.build(database())
+      const databaseContext = yield* Layer.build(clientDatabase())
       const sql = Context.get(databaseContext, SqlClient.SqlClient)
       yield* Migrations.client({ definition: Domain.definition, spaceId, clientId, migration }).pipe(
-        Effect.provideService(SqlClient.SqlClient, sql)
+        Effect.provideContext(databaseContext)
       )
       const layerCrypto = Layer.succeed(Crypto.Crypto, Context.get(databaseContext, Crypto.Crypto))
       const layerReactivity = Layer.succeed(
@@ -2333,8 +2458,13 @@ describe("server reconciled mutation log", () => {
         QueryReactivity.QueryReactivity,
         Context.get(databaseContext, QueryReactivity.QueryReactivity)
       )
+      const layerLane = Layer.succeed(
+        ConnectionLane.ConnectionLane,
+        Context.get(databaseContext, ConnectionLane.ConnectionLane)
+      )
       const layerServices = Layer.mergeAll(
         Layer.succeed(SqlClient.SqlClient, sql),
+        layerLane,
         layerCrypto,
         layerReactivity,
         layerQueryReactivity
@@ -2378,7 +2508,7 @@ describe("server reconciled mutation log", () => {
 
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "1")), Domain.todo("1"))
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(pending.envelope.mutationId))._tag, "Accepted")
     }, Effect.scoped))
   )
@@ -2387,7 +2517,7 @@ describe("server reconciled mutation log", () => {
     "rebases pending reads over an incrementally applied page",
     pipe(Effect.fnUntraced(
       function*() {
-        const layerClientDatabase = database()
+        const layerClientDatabase = clientDatabase()
         const layerLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
           Layer.provide(layerRuntime),
           Layer.provide(layerClientDatabase)
@@ -2470,7 +2600,12 @@ describe("server reconciled mutation log", () => {
           layerQueryReactivity: QueryReactivity.layer
         },
         ({ layerCrypto, layerQueryReactivity, layerReactivity, layerSql }) =>
-          Layer.mergeAll(layerSql, layerCrypto, layerReactivity, layerQueryReactivity)
+          Layer.mergeAll(
+            ConnectionLane.makeLayer().pipe(Layer.provideMerge(layerSql)),
+            layerCrypto,
+            layerReactivity,
+            layerQueryReactivity
+          )
       )
       const layerLive = LocalStore.layer({
         ...clientHistory,
@@ -2503,6 +2638,11 @@ describe("server reconciled mutation log", () => {
         },
         ({ ids, mutate }) => Effect.forEach(ids, mutate)
       )
+      const foreignClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+      const foreign = yield* service(LocalStore.Store, localLayer({ clientId: foreignClientId }))
+      yield* installFreshView(foreign, server, foreignClientId)
+      const foreignPending = yield* foreign.mutate(Domain.PutTodo, Domain.todo("projection-2", "foreign"))
+      yield* server.submit(foreignPending.envelope)
       const receipt = yield* server.submit(pending[0].envelope)
       const state = yield* local.replicationState
       const page = incremental(
@@ -2592,14 +2732,14 @@ describe("server reconciled mutation log", () => {
         Stream.runForEach((wake) => Queue.offer(wakes, wake)),
         Effect.forkChild({ startImmediately: true })
       )
-      yield* Queue.take(wakes)
+      yield* LosslessQueue.take(wakes)
       const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("retry-wake"))
       const first = yield* server.submit(pending.envelope)
       assert.strictEqual(first._tag, "Accepted")
-      yield* Queue.take(wakes)
+      yield* LosslessQueue.take(wakes)
 
       assert.deepStrictEqual(yield* server.submit(pending.envelope), first)
-      assert.deepStrictEqual(yield* Queue.take(wakes), Protocol.Wake.make({ spaceId }))
+      assert.deepStrictEqual(yield* LosslessQueue.take(wakes), Protocol.Wake.make({ spaceId }))
       yield* Fiber.interrupt(watcher)
     }, Effect.scoped))
   )
@@ -2623,7 +2763,7 @@ describe("server reconciled mutation log", () => {
           authorizeRead: () => Effect.void
         }).pipe(
           Layer.provide(layerRuntime),
-          Layer.provide(database())
+          Layer.provide(serverDatabase())
         )
         const server = yield* service(ServerStore.ServerStore, layerSecured)
         const submitted = yield* envelope(
@@ -2632,12 +2772,21 @@ describe("server reconciled mutation log", () => {
           1,
           Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000041")
         )
-        const request = Protocol.SubmitRequest.make({ envelope: submitted, schema: Domain.definition.schemaIdentity })
-        assert.strictEqual((yield* server.admit(request, { subject: "test" }))._tag, "Accepted")
+        const request = Protocol.SubmitBatchRequest.make({
+          envelopes: [submitted],
+          schema: Domain.definition.schemaIdentity
+        })
+        const admitted = yield* server.admitBatch(request, { subject: "test" })
+        assert.deepStrictEqual(admitted.receipts.map((receipt) => receipt._tag), ["Accepted"])
         yield* Ref.set(access, false)
 
-        const error = yield* server.admit(request, { subject: "test" }).pipe(Effect.flip)
-        assert.strictEqual(error._tag, "AuthorizationDenied")
+        const denied = yield* server.admitBatch(request, { subject: "test" }).pipe(
+          Effect.matchEffect({
+            onFailure: (error) => Effect.succeed(error._tag),
+            onSuccess: () => Effect.succeed("Admitted")
+          })
+        )
+        assert.strictEqual(denied, "AuthorizationDenied")
       },
       Effect.provide(NodeCrypto.layer),
       Effect.scoped
@@ -2647,7 +2796,7 @@ describe("server reconciled mutation log", () => {
   it.effect("keeps mutation payloads and private results out of the authoritative log", () =>
     Effect.scoped(Effect.gen(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
-      const layerServerDatabase = database()
+      const layerServerDatabase = serverDatabase()
       const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
         Layer.provide(layerRuntime),
         Layer.provide(layerServerDatabase)
@@ -2668,7 +2817,7 @@ describe("server reconciled mutation log", () => {
     "pulls authoritative entities without materializing private receipt payloads",
     pipe(Effect.fnUntraced(
       function*() {
-        const layerServerDatabase = database()
+        const layerServerDatabase = serverDatabase()
         const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
           Layer.provide(layerRuntime),
           Layer.provide(layerServerDatabase)
@@ -2724,7 +2873,7 @@ describe("server reconciled mutation log", () => {
     "stores matching authoritative entry and SQL identities",
     pipe(Effect.fnUntraced(
       function*() {
-        const layerServerDatabase = database()
+        const layerServerDatabase = serverDatabase()
         const layerServerLayerWithDatabase = ServerStore.layerTrusted({
           ...serverHistory,
           definition: Domain.definition
@@ -2773,7 +2922,7 @@ describe("server reconciled mutation log", () => {
       yield* local.applyReceipt(receipt)
       assert.strictEqual(yield* local.pendingCount, 0)
       assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "1")))
-      assert.strictEqual(yield* local.cursor, 0)
+      assert.strictEqual((yield* local.progress).cursor, 0)
     }, Effect.scoped))
   )
 
@@ -2912,7 +3061,7 @@ describe("server reconciled mutation log", () => {
     "assigns dense authoritative log sequences",
     pipe(Effect.fnUntraced(
       function*() {
-        const layerServerDatabase = database()
+        const layerServerDatabase = serverDatabase()
         const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
           Layer.provide(layerRuntime),
           Layer.provide(layerServerDatabase)
@@ -2948,7 +3097,7 @@ describe("server reconciled mutation log", () => {
     "rejects an exact retry whose durable receipt conflicts with its SQL identity",
     pipe(Effect.fnUntraced(
       function*() {
-        const layerServerDatabase = database()
+        const layerServerDatabase = serverDatabase()
         const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
           Layer.provide(layerRuntime),
           Layer.provide(layerServerDatabase)
@@ -2987,7 +3136,7 @@ describe("server reconciled mutation log", () => {
     "rejects an accepted retry whose receipt sequence conflicts with the authoritative log",
     pipe(Effect.fnUntraced(
       function*() {
-        const layerServerDatabase = database()
+        const layerServerDatabase = serverDatabase()
         const layerLive = ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
           Layer.provide(layerRuntime),
           Layer.provide(layerServerDatabase)
@@ -3026,7 +3175,7 @@ describe("server reconciled mutation log", () => {
     "rejects a pending row whose durable digest does not match its reconstructed identity",
     pipe(Effect.fnUntraced(
       function*() {
-        const layerClientDatabase = database()
+        const layerClientDatabase = clientDatabase()
         const layerLive = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
           Layer.provide(layerRuntime),
           Layer.provide(layerClientDatabase)
@@ -3046,30 +3195,219 @@ describe("server reconciled mutation log", () => {
     ))
   )
 
-  it.effect("persists each submitted receipt before submitting the next pending mutation", () =>
+  const makeCompactingHarness = Effect.gen(function*() {
+    const local = yield* service(LocalStore.Store, localLayer())
+    const server = yield* service(
+      ServerStore.ServerStore,
+      ServerStore.layerTrusted({
+        ...serverHistory,
+        retainedHistoryEntries: 0,
+        maximumHistoryEntries: 8,
+        retainedReceipts: 0,
+        maximumReceipts: 8,
+        retainedSnapshots: 1,
+        definition: Domain.definition
+      }).pipe(
+        Layer.provide(layerRuntime),
+        Layer.provide(serverDatabase())
+      )
+    )
+    const faults = { withholdPull: false, failExpiredBootstrap: false }
+    const withheldPull = Effect.fnUntraced(
+      function*(request: Protocol.PullRequest) {
+        const page = yield* server.pull(request)
+        if ("_tag" in page) return page
+        const changes: ReadonlyArray<Protocol.ViewChange> = []
+        return Protocol.PullPage.make({
+          ...page,
+          serverSequence: (yield* local.progress).cursor,
+          changes,
+          contentBytes: yield* Protocol.encodedBytesEffect(changes),
+          digest: yield* Protocol.viewChangesDigest(changes),
+          hasMore: false
+        })
+      },
+      Effect.provide(NodeCrypto.layer)
+    )
+    const remote = SyncEngine.SyncEngine.of({
+      waitForCredentialChange: () => Effect.never,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
+      discard: () => Effect.die("unexpected discard"),
+      submitBatch: (request) => server.admitBatch(request, null),
+      pull: (request) => {
+        if (faults.withholdPull) return withheldPull(request)
+        return server.pull(request)
+      },
+      bootstrap: (request) => {
+        if (faults.failExpiredBootstrap && request.afterOrdinal === -1) {
+          return Effect.fail(new ReplicaError.ServerUnavailable())
+        }
+        return server.bootstrap(request)
+      },
+      watch: server.watch
+    })
+    const reconciliation = yield* service(
+      Reconciler.Reconciliation,
+      Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+        Layer.provide(Layer.succeed(LocalStore.Store, local)),
+        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
+      )
+    )
+    yield* reconciliation.sync
+    return { local, server, faults, reconciliation }
+  })
+
+  it.effect("settles a stored accepted receipt that a resubmission reports as expired after compaction", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const { faults, local, reconciliation, server } = yield* makeCompactingHarness
+      faults.withholdPull = true
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("accepted-then-expired"))
+      yield* reconciliation.sync
+      const stored = yield* local.receipt(pending.envelope.mutationId)
+      assert.deepStrictEqual(Option.map(stored, (receipt) => receipt._tag), Option.some("Accepted"))
+      assert.strictEqual(yield* local.pendingCount, 1)
+      yield* server.maintain(spaceId)
+
+      yield* reconciliation.sync
+
+      assert.deepStrictEqual(yield* local.receipt(pending.envelope.mutationId), stored)
+      assert.strictEqual(yield* local.pendingCount, 0)
+    })))
+
+  it.effect("keeps a stored expired receipt when a resubmission reports a newer expiry snapshot", () =>
+    Effect.scoped(
+      Effect.gen(function*() {
+        const { faults, local, reconciliation, server } = yield* makeCompactingHarness
+        const lost = yield* local.mutate(Domain.PutTodo, Domain.todo("lost-response"))
+        yield* server.submit(lost.envelope)
+        yield* server.maintain(spaceId)
+        faults.withholdPull = true
+        faults.failExpiredBootstrap = true
+        const firstError = yield* expectedFailure(reconciliation.sync)
+        assert.strictEqual(firstError._tag, "ServerUnavailable")
+        const stored = yield* local.receipt(lost.envelope.mutationId)
+        assert.deepStrictEqual(Option.map(stored, (receipt) => receipt._tag), Option.some("Expired"))
+        const other = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("other-client"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8020-000000000001")
+        )
+        yield* server.submit(Protocol.MutationEnvelope.make({
+          ...other,
+          clientId: Identity.ClientId.make("cli_00000000-0000-4000-8020-000000000002"),
+          digest: yield* Protocol.mutationDigest({
+            ...other,
+            clientId: Identity.ClientId.make("cli_00000000-0000-4000-8020-000000000002")
+          })
+        }))
+        yield* server.maintain(spaceId)
+        faults.failExpiredBootstrap = false
+
+        yield* reconciliation.sync
+
+        assert.deepStrictEqual(yield* local.receipt(lost.envelope.mutationId), stored)
+        assert.strictEqual(yield* local.pendingCount, 0)
+      }).pipe(Effect.provide(NodeCrypto.layer))
+    ))
+
+  it.effect("returns the unacknowledged tail of a short batch to Retrying when the pass fails after it", () =>
     Effect.scoped(Effect.gen(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
-      const first = yield* local.mutate(Domain.PutTodo, Domain.todo("stream-1"))
-      const second = yield* local.mutate(Domain.PutTodo, Domain.todo("stream-2"))
+      const pending = yield* Effect.forEach(
+        ["tail-0", "tail-1", "tail-2"],
+        (id) => local.mutate(Domain.PutTodo, Domain.todo(id))
+      )
+      const server = yield* service(ServerStore.ServerStore, serverLayer())
+      const expiredSnapshot = Identity.SnapshotId.make("snp_00000000-0000-4000-8000-0000000000ff")
+      const remote = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
+        discard: () => Effect.die("unexpected discard"),
+        submitBatch: (request) => {
+          const first = request.envelopes[0]
+          return Effect.succeed(Protocol.SubmitBatchResult.make({
+            receipts: [Protocol.ExpiredReceipt.make({
+              ...putTodoProvenance,
+              spaceId,
+              clientId,
+              membershipIncarnation: first.membershipIncarnation,
+              mutationId: first.mutationId,
+              localSequence: first.localSequence,
+              snapshotId: expiredSnapshot,
+              snapshotSequence: Identity.ServerSequence.make(1_000_000),
+              terminalSequenceThrough: Identity.TerminalSequence.make(0)
+            })]
+          }))
+        },
+        pull: server.pull,
+        bootstrap: (request) => {
+          if (request.snapshotId === expiredSnapshot) return Effect.fail(new ReplicaError.ServerUnavailable())
+          return server.bootstrap(request)
+        },
+        watch: server.watch
+      })
+      const reconciliation = yield* service(
+        Reconciler.Reconciliation,
+        Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+          Layer.provide(Layer.succeed(LocalStore.Store, local)),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
+        )
+      )
+
+      const error = yield* expectedFailure(reconciliation.sync)
+
+      assert.strictEqual(error._tag, "ServerUnavailable")
+      const states = (yield* local.pending).map((mutation) => [
+        mutation.envelope.mutationId,
+        mutation.submissionState
+      ])
+      assert.deepStrictEqual(states, [
+        [pending[0].envelope.mutationId, "Submitted"],
+        [pending[1].envelope.mutationId, "Retrying"],
+        [pending[2].envelope.mutationId, "Retrying"]
+      ])
+    })))
+
+  it.effect("persists every receipt of a submitted batch before submitting the next batch", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const local = yield* service(LocalStore.Store, localLayer())
+      const pending = yield* Effect.forEach(
+        Array.from({ length: Protocol.maximumSubmitBatchEntries + 1 }, (_, index) => index),
+        (index) => local.mutate(Domain.PutTodo, Domain.todo(`stream-${index}`))
+      )
+      const firstBatch = pending.slice(0, Protocol.maximumSubmitBatchEntries)
       let submissions = 0
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
-        submit: Effect.fnUntraced(function*({ envelope: submitted }) {
+        submitBatch: Effect.fnUntraced(function*(request) {
           submissions++
           if (submissions === 2) {
-            assert.isTrue(Option.isSome(yield* local.receipt(first.envelope.mutationId)))
+            const persisted = yield* Effect.forEach(
+              firstBatch,
+              (mutation) => local.receipt(mutation.envelope.mutationId)
+            )
+            assert.isTrue(persisted.every(Option.isSome))
           }
-          return Protocol.RejectedReceipt.make({
-            ...putTodoProvenance,
-            spaceId,
-            clientId,
-            membershipIncarnation: submitted.membershipIncarnation,
-            mutationId: submitted.mutationId,
-            localSequence: submitted.localSequence,
-            origin: "Authorization",
-            rejection: "denied"
+          return Protocol.SubmitBatchResult.make({
+            receipts: request.envelopes.map((submitted) =>
+              Protocol.RejectedReceipt.make({
+                ...putTodoProvenance,
+                spaceId,
+                clientId,
+                membershipIncarnation: submitted.membershipIncarnation,
+                mutationId: submitted.mutationId,
+                localSequence: submitted.localSequence,
+                origin: "Authorization",
+                rejection: "denied"
+              })
+            )
           })
         }),
         pull: server.pull,
@@ -3086,14 +3424,14 @@ describe("server reconciled mutation log", () => {
 
       yield* reconciler.sync
       assert.strictEqual(submissions, 2)
-      assert.isTrue(Option.isSome(yield* local.receipt(first.envelope.mutationId)))
-      assert.isTrue(Option.isSome(yield* local.receipt(second.envelope.mutationId)))
+      const receipts = yield* Effect.forEach(pending, (mutation) => local.receipt(mutation.envelope.mutationId))
+      assert.isTrue(receipts.every(Option.isSome))
       assert.strictEqual(yield* local.pendingCount, 0)
     })))
 
   it.effect("invalidates the receipt dependency when a terminal receipt is stored", () =>
     Effect.scoped(Effect.gen(function*() {
-      const layerClientDatabase = database()
+      const layerClientDatabase = clientDatabase()
       const layerLocal = LocalStore.layer({ ...clientHistory, definition: Domain.definition, spaceId, clientId }).pipe(
         Layer.provide(layerRuntime),
         Layer.provide(layerClientDatabase)
@@ -3174,7 +3512,7 @@ describe("server reconciled mutation log", () => {
           maximumPendingMutations: 0
         }).pipe(
           Layer.provide(layerRuntime),
-          Layer.provide(database())
+          Layer.provide(clientDatabase())
         )
       ).pipe(expectedFailure)
       assert.strictEqual(localError._tag, "InvalidConfiguration")
@@ -3187,7 +3525,7 @@ describe("server reconciled mutation log", () => {
         ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition, wakeCapacity: 0 })
           .pipe(
             Layer.provide(layerRuntime),
-            Layer.provide(database())
+            Layer.provide(serverDatabase())
           )
       ).pipe(expectedFailure)
       assert.strictEqual(wakeCapacityError._tag, "InvalidConfiguration")
@@ -3203,7 +3541,7 @@ describe("server reconciled mutation log", () => {
           maximumPendingReadAuthorizations: 0
         }).pipe(
           Layer.provide(layerRuntime),
-          Layer.provide(database())
+          Layer.provide(serverDatabase())
         )
       ).pipe(expectedFailure)
       assert.strictEqual(pendingReadAuthorizationError._tag, "InvalidConfiguration")
@@ -3264,7 +3602,7 @@ describe("server reconciled mutation log", () => {
       })
       assert.strictEqual(Option.getOrThrow(yield* local.receipt(rename.envelope.mutationId))._tag, "Rejected")
       assert.strictEqual(yield* local.pendingCount, 0)
-      assert.strictEqual(yield* local.cursor, 2)
+      assert.strictEqual((yield* local.progress).cursor, 2)
     }, Effect.scoped))
   )
 
@@ -3292,7 +3630,7 @@ describe("server reconciled mutation log", () => {
       if (receipt._tag !== "Accepted") assert.fail("expected accepted receipt")
       const entry = acceptedMutation(first, receipt)
       yield* local.applyEntries([entry, entry])
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
       assert.deepStrictEqual(Option.getOrThrow(yield* local.get(Domain.Todo, "1")), Domain.todo("1"))
     }, Effect.scoped))
   )
@@ -3309,7 +3647,7 @@ describe("server reconciled mutation log", () => {
 
       const error = yield* local.applyEntries([{ ...entry, changes: [] }]).pipe(expectedFailure)
       assert.strictEqual(error._tag, "ProtocolInvalid")
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
     })))
 
   it.effect(
@@ -3328,7 +3666,7 @@ describe("server reconciled mutation log", () => {
 
       assert.strictEqual(error._tag, "ProtocolInvalid")
       assert.strictEqual(yield* local.pendingCount, 1)
-      assert.strictEqual(yield* local.cursor, 0)
+      assert.strictEqual((yield* local.progress).cursor, 0)
     }, Effect.scoped))
   )
 
@@ -3342,8 +3680,10 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: server.pull,
           bootstrap: server.bootstrap,
           watch: () =>
@@ -3389,10 +3729,12 @@ describe("server reconciled mutation log", () => {
       const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: () =>
             Deferred.await(releasePull).pipe(
               Effect.andThen(Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 0 })))
@@ -3449,10 +3791,12 @@ describe("server reconciled mutation log", () => {
       const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: () =>
             Deferred.await(releasePull).pipe(
               Effect.andThen(Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 0 })))
@@ -3504,12 +3848,14 @@ describe("server reconciled mutation log", () => {
       const layerRemote = Layer.succeed(
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(
               Effect.andThen(Deferred.await(credentialChanged))
             ),
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: (request) =>
             Ref.updateAndGet(pulls, (count) => count + 1).pipe(
               Effect.flatMap((attempt) => {
@@ -3581,6 +3927,8 @@ describe("server reconciled mutation log", () => {
       const subscriptions = yield* Ref.make(0)
       const pulls = yield* Ref.make(0)
       const subscribed = yield* Deferred.make<void>()
+      const pulled = yield* Deferred.make<void>()
+      const reportedFailed = yield* Deferred.make<void>()
       const stale = new ReplicaError.StaleSchema({
         expectedVersion: 2,
         expectedHash: "expected",
@@ -3591,9 +3939,15 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
-          pull: () => Ref.update(pulls, (count) => count + 1).pipe(Effect.andThen(Effect.fail(stale))),
+          submitBatch: () => Effect.die("unexpected submit"),
+          pull: () =>
+            Ref.update(pulls, (count) => count + 1).pipe(
+              Effect.andThen(Deferred.succeed(pulled, undefined)),
+              Effect.andThen(Effect.fail(stale))
+            ),
           bootstrap: () => Effect.fail(stale),
           watch: () =>
             Stream.unwrap(
@@ -3607,16 +3961,20 @@ describe("server reconciled mutation log", () => {
       const layerReconciliation = Reconciler.layer({
         definition: Domain.definition,
         spaceId,
-        retryDelay: "1 second"
+        retryDelay: "1 second",
+        onStatusChange: (status) => {
+          if (status._tag !== "Failed") return Effect.void
+          return Deferred.succeed(reportedFailed, undefined).pipe(Effect.asVoid)
+        }
       }).pipe(
         Layer.provide(localLayer()),
         Layer.provide(layerRemote)
       )
       const scheduler = yield* service(Reconciler.Reconciler, layerReconciliation)
       yield* Deferred.await(subscribed)
-      yield* Effect.yieldNow
-      yield* TestClock.adjust("5 seconds")
-      yield* Effect.yieldNow
+      yield* Deferred.await(pulled)
+      for (let step = 0; step < 50; step++) yield* TestClock.adjust("100 millis")
+      yield* Deferred.await(reportedFailed)
 
       assert.strictEqual(yield* Ref.get(subscriptions), 1)
       assert.strictEqual(yield* Ref.get(pulls), 1)
@@ -3636,8 +3994,10 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: (request) =>
             Effect.all([server.pull(request), Ref.get(observed)]).pipe(
               Effect.map(([result, serverSchema]) => ({ ...result, serverSchema }))
@@ -3675,8 +4035,10 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: (request) =>
             Deferred.succeed(pullEntered, undefined).pipe(
               Effect.andThen(Deferred.await(releasePull)),
@@ -3709,8 +4071,10 @@ describe("server reconciled mutation log", () => {
       const server = yield* service(ServerStore.ServerStore, serverLayer())
       const syncEngine = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
-        submit: () => Effect.die("unexpected submit"),
+        submitBatch: () => Effect.die("unexpected submit"),
         pull: server.pull,
         bootstrap: server.bootstrap,
         watch: () => Stream.never
@@ -3739,8 +4103,10 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: (request) =>
             Deferred.succeed(pullEntered, undefined).pipe(
               Effect.andThen(Deferred.await(releasePull)),
@@ -3777,8 +4143,10 @@ describe("server reconciled mutation log", () => {
         SyncEngine.SyncEngine,
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: ({ envelope: submitted }) =>
+          submitBatch: (request) =>
             Effect.suspend(() => {
               attempts++
               if (attempts === 1) {
@@ -3787,15 +4155,19 @@ describe("server reconciled mutation log", () => {
                 )
               }
 
-              return Deferred.succeed(secondAttempt, undefined).pipe(Effect.as(Protocol.RejectedReceipt.make({
-                ...putTodoProvenance,
-                spaceId,
-                clientId,
-                membershipIncarnation: submitted.membershipIncarnation,
-                mutationId: submitted.mutationId,
-                localSequence: submitted.localSequence,
-                origin: "Authorization",
-                rejection: "denied"
+              return Deferred.succeed(secondAttempt, undefined).pipe(Effect.as(Protocol.SubmitBatchResult.make({
+                receipts: request.envelopes.map((submitted) =>
+                  Protocol.RejectedReceipt.make({
+                    ...putTodoProvenance,
+                    spaceId,
+                    clientId,
+                    membershipIncarnation: submitted.membershipIncarnation,
+                    mutationId: submitted.mutationId,
+                    localSequence: submitted.localSequence,
+                    origin: "Authorization",
+                    rejection: "denied"
+                  })
+                )
               })))
             }),
           pull: server.pull,
@@ -3819,13 +4191,11 @@ describe("server reconciled mutation log", () => {
 
       yield* scheduler.notify
       yield* Deferred.await(firstAttempt)
-      yield* Effect.yieldNow
       yield* scheduler.notify
-      yield* TestClock.adjust("1 second")
-      yield* Effect.yieldNow
+      for (let step = 0; step < 20; step++) yield* TestClock.adjust("100 millis")
+      yield* Deferred.await(secondAttempt)
 
       assert.strictEqual(attempts, 2)
-      yield* Deferred.await(secondAttempt)
     })))
 
   it.effect(
@@ -3856,7 +4226,7 @@ describe("server reconciled mutation log", () => {
           ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition, wakeCapacity: 1 })
             .pipe(
               Layer.provide(layerRuntime),
-              Layer.provide(database())
+              Layer.provide(serverDatabase())
             )
         )
         const otherSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
@@ -3894,7 +4264,7 @@ describe("server reconciled mutation log", () => {
             localSequence: Identity.LocalSequence.make(localSequence),
             basis: Identity.ServerSequence.make(0),
             payload: Domain.todo(`${targetSpaceId}:${localSequence}`),
-            digestVersion: 3 as const,
+            digestVersion: 1 as const,
             membershipIncarnation: defaultMembershipIncarnation,
             ...putTodoProvenance
           }
@@ -3919,6 +4289,42 @@ describe("server reconciled mutation log", () => {
         assert.strictEqual(Option.getOrThrow(result).spaceId, otherSpaceId)
       }).pipe(Effect.provide(NodeCrypto.layer))
     ))
+
+  it.effect(
+    "delivers a wake published before the watch starts merging its sources",
+    pipe(Effect.fnUntraced(
+      function*() {
+        const server = yield* service(ServerStore.ServerStore, serverLayer())
+        const initial = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        let first = true
+        const wakes = yield* server.watch(watchRequest()).pipe(
+          Stream.tap(() => {
+            if (!first) return Effect.void
+            first = false
+            return Deferred.succeed(initial, undefined).pipe(Effect.andThen(Deferred.await(release)))
+          }),
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild
+        )
+        yield* Deferred.await(initial)
+        yield* server.submit(
+          yield* envelope(
+            Domain.PutTodo.name,
+            Domain.todo("preempted-wake"),
+            1,
+            Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000071")
+          )
+        )
+        yield* Deferred.succeed(release, undefined)
+        assert.strictEqual((yield* Fiber.join(wakes)).length, 2)
+      },
+      Effect.provide(NodeCrypto.layer),
+      Effect.scoped,
+      Effect.provideService(Scheduler.MaxOpsBeforeYield, 22)
+    ))
+  )
 
   it.effect("runs multi-read queries against one committed visible snapshot", () =>
     Effect.scoped(Effect.gen(function*() {
@@ -3967,8 +4373,13 @@ describe("server reconciled mutation log", () => {
           )
         })
       )
-      const pairDatabase = () =>
-        Layer.mergeAll(SqliteClient.layer({ filename }), NodeCrypto.layer, Reactivity.layer, QueryReactivity.layer)
+      const pairDatabase = (readonly: boolean) =>
+        Layer.mergeAll(
+          ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename, readonly }))),
+          NodeCrypto.layer,
+          Reactivity.layer,
+          QueryReactivity.layer
+        )
       const layerPairRuntime = MutationRuntime.layer(definition).pipe(
         Layer.provide(layerHandlers),
         Layer.provide(layerGate)
@@ -3981,16 +4392,15 @@ describe("server reconciled mutation log", () => {
         clientId
       }).pipe(
         Layer.provide(layerPairRuntime),
-        Layer.provide(pairDatabase())
+        Layer.provide(pairDatabase(false))
       )
       const layerQueries = QueryExecutor.layer(definition, spaceId).pipe(
         Layer.provide(layerHandlers),
         Layer.provide(layerGate),
-        Layer.provide(pairDatabase())
+        Layer.provide(pairDatabase(true))
       )
-      const context = yield* Layer.build(Layer.merge(layerLocal, layerQueries))
-      const store = Context.get(context, LocalStore.Store)
-      const queryExecutor = Context.get(context, QueryExecutor.QueryExecutor)
+      const store = Context.get(yield* Layer.build(layerLocal), LocalStore.Store)
+      const queryExecutor = Context.get(yield* Layer.build(layerQueries), QueryExecutor.QueryExecutor)
       yield* store.mutate(PutPair, { left: 0, right: 0 })
       const query = yield* queryExecutor.execute(ReadPair, undefined).pipe(Effect.forkChild)
       yield* Deferred.await(reached)
@@ -4049,6 +4459,40 @@ describe("server reconciled mutation log", () => {
       assert.strictEqual(yield* local.pendingCount, 1)
     })))
 
+  it.effect("rejects an expired receipt that does not cover the stored outcome and keeps the stored receipt", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const local = yield* service(LocalStore.Store, localLayer())
+      const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("1"))
+      const receipt = Protocol.AcceptedReceipt.make({
+        ...putTodoProvenance,
+        spaceId,
+        clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
+        mutationId: pending.envelope.mutationId,
+        localSequence: pending.envelope.localSequence,
+        serverSequence: Identity.ServerSequence.make(5),
+        terminalSequence: Identity.TerminalSequence.make(5),
+        result: pending.optimisticResult
+      })
+      yield* local.persistReceipts([receipt])
+      const expired = Protocol.ExpiredReceipt.make({
+        ...putTodoProvenance,
+        spaceId,
+        clientId,
+        membershipIncarnation: pending.envelope.membershipIncarnation,
+        mutationId: pending.envelope.mutationId,
+        localSequence: pending.envelope.localSequence,
+        snapshotId: Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000001"),
+        snapshotSequence: Identity.ServerSequence.make(4),
+        terminalSequenceThrough: Identity.TerminalSequence.make(5)
+      })
+
+      const error = yield* local.persistReceipts([expired]).pipe(expectedFailure)
+
+      assert.strictEqual(error._tag, "ProtocolInvalid")
+      assert.deepStrictEqual(yield* local.receipt(pending.envelope.mutationId), Option.some(receipt))
+    })))
+
   it.effect(
     "converges concurrent clients through server assigned order",
     pipe(Effect.fnUntraced(function*() {
@@ -4071,8 +4515,8 @@ describe("server reconciled mutation log", () => {
 
       assert.strictEqual(Option.getOrThrow(yield* first.get(Domain.Todo, "1")).count, 3)
       assert.strictEqual(Option.getOrThrow(yield* second.get(Domain.Todo, "1")).count, 3)
-      assert.strictEqual(yield* first.cursor, 3)
-      assert.strictEqual(yield* second.cursor, 3)
+      assert.strictEqual((yield* first.progress).cursor, 3)
+      assert.strictEqual((yield* second.progress).cursor, 3)
     }, Effect.scoped))
   )
 
@@ -4101,7 +4545,7 @@ describe("server reconciled mutation log", () => {
 
       const layerAuthoritative = ServerStore.layerTrusted({ ...serverHistory, definition: workDefinition }).pipe(
         Layer.provide(layerWorkRuntime),
-        Layer.provide(database())
+        Layer.provide(serverDatabase())
       )
       const server = yield* service(ServerStore.ServerStore, layerAuthoritative)
 
@@ -4114,7 +4558,7 @@ describe("server reconciled mutation log", () => {
         clientId
       }).pipe(
         Layer.provide(layerWorkRuntime),
-        Layer.provide(database())
+        Layer.provide(clientDatabase())
       )
       const layerReconciliation = Reconciler.layer({ definition: workDefinition, spaceId }).pipe(
         Layer.provide(layerLocal),
@@ -4134,6 +4578,247 @@ describe("server reconciled mutation log", () => {
 
       assert.strictEqual(yield* store.pendingCount, 0)
       assert.isAtMost(yield* Ref.get(executions), mutationCount * 3)
+    }, Effect.scoped))
+  )
+
+  it.effect(
+    "accepts a queue of own mutations without re-executing any pending handler",
+    pipe(Effect.fnUntraced(function*() {
+      const Item = Model.make("AcceptedQueueItem", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ id: Schema.String, value: Schema.Number })
+      })
+      const PutItem = Mutation.make("PutAcceptedQueueItem", {
+        version: 1,
+        payload: Item.schema,
+        success: Item.schema
+      })
+      const workDefinition = Definition.make({ version: 1, models: [Item], mutations: [PutItem] })
+      const executions = yield* Ref.make(0)
+      const layerWorkRuntime = MutationRuntime.layer(workDefinition).pipe(
+        Layer.provide(PutItem.toLayer(({ payload, transaction }) =>
+          Ref.update(executions, (count) => count + 1).pipe(
+            Effect.andThen(transaction.set(Item, payload.id, payload)),
+            Effect.as(payload)
+          )
+        ))
+      )
+      const server = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layerTrusted({ ...serverHistory, definition: workDefinition }).pipe(
+          Layer.provide(layerWorkRuntime),
+          Layer.provide(serverDatabase())
+        )
+      )
+      const layerLocal = LocalStore.layer({
+        ...clientHistory,
+        scope: Protocol.ReplicationScope.make({ models: [Item.name] }),
+        definition: workDefinition,
+        spaceId,
+        clientId
+      }).pipe(
+        Layer.provide(layerWorkRuntime),
+        Layer.provide(clientDatabase())
+      )
+      const context = yield* Layer.build(Layer.merge(
+        layerLocal,
+        Reconciler.layer({ definition: workDefinition, spaceId }).pipe(
+          Layer.provide(layerLocal),
+          Layer.provide(directSync(server))
+        )
+      ))
+      const store = Context.get(context, LocalStore.Store)
+      yield* Context.get(context, Reconciler.Reconciler).sync
+
+      const ids = Array.from({ length: 12 }, (_, index) => `accepted-${index}`)
+      yield* Ref.set(executions, 0)
+      yield* Effect.forEach(ids, (id, index) => store.mutate(PutItem, { id, value: index }))
+      yield* Context.get(context, Reconciler.Reconciler).sync
+
+      assert.strictEqual(yield* store.pendingCount, 0)
+      assert.strictEqual(yield* Ref.get(executions), ids.length * 2)
+      for (const [index, id] of ids.entries()) {
+        assert.deepStrictEqual(yield* store.get(Item, id), Option.some({ id, value: index }))
+      }
+    }, Effect.scoped))
+  )
+
+  it.effect(
+    "keeps a retracted entity hidden behind a pending write when an earlier mutation settles",
+    pipe(Effect.fnUntraced(function*() {
+      let hidden = false
+      const server = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layer({
+          ...serverHistory,
+          definition: Domain.definition,
+          authorizeAccess: () => Effect.void,
+          authorizeMutation: () => Effect.void,
+          authorizeRead: (input) => {
+            if (hidden && input._tag === "Entity" && input.entity.key === "retracted") {
+              return Effect.fail(new TestAuthorizationError({ reason: "revoked" }))
+            }
+            return Effect.void
+          }
+        }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(serverDatabase())
+        )
+      )
+      const writerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+      const writer = yield* service(LocalStore.Store, localLayer({ clientId: writerId }))
+      yield* server.submit((yield* writer.mutate(Domain.PutTodo, Domain.todo("retracted"))).envelope)
+
+      const local = yield* service(LocalStore.Store, localLayer())
+      const pull = (cursor: Protocol.ReplicationCursor | null) =>
+        server.pullAuthorized(pullRequest(cursor), "reader").pipe(
+          Effect.map((result) => {
+            if ("_tag" in result) assert.fail("expected an incremental page")
+            return result
+          })
+        )
+      const required = yield* server.pullAuthorized(pullRequest(null), "reader")
+      if (!("_tag" in required)) {
+        assert.fail("expected a bootstrap")
+      }
+      const snapshot = yield* server.bootstrapAuthorized(bootstrapRequest(required.manifest), "reader")
+      yield* local.prepareBootstrap(snapshot.manifest)
+      assert.isTrue(yield* local.stageBootstrapPage(snapshot))
+      yield* local.installBootstrap(snapshot.manifest)
+      for (let round = 0; round < 2; round++) {
+        yield* local.applyViewPage(yield* pull((yield* local.replicationState).cursor))
+      }
+      hidden = true
+      const revoked = yield* pull((yield* local.replicationState).cursor)
+      assert.deepStrictEqual(revoked.changes.map((change) => change._tag), ["Retract"])
+      yield* local.applyViewPage(revoked)
+      assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "retracted")))
+
+      const settling = yield* local.mutate(Domain.PutTodo, Domain.todo("settling"))
+      yield* local.mutate(Domain.PutTodo, Domain.todo("retracted", "local"))
+      yield* local.persistReceipts([yield* server.submit(settling.envelope)])
+      yield* local.applyViewPage(yield* pull((yield* local.replicationState).cursor))
+
+      assert.strictEqual(yield* local.pendingCount, 1)
+      const settled = Domain.todo("settling")
+      assert.deepStrictEqual(yield* local.get(Domain.Todo, "settling"), Option.some(settled))
+      assert.isTrue(Option.isNone(yield* local.get(Domain.Todo, "retracted")))
+    }, Effect.scoped))
+  )
+
+  it.effect(
+    "replays a pending mutation when a foreign write changes an entity it only read",
+    pipe(Effect.fnUntraced(function*() {
+      const Source = Model.make("ReadDependencySource", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ id: Schema.String, value: Schema.Number })
+      })
+      const Copy = Model.make("ReadDependencyCopy", {
+        version: 1,
+        key: Schema.String,
+        schema: Schema.Struct({ id: Schema.String, value: Schema.Number })
+      })
+      const PutSource = Mutation.make("PutReadDependencySource", {
+        version: 1,
+        payload: Source.schema,
+        success: Source.schema
+      })
+      const CopySource = Mutation.make("CopyReadDependencySource", {
+        version: 1,
+        payload: { sourceId: Schema.String, copyId: Schema.String },
+        success: Schema.Number
+      })
+      const workDefinition = Definition.make({
+        version: 1,
+        models: [Source, Copy],
+        mutations: [PutSource, CopySource]
+      })
+      const layerPutSource = PutSource.toLayer(({ payload, transaction }) =>
+        transaction.set(Source, payload.id, payload).pipe(Effect.as(payload))
+      )
+      const layerCopySource = CopySource.toLayer(({ payload, transaction }) =>
+        transaction.get(Source, payload.sourceId).pipe(
+          Effect.map(Option.match({ onNone: () => 0, onSome: (source) => source.value })),
+          Effect.tap((value) => transaction.set(Copy, payload.copyId, { id: payload.copyId, value }))
+        )
+      )
+      const layerWorkRuntime = MutationRuntime.layer(workDefinition).pipe(
+        Layer.provide(Layer.merge(layerPutSource, layerCopySource))
+      )
+      const server = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layerTrusted({ ...serverHistory, definition: workDefinition }).pipe(
+          Layer.provide(layerWorkRuntime),
+          Layer.provide(serverDatabase())
+        )
+      )
+      const workScope = Protocol.ReplicationScope.make({ models: [Source.name, Copy.name] })
+      const workLocal = (id: Identity.ClientId) =>
+        LocalStore.layer({ ...clientHistory, scope: workScope, definition: workDefinition, spaceId, clientId: id })
+          .pipe(
+            Layer.provide(layerWorkRuntime),
+            Layer.provide(clientDatabase())
+          )
+      const layerWriterLocal = workLocal(Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"))
+      const writer = yield* Layer.build(Layer.merge(
+        layerWriterLocal,
+        Reconciler.layer({ definition: workDefinition, spaceId }).pipe(
+          Layer.provide(layerWriterLocal),
+          Layer.provide(directSync(server))
+        )
+      ))
+      const writerStore = Context.get(writer, LocalStore.Store)
+      const writerSync = Context.get(writer, Reconciler.Reconciler)
+      const readerStore = yield* service(LocalStore.Store, workLocal(clientId))
+      const pullReader = (cursor: Protocol.ReplicationCursor | null) =>
+        server.pull(Protocol.PullRequest.make({
+          spaceId,
+          clientId,
+          schema: workDefinition.schemaIdentity,
+          scope: workScope,
+          scopeGeneration,
+          cursor,
+          limit: 10
+        }))
+
+      yield* writerSync.sync
+      yield* writerStore.mutate(PutSource, { id: "source", value: 1 })
+      yield* writerSync.sync
+      const required = yield* pullReader(null)
+      if (!("_tag" in required)) {
+        assert.fail("expected a bootstrap")
+      }
+      const snapshot = yield* server.bootstrap(Protocol.BootstrapRequest.make({
+        spaceId,
+        clientId: required.manifest.clientId,
+        schema: workDefinition.schemaIdentity,
+        scope: workScope,
+        scopeGeneration: required.manifest.scopeGeneration,
+        cursor: required.manifest.cursor,
+        snapshotId: required.manifest.snapshotId,
+        afterOrdinal: -1,
+        limit: 10
+      }))
+      yield* readerStore.prepareBootstrap(snapshot.manifest)
+      assert.isTrue(yield* readerStore.stageBootstrapPage(snapshot))
+      yield* readerStore.installBootstrap(snapshot.manifest)
+
+      yield* writerStore.mutate(PutSource, { id: "source", value: 2 })
+      yield* writerSync.sync
+      yield* readerStore.mutate(CopySource, { sourceId: "source", copyId: "copy" })
+      assert.deepStrictEqual(yield* readerStore.get(Copy, "copy"), Option.some({ id: "copy", value: 1 }))
+
+      const page = yield* pullReader((yield* readerStore.replicationState).cursor)
+      if ("_tag" in page) {
+        assert.fail("expected an incremental page")
+      }
+      yield* readerStore.applyViewPage(page)
+
+      assert.strictEqual(yield* readerStore.pendingCount, 1)
+      assert.deepStrictEqual(yield* readerStore.get(Source, "source"), Option.some({ id: "source", value: 2 }))
+      assert.deepStrictEqual(yield* readerStore.get(Copy, "copy"), Option.some({ id: "copy", value: 2 }))
     }, Effect.scoped))
   )
 
@@ -4171,7 +4856,7 @@ describe("server reconciled mutation log", () => {
         const filename = `${directory}/replica.db`
         const persistentDatabase = () =>
           Layer.mergeAll(
-            SqliteClient.layer({ filename, disableWAL: true }),
+            ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename, disableWAL: true }))),
             NodeCrypto.layer,
             Reactivity.layer,
             QueryReactivity.layer
@@ -4214,7 +4899,7 @@ describe("server reconciled mutation log", () => {
         const filename = `${directory}/submitting-recovery.db`
         const persistentDatabase = () =>
           Layer.mergeAll(
-            SqliteClient.layer({ filename, disableWAL: true }),
+            ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename, disableWAL: true }))),
             NodeCrypto.layer,
             Reactivity.layer,
             QueryReactivity.layer
@@ -4228,7 +4913,7 @@ describe("server reconciled mutation log", () => {
         const mutationId = yield* Effect.scoped(Effect.gen(function*() {
           const local = yield* service(LocalStore.Store, makeLocal())
           const pending = yield* local.mutate(Domain.PutTodo, Domain.todo("submitting-recovery"))
-          yield* local.markSubmitting(pending.envelope.mutationId)
+          yield* local.claimSubmitBatch({ after: 0, through: undefined })
           const submitting = (yield* local.pending)[0]
           assert.strictEqual(submitting.submissionState, "Submitting")
           assert.strictEqual(submitting.attempts, 1)
@@ -4250,7 +4935,7 @@ describe("server reconciled mutation log", () => {
 
   it.effect("restores Submitted and invalidates pending for an identical duplicate receipt", () =>
     Effect.scoped(Effect.gen(function*() {
-      const layerSharedDatabase = database()
+      const layerSharedDatabase = clientDatabase()
       const layerLocalLayerWithDatabase = LocalStore.layer({
         ...clientHistory,
         definition: Domain.definition,
@@ -4272,14 +4957,14 @@ describe("server reconciled mutation log", () => {
         origin: "Authorization",
         rejection: "denied"
       })
-      yield* local.persistReceipt(receipt)
+      yield* local.persistReceipts([receipt])
       yield* sql`UPDATE effect_local_client_pending_data SET submission_state = 'Retrying'
         WHERE space_id = ${spaceId} AND mutation_id = ${pending.envelope.mutationId}`
       let invalidations = 0
       const cancel = reactivity.registerUnsafe([ReactivityKey.pending(spaceId)], () => invalidations++)
       yield* Effect.addFinalizer(() => Effect.sync(cancel))
 
-      yield* local.persistReceipt(receipt)
+      yield* local.persistReceipts([receipt])
 
       const restored = (yield* local.pending)[0]
       assert.strictEqual(restored.submissionState, "Submitted")
@@ -4314,7 +4999,7 @@ describe("server reconciled mutation log", () => {
       })
 
       for (const invalid of [wrongSchema, wrongVersion]) {
-        const error = yield* local.persistReceipt(invalid).pipe(expectedFailure)
+        const error = yield* local.persistReceipts([invalid]).pipe(expectedFailure)
         assert.strictEqual(error._tag, "ProtocolInvalid")
         assert.isTrue(Option.isNone(yield* local.receipt(pending.envelope.mutationId)))
         assert.strictEqual((yield* local.pending)[0].submissionState, "Queued")
@@ -4322,7 +5007,7 @@ describe("server reconciled mutation log", () => {
     }, Effect.scoped))
   )
 
-  const layerRestartDatabase = database()
+  const layerRestartDatabase = clientDatabase()
 
   it.effect(
     "replays settlements to a subscriber attached after a runtime restart over the same database",
@@ -4438,7 +5123,7 @@ describe("server reconciled mutation log", () => {
       )
       const small = yield* settleTodo(local, "small-snapshot")
       const bulk = yield* local.mutate(Domain.PutManyMessages, { count: 40, chats: 2 })
-      yield* local.applyReceipt(legacyRejection(bulk))
+      yield* local.applyReceipt(authorizationRejection(bulk))
 
       const pull = yield* Stream.toPull(local.settlements({ from: 0 }))
       const observed: Array<Replica.SettledMutation> = []
@@ -4480,7 +5165,7 @@ describe("server reconciled mutation log", () => {
   it.effect(
     "replays surviving settlements after pruning a settlement whose snapshot was dropped",
     pipe(Effect.fnUntraced(function*() {
-      const layerClientDatabase = database()
+      const layerClientDatabase = clientDatabase()
       const layerLive = LocalStore.layer({
         ...clientHistory,
         retainedReceipts: 3,
@@ -4526,7 +5211,7 @@ describe("server reconciled mutation log", () => {
       for (let index = 0; index < 6; index++) {
         pendings.push(yield* local.mutate(Domain.PutTodo, Domain.todo(`concurrent-${index}`)))
       }
-      yield* Effect.forEach(pendings, (item) => local.applyReceipt(legacyRejection(item)), {
+      yield* Effect.forEach(pendings, (item) => local.applyReceipt(authorizationRejection(item)), {
         concurrency: "unbounded"
       })
       assert.strictEqual(yield* local.pendingCount, 0)
@@ -4538,22 +5223,11 @@ describe("server reconciled mutation log", () => {
   )
 
   it.effect(
-    "filters a named settlement replay in the durable backlog and keeps legacy receipts",
+    "filters a named settlement replay in the durable backlog",
     pipe(Effect.fnUntraced(function*() {
       const local = yield* service(LocalStore.Store, localLayer())
       const todoPending = yield* local.mutate(Domain.PutTodo, Domain.todo("named-todo"))
-      const legacyReceipt = Protocol.LegacyReceipt.make({
-        spaceId,
-        clientId,
-        mutationId: todoPending.envelope.mutationId,
-        localSequence: todoPending.envelope.localSequence,
-        membershipIncarnation: todoPending.envelope.membershipIncarnation,
-        sourceSchema: Domain.definition.schemaIdentity,
-        outcome: "Rejected",
-        serverSequence: null,
-        body: "legacy-denied"
-      })
-      yield* local.applyReceipt(legacyReceipt)
+      yield* local.applyReceipt(authorizationRejection(todoPending))
       yield* settleMessage(local, "named-message")
 
       const pull = yield* Stream.toPull(
@@ -4564,7 +5238,15 @@ describe("server reconciled mutation log", () => {
         named.map((settled) => settled.settlement.pending.envelope.mutationId),
         [todoPending.envelope.mutationId]
       )
-      assert.strictEqual(named[0].settlement.receipt._tag, "Legacy")
+      assert.strictEqual(named[0].settlement.receipt._tag, "Rejected")
+
+      const allPull = yield* Stream.toPull(local.settlements({ from: 0 }))
+      const observed: Array<Replica.SettledMutation> = []
+      while (observed.length < 2) observed.push(...(yield* allPull))
+      assert.deepStrictEqual(
+        observed.map((settled) => settled.settlement.pending.envelope.name),
+        [Domain.PutTodo.name, Domain.PutMessage.name]
+      )
     }, Effect.scoped))
   )
 })

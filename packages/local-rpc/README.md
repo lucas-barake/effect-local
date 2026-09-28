@@ -3,69 +3,65 @@
 Authenticated Effect RPC synchronization and bounded ephemera for Effect Local.
 
 One `SyncRpc.Rpcs` group carries mutation submission, ordered pulls, snapshot bootstrap pages, wake streams, and
-ephemeral join, publish, and heartbeat operations over one WebSocket. `SyncServer.layer` authenticates the public
-facade and routes space operations through `SpaceEntity.Client`. `SyncClient.layer` implements `SyncEngine`, while
+ephemeral join, publish, and heartbeat operations over one WebSocket. `SyncServer.layer` builds the whole server:
+the authenticated gateway, one Effect Cluster entity per space, the durable `ServerStore`, the ephemeral hub, signed
+principal assertions, and the maintenance singleton. `SyncClient.layer` implements `SyncEngine`, while
 `EphemeralClient.layer` exposes the joined ephemeral channel.
 
-## Space ownership
-
-`SpaceEntity` uses five volatile Cluster entity types. `SpaceAdmissionEntity` serializes Submit and Discard.
-`SpaceReadEntity` serves Pull and immutable Bootstrap pages concurrently. `SpaceWatchEntity` owns long lived sync
-watches. `SpaceEphemeralJoinEntity` owns joined streams with finite mailbox and verification admission.
-`SpaceEphemeralCommandEntity` owns publish and heartbeat. The Hub applies its watcher bound after authorization. A full
-join lane cannot starve commands or mutation admission.
+## Server
 
 ```ts
-import * as EphemeralHub from "@lucas-barake/effect-local-rpc/EphemeralHub"
-import * as SpaceEntity from "@lucas-barake/effect-local-rpc/SpaceEntity"
+import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
+import * as SyncRpc from "@lucas-barake/effect-local-rpc/SyncRpc"
+import * as SyncServer from "@lucas-barake/effect-local-rpc/SyncServer"
 import * as Layer from "effect/Layer"
+import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
+import * as HttpRouter from "effect/unstable/http/HttpRouter"
 
-const layerEphemeral = EphemeralHub.layer({
-  capacity: 1_024,
-  maximumSpaces: 1_024,
-  maximumWatchersPerSpace: 1_024,
-  maximumMembersPerSpace: 1_024,
-  maximumEventKeysPerMember: 64,
-  maximumEventKeysPerSpace: 4_096,
-  maximumStateKeysPerMember: 256,
-  maximumStateKeysPerSpace: 16_384,
-  maximumBytesPerMember: 1024 * 1024,
-  maximumBytesPerSpace: 16 * 1024 * 1024,
-  maximumSnapshotBytes: 4 * 1024 * 1024,
-  memberTtl: "1 minute",
-  authorizationRefreshInterval: "30 seconds",
-  maximumEventTtl: "1 minute",
-  maximumStateTtl: "7 days",
-  spaceIdleTtl: "7 days",
-  authorize: authorizeEphemeral
-})
+const layerProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(Layer.provide(HttpRouter.layer))
 
-const layerSpace = SpaceEntity.layer({
-  admissionMailboxCapacity: 64,
-  readMailboxCapacity: 64,
-  watchMailboxCapacity: 2_048,
-  ephemeralJoinMailboxCapacity: 1_280,
-  ephemeralCommandMailboxCapacity: 256,
-  maximumConcurrentBootstrapAuthorizations: 64,
-  maximumConcurrentBootstrapPagesPerSpace: 8,
-  maximumConcurrentEphemeralJoinVerificationsPerSpace: 64,
-  maximumConcurrentEphemeralRequestsPerSpace: 64
+export const layerServer = SyncServer.layer({
+  definition,
+  authorizeAccess,
+  authorizeMutation,
+  authorizeRead,
+  authorizeEphemeral
 }).pipe(
-  Layer.provide(layerStore),
-  Layer.provide(layerEphemeral),
-  Layer.provide(layerRunner)
+  Layer.provideMerge(layerProtocol),
+  Layer.provide(Authentication.layerServer.pipe(Layer.provide(layerAuthenticator))),
+  Layer.provide(SingleRunner.layer({ runnerStorage: "memory" })),
+  Layer.provide(layerMutationHandlers),
+  Layer.provide(layerDatabase),
+  Layer.provide(HttpRouter.serve(layerProtocol)),
+  Layer.provide([layerHttpServer, SyncRpc.layerJson()])
 )
 ```
 
-All nine numeric `SpaceEntity` options are required positive safe integers. Size `ephemeralJoinMailboxCapacity` for
-active watchers plus bounded pending verification. Join verification and command work have separate concurrency
-limits. A full entity mailbox maps to `ServerUnavailable`. Bootstrap concurrency is fail fast. Saturation reports
-typed `CapacityExceeded` with resource `bootstrap authorizations`, `bootstrap pages`, or
-`ephemeral join verifications`.
+The four authorization callbacks are required. Every limit has a default: `store` takes any `ServerStore` option (see
+`ServerStore.defaults`), `ephemeral` any `EphemeralHub` option, `spaces` any `SpaceEntity.HandlerOptions` (see
+`SpaceEntity.defaults`), and `maintenance.interval` defaults to one hour. The layer exposes `ServerStore`, so an
+application can call `invalidateReadAuthorization` after a permission change or `maintain` from an admin task.
 
-For one process, provide `SingleRunner.layer` with the selected runner storage. A multi-runner deployment provides
-Effect Cluster runner transport, storage, health, serialization, and sharding Layers. This package does not choose
-those deployment policies.
+Each space is served by one `EffectLocal/Space` entity, so an active space costs one resident entity. The entity
+serializes SubmitBatch and Discard behind one admission permit and serves Pull, Bootstrap, Watch, and ephemeral operations
+concurrently. Bootstrap authorizations, bootstrap pages per space, and ephemeral join verifications have fail-fast
+bounds, and ephemeral publish and heartbeat requests queue behind their own per-space bound. Saturation reports typed `CapacityExceeded` with resource
+`bootstrap authorizations`, `bootstrap pages`, or `ephemeral join verifications`.
+
+For one process, provide `SingleRunner.layer`. For several processes, provide Effect Cluster's runner transport and
+SQL runner and message storage instead. `SyncServer.layer` itself is the same on every runner. The gateway on any
+runner forwards a request to the runner that owns the space, and the maintenance sweep runs on one runner at a time.
+
+Run the runners' socket transport with NDJSON serialization, for example
+`NodeClusterSocket.layer({ serialization: "ndjson" })`. In Effect `4.0.0-rc.117` the default SchemaBinary runner
+serialization breaks volatile streaming entity calls between runners after their first element, which would stop
+cross-runner watches and presence. `packages/local-rpc/test/MultiRunner.test.ts` runs two real runners over sockets
+with shared SQL storage and covers batch submit, watch, presence, mismatched assertion secrets, and the maintenance
+singleton.
+
+Requests reach the space entity with a principal assertion signed by HMAC-SHA256. Pass the same `assertionSecret`
+(`Redacted`, at least 32 bytes) to every runner. Without it each process generates its own secret, which is correct
+for a single process and makes cross-runner requests fail with `AuthorizationDenied`.
 
 ## Ephemeral semantics
 
@@ -177,9 +173,12 @@ policy belongs to the application rather than this generic best-effort transport
 
 ## Bounds and expiry
 
-`EphemeralHub` validates every option when its Layer is built. `maximumWatchersPerSpace` is required. Defaults for the
-other limits are shown in the example above. `spaceIdleTtl` must be at least `maximumStateTtl`, so idle eviction cannot
-shorten promised state replay.
+`EphemeralHub` validates every option when its Layer is built. Every option is optional: `capacity`,
+`maximumSpaces`, `maximumWatchersPerSpace`, and `maximumMembersPerSpace` default to 1024, `maximumEventKeysPerMember`
+to 64, `maximumEventKeysPerSpace` to 4096, `maximumStateKeysPerMember` to 256, `maximumStateKeysPerSpace` to 16384,
+`maximumBytesPerMember` to 1 MiB, `maximumBytesPerSpace` to 16 MiB, and `maximumSnapshotBytes` to the 4 MiB frame
+limit. TTL bounds default to the wire maxima. `spaceIdleTtl` must be at least `maximumStateTtl`, so idle eviction
+cannot shorten promised state replay.
 
 The wire contract also caps each encoded join or publish payload at 16 KiB, channel and key strings at 256 characters,
 member and event TTLs at 60 seconds, and state TTLs at seven days. The server takes the smaller of the requested TTL
@@ -224,10 +223,39 @@ export const layerClientRpc = Layer.merge(
 The actual heartbeat interval is no longer than half the server-accepted member lease. Negotiation selects the highest shared
 version. A peer rejection causes one renegotiation and retry. No common version returns terminal `UpgradeRequired`.
 
+`ProtocolSession` and `SyncServer` default to `Protocol.supportedProtocolVersions`, which is `[1]`. `SyncEngine.submitBatch`
+sends one `SubmitBatch`, which carries up to `Protocol.maximumSubmitBatchEntries` envelopes of one space and returns their
+receipts in order. The server admits a batch
+one SQL transaction per envelope and returns a shorter prefix when the response would exceed `Protocol.maximumBatchBytes`
+or the batch has run for the store's `maximumSubmitBatchDuration`, default 1 second. The client resubmits the rest.
+
 `sessionAcquisitionTimeout` and `rpcTimeout` accept `Duration.Input` and default to 10 seconds. They bound negotiation,
 unary RPCs, and stream acquisition. Established join and watch streams may remain idle. Expiry returns typed
 `OperationTimeout`. Socket ping and reconnect detect dead connections without converting healthy idle streams into
 retry traffic.
+
+For the common case of one WebSocket per client, `SyncClient.layerWebSocket` composes the socket, JSON
+serialization, protocol session, credential middleware, sync engine, and ephemeral client. It requires only a
+`CredentialProvider` and a `WebSocketConstructor`, and it builds the credential middleware fresh so two clients with
+different providers under one memo map never share it:
+
+```ts
+import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
+import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
+import * as Layer from "effect/Layer"
+import * as Redacted from "effect/Redacted"
+import * as Socket from "effect/unstable/socket/Socket"
+
+export const layerSync = SyncClient.layerWebSocket({ url: "wss://example.com/sync" }).pipe(
+  Layer.provide(Socket.layerWebSocketConstructorGlobal),
+  Layer.provide(Authentication.layerCredentialProviderStatic(Redacted.make(token)))
+)
+```
+
+`url` also accepts an `Effect`, which runs again on every reconnect, so a discovered or signed address is never pinned to
+the first connection. `Authentication.layerCredentialProvider`
+takes a `SubscriptionRef` of credentials when the application rotates tokens; `awaitChange` resolves with the first
+credential whose generation differs from the rejected one.
 
 `SyncClient.layerProtocolSocket` exposes Effect's socket retry options:
 
@@ -247,17 +275,14 @@ const layerRpcProtocol = SyncClient.layerProtocolSocket({
 ## Authentication
 
 The client calls `CredentialProvider.acquire` for every RPC and sends a redacted bearer credential with its generation.
-The server provides a JSON principal through `Authenticator`. `SyncServer.layerHandlers` requires a
-`PrincipalAssertion.Issuer`, and `SpaceEntity.layerHandlers` requires the matching verifier. The opaque assertion is
-verified before an ephemeral authorization callback runs. Browser payloads never carry or choose principal authority.
-
-`ServerStore.layer` requires access, mutation, and read authorization callbacks. `EphemeralHub.layer` requires a tagged
-join, publish, or heartbeat callback containing the space, member, and verified principal. Use `layerTrusted` only when
-allow all is intentional.
+The server resolves a JSON principal through `Authenticator`, and `Authentication.layerServer` turns that into the RPC
+middleware `SyncServer.layer` requires. Provide your own `Authentication.Authentication` middleware instead when you
+need to wrap it, for example to add rate limiting. The gateway signs the principal into an assertion and the space
+entity verifies it before any authorization callback runs, so browser payloads never carry or choose principal
+authority.
 
 `CredentialRejected` pauses the rejected credential generation until `awaitChange` returns a new one.
-`AuthenticatorUnavailable` is retryable. `AuthorizationDenied` is terminal. Applications own assertion authenticity,
-expiry, and key rotation.
+`AuthenticatorUnavailable` is retryable. `AuthorizationDenied` is terminal.
 
 Use `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. Production ingress must enforce
 the same native frame limit with a reverse proxy or lower-level WebSocket upgrade handler.

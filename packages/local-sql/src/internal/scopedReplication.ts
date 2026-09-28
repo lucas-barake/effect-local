@@ -12,9 +12,11 @@ import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as AcceptedLog from "./acceptedLog.js"
 import * as Codec from "./codec.js"
+import type * as Dialect from "./dialect.js"
 import * as Rows from "./rows.js"
 import type * as ServerIndex from "./serverIndex.js"
 import * as StorageUnavailable from "./storageUnavailable.js"
+import * as SqlTransaction from "./transaction.js"
 import * as WindowSchema from "./windowSchema.js"
 
 export interface Authorization {
@@ -32,6 +34,7 @@ export interface Authorization {
 
 export interface Options {
   readonly sql: SqlClient.SqlClient
+  readonly dialect: Dialect.Dialect
   readonly crypto: Crypto.Crypto
   readonly definition: Definition.Any
   readonly maximumSnapshotEntities: number
@@ -89,7 +92,7 @@ const largestPagePrefix = (
 }
 
 export const make = (options: Options) => {
-  const { sql } = options
+  const { dialect, sql } = options
   const findSpace = SqlSchema.findOne({
     Request: Identity.SpaceId,
     Result: Rows.ReplicationSpaceRow,
@@ -98,6 +101,15 @@ export const make = (options: Options) => {
         target_schema_version, target_schema_hash, migration_hash, next_server_sequence, next_terminal_sequence,
         read_auth_epoch
       FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
+  })
+  const lockSpaceRow = SqlSchema.findOne({
+    Request: Identity.SpaceId,
+    Result: Rows.ReplicationSpaceRow,
+    execute: (spaceId) =>
+      sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
+        target_schema_version, target_schema_hash, migration_hash, next_server_sequence, next_terminal_sequence,
+        read_auth_epoch
+      FROM effect_local_server_spaces WHERE space_id = ${spaceId} ${dialect.forNoKeyUpdate}`
   })
   const findEntities = SqlSchema.findAll({
     Request: Schema.Struct({ spaceId: Identity.SpaceId, limit: Schema.Int }),
@@ -115,9 +127,12 @@ export const make = (options: Options) => {
       FROM effect_local_server_entities AS entity
       WHERE entity.space_id = ${spaceId}
         AND (entity.model, entity.entity_key) IN (
-          SELECT json_extract(requested.value, '$.model'),
-            json_extract(requested.value, '$.key')
-          FROM json_each(${entitiesJson}) AS requested
+          SELECT requested.model, requested.key FROM ${
+        dialect.jsonRecords(entitiesJson, "requested", [
+          { name: "model", affinity: "text" },
+          { name: "key", affinity: "text" }
+        ])
+      }
         )
       ORDER BY entity.model, entity.entity_key`
   })
@@ -205,12 +220,7 @@ export const make = (options: Options) => {
   const scopeDigest = (scope: Protocol.ReplicationScope) =>
     Protocol.replicationScopeDigest(scope).pipe(Effect.provideService(Crypto.Crypto, options.crypto))
 
-  const lockSpace = (spaceId: Identity.SpaceId) =>
-    sql`INSERT INTO effect_local_server_space_counts (space_id, history_count, receipt_count)
-      VALUES (${spaceId}, 0, 0) ON CONFLICT (space_id) DO NOTHING`.pipe(
-      Effect.andThen(findSpace(spaceId)),
-      Effect.mapError(StorageUnavailable.make)
-    )
+  const lockSpace = (spaceId: Identity.SpaceId) => lockSpaceRow(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
 
   const validatePreparedSpace = (
     expectedGeneration: number,
@@ -1092,337 +1102,368 @@ export const make = (options: Options) => {
     }
   )
 
+  const pullLocked = (
+    request: Protocol.PullRequest,
+    principal: typeof Schema.Json.Type,
+    expectedGeneration: number
+  ) =>
+    SqlTransaction.withServerTransaction(
+      sql,
+      Effect.gen(function*() {
+        const space = yield* lockSpace(request.spaceId)
+        yield* validatePreparedSpace(expectedGeneration, space)
+        const targetDefinition = yield* options.resolveDefinition(request.schema)
+        const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
+        yield* WindowSchema.validate(normalized, request.schema, options.definition.schemaIdentity)
+        const schemaIsCurrent = WindowSchema.isCurrent(request.schema, options.definition.schemaIdentity)
+        const normalizedDigest = yield* scopeDigest(normalized)
+        const principalHash = yield* principalDigest(principal)
+        const stored = yield* findView({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
+          Effect.mapError(StorageUnavailable.make)
+        )
+        if (Option.isSome(stored) && request.scopeGeneration < stored.value.scope_generation) {
+          return yield* new ReplicaError.StaleReplicationScope({
+            expected: stored.value.scope_generation,
+            actual: request.scopeGeneration
+          })
+        }
+        if (
+          request.cursor === null && Option.isSome(stored) && stored.value.principal_digest === principalHash &&
+          stored.value.definition_hash === targetDefinition.hash &&
+          stored.value.index_layout_hash === targetDefinition.indexLayoutHash &&
+          stored.value.schema_version === request.schema.version && stored.value.schema_hash === request.schema.hash &&
+          stored.value.scope_generation === request.scopeGeneration && stored.value.scope_digest === normalizedDigest
+        ) {
+          const snapshot = yield* findClientSnapshot({
+            spaceId: request.spaceId,
+            clientId: request.clientId
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+          if (
+            Option.isSome(snapshot) && snapshot.value.principal_digest === principalHash &&
+            snapshot.value.definition_hash === targetDefinition.hash &&
+            snapshot.value.index_layout_hash === targetDefinition.indexLayoutHash &&
+            snapshot.value.schema_version === request.schema.version &&
+            snapshot.value.schema_hash === request.schema.hash &&
+            snapshot.value.scope_generation === request.scopeGeneration &&
+            snapshot.value.scope_digest === normalizedDigest && snapshot.value.view_id === stored.value.view_id &&
+            snapshot.value.view_revision === stored.value.view_revision &&
+            snapshot.value.server_sequence === space.next_server_sequence - 1 &&
+            snapshot.value.terminal_sequence === space.next_terminal_sequence - 1
+          ) return existingBootstrapRequired(snapshot.value)
+        }
+        if (
+          request.cursor === null || Option.isNone(stored) || stored.value.principal_digest !== principalHash ||
+          stored.value.definition_hash !== targetDefinition.hash ||
+          stored.value.index_layout_hash !== targetDefinition.indexLayoutHash ||
+          stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
+          request.cursor.viewId !== stored.value.view_id || request.scopeGeneration < stored.value.scope_generation
+        ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
+        const view = stored.value
+        if (request.scopeGeneration === view.scope_generation && view.scope_digest !== normalizedDigest) {
+          return yield* new ReplicaError.ProtocolInvalid({
+            message: "Replication scope changed without advancing scope generation"
+          })
+        }
+        const pageRow = yield* findPage({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
+          Effect.mapError(StorageUnavailable.make)
+        )
+        if (Option.isSome(pageRow)) {
+          const row = pageRow.value
+          if (
+            row.principal_digest !== principalHash || row.view_id !== view.view_id
+          ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
+          if (
+            row.server_sequence < view.server_sequence ||
+            row.server_sequence > space.next_server_sequence - 1
+          ) {
+            return yield* new ReplicaError.StorageCorrupt({
+              message: "Durable replication page has an invalid server watermark"
+            })
+          }
+          const page = yield* pageFromRow(row)
+          const acknowledgesPriorGeneration = request.cursor.revision === row.target_revision &&
+            request.scopeGeneration > row.scope_generation
+          if (
+            !acknowledgesPriorGeneration &&
+            (row.scope_generation !== request.scopeGeneration || row.scope_digest !== normalizedDigest)
+          ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
+          if (request.cursor.revision === row.base_revision) {
+            let all: ReadonlyMap<string, MaterializedEntity>
+            if (schemaIsCurrent) {
+              const identities: Array<{ readonly model: string; readonly key: string }> = []
+              for (const change of page.changes) {
+                identities.push({
+                  model: change.entity.model,
+                  key: yield* Codec.stringify(change.entity.key)
+                })
+              }
+              all = yield* materializeByIdentity(request.spaceId, identities)
+            } else {
+              const source = yield* authoritative(request.spaceId)
+              all = (yield* projectVisible(
+                { ...request, scope: normalized },
+                principal,
+                source,
+                targetDefinition,
+                emptyWindowSelection
+              )).all
+            }
+            const windowKeys = yield* windowSelection(
+              request.spaceId,
+              space.active_schema_generation,
+              normalized
+            )
+            if (!(yield* pageSafe({ ...request, scope: normalized }, principal, page, all, windowKeys))) {
+              return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
+            }
+            return page
+          }
+          if (request.cursor.revision !== row.target_revision) {
+            return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
+          }
+          yield* applyAcknowledgedPage(request, principalHash, page, row)
+        } else if (request.cursor.revision !== view.view_revision) {
+          return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
+        }
+        const currentView = yield* findView({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
+          Effect.mapError(StorageUnavailable.make),
+          Effect.flatMap(Option.match({
+            onNone: () => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Replication view disappeared" })),
+            onSome: Effect.succeed
+          }))
+        )
+        yield* sql`INSERT INTO effect_local_server_offline_wake_acknowledgements
+        (space_id, client_id, acknowledged_sequence)
+        VALUES (${request.spaceId}, ${request.clientId}, ${currentView.delivered_sequence})
+        ON CONFLICT (space_id, client_id) DO UPDATE SET
+          acknowledged_sequence = ${
+          dialect.greatest(
+            sql`effect_local_server_offline_wake_acknowledgements.acknowledged_sequence`,
+            sql`excluded.acknowledged_sequence`
+          )
+        }`
+        yield* sql`DELETE FROM effect_local_server_offline_wakes
+        WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}
+          AND high_water_sequence <= ${currentView.delivered_sequence}`
+        let changes: ReadonlyArray<Protocol.ViewChange> | undefined
+        if (
+          schemaIsCurrent && currentView.scope_digest === normalizedDigest &&
+          currentView.read_auth_epoch === space.read_auth_epoch
+        ) {
+          const delta = yield* deriveDeltaChanges(request, principal, normalized, currentView, space)
+          if (Option.isSome(delta)) changes = delta.value
+        }
+        if (changes === undefined) {
+          const source = yield* authoritative(request.spaceId)
+          const selection = yield* windowSelection(request.spaceId, space.active_schema_generation, normalized)
+          const projected = yield* projectVisible(
+            { ...request, scope: normalized },
+            principal,
+            source,
+            targetDefinition,
+            selection
+          )
+          const acknowledged = yield* findViewEntities({
+            spaceId: request.spaceId,
+            clientId: request.clientId,
+            viewId: currentView.view_id
+          }).pipe(Effect.mapError(StorageUnavailable.make))
+          changes = yield* diff(
+            { ...request, scope: normalized },
+            acknowledged,
+            projected.all,
+            projected.target
+          )
+        }
+        return yield* pipe(
+          Identity.ServerSequence.make(space.next_server_sequence - 1),
+          (serverSequence) =>
+            persistNextPage(
+              request,
+              principalHash,
+              currentView,
+              changes,
+              serverSequence,
+              normalized,
+              normalizedDigest,
+              space.read_auth_epoch
+            )
+        )
+      })
+    )
+
   const pull = (
     request: Protocol.PullRequest,
     principal: typeof Schema.Json.Type,
     expectedGeneration: number
   ) =>
-    sql.withTransaction(Effect.gen(function*() {
-      yield* options.authorization.scope(request, principal)
-      const space = yield* lockSpace(request.spaceId)
-      yield* validatePreparedSpace(expectedGeneration, space)
-      const targetDefinition = yield* options.resolveDefinition(request.schema)
-      const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
-      yield* WindowSchema.validate(normalized, request.schema, options.definition.schemaIdentity)
-      const schemaIsCurrent = WindowSchema.isCurrent(request.schema, options.definition.schemaIdentity)
-      const normalizedDigest = yield* scopeDigest(normalized)
-      const principalHash = yield* principalDigest(principal)
-      const stored = yield* findView({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
-        Effect.mapError(StorageUnavailable.make)
-      )
-      if (Option.isSome(stored) && request.scopeGeneration < stored.value.scope_generation) {
-        return yield* new ReplicaError.StaleReplicationScope({
-          expected: stored.value.scope_generation,
-          actual: request.scopeGeneration
-        })
-      }
-      if (
-        request.cursor === null && Option.isSome(stored) && stored.value.principal_digest === principalHash &&
-        stored.value.definition_hash === targetDefinition.hash &&
-        stored.value.index_layout_hash === targetDefinition.indexLayoutHash &&
-        stored.value.schema_version === request.schema.version && stored.value.schema_hash === request.schema.hash &&
-        stored.value.scope_generation === request.scopeGeneration && stored.value.scope_digest === normalizedDigest
-      ) {
-        const snapshot = yield* findClientSnapshot({
-          spaceId: request.spaceId,
-          clientId: request.clientId
-        }).pipe(Effect.mapError(StorageUnavailable.make))
+    options.authorization.scope(request, principal).pipe(
+      Effect.andThen(pullLocked(request, principal, expectedGeneration)),
+      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+    )
+
+  const bootstrapLocked = (
+    request: Protocol.BootstrapRequest,
+    principal: typeof Schema.Json.Type,
+    expectedGeneration: number
+  ) =>
+    SqlTransaction.withServerTransaction(
+      sql,
+      Effect.gen(function*() {
+        const space = yield* lockSpace(request.spaceId)
+        yield* validatePreparedSpace(expectedGeneration, space)
+        const targetDefinition = yield* options.resolveDefinition(request.schema)
+        const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
+        yield* WindowSchema.validate(normalized, request.schema, options.definition.schemaIdentity)
+        const normalizedDigest = yield* scopeDigest(normalized)
+        const principalHash = yield* principalDigest(principal)
+        let stored = yield* findSnapshot(request.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
         if (
-          Option.isSome(snapshot) && snapshot.value.principal_digest === principalHash &&
-          snapshot.value.definition_hash === targetDefinition.hash &&
-          snapshot.value.index_layout_hash === targetDefinition.indexLayoutHash &&
-          snapshot.value.schema_version === request.schema.version &&
-          snapshot.value.schema_hash === request.schema.hash &&
-          snapshot.value.scope_generation === request.scopeGeneration &&
-          snapshot.value.scope_digest === normalizedDigest && snapshot.value.view_id === stored.value.view_id &&
-          snapshot.value.view_revision === stored.value.view_revision &&
-          snapshot.value.server_sequence === space.next_server_sequence - 1 &&
-          snapshot.value.terminal_sequence === space.next_terminal_sequence - 1
-        ) return existingBootstrapRequired(snapshot.value)
-      }
-      if (
-        request.cursor === null || Option.isNone(stored) || stored.value.principal_digest !== principalHash ||
-        stored.value.definition_hash !== targetDefinition.hash ||
-        stored.value.index_layout_hash !== targetDefinition.indexLayoutHash ||
-        stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
-        request.cursor.viewId !== stored.value.view_id || request.scopeGeneration < stored.value.scope_generation
-      ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
-      const view = stored.value
-      if (request.scopeGeneration === view.scope_generation && view.scope_digest !== normalizedDigest) {
-        return yield* new ReplicaError.ProtocolInvalid({
-          message: "Replication scope changed without advancing scope generation"
-        })
-      }
-      const pageRow = yield* findPage({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
-        Effect.mapError(StorageUnavailable.make)
-      )
-      if (Option.isSome(pageRow)) {
-        const row = pageRow.value
-        if (
-          row.principal_digest !== principalHash || row.view_id !== view.view_id
-        ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
-        if (
-          row.server_sequence < view.server_sequence ||
-          row.server_sequence > space.next_server_sequence - 1
+          Option.isNone(stored) || stored.value.space_id !== request.spaceId ||
+          stored.value.client_id !== request.clientId || stored.value.principal_digest !== principalHash ||
+          stored.value.definition_hash !== targetDefinition.hash ||
+          stored.value.index_layout_hash !== targetDefinition.indexLayoutHash ||
+          stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
+          stored.value.scope_digest !== normalizedDigest || stored.value.scope_generation !== request.scopeGeneration ||
+          stored.value.view_id !== request.cursor.viewId || stored.value.view_revision !== request.cursor.revision
         ) {
-          return yield* new ReplicaError.StorageCorrupt({
-            message: "Durable replication page has an invalid server watermark"
+          const manifest = yield* createSnapshot({ ...request, scope: normalized }, principal, principalHash)
+          stored = yield* findSnapshot(manifest.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
+        }
+        if (Option.isNone(stored)) {
+          return yield* new ReplicaError.StorageCorrupt({ message: "Scoped snapshot disappeared" })
+        }
+        let row = stored.value
+        let afterOrdinal = request.afterOrdinal
+        if (afterOrdinal >= row.entry_count) {
+          return yield* new ReplicaError.CursorGap({
+            expected: Math.max(-1, row.entry_count - 1),
+            actual: afterOrdinal
           })
         }
-        const page = yield* pageFromRow(row)
-        const acknowledgesPriorGeneration = request.cursor.revision === row.target_revision &&
-          request.scopeGeneration > row.scope_generation
-        if (
-          !acknowledgesPriorGeneration &&
-          (row.scope_generation !== request.scopeGeneration || row.scope_digest !== normalizedDigest)
-        ) return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
-        if (request.cursor.revision === row.base_revision) {
-          let all: ReadonlyMap<string, MaterializedEntity>
-          if (schemaIsCurrent) {
-            const identities: Array<{ readonly model: string; readonly key: string }> = []
-            for (const change of page.changes) {
-              identities.push({
-                model: change.entity.model,
-                key: yield* Codec.stringify(change.entity.key)
+        const loadEntries = (snapshot: typeof Rows.ScopedSnapshotManifestRow.Type, after: number) =>
+          findSnapshotEntryPage({
+            snapshotId: snapshot.snapshot_id,
+            afterOrdinal: after,
+            limit: request.limit
+          }).pipe(
+            Effect.mapError(StorageUnavailable.make),
+            Effect.flatMap(decodeSnapshotEntries),
+            Effect.flatMap((entries) => {
+              for (let index = 0; index < entries.length; index++) {
+                if (entries[index].entry.ordinal !== after + index + 1) {
+                  return Effect.fail(
+                    new ReplicaError.StorageCorrupt({ message: "Scoped snapshot page contains an ordinal gap" })
+                  )
+                }
+              }
+              if (entries.length === 0 && after + 1 < snapshot.entry_count) {
+                return Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Scoped snapshot page is missing durable entries" })
+                )
+              }
+              return Effect.succeed(entries)
+            })
+          )
+        const selectEntries = (
+          snapshot: typeof Rows.ScopedSnapshotManifestRow.Type,
+          after: number,
+          entries: ReadonlyArray<StoredSnapshotEntry>
+        ) => {
+          const length = pipe(
+            Math.min(request.limit, entries.length),
+            (maximumLength) =>
+              largestPagePrefix(maximumLength, (candidateLength) => {
+                const candidate = Protocol.BootstrapPage.make({
+                  manifest: manifestFromRow(snapshot),
+                  entries: entries.slice(0, candidateLength).map((snapshotEntry) => snapshotEntry.entry),
+                  hasMore: after + candidateLength + 1 < snapshot.entry_count,
+                  serverSchema: options.definition.schemaIdentity
+                })
+                return Protocol.encodedBytes(candidate) <= options.maximumBootstrapPageBytes
               })
-            }
-            all = yield* materializeByIdentity(request.spaceId, identities)
-          } else {
-            const source = yield* authoritative(request.spaceId)
-            all = (yield* projectVisible(
-              { ...request, scope: normalized },
-              principal,
-              source,
-              targetDefinition,
-              emptyWindowSelection
-            )).all
-          }
-          const windowKeys = yield* windowSelection(
-            request.spaceId,
-            space.active_schema_generation,
-            normalized
           )
-          if (!(yield* pageSafe({ ...request, scope: normalized }, principal, page, all, windowKeys))) {
-            return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
-          }
-          return page
+          return entries.slice(0, length)
         }
-        if (request.cursor.revision !== row.target_revision) {
-          return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
-        }
-        yield* applyAcknowledgedPage(request, principalHash, page, row)
-      } else if (request.cursor.revision !== view.view_revision) {
-        return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
-      }
-      const currentView = yield* findView({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
-        Effect.mapError(StorageUnavailable.make),
-        Effect.flatMap(Option.match({
-          onNone: () => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Replication view disappeared" })),
-          onSome: Effect.succeed
-        }))
-      )
-      yield* sql`INSERT INTO effect_local_server_offline_wake_acknowledgements
-        (space_id, client_id, acknowledged_sequence)
-        VALUES (${request.spaceId}, ${request.clientId}, ${currentView.delivered_sequence})
-        ON CONFLICT (space_id, client_id) DO UPDATE SET
-          acknowledged_sequence = MAX(acknowledged_sequence, excluded.acknowledged_sequence)`
-      yield* sql`DELETE FROM effect_local_server_offline_wakes
-        WHERE space_id = ${request.spaceId} AND client_id = ${request.clientId}
-          AND high_water_sequence <= ${currentView.delivered_sequence}`
-      let changes: ReadonlyArray<Protocol.ViewChange> | undefined
-      if (
-        schemaIsCurrent && currentView.scope_digest === normalizedDigest &&
-        currentView.read_auth_epoch === space.read_auth_epoch
-      ) {
-        const delta = yield* deriveDeltaChanges(request, principal, normalized, currentView, space)
-        if (Option.isSome(delta)) changes = delta.value
-      }
-      if (changes === undefined) {
-        const source = yield* authoritative(request.spaceId)
-        const selection = yield* windowSelection(request.spaceId, space.active_schema_generation, normalized)
-        const projected = yield* projectVisible(
-          { ...request, scope: normalized },
-          principal,
-          source,
-          targetDefinition,
-          selection
-        )
-        const acknowledged = yield* findViewEntities({
+        let remaining = yield* loadEntries(row, afterOrdinal)
+        let selected = selectEntries(row, afterOrdinal, remaining)
+        const sourceRows = yield* findEntitiesByIdentity({
           spaceId: request.spaceId,
-          clientId: request.clientId,
-          viewId: currentView.view_id
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-        changes = yield* diff(
-          { ...request, scope: normalized },
-          acknowledged,
-          projected.all,
-          projected.target
-        )
-      }
-      return yield* pipe(
-        Identity.ServerSequence.make(space.next_server_sequence - 1),
-        (serverSequence) =>
-          persistNextPage(
-            request,
-            principalHash,
-            currentView,
-            changes,
-            serverSequence,
-            normalized,
-            normalizedDigest,
-            space.read_auth_epoch
+          entitiesJson: yield* pipe(
+            selected.map((snapshotEntry) => ({
+              model: snapshotEntry.sourceModel,
+              key: snapshotEntry.sourceEntityKey
+            })),
+            Codec.stringify
           )
-      )
-    })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        }).pipe(Effect.mapError(StorageUnavailable.make))
+        const source = yield* decodeAuthoritative(request.spaceId, sourceRows)
+        const windowKeys = yield* windowSelection(request.spaceId, space.active_schema_generation, normalized)
+        let valid = true
+        for (const storedEntry of selected) {
+          const { entry } = storedEntry
+          const current = source.get(storedEntry.sourceIdentity)
+          let projected = Option.none<
+            { readonly entity: Protocol.EntityKey; readonly value: typeof Schema.Json.Type }
+          >()
+          if (current !== undefined) {
+            projected = yield* options.projectEntity(targetDefinition, current.entity, current.value)
+          }
+          let projectedKey: string | undefined
+          if (Option.isSome(projected)) {
+            projectedKey = yield* Codec.stringify(projected.value.entity.key)
+          }
+          if (
+            entry.change._tag !== "Upsert" || current === undefined ||
+            current.valueJson !== storedEntry.sourceValueJson || Option.isNone(projected) ||
+            !(normalized.models.includes(projected.value.entity.model) ||
+              (projectedKey !== undefined &&
+                (windowKeys.get(projected.value.entity.model)?.has(projectedKey) ?? false))) ||
+            entry.change.entity.model !== projected.value.entity.model ||
+            entry.change.entity.modelVersion !== projected.value.entity.modelVersion ||
+            (yield* Codec.stringify(entry.change.entity.key)) !== projectedKey ||
+            (yield* Codec.stringify(entry.change.value)) !== (yield* Codec.stringify(projected.value.value)) ||
+            !(yield* options.authorization.entity(request, principal, current.sourceEntity, current.sourceValue))
+          ) {
+            valid = false
+            break
+          }
+        }
+        if (!valid) {
+          const manifest = yield* createSnapshot({ ...request, scope: normalized }, principal, principalHash)
+          const replacement = yield* findSnapshot(manifest.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
+          if (Option.isNone(replacement)) {
+            return yield* new ReplicaError.StorageCorrupt({ message: "Replacement scoped snapshot disappeared" })
+          }
+          row = replacement.value
+          afterOrdinal = -1
+          remaining = yield* loadEntries(row, afterOrdinal)
+          selected = selectEntries(row, afterOrdinal, remaining)
+        }
+        if (remaining.length > 0 && selected.length === 0) {
+          return yield* new ReplicaError.CapacityExceeded({
+            resource: "bootstrap page bytes",
+            limit: options.maximumBootstrapPageBytes
+          })
+        }
+        return Protocol.BootstrapPage.make({
+          manifest: manifestFromRow(row),
+          entries: selected.map((snapshotEntry) => snapshotEntry.entry),
+          hasMore: afterOrdinal + selected.length + 1 < row.entry_count,
+          serverSchema: options.definition.schemaIdentity
+        })
+      })
+    )
 
   const bootstrap = (
     request: Protocol.BootstrapRequest,
     principal: typeof Schema.Json.Type,
     expectedGeneration: number
   ) =>
-    sql.withTransaction(Effect.gen(function*() {
-      yield* options.authorization.scope(request, principal)
-      const space = yield* lockSpace(request.spaceId)
-      yield* validatePreparedSpace(expectedGeneration, space)
-      const targetDefinition = yield* options.resolveDefinition(request.schema)
-      const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
-      yield* WindowSchema.validate(normalized, request.schema, options.definition.schemaIdentity)
-      const normalizedDigest = yield* scopeDigest(normalized)
-      const principalHash = yield* principalDigest(principal)
-      let stored = yield* findSnapshot(request.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
-      if (
-        Option.isNone(stored) || stored.value.space_id !== request.spaceId ||
-        stored.value.client_id !== request.clientId || stored.value.principal_digest !== principalHash ||
-        stored.value.definition_hash !== targetDefinition.hash ||
-        stored.value.index_layout_hash !== targetDefinition.indexLayoutHash ||
-        stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
-        stored.value.scope_digest !== normalizedDigest || stored.value.scope_generation !== request.scopeGeneration ||
-        stored.value.view_id !== request.cursor.viewId || stored.value.view_revision !== request.cursor.revision
-      ) {
-        const manifest = yield* createSnapshot({ ...request, scope: normalized }, principal, principalHash)
-        stored = yield* findSnapshot(manifest.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
-      }
-      if (Option.isNone(stored)) {
-        return yield* new ReplicaError.StorageCorrupt({ message: "Scoped snapshot disappeared" })
-      }
-      let row = stored.value
-      let afterOrdinal = request.afterOrdinal
-      if (afterOrdinal >= row.entry_count) {
-        return yield* new ReplicaError.CursorGap({
-          expected: Math.max(-1, row.entry_count - 1),
-          actual: afterOrdinal
-        })
-      }
-      const loadEntries = (snapshot: typeof Rows.ScopedSnapshotManifestRow.Type, after: number) =>
-        findSnapshotEntryPage({
-          snapshotId: snapshot.snapshot_id,
-          afterOrdinal: after,
-          limit: request.limit
-        }).pipe(
-          Effect.mapError(StorageUnavailable.make),
-          Effect.flatMap(decodeSnapshotEntries),
-          Effect.flatMap((entries) => {
-            for (let index = 0; index < entries.length; index++) {
-              if (entries[index].entry.ordinal !== after + index + 1) {
-                return Effect.fail(
-                  new ReplicaError.StorageCorrupt({ message: "Scoped snapshot page contains an ordinal gap" })
-                )
-              }
-            }
-            if (entries.length === 0 && after + 1 < snapshot.entry_count) {
-              return Effect.fail(
-                new ReplicaError.StorageCorrupt({ message: "Scoped snapshot page is missing durable entries" })
-              )
-            }
-            return Effect.succeed(entries)
-          })
-        )
-      const selectEntries = (
-        snapshot: typeof Rows.ScopedSnapshotManifestRow.Type,
-        after: number,
-        entries: ReadonlyArray<StoredSnapshotEntry>
-      ) => {
-        const length = pipe(
-          Math.min(request.limit, entries.length),
-          (maximumLength) =>
-            largestPagePrefix(maximumLength, (candidateLength) => {
-              const candidate = Protocol.BootstrapPage.make({
-                manifest: manifestFromRow(snapshot),
-                entries: entries.slice(0, candidateLength).map((snapshotEntry) => snapshotEntry.entry),
-                hasMore: after + candidateLength + 1 < snapshot.entry_count,
-                serverSchema: options.definition.schemaIdentity
-              })
-              return Protocol.encodedBytes(candidate) <= options.maximumBootstrapPageBytes
-            })
-        )
-        return entries.slice(0, length)
-      }
-      let remaining = yield* loadEntries(row, afterOrdinal)
-      let selected = selectEntries(row, afterOrdinal, remaining)
-      const sourceRows = yield* findEntitiesByIdentity({
-        spaceId: request.spaceId,
-        entitiesJson: yield* pipe(
-          selected.map((snapshotEntry) => ({
-            model: snapshotEntry.sourceModel,
-            key: snapshotEntry.sourceEntityKey
-          })),
-          Codec.stringify
-        )
-      }).pipe(Effect.mapError(StorageUnavailable.make))
-      const source = yield* decodeAuthoritative(request.spaceId, sourceRows)
-      const windowKeys = yield* windowSelection(request.spaceId, space.active_schema_generation, normalized)
-      let valid = true
-      for (const storedEntry of selected) {
-        const { entry } = storedEntry
-        const current = source.get(storedEntry.sourceIdentity)
-        let projected = Option.none<{ readonly entity: Protocol.EntityKey; readonly value: typeof Schema.Json.Type }>()
-        if (current !== undefined) {
-          projected = yield* options.projectEntity(targetDefinition, current.entity, current.value)
-        }
-        let projectedKey: string | undefined
-        if (Option.isSome(projected)) {
-          projectedKey = yield* Codec.stringify(projected.value.entity.key)
-        }
-        if (
-          entry.change._tag !== "Upsert" || current === undefined ||
-          current.valueJson !== storedEntry.sourceValueJson || Option.isNone(projected) ||
-          !(normalized.models.includes(projected.value.entity.model) ||
-            (projectedKey !== undefined &&
-              (windowKeys.get(projected.value.entity.model)?.has(projectedKey) ?? false))) ||
-          entry.change.entity.model !== projected.value.entity.model ||
-          entry.change.entity.modelVersion !== projected.value.entity.modelVersion ||
-          (yield* Codec.stringify(entry.change.entity.key)) !== projectedKey ||
-          (yield* Codec.stringify(entry.change.value)) !== (yield* Codec.stringify(projected.value.value)) ||
-          !(yield* options.authorization.entity(request, principal, current.sourceEntity, current.sourceValue))
-        ) {
-          valid = false
-          break
-        }
-      }
-      if (!valid) {
-        const manifest = yield* createSnapshot({ ...request, scope: normalized }, principal, principalHash)
-        const replacement = yield* findSnapshot(manifest.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
-        if (Option.isNone(replacement)) {
-          return yield* new ReplicaError.StorageCorrupt({ message: "Replacement scoped snapshot disappeared" })
-        }
-        row = replacement.value
-        afterOrdinal = -1
-        remaining = yield* loadEntries(row, afterOrdinal)
-        selected = selectEntries(row, afterOrdinal, remaining)
-      }
-      if (remaining.length > 0 && selected.length === 0) {
-        return yield* new ReplicaError.CapacityExceeded({
-          resource: "bootstrap page bytes",
-          limit: options.maximumBootstrapPageBytes
-        })
-      }
-      return Protocol.BootstrapPage.make({
-        manifest: manifestFromRow(row),
-        entries: selected.map((snapshotEntry) => snapshotEntry.entry),
-        hasMore: afterOrdinal + selected.length + 1 < row.entry_count,
-        serverSchema: options.definition.schemaIdentity
-      })
-    })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    options.authorization.scope(request, principal).pipe(
+      Effect.andThen(bootstrapLocked(request, principal, expectedGeneration)),
+      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+    )
 
   return { pull, bootstrap } as const
 }

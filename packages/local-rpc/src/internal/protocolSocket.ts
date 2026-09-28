@@ -3,12 +3,16 @@ import * as Effect from "effect/Effect"
 import { constVoid } from "effect/Function"
 import * as Latch from "effect/Latch"
 import * as Option from "effect/Option"
+import * as Pull from "effect/Pull"
 import * as Result from "effect/Result"
 import * as Schedule from "effect/Schedule"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
+import * as SubscriptionRef from "effect/SubscriptionRef"
 import { RpcClient, RpcClientError, RpcMessage, RpcSerialization } from "effect/unstable/rpc"
 import * as Socket from "effect/unstable/socket/Socket"
+import { reconnectPolicy } from "./configuration.js"
 
 export interface Options {
   readonly retryTransientErrors?: boolean
@@ -45,7 +49,25 @@ function fromJsonWire(response: WireFromServer): WireFromServer | RpcMessage.Fro
   return response
 }
 
-export const make = (options?: Options): Effect.Effect<
+export interface ProtocolSocket {
+  readonly protocol: RpcClient.Protocol["Service"]
+  readonly connections: SubscriptionRef.SubscriptionRef<number>
+}
+
+export const make = Effect.fnUntraced(function*(options?: Options): Effect.fn.Return<
+  ProtocolSocket,
+  never,
+  Scope.Scope | RpcSerialization.RpcSerialization | Socket.Socket
+> {
+  const connections = yield* SubscriptionRef.make(0)
+  const protocol = yield* makeProtocol(options, connections)
+  return { protocol, connections }
+})
+
+const makeProtocol = (
+  options: Options | undefined,
+  connections: SubscriptionRef.SubscriptionRef<number>
+): Effect.Effect<
   RpcClient.Protocol["Service"],
   never,
   Scope.Scope | RpcSerialization.RpcSerialization | Socket.Socket
@@ -55,16 +77,10 @@ export const make = (options?: Options): Effect.Effect<
     const serialization = yield* RpcSerialization.RpcSerialization
     const hooks = yield* Effect.serviceOption(RpcClient.ConnectionHooks)
     const requestClientMap = new Map<string | number, number>()
-    const write = yield* socket.writer
+    const writer = yield* socket.writer
     let parser = serialization.makeUnsafe()
-    const writePing = write(parser.encode(RpcMessage.constPing)!)
-    const pinger = yield* makePinger(writePing)
+    const pinger = yield* makePinger(Effect.suspend(() => writer.write(parser.encode(RpcMessage.constPing)!)))
     let currentError: RpcClientError.RpcClientError | undefined
-    const onOpen = Effect.suspend(() => {
-      currentError = undefined
-      if (Option.isSome(hooks)) return hooks.value.onConnect
-      return Effect.void
-    })
     const broadcast = (response: RpcMessage.FromServerEncoded) =>
       Effect.forEach(clientIds, (clientId) => writeResponse(clientId, response))
     const failCurrentSocket = (error: RpcClientError.RpcClientError) => {
@@ -73,59 +89,74 @@ export const make = (options?: Options): Effect.Effect<
       requestClientMap.clear()
       return broadcast({ _tag: "ClientProtocolError", error })
     }
+    const processFrame = Effect.fnUntraced(function*(message: Uint8Array | string) {
+      const decoded = Effect.try({
+        try: () => parser.decode(message),
+        catch: (cause) =>
+          new RpcClientError.RpcClientDefect({
+            message: "Error decoding message",
+            cause
+          })
+      }).pipe(
+        Effect.flatMap(Schema.decodeUnknownEffect(FromServerMessages)),
+        Effect.catchTag("SchemaError", (cause) =>
+          Effect.fail(
+            new RpcClientError.RpcClientDefect({
+              message: "Error decoding message",
+              cause
+            })
+          ))
+      )
+      const result = yield* Effect.result(decoded)
+      if (Result.isFailure(result)) {
+        yield* failCurrentSocket(new RpcClientError.RpcClientError({ reason: result.failure }))
+        return
+      }
+      const responses = result.success
+      let index = 0
+      yield* Effect.whileLoop({
+        while: () => index < responses.length,
+        body: () => {
+          // Effect's JSON codec represents an absent interrupt fiber id as null while its encoded type says undefined.
+          const response = fromJsonWire(responses[index++])
+          if (response._tag === "Pong") {
+            pinger.onPong()
+            return Effect.void
+          }
+          if (response._tag === "Chunk" || response._tag === "Exit") {
+            const clientId = requestClientMap.get(response.requestId)
+            if (clientId !== undefined) {
+              if (response._tag === "Exit") requestClientMap.delete(response.requestId)
+              return writeResponse(clientId, response)
+            }
+          }
+          return broadcast(response)
+        },
+        step: constVoid
+      })
+    })
 
-    yield* Effect.suspend(() => {
+    let connected = false
+    const readFrames = Effect.gen(function*() {
+      const { pull } = yield* socket.reader.pipe(Effect.provideService(Scheduler.PreventSchedulerYield, true))
+      currentError = undefined
+      if (Option.isSome(hooks)) yield* hooks.value.onConnect
+      yield* writer.write(parser.encode(RpcMessage.constPing)!)
+      while (true) {
+        const frames = yield* pull
+        if (!connected) {
+          connected = true
+          yield* SubscriptionRef.update(connections, (generation) => generation + 1)
+        }
+        for (const frame of frames) yield* processFrame(frame)
+      }
+    })
+
+    const connection = Effect.suspend(() => {
       parser = serialization.makeUnsafe()
       pinger.reset()
-      return socket.runRaw(
-        Effect.fnUntraced(function*(message) {
-          const decoded = Effect.try({
-            try: () => parser.decode(message),
-            catch: (cause) =>
-              new RpcClientError.RpcClientDefect({
-                message: "Error decoding message",
-                cause
-              })
-          }).pipe(
-            Effect.flatMap(Schema.decodeUnknownEffect(FromServerMessages)),
-            Effect.catchTag("SchemaError", (cause) =>
-              Effect.fail(
-                new RpcClientError.RpcClientDefect({
-                  message: "Error decoding message",
-                  cause
-                })
-              ))
-          )
-          const result = yield* Effect.result(decoded)
-          if (Result.isFailure(result)) {
-            yield* failCurrentSocket(new RpcClientError.RpcClientError({ reason: result.failure }))
-            return
-          }
-          const responses = result.success
-          let index = 0
-          yield* Effect.whileLoop({
-            while: () => index < responses.length,
-            body: () => {
-              // Effect's JSON codec represents an absent interrupt fiber id as null while its encoded type says undefined.
-              const response = fromJsonWire(responses[index++])
-              if (response._tag === "Pong") {
-                pinger.onPong()
-                return Effect.void
-              }
-              if (response._tag === "Chunk" || response._tag === "Exit") {
-                const clientId = requestClientMap.get(response.requestId)
-                if (clientId !== undefined) {
-                  if (response._tag === "Exit") requestClientMap.delete(response.requestId)
-                  return writeResponse(clientId, response)
-                }
-              }
-              return broadcast(response)
-            },
-            step: constVoid
-          })
-        }),
-        { onOpen }
-      ).pipe(
+      return readFrames.pipe(
+        Effect.scoped,
         Effect.raceFirst(Effect.flatMap(
           pinger.timeout,
           () =>
@@ -140,10 +171,6 @@ export const make = (options?: Options): Effect.Effect<
         ))
       )
     }).pipe(
-      Effect.flatMap(() => {
-        const reason = new Socket.SocketCloseError({ code: 1000 })
-        return Effect.fail(new Socket.SocketError({ reason }))
-      }),
       Effect.ensuring(Option.match(hooks, {
         onNone: () => Effect.void,
         onSome: (connectionHooks) => connectionHooks.onDisconnect
@@ -163,8 +190,25 @@ export const make = (options?: Options): Effect.Effect<
           cause
         })
         return failCurrentSocket(new RpcClientError.RpcClientError({ reason }))
-      }),
-      Effect.retry(options?.retryPolicy ?? defaultRetryPolicy),
+      })
+    )
+    const retryPolicy = options?.retryPolicy ?? reconnectPolicy
+
+    yield* Effect.gen(function*() {
+      let step = yield* Schedule.toStepWithMetadata(retryPolicy)
+      while (true) {
+        connected = false
+        const error = yield* Effect.flip(connection)
+        if (connected) step = yield* Schedule.toStepWithMetadata(retryPolicy)
+        const retrying = yield* step(error).pipe(
+          Effect.as(true),
+          Pull.catchDone(() =>
+            failCurrentSocket(new RpcClientError.RpcClientError({ reason: error.reason })).pipe(Effect.as(false))
+          )
+        )
+        if (!retrying) return
+      }
+    }).pipe(
       Effect.annotateLogs({
         module: "RpcClient",
         method: "makeProtocolSocket"
@@ -179,19 +223,15 @@ export const make = (options?: Options): Effect.Effect<
         if (request._tag === "Request") requestClientMap.set(request.id, clientId)
         const encoded = parser.encode(request)
         if (encoded === undefined) return Effect.void
-        return write(encoded).pipe(
+        return writer.write(encoded).pipe(
           Effect.catchTag("SocketError", (error) => Effect.die(error))
         )
       },
       supportsAck: true,
-      supportsTransferables: false
+      supportsTransferables: false,
+      codecFor: serialization.codecFor
     }
   }))
-
-const defaultRetryPolicy = Schedule.min([
-  Schedule.exponential(500, 1.5),
-  Schedule.spaced(5000)
-])
 
 const makePinger = Effect.fnUntraced(function*<A, E extends { readonly _tag: string }, R,>(
   writePing: Effect.Effect<A, E, R>

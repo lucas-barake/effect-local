@@ -4,13 +4,16 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import { identity } from "effect/Function"
 import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
+import * as Dialect from "./internal/dialect.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 
 export type Catalog = "Client" | "Server"
@@ -76,12 +79,6 @@ const MigrationRow = Schema.Struct({
   checksum: Identity.SchemaHash
 })
 const CountRow = Schema.Struct({ count: NonNegativeInt })
-const ForeignKeyCheckRow = Schema.Struct({
-  table: Schema.String,
-  rowid: Schema.NullOr(Schema.Int),
-  parent: Schema.String,
-  fkid: Schema.Int
-})
 
 const ClientIdentityRow = Schema.Struct({
   client_id: Identity.ClientId
@@ -112,24 +109,28 @@ const validateCatalog = (
   return undefined
 }
 
-const clientLedger = `CREATE TABLE IF NOT EXISTS effect_local_client_migrations (
+const ledger = (table: string, text: string) =>
+  `CREATE TABLE IF NOT EXISTS ${table} (
   id INTEGER PRIMARY KEY CHECK (id > 0),
-  name TEXT NOT NULL UNIQUE,
-  checksum TEXT NOT NULL,
-  applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  name ${text} NOT NULL UNIQUE,
+  checksum ${text} NOT NULL,
+  applied_at ${text} NOT NULL DEFAULT CURRENT_TIMESTAMP
 )`
 
-const serverLedger = `CREATE TABLE IF NOT EXISTS effect_local_server_migrations (
-  id INTEGER PRIMARY KEY CHECK (id > 0),
-  name TEXT NOT NULL UNIQUE,
-  checksum TEXT NOT NULL,
-  applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-)`
+interface Access {
+  readonly withTransaction: <A, E extends { readonly _tag: string }, R,>(
+    effect: Effect.Effect<A, E, R>
+  ) => Effect.Effect<A, E | SqlError.SqlError, R>
+  readonly withStatement: <A, E extends { readonly _tag: string }, R,>(
+    effect: Effect.Effect<A, E, R>
+  ) => Effect.Effect<A, E, R>
+}
 
-export const runCatalog = Effect.fn("Migrations.runCatalog")(function*(
+const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
+  access: Access,
   catalog: Catalog,
   migrations: ReadonlyArray<Migration>,
-  options: Options = defaultOptions
+  options: Options
 ) {
   yield* Effect.annotateCurrentSpan({
     "migration.catalog": catalog,
@@ -158,12 +159,15 @@ export const runCatalog = Effect.fn("Migrations.runCatalog")(function*(
     Result: MigrationRow,
     execute: () => sql`SELECT id, name, checksum FROM effect_local_server_migrations ORDER BY id`
   })
+  const dialect = yield* Dialect.make(sql)
+  let ledgerTable = "effect_local_server_migrations"
+  if (catalog === "Client") ledgerTable = "effect_local_client_migrations"
   let appliedAtAttempt = 0
   const migrate = Effect.gen(function*() {
-    let ledger = serverLedger
-    if (catalog === "Client") ledger = clientLedger
-    yield* sql.unsafe(ledger)
-    yield* sql.withTransaction(Effect.gen(function*() {
+    const ledgerStatement = ledger(ledgerTable, dialect.text)
+    yield* access.withTransaction(dialect.lockSchema.pipe(Effect.andThen(sql.unsafe(ledgerStatement))))
+    yield* access.withTransaction(Effect.gen(function*() {
+      yield* dialect.lockSchema
       let read = readServer
       if (catalog === "Client") read = readClient
       const applied = yield* read(undefined).pipe(
@@ -221,7 +225,7 @@ export const runCatalog = Effect.fn("Migrations.runCatalog")(function*(
     ) {
       let read = readServer
       if (catalog === "Client") read = readClient
-      const applied = yield* read(undefined).pipe(
+      const applied = yield* access.withStatement(read(undefined)).pipe(
         Effect.mapError((cause) => {
           if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
           return new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause })
@@ -253,717 +257,17 @@ export const runCatalog = Effect.fn("Migrations.runCatalog")(function*(
   }
 })
 
-const clientV1 = makeMigration({
+export const runCatalog = (catalog: Catalog, migrations: ReadonlyArray<Migration>, options: Options = defaultOptions) =>
+  Effect.flatMap(
+    SqlClient.SqlClient,
+    (sql) =>
+      runCatalogWith({ withTransaction: sql.withTransaction, withStatement: identity }, catalog, migrations, options)
+  )
+
+const clientBaseline = makeMigration({
   id: 1,
-  name: "mutation-log",
+  name: "client-baseline",
   statements: [
-    `CREATE TABLE IF NOT EXISTS effect_local_client_meta (
-      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      definition_hash TEXT NOT NULL,
-      next_local_sequence INTEGER NOT NULL,
-      server_cursor INTEGER NOT NULL,
-      visible_revision INTEGER NOT NULL,
-      requested_generation INTEGER NOT NULL DEFAULT 0 CHECK (requested_generation >= 0),
-      completed_generation INTEGER NOT NULL DEFAULT 0 CHECK (
-        completed_generation >= 0 AND completed_generation <= requested_generation
-      )
-    )`,
-    `CREATE TABLE IF NOT EXISTS effect_local_pending (
-      mutation_id TEXT PRIMARY KEY,
-      local_sequence INTEGER NOT NULL UNIQUE,
-      basis INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      digest TEXT NOT NULL,
-      optimistic_result_json TEXT NOT NULL,
-      changes_json TEXT NOT NULL
-    )`,
-    `CREATE TABLE IF NOT EXISTS effect_local_receipts (
-      mutation_id TEXT PRIMARY KEY,
-      local_sequence INTEGER NOT NULL UNIQUE,
-      receipt_json TEXT NOT NULL
-    )`,
-    `CREATE TABLE IF NOT EXISTS effect_local_server_log (
-      server_sequence INTEGER PRIMARY KEY,
-      mutation_id TEXT NOT NULL UNIQUE,
-      entry_json TEXT NOT NULL
-    )`,
-    `CREATE TABLE IF NOT EXISTS effect_local_canonical_entities (
-      model TEXT NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      PRIMARY KEY (model, entity_key)
-    )`,
-    `CREATE TABLE IF NOT EXISTS effect_local_visible_entities (
-      model TEXT NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      PRIMARY KEY (model, entity_key)
-    )`
-  ]
-})
-
-const clientV2 = makeMigration({
-  id: 2,
-  name: "schema-evolution",
-  statements: [
-    "ALTER TABLE effect_local_client_meta ADD COLUMN schema_version INTEGER",
-    "ALTER TABLE effect_local_client_meta ADD COLUMN schema_hash TEXT",
-    "ALTER TABLE effect_local_client_meta ADD COLUMN schema_generation INTEGER NOT NULL DEFAULT 0 CHECK (schema_generation >= 0)",
-    "ALTER TABLE effect_local_client_meta ADD COLUMN target_schema_version INTEGER",
-    "ALTER TABLE effect_local_client_meta ADD COLUMN target_schema_hash TEXT",
-    "ALTER TABLE effect_local_client_meta ADD COLUMN migration_hash TEXT",
-    "ALTER TABLE effect_local_pending ADD COLUMN digest_version INTEGER NOT NULL DEFAULT 1 CHECK (digest_version IN (1, 2))",
-    "ALTER TABLE effect_local_pending ADD COLUMN source_schema_version INTEGER",
-    "ALTER TABLE effect_local_pending ADD COLUMN source_schema_hash TEXT",
-    "ALTER TABLE effect_local_pending ADD COLUMN mutation_version INTEGER",
-    "ALTER TABLE effect_local_receipts ADD COLUMN source_schema_version INTEGER",
-    "ALTER TABLE effect_local_receipts ADD COLUMN source_schema_hash TEXT",
-    "ALTER TABLE effect_local_receipts ADD COLUMN mutation_version INTEGER",
-    "ALTER TABLE effect_local_receipts ADD COLUMN rejection_origin TEXT",
-    "ALTER TABLE effect_local_server_log ADD COLUMN source_schema_version INTEGER",
-    "ALTER TABLE effect_local_server_log ADD COLUMN source_schema_hash TEXT",
-    "ALTER TABLE effect_local_server_log ADD COLUMN mutation_version INTEGER",
-    "ALTER TABLE effect_local_canonical_entities ADD COLUMN model_version INTEGER",
-    "ALTER TABLE effect_local_visible_entities ADD COLUMN model_version INTEGER",
-    `CREATE TABLE effect_local_client_evolution (
-      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-      source_schema_version INTEGER NOT NULL,
-      source_schema_hash TEXT NOT NULL,
-      target_schema_version INTEGER NOT NULL,
-      target_schema_hash TEXT NOT NULL,
-      migration_hash TEXT NOT NULL,
-      generation INTEGER NOT NULL CHECK (generation > 0),
-      phase TEXT NOT NULL,
-      cursor_model TEXT,
-      cursor_key TEXT
-    )`,
-    `CREATE TABLE effect_local_client_shadow_entities (
-      generation INTEGER NOT NULL,
-      model TEXT NOT NULL,
-      model_version INTEGER NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      PRIMARY KEY (generation, model, entity_key)
-    )`,
-    `CREATE TABLE effect_local_client_shadow_receipts (
-      generation INTEGER NOT NULL,
-      mutation_id TEXT NOT NULL,
-      local_sequence INTEGER NOT NULL,
-      receipt_json TEXT NOT NULL,
-      source_schema_version INTEGER NOT NULL,
-      source_schema_hash TEXT NOT NULL,
-      mutation_version INTEGER NOT NULL,
-      rejection_origin TEXT,
-      PRIMARY KEY (generation, mutation_id),
-      UNIQUE (generation, local_sequence)
-    )`,
-    `CREATE TABLE effect_local_client_key_lineage (
-      source_schema_version INTEGER NOT NULL,
-      source_schema_hash TEXT NOT NULL,
-      source_model TEXT NOT NULL,
-      source_model_version INTEGER NOT NULL,
-      source_key TEXT NOT NULL,
-      target_model TEXT NOT NULL,
-      target_model_version INTEGER NOT NULL,
-      target_key TEXT NOT NULL,
-      PRIMARY KEY (source_schema_version, source_schema_hash, source_model, source_model_version, source_key)
-    )`,
-    `CREATE INDEX effect_local_client_key_lineage_target
-      ON effect_local_client_key_lineage (target_model, target_model_version, target_key)`
-  ]
-})
-
-const clientV3 = makeMigration({
-  id: 3,
-  name: "schema-key-lineage-groups",
-  statements: [
-    `CREATE TABLE effect_local_client_key_lineage_groups (
-      source_schema_version INTEGER NOT NULL,
-      source_schema_hash TEXT NOT NULL,
-      source_model TEXT NOT NULL,
-      source_model_version INTEGER NOT NULL,
-      source_key TEXT NOT NULL,
-      lineage_id TEXT NOT NULL,
-      PRIMARY KEY (source_schema_version, source_schema_hash, source_model, source_model_version, source_key)
-    )`,
-    `CREATE TABLE effect_local_client_key_lineage_targets (
-      target_model TEXT NOT NULL,
-      target_model_version INTEGER NOT NULL,
-      target_key TEXT NOT NULL,
-      lineage_id TEXT NOT NULL,
-      PRIMARY KEY (target_model, target_model_version, target_key)
-    )`
-  ]
-})
-
-const clientV4 = makeMigration({
-  id: 4,
-  name: "schema-evolution-staging",
-  statements: [
-    "ALTER TABLE effect_local_client_evolution ADD COLUMN cursor_sequence INTEGER",
-    "ALTER TABLE effect_local_receipts ADD COLUMN mutation_name TEXT",
-    "ALTER TABLE effect_local_client_shadow_receipts ADD COLUMN mutation_name TEXT",
-    `CREATE TABLE effect_local_client_shadow_visible_entities (
-      generation INTEGER NOT NULL,
-      model TEXT NOT NULL,
-      model_version INTEGER NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      PRIMARY KEY (generation, model, entity_key)
-    )`,
-    `CREATE TABLE effect_local_client_shadow_pending (
-      generation INTEGER NOT NULL,
-      mutation_id TEXT NOT NULL,
-      local_sequence INTEGER NOT NULL,
-      basis INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      digest TEXT NOT NULL,
-      digest_version INTEGER NOT NULL CHECK (digest_version IN (1, 2)),
-      source_schema_version INTEGER NOT NULL,
-      source_schema_hash TEXT NOT NULL,
-      mutation_version INTEGER NOT NULL,
-      optimistic_result_json TEXT NOT NULL,
-      changes_json TEXT NOT NULL,
-      PRIMARY KEY (generation, mutation_id),
-      UNIQUE (generation, local_sequence)
-    )`
-  ]
-})
-
-const clientV5 = makeMigration({
-  id: 5,
-  name: "opaque-legacy-receipts",
-  statements: [
-    `CREATE TABLE effect_local_client_shadow_receipts_v2 (
-      generation INTEGER NOT NULL,
-      mutation_id TEXT NOT NULL,
-      local_sequence INTEGER NOT NULL,
-      receipt_json TEXT NOT NULL,
-      source_schema_version INTEGER NOT NULL,
-      source_schema_hash TEXT NOT NULL,
-      mutation_version INTEGER,
-      mutation_name TEXT,
-      rejection_origin TEXT,
-      PRIMARY KEY (generation, mutation_id),
-      UNIQUE (generation, local_sequence)
-    )`
-  ]
-})
-
-const clientV6 = makeMigration({
-  id: 6,
-  name: "bounded-history-and-snapshots",
-  statements: [
-    "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_id TEXT",
-    "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_sequence INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_client_meta ADD COLUMN installed_snapshot_terminal_sequence INTEGER NOT NULL DEFAULT 0"
-  ]
-})
-
-const serverV1 = makeMigration({
-  id: 1,
-  name: "mutation-log",
-  statements: [
-    `CREATE TABLE IF NOT EXISTS effect_local_server_spaces (
-      space_id TEXT PRIMARY KEY,
-      definition_hash TEXT NOT NULL,
-      next_server_sequence INTEGER NOT NULL
-    )`,
-    `CREATE TABLE IF NOT EXISTS effect_local_server_clients (
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      last_local_sequence INTEGER NOT NULL,
-      PRIMARY KEY (space_id, client_id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS effect_local_server_receipts (
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      local_sequence INTEGER NOT NULL,
-      mutation_id TEXT NOT NULL,
-      digest TEXT NOT NULL,
-      receipt_json TEXT NOT NULL,
-      PRIMARY KEY (space_id, client_id, local_sequence),
-      UNIQUE (space_id, mutation_id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS effect_local_authoritative_log (
-      space_id TEXT NOT NULL,
-      server_sequence INTEGER NOT NULL,
-      mutation_id TEXT NOT NULL,
-      entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
-      entry_json TEXT NOT NULL,
-      PRIMARY KEY (space_id, server_sequence),
-      UNIQUE (space_id, mutation_id)
-    )`,
-    `CREATE TABLE IF NOT EXISTS effect_local_server_entities (
-      space_id TEXT NOT NULL,
-      model TEXT NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      PRIMARY KEY (space_id, model, entity_key)
-    )`
-  ]
-})
-
-const serverV2 = makeMigration({
-  id: 2,
-  name: "schema-evolution",
-  statements: [
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN schema_version INTEGER",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN schema_hash TEXT",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN schema_generation INTEGER NOT NULL DEFAULT 0 CHECK (schema_generation >= 0)",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN target_schema_version INTEGER",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN target_schema_hash TEXT",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN migration_hash TEXT",
-    "ALTER TABLE effect_local_server_receipts ADD COLUMN digest_version INTEGER NOT NULL DEFAULT 1 CHECK (digest_version IN (1, 2))",
-    "ALTER TABLE effect_local_server_receipts ADD COLUMN source_schema_version INTEGER",
-    "ALTER TABLE effect_local_server_receipts ADD COLUMN source_schema_hash TEXT",
-    "ALTER TABLE effect_local_server_receipts ADD COLUMN mutation_version INTEGER",
-    "ALTER TABLE effect_local_server_receipts ADD COLUMN rejection_origin TEXT",
-    "ALTER TABLE effect_local_authoritative_log ADD COLUMN source_schema_version INTEGER",
-    "ALTER TABLE effect_local_authoritative_log ADD COLUMN source_schema_hash TEXT",
-    "ALTER TABLE effect_local_authoritative_log ADD COLUMN mutation_version INTEGER",
-    "ALTER TABLE effect_local_server_entities ADD COLUMN model_version INTEGER",
-    `CREATE TABLE effect_local_server_evolution (
-      space_id TEXT PRIMARY KEY,
-      source_schema_version INTEGER NOT NULL,
-      source_schema_hash TEXT NOT NULL,
-      target_schema_version INTEGER NOT NULL,
-      target_schema_hash TEXT NOT NULL,
-      migration_hash TEXT NOT NULL,
-      generation INTEGER NOT NULL CHECK (generation > 0),
-      phase TEXT NOT NULL,
-      cursor_model TEXT,
-      cursor_key TEXT
-    )`,
-    `CREATE TABLE effect_local_server_shadow_entities (
-      space_id TEXT NOT NULL,
-      generation INTEGER NOT NULL,
-      model TEXT NOT NULL,
-      model_version INTEGER NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      PRIMARY KEY (space_id, generation, model, entity_key)
-    )`,
-    `CREATE TABLE effect_local_server_key_lineage (
-      space_id TEXT NOT NULL,
-      source_schema_version INTEGER NOT NULL,
-      source_schema_hash TEXT NOT NULL,
-      source_model TEXT NOT NULL,
-      source_model_version INTEGER NOT NULL,
-      source_key TEXT NOT NULL,
-      target_model TEXT NOT NULL,
-      target_model_version INTEGER NOT NULL,
-      target_key TEXT NOT NULL,
-      PRIMARY KEY (
-        space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key
-      )
-    )`,
-    `CREATE INDEX effect_local_server_key_lineage_target
-      ON effect_local_server_key_lineage (space_id, target_model, target_model_version, target_key)`
-  ]
-})
-
-const serverV3 = makeMigration({
-  id: 3,
-  name: "schema-key-lineage-groups",
-  statements: [
-    `CREATE TABLE effect_local_server_key_lineage_groups (
-      space_id TEXT NOT NULL,
-      source_schema_version INTEGER NOT NULL,
-      source_schema_hash TEXT NOT NULL,
-      source_model TEXT NOT NULL,
-      source_model_version INTEGER NOT NULL,
-      source_key TEXT NOT NULL,
-      lineage_id TEXT NOT NULL,
-      PRIMARY KEY (
-        space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key
-      )
-    )`,
-    `CREATE TABLE effect_local_server_key_lineage_targets (
-      space_id TEXT NOT NULL,
-      target_model TEXT NOT NULL,
-      target_model_version INTEGER NOT NULL,
-      target_key TEXT NOT NULL,
-      lineage_id TEXT NOT NULL,
-      PRIMARY KEY (space_id, target_model, target_model_version, target_key)
-    )`
-  ]
-})
-
-const serverV4 = makeMigration({
-  id: 4,
-  name: "schema-evolution-staging",
-  statements: [
-    "ALTER TABLE effect_local_server_evolution ADD COLUMN cursor_sequence INTEGER",
-    "ALTER TABLE effect_local_server_receipts ADD COLUMN mutation_name TEXT"
-  ]
-})
-
-const serverV5 = makeMigration({
-  id: 5,
-  name: "bounded-history-and-snapshots",
-  statements: [
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN next_terminal_sequence INTEGER NOT NULL DEFAULT 1",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN history_floor INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN receipt_floor INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN retained_history_count INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN retained_receipt_count INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN entity_count INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN entity_bytes INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN snapshot_id TEXT",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN snapshot_sequence INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN snapshot_terminal_sequence INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN metadata_verified INTEGER NOT NULL DEFAULT 0 CHECK (metadata_verified IN (0, 1))",
-    "ALTER TABLE effect_local_server_clients ADD COLUMN expired_local_sequence INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_receipts ADD COLUMN terminal_sequence INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_server_receipts ADD COLUMN server_sequence INTEGER",
-    "ALTER TABLE effect_local_authoritative_log ADD COLUMN client_id TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE effect_local_authoritative_log ADD COLUMN local_sequence INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_authoritative_log ADD COLUMN digest TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE effect_local_server_entities ADD COLUMN entity_bytes INTEGER NOT NULL DEFAULT 0",
-    `UPDATE effect_local_authoritative_log SET
-      client_id = COALESCE(json_extract(entry_json, '$.clientId'), ''),
-      local_sequence = COALESCE(json_extract(entry_json, '$.localSequence'), 0),
-      digest = COALESCE(json_extract(entry_json, '$.digest'), '')`,
-    `WITH ranked AS (
-      SELECT rowid AS receipt_rowid,
-        ROW_NUMBER() OVER (PARTITION BY space_id ORDER BY rowid) AS terminal_sequence
-      FROM effect_local_server_receipts
-    )
-    UPDATE effect_local_server_receipts SET
-      terminal_sequence = (
-        SELECT ranked.terminal_sequence FROM ranked
-        WHERE ranked.receipt_rowid = effect_local_server_receipts.rowid
-      ),
-      server_sequence = CASE
-        WHEN json_extract(receipt_json, '$._tag') = 'Accepted'
-        THEN json_extract(receipt_json, '$.serverSequence')
-        ELSE NULL
-      END`,
-    `UPDATE effect_local_server_receipts SET receipt_json =
-      json_set(receipt_json, '$.terminalSequence', terminal_sequence)
-      WHERE json_extract(receipt_json, '$._tag') IN ('Accepted', 'Rejected')`,
-    `UPDATE effect_local_server_spaces SET
-      next_terminal_sequence = COALESCE((
-        SELECT MAX(r.terminal_sequence) + 1 FROM effect_local_server_receipts AS r
-        WHERE r.space_id = effect_local_server_spaces.space_id
-      ), 1),
-      retained_history_count = (
-        SELECT COUNT(*) FROM effect_local_authoritative_log AS l
-        WHERE l.space_id = effect_local_server_spaces.space_id
-      ),
-      retained_receipt_count = (
-        SELECT COUNT(*) FROM effect_local_server_receipts AS r
-        WHERE r.space_id = effect_local_server_spaces.space_id
-      )`,
-    `CREATE TABLE effect_local_server_space_counts (
-      space_id TEXT PRIMARY KEY,
-      history_count INTEGER NOT NULL CHECK (history_count >= 0),
-      receipt_count INTEGER NOT NULL CHECK (receipt_count >= 0)
-    )`,
-    `CREATE INDEX effect_local_server_space_counts_history
-      ON effect_local_server_space_counts (history_count DESC)`,
-    `CREATE INDEX effect_local_server_space_counts_receipts
-      ON effect_local_server_space_counts (receipt_count DESC)`,
-    `INSERT INTO effect_local_server_space_counts (space_id, history_count, receipt_count)
-      SELECT space_id, retained_history_count, retained_receipt_count
-      FROM effect_local_server_spaces`,
-    `CREATE TABLE effect_local_server_snapshots (
-      space_id TEXT NOT NULL,
-      snapshot_id TEXT NOT NULL,
-      definition_hash TEXT NOT NULL,
-      schema_version INTEGER NOT NULL,
-      schema_hash TEXT NOT NULL,
-      server_sequence INTEGER NOT NULL,
-      terminal_sequence INTEGER NOT NULL,
-      entity_count INTEGER NOT NULL,
-      content_bytes INTEGER NOT NULL,
-      digest TEXT NOT NULL,
-      PRIMARY KEY (space_id, snapshot_id),
-      UNIQUE (space_id, server_sequence, terminal_sequence)
-    )`,
-    `CREATE TABLE effect_local_server_snapshot_entities (
-      space_id TEXT NOT NULL,
-      snapshot_id TEXT NOT NULL,
-      ordinal INTEGER NOT NULL,
-      model TEXT NOT NULL,
-      model_version INTEGER NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      entity_bytes INTEGER NOT NULL,
-      wire_json TEXT NOT NULL,
-      wire_bytes INTEGER NOT NULL CHECK (wire_bytes > 0),
-      PRIMARY KEY (space_id, snapshot_id, ordinal),
-      UNIQUE (space_id, snapshot_id, model, entity_key)
-    )`,
-    `CREATE INDEX effect_local_server_history_terminal
-      ON effect_local_authoritative_log (space_id, server_sequence, mutation_id)`,
-    `CREATE INDEX effect_local_server_receipts_terminal
-      ON effect_local_server_receipts (space_id, terminal_sequence, client_id, local_sequence)`,
-    `CREATE INDEX effect_local_server_snapshots_latest
-      ON effect_local_server_snapshots (space_id, server_sequence DESC, terminal_sequence DESC)`,
-    `CREATE INDEX effect_local_server_entities_largest
-      ON effect_local_server_entities (space_id, entity_bytes DESC, model, entity_key)`,
-    `CREATE TRIGGER effect_local_count_history_insert AFTER INSERT ON effect_local_authoritative_log
-      BEGIN
-        UPDATE effect_local_server_spaces SET retained_history_count = retained_history_count + 1
-          WHERE space_id = NEW.space_id;
-        UPDATE effect_local_server_space_counts SET history_count = history_count + 1
-          WHERE space_id = NEW.space_id;
-      END`,
-    `CREATE TRIGGER effect_local_count_history_delete AFTER DELETE ON effect_local_authoritative_log
-      BEGIN
-        UPDATE effect_local_server_spaces SET retained_history_count = retained_history_count - 1
-          WHERE space_id = OLD.space_id;
-        UPDATE effect_local_server_space_counts SET history_count = history_count - 1
-          WHERE space_id = OLD.space_id;
-      END`,
-    `CREATE TRIGGER effect_local_count_receipt_insert AFTER INSERT ON effect_local_server_receipts
-      BEGIN
-        UPDATE effect_local_server_spaces SET retained_receipt_count = retained_receipt_count + 1
-          WHERE space_id = NEW.space_id;
-        UPDATE effect_local_server_space_counts SET receipt_count = receipt_count + 1
-          WHERE space_id = NEW.space_id;
-      END`,
-    `CREATE TRIGGER effect_local_count_receipt_delete AFTER DELETE ON effect_local_server_receipts
-      BEGIN
-        UPDATE effect_local_server_spaces SET retained_receipt_count = retained_receipt_count - 1
-          WHERE space_id = OLD.space_id;
-        UPDATE effect_local_server_space_counts SET receipt_count = receipt_count - 1
-          WHERE space_id = OLD.space_id;
-      END`,
-    `UPDATE effect_local_server_spaces SET metadata_verified = 1 WHERE NOT EXISTS (
-      SELECT 1 FROM effect_local_server_entities AS e
-      WHERE e.space_id = effect_local_server_spaces.space_id
-    )`,
-    `CREATE TRIGGER effect_local_require_current_space_writer
-      BEFORE INSERT ON effect_local_server_spaces
-      WHEN NEW.metadata_verified = 0
-      BEGIN SELECT RAISE(ABORT, 'effect-local server writer upgrade required'); END`,
-    `CREATE TRIGGER effect_local_require_current_receipt_writer
-      BEFORE INSERT ON effect_local_server_receipts
-      WHEN NEW.terminal_sequence = 0
-      BEGIN SELECT RAISE(ABORT, 'effect-local server writer upgrade required'); END`,
-    `CREATE TRIGGER effect_local_require_current_history_writer
-      BEFORE INSERT ON effect_local_authoritative_log
-      WHEN NEW.client_id = '' OR NEW.local_sequence = 0 OR NEW.digest = ''
-      BEGIN SELECT RAISE(ABORT, 'effect-local server writer upgrade required'); END`
-  ],
-  effect: {
-    id: "validate-bounded-history-backfill",
-    run: Effect.fnUntraced(
-      function*(sql) {
-        const row = yield* SqlSchema.findOne({
-          Request: Schema.Void,
-          Result: CountRow,
-          execute: () =>
-            sql`SELECT
-            (SELECT COUNT(*) FROM effect_local_authoritative_log
-              WHERE json_valid(entry_json) = 0 OR client_id = '' OR local_sequence = 0 OR digest = '') +
-            (SELECT COUNT(*) FROM effect_local_server_receipts AS r
-              WHERE json_valid(r.receipt_json) = 0 OR r.terminal_sequence <= 0 OR
-                (json_extract(r.receipt_json, '$._tag') = 'Accepted' AND (
-                  r.server_sequence IS NULL OR NOT EXISTS (
-                    SELECT 1 FROM effect_local_authoritative_log AS l
-                    WHERE l.space_id = r.space_id AND l.mutation_id = r.mutation_id AND
-                      l.server_sequence = r.server_sequence
-                  )
-                )) OR
-                (json_extract(r.receipt_json, '$._tag') <> 'Accepted' AND r.server_sequence IS NOT NULL)
-            ) AS count`
-        })(undefined)
-        if (row.count !== 0) {
-          return yield* new ReplicaError.StorageCorrupt({
-            message: "Legacy server history contains invalid mutation identity"
-          })
-        }
-        return yield* Effect.void
-      },
-      Effect.mapError((cause) => {
-        if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
-        return new ReplicaError.StorageCorrupt({ message: "Server history backfill validation failed", cause })
-      })
-    )
-  }
-})
-
-const clientV7 = makeMigration({
-  id: 7,
-  name: "generation-owned-storage",
-  statements: [
-    "ALTER TABLE effect_local_client_meta ADD COLUMN active_schema_generation INTEGER NOT NULL DEFAULT 0 CHECK (active_schema_generation >= 0)",
-    "ALTER TABLE effect_local_client_evolution ADD COLUMN source_generation INTEGER NOT NULL DEFAULT 0 CHECK (source_generation >= 0)",
-    `UPDATE effect_local_client_meta SET active_schema_generation = CASE
-      WHEN EXISTS (SELECT 1 FROM effect_local_client_evolution WHERE singleton = 1)
-      THEN MAX(schema_generation - 1, 0) ELSE schema_generation END`,
-    `UPDATE effect_local_client_evolution SET source_generation =
-      (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
-      phase = 'Log', cursor_model = NULL, cursor_key = NULL, cursor_sequence = 0`,
-    `CREATE TABLE effect_local_client_pending_data (
-      generation INTEGER NOT NULL,
-      mutation_id TEXT NOT NULL,
-      local_sequence INTEGER NOT NULL,
-      basis INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      digest TEXT NOT NULL,
-      digest_version INTEGER NOT NULL CHECK (digest_version IN (1, 2)),
-      source_schema_version INTEGER,
-      source_schema_hash TEXT,
-      mutation_version INTEGER,
-      optimistic_result_json TEXT NOT NULL,
-      changes_json TEXT NOT NULL,
-      PRIMARY KEY (generation, mutation_id),
-      UNIQUE (generation, local_sequence)
-    )`,
-    `INSERT INTO effect_local_client_pending_data
-      SELECT (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
-        mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
-        source_schema_version, source_schema_hash, mutation_version, optimistic_result_json, changes_json
-      FROM effect_local_pending`,
-    `CREATE TABLE effect_local_client_receipts_data (
-      generation INTEGER NOT NULL,
-      mutation_id TEXT NOT NULL,
-      local_sequence INTEGER NOT NULL,
-      receipt_json TEXT NOT NULL,
-      source_schema_version INTEGER,
-      source_schema_hash TEXT,
-      mutation_version INTEGER,
-      rejection_origin TEXT,
-      mutation_name TEXT,
-      PRIMARY KEY (generation, mutation_id),
-      UNIQUE (generation, local_sequence)
-    )`,
-    `INSERT INTO effect_local_client_receipts_data
-      SELECT (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
-        mutation_id, local_sequence, receipt_json, source_schema_version, source_schema_hash,
-        mutation_version, rejection_origin, mutation_name FROM effect_local_receipts`,
-    `CREATE TABLE effect_local_client_canonical_entities_data (
-      generation INTEGER NOT NULL,
-      model TEXT NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      model_version INTEGER,
-      PRIMARY KEY (generation, model, entity_key)
-    )`,
-    `INSERT INTO effect_local_client_canonical_entities_data
-      SELECT (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
-        model, entity_key, value_json, model_version FROM effect_local_canonical_entities`,
-    `CREATE TABLE effect_local_client_visible_entities_data (
-      generation INTEGER NOT NULL,
-      model TEXT NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      model_version INTEGER,
-      PRIMARY KEY (generation, model, entity_key)
-    )`,
-    `INSERT INTO effect_local_client_visible_entities_data
-      SELECT (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
-        model, entity_key, value_json, model_version FROM effect_local_visible_entities`,
-    "DROP TABLE effect_local_pending",
-    "DROP TABLE effect_local_receipts",
-    "DROP TABLE effect_local_canonical_entities",
-    "DROP TABLE effect_local_visible_entities",
-    "DELETE FROM effect_local_client_shadow_entities",
-    "DELETE FROM effect_local_client_shadow_visible_entities",
-    "DELETE FROM effect_local_client_shadow_receipts_v2",
-    "DELETE FROM effect_local_client_shadow_pending",
-    `CREATE VIEW effect_local_pending AS SELECT mutation_id, local_sequence, basis, name, payload_json,
-      digest, digest_version, source_schema_version, source_schema_hash, mutation_version,
-      optimistic_result_json, changes_json FROM effect_local_client_pending_data
-      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)`,
-    `CREATE VIEW effect_local_receipts AS SELECT mutation_id, local_sequence, receipt_json,
-      source_schema_version, source_schema_hash, mutation_version, rejection_origin, mutation_name
-      FROM effect_local_client_receipts_data
-      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)`,
-    `CREATE VIEW effect_local_canonical_entities AS SELECT model, entity_key, value_json, model_version
-      FROM effect_local_client_canonical_entities_data
-      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)`,
-    `CREATE VIEW effect_local_visible_entities AS SELECT model, entity_key, value_json, model_version
-      FROM effect_local_client_visible_entities_data
-      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)`,
-    `CREATE TRIGGER effect_local_pending_insert INSTEAD OF INSERT ON effect_local_pending BEGIN
-      INSERT INTO effect_local_client_pending_data
-        (generation, mutation_id, local_sequence, basis, name, payload_json, digest, digest_version,
-          source_schema_version, source_schema_hash, mutation_version, optimistic_result_json, changes_json)
-      VALUES ((SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
-        NEW.mutation_id, NEW.local_sequence, NEW.basis, NEW.name, NEW.payload_json, NEW.digest,
-        NEW.digest_version, NEW.source_schema_version, NEW.source_schema_hash, NEW.mutation_version,
-        NEW.optimistic_result_json, NEW.changes_json); END`,
-    `CREATE TRIGGER effect_local_pending_update INSTEAD OF UPDATE ON effect_local_pending BEGIN
-      UPDATE effect_local_client_pending_data SET mutation_id = NEW.mutation_id, local_sequence = NEW.local_sequence,
-        basis = NEW.basis, name = NEW.name, payload_json = NEW.payload_json, digest = NEW.digest,
-        digest_version = NEW.digest_version, source_schema_version = NEW.source_schema_version,
-        source_schema_hash = NEW.source_schema_hash, mutation_version = NEW.mutation_version,
-        optimistic_result_json = NEW.optimistic_result_json, changes_json = NEW.changes_json
-      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
-        AND mutation_id = OLD.mutation_id; END`,
-    `CREATE TRIGGER effect_local_pending_delete INSTEAD OF DELETE ON effect_local_pending BEGIN
-      DELETE FROM effect_local_client_pending_data
-      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
-        AND mutation_id = OLD.mutation_id; END`,
-    `CREATE TRIGGER effect_local_receipts_insert INSTEAD OF INSERT ON effect_local_receipts BEGIN
-      INSERT INTO effect_local_client_receipts_data
-        (generation, mutation_id, local_sequence, receipt_json, source_schema_version, source_schema_hash,
-          mutation_version, rejection_origin, mutation_name)
-      VALUES ((SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
-        NEW.mutation_id, NEW.local_sequence, NEW.receipt_json, NEW.source_schema_version, NEW.source_schema_hash,
-        NEW.mutation_version, NEW.rejection_origin, NEW.mutation_name); END`,
-    `CREATE TRIGGER effect_local_receipts_update INSTEAD OF UPDATE ON effect_local_receipts BEGIN
-      UPDATE effect_local_client_receipts_data SET mutation_id = NEW.mutation_id, local_sequence = NEW.local_sequence,
-        receipt_json = NEW.receipt_json, source_schema_version = NEW.source_schema_version,
-        source_schema_hash = NEW.source_schema_hash, mutation_version = NEW.mutation_version,
-        rejection_origin = NEW.rejection_origin, mutation_name = NEW.mutation_name
-      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
-        AND mutation_id = OLD.mutation_id; END`,
-    `CREATE TRIGGER effect_local_receipts_delete INSTEAD OF DELETE ON effect_local_receipts BEGIN
-      DELETE FROM effect_local_client_receipts_data
-      WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
-        AND mutation_id = OLD.mutation_id; END`,
-    ...["canonical", "visible"].flatMap((kind) => [
-      `CREATE TRIGGER effect_local_${kind}_entities_insert INSTEAD OF INSERT ON effect_local_${kind}_entities BEGIN
-        INSERT INTO effect_local_client_${kind}_entities_data
-          (generation, model, entity_key, value_json, model_version)
-        VALUES ((SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1),
-          NEW.model, NEW.entity_key, NEW.value_json, NEW.model_version); END`,
-      `CREATE TRIGGER effect_local_${kind}_entities_update INSTEAD OF UPDATE ON effect_local_${kind}_entities BEGIN
-        UPDATE effect_local_client_${kind}_entities_data SET model = NEW.model, entity_key = NEW.entity_key,
-          value_json = NEW.value_json, model_version = NEW.model_version
-        WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
-          AND model = OLD.model AND entity_key = OLD.entity_key; END`,
-      `CREATE TRIGGER effect_local_${kind}_entities_delete INSTEAD OF DELETE ON effect_local_${kind}_entities BEGIN
-        DELETE FROM effect_local_client_${kind}_entities_data
-        WHERE generation = (SELECT active_schema_generation FROM effect_local_client_meta WHERE singleton = 1)
-          AND model = OLD.model AND entity_key = OLD.entity_key; END`
-    ])
-  ]
-})
-
-const clientV8 = makeMigration({
-  id: 8,
-  name: "multi-space-client-storage",
-  statements: [
-    "DROP TRIGGER effect_local_pending_insert",
-    "DROP TRIGGER effect_local_pending_update",
-    "DROP TRIGGER effect_local_pending_delete",
-    "DROP TRIGGER effect_local_receipts_insert",
-    "DROP TRIGGER effect_local_receipts_update",
-    "DROP TRIGGER effect_local_receipts_delete",
-    "DROP TRIGGER effect_local_canonical_entities_insert",
-    "DROP TRIGGER effect_local_canonical_entities_update",
-    "DROP TRIGGER effect_local_canonical_entities_delete",
-    "DROP TRIGGER effect_local_visible_entities_insert",
-    "DROP TRIGGER effect_local_visible_entities_update",
-    "DROP TRIGGER effect_local_visible_entities_delete",
-    "DROP VIEW effect_local_pending",
-    "DROP VIEW effect_local_receipts",
-    "DROP VIEW effect_local_canonical_entities",
-    "DROP VIEW effect_local_visible_entities",
-    "ALTER TABLE effect_local_client_meta RENAME TO effect_local_client_meta_v7",
     `CREATE TABLE effect_local_client_meta (
       singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
       client_id TEXT NOT NULL UNIQUE
@@ -972,8 +276,8 @@ const clientV8 = makeMigration({
       space_id TEXT PRIMARY KEY,
       membership_incarnation TEXT NOT NULL,
       definition_hash TEXT NOT NULL,
-      schema_version INTEGER,
-      schema_hash TEXT,
+      schema_version INTEGER NOT NULL,
+      schema_hash TEXT NOT NULL,
       schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
       active_schema_generation INTEGER NOT NULL CHECK (active_schema_generation >= 0),
       active_projection_generation INTEGER NOT NULL DEFAULT 0 CHECK (active_projection_generation >= 0),
@@ -999,23 +303,23 @@ const clientV8 = makeMigration({
         CHECK (length(desired_scope_digest) = 64),
       scope_generation INTEGER NOT NULL DEFAULT 0 CHECK (scope_generation >= 0),
       projection_replay_generation INTEGER,
-      projection_replay_cursor TEXT
+      projection_replay_cursor TEXT,
+      next_settled_sequence INTEGER NOT NULL DEFAULT 1,
+      settlement_floor INTEGER NOT NULL DEFAULT 0,
+      settlement_prune_sequence INTEGER NOT NULL DEFAULT 0
     )`,
-    "ALTER TABLE effect_local_server_log RENAME TO effect_local_server_log_v7",
     `CREATE TABLE effect_local_server_log (
       space_id TEXT NOT NULL,
       membership_incarnation TEXT NOT NULL,
       server_sequence INTEGER NOT NULL,
       mutation_id TEXT NOT NULL,
       entry_json TEXT NOT NULL,
-      source_schema_version INTEGER,
-      source_schema_hash TEXT,
-      mutation_version INTEGER,
+      source_schema_version INTEGER NOT NULL,
+      source_schema_hash TEXT NOT NULL,
       PRIMARY KEY (space_id, server_sequence),
       UNIQUE (space_id, mutation_id),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    "ALTER TABLE effect_local_client_pending_data RENAME TO effect_local_client_pending_data_v7",
     `CREATE TABLE effect_local_client_pending_data (
       space_id TEXT NOT NULL,
       schema_generation INTEGER NOT NULL,
@@ -1026,10 +330,10 @@ const clientV8 = makeMigration({
       name TEXT NOT NULL,
       payload_json TEXT NOT NULL,
       digest TEXT NOT NULL,
-      digest_version INTEGER NOT NULL CHECK (digest_version = 3),
-      source_schema_version INTEGER,
-      source_schema_hash TEXT,
-      mutation_version INTEGER,
+      digest_version INTEGER NOT NULL CHECK (digest_version = 1),
+      source_schema_version INTEGER NOT NULL,
+      source_schema_hash TEXT NOT NULL,
+      mutation_version INTEGER NOT NULL,
       optimistic_result_json TEXT NOT NULL,
       changes_json TEXT NOT NULL,
       submission_state TEXT NOT NULL DEFAULT 'Queued' CHECK (
@@ -1040,7 +344,6 @@ const clientV8 = makeMigration({
       UNIQUE (space_id, schema_generation, local_sequence),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    "ALTER TABLE effect_local_client_receipts_data RENAME TO effect_local_client_receipts_data_v7",
     `CREATE TABLE effect_local_client_receipts_data (
       space_id TEXT NOT NULL,
       schema_generation INTEGER NOT NULL,
@@ -1048,27 +351,34 @@ const clientV8 = makeMigration({
       mutation_id TEXT NOT NULL,
       local_sequence INTEGER NOT NULL,
       receipt_json TEXT NOT NULL,
-      source_schema_version INTEGER,
-      source_schema_hash TEXT,
-      mutation_version INTEGER,
+      source_schema_version INTEGER NOT NULL,
+      source_schema_hash TEXT NOT NULL,
+      mutation_version INTEGER NOT NULL,
+      mutation_name TEXT NOT NULL,
       rejection_origin TEXT,
-      mutation_name TEXT,
+      settled_pending_json TEXT,
+      settled_sequence INTEGER,
+      pending_name TEXT,
       PRIMARY KEY (space_id, schema_generation, mutation_id),
       UNIQUE (space_id, schema_generation, local_sequence),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    "ALTER TABLE effect_local_client_canonical_entities_data RENAME TO effect_local_client_canonical_entities_data_v7",
+    `CREATE UNIQUE INDEX effect_local_client_receipts_settled
+      ON effect_local_client_receipts_data (space_id, schema_generation, settled_sequence)
+      WHERE settled_sequence IS NOT NULL`,
+    `CREATE INDEX effect_local_client_receipts_unsettled
+      ON effect_local_client_receipts_data (space_id, schema_generation, local_sequence)
+      WHERE settled_sequence IS NULL`,
     `CREATE TABLE effect_local_client_canonical_entities_data (
       space_id TEXT NOT NULL,
       schema_generation INTEGER NOT NULL,
       model TEXT NOT NULL,
       entity_key TEXT NOT NULL,
       value_json TEXT NOT NULL,
-      model_version INTEGER,
+      model_version INTEGER NOT NULL,
       PRIMARY KEY (space_id, schema_generation, model, entity_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    "ALTER TABLE effect_local_client_visible_entities_data RENAME TO effect_local_client_visible_entities_data_v7",
     `CREATE TABLE effect_local_client_visible_entities_data (
       space_id TEXT NOT NULL,
       schema_generation INTEGER NOT NULL,
@@ -1076,11 +386,10 @@ const clientV8 = makeMigration({
       model TEXT NOT NULL,
       entity_key TEXT NOT NULL,
       value_json TEXT NOT NULL,
-      model_version INTEGER,
+      model_version INTEGER NOT NULL,
       PRIMARY KEY (space_id, schema_generation, projection_generation, model, entity_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    "ALTER TABLE effect_local_client_evolution RENAME TO effect_local_client_evolution_v7",
     `CREATE TABLE effect_local_client_evolution (
       space_id TEXT PRIMARY KEY,
       source_schema_version INTEGER NOT NULL,
@@ -1098,7 +407,6 @@ const clientV8 = makeMigration({
       cursor_sequence INTEGER,
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    "ALTER TABLE effect_local_client_key_lineage RENAME TO effect_local_client_key_lineage_v7",
     `CREATE TABLE effect_local_client_key_lineage (
       space_id TEXT NOT NULL,
       source_schema_version INTEGER NOT NULL,
@@ -1112,7 +420,6 @@ const clientV8 = makeMigration({
       PRIMARY KEY (space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    "ALTER TABLE effect_local_client_key_lineage_groups RENAME TO effect_local_client_key_lineage_groups_v7",
     `CREATE TABLE effect_local_client_key_lineage_groups (
       space_id TEXT NOT NULL,
       source_schema_version INTEGER NOT NULL,
@@ -1124,7 +431,6 @@ const clientV8 = makeMigration({
       PRIMARY KEY (space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    "ALTER TABLE effect_local_client_key_lineage_targets RENAME TO effect_local_client_key_lineage_targets_v7",
     `CREATE TABLE effect_local_client_key_lineage_targets (
       space_id TEXT NOT NULL,
       target_model TEXT NOT NULL,
@@ -1176,48 +482,6 @@ const clientV8 = makeMigration({
       UNIQUE (space_id, model, entity_key),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_scoped_bootstrap(space_id) ON DELETE CASCADE
     )`,
-    "DROP TABLE effect_local_client_shadow_entities",
-    "DROP TABLE effect_local_client_shadow_receipts",
-    "DROP TABLE effect_local_client_shadow_visible_entities",
-    "DROP TABLE effect_local_client_shadow_pending",
-    "DROP TABLE effect_local_client_shadow_receipts_v2",
-    "DROP TABLE effect_local_client_key_lineage_targets_v7",
-    "DROP TABLE effect_local_client_key_lineage_groups_v7",
-    "DROP TABLE effect_local_client_key_lineage_v7",
-    "DROP TABLE effect_local_client_evolution_v7",
-    "DROP TABLE effect_local_client_visible_entities_data_v7",
-    "DROP TABLE effect_local_client_canonical_entities_data_v7",
-    "DROP TABLE effect_local_client_receipts_data_v7",
-    "DROP TABLE effect_local_client_pending_data_v7",
-    "DROP TABLE effect_local_server_log_v7",
-    "DROP TABLE effect_local_client_meta_v7"
-  ],
-  effect: {
-    id: "validate-multi-space-client-storage",
-    run: (sql) =>
-      SqlSchema.findAll({
-        Request: Schema.Void,
-        Result: ForeignKeyCheckRow,
-        execute: () => sql`PRAGMA foreign_key_check`
-      })(undefined).pipe(
-        Effect.flatMap((rows) => {
-          if (rows.length === 0) return Effect.void
-          return new ReplicaError.StorageCorrupt({
-            message: `Client migration left ${rows.length} foreign key violation(s)`
-          })
-        }),
-        Effect.mapError((cause) => {
-          if (cause._tag === "StorageCorrupt") return cause
-          return StorageUnavailable.make(cause)
-        })
-      )
-  }
-})
-
-const clientV9 = makeMigration({
-  id: 9,
-  name: "pending-mutation-quarantine",
-  statements: [
     `CREATE TABLE effect_local_client_quarantine (
       space_id TEXT NOT NULL,
       membership_incarnation TEXT NOT NULL,
@@ -1227,7 +491,7 @@ const clientV9 = makeMigration({
       name TEXT NOT NULL,
       payload_json TEXT NOT NULL,
       digest TEXT NOT NULL,
-      digest_version INTEGER NOT NULL CHECK (digest_version = 3),
+      digest_version INTEGER NOT NULL CHECK (digest_version = 1),
       source_schema_version INTEGER NOT NULL,
       source_schema_hash TEXT NOT NULL,
       mutation_version INTEGER NOT NULL,
@@ -1237,14 +501,7 @@ const clientV9 = makeMigration({
       PRIMARY KEY (space_id, mutation_id),
       UNIQUE (space_id, membership_incarnation, local_sequence),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
-    )`
-  ]
-})
-
-const clientV10 = makeMigration({
-  id: 10,
-  name: "quarantine-resubmission-intents",
-  statements: [
+    )`,
     `CREATE TABLE effect_local_client_quarantine_resubmissions (
       space_id TEXT NOT NULL,
       original_mutation_id TEXT NOT NULL,
@@ -1252,14 +509,7 @@ const clientV10 = makeMigration({
       PRIMARY KEY (space_id, original_mutation_id),
       UNIQUE (space_id, replacement_mutation_id),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
-    )`
-  ]
-})
-
-const clientV11 = makeMigration({
-  id: 11,
-  name: "quarantine-cancellation-continuations",
-  statements: [
+    )`,
     `CREATE TABLE effect_local_client_quarantine_cancellations (
       space_id TEXT NOT NULL,
       root_mutation_id TEXT NOT NULL,
@@ -1267,14 +517,7 @@ const clientV11 = makeMigration({
       PRIMARY KEY (space_id, root_mutation_id),
       UNIQUE (space_id, current_mutation_id),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
-    )`
-  ]
-})
-
-const clientV12 = makeMigration({
-  id: 12,
-  name: "projection-dirty-entities",
-  statements: [
+    )`,
     `CREATE TABLE effect_local_client_projection_dirty (
       space_id TEXT NOT NULL,
       schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
@@ -1282,30 +525,7 @@ const clientV12 = makeMigration({
       model_version INTEGER NOT NULL CHECK (model_version > 0),
       entity_key TEXT NOT NULL,
       PRIMARY KEY (space_id, schema_generation, model, entity_key)
-    )`
-  ]
-})
-
-const clientV13 = makeMigration({
-  id: 13,
-  name: "durable-settlements",
-  statements: [
-    "ALTER TABLE effect_local_client_receipts_data ADD COLUMN settled_pending_json TEXT",
-    "ALTER TABLE effect_local_client_receipts_data ADD COLUMN settled_sequence INTEGER",
-    "ALTER TABLE effect_local_client_receipts_data ADD COLUMN pending_name TEXT",
-    `CREATE UNIQUE INDEX effect_local_client_receipts_settled
-      ON effect_local_client_receipts_data (space_id, schema_generation, settled_sequence)
-      WHERE settled_sequence IS NOT NULL`,
-    "ALTER TABLE effect_local_client_spaces ADD COLUMN next_settled_sequence INTEGER NOT NULL DEFAULT 1",
-    "ALTER TABLE effect_local_client_spaces ADD COLUMN settlement_floor INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE effect_local_client_spaces ADD COLUMN settlement_prune_sequence INTEGER NOT NULL DEFAULT 0"
-  ]
-})
-
-const clientV14 = makeMigration({
-  id: 14,
-  name: "settlement-prune-watermarks",
-  statements: [
+    )`,
     `CREATE TABLE effect_local_client_settlement_prune (
       space_id TEXT NOT NULL,
       pending_name TEXT NOT NULL,
@@ -1313,71 +533,111 @@ const clientV14 = makeMigration({
       PRIMARY KEY (space_id, pending_name),
       FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
-    `CREATE INDEX effect_local_client_receipts_unsettled
-      ON effect_local_client_receipts_data (space_id, schema_generation, local_sequence)
-      WHERE settled_sequence IS NULL`
-  ]
-})
-
-export const clientCatalog = Object.freeze([
-  clientV1,
-  clientV2,
-  clientV3,
-  clientV4,
-  clientV5,
-  clientV6,
-  clientV7,
-  clientV8,
-  clientV9,
-  clientV10,
-  clientV11,
-  clientV12,
-  clientV13,
-  clientV14
-])
-
-const serverV6 = makeMigration({
-  id: 6,
-  name: "legacy-schema-baseline",
-  statements: [
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN legacy_schema_version INTEGER",
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN legacy_schema_hash TEXT"
-  ]
-})
-
-const serverV7 = makeMigration({
-  id: 7,
-  name: "generation-owned-storage",
-  statements: [
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN active_schema_generation INTEGER NOT NULL DEFAULT 0 CHECK (active_schema_generation >= 0)",
-    "ALTER TABLE effect_local_server_evolution ADD COLUMN source_generation INTEGER NOT NULL DEFAULT 0 CHECK (source_generation >= 0)",
-    "ALTER TABLE effect_local_server_evolution ADD COLUMN target_entity_count INTEGER NOT NULL DEFAULT 0 CHECK (target_entity_count >= 0)",
-    "ALTER TABLE effect_local_server_evolution ADD COLUMN target_entity_bytes INTEGER NOT NULL DEFAULT 0 CHECK (target_entity_bytes >= 0)",
-    `UPDATE effect_local_server_spaces SET active_schema_generation = CASE
-      WHEN EXISTS (SELECT 1 FROM effect_local_server_evolution AS e
-        WHERE e.space_id = effect_local_server_spaces.space_id)
-      THEN MAX(schema_generation - 1, 0) ELSE schema_generation END`,
-    `UPDATE effect_local_server_evolution SET source_generation =
-      (SELECT active_schema_generation FROM effect_local_server_spaces AS s
-        WHERE s.space_id = effect_local_server_evolution.space_id),
-      target_entity_count = 0, target_entity_bytes = 0,
-      phase = 'Log', cursor_model = NULL, cursor_key = NULL, cursor_sequence = 0`,
-    `CREATE TABLE effect_local_server_entities_data (
+    `CREATE TABLE effect_local_client_retired_mutations (
       space_id TEXT NOT NULL,
-      generation INTEGER NOT NULL,
-      model TEXT NOT NULL,
-      entity_key TEXT NOT NULL,
-      value_json TEXT NOT NULL,
-      model_version INTEGER,
-      entity_bytes INTEGER NOT NULL DEFAULT 0,
+      mutation_id TEXT NOT NULL,
+      local_sequence INTEGER NOT NULL,
+      PRIMARY KEY (space_id, mutation_id),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
+    )`,
+    `CREATE INDEX effect_local_client_retired_mutations_sequence
+      ON effect_local_client_retired_mutations (space_id, local_sequence)`
+  ]
+})
+
+export const clientCatalog = Object.freeze([clientBaseline])
+
+interface ServerTypes {
+  readonly text: string
+  readonly integer: string
+  readonly flag: string
+  readonly json: (column: string) => string
+}
+
+const serverTables = (types: ServerTypes): ReadonlyArray<string> => {
+  const { flag, integer, json, text } = types
+  return [
+    `CREATE TABLE effect_local_server_spaces (
+      space_id ${text} PRIMARY KEY,
+      definition_hash ${text} NOT NULL,
+      next_server_sequence ${integer} NOT NULL,
+      schema_version ${integer} NOT NULL,
+      schema_hash ${text} NOT NULL,
+      schema_generation ${integer} NOT NULL DEFAULT 0 CHECK (schema_generation >= 0),
+      active_schema_generation ${integer} NOT NULL DEFAULT 0 CHECK (active_schema_generation >= 0),
+      target_schema_version ${integer},
+      target_schema_hash ${text},
+      migration_hash ${text},
+      next_terminal_sequence ${integer} NOT NULL DEFAULT 1,
+      history_floor ${integer} NOT NULL DEFAULT 0,
+      receipt_floor ${integer} NOT NULL DEFAULT 0,
+      retained_history_count ${integer} NOT NULL DEFAULT 0,
+      retained_receipt_count ${integer} NOT NULL DEFAULT 0,
+      entity_count ${integer} NOT NULL DEFAULT 0,
+      entity_bytes ${integer} NOT NULL DEFAULT 0,
+      snapshot_id ${text},
+      snapshot_sequence ${integer} NOT NULL DEFAULT 0,
+      snapshot_terminal_sequence ${integer} NOT NULL DEFAULT 0,
+      read_auth_epoch ${integer} NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)
+    )`,
+    `CREATE TABLE effect_local_server_clients (
+      space_id ${text} NOT NULL,
+      client_id ${text} NOT NULL,
+      membership_incarnation ${text} NOT NULL,
+      last_local_sequence ${integer} NOT NULL,
+      expired_local_sequence ${integer} NOT NULL DEFAULT 0,
+      PRIMARY KEY (space_id, client_id, membership_incarnation)
+    )`,
+    `CREATE TABLE effect_local_server_receipts (
+      space_id ${text} NOT NULL,
+      client_id ${text} NOT NULL,
+      membership_incarnation ${text} NOT NULL,
+      local_sequence ${integer} NOT NULL,
+      mutation_id ${text} NOT NULL,
+      digest ${text} NOT NULL,
+      digest_version INTEGER NOT NULL CHECK (digest_version = 1),
+      receipt_json ${text} NOT NULL,
+      source_schema_version ${integer} NOT NULL,
+      source_schema_hash ${text} NOT NULL,
+      mutation_version ${integer} NOT NULL,
+      mutation_name ${text} NOT NULL,
+      rejection_origin ${text},
+      terminal_sequence ${integer} NOT NULL,
+      server_sequence ${integer},
+      PRIMARY KEY (space_id, client_id, membership_incarnation, local_sequence),
+      UNIQUE (space_id, mutation_id)
+    )`,
+    `CREATE INDEX effect_local_server_receipts_terminal
+      ON effect_local_server_receipts
+        (space_id, terminal_sequence, client_id, membership_incarnation, local_sequence)`,
+    `CREATE TABLE effect_local_authoritative_log (
+      space_id ${text} NOT NULL,
+      server_sequence ${integer} NOT NULL,
+      mutation_id ${text} NOT NULL,
+      client_id ${text} NOT NULL,
+      membership_incarnation ${text} NOT NULL,
+      local_sequence ${integer} NOT NULL,
+      digest ${text} NOT NULL,
+      entry_bytes ${integer} NOT NULL CHECK (entry_bytes > 0),
+      entry_json ${text} NOT NULL,
+      source_schema_version ${integer} NOT NULL,
+      source_schema_hash ${text} NOT NULL,
+      mutation_version ${integer} NOT NULL,
+      PRIMARY KEY (space_id, server_sequence),
+      UNIQUE (space_id, mutation_id)
+    )`,
+    `CREATE INDEX effect_local_server_history_terminal
+      ON effect_local_authoritative_log (space_id, server_sequence, mutation_id)`,
+    `CREATE TABLE effect_local_server_entities_data (
+      space_id ${text} NOT NULL,
+      generation ${integer} NOT NULL,
+      model ${text} NOT NULL,
+      entity_key ${text} NOT NULL,
+      value_json ${text} NOT NULL,
+      model_version ${integer} NOT NULL,
+      entity_bytes ${integer} NOT NULL,
       PRIMARY KEY (space_id, generation, model, entity_key)
     )`,
-    `INSERT INTO effect_local_server_entities_data
-      SELECT e.space_id, s.active_schema_generation, e.model, e.entity_key, e.value_json,
-        e.model_version, e.entity_bytes FROM effect_local_server_entities AS e
-      INNER JOIN effect_local_server_spaces AS s ON s.space_id = e.space_id`,
-    "DROP TABLE effect_local_server_entities",
-    "DELETE FROM effect_local_server_shadow_entities",
     `CREATE INDEX effect_local_server_entities_largest
       ON effect_local_server_entities_data (space_id, generation, entity_bytes DESC, model, entity_key)`,
     `CREATE VIEW effect_local_server_entities AS
@@ -1385,186 +645,277 @@ const serverV7 = makeMigration({
       FROM effect_local_server_entities_data AS d
       INNER JOIN effect_local_server_spaces AS s ON s.space_id = d.space_id
         AND s.active_schema_generation = d.generation`,
-    `CREATE TRIGGER effect_local_server_entities_insert INSTEAD OF INSERT ON effect_local_server_entities BEGIN
-      INSERT INTO effect_local_server_entities_data
-        (space_id, generation, model, entity_key, value_json, model_version, entity_bytes)
-      VALUES (NEW.space_id, (SELECT active_schema_generation FROM effect_local_server_spaces
-        WHERE space_id = NEW.space_id), NEW.model, NEW.entity_key, NEW.value_json, NEW.model_version,
-        NEW.entity_bytes); END`,
-    `CREATE TRIGGER effect_local_server_entities_update INSTEAD OF UPDATE ON effect_local_server_entities BEGIN
-      UPDATE effect_local_server_entities_data SET space_id = NEW.space_id, model = NEW.model,
-        entity_key = NEW.entity_key, value_json = NEW.value_json, model_version = NEW.model_version,
-        entity_bytes = NEW.entity_bytes
-      WHERE space_id = OLD.space_id AND generation = (SELECT active_schema_generation
-        FROM effect_local_server_spaces WHERE space_id = OLD.space_id)
-        AND model = OLD.model AND entity_key = OLD.entity_key; END`,
-    `CREATE TRIGGER effect_local_server_entities_delete INSTEAD OF DELETE ON effect_local_server_entities BEGIN
-      DELETE FROM effect_local_server_entities_data WHERE space_id = OLD.space_id
-        AND generation = (SELECT active_schema_generation FROM effect_local_server_spaces
-          WHERE space_id = OLD.space_id) AND model = OLD.model AND entity_key = OLD.entity_key; END`,
-    `CREATE TRIGGER effect_local_server_entity_count_insert AFTER INSERT ON effect_local_server_entities_data
-      WHEN NEW.generation = (SELECT active_schema_generation FROM effect_local_server_spaces
-        WHERE space_id = NEW.space_id) BEGIN
-      UPDATE effect_local_server_spaces SET entity_count = entity_count + 1,
-        entity_bytes = entity_bytes + NEW.entity_bytes WHERE space_id = NEW.space_id; END`,
-    `CREATE TRIGGER effect_local_server_entity_count_delete AFTER DELETE ON effect_local_server_entities_data
-      WHEN OLD.generation = (SELECT active_schema_generation FROM effect_local_server_spaces
-        WHERE space_id = OLD.space_id) BEGIN
-      UPDATE effect_local_server_spaces SET entity_count = entity_count - 1,
-        entity_bytes = entity_bytes - OLD.entity_bytes WHERE space_id = OLD.space_id; END`,
-    `CREATE TRIGGER effect_local_server_entity_count_update AFTER UPDATE OF entity_bytes
-      ON effect_local_server_entities_data
-      WHEN NEW.generation = OLD.generation AND NEW.space_id = OLD.space_id AND
-        NEW.generation = (SELECT active_schema_generation FROM effect_local_server_spaces
-          WHERE space_id = NEW.space_id) BEGIN
-      UPDATE effect_local_server_spaces SET entity_bytes = entity_bytes + NEW.entity_bytes - OLD.entity_bytes
-        WHERE space_id = NEW.space_id; END`,
+    `CREATE TABLE effect_local_server_evolution (
+      space_id ${text} PRIMARY KEY,
+      source_schema_version ${integer} NOT NULL,
+      source_schema_hash ${text} NOT NULL,
+      target_schema_version ${integer} NOT NULL,
+      target_schema_hash ${text} NOT NULL,
+      migration_hash ${text} NOT NULL,
+      generation ${integer} NOT NULL CHECK (generation > 0),
+      source_generation ${integer} NOT NULL CHECK (source_generation >= 0),
+      target_entity_count ${integer} NOT NULL CHECK (target_entity_count >= 0),
+      target_entity_bytes ${integer} NOT NULL CHECK (target_entity_bytes >= 0),
+      phase ${text} NOT NULL,
+      cursor_model ${text},
+      cursor_key ${text},
+      cursor_sequence ${integer}
+    )`,
+    `CREATE TABLE effect_local_server_key_lineage (
+      space_id ${text} NOT NULL,
+      source_schema_version ${integer} NOT NULL,
+      source_schema_hash ${text} NOT NULL,
+      source_model ${text} NOT NULL,
+      source_model_version ${integer} NOT NULL,
+      source_key ${text} NOT NULL,
+      target_model ${text} NOT NULL,
+      target_model_version ${integer} NOT NULL,
+      target_key ${text} NOT NULL,
+      PRIMARY KEY (
+        space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key
+      )
+    )`,
+    `CREATE INDEX effect_local_server_key_lineage_target
+      ON effect_local_server_key_lineage (space_id, target_model, target_model_version, target_key)`,
+    `CREATE TABLE effect_local_server_key_lineage_groups (
+      space_id ${text} NOT NULL,
+      source_schema_version ${integer} NOT NULL,
+      source_schema_hash ${text} NOT NULL,
+      source_model ${text} NOT NULL,
+      source_model_version ${integer} NOT NULL,
+      source_key ${text} NOT NULL,
+      lineage_id ${text} NOT NULL,
+      PRIMARY KEY (
+        space_id, source_schema_version, source_schema_hash, source_model, source_model_version, source_key
+      )
+    )`,
+    `CREATE TABLE effect_local_server_key_lineage_targets (
+      space_id ${text} NOT NULL,
+      target_model ${text} NOT NULL,
+      target_model_version ${integer} NOT NULL,
+      target_key ${text} NOT NULL,
+      lineage_id ${text} NOT NULL,
+      PRIMARY KEY (space_id, target_model, target_model_version, target_key)
+    )`,
+    `CREATE TABLE effect_local_server_space_counts (
+      space_id ${text} PRIMARY KEY,
+      history_count ${integer} NOT NULL CHECK (history_count >= 0),
+      receipt_count ${integer} NOT NULL CHECK (receipt_count >= 0)
+    )`,
+    `CREATE INDEX effect_local_server_space_counts_history
+      ON effect_local_server_space_counts (history_count DESC)`,
+    `CREATE INDEX effect_local_server_space_counts_receipts
+      ON effect_local_server_space_counts (receipt_count DESC)`,
+    `CREATE TABLE effect_local_server_snapshots (
+      space_id ${text} NOT NULL,
+      snapshot_id ${text} NOT NULL,
+      definition_hash ${text} NOT NULL,
+      schema_version ${integer} NOT NULL,
+      schema_hash ${text} NOT NULL,
+      server_sequence ${integer} NOT NULL,
+      terminal_sequence ${integer} NOT NULL,
+      entity_count ${integer} NOT NULL,
+      content_bytes ${integer} NOT NULL,
+      digest ${text} NOT NULL,
+      PRIMARY KEY (space_id, snapshot_id),
+      UNIQUE (space_id, server_sequence, terminal_sequence)
+    )`,
+    `CREATE INDEX effect_local_server_snapshots_latest
+      ON effect_local_server_snapshots (space_id, server_sequence DESC, terminal_sequence DESC)`,
+    `CREATE TABLE effect_local_server_snapshot_entities (
+      space_id ${text} NOT NULL,
+      snapshot_id ${text} NOT NULL,
+      ordinal ${integer} NOT NULL,
+      model ${text} NOT NULL,
+      model_version ${integer} NOT NULL,
+      entity_key ${text} NOT NULL,
+      value_json ${text} NOT NULL,
+      entity_bytes ${integer} NOT NULL,
+      wire_json ${text} NOT NULL,
+      wire_bytes ${integer} NOT NULL CHECK (wire_bytes > 0),
+      PRIMARY KEY (space_id, snapshot_id, ordinal),
+      UNIQUE (space_id, snapshot_id, model, entity_key)
+    )`,
     `CREATE TABLE effect_local_server_replication_views (
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
-      view_id TEXT NOT NULL,
-      view_revision INTEGER NOT NULL CHECK (view_revision >= 0),
-      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
-      scope_json TEXT NOT NULL CHECK (json_valid(scope_json)),
-      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
-      definition_hash TEXT NOT NULL,
-      schema_version INTEGER NOT NULL,
-      schema_hash TEXT NOT NULL,
-      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
+      space_id ${text} NOT NULL,
+      client_id ${text} NOT NULL,
+      principal_digest ${text} NOT NULL CHECK (length(principal_digest) = 64),
+      view_id ${text} NOT NULL,
+      view_revision ${integer} NOT NULL CHECK (view_revision >= 0),
+      scope_generation ${integer} NOT NULL CHECK (scope_generation >= 0),
+      scope_json ${text} NOT NULL CHECK (${json("scope_json")}),
+      scope_digest ${text} NOT NULL CHECK (length(scope_digest) = 64),
+      definition_hash ${text} NOT NULL,
+      index_layout_hash ${text} NOT NULL,
+      schema_version ${integer} NOT NULL,
+      schema_hash ${text} NOT NULL,
+      server_sequence ${integer} NOT NULL CHECK (server_sequence >= 0),
+      delivered_sequence ${integer} NOT NULL CHECK (delivered_sequence >= 0),
+      read_auth_epoch ${integer} NOT NULL CHECK (read_auth_epoch >= 0),
       PRIMARY KEY (space_id, client_id)
     )`,
     `CREATE TABLE effect_local_server_replication_view_entities (
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
-      view_id TEXT NOT NULL,
-      model TEXT NOT NULL,
-      model_version INTEGER NOT NULL CHECK (model_version > 0),
-      entity_key TEXT NOT NULL,
-      disposition TEXT NOT NULL CHECK (disposition IN ('Upsert', 'Delete', 'Retract')),
-      value_json TEXT CHECK (value_json IS NULL OR json_valid(value_json)),
+      space_id ${text} NOT NULL,
+      client_id ${text} NOT NULL,
+      principal_digest ${text} NOT NULL CHECK (length(principal_digest) = 64),
+      view_id ${text} NOT NULL,
+      model ${text} NOT NULL,
+      model_version ${integer} NOT NULL CHECK (model_version > 0),
+      entity_key ${text} NOT NULL,
+      disposition ${text} NOT NULL CHECK (disposition IN ('Upsert', 'Delete', 'Retract')),
+      value_json ${text} CHECK (value_json IS NULL OR ${json("value_json")}),
       PRIMARY KEY (space_id, client_id, view_id, model, entity_key)
-    )`,
-    `CREATE TABLE effect_local_server_replication_pages (
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
-      view_id TEXT NOT NULL,
-      base_revision INTEGER NOT NULL CHECK (base_revision >= 0),
-      target_revision INTEGER NOT NULL CHECK (target_revision = base_revision + 1),
-      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
-      scope_json TEXT NOT NULL CHECK (json_valid(scope_json)),
-      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
-      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
-      changes_json TEXT NOT NULL CHECK (json_valid(changes_json)),
-      content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
-      digest TEXT NOT NULL CHECK (length(digest) = 64),
-      has_more INTEGER NOT NULL CHECK (has_more IN (0, 1)),
-      PRIMARY KEY (space_id, client_id)
-    )`,
-    `CREATE TABLE effect_local_server_scoped_snapshots (
-      snapshot_id TEXT PRIMARY KEY,
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      principal_digest TEXT NOT NULL CHECK (length(principal_digest) = 64),
-      definition_hash TEXT NOT NULL,
-      schema_version INTEGER NOT NULL,
-      schema_hash TEXT NOT NULL,
-      scope_json TEXT NOT NULL CHECK (json_valid(scope_json)),
-      scope_digest TEXT NOT NULL CHECK (length(scope_digest) = 64),
-      scope_generation INTEGER NOT NULL CHECK (scope_generation >= 0),
-      view_id TEXT NOT NULL,
-      view_revision INTEGER NOT NULL CHECK (view_revision >= 0),
-      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
-      terminal_sequence INTEGER NOT NULL CHECK (terminal_sequence >= 0),
-      entry_count INTEGER NOT NULL CHECK (entry_count >= 0),
-      content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
-      digest TEXT NOT NULL CHECK (length(digest) = 64),
-      UNIQUE (space_id, client_id)
-    )`,
-    `CREATE TABLE effect_local_server_scoped_snapshot_entries (
-      snapshot_id TEXT NOT NULL,
-      ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-      change_json TEXT NOT NULL CHECK (json_valid(change_json)),
-      entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
-      source_model TEXT NOT NULL,
-      source_model_version INTEGER NOT NULL CHECK (source_model_version > 0),
-      source_entity_key TEXT NOT NULL,
-      source_value_json TEXT NOT NULL CHECK (json_valid(source_value_json)),
-      PRIMARY KEY (snapshot_id, ordinal)
     )`,
     `CREATE INDEX effect_local_server_replication_view_entities_identity
       ON effect_local_server_replication_view_entities (space_id, client_id, model, entity_key)`,
+    `CREATE TABLE effect_local_server_replication_pages (
+      space_id ${text} NOT NULL,
+      client_id ${text} NOT NULL,
+      principal_digest ${text} NOT NULL CHECK (length(principal_digest) = 64),
+      view_id ${text} NOT NULL,
+      base_revision ${integer} NOT NULL CHECK (base_revision >= 0),
+      target_revision ${integer} NOT NULL CHECK (target_revision = base_revision + 1),
+      scope_generation ${integer} NOT NULL CHECK (scope_generation >= 0),
+      scope_json ${text} NOT NULL CHECK (${json("scope_json")}),
+      scope_digest ${text} NOT NULL CHECK (length(scope_digest) = 64),
+      server_sequence ${integer} NOT NULL CHECK (server_sequence >= 0),
+      changes_json ${text} NOT NULL CHECK (${json("changes_json")}),
+      content_bytes ${integer} NOT NULL CHECK (content_bytes >= 0),
+      digest ${text} NOT NULL CHECK (length(digest) = 64),
+      has_more ${flag} NOT NULL CHECK (has_more IN (0, 1)),
+      read_auth_epoch ${integer} NOT NULL CHECK (read_auth_epoch >= 0),
+      PRIMARY KEY (space_id, client_id)
+    )`,
+    `CREATE TABLE effect_local_server_scoped_snapshots (
+      snapshot_id ${text} PRIMARY KEY,
+      space_id ${text} NOT NULL,
+      client_id ${text} NOT NULL,
+      principal_digest ${text} NOT NULL CHECK (length(principal_digest) = 64),
+      definition_hash ${text} NOT NULL,
+      index_layout_hash ${text} NOT NULL,
+      schema_version ${integer} NOT NULL,
+      schema_hash ${text} NOT NULL,
+      scope_json ${text} NOT NULL CHECK (${json("scope_json")}),
+      scope_digest ${text} NOT NULL CHECK (length(scope_digest) = 64),
+      scope_generation ${integer} NOT NULL CHECK (scope_generation >= 0),
+      view_id ${text} NOT NULL,
+      view_revision ${integer} NOT NULL CHECK (view_revision >= 0),
+      server_sequence ${integer} NOT NULL CHECK (server_sequence >= 0),
+      terminal_sequence ${integer} NOT NULL CHECK (terminal_sequence >= 0),
+      entry_count ${integer} NOT NULL CHECK (entry_count >= 0),
+      content_bytes ${integer} NOT NULL CHECK (content_bytes >= 0),
+      digest ${text} NOT NULL CHECK (length(digest) = 64),
+      UNIQUE (space_id, client_id)
+    )`,
+    `CREATE TABLE effect_local_server_scoped_snapshot_entries (
+      snapshot_id ${text} NOT NULL,
+      ordinal ${integer} NOT NULL CHECK (ordinal >= 0),
+      change_json ${text} NOT NULL CHECK (${json("change_json")}),
+      entry_bytes ${integer} NOT NULL CHECK (entry_bytes > 0),
+      source_model ${text} NOT NULL,
+      source_model_version ${integer} NOT NULL CHECK (source_model_version > 0),
+      source_entity_key ${text} NOT NULL,
+      source_value_json ${text} NOT NULL CHECK (${json("source_value_json")}),
+      PRIMARY KEY (snapshot_id, ordinal)
+    )`,
     `CREATE INDEX effect_local_server_scoped_snapshot_entries_page
-      ON effect_local_server_scoped_snapshot_entries (snapshot_id, ordinal)`
+      ON effect_local_server_scoped_snapshot_entries (snapshot_id, ordinal)`,
+    `CREATE TABLE effect_local_server_index_catalog (
+      model ${text} NOT NULL,
+      index_name ${text} NOT NULL,
+      descriptor_hash ${text} NOT NULL,
+      table_name ${text} NOT NULL UNIQUE,
+      scan_index_name ${text} NOT NULL UNIQUE,
+      PRIMARY KEY (model, index_name, descriptor_hash)
+    )`,
+    `CREATE TABLE effect_local_server_index_state (
+      space_id ${text} NOT NULL,
+      schema_generation ${integer} NOT NULL CHECK (schema_generation >= 0),
+      descriptor_hash ${text} NOT NULL,
+      built ${flag} NOT NULL DEFAULT 0 CHECK (built IN (0, 1)),
+      PRIMARY KEY (space_id, schema_generation, descriptor_hash)
+    )`,
+    `CREATE TABLE effect_local_server_index_partition_log (
+      space_id ${text} NOT NULL,
+      schema_generation ${integer} NOT NULL CHECK (schema_generation >= 0),
+      server_sequence ${integer} NOT NULL CHECK (server_sequence >= 0),
+      descriptor_hash ${text} NOT NULL,
+      partition_json ${text} NOT NULL CHECK (${json("partition_json")}),
+      PRIMARY KEY (space_id, server_sequence, descriptor_hash, partition_json)
+    )`,
+    `CREATE TABLE effect_local_server_offline_wake_acknowledgements (
+      space_id ${text} NOT NULL,
+      client_id ${text} NOT NULL,
+      acknowledged_sequence ${integer} NOT NULL CHECK (acknowledged_sequence >= 0),
+      PRIMARY KEY (space_id, client_id)
+    )`,
+    `CREATE TABLE effect_local_server_offline_wake_spaces (
+      space_id ${text} PRIMARY KEY,
+      high_water_sequence ${integer} NOT NULL CHECK (high_water_sequence > 0),
+      expanded_sequence ${integer} NOT NULL DEFAULT 0
+        CHECK (expanded_sequence >= 0 AND expanded_sequence <= high_water_sequence),
+      membership_generation ${integer} NOT NULL DEFAULT 0 CHECK (membership_generation >= 0),
+      attempt_count ${integer} NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+      next_attempt_at ${integer} NOT NULL CHECK (next_attempt_at >= 0),
+      claim_token ${text},
+      claimed_until ${integer},
+      CHECK ((claim_token IS NULL AND claimed_until IS NULL) OR
+        (claim_token IS NOT NULL AND claimed_until IS NOT NULL AND claimed_until >= 0))
+    )`,
+    `CREATE INDEX effect_local_server_offline_wake_spaces_due
+      ON effect_local_server_offline_wake_spaces (next_attempt_at, space_id)
+      WHERE high_water_sequence > expanded_sequence`,
+    `CREATE TABLE effect_local_server_offline_wakes (
+      space_id ${text} NOT NULL,
+      client_id ${text} NOT NULL,
+      wake_id ${text} NOT NULL,
+      high_water_sequence ${integer} NOT NULL CHECK (high_water_sequence > 0),
+      notified_sequence ${integer} NOT NULL DEFAULT 0
+        CHECK (notified_sequence >= 0 AND notified_sequence <= high_water_sequence),
+      membership_generation ${integer} NOT NULL CHECK (membership_generation > 0),
+      attempt_count ${integer} NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+      next_attempt_at ${integer} NOT NULL CHECK (next_attempt_at >= 0),
+      claim_token ${text},
+      claimed_until ${integer},
+      PRIMARY KEY (space_id, client_id),
+      UNIQUE (wake_id),
+      CHECK ((claim_token IS NULL AND claimed_until IS NULL) OR
+        (claim_token IS NOT NULL AND claimed_until IS NOT NULL AND claimed_until >= 0))
+    )`,
+    `CREATE INDEX effect_local_server_offline_wakes_due
+      ON effect_local_server_offline_wakes (next_attempt_at, space_id, client_id)
+      WHERE high_water_sequence > notified_sequence`,
+    `CREATE TABLE effect_local_server_watch_runtimes (
+      runtime_id ${text} PRIMARY KEY,
+      expires_at ${integer} NOT NULL CHECK (expires_at >= 0)
+    )`,
+    `CREATE INDEX effect_local_server_watch_runtimes_expiry
+      ON effect_local_server_watch_runtimes (expires_at, runtime_id)`,
+    `CREATE TABLE effect_local_server_watch_presence (
+      space_id ${text} NOT NULL,
+      client_id ${text} NOT NULL,
+      watcher_id ${text} NOT NULL,
+      runtime_id ${text} NOT NULL,
+      PRIMARY KEY (space_id, client_id, watcher_id),
+      UNIQUE (runtime_id, watcher_id)
+    )`,
+    `CREATE INDEX effect_local_server_watch_presence_active
+      ON effect_local_server_watch_presence (space_id, client_id, runtime_id)`,
+    `CREATE INDEX effect_local_server_watch_presence_runtime
+      ON effect_local_server_watch_presence (runtime_id)`
   ]
-})
+}
 
-const serverV8 = makeMigration({
-  id: 8,
-  name: "membership-incarnation-lineage",
+const sqliteServerBaseline = makeMigration({
+  id: 1,
+  name: "server-baseline",
   statements: [
-    "DROP TRIGGER effect_local_count_history_insert",
-    "DROP TRIGGER effect_local_count_history_delete",
-    "DROP TRIGGER effect_local_count_receipt_insert",
-    "DROP TRIGGER effect_local_count_receipt_delete",
-    "DROP TRIGGER effect_local_require_current_receipt_writer",
-    "DROP TRIGGER effect_local_require_current_history_writer",
-    "ALTER TABLE effect_local_server_clients RENAME TO effect_local_server_clients_v7",
-    "ALTER TABLE effect_local_server_receipts RENAME TO effect_local_server_receipts_v7",
-    "ALTER TABLE effect_local_authoritative_log RENAME TO effect_local_authoritative_log_v7",
-    `CREATE TABLE effect_local_server_clients (
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      membership_incarnation TEXT NOT NULL,
-      last_local_sequence INTEGER NOT NULL,
-      expired_local_sequence INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (space_id, client_id, membership_incarnation)
-    )`,
-    `CREATE TABLE effect_local_server_receipts (
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      membership_incarnation TEXT NOT NULL,
-      local_sequence INTEGER NOT NULL,
-      mutation_id TEXT NOT NULL,
-      digest TEXT NOT NULL,
-      receipt_json TEXT NOT NULL,
-      digest_version INTEGER NOT NULL CHECK (digest_version = 3),
-      source_schema_version INTEGER,
-      source_schema_hash TEXT,
-      mutation_version INTEGER,
-      rejection_origin TEXT,
-      terminal_sequence INTEGER NOT NULL DEFAULT 0,
-      server_sequence INTEGER,
-      mutation_name TEXT,
-      PRIMARY KEY (space_id, client_id, membership_incarnation, local_sequence),
-      UNIQUE (space_id, mutation_id)
-    )`,
-    `CREATE TABLE effect_local_authoritative_log (
-      space_id TEXT NOT NULL,
-      server_sequence INTEGER NOT NULL,
-      mutation_id TEXT NOT NULL,
-      entry_bytes INTEGER NOT NULL CHECK (entry_bytes > 0),
-      entry_json TEXT NOT NULL,
-      source_schema_version INTEGER,
-      source_schema_hash TEXT,
-      mutation_version INTEGER,
-      client_id TEXT NOT NULL,
-      local_sequence INTEGER NOT NULL,
-      digest TEXT NOT NULL,
-      membership_incarnation TEXT NOT NULL,
-      PRIMARY KEY (space_id, server_sequence),
-      UNIQUE (space_id, mutation_id)
-    )`,
-    "DROP TABLE effect_local_server_clients_v7",
-    "DROP TABLE effect_local_server_receipts_v7",
-    "DROP TABLE effect_local_authoritative_log_v7",
-    `CREATE INDEX effect_local_server_history_terminal
-      ON effect_local_authoritative_log (space_id, server_sequence, mutation_id)`,
-    `CREATE INDEX effect_local_server_receipts_terminal
-      ON effect_local_server_receipts
-        (space_id, terminal_sequence, client_id, membership_incarnation, local_sequence)`,
+    ...serverTables({
+      text: "TEXT",
+      integer: "INTEGER",
+      flag: "INTEGER",
+      json: (column) => `json_valid(${column})`
+    }),
     `CREATE TRIGGER effect_local_count_history_insert AFTER INSERT ON effect_local_authoritative_log
       BEGIN
         UPDATE effect_local_server_spaces SET retained_history_count = retained_history_count + 1
@@ -1593,178 +944,102 @@ const serverV8 = makeMigration({
         UPDATE effect_local_server_space_counts SET receipt_count = receipt_count - 1
           WHERE space_id = OLD.space_id;
       END`,
-    `CREATE TRIGGER effect_local_require_current_receipt_writer
-      BEFORE INSERT ON effect_local_server_receipts
-      WHEN NEW.terminal_sequence = 0
-      BEGIN SELECT RAISE(ABORT, 'effect-local server writer upgrade required'); END`,
-    `CREATE TRIGGER effect_local_require_current_history_writer
-      BEFORE INSERT ON effect_local_authoritative_log
-      WHEN NEW.client_id = '' OR NEW.local_sequence = 0 OR NEW.digest = ''
-      BEGIN SELECT RAISE(ABORT, 'effect-local server writer upgrade required'); END`
+    `CREATE TRIGGER effect_local_server_entity_count_insert AFTER INSERT ON effect_local_server_entities_data
+      WHEN NEW.generation = (SELECT active_schema_generation FROM effect_local_server_spaces
+        WHERE space_id = NEW.space_id) BEGIN
+      UPDATE effect_local_server_spaces SET entity_count = entity_count + 1,
+        entity_bytes = entity_bytes + NEW.entity_bytes WHERE space_id = NEW.space_id; END`,
+    `CREATE TRIGGER effect_local_server_entity_count_delete AFTER DELETE ON effect_local_server_entities_data
+      WHEN OLD.generation = (SELECT active_schema_generation FROM effect_local_server_spaces
+        WHERE space_id = OLD.space_id) BEGIN
+      UPDATE effect_local_server_spaces SET entity_count = entity_count - 1,
+        entity_bytes = entity_bytes - OLD.entity_bytes WHERE space_id = OLD.space_id; END`,
+    `CREATE TRIGGER effect_local_server_entity_count_update AFTER UPDATE OF entity_bytes
+      ON effect_local_server_entities_data
+      WHEN NEW.generation = OLD.generation AND NEW.space_id = OLD.space_id AND
+        NEW.generation = (SELECT active_schema_generation FROM effect_local_server_spaces
+          WHERE space_id = NEW.space_id) BEGIN
+      UPDATE effect_local_server_spaces SET entity_bytes = entity_bytes + NEW.entity_bytes - OLD.entity_bytes
+        WHERE space_id = NEW.space_id; END`
   ]
 })
 
-const serverV9 = makeMigration({
-  id: 9,
-  name: "snapshot-schema-projections",
+export const serverCatalog = Object.freeze([sqliteServerBaseline])
+
+const postgresBaseline = makeMigration({
+  id: 1,
+  name: "postgres-baseline",
   statements: [
-    `CREATE TABLE effect_local_server_snapshot_projections (
-      space_id TEXT NOT NULL,
-      snapshot_id TEXT NOT NULL,
-      target_schema_version INTEGER NOT NULL,
-      target_schema_hash TEXT NOT NULL,
-      definition_hash TEXT NOT NULL,
-      entity_count INTEGER NOT NULL CHECK (entity_count >= 0),
-      content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
-      digest TEXT NOT NULL,
-      PRIMARY KEY (space_id, snapshot_id, target_schema_version, target_schema_hash)
-    )`,
-    `CREATE TABLE effect_local_server_snapshot_projection_entities (
-      space_id TEXT NOT NULL,
-      snapshot_id TEXT NOT NULL,
-      target_schema_version INTEGER NOT NULL,
-      target_schema_hash TEXT NOT NULL,
-      ordinal INTEGER NOT NULL,
-      model TEXT NOT NULL,
-      model_version INTEGER NOT NULL,
-      entity_key TEXT NOT NULL,
-      wire_json TEXT NOT NULL,
-      wire_bytes INTEGER NOT NULL CHECK (wire_bytes > 0),
-      PRIMARY KEY (space_id, snapshot_id, target_schema_version, target_schema_hash, ordinal),
-      UNIQUE (space_id, snapshot_id, target_schema_version, target_schema_hash, model, entity_key)
-    )`,
-    `CREATE TRIGGER effect_local_delete_snapshot_projections AFTER DELETE ON effect_local_server_snapshots BEGIN
-      DELETE FROM effect_local_server_snapshot_projection_entities
-        WHERE space_id = OLD.space_id AND snapshot_id = OLD.snapshot_id;
-      DELETE FROM effect_local_server_snapshot_projections
-        WHERE space_id = OLD.space_id AND snapshot_id = OLD.snapshot_id;
-    END`
+    ...serverTables({
+      text: "TEXT COLLATE \"C\"",
+      integer: "BIGINT",
+      flag: "SMALLINT",
+      json: (column) => `${column} IS JSON`
+    }),
+    `CREATE FUNCTION effect_local_count_history() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF TG_OP = 'INSERT' THEN
+          UPDATE effect_local_server_spaces SET retained_history_count = retained_history_count + 1
+            WHERE space_id = NEW.space_id;
+          UPDATE effect_local_server_space_counts SET history_count = history_count + 1
+            WHERE space_id = NEW.space_id;
+          RETURN NEW;
+        END IF;
+        UPDATE effect_local_server_spaces SET retained_history_count = retained_history_count - 1
+          WHERE space_id = OLD.space_id;
+        UPDATE effect_local_server_space_counts SET history_count = history_count - 1
+          WHERE space_id = OLD.space_id;
+        RETURN OLD;
+      END
+    $$`,
+    `CREATE TRIGGER effect_local_count_history AFTER INSERT OR DELETE ON effect_local_authoritative_log
+      FOR EACH ROW EXECUTE FUNCTION effect_local_count_history()`,
+    `CREATE FUNCTION effect_local_count_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF TG_OP = 'INSERT' THEN
+          UPDATE effect_local_server_spaces SET retained_receipt_count = retained_receipt_count + 1
+            WHERE space_id = NEW.space_id;
+          UPDATE effect_local_server_space_counts SET receipt_count = receipt_count + 1
+            WHERE space_id = NEW.space_id;
+          RETURN NEW;
+        END IF;
+        UPDATE effect_local_server_spaces SET retained_receipt_count = retained_receipt_count - 1
+          WHERE space_id = OLD.space_id;
+        UPDATE effect_local_server_space_counts SET receipt_count = receipt_count - 1
+          WHERE space_id = OLD.space_id;
+        RETURN OLD;
+      END
+    $$`,
+    `CREATE TRIGGER effect_local_count_receipt AFTER INSERT OR DELETE ON effect_local_server_receipts
+      FOR EACH ROW EXECUTE FUNCTION effect_local_count_receipt()`,
+    `CREATE FUNCTION effect_local_server_entity_count() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN
+        IF TG_OP = 'INSERT' THEN
+          UPDATE effect_local_server_spaces SET entity_count = entity_count + 1,
+            entity_bytes = entity_bytes + NEW.entity_bytes
+            WHERE space_id = NEW.space_id AND active_schema_generation = NEW.generation;
+          RETURN NEW;
+        END IF;
+        IF TG_OP = 'DELETE' THEN
+          UPDATE effect_local_server_spaces SET entity_count = entity_count - 1,
+            entity_bytes = entity_bytes - OLD.entity_bytes
+            WHERE space_id = OLD.space_id AND active_schema_generation = OLD.generation;
+          RETURN OLD;
+        END IF;
+        IF NEW.generation = OLD.generation AND NEW.space_id = OLD.space_id THEN
+          UPDATE effect_local_server_spaces SET entity_bytes = entity_bytes + NEW.entity_bytes - OLD.entity_bytes
+            WHERE space_id = NEW.space_id AND active_schema_generation = NEW.generation;
+        END IF;
+        RETURN NEW;
+      END
+    $$`,
+    `CREATE TRIGGER effect_local_server_entity_count
+      AFTER INSERT OR DELETE OR UPDATE OF entity_bytes ON effect_local_server_entities_data
+      FOR EACH ROW EXECUTE FUNCTION effect_local_server_entity_count()`
   ]
 })
 
-const serverV10 = makeMigration({
-  id: 10,
-  name: "server-secondary-indexes",
-  statements: [
-    `CREATE TABLE effect_local_server_index_catalog (
-      model TEXT NOT NULL,
-      index_name TEXT NOT NULL,
-      descriptor_hash TEXT NOT NULL,
-      table_name TEXT NOT NULL UNIQUE,
-      scan_index_name TEXT NOT NULL UNIQUE,
-      PRIMARY KEY (model, index_name, descriptor_hash)
-    )`,
-    `CREATE TABLE effect_local_server_index_state (
-      space_id TEXT NOT NULL,
-      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
-      descriptor_hash TEXT NOT NULL,
-      built INTEGER NOT NULL DEFAULT 0 CHECK (built IN (0, 1)),
-      PRIMARY KEY (space_id, schema_generation, descriptor_hash)
-    )`,
-    `CREATE TABLE effect_local_server_index_partition_log (
-      space_id TEXT NOT NULL,
-      schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
-      server_sequence INTEGER NOT NULL CHECK (server_sequence >= 0),
-      descriptor_hash TEXT NOT NULL,
-      partition_json TEXT NOT NULL CHECK (json_valid(partition_json)),
-      PRIMARY KEY (space_id, server_sequence, descriptor_hash, partition_json)
-    )`
-  ]
-})
-
-const serverV11 = makeMigration({
-  id: 11,
-  name: "scoped-replication-fences",
-  statements: [
-    "ALTER TABLE effect_local_server_spaces ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)",
-    "ALTER TABLE effect_local_server_replication_views ADD COLUMN delivered_sequence INTEGER NOT NULL DEFAULT 0 CHECK (delivered_sequence >= 0)",
-    "UPDATE effect_local_server_replication_views SET delivered_sequence = server_sequence",
-    "ALTER TABLE effect_local_server_replication_views ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)",
-    "ALTER TABLE effect_local_server_replication_pages ADD COLUMN read_auth_epoch INTEGER NOT NULL DEFAULT 0 CHECK (read_auth_epoch >= 0)",
-    "ALTER TABLE effect_local_server_replication_views ADD COLUMN index_layout_hash TEXT NOT NULL DEFAULT ''",
-    "ALTER TABLE effect_local_server_scoped_snapshots ADD COLUMN index_layout_hash TEXT NOT NULL DEFAULT ''"
-  ]
-})
-
-const serverV12 = makeMigration({
-  id: 12,
-  name: "durable-offline-wakes",
-  statements: [
-    `CREATE TABLE effect_local_server_offline_wake_acknowledgements (
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      acknowledged_sequence INTEGER NOT NULL CHECK (acknowledged_sequence >= 0),
-      PRIMARY KEY (space_id, client_id)
-    )`,
-    `CREATE TABLE effect_local_server_offline_wake_spaces (
-      space_id TEXT PRIMARY KEY,
-      high_water_sequence INTEGER NOT NULL CHECK (high_water_sequence > 0),
-      expanded_sequence INTEGER NOT NULL DEFAULT 0 CHECK (expanded_sequence >= 0 AND expanded_sequence <= high_water_sequence),
-      membership_generation INTEGER NOT NULL DEFAULT 0 CHECK (membership_generation >= 0),
-      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-      next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
-      claim_token TEXT,
-      claimed_until INTEGER,
-      CHECK ((claim_token IS NULL AND claimed_until IS NULL) OR
-        (claim_token IS NOT NULL AND claimed_until IS NOT NULL AND claimed_until >= 0))
-    )`,
-    `CREATE INDEX effect_local_server_offline_wake_spaces_due
-      ON effect_local_server_offline_wake_spaces (next_attempt_at, space_id)
-      WHERE high_water_sequence > expanded_sequence`,
-    `CREATE TABLE effect_local_server_offline_wakes (
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      wake_id TEXT NOT NULL,
-      high_water_sequence INTEGER NOT NULL CHECK (high_water_sequence > 0),
-      notified_sequence INTEGER NOT NULL DEFAULT 0 CHECK (notified_sequence >= 0 AND notified_sequence <= high_water_sequence),
-      membership_generation INTEGER NOT NULL CHECK (membership_generation > 0),
-      attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-      next_attempt_at INTEGER NOT NULL CHECK (next_attempt_at >= 0),
-      claim_token TEXT,
-      claimed_until INTEGER,
-      PRIMARY KEY (space_id, client_id),
-      UNIQUE (wake_id),
-      CHECK ((claim_token IS NULL AND claimed_until IS NULL) OR
-        (claim_token IS NOT NULL AND claimed_until IS NOT NULL AND claimed_until >= 0))
-    )`,
-    `CREATE INDEX effect_local_server_offline_wakes_due
-      ON effect_local_server_offline_wakes (next_attempt_at, space_id, client_id)
-      WHERE high_water_sequence > notified_sequence`,
-    `CREATE TABLE effect_local_server_watch_runtimes (
-      runtime_id TEXT PRIMARY KEY,
-      expires_at INTEGER NOT NULL CHECK (expires_at >= 0)
-    )`,
-    `CREATE INDEX effect_local_server_watch_runtimes_expiry
-      ON effect_local_server_watch_runtimes (expires_at, runtime_id)`,
-    `CREATE TABLE effect_local_server_watch_presence (
-      space_id TEXT NOT NULL,
-      client_id TEXT NOT NULL,
-      watcher_id TEXT NOT NULL,
-      runtime_id TEXT NOT NULL,
-      PRIMARY KEY (space_id, client_id, watcher_id),
-      UNIQUE (runtime_id, watcher_id)
-    )`,
-    `CREATE INDEX effect_local_server_watch_presence_active
-      ON effect_local_server_watch_presence (space_id, client_id, runtime_id)`,
-    `CREATE INDEX effect_local_server_watch_presence_runtime
-      ON effect_local_server_watch_presence (runtime_id)`
-  ]
-})
-
-export const serverCatalog = Object.freeze([
-  serverV1,
-  serverV2,
-  serverV3,
-  serverV4,
-  serverV5,
-  serverV6,
-  serverV7,
-  serverV8,
-  serverV9,
-  serverV10,
-  serverV11,
-  serverV12
-])
+export const serverPostgresCatalog = Object.freeze([postgresBaseline])
 
 export const client = Effect.fnUntraced(function*(options: {
   readonly definition: Definition.Any
@@ -1773,34 +1048,41 @@ export const client = Effect.fnUntraced(function*(options: {
   readonly migration?: Options
 }) {
   const sql = yield* SqlClient.SqlClient
-  yield* sql.unsafe("PRAGMA foreign_keys = ON")
-  const pragma = yield* SqlSchema.findOne({
-    Request: Schema.Void,
-    Result: PragmaEnabledRow,
-    execute: () => sql`PRAGMA foreign_keys`
-  })(undefined).pipe(Effect.mapError((cause) => {
+  const lane = yield* ConnectionLane.ConnectionLane
+  yield* lane.withStatement(sql.unsafe("PRAGMA foreign_keys = ON"))
+  const pragma = yield* lane.withStatement(
+    SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: PragmaEnabledRow,
+      execute: () => sql`PRAGMA foreign_keys`
+    })(undefined)
+  ).pipe(Effect.mapError((cause) => {
     if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
     return new ReplicaError.StorageCorrupt({ message: "SQLite foreign key state is unreadable", cause })
   }))
   if (pragma.foreign_keys !== 1) {
     return yield* new ReplicaError.StorageCorrupt({ message: "SQLite foreign keys could not be enabled" })
   }
-  const metaExists = yield* SqlSchema.findOne({
-    Request: Schema.Void,
-    Result: CountRow,
-    execute: () =>
-      sql`SELECT COUNT(*) AS count FROM sqlite_master
+  const metaExists = yield* lane.withStatement(
+    SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: CountRow,
+      execute: () =>
+        sql`SELECT COUNT(*) AS count FROM sqlite_master
         WHERE type = 'table' AND name = 'effect_local_client_meta'`
-  })(undefined).pipe(Effect.mapError((cause) => {
+    })(undefined)
+  ).pipe(Effect.mapError((cause) => {
     if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
     return new ReplicaError.StorageCorrupt({ message: "Client metadata catalog is unreadable", cause })
   }))
   if (metaExists.count !== 0) {
-    const beforeMigration = yield* SqlSchema.findOneOption({
-      Request: Schema.Void,
-      Result: ClientIdentityRow,
-      execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
-    })(undefined).pipe(Effect.mapError((cause) => {
+    const beforeMigration = yield* lane.withStatement(
+      SqlSchema.findOneOption({
+        Request: Schema.Void,
+        Result: ClientIdentityRow,
+        execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
+      })(undefined)
+    ).pipe(Effect.mapError((cause) => {
       if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
       return new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
     }))
@@ -1811,12 +1093,14 @@ export const client = Effect.fnUntraced(function*(options: {
       })
     }
   }
-  yield* runCatalog("Client", clientCatalog, options.migration)
-  const existing = yield* SqlSchema.findOneOption({
-    Request: Schema.Void,
-    Result: ClientIdentityRow,
-    execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
-  })(undefined).pipe(
+  yield* runCatalogWith(lane, "Client", clientCatalog, options.migration ?? defaultOptions)
+  const existing = yield* lane.withStatement(
+    SqlSchema.findOneOption({
+      Request: Schema.Void,
+      Result: ClientIdentityRow,
+      execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
+    })(undefined)
+  ).pipe(
     Effect.mapError((cause) => {
       if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
       return new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
@@ -1828,11 +1112,11 @@ export const client = Effect.fnUntraced(function*(options: {
       actualClientId: existing.value.client_id
     })
   }
-  yield* sql`INSERT INTO effect_local_client_meta
+  yield* lane.withStatement(sql`INSERT INTO effect_local_client_meta
     (singleton, client_id) VALUES (1, ${options.clientId})
-    ON CONFLICT (singleton) DO NOTHING`
+    ON CONFLICT (singleton) DO NOTHING`)
   if (options.spaceId !== undefined) {
-    yield* sql`INSERT INTO effect_local_client_spaces
+    yield* lane.withStatement(sql`INSERT INTO effect_local_client_spaces
         (space_id, membership_incarnation, definition_hash, schema_version, schema_hash, schema_generation,
           active_schema_generation, active_projection_generation, projection_schema_generation,
           next_local_sequence, server_cursor, visible_revision, requested_generation, completed_generation,
@@ -1844,9 +1128,13 @@ export const client = Effect.fnUntraced(function*(options: {
             lower(hex(randomblob(6)))), ${options.definition.hash},
           ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash}, 0, 0, 0, 0,
           1, 0, 0, 0, 0, 0, 0)
-        ON CONFLICT (space_id) DO NOTHING`
+        ON CONFLICT (space_id) DO NOTHING`)
   }
   return undefined
 }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
-export const server = (options: Options = defaultOptions) => runCatalog("Server", serverCatalog, options)
+export const server = Effect.fnUntraced(function*(options: Options = defaultOptions) {
+  const dialect = yield* Dialect.make(yield* SqlClient.SqlClient)
+  if (dialect.name === "pg") return yield* runCatalog("Server", serverPostgresCatalog, options)
+  return yield* runCatalog("Server", serverCatalog, options)
+})

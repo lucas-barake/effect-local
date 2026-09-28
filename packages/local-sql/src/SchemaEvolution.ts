@@ -10,8 +10,11 @@ import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as ConnectionLane from "./ConnectionLane.js"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as Codec from "./internal/codec.js"
+import * as Dialect from "./internal/dialect.js"
+import * as Rows from "./internal/rows.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as TerminalRejection from "./internal/TerminalRejection.js"
 import * as SqlTransaction from "./internal/transaction.js"
@@ -36,8 +39,8 @@ const EvolutionPhase = Schema.Literals([
 
 const MetaRow = Schema.Struct({
   definition_hash: Schema.String,
-  schema_version: NullableSchemaVersion,
-  schema_hash: NullableSchemaHash,
+  schema_version: Identity.SchemaVersion,
+  schema_hash: Identity.SchemaHash,
   schema_generation: NonNegativeInt,
   active_schema_generation: NonNegativeInt,
   active_projection_generation: NonNegativeInt.pipe(Schema.withDecodingDefaultKey(Effect.succeed(0))),
@@ -64,7 +67,7 @@ const ProgressRow = Schema.Struct({
 
 const EntityBatchRow = Schema.Struct({
   model: Schema.String,
-  model_version: NullableSchemaVersion,
+  model_version: Rows.integer(Identity.SchemaVersion),
   entity_key: Schema.String,
   value_json: Schema.String
 })
@@ -76,21 +79,21 @@ const RetractionBatchRow = Schema.Struct({
 })
 
 const LogBatchRow = Schema.Struct({
-  server_sequence: Identity.ServerSequence,
+  server_sequence: Rows.integer(Identity.ServerSequence),
   mutation_id: Identity.MutationId,
   entry_json: Schema.String,
-  source_schema_version: NullableSchemaVersion,
-  source_schema_hash: NullableSchemaHash
+  source_schema_version: Rows.integer(Identity.SchemaVersion),
+  source_schema_hash: Identity.SchemaHash
 })
 
 const ServerReceiptBatchRow = Schema.Struct({
   mutation_id: Identity.MutationId,
-  local_sequence: Identity.LocalSequence,
+  local_sequence: Rows.integer(Identity.LocalSequence),
   receipt_json: Schema.String,
-  source_schema_version: NullableSchemaVersion,
-  source_schema_hash: NullableSchemaHash,
-  mutation_version: NullableSchemaVersion,
-  mutation_name: Schema.NullOr(Schema.String),
+  source_schema_version: Rows.integer(Identity.SchemaVersion),
+  source_schema_hash: Identity.SchemaHash,
+  mutation_version: Rows.integer(Identity.SchemaVersion),
+  mutation_name: Schema.String,
   rejection_origin: Schema.NullOr(Protocol.RejectionOrigin)
 })
 
@@ -110,9 +113,9 @@ const PendingBatchRow = Schema.Struct({
   payload_json: Schema.String,
   digest: Protocol.MutationDigest,
   digest_version: Protocol.MutationDigestVersion,
-  source_schema_version: NullableSchemaVersion,
-  source_schema_hash: NullableSchemaHash,
-  mutation_version: NullableSchemaVersion,
+  source_schema_version: Identity.SchemaVersion,
+  source_schema_hash: Identity.SchemaHash,
+  mutation_version: Identity.SchemaVersion,
   optimistic_result_json: Schema.String,
   changes_json: Schema.String,
   submission_state: Protocol.SubmissionState,
@@ -121,8 +124,8 @@ const PendingBatchRow = Schema.Struct({
 })
 
 const SequenceBytesRow = Schema.Struct({
-  server_sequence: Identity.ServerSequence,
-  row_bytes: NonNegativeInt
+  server_sequence: Rows.integer(Identity.ServerSequence),
+  row_bytes: Rows.integer(NonNegativeInt)
 })
 const LocalSequenceBytesRow = Schema.Struct({
   local_sequence: Identity.LocalSequence,
@@ -131,13 +134,9 @@ const LocalSequenceBytesRow = Schema.Struct({
 const EntityBytesRow = Schema.Struct({
   model: Schema.String,
   entity_key: Schema.String,
-  row_bytes: NonNegativeInt
+  row_bytes: Rows.integer(NonNegativeInt)
 })
-const KeyBytesRow = Schema.Struct({
-  mutation_id: Identity.MutationId,
-  row_bytes: NonNegativeInt
-})
-const CountRow = Schema.Struct({ count: NonNegativeInt })
+const CountRow = Schema.Struct({ count: Rows.integer(NonNegativeInt) })
 
 const boundedCount = (
   rows: ReadonlyArray<{ readonly row_bytes: number }>,
@@ -163,36 +162,6 @@ const boundedCount = (
 }
 
 const LineageRow = Schema.Struct({ lineage_id: Schema.String })
-
-const LegacyEntityKey = Schema.Struct({ model: Schema.String, key: Schema.Json })
-const LegacyUpsert = Schema.TaggedStruct("Upsert", { entity: LegacyEntityKey, value: Schema.Json })
-const LegacyDelete = Schema.TaggedStruct("Delete", { entity: LegacyEntityKey })
-const LegacyEntityChange = Schema.Union([LegacyUpsert, LegacyDelete])
-const LegacyAcceptedMutation = Schema.Struct({
-  sequence: Identity.ServerSequence,
-  spaceId: Identity.SpaceId,
-  clientId: Identity.ClientId,
-  mutationId: Identity.MutationId,
-  localSequence: Identity.LocalSequence,
-  digest: Protocol.MutationDigest,
-  changes: Schema.Array(LegacyEntityChange)
-})
-const LegacyAcceptedReceipt = Schema.TaggedStruct("Accepted", {
-  spaceId: Identity.SpaceId,
-  clientId: Identity.ClientId,
-  mutationId: Identity.MutationId,
-  localSequence: Identity.LocalSequence,
-  serverSequence: Identity.ServerSequence,
-  result: Schema.Json
-})
-const LegacyRejectedReceipt = Schema.TaggedStruct("Rejected", {
-  spaceId: Identity.SpaceId,
-  clientId: Identity.ClientId,
-  mutationId: Identity.MutationId,
-  localSequence: Identity.LocalSequence,
-  rejection: Schema.Json
-})
-const LegacyReceipt = Schema.Union([LegacyAcceptedReceipt, LegacyRejectedReceipt])
 
 const sameIdentity = (left: Identity.SchemaIdentity, right: Identity.SchemaIdentity): boolean =>
   left.version === right.version && left.hash === right.hash
@@ -253,10 +222,7 @@ const migrateEntityChange = (
 }
 
 const protocolReceiptMetadata = (receipt: Protocol.Receipt) => {
-  if (receipt._tag === "Legacy") {
-    return { mutationVersion: null, mutationName: null, rejectionOrigin: "Legacy" }
-  }
-  let rejectionOrigin: string | null = null
+  let rejectionOrigin: Protocol.RejectionOrigin | null = null
   if (receipt._tag === "Rejected") rejectionOrigin = receipt.origin
   return {
     mutationVersion: receipt.mutationVersion,
@@ -283,152 +249,42 @@ const sourceDefinition = (
   return Effect.succeed(definition)
 }
 
-const resolveInitialSource = (
-  meta: Pick<typeof MetaRow.Type, "definition_hash" | "schema_version" | "schema_hash">,
-  evolution: Evolution.Evolution
-): Effect.Effect<
-  { readonly identity: Identity.SchemaIdentity; readonly legacy: boolean },
-  ReplicaError.ReplicaError
-> => {
-  if (meta.schema_version !== null || meta.schema_hash !== null) {
-    if (meta.schema_version === null || meta.schema_hash === null) {
-      return Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client schema identity is partially stored" }))
-    }
-    return sourceDefinition(evolution, identityFrom(meta.schema_version, meta.schema_hash)).pipe(
-      Effect.map((definition) => ({ identity: definition.schemaIdentity, legacy: false }))
-    )
-  }
-  if (meta.definition_hash === evolution.current.hash) {
-    return Effect.succeed({ identity: evolution.current.schemaIdentity, legacy: true })
-  }
-  const baseline = evolution.legacyBaselineByHash.get(meta.definition_hash)
-  if (baseline === undefined) {
-    return Effect.fail(
-      new ReplicaError.DefinitionMismatch({
-        expected: Array.from(evolution.legacyBaselineByHash.keys()).concat(evolution.current.hash).join(","),
-        actual: meta.definition_hash
-      })
-    )
-  }
-  return Effect.succeed({ identity: baseline.definition.schemaIdentity, legacy: true })
-}
-
-const currentOrLegacyEntry = Effect.fnUntraced(function*(
-  row: typeof LogBatchRow.Type,
-  source: Identity.SchemaIdentity,
-  definition: Definition.Any
-) {
-  const parsed = yield* Codec.parse(row.entry_json)
-  const current = yield* Codec.decode(Protocol.AcceptedMutation, parsed).pipe(Effect.result)
-  if (Result.isSuccess(current)) {
-    const entry = current.success
-    const incompleteSource = (row.source_schema_version === null) !== (row.source_schema_hash === null)
-    if (
-      entry.sequence !== row.server_sequence || entry.mutationId !== row.mutation_id || incompleteSource ||
-      (row.source_schema_version !== null && row.source_schema_version !== entry.sourceSchema.version) ||
-      (row.source_schema_hash !== null && row.source_schema_hash !== entry.sourceSchema.hash)
-    ) {
-      return yield* new ReplicaError.StorageCorrupt({
-        message: `Accepted entry ${row.server_sequence} conflicts with its durable metadata`
-      })
-    }
-    return entry
-  }
-  const legacy = yield* Codec.decode(LegacyAcceptedMutation, parsed)
-  const incompleteSource = (row.source_schema_version === null) !== (row.source_schema_hash === null)
+const acceptedEntry = Effect.fnUntraced(function*(row: typeof LogBatchRow.Type) {
+  const entry = yield* decodeJson(Protocol.AcceptedMutation, row.entry_json)
   if (
-    legacy.sequence !== row.server_sequence || legacy.mutationId !== row.mutation_id || incompleteSource ||
-    (row.source_schema_version !== null && row.source_schema_version !== source.version) ||
-    (row.source_schema_hash !== null && row.source_schema_hash !== source.hash)
+    entry.sequence !== row.server_sequence || entry.mutationId !== row.mutation_id ||
+    row.source_schema_version !== entry.sourceSchema.version || row.source_schema_hash !== entry.sourceSchema.hash
   ) {
     return yield* new ReplicaError.StorageCorrupt({
-      message: `Legacy accepted entry ${row.server_sequence} conflicts with its durable metadata`
+      message: `Accepted entry ${row.server_sequence} conflicts with its durable metadata`
     })
   }
-  const changes: Array<Protocol.EntityChange> = []
-  for (const change of legacy.changes) {
-    const model = definition.modelByName.get(change.entity.model)
-    if (model === undefined) {
-      return yield* new ReplicaError.StorageCorrupt({
-        message: `Legacy log entry references unknown model ${change.entity.model}`
-      })
-    }
-    if (change._tag === "Delete") {
-      changes.push({ _tag: "Delete", entity: { ...change.entity, modelVersion: model.version } })
-    } else {
-      changes.push({ _tag: "Upsert", entity: { ...change.entity, modelVersion: model.version }, value: change.value })
-    }
-  }
-  return {
-    sequence: legacy.sequence,
-    spaceId: legacy.spaceId,
-    clientId: legacy.clientId,
-    membershipIncarnation: Identity.legacyMembershipIncarnation,
-    mutationId: legacy.mutationId,
-    localSequence: legacy.localSequence,
-    sourceSchema: source,
-    digest: legacy.digest,
-    changes
-  }
+  return entry
 })
 
-const currentOrLegacyReceipt = Effect.fnUntraced(function*(
-  row: typeof ServerReceiptBatchRow.Type,
-  source: Identity.SchemaIdentity
-) {
-  const parsed = yield* Codec.parse(row.receipt_json)
-  const current = yield* Codec.decode(Protocol.Receipt, parsed).pipe(Effect.result)
-  if (Result.isSuccess(current)) {
-    const receipt = current.success
-    const incompleteSource = (row.source_schema_version === null) !== (row.source_schema_hash === null)
-    const expected = protocolReceiptMetadata(receipt)
-    if (
-      receipt.mutationId !== row.mutation_id || receipt.localSequence !== row.local_sequence || incompleteSource ||
-      (row.source_schema_version !== null && row.source_schema_version !== receipt.sourceSchema.version) ||
-      (row.source_schema_hash !== null && row.source_schema_hash !== receipt.sourceSchema.hash) ||
-      (row.mutation_version !== null && row.mutation_version !== expected.mutationVersion) ||
-      (row.mutation_name !== null && row.mutation_name !== expected.mutationName) ||
-      (row.rejection_origin !== null && row.rejection_origin !== expected.rejectionOrigin)
-    ) {
-      return yield* new ReplicaError.StorageCorrupt({
-        message: `Receipt ${row.mutation_id} conflicts with its durable metadata`
-      })
-    }
-    return receipt
-  }
-  const legacy = yield* Codec.decode(LegacyReceipt, parsed)
-  const incompleteSource = (row.source_schema_version === null) !== (row.source_schema_hash === null)
+const storedReceipt = Effect.fnUntraced(function*(row: typeof ServerReceiptBatchRow.Type) {
+  const receipt = yield* decodeJson(Protocol.Receipt, row.receipt_json)
+  const expected = protocolReceiptMetadata(receipt)
   if (
-    legacy.mutationId !== row.mutation_id || legacy.localSequence !== row.local_sequence || incompleteSource ||
-    (row.source_schema_version !== null && row.source_schema_version !== source.version) ||
-    (row.source_schema_hash !== null && row.source_schema_hash !== source.hash) ||
-    row.mutation_version !== null || row.mutation_name !== null ||
-    (row.rejection_origin !== null && row.rejection_origin !== "Legacy")
+    receipt.mutationId !== row.mutation_id || receipt.localSequence !== row.local_sequence ||
+    row.source_schema_version !== receipt.sourceSchema.version ||
+    row.source_schema_hash !== receipt.sourceSchema.hash ||
+    row.mutation_version !== expected.mutationVersion ||
+    row.mutation_name !== expected.mutationName ||
+    row.rejection_origin !== expected.rejectionOrigin
   ) {
     return yield* new ReplicaError.StorageCorrupt({
-      message: `Legacy receipt ${row.mutation_id} conflicts with its durable metadata`
+      message: `Receipt ${row.mutation_id} conflicts with its durable metadata`
     })
   }
-  let serverSequence: Identity.ServerSequence | null = null
-  if (legacy._tag === "Accepted") serverSequence = legacy.serverSequence
-  return Protocol.LegacyReceipt.make({
-    spaceId: legacy.spaceId,
-    clientId: legacy.clientId,
-    membershipIncarnation: Identity.legacyMembershipIncarnation,
-    mutationId: legacy.mutationId,
-    localSequence: legacy.localSequence,
-    sourceSchema: source,
-    outcome: legacy._tag,
-    serverSequence,
-    body: yield* Codec.decode(Schema.Json, parsed)
-  })
+  return receipt
 })
 
 export const migrateReceipt = Effect.fnUntraced(function*(
   receipt: Protocol.Receipt,
   evolution: Evolution.Evolution
 ) {
-  if (receipt._tag === "Legacy" || receipt._tag === "Expired") return receipt
+  if (receipt._tag === "Expired") return receipt
   const target = evolution.current.mutationByName.get(receipt.name)
   if (target === undefined) {
     return yield* new ReplicaError.SchemaEvolutionUnsupported({
@@ -477,21 +333,8 @@ export const migrateReceipt = Effect.fnUntraced(function*(
 
 const pendingEnvelope = Effect.fnUntraced(function*(
   row: typeof PendingBatchRow.Type,
-  options: ClientOptions,
-  source: Identity.SchemaIdentity,
-  definition: Definition.Any
+  options: ClientOptions
 ) {
-  const mutation = definition.mutationByName.get(row.name)
-  let rowSource = source
-  if (row.source_schema_version !== null && row.source_schema_hash !== null) {
-    rowSource = identityFrom(row.source_schema_version, row.source_schema_hash)
-  }
-  const version = row.mutation_version ?? mutation?.version
-  if (version === undefined) {
-    return yield* new ReplicaError.StorageCorrupt({
-      message: `Pending mutation references unknown mutation ${row.name}`
-    })
-  }
   const envelope = yield* Codec.decode(Protocol.MutationEnvelope, {
     spaceId: options.spaceId,
     clientId: options.clientId,
@@ -502,8 +345,8 @@ const pendingEnvelope = Effect.fnUntraced(function*(
     payload: yield* decodeJson(Schema.Json, row.payload_json),
     digestVersion: row.digest_version,
     membershipIncarnation: row.membership_incarnation,
-    sourceSchema: rowSource,
-    mutationVersion: version,
+    sourceSchema: identityFrom(row.source_schema_version, row.source_schema_hash),
+    mutationVersion: row.mutation_version,
     digest: row.digest
   })
   const digest = yield* Protocol.mutationDigest({
@@ -535,13 +378,19 @@ export interface ClientOptions {
   readonly batchSize?: number | undefined
   readonly batchBytes?: number | undefined
   readonly afterBatch?: Effect.Effect<void> | undefined
+  readonly onReplicationViewCleared?: Effect.Effect<void> | undefined
 }
 
 export const client = Effect.fn("SchemaEvolution.client")(function*(options: ClientOptions) {
   yield* Effect.annotateCurrentSpan({ "space.id": options.spaceId, "client.id": options.clientId })
   const sql = yield* SqlClient.SqlClient
+  const lane = yield* ConnectionLane.ConnectionLane
   const withTransaction = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
-    sql.withTransaction(effect)
+    lane.withTransaction(effect)
+  const onLane = <I, A, E extends { readonly _tag: string }, R,>(
+    query: (request: I) => Effect.Effect<A, E, R>
+  ) =>
+  (request: I) => lane.withStatement(query(request))
   const runtime = yield* MutationRuntime
   if (!sameIdentity(options.definition.schemaIdentity, options.evolution.current.schemaIdentity)) {
     return yield* new ReplicaError.InvalidConfiguration({
@@ -573,7 +422,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
     })
   }
 
-  const readMeta = SqlSchema.findOne({
+  const readMeta = onLane(SqlSchema.findOne({
     Request: Schema.Void,
     Result: MetaRow,
     execute: () =>
@@ -581,8 +430,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         active_projection_generation,
         target_schema_version, target_schema_hash, migration_hash
         FROM effect_local_client_spaces WHERE space_id = ${options.spaceId}`
-  })
-  const readProgress = SqlSchema.findOneOption({
+  }))
+  const readProgress = onLane(SqlSchema.findOneOption({
     Request: Schema.Void,
     Result: ProgressRow,
     execute: () =>
@@ -591,43 +440,43 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         target_projection_generation, phase,
         cursor_model, cursor_key, cursor_sequence
         FROM effect_local_client_evolution WHERE space_id = ${options.spaceId}`
-  })
-  const countCanonicalGeneration = SqlSchema.findOne({
+  }))
+  const countCanonicalGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
     execute: (generation) =>
       sql`SELECT COUNT(*) AS count FROM effect_local_client_canonical_entities_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}`
-  })
-  const countVisibleGeneration = SqlSchema.findOne({
+  }))
+  const countVisibleGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
     execute: (generation) =>
       sql`SELECT COUNT(*) AS count FROM effect_local_client_visible_entities_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}`
-  })
-  const countReceiptGeneration = SqlSchema.findOne({
+  }))
+  const countReceiptGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
     execute: (generation) =>
       sql`SELECT COUNT(*) AS count FROM effect_local_client_receipts_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}`
-  })
-  const countPendingGeneration = SqlSchema.findOne({
+  }))
+  const countPendingGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
     execute: (generation) =>
       sql`SELECT COUNT(*) AS count FROM effect_local_client_pending_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}`
-  })
-  const countRetractionGeneration = SqlSchema.findOne({
+  }))
+  const countRetractionGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
     execute: (generation) =>
       sql`SELECT COUNT(*) AS count FROM effect_local_client_retractions
         WHERE space_id = ${options.spaceId} AND generation = ${generation}`
-  })
-  const beginPromotion = SqlSchema.findOneOption({
+  }))
+  const beginPromotion = onLane(SqlSchema.findOneOption({
     Request: Schema.Struct({
       expectedGeneration: NonNegativeInt,
       generation: Identity.SchemaVersion,
@@ -644,8 +493,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
           WHERE space_id = ${options.spaceId} AND schema_generation = ${expectedGeneration}
             AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL
           RETURNING schema_generation`
-  })
-  const initialEntityMetadata = SqlSchema.findAll({
+  }))
+  const initialEntityMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, limit: Schema.Number }),
     Result: EntityBytesRow,
     execute: ({ generation, limit }) =>
@@ -654,8 +503,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_canonical_entities_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const continuingEntityMetadata = SqlSchema.findAll({
+  }))
+  const continuingEntityMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({
       generation: NonNegativeInt,
       model: Schema.String,
@@ -670,8 +519,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const initialEntityBatch = SqlSchema.findAll({
+  }))
+  const initialEntityBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, limit: Schema.Number }),
     Result: EntityBatchRow,
     execute: ({ generation, limit }) =>
@@ -679,8 +528,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_canonical_entities_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const continuingEntityBatch = SqlSchema.findAll({
+  }))
+  const continuingEntityBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({
       generation: NonNegativeInt,
       model: Schema.String,
@@ -694,8 +543,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const initialRetractionMetadata = SqlSchema.findAll({
+  }))
+  const initialRetractionMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, limit: Schema.Number }),
     Result: EntityBytesRow,
     execute: ({ generation, limit }) =>
@@ -703,8 +552,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_retractions
         WHERE space_id = ${options.spaceId} AND generation = ${generation}
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const continuingRetractionMetadata = SqlSchema.findAll({
+  }))
+  const continuingRetractionMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({
       generation: NonNegativeInt,
       model: Schema.String,
@@ -718,16 +567,16 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         WHERE space_id = ${options.spaceId} AND generation = ${generation}
           AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const initialRetractionBatch = SqlSchema.findAll({
+  }))
+  const initialRetractionBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, limit: Schema.Number }),
     Result: RetractionBatchRow,
     execute: ({ generation, limit }) =>
       sql`SELECT model, model_version, entity_key FROM effect_local_client_retractions
         WHERE space_id = ${options.spaceId} AND generation = ${generation}
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const continuingRetractionBatch = SqlSchema.findAll({
+  }))
+  const continuingRetractionBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({
       generation: NonNegativeInt,
       model: Schema.String,
@@ -740,16 +589,16 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         WHERE space_id = ${options.spaceId} AND generation = ${generation}
           AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
-  })
-  const logMetadata = SqlSchema.findAll({
+  }))
+  const logMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ after: NonNegativeInt, limit: Schema.Number }),
     Result: SequenceBytesRow,
     execute: ({ after, limit }) =>
       sql`SELECT server_sequence, length(CAST(entry_json AS BLOB)) AS row_bytes
         FROM effect_local_server_log WHERE space_id = ${options.spaceId} AND server_sequence > ${after}
         ORDER BY server_sequence LIMIT ${limit}`
-  })
-  const logBatch = SqlSchema.findAll({
+  }))
+  const logBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ after: NonNegativeInt, limit: Schema.Number }),
     Result: LogBatchRow,
     execute: ({ after, limit }) =>
@@ -757,8 +606,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         source_schema_version, source_schema_hash FROM effect_local_server_log
         WHERE space_id = ${options.spaceId} AND server_sequence > ${after}
         ORDER BY server_sequence LIMIT ${limit}`
-  })
-  const receiptBatch = SqlSchema.findAll({
+  }))
+  const receiptBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, after: NonNegativeInt, limit: Schema.Number }),
     Result: ReceiptBatchRow,
     execute: ({ generation, after, limit }) =>
@@ -768,8 +617,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_receipts_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND local_sequence > ${after} ORDER BY local_sequence LIMIT ${limit}`
-  })
-  const receiptMetadata = SqlSchema.findAll({
+  }))
+  const receiptMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, after: NonNegativeInt, limit: Schema.Number }),
     Result: LocalSequenceBytesRow,
     execute: ({ generation, after, limit }) =>
@@ -777,8 +626,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_receipts_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND local_sequence > ${after} ORDER BY local_sequence LIMIT ${limit}`
-  })
-  const pendingBatch = SqlSchema.findAll({
+  }))
+  const pendingBatch = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, after: NonNegativeInt, limit: Schema.Number }),
     Result: PendingBatchRow,
     execute: ({ generation, after, limit }) =>
@@ -792,8 +641,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         WHERE p.space_id = ${options.spaceId} AND p.schema_generation = ${generation}
           AND p.local_sequence > ${after}
         ORDER BY local_sequence LIMIT ${limit}`
-  })
-  const pendingMetadata = SqlSchema.findAll({
+  }))
+  const pendingMetadata = onLane(SqlSchema.findAll({
     Request: Schema.Struct({ generation: NonNegativeInt, after: NonNegativeInt, limit: Schema.Number }),
     Result: LocalSequenceBytesRow,
     execute: ({ generation, after, limit }) =>
@@ -802,7 +651,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         FROM effect_local_client_pending_data
         WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}
           AND local_sequence > ${after} ORDER BY local_sequence LIMIT ${limit}`
-  })
+  }))
   const registerLineage = ClientLineage.make(sql, options.spaceId)
 
   const validateBatch = Effect.fnUntraced(function*(state: typeof ProgressRow.Type) {
@@ -833,8 +682,11 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
   let progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
   if (Option.isNone(progress)) {
     const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
-    const source = yield* resolveInitialSource(meta, options.evolution)
-    if (!source.legacy && sameIdentity(source.identity, options.definition.schemaIdentity)) {
+    const source = (yield* sourceDefinition(
+      options.evolution,
+      identityFrom(meta.schema_version, meta.schema_hash)
+    )).schemaIdentity
+    if (sameIdentity(source, options.definition.schemaIdentity)) {
       if (meta.definition_hash === options.definition.hash) return meta.schema_generation
       return yield* withTransaction(Effect.gen(function*() {
         yield* sql`UPDATE effect_local_client_spaces SET definition_hash = ${options.definition.hash}
@@ -867,8 +719,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
       const promoted = yield* beginPromotion({
         expectedGeneration: meta.schema_generation,
         generation,
-        sourceVersion: source.identity.version,
-        sourceHash: source.identity.hash
+        sourceVersion: source.version,
+        sourceHash: source.hash
       }).pipe(Effect.mapError(StorageUnavailable.make))
       if (Option.isNone(promoted)) return
       yield* sql`DELETE FROM effect_local_client_canonical_entities_data
@@ -885,7 +737,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
           (space_id, source_schema_version, source_schema_hash, target_schema_version, target_schema_hash,
             migration_hash, generation, source_generation, source_projection_generation,
             target_projection_generation, phase, cursor_model, cursor_key, cursor_sequence)
-          VALUES (${options.spaceId}, ${source.identity.version}, ${source.identity.hash},
+          VALUES (${options.spaceId}, ${source.version}, ${source.hash},
             ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash},
             ${options.evolution.migrationHash}, ${generation}, ${meta.active_schema_generation},
             ${meta.active_projection_generation}, 0, 'Log', NULL, NULL, 0)`
@@ -945,15 +797,10 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
-          const entry = yield* currentOrLegacyEntry(row, source, definition)
+          const entry = yield* acceptedEntry(row)
           for (const change of entry.changes) {
             const migrated = yield* migrateEntityChange(options.evolution, entry.sourceSchema, change)
             yield* registerLineage(change.entity.model, migrated)
-          }
-          if (row.source_schema_version === null || row.source_schema_hash === null) {
-            yield* sql`UPDATE effect_local_server_log SET entry_json = ${yield* Codec.stringify(entry)},
-                source_schema_version = ${entry.sourceSchema.version}, source_schema_hash = ${entry.sourceSchema.hash}
-                WHERE space_id = ${options.spaceId} AND server_sequence = ${row.server_sequence}`
           }
         }
         if (rows.length === 0) {
@@ -998,18 +845,11 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
-          const model = definition.modelByName.get(row.model)
-          const modelVersion = row.model_version ?? model?.version
-          if (modelVersion === undefined) {
-            return yield* new ReplicaError.StorageCorrupt({
-              message: `Stored entity references unknown model ${row.model}`
-            })
-          }
           const migrated = yield* Evolution.migrateModel({
             evolution: options.evolution,
             source,
             model: row.model,
-            modelVersion,
+            modelVersion: row.model_version,
             key: yield* decodeJson(Schema.Json, row.entity_key),
             value: yield* decodeJson(Schema.Json, row.value_json)
           })
@@ -1050,12 +890,12 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
-          const decoded = yield* currentOrLegacyReceipt(row, source)
+          const decoded = yield* storedReceipt(row)
           const receipt = yield* migrateReceipt(decoded, options.evolution)
           const protocolMetadata = protocolReceiptMetadata(receipt)
           let snapshotJson = row.settled_pending_json
           if (
-            snapshotJson !== null && receipt._tag !== "Legacy" && row.pending_name !== null &&
+            snapshotJson !== null && row.pending_name !== null &&
             !options.definition.mutationByName.has(row.pending_name)
           ) {
             snapshotJson = null
@@ -1097,42 +937,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
       yield* Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
-          const envelope = yield* pendingEnvelope(row, options, source, definition)
-          const decodedChanges = yield* decodeJson(
-            Schema.Array(Protocol.EntityChange),
-            row.changes_json
-          ).pipe(Effect.result)
-          let historicalChanges: ReadonlyArray<Protocol.EntityChange>
-          if (Result.isSuccess(decodedChanges)) {
-            historicalChanges = decodedChanges.success
-          } else {
-            historicalChanges = yield* decodeJson(Schema.Array(LegacyEntityChange), row.changes_json).pipe(
-              Effect.flatMap(Effect.forEach((change: typeof LegacyEntityChange.Type): Effect.Effect<
-                Protocol.EntityChange,
-                ReplicaError.StorageCorrupt
-              > => {
-                const model = definition.modelByName.get(change.entity.model)
-                if (model === undefined) {
-                  return Effect.fail(
-                    new ReplicaError.StorageCorrupt({
-                      message: `Pending mutation references unknown model ${change.entity.model}`
-                    })
-                  )
-                }
-                if (change._tag === "Delete") {
-                  return Effect.succeed({
-                    _tag: "Delete" as const,
-                    entity: { ...change.entity, modelVersion: model.version }
-                  })
-                }
-                return Effect.succeed({
-                  _tag: "Upsert" as const,
-                  entity: { ...change.entity, modelVersion: model.version },
-                  value: change.value
-                })
-              }))
-            )
-          }
+          const envelope = yield* pendingEnvelope(row, options)
+          const historicalChanges = yield* decodeJson(Schema.Array(Protocol.EntityChange), row.changes_json)
           const migratedHistoricalChanges: Array<Protocol.EntityChange> = []
           for (const change of historicalChanges) {
             const migrated = yield* migrateEntityChange(options.evolution, source, change)
@@ -1325,7 +1131,10 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
               AND active_schema_generation = ${state.source_generation}`
         yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupCanonical'
             WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
-      }))
+      })).pipe(
+        Effect.andThen(options.onReplicationViewCleared ?? Effect.void),
+        Effect.uninterruptible
+      )
     } else if (state.phase === "CleanupCanonical") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
@@ -1420,29 +1229,28 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
 
 const ServerMetaEvolutionRow = Schema.Struct({
   definition_hash: Schema.String,
-  schema_version: NullableSchemaVersion,
-  schema_hash: NullableSchemaHash,
-  schema_generation: NonNegativeInt,
-  active_schema_generation: NonNegativeInt,
-  target_schema_version: NullableSchemaVersion,
+  schema_version: Rows.integer(Identity.SchemaVersion),
+  schema_hash: Identity.SchemaHash,
+  schema_generation: Rows.integer(NonNegativeInt),
+  active_schema_generation: Rows.integer(NonNegativeInt),
+  target_schema_version: Schema.NullOr(Rows.integer(Identity.SchemaVersion)),
   target_schema_hash: NullableSchemaHash,
   migration_hash: NullableSchemaHash
 })
 
 const ServerProgressRow = Schema.Struct({
-  source_schema_version: Identity.SchemaVersion,
+  source_schema_version: Rows.integer(Identity.SchemaVersion),
   source_schema_hash: Identity.SchemaHash,
-  target_schema_version: Identity.SchemaVersion,
+  target_schema_version: Rows.integer(Identity.SchemaVersion),
   target_schema_hash: Identity.SchemaHash,
   migration_hash: Identity.SchemaHash,
-  generation: Identity.SchemaVersion,
-  source_generation: NonNegativeInt,
-  target_entity_count: NonNegativeInt,
-  target_entity_bytes: NonNegativeInt,
+  generation: Rows.integer(Identity.SchemaVersion),
+  source_generation: Rows.integer(NonNegativeInt),
+  target_entity_count: Rows.integer(NonNegativeInt),
+  target_entity_bytes: Rows.integer(NonNegativeInt),
   phase: Schema.Literals([
     "Log",
     "Entities",
-    "Receipts",
     "Flip",
     "CleanupScopedSnapshotEntries",
     "CleanupScopedSnapshots",
@@ -1454,7 +1262,7 @@ const ServerProgressRow = Schema.Struct({
   ]),
   cursor_model: Schema.NullOr(Schema.String),
   cursor_key: Schema.NullOr(Schema.String),
-  cursor_sequence: Schema.NullOr(NonNegativeInt)
+  cursor_sequence: Schema.NullOr(Rows.integer(NonNegativeInt))
 })
 
 export interface ServerOptions {
@@ -1469,8 +1277,9 @@ export interface ServerOptions {
 export const server = Effect.fn("SchemaEvolution.server")(function*(options: ServerOptions) {
   yield* Effect.annotateCurrentSpan("space.id", options.spaceId)
   const sql = yield* SqlClient.SqlClient
+  const dialect = yield* Dialect.make(sql)
   const withTransaction = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
-    sql.withTransaction(effect)
+    SqlTransaction.withServerTransaction(sql, effect)
   if (!sameIdentity(options.definition.schemaIdentity, options.evolution.current.schemaIdentity)) {
     return yield* new ReplicaError.InvalidConfiguration({
       option: "evolution",
@@ -1500,6 +1309,14 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
         target_schema_version, target_schema_hash, migration_hash FROM effect_local_server_spaces
         WHERE space_id = ${options.spaceId}`
   })
+  const lockMeta = SqlSchema.findOne({
+    Request: Schema.Void,
+    Result: ServerMetaEvolutionRow,
+    execute: () =>
+      sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
+        target_schema_version, target_schema_hash, migration_hash FROM effect_local_server_spaces
+        WHERE space_id = ${options.spaceId} ${dialect.forNoKeyUpdate}`
+  })
   const readProgress = SqlSchema.findOneOption({
     Request: Schema.Void,
     Result: ServerProgressRow,
@@ -1520,39 +1337,39 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     Request: Schema.Void,
     Result: CountRow,
     execute: () =>
-      sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_scoped_snapshot_entries
+      sql`SELECT CASE WHEN EXISTS(SELECT 1 FROM effect_local_server_scoped_snapshot_entries
         WHERE snapshot_id IN (
           SELECT snapshot_id FROM effect_local_server_scoped_snapshots
           WHERE space_id = ${options.spaceId}
-        )) AS count`
+        )) THEN 1 ELSE 0 END AS count`
   })
   const countScopedSnapshots = SqlSchema.findOne({
     Request: Schema.Void,
     Result: CountRow,
     execute: () =>
-      sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_scoped_snapshots
-        WHERE space_id = ${options.spaceId}) AS count`
+      sql`SELECT CASE WHEN EXISTS(SELECT 1 FROM effect_local_server_scoped_snapshots
+        WHERE space_id = ${options.spaceId}) THEN 1 ELSE 0 END AS count`
   })
   const countReplicationPages = SqlSchema.findOne({
     Request: Schema.Void,
     Result: CountRow,
     execute: () =>
-      sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_replication_pages AS page
-        WHERE page.space_id = ${options.spaceId}) AS count`
+      sql`SELECT CASE WHEN EXISTS(SELECT 1 FROM effect_local_server_replication_pages AS page
+        WHERE page.space_id = ${options.spaceId}) THEN 1 ELSE 0 END AS count`
   })
   const countReplicationViewEntities = SqlSchema.findOne({
     Request: Schema.Void,
     Result: CountRow,
     execute: () =>
-      sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_replication_view_entities AS entity
-        WHERE entity.space_id = ${options.spaceId}) AS count`
+      sql`SELECT CASE WHEN EXISTS(SELECT 1 FROM effect_local_server_replication_view_entities AS entity
+        WHERE entity.space_id = ${options.spaceId}) THEN 1 ELSE 0 END AS count`
   })
   const countReplicationViews = SqlSchema.findOne({
     Request: Schema.Void,
     Result: CountRow,
     execute: () =>
-      sql`SELECT EXISTS(SELECT 1 FROM effect_local_server_replication_views
-        WHERE space_id = ${options.spaceId}) AS count`
+      sql`SELECT CASE WHEN EXISTS(SELECT 1 FROM effect_local_server_replication_views
+        WHERE space_id = ${options.spaceId}) THEN 1 ELSE 0 END AS count`
   })
   const beginPromotion = SqlSchema.findOneOption({
     Request: Schema.Struct({
@@ -1561,12 +1378,10 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
       sourceVersion: Identity.SchemaVersion,
       sourceHash: Identity.SchemaHash
     }),
-    Result: Schema.Struct({ schema_generation: Identity.SchemaVersion }),
+    Result: Schema.Struct({ schema_generation: Rows.integer(Identity.SchemaVersion) }),
     execute: ({ expectedGeneration, generation, sourceVersion, sourceHash }) =>
       sql`UPDATE effect_local_server_spaces SET
           schema_version = ${sourceVersion}, schema_hash = ${sourceHash},
-          legacy_schema_version = COALESCE(legacy_schema_version, ${sourceVersion}),
-          legacy_schema_hash = COALESCE(legacy_schema_hash, ${sourceHash}),
           target_schema_version = ${options.definition.schemaIdentity.version},
           target_schema_hash = ${options.definition.schemaIdentity.hash},
           migration_hash = ${options.evolution.migrationHash}, schema_generation = ${generation}
@@ -1588,7 +1403,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     Result: EntityBytesRow,
     execute: ({ generation, limit }) =>
       sql`SELECT model, entity_key,
-          length(CAST(entity_key AS BLOB)) + length(CAST(value_json AS BLOB)) AS row_bytes
+          ${dialect.byteLength("entity_key")} + ${dialect.byteLength("value_json")} AS row_bytes
         FROM effect_local_server_entities_data WHERE space_id = ${options.spaceId}
           AND generation = ${generation} ORDER BY model, entity_key LIMIT ${limit}`
   })
@@ -1602,7 +1417,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     Result: EntityBytesRow,
     execute: ({ generation, model, key, limit }) =>
       sql`SELECT model, entity_key,
-          length(CAST(entity_key AS BLOB)) + length(CAST(value_json AS BLOB)) AS row_bytes
+          ${dialect.byteLength("entity_key")} + ${dialect.byteLength("value_json")} AS row_bytes
         FROM effect_local_server_entities_data WHERE space_id = ${options.spaceId}
           AND generation = ${generation} AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
@@ -1629,45 +1444,11 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
           AND generation = ${generation} AND (model > ${model} OR (model = ${model} AND entity_key > ${key}))
         ORDER BY model, entity_key LIMIT ${limit}`
   })
-  const initialReceiptMetadata = SqlSchema.findAll({
-    Request: Schema.Number,
-    Result: KeyBytesRow,
-    execute: (limit) =>
-      sql`SELECT mutation_id, length(CAST(receipt_json AS BLOB)) AS row_bytes
-        FROM effect_local_server_receipts WHERE space_id = ${options.spaceId}
-        ORDER BY mutation_id LIMIT ${limit}`
-  })
-  const continuingReceiptMetadata = SqlSchema.findAll({
-    Request: Schema.Struct({ after: Schema.String, limit: Schema.Number }),
-    Result: KeyBytesRow,
-    execute: ({ after, limit }) =>
-      sql`SELECT mutation_id, length(CAST(receipt_json AS BLOB)) AS row_bytes
-        FROM effect_local_server_receipts WHERE space_id = ${options.spaceId} AND mutation_id > ${after}
-        ORDER BY mutation_id LIMIT ${limit}`
-  })
-  const initialReceiptBatch = SqlSchema.findAll({
-    Request: Schema.Number,
-    Result: ServerReceiptBatchRow,
-    execute: (limit) =>
-      sql`SELECT mutation_id, local_sequence, receipt_json,
-        source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin
-        FROM effect_local_server_receipts WHERE space_id = ${options.spaceId}
-        ORDER BY mutation_id LIMIT ${limit}`
-  })
-  const continuingReceiptBatch = SqlSchema.findAll({
-    Request: Schema.Struct({ after: Schema.String, limit: Schema.Number }),
-    Result: ServerReceiptBatchRow,
-    execute: ({ after, limit }) =>
-      sql`SELECT mutation_id, local_sequence, receipt_json,
-        source_schema_version, source_schema_hash, mutation_version, mutation_name, rejection_origin
-        FROM effect_local_server_receipts WHERE space_id = ${options.spaceId} AND mutation_id > ${after}
-        ORDER BY mutation_id LIMIT ${limit}`
-  })
   const logMetadata = SqlSchema.findAll({
     Request: Schema.Struct({ after: NonNegativeInt, limit: Schema.Number }),
     Result: SequenceBytesRow,
     execute: ({ after, limit }) =>
-      sql`SELECT server_sequence, length(CAST(entry_json AS BLOB)) AS row_bytes
+      sql`SELECT server_sequence, ${dialect.byteLength("entry_json")} AS row_bytes
         FROM effect_local_authoritative_log WHERE space_id = ${options.spaceId}
           AND server_sequence > ${after} ORDER BY server_sequence LIMIT ${limit}`
   })
@@ -1764,12 +1545,11 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
   })
 
   const validateBatch = Effect.fnUntraced(function*(state: typeof ServerProgressRow.Type) {
-    const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    const meta = yield* lockMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
     const progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
     let expectedActiveGeneration: number = state.generation
     if (
-      state.phase === "Flip" || state.phase === "Log" || state.phase === "Entities" ||
-      state.phase === "Receipts"
+      state.phase === "Flip" || state.phase === "Log" || state.phase === "Entities"
     ) {
       expectedActiveGeneration = state.source_generation
     }
@@ -1793,8 +1573,11 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
   let progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
   if (Option.isNone(progress)) {
     const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
-    const source = yield* resolveInitialSource(meta, options.evolution)
-    if (!source.legacy && sameIdentity(source.identity, options.definition.schemaIdentity)) {
+    const source = (yield* sourceDefinition(
+      options.evolution,
+      identityFrom(meta.schema_version, meta.schema_hash)
+    )).schemaIdentity
+    if (sameIdentity(source, options.definition.schemaIdentity)) {
       if (meta.definition_hash === options.definition.hash) return meta.schema_generation
       return yield* withTransaction(Effect.gen(function*() {
         yield* sql`UPDATE effect_local_server_spaces SET definition_hash = ${options.definition.hash}
@@ -1827,8 +1610,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
       const promoted = yield* beginPromotion({
         expectedGeneration: meta.schema_generation,
         generation,
-        sourceVersion: source.identity.version,
-        sourceHash: source.identity.hash
+        sourceVersion: source.version,
+        sourceHash: source.hash
       }).pipe(Effect.mapError(StorageUnavailable.make))
       if (Option.isNone(promoted)) return
       yield* sql`DELETE FROM effect_local_server_entities_data
@@ -1837,7 +1620,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
           (space_id, source_schema_version, source_schema_hash, target_schema_version,
             target_schema_hash, migration_hash, generation, source_generation,
             target_entity_count, target_entity_bytes, phase, cursor_model, cursor_key, cursor_sequence)
-          VALUES (${options.spaceId}, ${source.identity.version}, ${source.identity.hash},
+          VALUES (${options.spaceId}, ${source.version}, ${source.hash},
             ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash},
             ${options.evolution.migrationHash}, ${generation}, ${meta.active_schema_generation},
             0, 0, 'Log', NULL, NULL, 0)`
@@ -1861,7 +1644,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     })
   }
   const source = identityFrom(expected.source_schema_version, expected.source_schema_hash)
-  const definition = yield* sourceDefinition(options.evolution, source)
+  yield* sourceDefinition(options.evolution, source)
 
   while (true) {
     const current = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
@@ -1896,17 +1679,10 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
-          const entry = yield* currentOrLegacyEntry(row, source, definition)
+          const entry = yield* acceptedEntry(row)
           for (const change of entry.changes) {
             const migrated = yield* migrateEntityChange(options.evolution, entry.sourceSchema, change)
             yield* registerLineage(change.entity.model, migrated)
-          }
-          if (row.source_schema_version === null || row.source_schema_hash === null) {
-            const entryJson = yield* Codec.stringify(entry)
-            yield* sql`UPDATE effect_local_authoritative_log SET entry_json = ${entryJson},
-                entry_bytes = ${new TextEncoder().encode(entryJson).byteLength},
-                source_schema_version = ${entry.sourceSchema.version}, source_schema_hash = ${entry.sourceSchema.hash}
-                WHERE space_id = ${options.spaceId} AND server_sequence = ${row.server_sequence}`
           }
         }
         if (rows.length === 0) {
@@ -1952,18 +1728,11 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
-          const model = definition.modelByName.get(row.model)
-          const modelVersion = row.model_version ?? model?.version
-          if (modelVersion === undefined) {
-            return yield* new ReplicaError.StorageCorrupt({
-              message: `Stored entity references unknown model ${row.model}`
-            })
-          }
           const migrated = yield* Evolution.migrateModel({
             evolution: options.evolution,
             source,
             model: row.model,
-            modelVersion,
+            modelVersion: row.model_version,
             key: yield* decodeJson(Schema.Json, row.entity_key),
             value: yield* decodeJson(Schema.Json, row.value_json)
           })
@@ -1992,8 +1761,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
         }
         if (rows.length === 0) {
-          yield* sql`UPDATE effect_local_server_evolution SET phase = 'Receipts', cursor_model = NULL,
-              cursor_key = NULL, cursor_sequence = 0 WHERE space_id = ${options.spaceId}
+          yield* sql`UPDATE effect_local_server_evolution SET phase = 'Flip', cursor_model = NULL,
+              cursor_key = NULL, cursor_sequence = NULL WHERE space_id = ${options.spaceId}
               AND generation = ${state.generation}`
         } else {
           const last = rows[rows.length - 1]
@@ -2001,39 +1770,6 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
         }
         return undefined
-      }))
-    } else if (state.phase === "Receipts") {
-      let metadataQuery = initialReceiptMetadata(batchSize)
-      if (state.cursor_key !== null) {
-        metadataQuery = continuingReceiptMetadata({ after: state.cursor_key, limit: batchSize })
-      }
-      const metadata = yield* metadataQuery.pipe(
-        Effect.mapError(StorageUnavailable.make)
-      )
-      const limit = yield* boundedCount(metadata, batchBytes)
-      let receiptQuery = initialReceiptBatch(limit)
-      if (state.cursor_key !== null) receiptQuery = continuingReceiptBatch({ after: state.cursor_key, limit })
-      const rows = yield* receiptQuery.pipe(Effect.mapError(StorageUnavailable.make))
-      yield* withTransaction(Effect.gen(function*() {
-        yield* validateBatch(state)
-        for (const row of rows) {
-          const receipt = yield* currentOrLegacyReceipt(row, source)
-          const protocolMetadata = protocolReceiptMetadata(receipt)
-          yield* sql`UPDATE effect_local_server_receipts SET receipt_json = ${yield* Codec.stringify(receipt)},
-              source_schema_version = ${receipt.sourceSchema.version}, source_schema_hash = ${receipt.sourceSchema.hash},
-              mutation_version = ${protocolMetadata.mutationVersion},
-              mutation_name = ${protocolMetadata.mutationName},
-              rejection_origin = ${protocolMetadata.rejectionOrigin}
-              WHERE space_id = ${options.spaceId} AND mutation_id = ${row.mutation_id}`
-        }
-        if (rows.length === 0) {
-          yield* sql`UPDATE effect_local_server_evolution SET phase = 'Flip', cursor_key = NULL,
-              cursor_sequence = NULL
-              WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
-        } else {
-          yield* sql`UPDATE effect_local_server_evolution SET cursor_key = ${rows[rows.length - 1].mutation_id}
-              WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
-        }
       }))
     } else if (state.phase === "Flip") {
       yield* withTransaction(Effect.gen(function*() {
@@ -2049,8 +1785,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupScopedSnapshotEntries") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_scoped_snapshot_entries WHERE rowid IN (
-            SELECT entry.rowid FROM effect_local_server_scoped_snapshot_entries AS entry
+        yield* sql`DELETE FROM effect_local_server_scoped_snapshot_entries WHERE (snapshot_id, ordinal) IN (
+            SELECT entry.snapshot_id, entry.ordinal FROM effect_local_server_scoped_snapshot_entries AS entry
             INNER JOIN effect_local_server_scoped_snapshots AS snapshot
               ON snapshot.snapshot_id = entry.snapshot_id
             WHERE snapshot.space_id = ${options.spaceId}
@@ -2064,8 +1800,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupScopedSnapshots") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_scoped_snapshots WHERE rowid IN (
-            SELECT rowid FROM effect_local_server_scoped_snapshots
+        yield* sql`DELETE FROM effect_local_server_scoped_snapshots WHERE snapshot_id IN (
+            SELECT snapshot_id FROM effect_local_server_scoped_snapshots
             WHERE space_id = ${options.spaceId}
             ORDER BY snapshot_id LIMIT ${batchSize})`
         const remaining = yield* countScopedSnapshots(undefined).pipe(Effect.mapError(StorageUnavailable.make))
@@ -2077,8 +1813,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupReplicationPages") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_replication_pages WHERE rowid IN (
-            SELECT page.rowid FROM effect_local_server_replication_pages AS page
+        yield* sql`DELETE FROM effect_local_server_replication_pages WHERE (space_id, client_id) IN (
+            SELECT page.space_id, page.client_id FROM effect_local_server_replication_pages AS page
             INNER JOIN effect_local_server_replication_views AS view
               ON view.space_id = page.space_id AND view.client_id = page.client_id
             WHERE view.space_id = ${options.spaceId}
@@ -2092,8 +1828,10 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupReplicationViewEntities") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_replication_view_entities WHERE rowid IN (
-            SELECT entity.rowid FROM effect_local_server_replication_view_entities AS entity
+        yield* sql`DELETE FROM effect_local_server_replication_view_entities
+          WHERE (space_id, client_id, view_id, model, entity_key) IN (
+            SELECT entity.space_id, entity.client_id, entity.view_id, entity.model, entity.entity_key
+            FROM effect_local_server_replication_view_entities AS entity
             INNER JOIN effect_local_server_replication_views AS view
               ON view.space_id = entity.space_id AND view.client_id = entity.client_id
             WHERE view.space_id = ${options.spaceId}
@@ -2109,8 +1847,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupReplicationViews") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_replication_views WHERE rowid IN (
-            SELECT rowid FROM effect_local_server_replication_views
+        yield* sql`DELETE FROM effect_local_server_replication_views WHERE (space_id, client_id) IN (
+            SELECT space_id, client_id FROM effect_local_server_replication_views
             WHERE space_id = ${options.spaceId}
             ORDER BY client_id LIMIT ${batchSize})`
         const remaining = yield* countReplicationViews(undefined).pipe(Effect.mapError(StorageUnavailable.make))
@@ -2122,8 +1860,8 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "CleanupEntities") {
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
-        yield* sql`DELETE FROM effect_local_server_entities_data WHERE rowid IN (
-            SELECT rowid FROM effect_local_server_entities_data
+        yield* sql`DELETE FROM effect_local_server_entities_data WHERE (space_id, generation, model, entity_key) IN (
+            SELECT space_id, generation, model, entity_key FROM effect_local_server_entities_data
             WHERE space_id = ${options.spaceId} AND generation = ${state.source_generation}
             ORDER BY model, entity_key LIMIT ${batchSize})`
         const remaining = yield* countEntityGeneration(state.source_generation).pipe(

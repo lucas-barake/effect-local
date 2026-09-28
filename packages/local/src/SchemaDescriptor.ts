@@ -158,7 +158,7 @@ const hasSemanticContext = (
     context.isOptional ||
     context.isMutable ||
     hasSemanticAnnotations(context.annotations) ||
-    (includeConstructorDefaults && context.defaultValue !== undefined)
+    (includeConstructorDefaults && context.constructorDefault !== undefined)
   )
 
 const fromAnnotations = (
@@ -370,19 +370,14 @@ const fromAST = (
     if (ast.context.isMutable) context.isMutable = true
     const contextAnnotations = fromAnnotations(ast.context.annotations, state)
     if (contextAnnotations !== undefined) context.annotations = contextAnnotations
-    if (ast.context.defaultValue !== undefined && state.includeConstructorDefaults) {
+    if (ast.context.constructorDefault !== undefined && state.includeConstructorDefaults) {
       if (ast._tag === "Literal") {
         context.defaultValue = { _tag: "LiteralDefault", value: fromUnknown(ast.literal, state) }
       } else {
         if (!hasStableMetadata(ast.annotations) && !hasStableMetadata(ast.context.annotations)) {
           return Defect.invalid("Opaque constructor defaults require an identifier or meta annotation")
         }
-        context.defaultValue = fromEncoding(
-          ast,
-          ast.context.defaultValue,
-          state,
-          identifiedBehavior
-        )
+        context.defaultValue = { _tag: "OpaqueDefault" }
       }
     }
     if (Object.keys(context).length > 0) node.context = context
@@ -441,7 +436,7 @@ const fromAST = (
       break
     }
     case "Union": {
-      node.mode = ast.mode
+      node.mode = ast.options?.mode ?? "anyOf"
       node.types = ast.types.map((member) => fromAST(member, state, trustedBehavior))
       const encodingChecks = fromChecks(ast.encodingChecks, state, identifiedBehavior)
       if (encodingChecks !== undefined) node.encodingChecks = encodingChecks

@@ -2,7 +2,9 @@
 
 `SyncEngine` is the transport neutral client contract:
 
-- `submit` sends one stable mutation envelope and returns its durable terminal receipt
+- `submitBatch` sends up to `Protocol.maximumSubmitBatchEntries` stable mutation envelopes of one space in local
+  order and returns their durable terminal receipts in the same order. The result may cover only a nonempty prefix of
+  the envelopes. The caller resubmits the rest.
 - `discard` resolves one quarantined envelope without executing its mutation handler
 - `pull` advances one durable client view through bounded `Upsert`, `Delete`, and `Retract` changes, or returns the
   immutable scoped snapshot manifest required for bootstrap
@@ -16,8 +18,14 @@ authorized entities through incremental pull. Narrowing emits `Retract` changes 
 without a full bootstrap.
 
 The reconciler does not trust notification delivery or ordering. A notification only requests another durable
-generation for its space. Every sync pass reads that space's SQLite cursor, catches up, submits pending mutations in
-local order, and catches up again. SQLite commits requested generation changes with local mutations and records
+generation for its space. Notifications that arrive before a turn reads the generations share the request already
+written, so a burst of wakes costs one write per turn. Every sync pass reads that space's SQLite cursor, catches up, submits pending mutations in
+local order, and catches up again. Pending mutations leave in batches of at most `Protocol.maximumSubmitBatchEntries`
+envelopes whose encoded size stays within `Protocol.maximumBatchBytes`, so N pending mutations cost
+`ceil(N / maximumSubmitBatchEntries)` round trips when nothing fails. The client marks a batch as submitting in one
+SQLite transaction and records its receipts in one transaction with a savepoint per receipt, so a receipt that fails
+validation rolls back alone and the receipts before it stay recorded. The next batch is sent only after the previous
+batch's receipts are durable. SQLite commits requested generation changes with local mutations and records
 completed generations idempotently. The in memory composition has one dispatcher, one keyed watch per joined space,
 and one keyed turn per active space. A blocked or retrying turn cannot prevent another key from starting, and all keys
 share the same RPC protocol and physical WebSocket.
@@ -67,9 +75,10 @@ before the client has acknowledged a later pull.
 ## History lifecycle
 
 The server retains a configurable dense accepted suffix and a configurable terminal receipt suffix. Hard caps are
-larger than retained targets and apply backpressure before mutation handlers run. `ServerStore.layerMaintenance`
-periodically publishes recovery state and reclaims bounded prefixes. Deployments that use an external scheduler call
-the same `maintainAll` operation.
+larger than retained targets and apply backpressure before mutation handlers run. A write that takes a space past the
+midpoint between its retained target and hard cap starts one background maintenance run for that space.
+`ServerStore.layerMaintenance` also sweeps every space from an Effect Cluster singleton, once at start and then every
+interval. Deployments that use an external scheduler call the same `maintainAll` operation.
 
 Maintenance snapshots the current authoritative entities at accepted sequence `S` and terminal sequence `T`. The
 manifest binds space, definition, snapshot identity, both fences, entity count, content bytes, and a chained SHA 256
@@ -98,12 +107,14 @@ Receipt reclamation advances a per client expired local sequence watermark. A re
 `Expired`, bound to a covering published snapshot, and never reexecutes. The pending client mutation remains visible
 until that snapshot installs. If the durable cursor already covers the snapshot sequence, the accepted state is
 already canonical and the receipt can settle without replacing state. This preserves at most once execution after the
-full private result was reclaimed.
+full private result was reclaimed. An `Expired` receipt depends on the snapshot current when it was issued, so a later retry of the same mutation can
+return a different one. The client keeps the receipt it already stored when the new `Expired` receipt has the same
+identity and its snapshot covers the stored outcome. Any other difference is a conflicting duplicate.
 
 ## WebSocket RPC
 
-`SyncRpc.Rpcs` uses one Effect RPC group for negotiation, submit, discard, pull, bootstrap, watch, ephemeral join,
-publish, and heartbeat. Effect's RPC
+`SyncRpc.Rpcs` uses one Effect RPC group for negotiation, batch submit, discard, pull, bootstrap, watch,
+ephemeral join, publish, and heartbeat. Effect's RPC
 Schema codecs define the external contract. `SyncServer.layer` is the authenticated facade. It routes each operation
 through the Effect Cluster entity named by the request's space. The entity validates that embedded space identity
 matches its Cluster address, then calls `ServerStore` or `EphemeralHub`. `SyncClient.layer` maps the generated client
@@ -148,9 +159,25 @@ SQLite outbox. After admission, `ServerStore` keeps the terminal receipt and acc
 `effect_local_server_receipts` and `effect_local_authoritative_log`. If a runner fails before SQL commit, the entity call
 fails and the client resubmits. If SQL committed before the reply was lost, exact resubmission returns the stored receipt.
 
-This is the same store backed actor pattern as the former recipient relay. Persisting Submit through Effect beta.103
-`MessageStorage` would retain every completed request payload and reply with no per-request retention control. The
-authoritative mutation would then exist permanently in both Cluster history and the server log. Keeping entity calls
+A batch is one entity call under the space's admission permit. The entity admits its envelopes in order and each
+admission is its own SQL transaction, exactly as if each envelope had arrived in its own batch. A terminal
+rejection is a receipt, so later envelopes in the batch are still admitted. Any other failure stops the batch. When it
+happens at the first envelope the call fails with that error. When it happens later the call returns the receipts
+admitted so far, and the client's next batch starts at the failed envelope and receives the error there. The receipts
+of one response are bounded by `Protocol.maximumBatchBytes`. An admitted envelope whose receipt would exceed that bound
+is left out of the response and returned by exact resubmission. The entity also stops starting admissions once a batch
+has run for `maximumSubmitBatchDuration`, default 1 second, so a slow database or authorization hook shortens the
+response instead of letting one call outlive the client's `rpcTimeout`. An interrupted or lost batch leaves a committed
+prefix that exact resubmission returns without executing anything twice.
+
+One SQL transaction per batch was measured and rejected. Admission issues about 25 statements per mutation, so
+commits are a small share of its cost. On PostgreSQL a single transaction was 3 to 6 percent slower for 56 mutations
+and its savepoints overflow the 64 entry subtransaction cache after 32 mutations. It would also hold the space lock,
+and on SQLite the database writer lock, for the whole batch and keep compaction from running between mutations.
+
+This is a store backed actor pattern. Persisting SubmitBatch through Cluster
+`MessageStorage` would store every request payload and reply a second time beside the server log, and the application
+would have to clear them with `clearReplies` once the SQL receipt exists. Keeping entity calls
 volatile avoids that duplicate history while Cluster still supplies unique ownership, cross runner routing, and live
 recipient streams.
 
@@ -176,6 +203,10 @@ ephemeral operation must carry that selected version. There is no implicit proto
 operation rejected after reconnect clears the cached selection, negotiates against the new peer, and retries once. No
 shared version returns typed `UpgradeRequired`. Reconciliation treats it as terminal. Transport loss and
 `ServerUnavailable` remain retryable. A malformed frame remains `ProtocolInvalid`. It is not used as a version signal.
+
+Clients and servers support protocol version 1 by default. Pending mutations are submitted with `SubmitBatch`, which
+carries up to `Protocol.maximumSubmitBatchEntries` envelopes of one space. A remote defect is a server failure. Every
+sync operation reports it as typed `ProtocolInvalid`, so reconciliation shows `Failed` instead of losing its worker.
 
 `sessionAcquisitionTimeout` bounds negotiation and renegotiation. `rpcTimeout` bounds every unary sync and ephemeral
 RPC plus stream acquisition. Both accept `Duration.Input` and default to 10 seconds. Expiry interrupts the operation

@@ -7,8 +7,10 @@ import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
+import * as Predicate from "effect/Predicate"
 import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlError from "effect/unstable/sql/SqlError"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
@@ -222,3 +224,28 @@ export const applyCanonicalChange = Effect.fnUntraced(function*(
 }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const entityKey = (entity: Protocol.EntityKey) => `${entity.model}\u0000${Canonical.stringify(entity.key)}`
+
+const maximumTransactionAttempts = 8
+
+const isTransientConflict = (error: SqlError.SqlError) =>
+  error.reason._tag === "DeadlockError" || error.reason._tag === "SerializationError"
+
+const transientConflict = (error: unknown) => {
+  if (SqlError.isSqlError(error)) return isTransientConflict(error)
+  if (!Predicate.isTagged(error, "StorageUnavailable") || !Predicate.hasProperty(error, "cause")) return false
+  return SqlError.isSqlError(error.cause) && isTransientConflict(error.cause)
+}
+
+export const withServerTransaction = <A, E extends { readonly _tag: string }, R,>(
+  sql: SqlClient.SqlClient,
+  effect: Effect.Effect<A, E, R>
+): Effect.Effect<A, E | SqlError.SqlError, R> => {
+  const attempt = (remaining: number): Effect.Effect<A, E | SqlError.SqlError, R> =>
+    sql.withTransaction(effect).pipe(
+      Effect.catch((error) => {
+        if (remaining > 1 && transientConflict(error)) return attempt(remaining - 1)
+        return Effect.fail(error)
+      })
+    )
+  return attempt(maximumTransactionAttempts)
+}

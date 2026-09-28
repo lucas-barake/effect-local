@@ -2,17 +2,14 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as EffectLayer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
-import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
+import type * as Stream from "effect/Stream"
 import { BrowserStorageError } from "../BrowserStorageError.js"
+import * as LosslessQueue from "./losslessQueue.js"
 
 export { BrowserStorageError }
-
-const StoredEpoch = Schema.NumberFromString.check(
-  Schema.isInt(),
-  Schema.isGreaterThanOrEqualTo(0)
-)
 
 export interface WebLockHold {
   readonly lost: Effect.Effect<void>
@@ -23,36 +20,48 @@ export interface WebLocksService {
     name: string,
     options?: { readonly steal?: boolean }
   ) => Effect.Effect<WebLockHold, never, Scope.Scope>
+  readonly tryAcquire: (name: string) => Effect.Effect<Option.Option<WebLockHold>, never, Scope.Scope>
+  readonly held: Effect.Effect<ReadonlyArray<string>>
+  readonly released: (name: string) => Effect.Effect<void>
 }
 
 export class WebLocks extends Context.Service<WebLocks, WebLocksService>()(
   "@lucas-barake/effect-local-browser/WebLocks"
 ) {}
 
-const acquireNavigatorLock = Effect.fnUntraced(function*(
+const requestNavigatorLock = Effect.fnUntraced(function*(
   name: string,
-  options?: { readonly steal?: boolean }
+  mode: { readonly steal?: boolean; readonly ifAvailable?: boolean }
 ) {
   const scope = yield* Effect.scope
-  const granted = yield* Deferred.make<void>()
+  const granted = yield* Deferred.make<boolean>()
   const lost = yield* Deferred.make<void>()
   let releaseLock: () => void = () => {}
+  let closed = false
   const controller = new AbortController()
   let lockOptions: LockOptions
-  if (options?.steal === true) {
+  if (mode.steal === true) {
     lockOptions = { mode: "exclusive", steal: true }
+  } else if (mode.ifAvailable === true) {
+    lockOptions = { mode: "exclusive", ifAvailable: true }
   } else {
     lockOptions = { mode: "exclusive", signal: controller.signal }
   }
   const request = navigator.locks.request(
     name,
     lockOptions,
-    () => {
-      Deferred.doneUnsafe(granted, Effect.void)
+    (lock) => {
+      if (lock === null) {
+        Deferred.doneUnsafe(granted, Effect.succeed(false))
+        return undefined
+      }
+      if (closed) return undefined
       // oxlint-disable-next-line effect/noNewPromise -- navigator.locks holds the lock exactly as long as the callback's promise stays pending, so the release must be a raw resolver the scope finalizer calls.
-      return new Promise<void>((resolve) => {
+      const held = new Promise<void>((resolve) => {
         releaseLock = resolve
       })
+      Deferred.doneUnsafe(granted, Effect.succeed(true))
+      return held
     }
   )
   // The request promise rejects when the grant is aborted or a later `steal`
@@ -64,18 +73,51 @@ const acquireNavigatorLock = Effect.fnUntraced(function*(
   yield* Scope.addFinalizer(
     scope,
     Effect.sync(() => {
+      closed = true
       releaseLock()
       controller.abort()
     })
   )
-  yield* Deferred.await(granted)
-  const hold: WebLockHold = { lost: Deferred.await(lost) }
-  return hold
+  const acquired = yield* Deferred.await(granted)
+  return { acquired, lost: Deferred.await(lost) }
 })
+
+const acquireNavigatorLock = (name: string, options?: { readonly steal?: boolean }) =>
+  requestNavigatorLock(name, { steal: options?.steal === true }).pipe(
+    Effect.map((request): WebLockHold => ({ lost: request.lost }))
+  )
+
+const tryAcquireNavigatorLock = (name: string) =>
+  requestNavigatorLock(name, { ifAvailable: true }).pipe(
+    Effect.map((request) => {
+      if (!request.acquired) return Option.none<WebLockHold>()
+      return Option.some<WebLockHold>({ lost: request.lost })
+    })
+  )
+
+const heldNavigatorLocks: Effect.Effect<ReadonlyArray<string>> = Effect.promise(() => navigator.locks.query()).pipe(
+  Effect.map((snapshot) => {
+    const names: Array<string> = []
+    for (const lock of snapshot.held ?? []) {
+      if (lock.mode === "exclusive" && lock.name !== undefined) names.push(lock.name)
+    }
+    return names
+  })
+)
+
+const releasedNavigatorLock = (name: string): Effect.Effect<void> =>
+  Effect.promise((signal) => navigator.locks.request(name, { mode: "shared", signal }, () => undefined)).pipe(
+    Effect.asVoid
+  )
 
 export const layerWebLocksNavigator: EffectLayer.Layer<WebLocks> = EffectLayer.succeed(
   WebLocks,
-  { acquire: acquireNavigatorLock }
+  {
+    acquire: acquireNavigatorLock,
+    tryAcquire: tryAcquireNavigatorLock,
+    held: heldNavigatorLocks,
+    released: releasedNavigatorLock
+  }
 )
 
 export interface TabChannelConnection {
@@ -94,9 +136,19 @@ export class TabChannel extends Context.Service<TabChannel, TabChannelService>()
 const openBroadcastChannel = Effect.fnUntraced(function*(name: string) {
   const scope = yield* Effect.scope
   const channel = new BroadcastChannel(name)
-  yield* Scope.addFinalizer(scope, Effect.sync(() => channel.close()))
+  let closed = false
+  yield* Scope.addFinalizer(
+    scope,
+    Effect.sync(() => {
+      closed = true
+      channel.close()
+    })
+  )
   const connection: TabChannelConnection = {
-    post: (frame) => Effect.sync(() => channel.postMessage(frame)),
+    post: (frame) =>
+      Effect.sync(() => {
+        if (!closed) channel.postMessage(frame)
+      }),
     messages: Effect.gen(function*() {
       const subscriberScope = yield* Effect.scope
       const queue = yield* Queue.make<unknown>()
@@ -121,41 +173,32 @@ export const layerTabChannelBroadcast: EffectLayer.Layer<TabChannel> = EffectLay
   { open: openBroadcastChannel }
 )
 
-export interface EpochStoreService {
-  readonly bump: (key: string) => Effect.Effect<number, BrowserStorageError>
+export interface TabVisibilityService {
+  readonly visible: Effect.Effect<boolean>
+  readonly changes: Stream.Stream<void>
 }
 
-export class EpochStore extends Context.Service<EpochStore, EpochStoreService>()(
-  "@lucas-barake/effect-local-browser/EpochStore"
+export class TabVisibility extends Context.Service<TabVisibility, TabVisibilityService>()(
+  "@lucas-barake/effect-local-browser/TabVisibility"
 ) {}
 
-export const layerEpochStoreLocalStorage: EffectLayer.Layer<EpochStore> = EffectLayer.succeed(
-  EpochStore,
+export const layerTabVisibilityDocument: EffectLayer.Layer<TabVisibility> = EffectLayer.succeed(
+  TabVisibility,
   {
-    bump: Effect.fnUntraced(function*(key) {
-      const raw = yield* Effect.try({
-        try: () => {
-          // oxlint-disable-next-line effect/noGlobals -- This layer is the browser platform adapter for epoch storage; the epoch must be readable synchronously before any database is open.
-          return localStorage.getItem(key)
-        },
-        catch: (cause) => new BrowserStorageError({ operation: "read", key, cause })
-      })
-      let previous = 0
-      if (raw !== null) {
-        previous = yield* Schema.decodeUnknownEffect(StoredEpoch)(raw).pipe(
-          Effect.mapError((cause) => new BrowserStorageError({ operation: "decode", key, cause }))
-        )
+    visible: Effect.sync(() => typeof document !== "object" || document.visibilityState !== "hidden"),
+    changes: LosslessQueue.callback<void>((queue) => {
+      if (typeof document !== "object") return Queue.offer(queue, undefined)
+      const listener = () => {
+        Queue.offerUnsafe(queue, undefined)
       }
-      const next = previous + 1
-      yield* Effect.try({
-        try: () => {
-          // oxlint-disable-next-line effect/noGlobals -- Same platform adapter boundary as the read above.
-          localStorage.setItem(key, String(next))
-        },
-        catch: (cause) => new BrowserStorageError({ operation: "write", key, cause })
-      })
-      return next
-    })
+      return Effect.acquireRelease(
+        Effect.sync(() => {
+          document.addEventListener("visibilitychange", listener)
+          Queue.offerUnsafe(queue, undefined)
+        }),
+        () => Effect.sync(() => document.removeEventListener("visibilitychange", listener))
+      )
+    }, { bufferSize: 1, strategy: "sliding" })
   }
 )
 

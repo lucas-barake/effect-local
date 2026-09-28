@@ -12,7 +12,8 @@ import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import type * as Statement from "effect/unstable/sql/Statement"
 import * as Codec from "./codec.js"
-import { affinitySql, encodedComponents, encodedPrimitive, type SqlValue } from "./indexComponents.js"
+import type * as Dialect from "./dialect.js"
+import { encodedComponents, encodedPrimitive, type SqlValue } from "./indexComponents.js"
 import * as StorageUnavailable from "./storageUnavailable.js"
 
 interface Descriptor {
@@ -81,9 +82,14 @@ const PartitionValues = Schema.Array(Schema.Union([Schema.String, Schema.Number]
 
 const backfillPageSize = 500
 
-const makeDescriptor = (model: Model.Any, indexName: string, index: SecondaryIndex.Any): Descriptor => {
+const makeDescriptor = (
+  dialect: Dialect.Dialect,
+  model: Model.Any,
+  indexName: string,
+  index: SecondaryIndex.Any
+): Descriptor => {
   const hash = Canonical.hash({
-    format: 3,
+    format: 1,
     model: model.name,
     index: indexName,
     version: index.version,
@@ -107,15 +113,15 @@ const makeDescriptor = (model: Model.Any, indexName: string, index: SecondaryInd
       prefix = "p"
       ordinal = position
     }
-    return `${prefix}${ordinal} ${affinitySql[component.affinity]} NOT NULL`
+    return `${prefix}${ordinal} ${dialect.indexColumn(component.affinity)} NOT NULL`
   })
   const tableDdl = `CREATE TABLE IF NOT EXISTS ${tableName} (
-    space_id TEXT NOT NULL,
-    schema_generation INTEGER NOT NULL CHECK (schema_generation >= 0),
-    entity_key TEXT NOT NULL,
+    space_id ${dialect.text} NOT NULL,
+    schema_generation ${dialect.integer} NOT NULL CHECK (schema_generation >= 0),
+    entity_key ${dialect.text} NOT NULL,
     ${componentColumns.join(",\n    ")},
     PRIMARY KEY (space_id, schema_generation, entity_key)
-  ) WITHOUT ROWID`
+  )${dialect.tableOptions}`
   const scanColumns = [
     "space_id",
     "schema_generation",
@@ -127,6 +133,11 @@ const makeDescriptor = (model: Model.Any, indexName: string, index: SecondaryInd
   return { model, indexName, index, hash, tableName, scanIndexName, tableDdl, scanIndexDdl }
 }
 
+const bindComponent = (dialect: Dialect.Dialect, value: SqlValue): SqlValue => {
+  if (typeof value === "string") return dialect.encodeText(value)
+  return value
+}
+
 const partitionColumns = (descriptor: Descriptor): ReadonlyArray<string> =>
   descriptor.index.partition.map((_, position) => `p${position}`)
 
@@ -134,6 +145,7 @@ const sortColumns = (descriptor: Descriptor): ReadonlyArray<string> =>
   descriptor.index.sort.map((_, position) => `s${position}`)
 
 const indexRow = (
+  dialect: Dialect.Dialect,
   descriptor: Descriptor,
   spaceId: Identity.SpaceId,
   schemaGeneration: number,
@@ -146,10 +158,10 @@ const indexRow = (
     entity_key: entityKey
   }
   for (let position = 0; position < descriptor.index.partition.length; position++) {
-    row[`p${position}`] = values[position]
+    row[`p${position}`] = bindComponent(dialect, values[position])
   }
   for (let position = 0; position < descriptor.index.sort.length; position++) {
-    row[`s${position}`] = values[descriptor.index.partition.length + position]
+    row[`s${position}`] = bindComponent(dialect, values[descriptor.index.partition.length + position])
   }
   return row
 }
@@ -157,10 +169,11 @@ const indexRow = (
 export const make = Effect.fn("ServerIndex.make")(
   function*(
     sql: SqlClient.SqlClient,
+    dialect: Dialect.Dialect,
     definition: Definition.Any
   ) {
     const all = definition.models.flatMap((model) =>
-      Object.entries(model.indexes).map(([indexName, index]) => makeDescriptor(model, indexName, index))
+      Object.entries(model.indexes).map(([indexName, index]) => makeDescriptor(dialect, model, indexName, index))
     )
     const byModel = new Map<string, ReadonlyArray<Descriptor>>()
     for (const model of definition.models) {
@@ -169,51 +182,69 @@ export const make = Effect.fn("ServerIndex.make")(
     const byLabel = new Map(
       all.map((descriptor) => [Canonical.stringify([descriptor.model.name, descriptor.indexName]), descriptor])
     )
-    for (const descriptor of all) {
-      yield* sql.unsafe(descriptor.tableDdl)
-      yield* sql.unsafe(descriptor.scanIndexDdl)
-      yield* sql`INSERT INTO effect_local_server_index_catalog
-        (model, index_name, descriptor_hash, table_name, scan_index_name)
-        VALUES (${descriptor.model.name}, ${descriptor.indexName}, ${descriptor.hash},
-          ${descriptor.tableName}, ${descriptor.scanIndexName})
-        ON CONFLICT (model, index_name, descriptor_hash) DO NOTHING`
-    }
-    const catalog = yield* SqlSchema.findAll({
-      Request: Schema.Void,
-      Result: CatalogRow,
-      execute: () =>
-        sql`SELECT model, index_name, descriptor_hash, table_name, scan_index_name
-        FROM effect_local_server_index_catalog`
-    })(undefined).pipe(
-      Effect.catchTag(
-        "SchemaError",
-        (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
+    yield* sql.withTransaction(Effect.gen(function*() {
+      yield* dialect.lockSchema
+      const existing = yield* SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: CatalogRow,
+        execute: () =>
+          sql`SELECT model, index_name, descriptor_hash, table_name, scan_index_name
+          FROM effect_local_server_index_catalog`
+      })(undefined).pipe(
+        Effect.catchTag(
+          "SchemaError",
+          (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
+        )
       )
-    )
-    const byHash = new Map(all.map((descriptor) => [descriptor.hash, descriptor]))
-    for (const row of catalog) {
-      const tableName = `effect_local_srvidx_${row.descriptor_hash}`
-      const scanIndexName = `${tableName}_scan`
-      const descriptor = byHash.get(row.descriptor_hash)
-      if (
-        row.table_name !== tableName || row.scan_index_name !== scanIndexName ||
-        (descriptor !== undefined &&
-          (row.model !== descriptor.model.name || row.index_name !== descriptor.indexName))
-      ) {
-        return yield* new ReplicaError.StorageCorrupt({
-          message: "Server index catalog conflicts with its descriptor metadata"
-        })
+      const created = new Set(existing.map((row) => row.descriptor_hash))
+      for (const descriptor of all) {
+        if (created.has(descriptor.hash)) continue
+        yield* sql.unsafe(descriptor.tableDdl)
+        yield* sql.unsafe(descriptor.scanIndexDdl)
+        yield* sql`INSERT INTO effect_local_server_index_catalog
+          (model, index_name, descriptor_hash, table_name, scan_index_name)
+          VALUES (${descriptor.model.name}, ${descriptor.indexName}, ${descriptor.hash},
+            ${descriptor.tableName}, ${descriptor.scanIndexName})
+          ON CONFLICT (model, index_name, descriptor_hash) DO NOTHING`
       }
-      if (descriptor !== undefined) {
-        continue
+      const catalog = yield* SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: CatalogRow,
+        execute: () =>
+          sql`SELECT model, index_name, descriptor_hash, table_name, scan_index_name
+          FROM effect_local_server_index_catalog`
+      })(undefined).pipe(
+        Effect.catchTag(
+          "SchemaError",
+          (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
+        )
+      )
+      const byHash = new Map(all.map((descriptor) => [descriptor.hash, descriptor]))
+      for (const row of catalog) {
+        const tableName = `effect_local_srvidx_${row.descriptor_hash}`
+        const scanIndexName = `${tableName}_scan`
+        const descriptor = byHash.get(row.descriptor_hash)
+        if (
+          row.table_name !== tableName || row.scan_index_name !== scanIndexName ||
+          (descriptor !== undefined &&
+            (row.model !== descriptor.model.name || row.index_name !== descriptor.indexName))
+        ) {
+          return yield* new ReplicaError.StorageCorrupt({
+            message: "Server index catalog conflicts with its descriptor metadata"
+          })
+        }
+        if (descriptor !== undefined) {
+          continue
+        }
+        yield* sql.unsafe(`DROP INDEX IF EXISTS ${scanIndexName}`)
+        yield* sql.unsafe(`DROP TABLE IF EXISTS ${tableName}`)
+        yield* sql`DELETE FROM effect_local_server_index_state WHERE descriptor_hash = ${row.descriptor_hash}`
+        yield* sql`DELETE FROM effect_local_server_index_catalog
+          WHERE model = ${row.model} AND index_name = ${row.index_name}
+            AND descriptor_hash = ${row.descriptor_hash}`
       }
-      yield* sql.unsafe(`DROP INDEX IF EXISTS ${scanIndexName}`)
-      yield* sql.unsafe(`DROP TABLE IF EXISTS ${tableName}`)
-      yield* sql`DELETE FROM effect_local_server_index_state WHERE descriptor_hash = ${row.descriptor_hash}`
-      yield* sql`DELETE FROM effect_local_server_index_catalog
-        WHERE model = ${row.model} AND index_name = ${row.index_name}
-          AND descriptor_hash = ${row.descriptor_hash}`
-    }
+      return undefined
+    }))
 
     const findState = SqlSchema.findOneOption({
       Request: Schema.Struct({
@@ -264,6 +295,17 @@ export const make = Effect.fn("ServerIndex.make")(
       )
     }
 
+    const decodePartitionValues = (valuesJson: string) =>
+      Codec.parse(valuesJson).pipe(
+        Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed)),
+        Effect.map((values) =>
+          values.map((value) => {
+            if (typeof value === "string") return dialect.decodeText(value)
+            return value
+          })
+        )
+      )
+
     const decodeValue = (model: Model.Any, valueJson: string) =>
       Codec.parse(valueJson).pipe(Effect.flatMap((parsed) => Codec.decode(model.schema, parsed)))
 
@@ -296,7 +338,7 @@ export const make = Effect.fn("ServerIndex.make")(
         for (const row of rows) {
           const value = yield* decodeValue(descriptor.model, row.value_json)
           const values = yield* encodedComponents(descriptor.index, value)
-          encoded.push(indexRow(descriptor, spaceId, schemaGeneration, row.entity_key, values))
+          encoded.push(indexRow(dialect, descriptor, spaceId, schemaGeneration, row.entity_key, values))
         }
         yield* writeRows(descriptor, encoded)
         after = rows[rows.length - 1].entity_key
@@ -353,13 +395,11 @@ export const make = Effect.fn("ServerIndex.make")(
           for (const row of rows) found.set(row.entity_key, [])
           continue
         }
-        const partitionIdentifiers = partitions.map((name) => sql.literal(name))
-        const valuesJson = sql.csv(partitionIdentifiers)
         const rows = yield* SqlSchema.findAll({
           Request: Schema.Void,
           Result: Schema.Struct({ entity_key: Schema.String, values_json: Schema.String }),
           execute: () =>
-            sql`SELECT entity_key, json_array(${valuesJson}) AS values_json
+            sql`SELECT entity_key, ${dialect.jsonArrayText(partitions)} AS values_json
               FROM ${sql(descriptor.tableName)}
               WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
                 AND entity_key IN ${sql.in(batch)}`
@@ -370,12 +410,7 @@ export const make = Effect.fn("ServerIndex.make")(
           )
         )
         for (const row of rows) {
-          found.set(
-            row.entity_key,
-            yield* Codec.parse(row.values_json).pipe(
-              Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed))
-            )
-          )
+          found.set(row.entity_key, yield* decodePartitionValues(row.values_json))
         }
       }
       return found
@@ -423,16 +458,16 @@ export const make = Effect.fn("ServerIndex.make")(
         }> = []
         const model = definition.modelByName.get(modelName)
         if (model === undefined) continue
+        const latest = new Map<string, Protocol.EntityChange>()
         for (const change of modelChanges) {
+          latest.set(yield* Codec.stringify(change.entity.key), change)
+        }
+        for (const [entityKey, change] of latest) {
           let value: unknown
           if (change._tag === "Upsert") {
             value = yield* Codec.decode(model.schema, change.value)
           }
-          prepared.push({
-            change,
-            entityKey: yield* Codec.stringify(change.entity.key),
-            value
-          })
+          prepared.push({ change, entityKey, value })
         }
         for (const descriptor of active) {
           const previousByKey = yield* readPartitions(
@@ -464,7 +499,7 @@ export const make = Effect.fn("ServerIndex.make")(
             const next = values.slice(0, descriptor.index.partition.length)
             if (previous !== undefined && Canonical.stringify(previous) !== Canonical.stringify(next)) log(previous)
             log(next)
-            rows.push(indexRow(descriptor, spaceId, schemaGeneration, item.entityKey, values))
+            rows.push(indexRow(dialect, descriptor, spaceId, schemaGeneration, item.entityKey, values))
           }
           for (let offset = 0; offset < deleted.length; offset += 100) {
             yield* sql`DELETE FROM ${sql(descriptor.tableName)}
@@ -494,7 +529,7 @@ export const make = Effect.fn("ServerIndex.make")(
       if (columns.length === 0) return sql`1 = 1`
       const clauses = columns.map((name, position) => {
         const column = sql(name)
-        return sql`${column} = ${values[position]}`
+        return sql`${column} = ${bindComponent(dialect, values[position])}`
       })
       return sql.and(clauses)
     }
@@ -506,10 +541,12 @@ export const make = Effect.fn("ServerIndex.make")(
       const leading = descriptor.index.sort[0]
       const column = sql(sortColumns(descriptor)[0])
       const clauses: Array<Statement.Fragment> = []
-      if (bounds.gt !== undefined) clauses.push(sql`${column} > ${yield* encodedPrimitive(leading, bounds.gt)}`)
-      if (bounds.gte !== undefined) clauses.push(sql`${column} >= ${yield* encodedPrimitive(leading, bounds.gte)}`)
-      if (bounds.lt !== undefined) clauses.push(sql`${column} < ${yield* encodedPrimitive(leading, bounds.lt)}`)
-      if (bounds.lte !== undefined) clauses.push(sql`${column} <= ${yield* encodedPrimitive(leading, bounds.lte)}`)
+      const bound = (value: Protocol.WindowComponentValue) =>
+        encodedPrimitive(leading, value).pipe(Effect.map((encoded) => bindComponent(dialect, encoded)))
+      if (bounds.gt !== undefined) clauses.push(sql`${column} > ${yield* bound(bounds.gt)}`)
+      if (bounds.gte !== undefined) clauses.push(sql`${column} >= ${yield* bound(bounds.gte)}`)
+      if (bounds.lt !== undefined) clauses.push(sql`${column} < ${yield* bound(bounds.lt)}`)
+      if (bounds.lte !== undefined) clauses.push(sql`${column} <= ${yield* bound(bounds.lte)}`)
       return clauses
     })
 
@@ -553,13 +590,20 @@ export const make = Effect.fn("ServerIndex.make")(
         )
       let exclusion = sql`1 = 1`
       if (overrideValues.length > 0) {
-        const overrideClauses = partitions.map((name, position) => {
+        const overrideClauses = partitions.map((name) => {
           const column = sql(name)
-          return sql`${column} = json_extract(override.value, ${`$[${position}]`})`
+          return sql`${table}.${column} = override.${sql.literal(name)}`
         })
         const overrideMatch = sql.and(overrideClauses)
+        const overrideRecords = overrideValues.map((values) =>
+          Object.fromEntries(partitions.map((name, position) => [name, bindComponent(dialect, values[position])]))
+        )
+        const overrideFields = descriptor.index.partition.map((component, position) => ({
+          name: partitions[position],
+          affinity: component.affinity
+        }))
         exclusion = sql`NOT EXISTS (
-            SELECT 1 FROM json_each(${Canonical.stringify(overrideValues)}) AS override
+            SELECT 1 FROM ${dialect.jsonRecords(Canonical.stringify(overrideRecords), "override", overrideFields)}
             WHERE ${overrideMatch}
           )`
       }
@@ -583,7 +627,7 @@ export const make = Effect.fn("ServerIndex.make")(
                 ROW_NUMBER() OVER (PARTITION BY ${partitionTuple} ORDER BY ${orderTuple}) AS window_rank
               FROM ${table}
               WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration} AND ${exclusion}
-            ) WHERE window_rank <= ${window.count}`
+            ) AS ranked WHERE window_rank <= ${window.count}`
         )
       }
       for (let position = 0; position < overrides.length; position++) {
@@ -712,13 +756,11 @@ export const make = Effect.fn("ServerIndex.make")(
       })
       for (let offset = 0; offset < entityKeys.length; offset += 100) {
         const batch = entityKeys.slice(offset, offset + 100)
-        const partitionIdentifiers = partitions.map((name) => sql.literal(name))
-        const valuesJson = sql.csv(partitionIdentifiers)
         const rows = yield* SqlSchema.findAll({
           Request: Schema.Void,
           Result: RowSchema,
           execute: () =>
-            sql`SELECT entity_key, json_array(${valuesJson}) AS values_json FROM ${table}
+            sql`SELECT entity_key, ${dialect.jsonArrayText(partitions)} AS values_json FROM ${table}
               WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
                 AND entity_key IN ${sql.in(batch)}`
         })(undefined).pipe(
@@ -728,10 +770,7 @@ export const make = Effect.fn("ServerIndex.make")(
           )
         )
         for (const row of rows) {
-          const values = yield* Codec.parse(row.values_json).pipe(
-            Effect.flatMap((parsed) => Codec.decode(PartitionValues, parsed))
-          )
-          found.set(row.entity_key, values)
+          found.set(row.entity_key, yield* decodePartitionValues(row.values_json))
         }
       }
       return found

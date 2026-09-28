@@ -17,12 +17,12 @@ import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
-import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as FaultInjection from "../src/FaultInjection.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as TestReplica from "../src/TestReplica.js"
 import * as TestServer from "../src/TestServer.js"
 
@@ -41,7 +41,7 @@ const PutTodo = Mutation.make("PutTodo", {
   success: Todo.schema
 })
 
-class RejectTodoError extends Schema.TaggedErrorClass<RejectTodoError>(
+class RejectTodoError extends Schema.TaggedError<RejectTodoError>(
   "@lucas-barake/effect-local-test/RejectTodoError"
 )("RejectTodoError", { code: Schema.NumberFromString }) {}
 
@@ -151,6 +151,14 @@ const makeServices = Effect.gen(function*() {
   return { faults, replica }
 })
 
+const advanceClockUntil = Effect.fnUntraced(
+  function*<A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) {
+    const fiber = yield* Effect.forkChild(effect, { startImmediately: true })
+    while (fiber.pollUnsafe() === undefined) yield* TestClock.adjust("1 millis")
+    return yield* Fiber.join(fiber)
+  }
+)
+
 const subscribe = <A, E,>(stream: Stream.Stream<A, E>) =>
   stream.pipe(
     Stream.runHead,
@@ -200,8 +208,7 @@ describe("mutation observability", () => {
       assert.strictEqual(firstCommitted.receipt.mutationId, pending.envelope.mutationId)
       assert.strictEqual(dropped.receipt.mutationId, pending.envelope.mutationId)
       yield* faults.holdNextReceipt(spaceId)
-      yield* TestClock.adjust("1 millis")
-      const secondCommitted = yield* faults.awaitReceiptCommitted(spaceId)
+      const secondCommitted = yield* advanceClockUntil(faults.awaitReceiptCommitted(spaceId))
       assert.deepStrictEqual(secondCommitted.receipt, firstCommitted.receipt)
       const barrier = yield* space.mutate(PutTodo, { id: "trigger", title: "next reconciliation" })
       yield* faults.partitionAfterNextReceipt(spaceId)
@@ -209,8 +216,7 @@ describe("mutation observability", () => {
       const firstReturned = yield* faults.awaitReceiptReturned(spaceId)
       yield* faults.awaitRequestRejectedOffline(spaceId)
       yield* faults.heal(spaceId)
-      yield* TestClock.adjust("2 millis")
-      const duplicateReturned = yield* faults.awaitReceiptReturned(spaceId)
+      const duplicateReturned = yield* advanceClockUntil(faults.awaitReceiptReturned(spaceId))
       assert.strictEqual(firstReturned.receipt.mutationId, pending.envelope.mutationId)
       assert.strictEqual(duplicateReturned.receipt.mutationId, pending.envelope.mutationId)
       assert.deepStrictEqual(duplicateReturned.receipt, firstReturned.receipt)
@@ -220,7 +226,7 @@ describe("mutation observability", () => {
       const collectThroughBarrier = Effect.fnUntraced(function*(collector: typeof firstCollector) {
         const settlements: Array<Replica.SettledMutation<typeof PutTodo>> = []
         while (true) {
-          const settled = yield* Queue.take(collector)
+          const settled = yield* LosslessQueue.take(collector)
           settlements.push(settled)
           if (settled.settlement.pending.envelope.mutationId === barrier.envelope.mutationId) return settlements
         }

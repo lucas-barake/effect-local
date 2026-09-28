@@ -15,10 +15,10 @@ const TodoV1 = Model.make("Todo", {
   key: Schema.String,
   schema: Schema.Struct({ id: Schema.String, title: Schema.String })
 })
-class Missing extends Schema.TaggedErrorClass<Missing>(
+class Missing extends Schema.TaggedError<Missing>(
   "@lucas-barake/effect-local/test/Evolution/Missing"
 )("Missing", {}) {}
-class Forbidden extends Schema.TaggedErrorClass<Forbidden>(
+class Forbidden extends Schema.TaggedError<Forbidden>(
   "@lucas-barake/effect-local/test/Evolution/Forbidden"
 )("Forbidden", {}) {}
 const PutTodoV1 = Mutation.make("PutTodo", {
@@ -74,12 +74,7 @@ const oneToTwo = Evolution.step({
 })
 const evolution = Evolution.make({
   current: definitionV2,
-  steps: [oneToTwo],
-  legacyBaselines: [Evolution.legacyBaseline({
-    id: "mutation-log-v1",
-    hash: "0123456789abcdef",
-    definition: definitionV1
-  })]
+  steps: [oneToTwo]
 })
 
 describe("schema evolution", () => {
@@ -119,7 +114,6 @@ describe("schema evolution", () => {
         }),
       /does not terminate/
     )
-    assert.strictEqual(evolution.legacyBaselineByHash.get("0123456789abcdef")?.definition, definitionV1)
   })
 
   it.effect(

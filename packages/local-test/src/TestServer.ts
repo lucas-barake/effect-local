@@ -29,21 +29,36 @@ export const layer: Layer.Layer<
     })
     return SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
-      submit: Effect.fnUntraced(function*(request) {
-        yield* online(request.envelope.spaceId)
-        const receipt = yield* server.submit(request)
-        yield* faults.emit({ _tag: "ReceiptCommitted", spaceId: request.envelope.spaceId, receipt })
-        if (yield* faults.takeDroppedReceipt(request.envelope.spaceId)) {
-          yield* faults.emit({ _tag: "ReceiptDropped", spaceId: request.envelope.spaceId, receipt })
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
+      submitBatch: Effect.fnUntraced(function*(request) {
+        const spaceId = request.envelopes[0].spaceId
+        yield* online(spaceId)
+        const result = yield* server.admitBatch(request, null)
+        yield* Effect.forEach(
+          result.receipts,
+          (receipt) => faults.emit({ _tag: "ReceiptCommitted", spaceId, receipt }),
+          { discard: true }
+        )
+        if (yield* faults.takeDroppedReceipt(spaceId)) {
+          yield* Effect.forEach(
+            result.receipts,
+            (receipt) => faults.emit({ _tag: "ReceiptDropped", spaceId, receipt }),
+            { discard: true }
+          )
           return yield* new ReplicaError.ServerUnavailable()
         }
-        yield* faults.awaitReceiptRelease(request.envelope.spaceId)
-        if (yield* faults.takePartitionAfterReceipt(request.envelope.spaceId)) {
-          yield* faults.partition(request.envelope.spaceId)
+        yield* faults.awaitReceiptRelease(spaceId)
+        if (yield* faults.takePartitionAfterReceipt(spaceId)) {
+          yield* faults.partition(spaceId)
         }
-        yield* faults.emit({ _tag: "ReceiptReturned", spaceId: request.envelope.spaceId, receipt })
-        yield* faults.markReceiptReturned(request.envelope.spaceId)
-        return receipt
+        yield* Effect.forEach(
+          result.receipts,
+          (receipt) => faults.emit({ _tag: "ReceiptReturned", spaceId, receipt }),
+          { discard: true }
+        )
+        yield* faults.markReceiptReturned(spaceId)
+        return result
       }),
       discard: (request) => online(request.envelope.spaceId).pipe(Effect.andThen(server.discard(request, null))),
       pull: Effect.fnUntraced(function*(request) {

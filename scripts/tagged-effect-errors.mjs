@@ -782,7 +782,7 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
             const inspectBase = (node) => {
               if (schemaTagged) return
               const symbol = checker.getSymbolAtLocation(node)
-              if (hasDeclarationFrom(symbol, "TaggedErrorClass", schemaDeclarations)) {
+              if (hasDeclarationFrom(symbol, "TaggedError", schemaDeclarations)) {
                 schemaTagged = true
                 return
               }

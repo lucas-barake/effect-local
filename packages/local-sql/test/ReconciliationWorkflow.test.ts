@@ -28,6 +28,7 @@ import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import type * as Workflow from "effect/unstable/workflow/Workflow"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as LocalStore from "../src/LocalStore.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
@@ -50,7 +51,7 @@ const expectedFailure = <A, E extends { readonly _tag: string },>(exit: Exit.Exi
 
 const database = () => {
   return Layer.mergeAll(
-    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
+    ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))),
     NodeCrypto.layer,
     Reactivity.layer,
     QueryReactivity.layer
@@ -118,7 +119,9 @@ const directSync = (server: ServerStore.Service) =>
   pipe(
     SyncEngine.SyncEngine.of({
       waitForCredentialChange: () => Effect.never,
-      submit: server.submit,
+      transportGeneration: Effect.succeed(0),
+      waitForTransportChange: () => Effect.never,
+      submitBatch: (request) => server.admitBatch(request, null),
       discard: (request) => server.discard(request, null),
       pull: server.pull,
       bootstrap: server.bootstrap,
@@ -270,8 +273,10 @@ describe("reconciliation workflow", () => {
       const layerBlockedSync = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: () =>
             Deferred.succeed(pullEntered, undefined).pipe(
               Effect.andThen(Effect.never),
@@ -317,8 +322,10 @@ describe("reconciliation workflow", () => {
       const layerBlockedSync = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: () =>
             Deferred.succeed(pullEntered, undefined).pipe(
               Effect.andThen(Deferred.await(releasePull)),
@@ -372,10 +379,12 @@ describe("reconciliation workflow", () => {
       const credentialWaitStarted = yield* Deferred.make<void>()
       const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           waitForCredentialChange: () =>
             Deferred.succeed(credentialWaitStarted, undefined).pipe(Effect.andThen(Effect.never)),
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.die("unexpected submit"),
+          submitBatch: () => Effect.die("unexpected submit"),
           pull: () => Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 0 })),
           bootstrap: () => Effect.die("unexpected bootstrap"),
           watch: () =>
@@ -435,8 +444,10 @@ describe("reconciliation workflow", () => {
       const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, null),
-          submit: server.submit,
+          submitBatch: (request) => server.admitBatch(request, null),
           pull: (request) =>
             Ref.get(denied).pipe(
               Effect.flatMap((isDenied) => {
@@ -562,6 +573,25 @@ describe("reconciliation workflow", () => {
     Effect.fnUntraced(function*() {
       const serverContext = yield* Layer.build(layerServer)
       const server = Context.get(serverContext, ServerStore.ServerStore)
+      const submitting = yield* Deferred.make<void>()
+      const releaseSubmit = yield* Deferred.make<void>()
+      const layerGatedSync = Layer.succeed(
+        SyncEngine.SyncEngine,
+        SyncEngine.SyncEngine.of({
+          waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
+          submitBatch: (request) =>
+            Deferred.succeed(submitting, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseSubmit)),
+              Effect.andThen(server.admitBatch(request, null))
+            ),
+          discard: (request) => server.discard(request, null),
+          pull: server.pull,
+          bootstrap: server.bootstrap,
+          watch: server.watch
+        })
+      )
 
       const layerRunner = SingleRunner.layer({
         runnerStorage: "sql",
@@ -581,7 +611,7 @@ describe("reconciliation workflow", () => {
       }).pipe(
         Layer.provide(Domain.layerHandlers),
         Layer.provide(database()),
-        Layer.provide(directSync(server)),
+        Layer.provide(layerGatedSync),
         Layer.provideMerge(layerWorkflowEngine)
       )
       const context = yield* Layer.build(layerReplica)
@@ -589,17 +619,15 @@ describe("reconciliation workflow", () => {
       const space = yield* replica.space(spaceId)
 
       const mutation = yield* space.mutate(Domain.PutTodo, Domain.todo("cluster"))
-      const requested = 2
-      const payload = ReconciliationWorkflow.Payload.make({
-        scope: clientHistory.scope,
-        scopeGeneration,
-        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
-        spaceId,
-        clientId,
-        membershipIncarnation: mutation.envelope.membershipIncarnation,
-        generation: requested
-      })
-      yield* ReconciliationWorkflow.make(payload).execute(payload).pipe(Effect.provide(context))
+      yield* Deferred.await(submitting)
+      const settled = yield* space.settlementsFor(Domain.PutTodo, { from: 0 }).pipe(
+        Stream.runHead,
+        Effect.forkChild
+      )
+      yield* Deferred.succeed(releaseSubmit, undefined)
+      const settlement = Option.getOrThrow(yield* Fiber.join(settled)).settlement
+      assert.strictEqual(settlement.pending.envelope.mutationId, mutation.envelope.mutationId)
+      assert.strictEqual(settlement.receipt._tag, "Accepted")
 
       const storedReceipt = yield* space.receipt(Domain.PutTodo, mutation.envelope.mutationId)
       assert.strictEqual(Option.getOrThrow(storedReceipt)._tag, "Accepted")
@@ -622,7 +650,17 @@ describe("reconciliation workflow", () => {
         QueryReactivity.QueryReactivity,
         Context.get(databaseContext, QueryReactivity.QueryReactivity)
       )
-      const layerReplicaDatabase = Layer.mergeAll(layerSql, layerCrypto, layerReactivity, layerQueryReactivity)
+      const layerLane = Layer.succeed(
+        ConnectionLane.ConnectionLane,
+        Context.get(databaseContext, ConnectionLane.ConnectionLane)
+      )
+      const layerReplicaDatabase = Layer.mergeAll(
+        layerSql,
+        layerLane,
+        layerCrypto,
+        layerReactivity,
+        layerQueryReactivity
+      )
       const layerRunner = SingleRunner.layer({ runnerStorage: "sql" }).pipe(Layer.provide(layerReplicaDatabase))
       const engineContext = yield* ClusterWorkflowEngine.layer.pipe(Layer.provideMerge(layerRunner), Layer.build)
       const engine = Context.get(engineContext, WorkflowEngine.WorkflowEngine)
@@ -646,8 +684,10 @@ describe("reconciliation workflow", () => {
         const server = Context.get(serverContext, ServerStore.ServerStore)
         let remote = SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, null),
-          submit: server.submit,
+          submitBatch: (request) => server.admitBatch(request, null),
           pull: server.pull,
           bootstrap: server.bootstrap,
           watch: server.watch
@@ -655,8 +695,10 @@ describe("reconciliation workflow", () => {
         if (definition.hash !== Domain.definition.hash) {
           remote = SyncEngine.SyncEngine.of({
             waitForCredentialChange: () => Effect.never,
+            transportGeneration: Effect.succeed(0),
+            waitForTransportChange: () => Effect.never,
             discard: (request) => server.discard(request, null),
-            submit: server.submit,
+            submitBatch: (request) => server.admitBatch(request, null),
             pull: (request) => {
               if (request.cursor === null) return server.pull(request)
               const cursor = request.cursor
@@ -698,7 +740,7 @@ describe("reconciliation workflow", () => {
         return local
       })
 
-      const legacy = yield* register(Domain.definition)
+      const previous = yield* register(Domain.definition)
       const registrationEntered = yield* Deferred.make<void>()
       const interruptedEngine = new Proxy(engine, {
         get: (target, property, receiver) => {
@@ -712,20 +754,20 @@ describe("reconciliation workflow", () => {
       yield* Deferred.await(registrationEntered)
       yield* Fiber.interrupt(interruptedRegistration)
 
-      const retainedGeneration = yield* legacy.requestReconciliation
+      const retainedGeneration = yield* previous.requestReconciliation
       const retainedPayload = ReconciliationWorkflow.Payload.make({
         scope: clientHistory.scope,
         scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
-        membershipIncarnation: legacy.membershipIncarnation,
+        membershipIncarnation: previous.membershipIncarnation,
         generation: retainedGeneration
       })
       yield* ReconciliationWorkflow.make(retainedPayload).execute(retainedPayload).pipe(
         Effect.provideService(WorkflowEngine.WorkflowEngine, engine)
       )
-      assert.deepStrictEqual(yield* legacy.reconciliationGenerations, {
+      assert.deepStrictEqual(yield* previous.reconciliationGenerations, {
         requested: retainedGeneration,
         completed: retainedGeneration
       })
@@ -750,17 +792,17 @@ describe("reconciliation workflow", () => {
         completed: generation
       })
 
-      const legacyGeneration = yield* legacy.requestReconciliation
-      const legacyPayload = ReconciliationWorkflow.Payload.make({
+      const previousGeneration = yield* previous.requestReconciliation
+      const previousPayload = ReconciliationWorkflow.Payload.make({
         scope: clientHistory.scope,
         scopeGeneration,
         schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
         spaceId,
         clientId,
-        membershipIncarnation: legacy.membershipIncarnation,
-        generation: legacyGeneration
+        membershipIncarnation: previous.membershipIncarnation,
+        generation: previousGeneration
       })
-      const result = yield* ReconciliationWorkflow.make(legacyPayload).execute(legacyPayload).pipe(
+      const result = yield* ReconciliationWorkflow.make(previousPayload).execute(previousPayload).pipe(
         Effect.provideService(WorkflowEngine.WorkflowEngine, engine),
         Effect.exit
       )
@@ -799,8 +841,10 @@ describe("reconciliation workflow", () => {
         const local = Context.get(localContext, LocalStore.Store)
         const remote = SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: () => Effect.die("unexpected discard"),
-          submit: () => Effect.fail(new ReplicaError.ServerUnavailable()),
+          submitBatch: () => Effect.fail(new ReplicaError.ServerUnavailable()),
           pull: (request) =>
             Ref.update(pulls, (count) => count + 1).pipe(
               Effect.andThen(Deferred.succeed(pulled, undefined)),
@@ -885,8 +929,10 @@ describe("reconciliation workflow", () => {
       const server = Context.get(serverContext, ServerStore.ServerStore)
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
-        submit: () =>
+        submitBatch: () =>
           Ref.update(attempts, (count) => count + 1).pipe(
             Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
           ),
@@ -969,8 +1015,10 @@ describe("reconciliation workflow", () => {
       })
       const remote = SyncEngine.SyncEngine.of({
         waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
         discard: () => Effect.die("unexpected discard"),
-        submit: () => Effect.die("unexpected submit"),
+        submitBatch: () => Effect.die("unexpected submit"),
         pull: () =>
           Ref.update(attempts, (count) => count + 1).pipe(
             Effect.andThen(Deferred.succeed(attempted, undefined)),

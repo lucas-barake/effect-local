@@ -54,10 +54,12 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   return result
 }
 
+const UnknownFromJsonString = Schema.fromJsonString(Schema.Unknown)
+
 export const stringify = (value: unknown): string => {
   // Canonical hashing, cache keys, and SQL interpolation require this public codec to return synchronously.
   // oxlint-disable-next-line effect-local/noManualEffectBoundary
-  const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
+  const encode = Schema.encodeSync(UnknownFromJsonString)
   return encode(normalize(value, new WeakSet()))
 }
 

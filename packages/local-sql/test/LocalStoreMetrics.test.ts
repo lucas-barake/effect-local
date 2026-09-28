@@ -12,13 +12,14 @@ import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
 import * as Domain from "./Domain.js"
 
-class UnexpectedBootstrapInstallSuccess extends Schema.TaggedErrorClass<UnexpectedBootstrapInstallSuccess>(
+class UnexpectedBootstrapInstallSuccess extends Schema.TaggedError<UnexpectedBootstrapInstallSuccess>(
   "@lucas-barake/effect-local-sql/test/UnexpectedBootstrapInstallSuccess"
 )("UnexpectedBootstrapInstallSuccess", {}) {}
 
@@ -41,7 +42,7 @@ const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide
 const database = () => {
   const layerSqlite = SqliteClient.layer({ filename: ":memory:", disableWAL: true })
   return Layer.mergeAll(
-    layerSqlite,
+    ConnectionLane.makeLayer().pipe(Layer.provideMerge(layerSqlite)),
     NodeCrypto.layer,
     Reactivity.layer,
     QueryReactivity.layer
@@ -170,7 +171,7 @@ describe("LocalStore metrics", () => {
           }
         })
         const layerInfrastructure = Layer.mergeAll(
-          Layer.succeed(SqlClient.SqlClient, observedSql),
+          ConnectionLane.makeLayer().pipe(Layer.provideMerge(Layer.succeed(SqlClient.SqlClient, observedSql))),
           NodeCrypto.layer,
           Reactivity.layer,
           QueryReactivity.layer
@@ -339,7 +340,7 @@ describe("LocalStore metrics", () => {
       )
 
       assert.strictEqual(error._tag, "StorageUnavailable", "bootstrap installation must fail during projection replay")
-      assert.strictEqual(yield* store.cursor, 1)
+      assert.strictEqual((yield* store.progress).cursor, 1)
       assert.strictEqual(yield* bootstrapInstallCount, 1)
       assert.strictEqual(yield* pendingCount, 1)
       yield* Scope.close(scope, Exit.void)

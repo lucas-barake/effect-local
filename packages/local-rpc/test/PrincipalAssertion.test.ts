@@ -34,7 +34,7 @@ const layerDatabase = Layer.mergeAll(
   NodeCrypto.layer,
   Reactivity.layer
 )
-class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationError, Schema.JsonObject>(
+class TestAuthorizationError extends Schema.TaggedError<TestAuthorizationError, Schema.JsonObject>(
   "@lucas-barake/effect-local-rpc/test/PrincipalAssertion/TestAuthorizationError"
 )("TestAuthorizationError", { reason: Schema.String }) {}
 const layerStore = ServerStore.layer({
@@ -72,8 +72,26 @@ const layerTestShardingConfig = ShardingConfig.layer({
 })
 const provideTestShardingConfig = Effect.provide(layerTestShardingConfig)
 const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
+const provideJsonAssertions = Effect.provide(PrincipalAssertion.layerJson)
 
 describe("principal assertions", () => {
+  it.effect(
+    "layerJson round trips a principal and rejects a malformed assertion",
+    Effect.fnUntraced(function*() {
+      const issuer = yield* PrincipalAssertion.Issuer
+      const verifier = yield* PrincipalAssertion.Verifier
+      const principal = { userId: "alice", roles: ["reader", "writer"] }
+      const assertion = yield* issuer.issue(principal)
+      const verified = yield* verifier.verify(assertion)
+      assert.deepStrictEqual(verified, principal)
+
+      const forged = PrincipalAssertion.PrincipalAssertion.make("{not json")
+      const malformed = yield* verifier.verify(forged).pipe(Effect.result)
+      if (!Result.isFailure(malformed)) assert.fail("expected a malformed assertion to be denied")
+      assert.strictEqual(malformed.failure._tag, "AuthorizationDenied")
+    }, provideJsonAssertions)
+  )
+
   it.effect(
     "rejects a forged internal assertion before reaching entity authorization",
     Effect.fnUntraced(
@@ -85,11 +103,6 @@ describe("principal assertions", () => {
           return Effect.fail(new ReplicaError.AuthorizationDenied({ reason: "forged assertion" }))
         })
         const layerHandlers = SpaceEntity.layerHandlers({
-          admissionMailboxCapacity: 32,
-          readMailboxCapacity: 32,
-          watchMailboxCapacity: 32,
-          ephemeralJoinMailboxCapacity: 32,
-          ephemeralCommandMailboxCapacity: 32,
           maximumConcurrentBootstrapAuthorizations: 16,
           maximumConcurrentBootstrapPagesPerSpace: 4,
           maximumConcurrentEphemeralJoinVerificationsPerSpace: 16,
@@ -100,7 +113,7 @@ describe("principal assertions", () => {
           Layer.provide(EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 })),
           Layer.provide(layerVerifier)
         )
-        const makeClient = yield* Entity.makeTestClient(SpaceEntity.SpaceReadEntity, layerLiveHandlers)
+        const makeClient = yield* Entity.makeTestClient(SpaceEntity.Space, layerLiveHandlers)
         const client = yield* makeClient(spaceId)
         const request = Protocol.PullRequest.make({
           spaceId,

@@ -22,7 +22,9 @@ import * as Activity from "effect/unstable/workflow/Activity"
 import * as DurableClock from "effect/unstable/workflow/DurableClock"
 import * as Workflow from "effect/unstable/workflow/Workflow"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
+import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Reconciler from "./Reconciler.js"
 import * as SyncEngine from "./SyncEngine.js"
@@ -336,7 +338,7 @@ const handler = (
       )
     ))
     return undefined
-  })
+  }, Effect.provideService(ConnectionLane.Priority, "Background"))
 
 const register = Effect.fnUntraced(function*(
   options: Options,
@@ -381,18 +383,15 @@ const register = Effect.fnUntraced(function*(
   if (registered === undefined || registered.version < options.definition.schemaIdentity.version) {
     registrationState.schemas.set(replicaKey, options.definition.schemaIdentity)
   }
-  const legacySchemas = new Map<string, Definition.Any>()
+  const previousSchemas = new Map<string, Definition.Any>()
   for (const step of evolution.steps) {
-    legacySchemas.set(schemaIdentityKey(step.from), step.from)
+    previousSchemas.set(schemaIdentityKey(step.from), step.from)
   }
-  for (const baseline of evolution.legacyBaselines) {
-    legacySchemas.set(schemaIdentityKey(baseline.definition), baseline.definition)
-  }
-  legacySchemas.delete(schemaIdentityKey(options.definition))
-  for (const [legacyIdentity, definition] of legacySchemas) {
+  previousSchemas.delete(schemaIdentityKey(options.definition))
+  for (const [previousIdentity, definition] of previousSchemas) {
     yield* engine.register(
       make({
-        schemaIdentity: legacyIdentity,
+        schemaIdentity: previousIdentity,
         spaceId: options.spaceId,
         clientId: options.clientId,
         membershipIncarnation
@@ -567,7 +566,7 @@ const layerSchedulerWithConfiguration = (
       const supervise = Effect.gen(function*() {
         let retryAttempt = 0
         while (true) {
-          yield* Queue.take(wake)
+          yield* LosslessQueue.take(wake)
           yield* awaitAuthenticationChange
           const result = yield* Effect.gen(function*() {
             while (true) {
@@ -631,7 +630,9 @@ const layerSchedulerWithConfiguration = (
         }
       })
 
-      const supervisorFiber = yield* Effect.forkScoped(supervise)
+      const supervisorFiber = yield* Effect.forkScoped(
+        Effect.provideService(supervise, ConnectionLane.Priority, "Background")
+      )
       const watch = Effect.gen(function*() {
         let retryAttempt = 0
         while (true) {
@@ -694,7 +695,7 @@ const layerSchedulerWithConfiguration = (
           return
         }
       })
-      const watchFiber = yield* Effect.forkScoped(watch)
+      const watchFiber = yield* Effect.forkScoped(Effect.provideService(watch, ConnectionLane.Priority, "Background"))
       yield* requestAndNotify
       yield* Effect.addFinalizer(() => {
         return Fiber.interruptAll([supervisorFiber, watchFiber]).pipe(
@@ -716,7 +717,13 @@ const layerSchedulerWithConfiguration = (
         }
         yield* Fiber.join(supervisorInterruption)
       })
-      return Reconciler.Reconciler.of({ sync: reconciliation.sync, notify, status: reconciliation.status, shutdown })
+      return Reconciler.Reconciler.of({
+        sync: reconciliation.sync,
+        notify,
+        schedule: notify,
+        status: reconciliation.status,
+        shutdown
+      })
     })
   )
 

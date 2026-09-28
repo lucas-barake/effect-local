@@ -5,7 +5,7 @@ local SQLite, works while offline, and reconciles with an authoritative server a
 returns. Effect Schema defines every domain, durable, and wire contract. Effect services, Layers, scopes, streams,
 and Atom own the runtime.
 
-The library targets Effect `4.0.0-beta.103`. It has not published a stable release. Durable and public contracts may
+The library targets Effect `4.0.0-rc.117`. It has not published a stable release. Durable and public contracts may
 change before v1.
 
 ## Architecture
@@ -36,9 +36,11 @@ The submitting client's result remains in its private receipt. Replication sends
 for that client. The client applies those view changes to canonical state and then replays its remaining pending
 mutations over that state.
 
-Effect Cluster owns deployment neutral routing and live ownership. Separate entities per space isolate mutation
-admission, reads, watches, and bounded ephemera while routing them across runners. The actors do not retain mutation
-payloads or replies in Cluster message history. Server SQL stores authoritative entities, bounded mutation history and
+Effect Cluster owns deployment neutral routing and live ownership on both sides. On the server, one entity per space
+serializes mutation admission and serves reads, watches, and bounded ephemera concurrently, on one runner or many.
+The actors do not retain mutation payloads or replies in Cluster message history. In the browser, the tabs of one
+origin form their own cluster over `BroadcastChannel` and Web Locks. The leader tab owns the SQLite database and hosts
+the replica entity, every tab reaches it through `Entity.client`, and another tab takes over when the leader closes. Server SQL stores authoritative entities, bounded mutation history and
 receipts, and a materialized replication view per client. Ephemeral roster, event, and state data stays in memory.
 Clients retain pending mutations, a dense view cursor, the global mutation watermark, durable retractions, and
 resumable scoped bootstrap staging in SQLite. Effect Workflow owns durable client scheduling through finite
@@ -57,7 +59,7 @@ invariants and failure model.
 | `@lucas-barake/effect-local`         | Models, mutations, queries, field semantics, protocol, and errors |
 | `@lucas-barake/effect-local-sql`     | SQLite state, server log, and Workflow reconciliation             |
 | `@lucas-barake/effect-local-rpc`     | WebSocket RPC, Cluster space routing, and bounded ephemera        |
-| `@lucas-barake/effect-local-browser` | Browser SQLite ports and the joined Effect Atom graph             |
+| `@lucas-barake/effect-local-browser` | Browser SQLite, the multi-tab replica cluster, and the Atom graph |
 | `@lucas-barake/effect-local-test`    | Production shaped test layers and deterministic network faults    |
 
 All packages are ESM. Public modules are available as subpaths such as
@@ -225,26 +227,11 @@ const layerDatabase = Layer.mergeAll(
   NodeCrypto.layer
 )
 
-const history = {
-  retainedReceipts: 256,
-  maximumReceipts: 1_024,
-  retainedHistoryEntries: 256,
-  maximumBootstrapEntities: 100_000,
-  maximumBootstrapBytes: 64 * 1024 * 1024,
-  maximumBootstrapPageBytes: 4 * 1024 * 1024,
-  migration: { retryDelay: "25 millis", maximumAttempts: 8 }
-} as const
-
 export const layerReplica = SqlReplica.layer({
   definition,
   clientId,
   defaultScope: scope,
-  initialSpaces: [spaceId],
-  maximumActiveSpaces: 8,
-  foregroundActiveSpaces: 4,
-  reconciliationConcurrency: 8,
-  foregroundReconciliationConcurrency: 2,
-  ...history
+  initialSpaces: [spaceId]
 }).pipe(
   Layer.provide(layerDomain),
   Layer.provide(layerDatabase),
@@ -267,6 +254,8 @@ const program = Replica.Replica.use((replica) =>
 ).pipe(Effect.provide(layerReplica), Effect.scoped)
 ```
 
+Every other option has a default listed in `SqlReplica.defaults`, and `defaultScope` defaults to every model.
+
 Call `replica.join(spaceId)` to remember membership, `replica.leave(spaceId)` to evict that space, and `replica.spaces`
 to list remembered handles. A remembered space starts inactive. `space.activate` opens its local runtime and watch,
 while `space.deactivate` releases them without deleting local data. Entity, query, mutation, pending, receipt, and
@@ -286,20 +275,22 @@ state. Read individual `space.status` values only for rows the UI displays.
 The explicit Workflow composition persists only reconciliation execution control. Application data stays in the same
 SQLite tables used by the in memory composition.
 
-`space.mutate` still completes at the local optimistic commit. It never waits for the server and its error channel
+`space.mutate` still completes at the local optimistic commit. Pass `{ mutationId }` as its third argument to make a
+retry idempotent: the same id and payload return the recorded mutation, and a different payload fails with
+`MutationIdentityConflict`, even after the receipt was pruned, for the next `retainedMutationIds` mutations. It never waits for the server and its error channel
 contains only failures from that local run. Use `space.pending` to inspect every in flight mutation, including its
 decoded payload, submission state, and attempt count. Use `space.pendingFor(PutTask)` when the mutation specific type
 matters. `space.settlements()` is a durable Stream of `{ sequence, settlement }` values, where each settlement holds
 the terminal `{ pending, receipt }` pair, delivered only after rollback and pending replay have completed. The default
 `from: "live"` starts at the current tail; `from: "acknowledged"` resumes from the durable acknowledgement floor, and
 `from: n` replays everything after sequence `n`, so a settlement recorded while no subscriber was attached, or before
-an app restart, is still observed. `space.settlementsFor(PutTask)` filters by mutation in the durable read and includes
-legacy receipts. `space.acknowledgeSettlements(sequence)` advances the retention floor: pruning prefers acknowledged
+an app restart, is still observed. `space.settlementsFor(PutTask)` filters by mutation in the durable read. `space.acknowledgeSettlements(sequence)` advances the retention floor: pruning prefers acknowledged
 settlements, but the retained receipt budget is always enforced, so an app that never subscribes or never acknowledges
 keeps syncing. A replay that falls behind the prune horizon fails with `SettlementReplayTruncated` carrying the oldest
-available sequence instead of silently skipping. Consumers read at their own pace from SQLite and can never
+available sequence instead of silently skipping. `space.resolveSettlementStart(from)` turns `"live"` or
+`"acknowledged"` into the numeric sequence a consumer can persist and resume from. Consumers read at their own pace from SQLite and can never
 backpressure reconciliation or the local `mutate` commit. Mutation rejections from either surface are decoded through
-`PutTask.rejectionSchema`; authorization, capacity, legacy, and quarantine rejections remain distinct origin tagged
+`PutTask.rejectionSchema`; authorization, capacity, and quarantine rejections remain distinct origin tagged
 JSON branches.
 
 Use `SqlReplica.layerWorkflow` when reconciliation must recover through Effect Workflow. Supply
@@ -417,18 +408,73 @@ transaction, so handler execution, materialization, sequence allocation, and har
 The dense space sequence remains the mutation basis. A separate dense view cursor orders the subset visible to one
 client.
 
-Call `ServerStore.maintain` or provide `ServerStore.layerMaintenance` in the server scope. Maintenance prepares the
-global recovery snapshot used to expire old mutation and receipt evidence, then reclaims bounded prefixes. Admission
-returns `CapacityExceeded` before handler execution when a hard cap is reached, so the maintenance Layer is required
-in a long lived deployment. A fresh or invalid client view receives `BootstrapRequired` and installs client, scope,
-schema, and principal bound pages into durable staging before one atomic canonical replacement.
+Maintenance prepares the global recovery snapshot used to expire old mutation and receipt evidence, then reclaims
+bounded prefixes. A write that takes a space past the midpoint between its retained target and hard cap starts one
+background compaction of that space, and `ServerStore.layerMaintenance` sweeps every space from an Effect Cluster
+singleton, once at start and then hourly by default. Admission returns `CapacityExceeded` before handler execution only
+when compaction cannot keep up with the hard cap. A fresh or invalid client view receives `BootstrapRequired` and
+installs client, scope, schema, and principal bound pages into durable staging before one atomic canonical replacement.
+
+`SyncServer.layer` builds the whole server from the definition and four authorization callbacks: the gateway, one
+Cluster entity per space, the `ServerStore`, the ephemeral hub, HMAC-signed principal assertions, and the maintenance
+singleton. Every limit has a documented default.
+
+```ts
+import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
+import * as SyncRpc from "@lucas-barake/effect-local-rpc/SyncRpc"
+import * as SyncServer from "@lucas-barake/effect-local-rpc/SyncServer"
+import * as Layer from "effect/Layer"
+import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
+import * as HttpRouter from "effect/unstable/http/HttpRouter"
+
+const layerProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(Layer.provide(HttpRouter.layer))
+
+export const layerServer = SyncServer.layer({
+  definition,
+  authorizeAccess,
+  authorizeMutation,
+  authorizeRead,
+  authorizeEphemeral
+}).pipe(
+  Layer.provideMerge(layerProtocol),
+  Layer.provide(Authentication.layerServer.pipe(Layer.provide(layerAuthenticator))),
+  Layer.provide(SingleRunner.layer({ runnerStorage: "memory" })),
+  Layer.provide(layerDomain),
+  Layer.provide(layerDatabase),
+  Layer.provide(HttpRouter.serve(layerProtocol)),
+  Layer.provide([layerHttpServer, SyncRpc.layerJson()])
+)
+```
+
+Replace `SingleRunner.layer` with Effect Cluster's runner transport and SQL runner and message storage to run the same
+layer on several processes, and pass one `assertionSecret` to all of them. Use NDJSON runner serialization, for
+example `NodeClusterSocket.layer({ serialization: "ndjson" })`: in Effect `4.0.0-rc.117` the default SchemaBinary
+runner serialization breaks volatile streaming entity calls between runners after their first element.
+
+### PostgreSQL server storage
+
+The server runs unchanged on PostgreSQL 16 or later. Provide a `PgClient` from `@effect/sql-pg` where the example
+above provides a SQLite client. Every runner can point at the same database, including runners on different hosts, and
+Effect Cluster's SQL runner and message storage accept the same client. Client replicas stay on SQLite.
+
+```ts
+import { PgClient } from "@effect/sql-pg"
+import * as Config from "effect/Config"
+
+const layerDatabase = PgClient.layerConfig({ url: Config.Redacted("DATABASE_URL") })
+```
+
+`Migrations.server` picks the PostgreSQL catalog from the client's dialect and fails with `InvalidConfiguration` for
+any other dialect. Pass the client without `transformResultNames` or `transformQueryNames`, because server rows are
+decoded by their snake case column names. See the
+[`effect-local-sql` guide](packages/local-sql/README.md#postgresql-server-storage) for the storage and locking details.
 
 `ServerStore.layer` requires `authorizeAccess`, `authorizeMutation`, and `authorizeRead`. Access authorization runs
 before retry receipt lookup. Mutation admission rejection consumes the client's local sequence and persists an exact
 retry receipt, but does not consume a server sequence. `ServerStore.layerTrusted` is the explicit allow all Layer for
 tests and already trusted processes.
 
-`SyncRpc.Rpcs` multiplexes submit, pull, bootstrap, watch, and ephemera on one Effect RPC WebSocket. The server uses
+`SyncRpc.Rpcs` multiplexes negotiation, batch submit, discard, pull, bootstrap, watch, and ephemera on one Effect RPC WebSocket. The server uses
 `Authentication.layerServer`. The client uses `Authentication.layerClient` with an application supplied
 `CredentialProvider`. Its `acquire` Effect runs for every RPC and returns a redacted bearer credential plus its
 nonnegative generation. `awaitChange(rejectedGeneration)` signals when `acquire` can return a different generation.
@@ -450,12 +496,10 @@ It also remains responsible for its HTTP server, WebSocket path, TLS, Origin pol
 tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. A
 reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
 
-The facade uses five space entities. `SpaceAdmissionEntity` serializes Submit and Discard.
-`SpaceReadEntity` serves Pull and Bootstrap concurrently. A Layer wide fail fast allowance bounds Bootstrap assertion verification
-and preparation. A separate per space allowance bounds immutable page reads. `SpaceWatchEntity` owns long lived sync
-watches. `SpaceEphemeralJoinEntity` owns joined streams, while `SpaceEphemeralCommandEntity` owns publish and
-heartbeat. The Hub applies its watcher bound after authorization. Separate command and stream lanes keep a paused
-Bootstrap page or full join population from blocking mutation admission. Saturated work fails with typed
+Each space is one entity. It serializes SubmitBatch and Discard behind one admission permit and serves Pull, Bootstrap,
+Watch, and ephemeral operations concurrently, so a paused Bootstrap page or a full join population cannot block
+mutation admission. A Layer wide fail fast allowance bounds Bootstrap assertion verification and preparation, and a
+per space allowance bounds immutable page reads and ephemeral join verification. Saturated work fails with typed
 `CapacityExceeded` resource `bootstrap authorizations`, `bootstrap pages`, or `ephemeral join verifications`.
 
 `ServerStore.maximumWatchersPerSpace` and `EphemeralHub.maximumWatchersPerSpace` independently cap active streams.
@@ -464,7 +508,7 @@ resubscribes to a fresh roster and retained-state snapshot. Join establishes a p
 and heartbeat, and periodic authorization revocation closes the established stream. Sync authorization successes
 are cached by the complete normalized space, client, scope, and principal input. The refresh interval is the fail closed
 revocation bound. Executing policy calls, live authorization callers and owner lookups, completed successes, and active
-watchers have separate required limits. The same pending allowance also bounds per-wake visibility work. Pending overflow fails with typed
+watchers have separate limits. The same pending allowance also bounds per-wake visibility work. Pending overflow fails with typed
 `CapacityExceeded { resource: "read authorizations", limit }`. Accepted mutations publish one shared postcommit wake.
 Delivery performs no SQLite transaction or space row write per watcher.
 
@@ -477,14 +521,39 @@ benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1
 
 ```ts
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
-import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
+import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
+import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 
-export const graph = BrowserReplica.make(Layer.merge(layerReplica, EphemeralClient.layer))
+const ConversationId = Schema.String.pipe(Schema.brand("ConversationId"))
+const Typing = Ephemeral.make("Typing", {
+  kind: "event",
+  payload: { conversationId: ConversationId, active: Schema.Boolean }
+})
+const ReadPosition = Ephemeral.make("ReadPosition", {
+  kind: "state",
+  key: ConversationId,
+  payload: { messageId: Schema.String }
+})
+const Presence = Ephemeral.member({ status: Schema.String })
+
+const ephemerals = [Typing, ReadPosition]
+
+export const graph = ReplicaAtom.make(
+  BrowserReplica.layer({
+    name: "tasks",
+    definition,
+    layerDatabase: BrowserSqlite.layerWorker(() => new Worker(new URL("./sqlite.worker.ts", import.meta.url))),
+    layerSync,
+    spaces: [spaceId],
+    ephemerals,
+    profiles: { presence: Presence }
+  }).pipe(Layer.provide(layerDomain))
+)
 
 export const taskAtom = graph.entity(spaceId, Task)("task-1")
 export const tasksAtom = graph.query(spaceId, ListTasks)({ completed: false })
@@ -506,18 +575,6 @@ const member = Protocol.EphemeralMember.make({
   clientId,
   membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
 })
-
-const ConversationId = Schema.String.pipe(Schema.brand("ConversationId"))
-const Typing = Ephemeral.make("Typing", {
-  kind: "event",
-  payload: { conversationId: ConversationId, active: Schema.Boolean }
-})
-const ReadPosition = Ephemeral.make("ReadPosition", {
-  kind: "state",
-  key: ConversationId,
-  payload: { messageId: Schema.String }
-})
-const Presence = Ephemeral.member({ status: Schema.String })
 
 export const sessionAtom = graph.ephemeral(Presence, {
   spaceId,
@@ -608,7 +665,8 @@ the enclosing model through the same transaction. These semantics are domain too
 ## Testing
 
 `TestServer.layer` adapts the real authoritative store to a production shaped `SyncEngine`. `FaultInjection` can
-partition and heal the link, drop the next receipt after the server commits it, and duplicate the next catch up page.
+partition and heal the link, drop the next submit response after the server commits its receipts, and duplicate the
+next catch up page.
 `TestReplica.layer` is the same `SqlReplica` composition used in production.
 
 The repository runs on Node `22.22.2`, `24.15.0`, or `26+`.
@@ -628,8 +686,7 @@ out. Application schema compatibility and wire protocol compatibility are separa
 determines which old domain definitions can still sync. Protocol negotiation determines whether two library versions
 can speak the same wire format.
 
-Deploy the compatible server first. A new client cannot negotiate with a server that does not expose the negotiation
-RPC, and an old client needs the new server to project current data back to its schema.
+Deploy the compatible server first. An old client needs the new server to project current data back to its schema.
 
 ### Define both migration directions
 
@@ -753,7 +810,8 @@ import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as SyncServer from "@lucas-barake/effect-local-rpc/SyncServer"
 import * as Layer from "effect/Layer"
 
-export const layerServerRpc = SyncServer.layerWithOptions({
+export const layerServerRpc = SyncServer.layer({
+  ...serverOptions,
   supportedProtocolVersions: [1, 2]
 })
 
@@ -772,9 +830,12 @@ export const layerClientRpc = Layer.merge(
 )
 ```
 
-Negotiation selects the highest shared version. A rolling peer that rejects a cached version causes one renegotiation
-and retry. If there is no common version, the client receives terminal `UpgradeRequired` instead of retrying a decode
+Negotiation selects the highest shared version. A peer that rejects a cached version causes one renegotiation and
+retry. If there is no common version, the client receives terminal `UpgradeRequired` instead of retrying a decode
 failure forever.
+
+Both sides default to `Protocol.supportedProtocolVersions`, which is `[1]`. Each `SubmitBatch` round trip carries up to
+`Protocol.maximumSubmitBatchEntries` pending mutations of one space.
 
 ### Prompt compatible old clients to reload
 
@@ -833,11 +894,10 @@ and restart.
 
 The complete deployment sequence is:
 
-1. Deploy a server that accepts the old schema and advertises both protocol versions.
-2. Deploy the new client bundle with the same evolution catalog and protocol overlap.
+1. Deploy a server that accepts the old schema.
+2. Deploy the new client bundle with the same evolution catalog.
 3. Prompt compatible old clients to reload and monitor their remaining usage.
 4. Reduce `acceptedSchemaVersions` only after the application deprecation horizon.
-5. Remove the old protocol version only after no deployed client requires it.
 
 ## Guarantees and limits
 
@@ -852,18 +912,17 @@ The complete deployment sequence is:
   schema evolution, and crash recovery.
 - A terminal rejection rolls back its optimistic write set and replays remaining pending mutations.
 - Queues, mutation payloads, ephemeral payloads and state, pull pages, bootstrap pages, snapshots, receipts, and retained history
-  are bounded by explicit configuration.
+  are bounded. Every bound has a documented default and can be overridden.
 - Ephemeral roster, live events, and retained state are best effort, server expired, multi-space isolated, and never
   enter the durable mutation log. Persist read or delivery positions with a normal application mutation when they must
   survive server restart or the configured state TTL.
-- Cluster routes each space to one live owner across runners. Entity operations are volatile. A failed submit remains
-  in the client's pending SQLite outbox until exact resubmission returns the SQL backed terminal receipt. Pull and watch
+- Cluster routes each space to one live owner across runners. Entity operations are volatile. A failed submit, or the
+  unacknowledged tail of a batch, remains in the client's pending SQLite outbox until exact resubmission returns the SQL
+  backed terminal receipt. Pull and watch
   recover from the durable server sequence.
 - Workflow executions are finite and generation keyed. SQLite progress repairs lost wakes and browser termination when
   a runner starts again.
 - The server is an authority, not a peer. Conflict behavior is arrival order unless a handler explicitly applies field
   semantics.
-- SQL storage schemas advance through an ordered checksum validated migration catalog. A lifecycle migration still
-  requires old server writers to stop before they can issue a legacy SQL write shape. This is separate from the
-  supported mixed application schema and wire protocol window. There is no backward SQL migration, multi writer
-  browser ownership coordinator, encryption layer, or stable v1 compatibility promise yet.
+- SQL storage schemas advance through an ordered checksum validated migration catalog. There is no backward SQL
+  migration, encryption layer, or stable v1 compatibility promise yet.

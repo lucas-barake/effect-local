@@ -15,11 +15,16 @@ import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import type * as OfflineWake from "../OfflineWake.js"
 import * as Codec from "./codec.js"
 import * as Configuration from "./configuration.js"
+import * as Dialect from "./dialect.js"
+import * as LosslessQueue from "./losslessQueue.js"
+import * as Rows from "./rows.js"
 import * as StorageUnavailable from "./storageUnavailable.js"
+import * as SqlTransaction from "./transaction.js"
 
 const NonNegativeInt = Schema.Natural
 const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 type Options<R = never,> = OfflineWake.Options<R>
+const presenceReconcileBatchSize = 256
 const DeliveryOutcome = Schema.Literals(["Delivered", "NotRecipient"])
 
 export interface Service {
@@ -43,31 +48,32 @@ const disabled: Service = {
 
 const SpaceRow = Schema.Struct({
   space_id: Identity.SpaceId,
-  high_water_sequence: Identity.ServerSequence,
-  expanded_sequence: Identity.ServerSequence,
-  membership_generation: NonNegativeInt,
-  attempt_count: NonNegativeInt,
-  next_attempt_at: NonNegativeInt,
+  high_water_sequence: Rows.integer(Identity.ServerSequence),
+  expanded_sequence: Rows.integer(Identity.ServerSequence),
+  membership_generation: Rows.integer(NonNegativeInt),
+  attempt_count: Rows.integer(NonNegativeInt),
+  next_attempt_at: Rows.integer(NonNegativeInt),
   claim_token: Schema.NullOr(Schema.String),
-  claimed_until: Schema.NullOr(NonNegativeInt)
+  claimed_until: Schema.NullOr(Rows.integer(NonNegativeInt))
 })
 
 const ClientRow = Schema.Struct({
   space_id: Identity.SpaceId,
   client_id: Identity.ClientId,
   wake_id: Identity.WakeId,
-  high_water_sequence: Identity.ServerSequence,
-  notified_sequence: Identity.ServerSequence,
-  membership_generation: PositiveInt,
-  attempt_count: NonNegativeInt,
-  next_attempt_at: NonNegativeInt,
+  high_water_sequence: Rows.integer(Identity.ServerSequence),
+  notified_sequence: Rows.integer(Identity.ServerSequence),
+  membership_generation: Rows.integer(PositiveInt),
+  attempt_count: Rows.integer(NonNegativeInt),
+  next_attempt_at: Rows.integer(NonNegativeInt),
   claim_token: Schema.NullOr(Schema.String),
-  claimed_until: Schema.NullOr(NonNegativeInt)
+  claimed_until: Schema.NullOr(Rows.integer(NonNegativeInt))
 })
 
+const ClientKey = Schema.Struct({ space_id: Identity.SpaceId, client_id: Identity.ClientId })
 const WatcherRow = Schema.Struct({ watcher_id: Schema.String })
 const RuntimeRow = Schema.Struct({ runtime_id: Schema.String })
-const CountRow = Schema.Struct({ count: NonNegativeInt })
+const CountRow = Schema.Struct({ count: Rows.integer(NonNegativeInt) })
 
 const randomToken = (crypto: Crypto.Crypto) =>
   crypto.randomUUIDv4.pipe(
@@ -136,6 +142,7 @@ export const make = Effect.fnUntraced(function*<R,>(
   }
 
   const sql = yield* SqlClient.SqlClient
+  const dialect = yield* Dialect.make(sql)
   const crypto = yield* Crypto.Crypto
   const runtimeId = yield* randomToken(crypto)
   const presences = new Map<string, {
@@ -176,10 +183,12 @@ export const make = Effect.fnUntraced(function*<R,>(
     execute: ({ now, token, claimedUntil, limit }) =>
       sql`UPDATE effect_local_server_offline_wake_spaces
         SET claim_token = ${token}, claimed_until = ${claimedUntil}
-        WHERE rowid IN (SELECT rowid FROM effect_local_server_offline_wake_spaces
+        WHERE space_id IN (SELECT space_id FROM effect_local_server_offline_wake_spaces
           WHERE high_water_sequence > expanded_sequence AND next_attempt_at <= ${now}
             AND (claim_token IS NULL OR claimed_until <= ${now})
-          ORDER BY next_attempt_at, space_id LIMIT ${limit})
+          ORDER BY next_attempt_at, space_id LIMIT ${limit} ${dialect.skipLocked})
+          AND high_water_sequence > expanded_sequence AND next_attempt_at <= ${now}
+          AND (claim_token IS NULL OR claimed_until <= ${now})
         RETURNING space_id, high_water_sequence, expanded_sequence, membership_generation,
           attempt_count, next_attempt_at, claim_token, claimed_until`
   })
@@ -280,81 +289,133 @@ export const make = Effect.fnUntraced(function*<R,>(
         Effect.mapError(StorageUnavailable.make),
         Effect.map((wakeId) => ({ clientId, wakeId }))
       ))
-    const pendingJson = yield* Codec.stringify(pending).pipe(Effect.mapError(StorageUnavailable.make))
+    const pendingJson = yield* Codec.stringify(
+      pending.map(({ clientId, wakeId }) => ({ client_id: clientId, wake_id: wakeId }))
+    ).pipe(Effect.mapError(StorageUnavailable.make))
     const generation = row.membership_generation + 1
-    yield* sql.withTransaction(Effect.gen(function*() {
-      const locked = yield* lockSpaceClaim({ spaceId: row.space_id, token: row.claim_token! })
-      if (Option.isNone(locked)) return yield* Effect.void
-      yield* sql`INSERT INTO effect_local_server_offline_wakes
+    yield* SqlTransaction.withServerTransaction(
+      sql,
+      Effect.gen(function*() {
+        const locked = yield* lockSpaceClaim({ spaceId: row.space_id, token: row.claim_token! })
+        if (Option.isNone(locked)) return yield* Effect.void
+        yield* sql`INSERT INTO effect_local_server_offline_wakes
             (space_id, client_id, wake_id, high_water_sequence, notified_sequence,
               membership_generation, attempt_count, next_attempt_at)
-            SELECT ${row.space_id}, json_extract(candidate.value, '$.clientId'),
-              json_extract(candidate.value, '$.wakeId'), ${row.high_water_sequence}, 0,
+            SELECT ${row.space_id}, candidate.client_id, candidate.wake_id, ${row.high_water_sequence}, 0,
               ${generation}, 0, COALESCE((SELECT MAX(runtime.expires_at)
                 FROM effect_local_server_watch_presence AS presence
                 INNER JOIN effect_local_server_watch_runtimes AS runtime
                   ON runtime.runtime_id = presence.runtime_id
                 WHERE presence.space_id = ${row.space_id}
-                  AND presence.client_id = json_extract(candidate.value, '$.clientId')
+                  AND presence.client_id = candidate.client_id
                   AND runtime.expires_at > ${now}), ${now})
-            FROM json_each(${pendingJson}) AS candidate
+            FROM ${
+          dialect.jsonRecords(pendingJson, "candidate", [
+            { name: "client_id", affinity: "text" },
+            { name: "wake_id", affinity: "text" }
+          ])
+        }
             WHERE COALESCE((SELECT acknowledged_sequence
               FROM effect_local_server_offline_wake_acknowledgements AS acknowledged
               WHERE acknowledged.space_id = ${row.space_id}
-                AND acknowledged.client_id = json_extract(candidate.value, '$.clientId')), 0)
+                AND acknowledged.client_id = candidate.client_id), 0)
               < ${row.high_water_sequence}
             ON CONFLICT (space_id, client_id) DO UPDATE SET
               wake_id = CASE
                 WHEN effect_local_server_offline_wakes.notified_sequence <
                   effect_local_server_offline_wakes.high_water_sequence
                 THEN effect_local_server_offline_wakes.wake_id ELSE excluded.wake_id END,
-              high_water_sequence = MAX(effect_local_server_offline_wakes.high_water_sequence,
-                excluded.high_water_sequence),
+              high_water_sequence = ${
+          dialect.greatest(
+            sql`effect_local_server_offline_wakes.high_water_sequence`,
+            sql`excluded.high_water_sequence`
+          )
+        },
               membership_generation = excluded.membership_generation,
               next_attempt_at = CASE
                 WHEN effect_local_server_offline_wakes.notified_sequence <
                   effect_local_server_offline_wakes.high_water_sequence
                 THEN effect_local_server_offline_wakes.next_attempt_at ELSE excluded.next_attempt_at END`
-      yield* sql`DELETE FROM effect_local_server_offline_wakes
+        yield* sql`DELETE FROM effect_local_server_offline_wakes
             WHERE space_id = ${row.space_id} AND membership_generation < ${generation}`
-      yield* sql`UPDATE effect_local_server_offline_wake_spaces SET
-            expanded_sequence = MAX(expanded_sequence, ${row.high_water_sequence}),
+        yield* sql`UPDATE effect_local_server_offline_wake_spaces SET
+            expanded_sequence = ${dialect.greatest(sql`expanded_sequence`, sql`${row.high_water_sequence}`)},
             membership_generation = ${generation}, attempt_count = 0,
             next_attempt_at = CASE WHEN high_water_sequence > ${row.high_water_sequence}
               THEN ${now + coalescingWindowMillis} ELSE 0 END,
             claim_token = NULL, claimed_until = NULL
             WHERE space_id = ${row.space_id} AND claim_token = ${row.claim_token}`
-      return yield* Effect.void
-    })).pipe(
+        return yield* Effect.void
+      })
+    ).pipe(
       Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
     )
   })
 
-  const claimClients = SqlSchema.findAll({
+  const claimableClient = (now: number) =>
+    sql`wake.high_water_sequence > wake.notified_sequence AND wake.next_attempt_at <= ${now}
+      AND (wake.claim_token IS NULL OR wake.claimed_until <= ${now})
+      AND NOT EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS presence
+        INNER JOIN effect_local_server_watch_runtimes AS runtime
+          ON runtime.runtime_id = presence.runtime_id
+        WHERE presence.space_id = wake.space_id AND presence.client_id = wake.client_id
+          AND runtime.expires_at > ${now})`
+  const findClaimableClients = SqlSchema.findAll({
+    Request: Schema.Struct({ now: NonNegativeInt, limit: PositiveInt }),
+    Result: ClientKey,
+    execute: ({ now, limit }) =>
+      sql`SELECT wake.space_id, wake.client_id FROM effect_local_server_offline_wakes AS wake
+        WHERE ${claimableClient(now)}
+        ORDER BY wake.next_attempt_at, wake.space_id, wake.client_id LIMIT ${limit}`
+  })
+  const claimCandidates = SqlSchema.findAll({
     Request: Schema.Struct({
       now: NonNegativeInt,
       token: Schema.String,
       claimedUntil: NonNegativeInt,
-      limit: PositiveInt
+      candidates: Schema.NonEmptyArray(ClientKey)
     }),
     Result: ClientRow,
-    execute: ({ now, token, claimedUntil, limit }) =>
+    execute: ({ now, token, claimedUntil, candidates }) =>
       sql`UPDATE effect_local_server_offline_wakes SET claim_token = ${token}, claimed_until = ${claimedUntil}
-        WHERE rowid IN (SELECT wake.rowid FROM effect_local_server_offline_wakes AS wake
-          WHERE wake.high_water_sequence > wake.notified_sequence AND wake.next_attempt_at <= ${now}
-            AND (wake.claim_token IS NULL OR wake.claimed_until <= ${now})
-            AND NOT EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS presence
-              INNER JOIN effect_local_server_watch_runtimes AS runtime
-                ON runtime.runtime_id = presence.runtime_id
-              WHERE presence.space_id = wake.space_id AND presence.client_id = wake.client_id
-                AND runtime.expires_at > ${now})
-          ORDER BY wake.next_attempt_at, wake.space_id, wake.client_id LIMIT ${limit})
+        WHERE (space_id, client_id) IN (SELECT wake.space_id, wake.client_id
+          FROM effect_local_server_offline_wakes AS wake
+          WHERE (${
+        sql.or(candidates.map((candidate) =>
+          sql`(wake.space_id = ${candidate.space_id} AND wake.client_id = ${candidate.client_id})`
+        ))
+      }) AND ${claimableClient(now)} ${dialect.skipLocked})
+          AND high_water_sequence > notified_sequence AND next_attempt_at <= ${now}
+          AND (claim_token IS NULL OR claimed_until <= ${now})
         RETURNING space_id, client_id, wake_id, high_water_sequence, notified_sequence,
           membership_generation, attempt_count, next_attempt_at, claim_token, claimed_until`
   })
+  const claimClients = (request: {
+    readonly now: number
+    readonly token: string
+    readonly claimedUntil: number
+    readonly limit: number
+  }) =>
+    SqlTransaction.withServerTransaction(
+      sql,
+      Effect.gen(function*() {
+        const candidates = yield* findClaimableClients({ now: request.now, limit: request.limit })
+        if (candidates.length === 0) return []
+        yield* dialect.lockPresences(candidates.map((candidate) => ({
+          spaceId: candidate.space_id,
+          clientId: candidate.client_id
+        })))
+        return yield* claimCandidates({
+          now: request.now,
+          token: request.token,
+          claimedUntil: request.claimedUntil,
+          candidates: [candidates[0], ...candidates.slice(1)]
+        })
+      })
+    )
   const activePresence = SqlSchema.findOne({
     Request: Schema.Struct({ spaceId: Identity.SpaceId, clientId: Identity.ClientId, now: NonNegativeInt }),
-    Result: Schema.Struct({ expires_at: Schema.NullOr(NonNegativeInt) }),
+    Result: Schema.Struct({ expires_at: Schema.NullOr(Rows.integer(NonNegativeInt)) }),
     execute: ({ spaceId, clientId, now }) =>
       sql`SELECT MAX(runtime.expires_at) AS expires_at FROM effect_local_server_watch_presence AS presence
         INNER JOIN effect_local_server_watch_runtimes AS runtime ON runtime.runtime_id = presence.runtime_id
@@ -468,19 +529,22 @@ export const make = Effect.fnUntraced(function*<R,>(
         Effect.provideService(Crypto.Crypto, crypto),
         Effect.mapError(StorageUnavailable.make)
       )
-      yield* sql.withTransaction(Effect.gen(function*() {
-        yield* sql`UPDATE effect_local_server_offline_wakes SET
+      yield* SqlTransaction.withServerTransaction(
+        sql,
+        Effect.gen(function*() {
+          yield* sql`UPDATE effect_local_server_offline_wakes SET
           wake_id = ${nextWakeId}, attempt_count = 0,
           next_attempt_at = ${completedAt + coalescingWindowMillis},
           claim_token = NULL, claimed_until = NULL
           WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
             AND claim_token = ${row.claim_token}
             AND high_water_sequence > ${row.high_water_sequence}`
-        yield* sql`DELETE FROM effect_local_server_offline_wakes
+          yield* sql`DELETE FROM effect_local_server_offline_wakes
           WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
             AND claim_token = ${row.claim_token}
             AND high_water_sequence <= ${row.high_water_sequence}`
-      })).pipe(
+        })
+      ).pipe(
         Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
       )
       return
@@ -490,7 +554,7 @@ export const make = Effect.fnUntraced(function*<R,>(
       Effect.mapError(StorageUnavailable.make)
     )
     yield* sql`UPDATE effect_local_server_offline_wakes SET
-          notified_sequence = MAX(notified_sequence, ${row.high_water_sequence}),
+          notified_sequence = ${dialect.greatest(sql`notified_sequence`, sql`${row.high_water_sequence}`)},
           wake_id = CASE WHEN high_water_sequence > ${row.high_water_sequence} THEN ${nextWakeId} ELSE wake_id END,
           attempt_count = 0,
           next_attempt_at = CASE WHEN high_water_sequence > ${row.high_water_sequence}
@@ -505,16 +569,17 @@ export const make = Effect.fnUntraced(function*<R,>(
 
   const run = Effect.gen(function*() {
     const now = yield* Clock.currentTimeMillis
-    yield* sql`DELETE FROM effect_local_server_watch_presence WHERE rowid IN (
-      SELECT presence.rowid FROM effect_local_server_watch_runtimes AS runtime
+    yield* sql`DELETE FROM effect_local_server_watch_presence WHERE (space_id, client_id, watcher_id) IN (
+      SELECT presence.space_id, presence.client_id, presence.watcher_id
+      FROM effect_local_server_watch_runtimes AS runtime
       INNER JOIN effect_local_server_watch_presence AS presence ON presence.runtime_id = runtime.runtime_id
       WHERE runtime.expires_at <= ${now}
       ORDER BY runtime.expires_at, runtime.runtime_id LIMIT ${options.claimBatchSize}
     )`.pipe(
       Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
     )
-    yield* sql`DELETE FROM effect_local_server_watch_runtimes WHERE rowid IN (
-      SELECT runtime.rowid FROM effect_local_server_watch_runtimes AS runtime
+    yield* sql`DELETE FROM effect_local_server_watch_runtimes WHERE runtime_id IN (
+      SELECT runtime.runtime_id FROM effect_local_server_watch_runtimes AS runtime
       WHERE runtime.expires_at <= ${now}
         AND NOT EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS presence
           WHERE presence.runtime_id = runtime.runtime_id)
@@ -588,8 +653,12 @@ export const make = Effect.fnUntraced(function*<R,>(
               attempt_count, next_attempt_at)
             VALUES (${spaceId}, ${sequence}, 0, 0, 0, ${now + coalescingWindowMillis})
             ON CONFLICT (space_id) DO UPDATE SET
-              high_water_sequence = MAX(effect_local_server_offline_wake_spaces.high_water_sequence,
-                excluded.high_water_sequence),
+              high_water_sequence = ${
+          dialect.greatest(
+            sql`effect_local_server_offline_wake_spaces.high_water_sequence`,
+            sql`excluded.high_water_sequence`
+          )
+        },
               next_attempt_at = CASE
                 WHEN effect_local_server_offline_wake_spaces.expanded_sequence >=
                   effect_local_server_offline_wake_spaces.high_water_sequence
@@ -610,24 +679,28 @@ export const make = Effect.fnUntraced(function*<R,>(
       let registered = false
       while (!registered) {
         const now = yield* Clock.currentTimeMillis
-        const inserted = yield* sql.withTransaction(Effect.gen(function*() {
-          yield* sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
+        const inserted = yield* SqlTransaction.withServerTransaction(
+          sql,
+          Effect.gen(function*() {
+            yield* dialect.lockPresences([{ spaceId, clientId }])
+            yield* sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
                 VALUES (${runtimeId}, ${now + presenceLeaseMillis})
                 ON CONFLICT (runtime_id) DO UPDATE SET expires_at = excluded.expires_at`
-          const presenceInserted = yield* insertPresence({
-            spaceId,
-            clientId,
-            watcherId,
-            databaseRuntimeId: runtimeId,
-            now
-          })
-          if (Option.isSome(presenceInserted)) {
-            yield* sql`UPDATE effect_local_server_offline_wakes SET
-              next_attempt_at = MAX(next_attempt_at, ${now + presenceLeaseMillis})
+            const presenceInserted = yield* insertPresence({
+              spaceId,
+              clientId,
+              watcherId,
+              databaseRuntimeId: runtimeId,
+              now
+            })
+            if (Option.isSome(presenceInserted)) {
+              yield* sql`UPDATE effect_local_server_offline_wakes SET
+              next_attempt_at = ${dialect.greatest(sql`next_attempt_at`, sql`${now + presenceLeaseMillis}`)}
               WHERE space_id = ${spaceId} AND client_id = ${clientId}`
-          }
-          return presenceInserted
-        })).pipe(Effect.mapError(StorageUnavailable.make))
+            }
+            return presenceInserted
+          })
+        ).pipe(Effect.mapError(StorageUnavailable.make))
         if (Option.isSome(inserted)) {
           registered = true
         } else {
@@ -671,23 +744,25 @@ export const make = Effect.fnUntraced(function*<R,>(
     execute: ({ databaseRuntimeId, encoded }) =>
       sql`WITH
         local_presence AS MATERIALIZED (
-          SELECT json_extract(value, '$.watcherId') AS watcher_id FROM json_each(${encoded})
+          SELECT local_records.watcher_id FROM ${
+        dialect.jsonRecords(encoded, "local_records", [{ name: "watcher_id", affinity: "text" }])
+      }
         ),
         durable_presence AS MATERIALIZED (
           SELECT watcher_id FROM effect_local_server_watch_presence WHERE runtime_id = ${databaseRuntimeId}
         )
         SELECT
           (SELECT COUNT(*) FROM (SELECT watcher_id FROM local_presence
-            EXCEPT SELECT watcher_id FROM durable_presence))
+            EXCEPT SELECT watcher_id FROM durable_presence) AS missing)
           + (SELECT COUNT(*) FROM (SELECT watcher_id FROM durable_presence
-            EXCEPT SELECT watcher_id FROM local_presence)) AS count`
+            EXCEPT SELECT watcher_id FROM local_presence) AS extra) AS count`
   })
 
   const deferRuntimeWakes = (heartbeatAt: number) =>
     sql`UPDATE effect_local_server_offline_wakes SET
-      next_attempt_at = MAX(next_attempt_at, ${heartbeatAt + presenceLeaseMillis})
-      WHERE rowid IN (
-        SELECT wake.rowid FROM effect_local_server_watch_presence AS presence
+      next_attempt_at = ${dialect.greatest(sql`next_attempt_at`, sql`${heartbeatAt + presenceLeaseMillis}`)}
+      WHERE (space_id, client_id) IN (
+        SELECT wake.space_id, wake.client_id FROM effect_local_server_watch_presence AS presence
         INNER JOIN effect_local_server_offline_wakes AS wake
           ON wake.space_id = presence.space_id AND wake.client_id = presence.client_id
         WHERE presence.runtime_id = ${runtimeId})`
@@ -697,42 +772,71 @@ export const make = Effect.fnUntraced(function*<R,>(
       databaseRuntimeId: runtimeId,
       expiresAt: heartbeatAt + presenceLeaseMillis
     })
-    yield* deferRuntimeWakes(heartbeatAt)
+    yield* SqlTransaction.withServerTransaction(sql, deferRuntimeWakes(heartbeatAt))
     if (Option.isSome(updated) && !presenceDirty) return
     presenceDirty = true
     yield* presenceGate.withPermit(Effect.gen(function*() {
       const encoded = yield* Codec.stringify([...presences].map(([watcherId, presence]) => ({
-        watcherId,
-        spaceId: presence.spaceId,
-        clientId: presence.clientId
+        watcher_id: watcherId,
+        space_id: presence.spaceId,
+        client_id: presence.clientId
       }))).pipe(Effect.mapError(StorageUnavailable.make))
-      yield* sql.withTransaction(Effect.gen(function*() {
-        yield* sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
-            VALUES (${runtimeId}, ${heartbeatAt + presenceLeaseMillis})
-            ON CONFLICT (runtime_id) DO UPDATE SET expires_at = excluded.expires_at`
-        yield* sql`INSERT INTO effect_local_server_watch_presence
-            (space_id, client_id, watcher_id, runtime_id)
-            SELECT json_extract(value, '$.spaceId'), json_extract(value, '$.clientId'),
-              json_extract(value, '$.watcherId'), ${runtimeId}
-            FROM json_each(${encoded}) AS local_presence
-            WHERE NOT EXISTS (SELECT 1 FROM effect_local_server_offline_wakes AS wake
-              WHERE wake.space_id = json_extract(local_presence.value, '$.spaceId')
-                AND wake.client_id = json_extract(local_presence.value, '$.clientId')
-                AND wake.claim_token IS NOT NULL AND wake.claimed_until > ${heartbeatAt})
-            ON CONFLICT (space_id, client_id, watcher_id) DO UPDATE SET
-              runtime_id = excluded.runtime_id`
-        yield* deferRuntimeWakes(heartbeatAt)
-        yield* sql`UPDATE effect_local_server_offline_wakes SET next_attempt_at = 0
+      const localPresence = dialect.jsonRecords(encoded, "local_presence", [
+        { name: "space_id", affinity: "text" },
+        { name: "client_id", affinity: "text" },
+        { name: "watcher_id", affinity: "text" }
+      ])
+      yield* SqlTransaction.withServerTransaction(
+        sql,
+        sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
+          VALUES (${runtimeId}, ${heartbeatAt + presenceLeaseMillis})
+          ON CONFLICT (runtime_id) DO UPDATE SET expires_at = excluded.expires_at`
+      )
+      const entries = [...presences]
+      for (let offset = 0; offset < entries.length; offset += presenceReconcileBatchSize) {
+        const batch = entries.slice(offset, offset + presenceReconcileBatchSize)
+        const batchEncoded = yield* Codec.stringify(batch.map(([watcherId, presence]) => ({
+          watcher_id: watcherId,
+          space_id: presence.spaceId,
+          client_id: presence.clientId
+        }))).pipe(Effect.mapError(StorageUnavailable.make))
+        const batchPresence = dialect.jsonRecords(batchEncoded, "local_presence", [
+          { name: "space_id", affinity: "text" },
+          { name: "client_id", affinity: "text" },
+          { name: "watcher_id", affinity: "text" }
+        ])
+        yield* SqlTransaction.withServerTransaction(
+          sql,
+          Effect.gen(function*() {
+            yield* dialect.lockPresences(batch.map(([, presence]) => presence))
+            yield* sql`INSERT INTO effect_local_server_watch_presence
+              (space_id, client_id, watcher_id, runtime_id)
+              SELECT local_presence.space_id, local_presence.client_id, local_presence.watcher_id, ${runtimeId}
+              FROM ${batchPresence}
+              WHERE NOT EXISTS (SELECT 1 FROM effect_local_server_offline_wakes AS wake
+                WHERE wake.space_id = local_presence.space_id
+                  AND wake.client_id = local_presence.client_id
+                  AND wake.claim_token IS NOT NULL AND wake.claimed_until > ${heartbeatAt})
+              ON CONFLICT (space_id, client_id, watcher_id) DO UPDATE SET
+                runtime_id = excluded.runtime_id`
+          })
+        )
+      }
+      yield* SqlTransaction.withServerTransaction(
+        sql,
+        Effect.gen(function*() {
+          yield* deferRuntimeWakes(heartbeatAt)
+          yield* sql`UPDATE effect_local_server_offline_wakes SET next_attempt_at = 0
           WHERE EXISTS (SELECT 1 FROM effect_local_server_watch_presence AS durable
             WHERE durable.runtime_id = ${runtimeId}
               AND durable.space_id = effect_local_server_offline_wakes.space_id
               AND durable.client_id = effect_local_server_offline_wakes.client_id
-              AND durable.watcher_id NOT IN (
-                SELECT json_extract(value, '$.watcherId') FROM json_each(${encoded})))`
-        yield* sql`DELETE FROM effect_local_server_watch_presence
+              AND durable.watcher_id NOT IN (SELECT local_presence.watcher_id FROM ${localPresence}))`
+          yield* sql`DELETE FROM effect_local_server_watch_presence
           WHERE runtime_id = ${runtimeId}
-            AND watcher_id NOT IN (SELECT json_extract(value, '$.watcherId') FROM json_each(${encoded}))`
-      }))
+            AND watcher_id NOT IN (SELECT local_presence.watcher_id FROM ${localPresence})`
+        })
+      )
       const differences = yield* countPresenceDifferences({ databaseRuntimeId: runtimeId, encoded })
       presenceDirty = differences.count > 0
     }))
@@ -749,7 +853,7 @@ export const make = Effect.fnUntraced(function*<R,>(
     Effect.forkScoped
   )
 
-  const prompted = Queue.take(prompt)
+  const prompted = LosslessQueue.take(prompt)
   const polled = Effect.sleep(pollIntervalMillis)
   yield* Effect.raceFirst(prompted, polled).pipe(
     Effect.andThen(run),

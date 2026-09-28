@@ -13,12 +13,14 @@ import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
+import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as EphemeralClient from "../src/EphemeralClient.js"
 import * as ProtocolSession from "../src/ProtocolSession.js"
+import * as Transport from "../src/Transport.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const member = Protocol.EphemeralMember.make({
@@ -36,8 +38,13 @@ const layerFromFakeClient = (
     version: Effect.succeed(Protocol.currentProtocolVersion),
     rejected: () => Effect.succeed(Protocol.currentProtocolVersion)
   })
+  const transport = Transport.Transport.of({
+    generation: Effect.succeed(0),
+    waitForChange: () => Effect.never
+  })
   return EphemeralClient.layerFromSession(options).pipe(
-    Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session))
+    Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, session)),
+    Layer.provide(Layer.succeed(Transport.Transport, transport))
   )
 }
 
@@ -366,6 +373,41 @@ const offerUntilSettled = Effect.fnUntraced(function*(
   }
 })
 
+const neverDeliversEventsPublishedBeforeSubscription = Effect.fnUntraced(function*() {
+  const harness = yield* makeTypedHarness()
+  yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
+  yield* Queue.offer(harness.messagesA, snapshot(spaceId, 1))
+  const program = Effect.gen(function*() {
+    const client = yield* EphemeralClient.EphemeralClient
+    const session = yield* client.session(Profile, sessionOptions)
+    const probe = yield* session.events(Pings).pipe(
+      Stream.runHead,
+      Effect.forkChild({ startImmediately: true })
+    )
+    yield* Queue.offer(
+      harness.messagesA,
+      eventMessage(spaceId, 2, "Typing", { conversationId: "conversation-1", active: true })
+    )
+    yield* offerUntilSettled(harness.messagesA, probe, eventMessage(spaceId, 3, "Pings", { count: 1 }))
+    assert.isDefined(Option.getOrUndefined(yield* Fiber.join(probe)))
+    const late = yield* session.events(Typing).pipe(
+      Stream.runHead,
+      Effect.forkChild({ startImmediately: true })
+    )
+    yield* offerUntilSettled(
+      harness.messagesA,
+      late,
+      eventMessage(spaceId, 4, "Typing", { conversationId: "conversation-2", active: false })
+    )
+    const received = Option.getOrUndefined(yield* Fiber.join(late))
+    assert.deepStrictEqual(received?.payload, {
+      conversationId: ConversationId.make("conversation-2"),
+      active: false
+    })
+  })
+  yield* program.pipe(Effect.provide(harness.layerClient))
+})
+
 describe("EphemeralClient typed definitions", () => {
   it.effect(
     "publishes typed events and state through the generic wire protocol",
@@ -508,40 +550,7 @@ describe("EphemeralClient typed definitions", () => {
 
   it.effect(
     "never delivers events to projections subscribed after publication",
-    Effect.fnUntraced(function*() {
-      const harness = yield* makeTypedHarness()
-      yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
-      yield* Queue.offer(harness.messagesA, snapshot(spaceId, 1))
-      const program = Effect.gen(function*() {
-        const client = yield* EphemeralClient.EphemeralClient
-        const session = yield* client.session(Profile, sessionOptions)
-        const probe = yield* session.events(Pings).pipe(
-          Stream.runHead,
-          Effect.forkChild({ startImmediately: true })
-        )
-        yield* Queue.offer(
-          harness.messagesA,
-          eventMessage(spaceId, 2, "Typing", { conversationId: "conversation-1", active: true })
-        )
-        yield* offerUntilSettled(harness.messagesA, probe, eventMessage(spaceId, 3, "Pings", { count: 1 }))
-        assert.isDefined(Option.getOrUndefined(yield* Fiber.join(probe)))
-        const late = yield* session.events(Typing).pipe(
-          Stream.runHead,
-          Effect.forkChild({ startImmediately: true })
-        )
-        yield* offerUntilSettled(
-          harness.messagesA,
-          late,
-          eventMessage(spaceId, 4, "Typing", { conversationId: "conversation-2", active: false })
-        )
-        const received = Option.getOrUndefined(yield* Fiber.join(late))
-        assert.deepStrictEqual(received?.payload, {
-          conversationId: ConversationId.make("conversation-2"),
-          active: false
-        })
-      })
-      yield* program.pipe(Effect.provide(harness.layerClient))
-    })
+    neverDeliversEventsPublishedBeforeSubscription
   )
 
   it.effect(
@@ -922,5 +931,53 @@ describe("EphemeralClient projection work", () => {
       })
       yield* program.pipe(Effect.provide(harness.layerClient), Effect.scoped)
     })
+  )
+
+  it.effect(
+    "delivers every event to a projection whose fibers are preempted between queue checks",
+    Effect.fnUntraced(function*() {
+      const deliver = Effect.fnUntraced(function*(maxOpsBeforeYield: number, spacing: number) {
+        const harness = yield* makeTypedHarness()
+        yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
+        yield* Queue.offer(harness.messagesA, snapshot(spaceId, 1))
+        yield* Effect.gen(function*() {
+          const client = yield* EphemeralClient.EphemeralClient
+          const session = yield* client.session(Profile, sessionOptions)
+          const subscribed = yield* Deferred.make<void>()
+          const received = yield* session.events(Pings).pipe(
+            Stream.tap(() => Deferred.succeed(subscribed, undefined)),
+            Stream.filter((event) => event.payload.count >= 0),
+            Stream.take(6),
+            Stream.runCollect,
+            Effect.forkChild({ startImmediately: true })
+          )
+          let revision = 2
+          while (!(yield* Deferred.isDone(subscribed))) {
+            yield* Queue.offer(harness.messagesA, eventMessage(spaceId, revision++, "Pings", { count: -1 }))
+            yield* Effect.yieldNow
+          }
+          for (let count = 0; count < 6; count++) {
+            for (let turn = 0; turn < spacing; turn++) yield* Effect.yieldNow
+            yield* Queue.offer(harness.messagesA, eventMessage(spaceId, revision++, "Pings", { count }))
+          }
+          const events = yield* Fiber.join(received)
+          assert.deepStrictEqual(events.map((event) => event.payload.count), [0, 1, 2, 3, 4, 5])
+        }).pipe(
+          Effect.provide(harness.layerClient),
+          Effect.provideService(Scheduler.MaxOpsBeforeYield, maxOpsBeforeYield),
+          Effect.scoped
+        )
+      })
+      for (const maxOpsBeforeYield of [7, 8, 12]) {
+        for (let spacing = 0; spacing < 6; spacing++) yield* deliver(maxOpsBeforeYield, spacing)
+      }
+    })
+  )
+})
+
+describe("EphemeralClient at small scheduler budgets", () => {
+  it.effect(
+    "never delivers events to projections subscribed after publication at a scheduler budget of 12 operations",
+    () => neverDeliversEventsPublishedBeforeSubscription().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 12))
   )
 })

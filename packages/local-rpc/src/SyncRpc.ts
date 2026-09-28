@@ -79,6 +79,7 @@ export const layerJson = (options?: {
       return RpcSerialization.RpcSerialization.of({
         contentType: "application/json",
         includesFraming: false,
+        codecFor: RpcSerialization.json.codecFor,
         makeUnsafe: () => {
           const decoder = new TextDecoder()
           const encoder = new TextEncoder()
@@ -115,9 +116,9 @@ export const layerJson = (options?: {
     })
   )
 
-export class Submit extends Rpc.make("Submit", {
-  payload: Protocol.VersionedSubmitRequest.fields,
-  success: Protocol.Receipt,
+export class SubmitBatch extends Rpc.make("SubmitBatch", {
+  payload: Protocol.VersionedSubmitBatchRequest.fields,
+  success: Protocol.SubmitBatchResult,
   error: ReplicaError.ReplicaError,
   defect: RemoteDefect
 }) {}
@@ -182,7 +183,7 @@ export class HeartbeatEphemeral extends Rpc.make("HeartbeatEphemeral", {
 
 export const Rpcs = RpcGroup.make(
   Negotiate,
-  Submit,
+  SubmitBatch,
   Discard,
   Pull,
   Bootstrap,

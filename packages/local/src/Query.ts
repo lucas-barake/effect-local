@@ -46,8 +46,8 @@ export interface Query<Name extends string, P extends Schema.Top, A extends Sche
 
 export interface Any {
   readonly name: string
-  readonly payloadSchema: Schema.Top
-  readonly successSchema: Schema.Top
+  readonly payloadSchema: SchemaInput.WireSchema
+  readonly successSchema: SchemaInput.WireSchema
   readonly errorSchema: ErrorSchema
   readonly handler: Context.Service.Any
 }

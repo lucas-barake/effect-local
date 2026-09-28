@@ -1,8 +1,16 @@
-import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
-import type * as Effect from "effect/Effect"
+import * as Crypto from "effect/Crypto"
+import * as Duration from "effect/Duration"
+import * as Effect from "effect/Effect"
+import * as Encoding from "effect/Encoding"
 import * as Layer from "effect/Layer"
+import * as Redacted from "effect/Redacted"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import { invalidConfiguration } from "./internal/errors.js"
+import * as Hmac from "./internal/hmac.js"
 
 export const PrincipalAssertion = Schema.NonEmptyString.pipe(
   Schema.brand("@lucas-barake/effect-local-rpc/PrincipalAssertion")
@@ -36,3 +44,81 @@ export const layerIssuer = (
 export const layerVerifier = (
   verify: VerifierService["verify"]
 ): Layer.Layer<Verifier> => Layer.succeed(Verifier, Verifier.of({ verify }))
+
+const jsonAssertion = Schema.fromJsonString(Schema.Json)
+
+/**
+ * Carries the principal as its JSON encoding with no signature. Only for
+ * deployments where the issuing facade and the verifying entities share one
+ * trusted process; a networked cluster must sign assertions instead.
+ */
+export const layerJson: Layer.Layer<Issuer | Verifier> = Layer.merge(
+  layerIssuer((principal) =>
+    Schema.encodeUnknownEffect(jsonAssertion)(principal).pipe(
+      Effect.map((assertion) => PrincipalAssertion.make(assertion)),
+      Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "could not issue principal assertion" }))
+    )
+  ),
+  layerVerifier((assertion) =>
+    Schema.decodeUnknownEffect(jsonAssertion)(assertion).pipe(
+      Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" }))
+    )
+  )
+)
+
+export interface HmacOptions {
+  readonly secret: Redacted.Redacted
+  readonly timeToLive?: Duration.Input | undefined
+}
+
+const minimumSecretBytes = 32
+
+const HmacClaims = Schema.fromJsonString(Schema.Struct({
+  principal: Schema.Json,
+  expiresAtMillis: Schema.Number
+}))
+
+export const layerHmac = (
+  options: HmacOptions
+): Layer.Layer<Issuer | Verifier, ReplicaError.InvalidConfiguration, Crypto.Crypto> =>
+  Layer.effectContext(Effect.gen(function*() {
+    const crypto = yield* Crypto.Crypto
+    const encoder = new TextEncoder()
+    const key = encoder.encode(Redacted.value(options.secret))
+    if (key.length < minimumSecretBytes) {
+      return yield* invalidConfiguration("secret", `secret must be at least ${minimumSecretBytes} bytes`)
+    }
+    const timeToLiveMillis = Duration.toMillis(options.timeToLive ?? Duration.minutes(1))
+    const invalid = new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" })
+    const sign = (payload: string) =>
+      Hmac.sha256(crypto, key, encoder.encode(payload)).pipe(
+        Effect.catchTag("PlatformError", () => Effect.fail(new ReplicaError.AuthenticatorUnavailable()))
+      )
+    const issue = Effect.fnUntraced(function*(principal: typeof Schema.Json.Type) {
+      const expiresAtMillis = (yield* Clock.currentTimeMillis) + timeToLiveMillis
+      const claims = yield* Schema.encodeEffect(HmacClaims)({ principal, expiresAtMillis }).pipe(
+        Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "could not issue principal assertion" }))
+      )
+      const payload = Encoding.encodeBase64Url(claims)
+      const signature = Encoding.encodeBase64Url(yield* sign(payload))
+      return PrincipalAssertion.make(`${payload}.${signature}`)
+    })
+    const verify = Effect.fnUntraced(function*(assertion: PrincipalAssertion) {
+      const parts = assertion.split(".")
+      if (parts.length !== 2) return yield* invalid
+      const [payload, encodedSignature] = parts
+      const signature = Encoding.decodeBase64Url(encodedSignature)
+      if (Result.isFailure(signature)) return yield* invalid
+      if (!Hmac.constantTimeEqual(signature.success, yield* sign(payload))) return yield* invalid
+      const claimsJson = Encoding.decodeBase64UrlString(payload)
+      if (Result.isFailure(claimsJson)) return yield* invalid
+      const claims = yield* Schema.decodeUnknownEffect(HmacClaims)(claimsJson.success).pipe(
+        Effect.mapError(() => invalid)
+      )
+      if (claims.expiresAtMillis < (yield* Clock.currentTimeMillis)) {
+        return yield* new ReplicaError.AuthorizationDenied({ reason: "expired principal assertion" })
+      }
+      return claims.principal
+    })
+    return Context.make(Issuer, Issuer.of({ issue })).pipe(Context.add(Verifier, Verifier.of({ verify })))
+  }))

@@ -10,6 +10,34 @@ runtimes and `foregroundActiveSpaces` reserves capacity for addressed work. `for
 reserves foreground turns within the total `reconciliationConcurrency`. Active logical watches share the one
 `SyncEngine` and RPC WebSocket.
 
+Every local transaction and statement goes through one `ConnectionLane` per database, so the lane decides who uses the
+single SQLite connection next. Work runs at the `ConnectionLane.Priority` of the calling fiber, which is `Foreground`
+by default: app reads, queries, and commits need no extra setup. Reconciliation, settlement, bootstrap, and background
+activation run as `Background`. Waiting foreground work is served before waiting background work, in arrival order
+within each priority, and a background waiter joins the foreground order once it has waited `maximumBackgroundWait`
+(50 milliseconds by default), so sync cannot starve behind a busy UI. The per space projection gate follows the same
+rule, and a background holder of that gate is served as foreground while a foreground commit waits on it. A
+background gate holder keeps one lane turn across the transactions of its gated step until other work has waited
+`maximumBackgroundWait`, so a sync step does not queue again for each of its transactions. Receipt batches commit every
+`receiptPersistBatchSize` receipts (8 by default) while foreground work is waiting. Code that uses `LocalStore.layer`
+or `QueryExecutor.layer` directly provides one `ConnectionLane.makeLayer()` per database.
+
+`Replica.Space.status` reports a `SpaceStatus`. A remembered space that is not active is `Idle`, with its pending
+count: before its first activation, after deactivation or eviction, and between background syncs. `Idle` says nothing
+about the transport. An activated space is `Connecting` until its first sync attempt resolves. It becomes `Online`
+once a sync completes, and `Offline` only after an attempt failed or the transport reports that it cannot connect.
+Later syncs keep the last outcome until they resolve. Every status carries `synced`, which is `true` once the space
+has an installed replication view, meaning a bootstrap completed at least once, and `false` before that. It is read
+from durable storage, so a synced space stays `synced` after an offline reload. It returns to `false` only when the
+view is cleared: after leaving and rejoining the space, after the server revokes read access, or after a schema
+migration that requires a fresh bootstrap. A scope change keeps the installed view until the next bootstrap replaces
+it. An app can show an empty state when `synced` is `true` and a loading state while it is `false`.
+
+`Replica.status` summarizes every remembered space. `counts` holds one count per category, idle included, and
+`totalPending` sums every space. `state` is computed from the active spaces only: `Idle` when none is active, `Failed`
+or `NeedsAuthentication` when any active space is, `Online` or `Offline` when every active space is, `Connecting` when
+any active space is still connecting, and `Degraded` otherwise.
+
 `SqlReplica.layerWorkflow` uses the same store, query executor, and idempotent reconciliation pass with finite Effect
 Workflow generations. Local SQLite stores canonical entities, visible entities, pending mutations, bounded terminal
 receipts, a bounded accepted suffix, per space cursors, resumable snapshot staging, and requested and completed
@@ -40,28 +68,21 @@ const layerWorkflowEngine = ClusterWorkflowEngine.layer.pipe(
   Layer.provideMerge(SingleRunner.layer({ runnerStorage: "sql" }))
 )
 
-const scope = Protocol.ReplicationScope.make({ models: [Todo.name] })
-
 const layerReplica = SqlReplica.layerWorkflow({
   definition,
   clientId,
-  defaultScope: scope,
-  initialSpaces: [spaceId],
-  maximumActiveSpaces: 8,
-  foregroundActiveSpaces: 4,
-  reconciliationConcurrency: 8,
-  foregroundReconciliationConcurrency: 2,
-  retainedReceipts: 256,
-  maximumReceipts: 1_024,
-  retainedHistoryEntries: 256,
-  maximumBootstrapEntities: 100_000,
-  maximumBootstrapBytes: 64 * 1024 * 1024,
-  maximumBootstrapPageBytes: 4 * 1024 * 1024,
-  migration: { retryDelay: "25 millis", maximumAttempts: 8 }
+  defaultScope: Protocol.ReplicationScope.make({ models: [Todo.name] }),
+  initialSpaces: [spaceId]
 }).pipe(
   Layer.provide(layerWorkflowEngine)
 )
 ```
+
+Only `definition` and `clientId` are required. `SqlReplica.defaults` lists the rest: 16 active spaces with 4 reserved
+for foreground work, 256 retained receipts under a cap of 10000, 256 retained history entries, bootstrap bounds of
+100000 entities, 64 MiB, and 4 MiB pages. `defaultScope` defaults to every model in the definition. A caller-minted
+`mutationId` stays idempotent while its receipt is retained, and after that for the next `retainedMutationIds` (100000)
+mutations of the space, where reusing it fails with `MutationIdentityConflict` instead of running the handler again.
 
 `initialSpaces` seeds remembered membership without opening every space. Later calls to `Replica.join` persist
 membership and restart restores every handle inactive. Data operations and `space.activate` acquire foreground
@@ -69,14 +90,14 @@ capacity. `space.deactivate` closes its runtime without deleting data. Pending w
 `Replica.leave` closes any runtime before one cascading delete removes local state. The database keeps the singleton
 `clientId`. Rejoining creates a new membership incarnation and local sequence.
 
-The required `defaultScope` initializes only new membership. Every handle exposes its durable `space.scope` and
+`defaultScope` initializes only new membership. Every handle exposes its durable `space.scope` and
 `space.setScope`. Changing one space advances its generation, restarts its active watch, and reconciles it as foreground
 work. A wider scope backfills through incremental pull. A narrower scope receives `Retract` changes without a new
 bootstrap. Scopes support complete models and bounded secondary index windows with per partition overrides.
 
 `retryDelay`, `maximumRetryDelay`, and `maximumAttempts` bound exponential retries within one Workflow execution. A
 terminal failed generation stays failed until a later mutation or server wake requests a new generation. Effect
-beta.103 does not expose per Workflow completed history retention through `WorkflowEngine`; storage lifecycle remains
+4.0.0-rc.117 does not expose per Workflow completed history retention through `WorkflowEngine`; storage lifecycle remains
 an operational responsibility of the selected engine and runner.
 
 Provide separate `SqlClient` connections to the replica and to SQL backed `SingleRunner`. They may use the same file,
@@ -87,12 +108,13 @@ ordinary shutdown because it durably cancels the reconciliation.
 
 `ServerStore.layer` requires application supplied access, mutation admission, and read callbacks. It reauthorizes
 retries, deduplicates stable mutation identities, stores terminal rejections, assigns the next dense sequence to
-accepted mutations, and materializes authoritative state in the same SQL transaction. Its required history options
-set retained targets, hard admission caps, snapshot capacity, bootstrap page capacity, prune batches, retained
-snapshots, migration retry, maintenance concurrency, and the keyset page size used to enumerate spaces. The required
-`maximumWatchersPerSpace`, `readAuthorizationRefreshInterval`, `maximumConcurrentReadAuthorizations`,
-`maximumPendingReadAuthorizations`, and `readAuthorizationCacheCapacity` options bound live sync streams and their
-policy work. `ServerStore.layerTrusted` is the explicit allow all composition.
+accepted mutations, and materializes authoritative state in the same SQL transaction. Its history options set
+retained targets, hard admission caps, snapshot capacity, bootstrap page capacity, prune batches, retained snapshots,
+migration retry, maintenance concurrency, and the keyset page size used to enumerate spaces. `maximumWatchersPerSpace`,
+`readAuthorizationRefreshInterval`, `maximumConcurrentReadAuthorizations`, `maximumPendingReadAuthorizations`, and
+`readAuthorizationCacheCapacity` bound live sync streams and their policy work. Every one of them is optional and
+`ServerStore.defaults` lists the values used. `ServerStore.layerTrusted` is the explicit allow all composition.
+`SyncServer.layer` in `@lucas-barake/effect-local-rpc` builds the store for you.
 
 Sync watch authorization shares successful structural `(spaceId, clientId, normalized scope, principal)` checks.
 `maximumConcurrentReadAuthorizations` bounds executing policy calls. `maximumPendingReadAuthorizations` independently
@@ -148,26 +170,25 @@ class ReadPolicy extends Context.Service<ReadPolicy, {
 }>()("app/ReadPolicy") {}
 
 const layerStore = ServerStore.layer({
-  ...serverHistory,
   definition,
-  readAuthorizationRefreshInterval: "30 seconds",
-  maximumConcurrentReadAuthorizations: 64,
-  maximumPendingReadAuthorizations: 4_096,
-  readAuthorizationCacheCapacity: 4_096,
   authorizeAccess,
   authorizeMutation,
   authorizeRead: (input) => ReadPolicy.use((policy) => policy.authorize(input))
 }).pipe(Layer.provide(layerReadPolicy))
 ```
 
-Provide `ServerStore.layerMaintenance({ interval, runOnStart })` beside the store, or schedule `maintainAll` through an
-application owned job runner. Maintenance publishes an immutable snapshot and logical floors before bounded physical
-deletion. Admission fails before handler execution at a hard cap until maintenance creates capacity. Old cursors use
-the authenticated bootstrap path. Snapshot pages are identity bound, Schema decoded, byte bounded, ordered, and digest
-chained. Client staging survives interruption and installs with one atomic canonical replacement.
+Maintenance publishes an immutable snapshot and logical floors before bounded physical deletion. A space compacts
+itself: a write that takes its history or receipts past the midpoint between the retained target and the hard cap
+starts one background compaction of that space, so admission only reaches the cap, where it fails before handler
+execution, if compaction cannot keep up. `ServerStore.layerMaintenance` adds a sweep over every space as an Effect
+Cluster singleton, so it runs on one runner at a time. It sweeps once when it starts and then every `interval` (one
+hour by default), and it requires `Sharding`. Old cursors use the authenticated bootstrap path. Snapshot pages are
+identity bound, Schema decoded, byte bounded, ordered, and digest chained. Client staging survives interruption and
+installs with one atomic canonical replacement.
 
 ```ts
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
+import * as Layer from "effect/Layer"
 
 const layerStore = ServerStore.layer({
   definition,
@@ -176,33 +197,66 @@ const layerStore = ServerStore.layer({
   authorizeRead,
   retainedHistoryEntries: 10_000,
   maximumHistoryEntries: 20_000,
-  retainedReceipts: 10_000,
-  maximumReceipts: 20_000,
-  maximumSnapshotEntities: 100_000,
-  maximumSnapshotBytes: 64 * 1024 * 1024,
-  maximumBootstrapPageBytes: 4 * 1024 * 1024,
-  pruneBatchSize: 1_000,
-  retainedSnapshots: 2,
-  maintenanceConcurrency: 4,
-  maintenanceSpaceBatchSize: 128,
-  maximumWatchersPerSpace: 1_024,
-  readAuthorizationRefreshInterval: "30 seconds",
-  maximumConcurrentReadAuthorizations: 64,
-  maximumPendingReadAuthorizations: 4_096,
-  readAuthorizationCacheCapacity: 4_096,
-  migration: { retryDelay: "25 millis", maximumAttempts: 8 }
+  maintenanceConcurrency: 4
 })
 
-const layerServer = ServerStore.layerMaintenance({
-  interval: "30 seconds",
-  runOnStart: true
-}).pipe(Layer.provideMerge(layerStore))
+const layerServer = ServerStore.layerMaintenance({ interval: "30 minutes" }).pipe(
+  Layer.provideMerge(layerStore),
+  Layer.provide(layerSharding)
+)
 ```
 
 Exact retries return retained receipts. Once receipt evidence has crossed the published terminal fence, an old exact
 retry returns `Expired` and never executes again. The client retains an expired pending mutation until it installs the
 covering snapshot, unless its durable cursor already proves that canonical state includes the snapshot sequence.
 `SyncEngine` is the transport neutral boundary used by direct tests and the RPC client.
+
+## PostgreSQL server storage
+
+`ServerStore`, `Migrations.server`, and `SchemaEvolution.server` run on SQLite and on PostgreSQL 16 or later with the
+same results. The dialect comes from the `SqlClient` in context. Every other dialect fails with `InvalidConfiguration`
+before any statement runs. Client storage (`LocalStore`, `SqlReplica`, `QueryExecutor`, and `Migrations.client`) is
+SQLite only.
+
+```ts
+import { PgClient } from "@effect/sql-pg"
+import * as Config from "effect/Config"
+import * as Layer from "effect/Layer"
+
+const layerStore = ServerStore.layer(options).pipe(
+  Layer.provide(PgClient.layerConfig({ url: Config.Redacted("DATABASE_URL") }))
+)
+```
+
+PostgreSQL has its own migration catalog. Migration 1, `postgres-baseline`, creates the server schema from the same
+table definitions as the SQLite catalog's `server-baseline`. Later server migrations are appended to both catalogs. Sequences, counts, byte sizes, generations, and epoch
+milliseconds are `BIGINT`, and 0 or 1 flags are `SMALLINT`, so every integer decodes to the same JavaScript number as
+on SQLite. JSON columns stay `TEXT`, compared byte for byte. Every `TEXT` column uses `COLLATE "C"`, so ordering,
+cursors, and window membership follow UTF-8 byte order exactly like SQLite `BINARY`, whatever the database locale.
+PostgreSQL `TEXT` cannot hold U+0000, so text index components are stored with an order preserving escape (U+0001
+becomes U+0001 U+0002 and U+0000 becomes U+0001 U+0001). Queries decode it, so entity values containing control
+characters behave as on SQLite.
+
+SQLite serializes every write transaction. On PostgreSQL the same guarantees come from explicit locks, so several
+runners can share one database:
+
+- Admission, pull, bootstrap, snapshot publication, and pruning lock the space row. A pull or bootstrap therefore
+  reads one server head, and admission waits for it as it would behind SQLite's writer lock.
+- Snapshot preparation reads under `REPEATABLE READ`. Admission is not blocked, and a snapshot that went stale while
+  it was prepared is discarded when publication compares heads.
+- Each schema evolution batch locks the space row before validating its progress. A second runner working on the same
+  space fails that batch with `SchemaGenerationConflict` and never applies it twice.
+- Offline wake claims use `FOR UPDATE SKIP LOCKED` and repeat their claim conditions, so one wake is claimed by one
+  runtime. A transaction scoped advisory lock per space and client orders Watch presence registration against delivery
+  claims, so a live Watch and a delivery claim for the same client never both commit.
+- Migrations and index table creation take a transaction scoped advisory lock, so concurrent first boots create the
+  schema once.
+- A transaction that PostgreSQL aborts as a deadlock victim or as a serialization failure is retried as a whole, up
+  to 8 attempts, before the error surfaces.
+
+Pass the client without `transformResultNames` or `transformQueryNames`, because rows are decoded by their snake case
+column names. The test suite runs every server test on both dialects against a PostgreSQL container started through
+testcontainers, so running the tests requires Docker.
 
 ## Operational metrics
 

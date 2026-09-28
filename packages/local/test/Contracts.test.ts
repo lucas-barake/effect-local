@@ -525,18 +525,18 @@ describe("domain contracts", () => {
         basis: 0,
         name: "PutTodo",
         payload: { id: "1", title: "current" },
-        digestVersion: 3,
+        digestVersion: 1,
         sourceSchema: { version: 1, hash: "1111111111111111" },
         mutationVersion: 1,
         digest: "1".repeat(64)
       }
       const envelope = yield* Schema.decodeUnknownEffect(Protocol.MutationEnvelope)(current)
-      assert.deepStrictEqual(envelope.digestVersion, 3)
-      const oldDigestVersion = yield* Schema.decodeUnknownEffect(Protocol.MutationEnvelope)({
+      assert.deepStrictEqual(envelope.digestVersion, 1)
+      const unknownDigestVersion = yield* Schema.decodeUnknownEffect(Protocol.MutationEnvelope)({
         ...current,
         digestVersion: 2
       }).pipe(Effect.result)
-      assert.strictEqual(oldDigestVersion._tag, "Failure")
+      assert.strictEqual(unknownDigestVersion._tag, "Failure")
       const missingMembership = yield* Schema.decodeUnknownEffect(Protocol.MutationEnvelope)({
         ...current,
         membershipIncarnation: undefined
@@ -559,7 +559,7 @@ describe("domain contracts", () => {
         basis: 0,
         name: "Put",
         payload: null,
-        digestVersion: 3,
+        digestVersion: 1,
         sourceSchema: schema,
         mutationVersion: 1,
         digest: "0".repeat(64)
@@ -568,7 +568,7 @@ describe("domain contracts", () => {
       const scopeGeneration = 1
       const cursor = null
       const operations = [
-        [Protocol.VersionedSubmitRequest, { envelope, schema }],
+        [Protocol.VersionedSubmitBatchRequest, { envelopes: [envelope], schema }],
         [Protocol.VersionedDiscardRequest, { envelope, schema }],
         [Protocol.VersionedPullRequest, {
           spaceId,

@@ -1,5 +1,4 @@
 import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
-import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
@@ -9,7 +8,6 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
-import * as FileSystem from "effect/FileSystem"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -21,8 +19,13 @@ import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import * as SqlClient from "effect/unstable/sql/SqlClient"
+import type * as SqlError from "effect/unstable/sql/SqlError"
+import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as WorkflowEngine from "effect/unstable/workflow/WorkflowEngine"
+import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as Codec from "../src/internal/codec.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
+import * as Rows from "../src/internal/rows.js"
 import * as LocalStore from "../src/LocalStore.js"
 import type * as Migrations from "../src/Migrations.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
@@ -32,6 +35,7 @@ import * as ReconciliationWorkflow from "../src/ReconciliationWorkflow.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
+import { serverDatabases, sqliteLayer } from "./fixtures/ServerDatabase.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const writerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
@@ -72,12 +76,14 @@ const clientHistory = {
   migration
 }
 
-const layerDatabase = Layer.mergeAll(
-  SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
-  NodeCrypto.layer,
-  Reactivity.layer,
-  QueryReactivity.layer
-)
+const withServices = (layerSql: Layer.Layer<SqlClient.SqlClient, SqlError.SqlError>) =>
+  Layer.mergeAll(
+    ConnectionLane.makeLayer().pipe(Layer.provideMerge(layerSql)),
+    NodeCrypto.layer,
+    Reactivity.layer,
+    QueryReactivity.layer
+  )
+const layerClientDatabase = withServices(sqliteLayer())
 const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
 const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
 const provideNode = Effect.provide(Layer.merge(NodeFileSystem.layer, NodeCrypto.layer))
@@ -91,7 +97,8 @@ const defaultAuthorizeRead: ServerStore.Options["authorizeRead"] = (input) => {
   return Effect.void
 }
 
-const makeServer = (
+const makeServerWith = (
+  layerServerDatabase: ReturnType<typeof withServices>,
   authorizeRead: ServerStore.Options["authorizeRead"] = defaultAuthorizeRead,
   overrides: Partial<typeof history> = {}
 ) =>
@@ -103,7 +110,7 @@ const makeServer = (
     authorizeAccess: () => Effect.void,
     authorizeMutation: () => Effect.void,
     authorizeRead
-  }).pipe(Layer.provide(layerRuntime), Layer.provide(layerDatabase))
+  }).pipe(Layer.provide(layerRuntime), Layer.provide(layerServerDatabase))
 
 const service = <I, S, E extends { readonly _tag: string }, R,>(
   tag: Context.Service<I, S>,
@@ -126,7 +133,7 @@ const envelope = Effect.fnUntraced(function*(id: string, sequence: number, title
     basis: Identity.ServerSequence.make(0),
     name: Domain.PutTodo.name,
     payload: Domain.todo(id, title),
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: Domain.definition.schemaIdentity,
     mutationVersion: Domain.PutTodo.version
@@ -145,7 +152,7 @@ const deleteEnvelope = Effect.fnUntraced(function*(id: string, sequence: number)
     basis: Identity.ServerSequence.make(0),
     name: Domain.DeleteTodo.name,
     payload: { id },
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: Domain.definition.schemaIdentity,
     mutationVersion: Domain.DeleteTodo.version
@@ -164,7 +171,7 @@ const putManyEnvelope = Effect.fnUntraced(function*(count: number, sequence: num
     basis: Identity.ServerSequence.make(0),
     name: Domain.PutManyTodos.name,
     payload: { count },
-    digestVersion: 3 as const,
+    digestVersion: 1 as const,
     membershipIncarnation,
     sourceSchema: Domain.definition.schemaIdentity,
     mutationVersion: Domain.PutManyTodos.version
@@ -200,7 +207,13 @@ const bootstrapRequest = (manifest: Protocol.SnapshotManifest): Protocol.Bootstr
     limit: 100
   })
 
-describe("scoped replication", () => {
+describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
+  const layerServerDatabase = withServices(database.layer())
+  const makeServer = (
+    authorizeRead: ServerStore.Options["authorizeRead"] = defaultAuthorizeRead,
+    overrides: Partial<typeof history> = {}
+  ) => makeServerWith(layerServerDatabase, authorizeRead, overrides)
+
   it.effect(
     "bootstraps only scoped entities visible to the principal",
     Effect.fnUntraced(function*() {
@@ -604,7 +617,7 @@ describe("scoped replication", () => {
           basis: Identity.ServerSequence.make(0),
           name: Domain.PutMessage.name,
           payload: { id, chatId, sentAt, body: `body-${id}` },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation,
           sourceSchema: Domain.definition.schemaIdentity,
           mutationVersion: Domain.PutMessage.version
@@ -676,6 +689,73 @@ describe("scoped replication", () => {
   )
 
   it.effect(
+    "orders window text components bytewise and keeps control characters distinct",
+    Effect.fnUntraced(function*() {
+      const server = yield* service(ServerStore.ServerStore, makeServer())
+      let sequence = 0
+      const message = Effect.fnUntraced(function*(id: string, chatId: string, sentAt: number) {
+        sequence += 1
+        const identity = {
+          spaceId,
+          clientId: writerId,
+          mutationId: Identity.MutationId.make(`mut_00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`),
+          localSequence: Identity.LocalSequence.make(sequence),
+          basis: Identity.ServerSequence.make(0),
+          name: Domain.PutMessage.name,
+          payload: { id, chatId, sentAt, body: `body-${id}` },
+          digestVersion: 1 as const,
+          membershipIncarnation,
+          sourceSchema: Domain.definition.schemaIdentity,
+          mutationVersion: Domain.PutMessage.version
+        }
+        const submitted = Protocol.MutationEnvelope.make({
+          ...identity,
+          digest: yield* Protocol.mutationDigest(identity)
+        })
+        assert.strictEqual((yield* server.submit(submitted))._tag, "Accepted")
+      })
+      yield* message("a", "tie", 1)
+      yield* message("B", "tie", 1)
+      yield* message("plain", "n", 1)
+      yield* message("nul", "n\u0000", 1)
+      yield* message("soh", "n\u0001", 1)
+      const window = Protocol.ReplicationScope.make({
+        models: [],
+        windows: [Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "byChat", count: 1 })]
+      })
+      const keyOf = (change: Protocol.ViewChange) => {
+        if (typeof change.entity.key !== "string") return assert.fail("expected a string message key")
+        return change.entity.key
+      }
+      const keysOf = (changes: ReadonlyArray<Protocol.ViewChange>, tag: string) =>
+        changes.filter((change) => change._tag === tag).map(keyOf).toSorted()
+
+      const required = yield* server.pullAuthorized(pullRequest(null, window, 1), "reader")
+      if (!("_tag" in required)) assert.fail("expected scoped bootstrap")
+      const bootstrap = yield* server.bootstrapAuthorized(
+        Protocol.BootstrapRequest.make({ ...bootstrapRequest(required.manifest), scope: window }),
+        "reader"
+      )
+      assert.deepStrictEqual(bootstrap.entries.map((entry) => keyOf(entry.change)).toSorted(), [
+        "a",
+        "nul",
+        "plain",
+        "soh"
+      ])
+      const settled = yield* server.pullAuthorized(pullRequest(required.manifest.cursor, window, 1), "reader")
+      if ("_tag" in settled) assert.fail("expected steady page")
+      const acknowledged = yield* server.pullAuthorized(pullRequest(settled.cursor, window, 1), "reader")
+      if ("_tag" in acknowledged) assert.fail("expected acknowledged page")
+
+      yield* message("nul-later", "n\u0000", 2)
+      const slid = yield* server.pullAuthorized(pullRequest(acknowledged.cursor, window, 1), "reader")
+      if ("_tag" in slid) assert.fail("expected incremental page")
+      assert.deepStrictEqual(keysOf(slid.changes, "Upsert"), ["nul-later"])
+      assert.deepStrictEqual(keysOf(slid.changes, "Retract"), ["nul"])
+    }, provideNodeCrypto)
+  )
+
+  it.effect(
     "withholds unauthorized entities from a replication window",
     Effect.fnUntraced(function*() {
       let hiddenVisible = false
@@ -702,7 +782,7 @@ describe("scoped replication", () => {
           basis: Identity.ServerSequence.make(0),
           name: Domain.PutMessage.name,
           payload: { id, chatId, sentAt, body: `body-${id}` },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation,
           sourceSchema: Domain.definition.schemaIdentity,
           mutationVersion: Domain.PutMessage.version
@@ -768,7 +848,7 @@ describe("scoped replication", () => {
           basis: Identity.ServerSequence.make(0),
           name: Domain.PutMessage.name,
           payload: { id, chatId: "chat-a", sentAt, body: id },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation,
           sourceSchema: Domain.definition.schemaIdentity,
           mutationVersion: Domain.PutMessage.version
@@ -811,7 +891,7 @@ describe("scoped replication", () => {
           basis: Identity.ServerSequence.make(0),
           name: Domain.PutMessage.name,
           payload: { id, chatId: "chat-a", sentAt, body: id },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation,
           sourceSchema: Domain.definition.schemaIdentity,
           mutationVersion: Domain.PutMessage.version
@@ -929,9 +1009,7 @@ describe("scoped replication", () => {
   it.effect(
     "replaces a windowed view when the index layout changes",
     Effect.fnUntraced(function*() {
-      const fs = yield* FileSystem.FileSystem
-      const directory = yield* fs.makeTempDirectoryScoped()
-      const filename = `${directory}/index-layout.sqlite`
+      const shared = yield* database.shared
       const reorderedMessage = Model.make(Domain.Message.name, {
         version: Domain.Message.version,
         key: Domain.Message.key,
@@ -958,13 +1036,7 @@ describe("scoped replication", () => {
       assert.deepStrictEqual(reorderedDefinition.schemaIdentity, Domain.definition.schemaIdentity)
       assert.strictEqual(reorderedDefinition.hash, Domain.definition.hash)
       assert.notStrictEqual(reorderedDefinition.indexLayoutHash, Domain.definition.indexLayoutHash)
-      const persistentDatabase = () =>
-        Layer.mergeAll(
-          SqliteClient.layer({ filename, disableWAL: true }),
-          NodeCrypto.layer,
-          Reactivity.layer,
-          QueryReactivity.layer
-        )
+      const persistentDatabase = () => withServices(shared.layer())
       const build = (definition: Definition.Any) => {
         return ServerStore.layer({
           ...history,
@@ -991,7 +1063,7 @@ describe("scoped replication", () => {
           basis: Identity.ServerSequence.make(0),
           name: Domain.PutMessage.name,
           payload: { id, chatId: "chat-a", sentAt, body },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation,
           sourceSchema: Domain.definition.schemaIdentity,
           mutationVersion: Domain.PutMessage.version
@@ -1060,11 +1132,11 @@ describe("scoped replication", () => {
         ),
         Effect.flatMap(Effect.forkChild({ startImmediately: true }))
       )
-      assert.deepStrictEqual(yield* Queue.take(wakes), { spaceId })
-      const periodicWake = yield* Queue.take(wakes).pipe(
+      assert.deepStrictEqual(yield* LosslessQueue.take(wakes), { spaceId })
+      const periodicWake = yield* LosslessQueue.take(wakes).pipe(
         Effect.forkChild({ startImmediately: true })
       )
-      yield* TestClock.adjust("1 second")
+      for (let step = 0; step < 15; step++) yield* TestClock.adjust("100 millis")
       assert.deepStrictEqual(yield* Fiber.join(periodicWake), { spaceId })
       yield* Fiber.interrupt(watcher)
     }, provideNodeCrypto)
@@ -1234,7 +1306,7 @@ describe("scoped replication", () => {
         scope
       }).pipe(
         Layer.provide(layerRuntime),
-        Layer.provide(layerDatabase),
+        Layer.provide(layerClientDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
@@ -1369,7 +1441,7 @@ describe("scoped replication", () => {
         scope
       }).pipe(
         Layer.provide(layerRuntime),
-        Layer.provide(layerDatabase),
+        Layer.provide(layerClientDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
@@ -1410,7 +1482,7 @@ describe("scoped replication", () => {
         scope
       }).pipe(
         Layer.provide(layerRuntime),
-        Layer.provide(layerDatabase),
+        Layer.provide(layerClientDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
@@ -1424,7 +1496,7 @@ describe("scoped replication", () => {
       assert.isTrue(yield* local.stageBootstrapPage(bootstrap))
       yield* local.installBootstrap(required.manifest)
       const before = yield* local.replicationState
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
 
       const changes: ReadonlyArray<Protocol.ViewChange> = []
       const invalid = Protocol.PullPage.make({
@@ -1446,7 +1518,7 @@ describe("scoped replication", () => {
       if (Result.isFailure(result)) {
         assert.strictEqual(result.failure._tag, "ProtocolInvalid")
       }
-      assert.strictEqual(yield* local.cursor, 1)
+      assert.strictEqual((yield* local.progress).cursor, 1)
       assert.deepStrictEqual(yield* local.replicationState, before)
     }, provideNodeCrypto)
   )
@@ -1466,7 +1538,7 @@ describe("scoped replication", () => {
         scope
       }).pipe(
         Layer.provide(layerRuntime),
-        Layer.provide(layerDatabase),
+        Layer.provide(layerClientDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
@@ -1503,7 +1575,7 @@ describe("scoped replication", () => {
         scope
       }).pipe(
         Layer.provide(layerRuntime),
-        Layer.provide(layerDatabase),
+        Layer.provide(layerClientDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
@@ -1615,7 +1687,7 @@ describe("scoped replication", () => {
         authorizeAccess: () => Effect.void,
         authorizeMutation: () => Effect.void,
         authorizeRead: () => Effect.void
-      }).pipe(Layer.provide(layerRuntime), Layer.provideMerge(layerDatabase), Layer.build)
+      }).pipe(Layer.provide(layerRuntime), Layer.provideMerge(layerServerDatabase), Layer.build)
       const server = Context.get(context, ServerStore.ServerStore)
       const sql = Context.get(context, SqlClient.SqlClient)
       const request = (cursor: Protocol.ReplicationCursor | null) =>
@@ -1659,7 +1731,7 @@ describe("scoped replication", () => {
         authorizeAccess: () => Effect.void,
         authorizeMutation: () => Effect.void,
         authorizeRead: () => Effect.void
-      }).pipe(Layer.provide(layerRuntime), Layer.provideMerge(layerDatabase), Layer.build)
+      }).pipe(Layer.provide(layerRuntime), Layer.provideMerge(layerServerDatabase), Layer.build)
       const server = Context.get(context, ServerStore.ServerStore)
       const sql = Context.get(context, SqlClient.SqlClient)
       const initial = yield* server.pullAuthorized(pullRequest(), "reader")
@@ -1694,7 +1766,7 @@ describe("scoped replication", () => {
           authorizeAccess: () => Effect.void,
           authorizeMutation: () => Effect.void,
           authorizeRead: () => Effect.void
-        }).pipe(Layer.provide(layerRuntime), Layer.provideMerge(layerDatabase))
+        }).pipe(Layer.provide(layerRuntime), Layer.provideMerge(layerServerDatabase))
       )
       const server = Context.get(context, ServerStore.ServerStore)
       const sql = Context.get(context, SqlClient.SqlClient)
@@ -1715,25 +1787,22 @@ describe("scoped replication", () => {
       if (Result.isFailure(outcome)) {
         assert.strictEqual(outcome.failure._tag, "StorageCorrupt")
       }
-      const pages = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
-          FROM effect_local_server_replication_pages WHERE space_id = ${spaceId} AND client_id = ${readerId}`
-      assert.deepStrictEqual(pages, [{ count: 0 }])
+      const pages = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: Rows.CountRow,
+        execute: () =>
+          sql`SELECT COUNT(*) AS count FROM effect_local_server_replication_pages
+            WHERE space_id = ${spaceId} AND client_id = ${readerId}`
+      })(undefined)
+      assert.deepStrictEqual(pages, { count: 0 })
     }, provideNodeCrypto)
   )
 
   it.effect(
     "rejects corrupt server index catalog object names before cleanup",
     Effect.fnUntraced(function*() {
-      const fs = yield* FileSystem.FileSystem
-      const directory = yield* fs.makeTempDirectoryScoped()
-      const filename = `${directory}/corrupt-index-catalog.sqlite`
-      const persistentDatabase = () =>
-        Layer.mergeAll(
-          SqliteClient.layer({ filename, disableWAL: true }),
-          NodeCrypto.layer,
-          Reactivity.layer,
-          QueryReactivity.layer
-        )
+      const shared = yield* database.shared
+      const persistentDatabase = () => withServices(shared.layer())
       const serverLayer = () => {
         return ServerStore.layer({
           ...history,
@@ -1804,8 +1873,10 @@ describe("scoped replication", () => {
       const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, "reader"),
-          submit: server.submit,
+          submitBatch: (request) => server.admitBatch(request, null),
           pull: (request) => server.pullAuthorized(request, "reader"),
           bootstrap: (request) =>
             Ref.update(bootstrapCalls, (count) => count + 1).pipe(
@@ -1815,7 +1886,6 @@ describe("scoped replication", () => {
         }),
         Layer.succeed(SyncEngine.SyncEngine)
       )
-      const layerClientDatabase = layerDatabase
       const layerLocal = LocalStore.layer({
         ...clientHistory,
         definition: Domain.definition,
@@ -1872,7 +1942,7 @@ describe("scoped replication", () => {
         }
       }).pipe(
         Layer.provide(layerRuntime),
-        Layer.provide(layerDatabase),
+        Layer.provide(layerServerDatabase),
         Layer.build,
         Effect.map(Context.get(ServerStore.ServerStore))
       )
@@ -1885,15 +1955,17 @@ describe("scoped replication", () => {
         scope
       }).pipe(
         Layer.provide(layerRuntime),
-        Layer.provide(layerDatabase),
+        Layer.provide(layerClientDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )
       const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          transportGeneration: Effect.succeed(0),
+          waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, "reader"),
-          submit: (request) => server.admit(request, "reader"),
+          submitBatch: (request) => server.admitBatch(request, "reader"),
           pull: (request) => server.pullAuthorized(request, "reader"),
           bootstrap: (request) => server.bootstrapAuthorized(request, "reader"),
           watch: (request) => server.watchAuthorized(request, "reader").pipe(Stream.unwrap)
@@ -1937,7 +2009,7 @@ describe("scoped replication", () => {
         scope
       }).pipe(
         Layer.provide(layerRuntime),
-        Layer.provide(layerDatabase),
+        Layer.provide(layerClientDatabase),
         Layer.build,
         Effect.map(Context.get(LocalStore.Store))
       )

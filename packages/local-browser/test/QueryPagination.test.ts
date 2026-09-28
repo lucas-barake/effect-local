@@ -19,7 +19,7 @@ import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import { AtomRegistry } from "effect/unstable/reactivity"
 import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import * as BrowserReplica from "../src/BrowserReplica.js"
+import * as ReplicaAtom from "../src/ReplicaAtom.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
@@ -187,7 +187,9 @@ const layerSync = Effect.gen(function*() {
   const store = yield* ServerStore.ServerStore
   return SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
-    submit: store.submit,
+    transportGeneration: Effect.succeed(0),
+    waitForTransportChange: () => Effect.never,
+    submitBatch: (request) => store.admitBatch(request, null),
     discard: (request) => store.discard(request, null),
     pull: store.pull,
     bootstrap: store.bootstrap,
@@ -223,7 +225,7 @@ describe("query pagination", () => {
     "keyset pages stay correct and re-run when their model changes",
     Effect.fnUntraced(function*() {
       twoPageReads = 0
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const mutation = graph.mutation(spaceId, PutMessage)
@@ -253,7 +255,7 @@ describe("query pagination", () => {
     "keyset windows refresh on model writes and keep stable contents",
     Effect.fnUntraced(function*() {
       pageReads.clear()
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const mutation = graph.mutation(spaceId, PutMessage)
@@ -300,7 +302,7 @@ describe("query pagination", () => {
     "an ascending tail page picks up appends past its boundary",
     Effect.fnUntraced(function*() {
       ascendingReads.clear()
-      const graph = BrowserReplica.make(layerReplica)
+      const graph = ReplicaAtom.make(layerReplica)
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
       const mutation = graph.mutation(spaceId, PutMessage)

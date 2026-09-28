@@ -18,7 +18,7 @@ import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import { afterAll, assert, beforeAll, bench } from "vitest"
+import { afterAll, assert, beforeAll, test } from "vitest"
 import * as EphemeralHub from "../src/EphemeralHub.js"
 import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
 import * as SpaceEntity from "../src/SpaceEntity.js"
@@ -91,11 +91,6 @@ const layerEphemeralHub = EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1
 const assertion = PrincipalAssertion.PrincipalAssertion.make("fanout-benchmark")
 const layerAssertionVerifier = PrincipalAssertion.layerVerifier(() => Effect.succeed(null))
 const layerCluster = SpaceEntity.layer({
-  admissionMailboxCapacity: 32,
-  readMailboxCapacity: 32,
-  watchMailboxCapacity: 1_024,
-  ephemeralJoinMailboxCapacity: 1_280,
-  ephemeralCommandMailboxCapacity: 32,
   maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
   maximumConcurrentEphemeralJoinVerificationsPerSpace: 16,
@@ -182,7 +177,7 @@ const layerFanoutBench = Layer.effect(
           basis: Identity.ServerSequence.make(sequence - 1),
           name: PutTodo.name,
           payload: { id: `${fixture.watcherCount}-${sequence}`, title: "fanout" },
-          digestVersion: 3 as const,
+          digestVersion: 1 as const,
           membershipIncarnation: fixture.membershipIncarnation,
           sourceSchema: definition.schemaIdentity,
           mutationVersion: PutTodo.version
@@ -199,12 +194,12 @@ const layerFanoutBench = Layer.effect(
         const envelope = submissions[nextSubmission++]
         if (envelope === undefined) yield* Effect.die("Fanout benchmark exhausted its prepared submissions")
         for (const wake of wakes) assert.strictEqual(Queue.sizeUnsafe(wake), 0)
-        const receipt = yield* client.submit(
+        const result = yield* client.submitBatch(
           fixture.spaceId,
-          { envelope, schema: definition.schemaIdentity },
+          { envelopes: [envelope], schema: definition.schemaIdentity },
           assertion
         )
-        assert(receipt._tag === "Accepted")
+        assert(result.receipts.length === 1 && result.receipts[0]?._tag === "Accepted")
         const expected = {
           spaceId: fixture.spaceId
         }
@@ -244,8 +239,10 @@ afterAll(async () => {
 }, 120_000)
 
 for (const watcherCount of watcherCounts) {
-  bench(`${watcherCount} same-space watchers observe every submitted sequence`, async () => {
-    // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
-    await runtime.runPromise(FanoutBench.use((service) => service.submitAndObserve(watcherCount)))
-  }, { iterations, time: 0, warmupIterations, warmupTime: 0, throws: true })
+  test(`${watcherCount} same-space watchers observe every submitted sequence`, async ({ bench }) => {
+    await bench(`${watcherCount} same-space watchers observe every submitted sequence`, async () => {
+      // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Vitest invokes this Promise returning benchmark host callback.
+      await runtime.runPromise(FanoutBench.use((service) => service.submitAndObserve(watcherCount)))
+    }).run({ iterations, time: 0, warmupIterations, warmupTime: 0, throws: true })
+  })
 }

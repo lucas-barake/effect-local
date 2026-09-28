@@ -6,14 +6,18 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
+import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
+import * as Scheduler from "effect/Scheduler"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
 import * as EphemeralHub from "../src/EphemeralHub.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as SyncRpc from "../src/SyncRpc.js"
 
 const spaceA = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
@@ -90,6 +94,93 @@ const startJoin = Effect.fnUntraced(function*(
   }
 })
 
+const endsOnlyTheSubscriberThatFallsBehind = Effect.fnUntraced(function*() {
+  return yield* Effect.gen(function*() {
+    const hub = yield* EphemeralHub.EphemeralHub
+    const snapshotReady = yield* Deferred.make<void>()
+    const releaseSnapshot = yield* Deferred.make<void>()
+    const fastObserved = yield* Queue.unbounded<Identity.EphemeralRevision>()
+    const fast = yield* startJoin(hub, joinRequest(spaceA, memberB), (message) => {
+      if (message._tag !== "StateSet") return Effect.void
+      return Queue.offer(fastObserved, message.revision)
+    })
+    const slow = yield* hub.join(joinRequest(spaceA, memberA), null).pipe(
+      Stream.tap((message) => {
+        if (message._tag !== "Snapshot") return Effect.void
+        return Deferred.succeed(snapshotReady, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseSnapshot))
+        )
+      }),
+      Stream.runDrain,
+      Effect.forkChild({ startImmediately: true })
+    )
+    yield* Deferred.await(snapshotReady)
+
+    for (let message = 1; message <= 6; message++) {
+      yield* hub.publish(
+        Protocol.EphemeralSetStateRequest.make({
+          spaceId: spaceA,
+          member: memberB,
+          channel: "read",
+          key: "conversation-1",
+          value: { message },
+          ttlMillis: 30_000
+        }),
+        fast.session.sessionToken,
+        null
+      )
+      yield* LosslessQueue.take(fastObserved)
+    }
+    assert.strictEqual(fast.fiber.pollUnsafe(), undefined)
+    yield* Deferred.succeed(releaseSnapshot, undefined)
+    yield* Fiber.join(slow)
+
+    const late = yield* startJoin(hub, joinRequest(spaceA, memberC))
+    assert.deepStrictEqual(late.snapshot.states.map((entry) => entry.value), [{ message: 6 }])
+    yield* Fiber.interrupt(fast.fiber)
+    yield* Fiber.interrupt(late.fiber)
+  }).pipe(Effect.provide(layerTrusted({ ...options, capacity: 4 })))
+})
+
+const expiresRosterMembersAndRetainedState = Effect.fnUntraced(function*() {
+  return yield* Effect.gen(function*() {
+    const hub = yield* EphemeralHub.EphemeralHub
+    const memberLeft = yield* Deferred.make<void>()
+    const stateRemoved = yield* Deferred.make<void>()
+    const observer = yield* startJoin(hub, joinRequest(spaceA, memberA), (message) => {
+      if (message._tag === "MemberLeft" && message.member.clientId === memberB.clientId) {
+        return Deferred.succeed(memberLeft, undefined)
+      }
+      if (message._tag === "StateRemoved" && message.member.clientId === memberA.clientId) {
+        return Deferred.succeed(stateRemoved, undefined)
+      }
+      return Effect.void
+    })
+    const expiring = yield* startJoin(hub, {
+      ...joinRequest(spaceA, memberB),
+      ttlMillis: 1_000
+    })
+    yield* hub.publish(
+      Protocol.EphemeralSetStateRequest.make({
+        spaceId: spaceA,
+        member: memberA,
+        channel: "read",
+        key: "conversation-1",
+        value: 42,
+        ttlMillis: 1_000
+      }),
+      observer.session.sessionToken,
+      null
+    )
+
+    yield* TestClock.adjust("1 second")
+    yield* Deferred.await(memberLeft)
+    yield* Deferred.await(stateRemoved)
+    assert.isTrue(Exit.isSuccess(yield* Fiber.await(expiring.fiber)))
+    yield* Fiber.interrupt(observer.fiber)
+  }).pipe(Effect.provide(layerTrusted(options)))
+})
+
 describe("EphemeralHub", () => {
   it.effect(
     "rejects a member lease that cannot renew before expiry",
@@ -132,51 +223,7 @@ describe("EphemeralHub", () => {
     })
   )
 
-  it.effect(
-    "ends only the subscriber that falls behind",
-    Effect.fnUntraced(function*() {
-      return yield* Effect.gen(function*() {
-        const hub = yield* EphemeralHub.EphemeralHub
-        const snapshotReady = yield* Deferred.make<void>()
-        const releaseSnapshot = yield* Deferred.make<void>()
-        const fast = yield* startJoin(hub, joinRequest(spaceA, memberB))
-        const slow = yield* hub.join(joinRequest(spaceA, memberA), null).pipe(
-          Stream.tap((message) => {
-            if (message._tag !== "Snapshot") return Effect.void
-            return Deferred.succeed(snapshotReady, undefined).pipe(
-              Effect.andThen(Deferred.await(releaseSnapshot))
-            )
-          }),
-          Stream.runDrain,
-          Effect.forkChild({ startImmediately: true })
-        )
-        yield* Deferred.await(snapshotReady)
-
-        for (let message = 1; message <= 6; message++) {
-          yield* hub.publish(
-            Protocol.EphemeralSetStateRequest.make({
-              spaceId: spaceA,
-              member: memberB,
-              channel: "read",
-              key: "conversation-1",
-              value: { message },
-              ttlMillis: 30_000
-            }),
-            fast.session.sessionToken,
-            null
-          )
-        }
-        assert.strictEqual(fast.fiber.pollUnsafe(), undefined)
-        yield* Deferred.succeed(releaseSnapshot, undefined)
-        yield* Fiber.join(slow)
-
-        const late = yield* startJoin(hub, joinRequest(spaceA, memberC))
-        assert.deepStrictEqual(late.snapshot.states.map((entry) => entry.value), [{ message: 6 }])
-        yield* Fiber.interrupt(fast.fiber)
-        yield* Fiber.interrupt(late.fiber)
-      }).pipe(Effect.provide(layerTrusted({ ...options, capacity: 4 })))
-    })
-  )
+  it.effect("ends only the subscriber that falls behind", endsOnlyTheSubscriberThatFallsBehind)
 
   it.effect(
     "terminates a replaced session and clears its live event quota",
@@ -224,6 +271,44 @@ describe("EphemeralHub", () => {
         ...options,
         maximumEventKeysPerMember: 1
       })))
+    })
+  )
+
+  it.effect(
+    "ends a replaced session at its next pull while the space keeps publishing",
+    Effect.fnUntraced(function*() {
+      return yield* Effect.gen(function*() {
+        const hub = yield* EphemeralHub.EphemeralHub
+        const publisher = yield* startJoin(hub, joinRequest(spaceA, memberB))
+        const pull = yield* hub.join(joinRequest(spaceA, memberA), null).pipe(Stream.toPull)
+        let snapshotSeen = false
+        while (!snapshotSeen) {
+          snapshotSeen = (yield* pull).some((message) => message._tag === "Snapshot")
+        }
+        const replacement = yield* startJoin(hub, joinRequest(spaceA, memberA))
+        const delivered: Array<string> = []
+        let ended: string | undefined
+        for (let message = 1; message <= 3 && ended === undefined; message++) {
+          yield* hub.publish(
+            Protocol.EphemeralSetStateRequest.make({
+              spaceId: spaceA,
+              member: memberB,
+              channel: "read",
+              key: "conversation-1",
+              value: { message },
+              ttlMillis: 30_000
+            }),
+            publisher.session.sessionToken,
+            null
+          )
+          const result = yield* Effect.result(pull)
+          if (Result.isFailure(result)) ended = result.failure._tag
+          else delivered.push(...result.success.map((entry) => entry._tag))
+        }
+        assert.deepStrictEqual(delivered, [])
+        assert.strictEqual(ended, "EphemeralSessionUnavailable")
+        yield* Fiber.interruptAll([publisher.fiber, replacement.fiber])
+      }).pipe(Effect.scoped, Effect.provide(layerTrusted(options)))
     })
   )
 
@@ -423,47 +508,7 @@ describe("EphemeralHub", () => {
     })
   )
 
-  it.effect(
-    "expires roster members and retained state using the server clock",
-    Effect.fnUntraced(function*() {
-      return yield* Effect.gen(function*() {
-        const hub = yield* EphemeralHub.EphemeralHub
-        const memberLeft = yield* Deferred.make<void>()
-        const stateRemoved = yield* Deferred.make<void>()
-        const observer = yield* startJoin(hub, joinRequest(spaceA, memberA), (message) => {
-          if (message._tag === "MemberLeft" && message.member.clientId === memberB.clientId) {
-            return Deferred.succeed(memberLeft, undefined)
-          }
-          if (message._tag === "StateRemoved" && message.member.clientId === memberA.clientId) {
-            return Deferred.succeed(stateRemoved, undefined)
-          }
-          return Effect.void
-        })
-        const expiring = yield* startJoin(hub, {
-          ...joinRequest(spaceA, memberB),
-          ttlMillis: 1_000
-        })
-        yield* hub.publish(
-          Protocol.EphemeralSetStateRequest.make({
-            spaceId: spaceA,
-            member: memberA,
-            channel: "read",
-            key: "conversation-1",
-            value: 42,
-            ttlMillis: 1_000
-          }),
-          observer.session.sessionToken,
-          null
-        )
-
-        yield* TestClock.adjust("1 second")
-        yield* Deferred.await(memberLeft)
-        yield* Deferred.await(stateRemoved)
-        assert.isDefined(expiring.fiber.pollUnsafe())
-        yield* Fiber.interruptAll([observer.fiber, expiring.fiber])
-      }).pipe(Effect.provide(layerTrusted(options)))
-    })
-  )
+  it.effect("expires roster members and retained state using the server clock", expiresRosterMembersAndRetainedState)
 
   it.effect(
     "publishes heartbeat lease renewals to every joined observer",
@@ -752,5 +797,17 @@ describe("EphemeralHub", () => {
         }).pipe(Layer.provide(NodeCrypto.layer))
       ))
     })
+  )
+})
+
+describe("EphemeralHub at small scheduler budgets", () => {
+  it.effect(
+    "ends only the subscriber that falls behind at a scheduler budget of 5 operations",
+    () => endsOnlyTheSubscriberThatFallsBehind().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 5))
+  )
+
+  it.effect(
+    "expires roster members and retained state at a scheduler budget of 5 operations",
+    () => expiresRosterMembersAndRetainedState().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 5))
   )
 })

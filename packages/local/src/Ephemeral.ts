@@ -3,11 +3,11 @@ import * as Defect from "./internal/defect.js"
 import * as SchemaInput from "./internal/schemaInput.js"
 import * as Protocol from "./Protocol.js"
 
-export class EncodeError extends Schema.TaggedErrorClass<EncodeError>(
+export class EncodeError extends Schema.TaggedError<EncodeError>(
   "@lucas-barake/effect-local/EphemeralEncodeError"
 )("EphemeralEncodeError", { definition: Schema.String, cause: Schema.Defect() }) {}
 
-export class DecodeError extends Schema.TaggedErrorClass<DecodeError>(
+export class DecodeError extends Schema.TaggedError<DecodeError>(
   "@lucas-barake/effect-local/EphemeralDecodeError"
 )("EphemeralDecodeError", { definition: Schema.String, cause: Schema.Defect() }) {}
 

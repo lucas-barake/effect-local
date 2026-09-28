@@ -1663,7 +1663,7 @@ export const noManualEffectBoundary = Rule.define({
 
 const taggedEffectErrorMessage = (errorTypes) => {
   const displayedTypes = errorTypes.join(" | ")
-  return `Effect error channel contains an untagged type: ${displayedTypes}. Every non never Effect error must have a required _tag. Define library errors with Schema.TaggedErrorClass and propagate or handle them by _tag. Do not hide the error with a cast, any, or an unconstrained generic.`
+  return `Effect error channel contains an untagged type: ${displayedTypes}. Every non never Effect error must have a required _tag. Define library errors with Schema.TaggedError and propagate or handle them by _tag. Do not hide the error with a cast, any, or an unconstrained generic.`
 }
 
 const layerNameMessage = (name) =>
@@ -1774,9 +1774,9 @@ export const effectTestsUseEffect = makeTypePolicyRule({
 })
 
 export const requireSchemaTaggedErrorMessage =
-  "Define every library owned typed error with Schema.TaggedErrorClass<Self>(identifier)(\"Tag\", fields). Do not use Data.TaggedError or a custom tagged Error class."
+  "Define every library owned typed error with Schema.TaggedError<Self>(identifier)(\"Tag\", fields). Do not use Data.TaggedError or a custom tagged Error class."
 export const requireSchemaTaggedError = makeTypePolicyRule({
-  description: "Require Schema.TaggedErrorClass for library owned typed errors.",
+  description: "Require Schema.TaggedError for library owned typed errors.",
   failure: "Could not verify tagged error declarations",
   select: (analysis) => analysis.schemaTaggedErrorViolations,
   message: () => requireSchemaTaggedErrorMessage

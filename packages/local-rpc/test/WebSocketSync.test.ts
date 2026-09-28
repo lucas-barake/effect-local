@@ -1,7 +1,6 @@
 import { NodeCrypto, NodeHttpServer, NodeSocket } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
-import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
@@ -14,6 +13,7 @@ import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
@@ -44,19 +44,19 @@ const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Ef
     })
   )
 
-class TestAuthorizationError extends Schema.TaggedErrorClass<TestAuthorizationError, Schema.JsonObject>(
+class TestAuthorizationError extends Schema.TaggedError<TestAuthorizationError, Schema.JsonObject>(
   "@lucas-barake/effect-local-rpc/test/WebSocketSync/TestAuthorizationError"
 )("TestAuthorizationError", { reason: Schema.String }) {}
 import * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "../src/Authentication.js"
 import * as EphemeralClient from "../src/EphemeralClient.js"
-import * as EphemeralHub from "../src/EphemeralHub.js"
-import * as PrincipalAssertion from "../src/PrincipalAssertion.js"
+import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as ProtocolSession from "../src/ProtocolSession.js"
-import * as SpaceEntity from "../src/SpaceEntity.js"
+import type * as SpaceEntity from "../src/SpaceEntity.js"
 import * as SyncClient from "../src/SyncClient.js"
 import * as SyncRpc from "../src/SyncRpc.js"
 import * as SyncServer from "../src/SyncServer.js"
+import * as RecordingClock from "./fixtures/recordingClock.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
@@ -110,6 +110,11 @@ const pullRequest = (requestedSpaceId = spaceId): Protocol.PullRequest =>
     cursor: null,
     limit: 10
   })
+const submitOne = (engine: SyncEngine.Service, request: Protocol.SubmitRequest) =>
+  engine.submitBatch({ envelopes: [request.envelope], schema: request.schema }).pipe(
+    Effect.map(({ receipts }) => receipts[0])
+  )
+
 const evolution = Evolution.make({
   current: definition,
   steps: [Evolution.step({
@@ -129,7 +134,6 @@ const layerHandlers = Layer.mergeAll(
   ReturnHugeResult.toLayer(() => Effect.succeed("x".repeat(SyncRpc.maximumFrameBytes))),
   AssignRoleV2.toLayer(({ payload }) => Effect.succeed(payload.role))
 )
-const layerRuntime = MutationRuntime.layer(definition, evolution).pipe(Layer.provide(layerHandlers))
 const readAuthorized = MutableRef.make(true)
 const layerDatabase = Layer.mergeAll(
   SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
@@ -161,11 +165,6 @@ const serverHistory = {
   migration
 }
 const entityOptions = {
-  admissionMailboxCapacity: 64,
-  readMailboxCapacity: 64,
-  watchMailboxCapacity: 64,
-  ephemeralJoinMailboxCapacity: 64,
-  ephemeralCommandMailboxCapacity: 64,
   maximumConcurrentBootstrapAuthorizations: 16,
   maximumConcurrentBootstrapPagesPerSpace: 4,
   maximumConcurrentEphemeralJoinVerificationsPerSpace: 16,
@@ -184,11 +183,11 @@ const clientHistory = {
   migration
 }
 
-const layerStore = ServerStore.layer({
-  ...serverHistory,
+const serverOptions: SyncServer.LayerOptions<typeof definition> = {
   definition,
-  evolution,
-  acceptedSchemaVersions: 0,
+  store: { ...serverHistory, evolution, acceptedSchemaVersions: 0 },
+  spaces: entityOptions,
+  authorizeEphemeral: () => Effect.void,
   authorizeAccess: ({ principal, spaceId: requestedSpaceId }) => {
     if (
       principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
@@ -216,7 +215,7 @@ const layerStore = ServerStore.layer({
     }
     return Effect.fail(new TestAuthorizationError({ reason: "forbidden" }))
   }
-}).pipe(Layer.provide(layerRuntime), Layer.provide(layerDatabase))
+}
 
 const layerAuthenticator = Layer.succeed(
   Authentication.Authenticator,
@@ -229,65 +228,36 @@ const layerAuthenticator = Layer.succeed(
   })
 )
 const layerAuthenticationServer = Authentication.layerServer.pipe(Layer.provide(layerAuthenticator))
-const assertionCodec = Schema.fromJsonString(Schema.Json)
-const layerAssertionIssuer = PrincipalAssertion.layerIssuer((principal) =>
-  Schema.encodeUnknownEffect(assertionCodec)(principal).pipe(
-    Effect.map((assertion) => PrincipalAssertion.PrincipalAssertion.make(assertion)),
-    Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "could not issue principal assertion" }))
-  )
+const secretBearer = Redacted.make("secret")
+const revokedBearer = Redacted.make("revoked")
+const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(
+  Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
 )
-const layerAssertionVerifier = PrincipalAssertion.layerVerifier((assertion) =>
-  Schema.decodeUnknownEffect(assertionCodec)(assertion).pipe(
-    Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" }))
-  )
-)
-const authenticationClientProvider = Authentication.CredentialProvider.of({
-  acquire: Effect.succeed({ generation: 0, bearer: Redacted.make("secret") }),
-  awaitChange: () => Effect.never
-})
-const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
-  Layer.succeed(
-    Authentication.CredentialProvider,
-    authenticationClientProvider
-  )
-))
-const revokedAuthenticationClientProvider = Authentication.CredentialProvider.of({
-  acquire: Effect.succeed({ generation: 0, bearer: Redacted.make("revoked") }),
-  awaitChange: () => Effect.never
-})
-const layerRevokedAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(Layer.provide(
-  Layer.succeed(
-    Authentication.CredentialProvider,
-    revokedAuthenticationClientProvider
-  )
-))
-const layerCluster = SpaceEntity.layer(entityOptions).pipe(
-  Layer.provide(layerAssertionVerifier),
-  Layer.provide(layerStore),
-  Layer.provide(
-    EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
-  ),
-  Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
-)
-
 const layerWebsocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(
   Layer.provide(HttpRouter.layer)
 )
-const layerWebsocketServer = SyncServer.layer.pipe(
-  Layer.provideMerge(layerWebsocketProtocol),
-  Layer.provide(layerCluster),
-  Layer.provide(layerAuthenticationServer),
-  Layer.provide(layerAssertionIssuer),
-  Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
-)
+const layerSyncServer = <R,>(
+  options: SyncServer.LayerOptions<typeof definition>,
+  layerAuthentication: Layer.Layer<Authentication.Authentication, never, R>,
+  layerMutationHandlers: typeof layerHandlers
+) =>
+  SyncServer.layer(options).pipe(
+    Layer.provideMerge(layerWebsocketProtocol),
+    Layer.provide(layerAuthentication),
+    Layer.provide(SingleRunner.layer({ runnerStorage: "memory" })),
+    Layer.provide(layerMutationHandlers),
+    Layer.provide(layerDatabase),
+    Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
+  )
+const layerWebsocketServer = layerSyncServer(serverOptions, layerAuthenticationServer, layerHandlers)
 const webSocketConstructions = MutableRef.make(0)
 const liveWebSockets = MutableRef.make(0)
 const countedWebSocketConstructor = Effect.gen(function*() {
   const makeWebSocket = yield* Socket.WebSocketConstructor
-  return (url: string, protocols?: string | Array<string>) => {
+  return (url: string, options?: Socket.WebSocketConstructorOptions) => {
     MutableRef.update(webSocketConstructions, (count) => count + 1)
     MutableRef.update(liveWebSockets, (count) => count + 1)
-    const webSocket = makeWebSocket(url, protocols)
+    const webSocket = makeWebSocket(url, options)
     webSocket.addEventListener("close", () => {
       MutableRef.update(liveWebSockets, (count) => count - 1)
     }, { once: true })
@@ -300,24 +270,33 @@ const layerCountedConstructor = Layer.effect(
 ).pipe(
   Layer.provide(NodeSocket.layerWebSocketConstructor)
 )
-const layerSocket = Effect.gen(function*() {
+const serverUrl = Effect.gen(function*() {
   const server = yield* HttpServer.HttpServer
   const address = server.address
-  if (address._tag === "UnixAddress") return yield* Effect.die("Expected the test HTTP server to use a TCP address")
-  return yield* Socket.makeWebSocket(`http://127.0.0.1:${address.port}/sync`)
-}).pipe(Layer.effect(Socket.Socket), Layer.provide(layerCountedConstructor))
+  if (address._tag === "UnixPathAddress") return yield* Effect.die("Expected the test HTTP server to use a TCP address")
+  return `http://127.0.0.1:${address.port}/sync`
+})
+const layerSocket = Effect.flatMap(serverUrl, (url) => Socket.makeWebSocket(url)).pipe(
+  Layer.effect(Socket.Socket),
+  Layer.provide(layerCountedConstructor)
+)
 const layerClientProtocol = SyncClient.layerProtocolSocket().pipe(Layer.provide(layerSocket))
-const layerClient = Layer.merge(SyncClient.layer, EphemeralClient.layer).pipe(
-  Layer.provide(layerClientProtocol),
-  Layer.provide(layerAuthenticationClient)
+const layerClient = SyncClient.layerWebSocket({ url: serverUrl }).pipe(
+  Layer.provide(layerCountedConstructor),
+  Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
 )
 class RevokedSyncEngine extends Context.Service<RevokedSyncEngine, SyncEngine.Service>()(
   "@lucas-barake/effect-local-rpc/test/RevokedSyncEngine"
 ) {}
+// A second bundle with a different provider under the same memo map: proves the
+// bundle does not share the credential middleware between clients.
 const layerRevokedClient = Layer.effect(RevokedSyncEngine, SyncEngine.SyncEngine).pipe(
-  Layer.provide(Layer.fresh(SyncClient.layer)),
-  Layer.provide(Layer.fresh(layerClientProtocol)),
-  Layer.provide(layerRevokedAuthenticationClient)
+  Layer.provide(
+    SyncClient.layerWebSocket({ url: serverUrl }).pipe(
+      Layer.provide(layerCountedConstructor),
+      Layer.provide(Authentication.layerCredentialProviderStatic(revokedBearer))
+    )
+  )
 )
 const layerLive = Layer.merge(layerClient, layerRevokedClient).pipe(
   Layer.provideMerge(layerWebsocketServer),
@@ -328,12 +307,10 @@ const layerSingleClientLive = layerClient.pipe(
   Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
 )
 
-const layerIncompatibleServer = SyncServer.layerWithOptions({ supportedProtocolVersions: [2] }).pipe(
-  Layer.provideMerge(layerWebsocketProtocol),
-  Layer.provide(layerCluster),
-  Layer.provide(layerAuthenticationServer),
-  Layer.provide(layerAssertionIssuer),
-  Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
+const layerIncompatibleServer = layerSyncServer(
+  { ...serverOptions, supportedProtocolVersions: [2] },
+  layerAuthenticationServer,
+  layerHandlers
 )
 const layerIncompatibleClient = SyncClient.layerWithOptions({ supportedProtocolVersions: [1] }).pipe(
   Layer.provide(layerClientProtocol),
@@ -390,12 +367,10 @@ const layerObservingAuthenticationServer = Layer.effect(
 ).pipe(
   Layer.provide(layerAuthenticationServer)
 )
-const layerProtocol2Server = SyncServer.layerWithOptions({ supportedProtocolVersions: [1, 2] }).pipe(
-  Layer.provideMerge(layerWebsocketProtocol),
-  Layer.provide(layerCluster),
-  Layer.provide(layerObservingAuthenticationServer),
-  Layer.provide(layerAssertionIssuer),
-  Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
+const layerProtocol2Server = layerSyncServer(
+  { ...serverOptions, supportedProtocolVersions: [1, 2] },
+  layerObservingAuthenticationServer,
+  layerHandlers
 )
 const layerConfigurableProtocolSession = ProtocolSession.layerWithOptions({ supportedProtocolVersions: [1, 2] })
 const layerConfigurableClient = Layer.merge(SyncClient.layerFromSession(), EphemeralClient.layerFromSession()).pipe(
@@ -407,7 +382,7 @@ const layerConfigurableLive = layerConfigurableClient.pipe(
   Layer.provideMerge(layerProtocol2Server),
   Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
 )
-const layerBootstrapDependencies = Layer.mergeAll(layerLive, layerStore, layerDatabase)
+const layerBootstrapDependencies = Layer.merge(layerLive, layerDatabase)
 const layerRetryDependencies = Layer.merge(layerLive, layerDatabase)
 const provideBootstrapDependencies = Effect.provide(layerBootstrapDependencies)
 const provideConfigurableLive = Effect.provide(layerConfigurableLive)
@@ -420,11 +395,13 @@ const restoreReadAuthorization = Effect.ensuring(Effect.sync(() => MutableRef.se
 type AuthenticatorMode = "Available" | "Rejected" | "Unavailable"
 
 const awaitStatus = (
-  reactivity: Reactivity.Reactivity["Service"],
+  reactivity: Reactivity.Reactivity,
   space: Replica.Space,
   tag: "Online" | "Offline" | "NeedsAuthentication"
 ) =>
-  reactivity.stream([`effect-local:space:${space.spaceId}:status`], space.status).pipe(
+  reactivity.query([`effect-local:space:${space.spaceId}:status`], space.status).pipe(
+    Effect.map(LosslessQueue.stream),
+    Stream.unwrap,
     Stream.filter((status) => status._tag === tag),
     Stream.runHead,
     Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
@@ -452,17 +429,12 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const blockPull = MutableRef.make(false)
   const lifecycleWebSocketConstructions = MutableRef.make(0)
 
+  const credentialProvider = Authentication.makeCredentialProvider(credentials)
   const provider = Authentication.CredentialProvider.of({
-    acquire: SubscriptionRef.get(credentials),
+    acquire: credentialProvider.acquire,
     awaitChange: (generation) =>
       Deferred.succeed(refreshWaitStarted, generation).pipe(
-        Effect.andThen(
-          SubscriptionRef.changes(credentials).pipe(
-            Stream.filter((credential) => credential.generation !== generation),
-            Stream.runHead,
-            Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
-          )
-        )
+        Effect.andThen(credentialProvider.awaitChange(generation))
       )
   })
   const layerClientAuthentication = Authentication.layerClient.pipe(
@@ -514,57 +486,39 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     ReturnHugeResult.toLayer(() => Effect.succeed("x".repeat(SyncRpc.maximumFrameBytes))),
     AssignRoleV2.toLayer(({ payload }) => Effect.succeed(payload.role))
   )
-  const layerLifecycleRuntime = MutationRuntime.layer(definition, evolution).pipe(Layer.provide(layerLifecycleHandlers))
-  const layerLifecycleStore = ServerStore.layer({
-    ...serverHistory,
-    definition,
-    evolution,
-    acceptedSchemaVersions: 0,
-    authorizeAccess: ({ principal, spaceId: requestedSpaceId }) => {
-      if (
-        principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
-        "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
-      ) return Effect.void
-      return Effect.fail(new TestAuthorizationError({ reason: "forbidden" }))
+  const layerLifecycleServer = layerSyncServer(
+    {
+      definition,
+      store: { ...serverHistory, evolution, acceptedSchemaVersions: 0 },
+      spaces: entityOptions,
+      authorizeEphemeral: () => Effect.void,
+      authorizeAccess: ({ principal, spaceId: requestedSpaceId }) => {
+        if (
+          principal !== null && typeof principal === "object" && !Array.isArray(principal) &&
+          "subject" in principal && principal.subject === "test" && requestedSpaceId === spaceId
+        ) return Effect.void
+        return Effect.fail(new TestAuthorizationError({ reason: "forbidden" }))
+      },
+      authorizeMutation: () => Effect.void,
+      authorizeRead: () => {
+        if (!MutableRef.get(blockPull)) return Effect.void
+        return Deferred.succeed(pullEntered, undefined).pipe(
+          Effect.andThen(Deferred.await(pullRelease)),
+          Effect.ensuring(Deferred.succeed(pullInterrupted, undefined))
+        )
+      }
     },
-    authorizeMutation: () => Effect.void,
-    authorizeRead: () => {
-      if (!MutableRef.get(blockPull)) return Effect.void
-      return Deferred.succeed(pullEntered, undefined).pipe(
-        Effect.andThen(Deferred.await(pullRelease)),
-        Effect.ensuring(Deferred.succeed(pullInterrupted, undefined))
-      )
-    }
-  }).pipe(Layer.provide(layerLifecycleRuntime), Layer.provide(layerDatabase))
-  const layerLifecycleCluster = SpaceEntity.layer(entityOptions).pipe(
-    Layer.provide(layerAssertionVerifier),
-    Layer.provide(layerLifecycleStore),
-    Layer.provide(
-      EphemeralHub.layerTrusted({ maximumWatchersPerSpace: 1_024 }).pipe(Layer.provide(NodeCrypto.layer))
-    ),
-    Layer.provide(SingleRunner.layer({ runnerStorage: "memory" }).pipe(Layer.provide(layerDatabase)))
-  )
-  const layerLifecycleWebSocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(
-    Layer.provide(HttpRouter.layer)
-  )
-  const layerLifecycleServer = SyncServer.layer.pipe(
-    Layer.provideMerge(layerLifecycleWebSocketProtocol),
-    Layer.provide(layerLifecycleCluster),
-    Layer.provide(layerObservedAuthenticationServer),
-    Layer.provide(layerAssertionIssuer),
-    Layer.provide(HttpRouter.serve(layerLifecycleWebSocketProtocol, {
-      disableListenLog: true,
-      disableLogger: true
-    }))
+    layerObservedAuthenticationServer,
+    layerLifecycleHandlers
   )
   const lifecycleWebSocketConstructor = Effect.gen(function*() {
     const makeWebSocket = yield* Socket.WebSocketConstructor
     return (
       url: string,
-      protocols?: string | Array<string>
+      constructorOptions?: Socket.WebSocketConstructorOptions
     ) => {
       MutableRef.update(lifecycleWebSocketConstructions, (count) => count + 1)
-      return makeWebSocket(url, protocols)
+      return makeWebSocket(url, constructorOptions)
     }
   })
   const layerLifecycleConstructor = Layer.effect(
@@ -576,7 +530,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const layerLifecycleSocket = Effect.gen(function*() {
     const server = yield* HttpServer.HttpServer
     const address = server.address
-    if (address._tag === "UnixAddress") return yield* Effect.die("Expected a TCP test server")
+    if (address._tag === "UnixPathAddress") return yield* Effect.die("Expected a TCP test server")
     return yield* Socket.makeWebSocket(`http://127.0.0.1:${address.port}/sync`)
   }).pipe(Layer.effect(Socket.Socket), Layer.provide(layerLifecycleConstructor))
   const layerLifecycleClientProtocol = SyncClient.layerProtocolSocket().pipe(Layer.provide(layerLifecycleSocket))
@@ -588,7 +542,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     Layer.provideMerge(layerLifecycleServer),
     Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
   )
-  const replicaLayer = (maximumRetryDelay: Duration.Input) =>
+  const replicaLayer = (maximumRetryDelay: Duration.Input, layerReplicaClock: Layer.Layer<never> = Layer.empty) =>
     SqlReplica.layer({
       ...clientHistory,
       definition,
@@ -598,6 +552,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
       retryDelay: "1 second",
       maximumRetryDelay
     }).pipe(
+      Layer.provide(layerReplicaClock),
       Layer.provide(layerLifecycleHandlers),
       Layer.provideMerge(layerDatabase),
       Layer.provide(layerLifecycleLive)
@@ -693,7 +648,9 @@ describe("WebSocket synchronization", () => {
     "backs off an unavailable authenticator and recovers",
     Effect.fnUntraced(function*() {
       const harness = yield* makeLifecycleHarness()
-      const replicaContext = yield* Layer.build(harness.replicaLayer("2 seconds"))
+      const recording = yield* RecordingClock.make
+      const layerRecordingClock = Layer.succeed(Clock.Clock, recording.clock)
+      const replicaContext = yield* Layer.build(harness.replicaLayer("2 seconds", layerRecordingClock))
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
@@ -709,25 +666,28 @@ describe("WebSocket synchronization", () => {
       )
       MutableRef.set(harness.mode, "Unavailable")
       yield* space.mutate(PutTodo, { id: "outage", title: "backoff" })
-      assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
+      assert.deepInclude(yield* LosslessQueue.take(harness.attempts), { mode: "Unavailable" })
       assert.strictEqual((yield* Fiber.join(offline))._tag, "Offline")
 
-      yield* TestClock.adjust("999 millis")
+      const firstBackoff = yield* recording.nextSleep((request) => request.millis === 1_000)
+      yield* recording.advanceTo(firstBackoff.deadline - 1)
       assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
-      yield* TestClock.adjust("1 millis")
-      assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
+      yield* recording.advanceTo(firstBackoff.deadline)
+      assert.deepInclude(yield* LosslessQueue.take(harness.attempts), { mode: "Unavailable" })
 
-      yield* TestClock.adjust("1999 millis")
+      const secondBackoff = yield* recording.nextSleep((request) => request.millis === 2_000)
+      yield* recording.advanceTo(secondBackoff.deadline - 1)
       assert.isTrue(Option.isNone(yield* Queue.poll(harness.attempts)))
-      yield* TestClock.adjust("1 millis")
-      assert.deepInclude(yield* Queue.take(harness.attempts), { mode: "Unavailable" })
+      yield* recording.advanceTo(secondBackoff.deadline)
+      assert.deepInclude(yield* LosslessQueue.take(harness.attempts), { mode: "Unavailable" })
 
+      const recoveryBackoff = yield* recording.nextSleep((request) => request.millis === 2_000)
       const online = yield* awaitStatus(reactivity, space, "Online").pipe(
         Effect.forkChild({ startImmediately: true })
       )
       MutableRef.set(harness.mode, "Available")
-      yield* TestClock.adjust("2 seconds")
-      assert.strictEqual(yield* Queue.take(harness.applications), "outage")
+      yield* recording.advanceTo(recoveryBackoff.deadline)
+      assert.strictEqual(yield* LosslessQueue.take(harness.applications), "outage")
       assert.strictEqual((yield* Fiber.join(online))._tag, "Online")
     })
   )
@@ -810,11 +770,11 @@ describe("WebSocket synchronization", () => {
         second.mutate(PutTodo, { id: "shared", title: "second socket" })
       ], { concurrency: "unbounded" })
       const awaitReceipt = Effect.fnUntraced(function*(space: Replica.Space, id: Identity.MutationId) {
-        while (true) {
-          const receipt = yield* space.receipt(PutTodo, id)
-          if (Option.isSome(receipt)) return receipt.value
-          yield* Effect.yieldNow
-        }
+        yield* space.settlementsFor(PutTodo, { from: 0 }).pipe(
+          Stream.filter((settled) => settled.settlement.pending.envelope.mutationId === id),
+          Stream.runHead
+        )
+        return Option.getOrThrow(yield* space.receipt(PutTodo, id))
       })
       const [firstReceipt, secondReceipt] = yield* Effect.all([
         awaitReceipt(first, firstPending.envelope.mutationId),
@@ -888,8 +848,8 @@ describe("WebSocket synchronization", () => {
             basis: Identity.ServerSequence.make(0),
             name: PutTodo.name,
             payload: { id: `bootstrap-${sequence}`, title: "s".repeat(250) },
-            digestVersion: 3,
-            membershipIncarnation: Identity.legacyMembershipIncarnation,
+            digestVersion: 1,
+            membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000901"),
             sourceSchema: definition.schemaIdentity,
             mutationVersion: PutTodo.version
           }
@@ -897,7 +857,7 @@ describe("WebSocket synchronization", () => {
             ...identity,
             digest: yield* Protocol.mutationDigest(identity)
           })
-          yield* remote.submit({ envelope: mutation, schema: definition.schemaIdentity })
+          yield* submitOne(remote, { envelope: mutation, schema: definition.schemaIdentity })
         }
         yield* (yield* ServerStore.ServerStore).maintain(spaceId)
 
@@ -955,8 +915,8 @@ describe("WebSocket synchronization", () => {
           basis: Identity.ServerSequence.make(0),
           name: PutTodo.name,
           payload: { id: "1", title: "socket" },
-          digestVersion: 3 as const,
-          membershipIncarnation: Identity.legacyMembershipIncarnation,
+          digestVersion: 1 as const,
+          membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000901"),
           sourceSchema: definition.schemaIdentity,
           mutationVersion: PutTodo.version
         }
@@ -965,11 +925,11 @@ describe("WebSocket synchronization", () => {
           digest: yield* Protocol.mutationDigest(identity)
         }
         const request = { envelope, schema: definition.schemaIdentity }
-        const receipt = yield* remote.submit(request)
+        const receipt = yield* submitOne(remote, request)
         assert.strictEqual(receipt._tag, "Accepted")
 
         const revoked = yield* RevokedSyncEngine
-        const revokedRetry = yield* revoked.submit(request).pipe(Effect.flip)
+        const revokedRetry = yield* submitOne(revoked, request).pipe(Effect.flip)
         assert.strictEqual(revokedRetry._tag, "AuthorizationDenied")
 
         const sql = yield* SqlClient.SqlClient
@@ -1000,7 +960,7 @@ describe("WebSocket synchronization", () => {
           ...forbiddenIdentity,
           digest: yield* Protocol.mutationDigest(forbiddenIdentity)
         }
-        const forbidden = yield* remote.submit({
+        const forbidden = yield* submitOne(remote, {
           envelope: forbiddenEnvelope,
           schema: definition.schemaIdentity
         }).pipe(Effect.flip)
@@ -1057,8 +1017,8 @@ describe("WebSocket synchronization", () => {
           basis: Identity.ServerSequence.make(0),
           name: AssignRoleV1.name,
           payload: { account: "victim" },
-          digestVersion: 3 as const,
-          membershipIncarnation: Identity.legacyMembershipIncarnation,
+          digestVersion: 1 as const,
+          membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000901"),
           sourceSchema: definitionV1.schemaIdentity,
           mutationVersion: AssignRoleV1.version
         }
@@ -1066,7 +1026,7 @@ describe("WebSocket synchronization", () => {
           ...identity,
           digest: yield* Protocol.mutationDigest(identity)
         }
-        const receipt = yield* remote.submit({ envelope, schema: definition.schemaIdentity })
+        const receipt = yield* submitOne(remote, { envelope, schema: definition.schemaIdentity })
 
         assert.strictEqual(receipt._tag, "Rejected")
         if (receipt._tag === "Rejected") {
@@ -1130,8 +1090,8 @@ describe("WebSocket synchronization", () => {
           basis: Identity.ServerSequence.make(0),
           name: ReturnHugeResult.name,
           payload: null,
-          digestVersion: 3 as const,
-          membershipIncarnation: Identity.legacyMembershipIncarnation,
+          digestVersion: 1 as const,
+          membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000901"),
           sourceSchema: definition.schemaIdentity,
           mutationVersion: ReturnHugeResult.version
         }
@@ -1140,8 +1100,8 @@ describe("WebSocket synchronization", () => {
           digest: yield* Protocol.mutationDigest(identity)
         }
         const request = { envelope: submitted, schema: definition.schemaIdentity }
-        const first = yield* remote.submit(request)
-        const retry = yield* remote.submit(request)
+        const first = yield* submitOne(remote, request)
+        const retry = yield* submitOne(remote, request)
 
         assert.strictEqual(first._tag, "Rejected")
         assert.deepStrictEqual(retry, first)

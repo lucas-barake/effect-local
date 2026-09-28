@@ -113,12 +113,12 @@ in Effects. Callers select either the lightweight in memory reconciliation Layer
 Workflow payload contains only definition, space, client, membership incarnation, and generation identity. Activities call the same
 idempotent reconciliation operation as the in memory scheduler.
 
-The server front door is an authenticated WebSocket RPC facade. It routes every operation by space through five Effect
-Cluster entity types. `SpaceAdmissionEntity` runs Submit and Discard sequentially. `SpaceReadEntity` serves Pull and
-immutable snapshot Bootstrap pages concurrently. `SpaceWatchEntity` owns long lived sync watches. `SpaceEphemeralJoinEntity` runs
-joined ephemeral streams. `SpaceEphemeralCommandEntity` runs publications and heartbeats. Join authorization precedes
-the Hub watcher bound. Separate command and stream lanes prevent a full join population from occupying command or
-mutation admission.
+The server front door is an authenticated WebSocket RPC facade. It routes every operation by space to one Effect
+Cluster entity, `EffectLocal/Space`, so an active space costs one resident entity. The entity runs SubmitBatch and Discard
+sequentially behind one admission permit and serves Pull, immutable snapshot Bootstrap pages, sync watches, joined
+ephemeral streams, publications, and heartbeats concurrently. Join authorization precedes the Hub watcher bound.
+Because only admission is serialized, a full join population or a paused Bootstrap page cannot occupy mutation
+admission.
 
 An accepted admission publishes a shared in memory wake after its SQL transaction commits. Subscribers read that
 publication from the per space hub. Fanout does not acquire a SQLite transaction or write a space row for each watcher.
@@ -131,9 +131,16 @@ resubmission. Cluster provides ownership and routing without retaining a second 
 and private reply.
 
 Applications provide Effect's Cluster runner, storage, and transport Layers. A single process can use
-`SingleRunner`. Sharded deployments can use shared runner storage and the Node runner transport. The authoritative
+`SingleRunner`. Sharded deployments can use shared runner storage and the Node runner transport, with one shared
+`assertionSecret` so each runner verifies the principal assertions another runner's gateway signed. The authoritative
 server SQL database must remain reachable after shard reassignment. Pod-local SQLite is valid only when deployment
 placement keeps that database with its space owner.
+
+In the browser, the tabs of one origin form their own Effect Cluster. Each tab is a runner. Holding a Web Lock named after the runner is liveness. Only the leader tab reports itself ready, and only once its replica is open, so every shard, and with it the replica entity, lives on the leader tab, which alone opens the SQLite database. Tabs exchange Cluster
+frames over one `BroadcastChannel` inbox per tab. When the leader tab closes its locks are released, the transport
+fails the calls addressed to it, Cluster resends them to the next leader, and caller-minted mutation ids keep resent
+mutations from running twice. Cluster fibers dispatch through a private `MessageChannel`, because hidden tabs throttle
+timers and the leader is often hidden.
 
 The browser graph defaults to Effect's shared `Atom.runtime`. The replica Layer and `factory.withReactivity` therefore
 share one application memo map and memoized `Reactivity` service. Every atom and invalidation key includes its space.

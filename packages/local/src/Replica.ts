@@ -46,18 +46,12 @@ export type RejectedReceipt<M extends Mutation.Any,> =
 export type Receipt<M extends Mutation.Any,> =
   | AcceptedReceipt<M>
   | RejectedReceipt<M>
-  | Protocol.LegacyReceipt
   | Protocol.ExpiredReceipt
 
-export type MutationSettlement<M extends Mutation.Any = Mutation.Any,> =
-  | {
-    readonly pending: PendingMutation<M>
-    readonly receipt: Exclude<Receipt<M>, Protocol.LegacyReceipt>
-  }
-  | {
-    readonly pending: Protocol.PendingMutation
-    readonly receipt: Protocol.LegacyReceipt
-  }
+export interface MutationSettlement<M extends Mutation.Any = Mutation.Any,> {
+  readonly pending: PendingMutation<M>
+  readonly receipt: Receipt<M>
+}
 
 export type SettledMutation<M extends Mutation.Any = Mutation.Any,> = {
   readonly sequence: Identity.SettlementSequence
@@ -68,6 +62,10 @@ export type SettlementStart = "live" | "acknowledged" | number
 
 export interface SettlementOptions {
   readonly from?: SettlementStart | undefined
+}
+
+export interface MutateOptions {
+  readonly mutationId?: Identity.MutationId | undefined
 }
 
 export const Activation = Schema.Literals(["Inactive", "Activating", "Active", "Deactivating"])
@@ -82,7 +80,8 @@ export interface Space {
   readonly deactivate: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly mutate: <M extends Mutation.Any,>(
     mutation: M,
-    payload: Mutation.Payload<M>
+    payload: Mutation.Payload<M>,
+    options?: MutateOptions
   ) => Effect.Effect<Protocol.PendingMutation, ReplicaError.ReplicaError | Mutation.Rejection<M>>
   readonly get: <M extends Model.Any,>(
     model: M,
@@ -110,6 +109,9 @@ export interface Space {
     mutation: M,
     options?: SettlementOptions
   ) => Stream.Stream<SettledMutation<M>, ReplicaError.ReplicaError>
+  readonly resolveSettlementStart: (
+    from: SettlementStart
+  ) => Effect.Effect<number, ReplicaError.ReplicaError>
   readonly acknowledgeSettlements: (
     sequence: number
   ) => Effect.Effect<void, ReplicaError.ReplicaError>

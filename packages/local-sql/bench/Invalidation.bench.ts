@@ -2,7 +2,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as ManagedRuntime from "effect/ManagedRuntime"
-import { assert, beforeAll, bench, describe } from "vitest"
+import { assert, beforeAll, describe, test } from "vitest"
 import * as QueryReactivity from "../src/QueryReactivity.js"
 
 /* oxlint-disable effect/noTestLifecycleHooks, effect/noAsyncFunction, no-await-in-loop -- Vitest owns benchmark fixture setup, timing callbacks, and teardown. */
@@ -63,12 +63,16 @@ beforeAll(async () => {
 describe("invalidation cost", () => {
   for (const queries of querySizes) {
     for (const keys of keySizes) {
-      bench(`affected ${keys} entity keys against ${queries} retained queries`, () => {
-        affected(queries, batches.get(keys)!)
+      test(`affected ${keys} entity keys against ${queries} retained queries`, async ({ bench }) => {
+        await bench(`affected ${keys} entity keys against ${queries} retained queries`, () => {
+          affected(queries, batches.get(keys)!)
+        }).run()
       })
     }
   }
-  bench("affected one model change against 1000 retained queries", () => {
-    affected(1_000, [], ["model-500"])
+  test("affected one model change against 1000 retained queries", async ({ bench }) => {
+    await bench("affected one model change against 1000 retained queries", () => {
+      affected(1_000, [], ["model-500"])
+    }).run()
   })
 })
