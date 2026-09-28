@@ -544,7 +544,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           target_schema_version, target_schema_hash, migration_hash, next_server_sequence,
           next_terminal_sequence, history_floor,
             receipt_floor, retained_history_count, retained_receipt_count, entity_count, entity_bytes,
-            snapshot_id, snapshot_sequence, snapshot_terminal_sequence, metadata_verified`
+            snapshot_id, snapshot_sequence, snapshot_terminal_sequence`
       })
       const findSpace = SqlSchema.findOneOption({
         Request: Identity.SpaceId,
@@ -554,7 +554,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
             target_schema_version, target_schema_hash, migration_hash,
             next_server_sequence, next_terminal_sequence, history_floor,
             receipt_floor, retained_history_count, retained_receipt_count, entity_count, entity_bytes,
-            snapshot_id, snapshot_sequence, snapshot_terminal_sequence, metadata_verified
+            snapshot_id, snapshot_sequence, snapshot_terminal_sequence
           FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
       })
       const findSpaces = SqlSchema.findAll({
@@ -563,18 +563,6 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         execute: ({ after, limit }) =>
           sql`SELECT space_id FROM effect_local_server_spaces
           WHERE space_id > ${after} ORDER BY space_id LIMIT ${limit}`
-      })
-      const countHistory = SqlSchema.findOne({
-        Request: Identity.SpaceId,
-        Result: Rows.CountRow,
-        execute: (spaceId) =>
-          sql`SELECT COUNT(*) AS count FROM effect_local_authoritative_log WHERE space_id = ${spaceId}`
-      })
-      const countReceipts = SqlSchema.findOne({
-        Request: Identity.SpaceId,
-        Result: Rows.CountRow,
-        execute: (spaceId) =>
-          sql`SELECT COUNT(*) AS count FROM effect_local_server_receipts WHERE space_id = ${spaceId}`
       })
       const findSpaceCounts = SqlSchema.findOne({
         Request: Identity.SpaceId,
@@ -933,9 +921,9 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
             (space_id, definition_hash, next_server_sequence, schema_version, schema_hash, schema_generation,
               next_terminal_sequence, history_floor, receipt_floor, retained_history_count,
               retained_receipt_count, entity_count, entity_bytes, snapshot_sequence,
-              snapshot_terminal_sequence, metadata_verified)
+              snapshot_terminal_sequence)
             VALUES (${spaceId}, ${options.definition.hash}, 1, ${options.definition.schemaIdentity.version},
-              ${options.definition.schemaIdentity.hash}, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1)
+              ${options.definition.schemaIdentity.hash}, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0)
             ON CONFLICT (space_id) DO NOTHING`
         yield* sql`INSERT INTO effect_local_server_space_counts (space_id, history_count, receipt_count)
             VALUES (${spaceId}, 0, 0) ON CONFLICT (space_id) DO NOTHING`
@@ -1075,53 +1063,6 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         return { entities, contentBytes, digest }
       })
 
-      const repairLockedSpace = Effect.fnUntraced(function*(
-        spaceId: Identity.SpaceId,
-        meta: typeof Rows.ServerMetaRow.Type
-      ) {
-        if (meta.definition_hash !== options.definition.hash) {
-          return yield* new ReplicaError.DefinitionMismatch({
-            expected: options.definition.hash,
-            actual: meta.definition_hash
-          })
-        }
-        const rows = yield* findEntities({
-          spaceId,
-          limit: options.maximumSnapshotEntities + 1
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-        const decoded = yield* decodeEntityRows(spaceId, rows)
-        const history = yield* countHistory(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-        const receipts = yield* countReceipts(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-        for (let index = 0; index < rows.length; index++) {
-          const row = rows[index]
-          const entity = decoded.entities[index]
-          if (row.entity_bytes !== entity.entityBytes) {
-            yield* sql`UPDATE effect_local_server_entities_data SET entity_bytes = ${entity.entityBytes}
-                WHERE space_id = ${spaceId} AND generation = ${meta.active_schema_generation}
-                  AND model = ${row.model} AND entity_key = ${row.entity_key}`
-          }
-        }
-        yield* sql`UPDATE effect_local_server_spaces SET
-            retained_history_count = ${history.count},
-            retained_receipt_count = ${receipts.count},
-            entity_count = ${decoded.entities.length},
-            entity_bytes = ${decoded.contentBytes},
-            metadata_verified = 1
-            WHERE space_id = ${spaceId}`
-        yield* sql`UPDATE effect_local_server_space_counts SET
-            history_count = ${history.count}, receipt_count = ${receipts.count}
-            WHERE space_id = ${spaceId}`
-        const repaired: typeof Rows.ServerMetaRow.Type = {
-          ...meta,
-          retained_history_count: history.count,
-          retained_receipt_count: receipts.count,
-          entity_count: decoded.entities.length,
-          entity_bytes: decoded.contentBytes,
-          metadata_verified: 1
-        }
-        return repaired
-      })
-
       const admit = Effect.fnUntraced(function*(
         request: Protocol.SubmitRequest,
         principal: typeof Schema.Json.Type
@@ -1172,12 +1113,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               (space_id, client_id, membership_incarnation, last_local_sequence, expired_local_sequence)
               VALUES (${envelope.spaceId}, ${envelope.clientId}, ${membershipIncarnation}, 0, 0)
               ON CONFLICT (space_id, client_id, membership_incarnation) DO NOTHING`
-              let storedSpace: typeof Rows.ServerMetaRow.Type = yield* lockSpace(envelope.spaceId).pipe(
-                Effect.mapError(StorageUnavailable.make)
-              )
-              if (storedSpace.metadata_verified === 0) {
-                storedSpace = yield* repairLockedSpace(envelope.spaceId, storedSpace)
-              }
+              const storedSpace = yield* lockSpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
               const verifiedCounts = yield* findSpaceCounts(envelope.spaceId).pipe(
                 Effect.mapError(StorageUnavailable.make)
               )
@@ -1560,10 +1496,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               (space_id, client_id, membership_incarnation, last_local_sequence, expired_local_sequence)
               VALUES (${envelope.spaceId}, ${envelope.clientId}, ${membershipIncarnation}, 0, 0)
               ON CONFLICT (space_id, client_id, membership_incarnation) DO NOTHING`
-              let storedSpace = yield* lockSpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-              if (storedSpace.metadata_verified === 0) {
-                storedSpace = yield* repairLockedSpace(envelope.spaceId, storedSpace)
-              }
+              const storedSpace = yield* lockSpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
               yield* validateStoredSpace(storedSpace)
               const committed = yield* findReceiptByMutation({
                 spaceId: envelope.spaceId,
@@ -1721,11 +1654,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
             yield* dialect.beginSnapshotRead
             const stored = yield* findSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
             if (Option.isNone(stored)) return Option.none()
-            let meta: typeof Rows.ServerMetaRow.Type = stored.value
-            if (meta.metadata_verified === 0) {
-              const locked = yield* lockSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-              meta = yield* repairLockedSpace(spaceId, locked)
-            }
+            const meta = stored.value
             yield* validateStoredSpace(meta)
             const rows = yield* findEntities({ spaceId, limit: options.maximumSnapshotEntities + 1 }).pipe(
               Effect.mapError(StorageUnavailable.make)
@@ -1925,7 +1854,6 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         meta: typeof Rows.ServerMetaRow.Type
       ) {
         if (
-          meta.metadata_verified !== 1 ||
           meta.snapshot_id === null ||
           meta.snapshot_sequence !== meta.next_server_sequence - 1 ||
           meta.snapshot_terminal_sequence !== meta.next_terminal_sequence - 1

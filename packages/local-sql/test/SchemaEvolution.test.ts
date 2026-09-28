@@ -2364,18 +2364,6 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
           (SELECT COUNT(*) FROM effect_local_server_replication_views) AS count`
         })(undefined)
         assert.deepStrictEqual(scopedState, { count: 0 })
-        if (database.dialect === "sqlite") {
-          const ProjectionCounts = Schema.Struct({ manifests: Schema.Number, entities: Schema.Number })
-          const projectionCounts = yield* SqlSchema.findOne({
-            Request: Schema.Void,
-            Result: ProjectionCounts,
-            execute: () =>
-              sql`SELECT
-            (SELECT COUNT(*) FROM effect_local_server_snapshot_projections) AS manifests,
-            (SELECT COUNT(*) FROM effect_local_server_snapshot_projection_entities) AS entities`
-          })(undefined)
-          assert.deepStrictEqual(projectionCounts, { manifests: 0, entities: 0 })
-        }
       },
       Effect.scoped,
       provideServerDatabase

@@ -42,12 +42,6 @@ const expectedFailure = <A, E extends { readonly _tag: string },>(exit: Exit.Exi
 const LedgerRow = Schema.Struct({ id: Schema.Number, name: Schema.String, checksum: Schema.String })
 const NameRow = Schema.Struct({ name: Schema.String })
 const CountRow = Schema.Struct({ count: Schema.Number })
-const UpgradedScopedRow = Schema.Struct({
-  delivered_sequence: Schema.Number,
-  read_auth_epoch: Schema.Number,
-  view_layout: Schema.String,
-  snapshot_layout: Schema.String
-})
 const ClientReplicationMetaRow = Schema.Struct({
   replication_view_id: Schema.NullOr(Schema.String),
   replication_view_revision: Schema.Number,
@@ -92,7 +86,7 @@ const probeCount = (sql: SqlClient.SqlClient) =>
 
 describe("storage migration catalogs", () => {
   it.effect(
-    "creates covering lifecycle indexes and fences pre upgrade server writers",
+    "creates covering lifecycle indexes",
     Effect.fnUntraced(function*() {
       const sql = yield* SqlClient.SqlClient
       yield* Migrations.server()
@@ -102,11 +96,6 @@ describe("storage migration catalogs", () => {
         FROM effect_local_server_entities WHERE space_id = ${spaceId}
         ORDER BY entity_bytes DESC, model, entity_key LIMIT 1`
       assert.isFalse(plan.some((row) => row.detail.includes("TEMP B-TREE")))
-
-      const result = yield* sql`INSERT INTO effect_local_server_spaces
-        (space_id, definition_hash, next_server_sequence) VALUES (${spaceId}, 'definition', 1)`.pipe(Effect.exit)
-      const error = expectedFailure(result).pipe(Option.getOrThrow)
-      assert.isTrue(SqlError.isSqlError(error))
     }, provideDatabase)
   )
 
@@ -120,9 +109,7 @@ describe("storage migration catalogs", () => {
         const lockClient = yield* SqliteClient.make({ filename })
         const migratorClient = yield* SqliteClient.make({ filename })
         yield* migratorClient`PRAGMA busy_timeout = 1`
-        yield* Migrations.runCatalog("Server", Migrations.serverCatalog.slice(0, -1)).pipe(
-          Effect.provideService(SqlClient.SqlClient, migratorClient)
-        )
+        yield* Migrations.server().pipe(Effect.provideService(SqlClient.SqlClient, migratorClient))
         const firstFailure = yield* Deferred.make<void>()
         const observedClient = new Proxy(migratorClient, {
           get: (target, property, receiver) => {
@@ -152,6 +139,12 @@ describe("storage migration catalogs", () => {
         yield* lockClient`ROLLBACK`
         yield* TestClock.adjust("1 second")
         yield* Fiber.join(migrationFiber)
+        const ledger = yield* serverMigrationLedger(migratorClient)
+        assert.deepStrictEqual(ledger, [{
+          id: 1,
+          name: Migrations.serverCatalog[0].name,
+          checksum: Migrations.serverCatalog[0].checksum
+        }])
       },
       provideNodeFileSystemAndReactivity,
       Effect.scoped
@@ -177,11 +170,11 @@ describe("storage migration catalogs", () => {
 
       pipe(
         (yield* clientLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+        (ids) => assert.deepStrictEqual(ids, [1])
       )
       pipe(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
+        (ids) => assert.deepStrictEqual(ids, [1])
       )
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
@@ -204,7 +197,6 @@ describe("storage migration catalogs", () => {
         "effect_local_server_key_lineage",
         "effect_local_server_key_lineage_groups",
         "effect_local_server_key_lineage_targets",
-        "effect_local_server_shadow_entities",
         "effect_local_server_entities_data",
         "effect_local_server_replication_views",
         "effect_local_server_replication_view_entities",
@@ -215,9 +207,7 @@ describe("storage migration catalogs", () => {
         "effect_local_server_watch_presence",
         "effect_local_server_watch_runtimes",
         "effect_local_server_scoped_snapshots",
-        "effect_local_server_scoped_snapshot_entries",
-        "effect_local_server_snapshot_projections",
-        "effect_local_server_snapshot_projection_entities"
+        "effect_local_server_scoped_snapshot_entries"
       ])
       assert.notInclude(names, "effect_local_bootstrap")
       assert.notInclude(names, "effect_local_bootstrap_entities")
@@ -231,51 +221,6 @@ describe("storage migration catalogs", () => {
         Effect.exit
       )
       assert.isTrue(SqlError.isSqlError(expectedFailure(duplicatePresence).pipe(Option.getOrThrow)))
-    }, provideDatabase)
-  )
-
-  it.effect(
-    "preserves released server migration checksums and upgrades scoped storage",
-    Effect.fnUntraced(function*() {
-      const sql = yield* SqlClient.SqlClient
-      assert.strictEqual(Migrations.serverCatalog[6].checksum, "165fbc25e03ae1c8")
-      yield* Migrations.runCatalog("Server", Migrations.serverCatalog.slice(0, 9))
-      yield* sql`INSERT INTO effect_local_server_replication_views
-        (space_id, client_id, principal_digest, view_id, view_revision, scope_generation,
-          scope_json, scope_digest, definition_hash, schema_version, schema_hash, server_sequence)
-        VALUES (${spaceId}, ${clientId}, ${"0".repeat(64)}, ${"view-1"}, 0, 1,
-          ${"{\"models\":[]}"}, ${"1".repeat(64)}, ${"definition"}, 1, ${"schema"}, 7)`
-      yield* sql`INSERT INTO effect_local_server_scoped_snapshots
-        (snapshot_id, space_id, client_id, principal_digest, definition_hash, schema_version,
-          schema_hash, scope_json, scope_digest, scope_generation, view_id, view_revision,
-          server_sequence, terminal_sequence, entry_count, content_bytes, digest)
-        VALUES (${"snapshot-1"}, ${spaceId}, ${clientId}, ${"0".repeat(64)}, ${"definition"}, 1,
-          ${"schema"}, ${"{\"models\":[]}"}, ${"1".repeat(64)}, 1, ${"view-1"}, 0, 7, 7, 0, 0,
-          ${"2".repeat(64)})`
-
-      yield* Migrations.server()
-
-      const upgraded = yield* SqlSchema.findOne({
-        Request: Schema.Void,
-        Result: UpgradedScopedRow,
-        execute: () =>
-          sql`SELECT v.delivered_sequence, v.read_auth_epoch,
-            v.index_layout_hash AS view_layout,
-            s.index_layout_hash AS snapshot_layout
-          FROM effect_local_server_replication_views AS v
-          INNER JOIN effect_local_server_scoped_snapshots AS s
-            ON s.space_id = v.space_id AND s.client_id = v.client_id`
-      })(undefined)
-      assert.deepStrictEqual(upgraded, {
-        delivered_sequence: 7,
-        read_auth_epoch: 0,
-        view_layout: "",
-        snapshot_layout: ""
-      })
-      pipe(
-        (yield* serverMigrationLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12])
-      )
     }, provideDatabase)
   )
 
@@ -634,21 +579,23 @@ describe.each(serverDatabases)("server catalog counters ($dialect)", (database) 
         (space_id, definition_hash, next_server_sequence, schema_version, schema_hash, schema_generation,
           next_terminal_sequence, history_floor, receipt_floor, retained_history_count,
           retained_receipt_count, entity_count, entity_bytes, snapshot_sequence,
-          snapshot_terminal_sequence, metadata_verified)
-        VALUES (${spaceId}, 'definition', 1, 1, 'aaaaaaaaaaaaaaaa', 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1)`
+          snapshot_terminal_sequence)
+        VALUES (${spaceId}, 'definition', 1, 1, 'aaaaaaaaaaaaaaaa', 0, 1, 0, 0, 0, 0, 0, 0, 0, 0)`
       yield* sql`INSERT INTO effect_local_server_space_counts (space_id, history_count, receipt_count)
         VALUES (${spaceId}, 0, 0)`
       for (const sequence of [1, 2]) {
         yield* sql`INSERT INTO effect_local_authoritative_log
           (space_id, server_sequence, client_id, membership_incarnation, local_sequence, mutation_id, digest,
-            entry_bytes, entry_json)
+            entry_bytes, entry_json, source_schema_version, source_schema_hash, mutation_version)
           VALUES (${spaceId}, ${sequence}, ${clientId}, 'incarnation', ${sequence}, ${`mutation-${sequence}`},
-            'digest', 2, '{}')`
+            'digest', 2, '{}', 1, 'aaaaaaaaaaaaaaaa', 1)`
       }
       yield* sql`INSERT INTO effect_local_server_receipts
         (space_id, client_id, membership_incarnation, local_sequence, mutation_id, digest, receipt_json,
-          digest_version, terminal_sequence)
-        VALUES (${spaceId}, ${clientId}, 'incarnation', 1, 'mutation-1', 'digest', '{}', 1, 1)`
+          digest_version, terminal_sequence, source_schema_version, source_schema_hash, mutation_version,
+          mutation_name)
+        VALUES (${spaceId}, ${clientId}, 'incarnation', 1, 'mutation-1', 'digest', '{}', 1, 1, 1,
+          'aaaaaaaaaaaaaaaa', 1, 'Put')`
       yield* sql`DELETE FROM effect_local_authoritative_log WHERE space_id = ${spaceId} AND server_sequence = 1`
       for (const [generation, key, bytes] of [[0, "a", 10], [0, "b", 20], [1, "c", 40]] as const) {
         yield* sql`INSERT INTO effect_local_server_entities_data
@@ -667,7 +614,7 @@ describe.each(serverDatabases)("server catalog counters ($dialect)", (database) 
           sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
             target_schema_version, target_schema_hash, migration_hash, next_server_sequence, next_terminal_sequence,
             history_floor, receipt_floor, retained_history_count, retained_receipt_count, entity_count, entity_bytes,
-            snapshot_id, snapshot_sequence, snapshot_terminal_sequence, metadata_verified
+            snapshot_id, snapshot_sequence, snapshot_terminal_sequence
           FROM effect_local_server_spaces WHERE space_id = ${spaceId}`
       })(undefined)
       const counts = yield* SqlSchema.findOne({

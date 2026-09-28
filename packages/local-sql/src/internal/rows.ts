@@ -184,8 +184,7 @@ export const ServerMetaRow = Schema.Struct({
   entity_bytes: integer(NonNegativeInt),
   snapshot_id: Schema.NullOr(Identity.SnapshotId),
   snapshot_sequence: integer(Identity.ServerSequence),
-  snapshot_terminal_sequence: integer(Identity.TerminalSequence),
-  metadata_verified: Schema.Literals([0, 1])
+  snapshot_terminal_sequence: integer(Identity.TerminalSequence)
 })
 
 export const ServerClientRow = Schema.Struct({
@@ -221,8 +220,8 @@ export const ServerReceiptRow = Schema.Struct({
   digest_version: Protocol.MutationDigestVersion,
   source_schema_version: integer(Identity.SchemaVersion),
   source_schema_hash: Identity.SchemaHash,
-  mutation_version: Schema.NullOr(integer(Identity.SchemaVersion)),
-  mutation_name: Schema.NullOr(Schema.String),
+  mutation_version: integer(Identity.SchemaVersion),
+  mutation_name: Schema.String,
   rejection_origin: Schema.NullOr(Protocol.RejectionOrigin),
   mutation_id: Identity.MutationId,
   terminal_sequence: integer(Identity.TerminalSequence),
@@ -295,17 +294,6 @@ export const SnapshotEntityWireRow = Schema.Struct({
   ordinal: integer(NonNegativeInt),
   wire_json: Schema.String,
   wire_bytes: integer(PositiveInt)
-})
-
-export const SnapshotProjectionRow = Schema.Struct({
-  space_id: Identity.SpaceId,
-  snapshot_id: Identity.SnapshotId,
-  target_schema_version: integer(Identity.SchemaVersion),
-  target_schema_hash: Identity.SchemaHash,
-  definition_hash: Schema.String,
-  entity_count: integer(NonNegativeInt),
-  content_bytes: integer(NonNegativeInt),
-  digest: Protocol.SnapshotDigest
 })
 
 export const ReplicationViewRow = Schema.Struct({
