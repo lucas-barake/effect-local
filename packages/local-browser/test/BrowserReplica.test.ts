@@ -968,8 +968,7 @@ describe("BrowserReplica", () => {
         const leader = yield* environment.openTab
         const follower = yield* environment.openTab
         const space = yield* settle(follower.replica.space(spaceId))
-        const start = yield* settle(space.resolveSettlementStart("live"))
-        const received = yield* Effect.forkChild(space.settlements({ from: start }).pipe(Stream.runHead))
+        const received = yield* Effect.forkChild(space.settlements({ from: "live" }).pipe(Stream.runHead))
         const pending = yield* settle(space.mutate(PutTodo, { id: "6", title: "settles on the new leader" }))
         submitAllowed = true
         yield* settle(Scope.close(leader.scope, Exit.void))
@@ -1104,11 +1103,21 @@ describe("BrowserReplica", () => {
         yield* settle(space.mutate(PutTodo, { id: "b", title: "b" }))
         yield* settle(space.mutate(PutTodo, { id: "c", title: "c" }))
         yield* settle(space.settlements({ from: 0 }).pipe(Stream.take(3), Stream.runDrain))
-        assert.strictEqual(yield* settle(space.resolveSettlementStart("live")), 3)
-        yield* space.settlements({ from: "live" }).pipe(Stream.runDrain, Effect.forkScoped)
-        yield* TestClock.adjust("5 seconds")
-        yield* space.settlements({ from: "acknowledged" }).pipe(Stream.runDrain, Effect.forkScoped)
-        yield* TestClock.adjust("5 seconds")
+        const live = yield* settle(space.resolveSettlementStart("live"))
+        assert.strictEqual(live, 3)
+        const liveOpen = yield* Deferred.make<void>()
+        yield* space.settlements({ from: live }).pipe(
+          Stream.runForEach(() => Deferred.succeed(liveOpen, undefined)),
+          Effect.forkScoped
+        )
+        yield* settle(space.mutate(PutTodo, { id: "d", title: "d" }))
+        yield* settle(Deferred.await(liveOpen))
+        const acknowledgedOpen = yield* Deferred.make<void>()
+        yield* space.settlements({ from: "acknowledged" }).pipe(
+          Stream.runForEach(() => Deferred.succeed(acknowledgedOpen, undefined)),
+          Effect.forkScoped
+        )
+        yield* settle(Deferred.await(acknowledgedOpen))
         yield* settle(space.acknowledgeSettlements(1))
         assert.strictEqual(yield* settle(space.resolveSettlementStart("acknowledged")), 1)
       },
