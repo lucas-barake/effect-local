@@ -37,7 +37,7 @@ const graph = ReplicaAtom.make(layerReplica)
 `name` scopes the cluster, its locks, and the durable client id, so two replicas on one origin need different names.
 Everything else is optional. `replica` forwards `SqlReplica` options, `sharding` overrides the tab cluster's
 `ShardingConfig`, and `retryDelay` (1 second) paces leader election retries. `layerPlatform` replaces the Web Locks,
-`BroadcastChannel`, and `localStorage` adapters, which is how the tests run several tabs in one process.
+`BroadcastChannel`, `localStorage`, and WebCrypto adapters, which is how the tests run several tabs in one process.
 `BrowserSqlite.layerWorker` spawns and owns a dedicated SQLite WASM worker that is terminated when the Layer's scope
 closes, and `BrowserSqlite.layerMessagePort` adapts an application-owned worker port instead.
 

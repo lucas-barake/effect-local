@@ -19,6 +19,7 @@ import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
+import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -241,7 +242,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
       spaces: [spaceId],
       profiles: { status: StatusProfile },
       ephemerals: build.ephemerals,
-      layerPlatform: Layer.merge(kit.layerAll, Layer.succeed(platform.TabVisibility, visibility)),
+      layerPlatform: Layer.mergeAll(kit.layerAll, Layer.succeed(platform.TabVisibility, visibility), NodeCrypto.layer),
       requestPersistence: false,
       retryDelay: environmentOptions.retryDelay ?? "100 millis",
       sharding: environmentOptions.sharding
@@ -967,15 +968,11 @@ describe("BrowserReplica", () => {
         const leader = yield* environment.openTab
         const follower = yield* environment.openTab
         const space = yield* settle(follower.replica.space(spaceId))
-        const received = yield* Effect.forkChild(
-          space.settlements({ from: "live" }).pipe(Stream.runHead, Effect.timeoutOption("60 seconds"))
-        )
-        yield* TestClock.adjust("5 seconds")
+        const received = yield* Effect.forkChild(space.settlements({ from: "live" }).pipe(Stream.runHead))
         const pending = yield* settle(space.mutate(PutTodo, { id: "6", title: "settles on the new leader" }))
         submitAllowed = true
         yield* settle(Scope.close(leader.scope, Exit.void))
-        yield* TestClock.adjust("60 seconds")
-        const settled = Option.flatten(yield* Fiber.join(received))
+        const settled = yield* settle(Fiber.join(received))
         assert.isTrue(Option.isSome(settled))
         if (Option.isSome(settled)) {
           assert.strictEqual(settled.value.settlement.pending.envelope.mutationId, pending.envelope.mutationId)
@@ -1105,11 +1102,22 @@ describe("BrowserReplica", () => {
         yield* settle(space.mutate(PutTodo, { id: "a", title: "a" }))
         yield* settle(space.mutate(PutTodo, { id: "b", title: "b" }))
         yield* settle(space.mutate(PutTodo, { id: "c", title: "c" }))
-        assert.strictEqual(yield* settle(space.resolveSettlementStart("live")), 3)
-        yield* space.settlements({ from: "live" }).pipe(Stream.runDrain, Effect.forkScoped)
-        yield* TestClock.adjust("5 seconds")
-        yield* space.settlements({ from: "acknowledged" }).pipe(Stream.runDrain, Effect.forkScoped)
-        yield* TestClock.adjust("5 seconds")
+        yield* settle(space.settlements({ from: 0 }).pipe(Stream.take(3), Stream.runDrain))
+        const live = yield* settle(space.resolveSettlementStart("live"))
+        assert.strictEqual(live, 3)
+        const liveOpen = yield* Deferred.make<void>()
+        yield* space.settlements({ from: live }).pipe(
+          Stream.runForEach(() => Deferred.succeed(liveOpen, undefined)),
+          Effect.forkScoped
+        )
+        yield* settle(space.mutate(PutTodo, { id: "d", title: "d" }))
+        yield* settle(Deferred.await(liveOpen))
+        const acknowledgedOpen = yield* Deferred.make<void>()
+        yield* space.settlements({ from: "acknowledged" }).pipe(
+          Stream.runForEach(() => Deferred.succeed(acknowledgedOpen, undefined)),
+          Effect.forkScoped
+        )
+        yield* settle(Deferred.await(acknowledgedOpen))
         yield* settle(space.acknowledgeSettlements(1))
         assert.strictEqual(yield* settle(space.resolveSettlementStart("acknowledged")), 1)
       },
@@ -1131,12 +1139,12 @@ describe("BrowserReplica", () => {
           Stream.runForEach((settled) => Queue.offer(delivered, settled.sequence)),
           Effect.forkScoped
         )
-        yield* TestClock.adjust("5 seconds")
         yield* settle(space.mutate(PutTodo, { id: "a", title: "a" }))
         yield* settle(space.mutate(PutTodo, { id: "b", title: "b" }))
+        assert.deepStrictEqual(yield* settle(Effect.all([Queue.take(delivered), Queue.take(delivered)])), [1, 2])
         yield* settle(Scope.close(leader.scope, Exit.void))
         yield* settle(space.mutate(PutTodo, { id: "c", title: "c" }))
-        assert.deepStrictEqual(yield* settle(Queue.takeN(delivered, 3)), [1, 2, 3])
+        assert.strictEqual(yield* settle(Queue.take(delivered)), 3)
       },
       Effect.scoped,
       provideFileSystem
@@ -1183,7 +1191,8 @@ describe("BrowserReplica", () => {
         Layer.succeed(platform.ClientIdentityStore, {
           load: () => Effect.succeed("not-a-client-id"),
           store: () => Effect.void
-        })
+        }),
+        NodeCrypto.layer
       )
       const outcome = yield* Layer.build(
         BrowserReplica.layer({
@@ -1211,6 +1220,52 @@ describe("BrowserReplica", () => {
         Effect.catchTag("BrowserStorageError", (error) => Effect.succeed(error.operation))
       )
       assert.strictEqual(outcome, "decode")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "generates the durable client identity with the platform's Crypto",
+    Effect.fnUntraced(function*() {
+      const kit = yield* testKit.makeMemoryPlatform
+      const nodeCrypto = Context.get(yield* Layer.build(NodeCrypto.layer), Crypto.Crypto)
+      const zeroCrypto = Crypto.make({
+        randomBytes: (size) => new Uint8Array(size),
+        digest: (algorithm, data) => nodeCrypto.digest(algorithm, data)
+      })
+      const stored = yield* Deferred.make<string>()
+      const layerPlatform = Layer.mergeAll(
+        Layer.succeed(platform.TabChannel, kit.tabChannel),
+        Layer.succeed(platform.WebLocks, kit.webLocks),
+        Layer.succeed(platform.TabVisibility, (yield* testKit.makeMemoryVisibility(true)).service),
+        Layer.succeed(platform.ClientIdentityStore, {
+          load: () => Effect.succeed(undefined),
+          store: (_key, value) => Deferred.succeed(stored, value).pipe(Effect.asVoid)
+        }),
+        Layer.succeed(Crypto.Crypto, zeroCrypto)
+      )
+      yield* Layer.build(
+        BrowserReplica.layer({
+          name: "platform-crypto",
+          definition,
+          layerDatabase: SqliteClient.layer({ filename: ":memory:" }),
+          layerSync: Layer.merge(
+            Layer.succeed(SyncEngine.SyncEngine, {
+              waitForCredentialChange: () => Effect.never,
+              transportGeneration: Effect.succeed(0),
+              waitForTransportChange: () => Effect.never,
+              submitBatch: () => Effect.never,
+              discard: () => Effect.never,
+              pull: () => Effect.never,
+              bootstrap: () => Effect.never,
+              watch: () => Stream.never
+            }),
+            layerEphemeralInactive
+          ),
+          layerPlatform,
+          requestPersistence: false
+        }).pipe(Layer.provide(layerHandlers), Layer.provide(Reactivity.layer))
+      ).pipe(Effect.forkScoped)
+      assert.strictEqual(yield* Deferred.await(stored), "cli_00000000-0000-4000-8000-000000000000")
     }, Effect.scoped)
   )
 })
