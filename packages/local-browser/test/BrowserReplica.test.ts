@@ -19,6 +19,7 @@ import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
+import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -241,7 +242,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
       spaces: [spaceId],
       profiles: { status: StatusProfile },
       ephemerals: build.ephemerals,
-      layerPlatform: Layer.merge(kit.layerAll, Layer.succeed(platform.TabVisibility, visibility)),
+      layerPlatform: Layer.mergeAll(kit.layerAll, Layer.succeed(platform.TabVisibility, visibility), NodeCrypto.layer),
       requestPersistence: false,
       retryDelay: environmentOptions.retryDelay ?? "100 millis",
       sharding: environmentOptions.sharding
@@ -1183,7 +1184,8 @@ describe("BrowserReplica", () => {
         Layer.succeed(platform.ClientIdentityStore, {
           load: () => Effect.succeed("not-a-client-id"),
           store: () => Effect.void
-        })
+        }),
+        NodeCrypto.layer
       )
       const outcome = yield* Layer.build(
         BrowserReplica.layer({
@@ -1211,6 +1213,52 @@ describe("BrowserReplica", () => {
         Effect.catchTag("BrowserStorageError", (error) => Effect.succeed(error.operation))
       )
       assert.strictEqual(outcome, "decode")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "generates the durable client identity with the platform's Crypto",
+    Effect.fnUntraced(function*() {
+      const kit = yield* testKit.makeMemoryPlatform
+      const nodeCrypto = Context.get(yield* Layer.build(NodeCrypto.layer), Crypto.Crypto)
+      const zeroCrypto = Crypto.make({
+        randomBytes: (size) => new Uint8Array(size),
+        digest: (algorithm, data) => nodeCrypto.digest(algorithm, data)
+      })
+      const stored = yield* Deferred.make<string>()
+      const layerPlatform = Layer.mergeAll(
+        Layer.succeed(platform.TabChannel, kit.tabChannel),
+        Layer.succeed(platform.WebLocks, kit.webLocks),
+        Layer.succeed(platform.TabVisibility, (yield* testKit.makeMemoryVisibility(true)).service),
+        Layer.succeed(platform.ClientIdentityStore, {
+          load: () => Effect.succeed(undefined),
+          store: (_key, value) => Deferred.succeed(stored, value).pipe(Effect.asVoid)
+        }),
+        Layer.succeed(Crypto.Crypto, zeroCrypto)
+      )
+      yield* Layer.build(
+        BrowserReplica.layer({
+          name: "platform-crypto",
+          definition,
+          layerDatabase: SqliteClient.layer({ filename: ":memory:" }),
+          layerSync: Layer.merge(
+            Layer.succeed(SyncEngine.SyncEngine, {
+              waitForCredentialChange: () => Effect.never,
+              transportGeneration: Effect.succeed(0),
+              waitForTransportChange: () => Effect.never,
+              submitBatch: () => Effect.never,
+              discard: () => Effect.never,
+              pull: () => Effect.never,
+              bootstrap: () => Effect.never,
+              watch: () => Stream.never
+            }),
+            layerEphemeralInactive
+          ),
+          layerPlatform,
+          requestPersistence: false
+        }).pipe(Layer.provide(layerHandlers), Layer.provide(Reactivity.layer))
+      ).pipe(Effect.forkScoped)
+      assert.strictEqual(yield* Deferred.await(stored), "cli_00000000-0000-4000-8000-000000000000")
     }, Effect.scoped)
   )
 })

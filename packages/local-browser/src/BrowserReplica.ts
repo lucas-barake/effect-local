@@ -46,22 +46,26 @@ export interface Options<D extends Definition.Any, ED extends Tagged, ES extends
   readonly requestPersistence?: boolean | undefined
   readonly retryDelay?: Duration.Input | undefined
   readonly sharding?: Partial<ShardingConfig.ShardingConfig["Service"]> | undefined
-  readonly layerPlatform?:
-    | Layer.Layer<platform.WebLocks | platform.TabChannel | platform.TabVisibility | platform.ClientIdentityStore>
-    | undefined
+  readonly layerPlatform?: Layer.Layer<Platform> | undefined
 }
 
 interface Tagged {
   readonly _tag: string
 }
 
-export const layerPlatformBrowser: Layer.Layer<
-  platform.WebLocks | platform.TabChannel | platform.TabVisibility | platform.ClientIdentityStore
-> = Layer.mergeAll(
+export type Platform =
+  | platform.WebLocks
+  | platform.TabChannel
+  | platform.TabVisibility
+  | platform.ClientIdentityStore
+  | Crypto.Crypto
+
+export const layerPlatformBrowser: Layer.Layer<Platform> = Layer.mergeAll(
   platform.layerWebLocksNavigator,
   platform.layerTabChannelBroadcast,
   platform.layerTabVisibilityDocument,
-  platform.layerClientIdentityStoreLocalStorage
+  platform.layerClientIdentityStoreLocalStorage,
+  BrowserCrypto.layer
 )
 
 const requestPersistence = Effect.suspend(() => {
@@ -75,15 +79,15 @@ const requestPersistence = Effect.suspend(() => {
 
 const layerRequestPersistence = Layer.effectDiscard(Effect.forkScoped(requestPersistence))
 
-const randomUuid = Crypto.Crypto.use((crypto) => crypto.randomUUIDv4).pipe(
-  Effect.catchTag("PlatformError", (error) => Effect.die(error))
-)
+const randomUuid = (crypto: Crypto.Crypto) =>
+  crypto.randomUUIDv4.pipe(Effect.catchTag("PlatformError", (error) => Effect.die(error)))
 
 const loadClientId = Effect.fnUntraced(function*(
   names: lockNames.LockNames,
   key: string,
   locks: platform.WebLocksService,
-  identities: platform.ClientIdentityStoreService
+  identities: platform.ClientIdentityStoreService,
+  crypto: Crypto.Crypto
 ) {
   yield* locks.acquire(names.clientIdentity)
   const stored = yield* identities.load(key)
@@ -92,7 +96,7 @@ const loadClientId = Effect.fnUntraced(function*(
       Effect.mapError((cause) => new BrowserStorageError({ operation: "decode", key, cause }))
     )
   }
-  const generated = Identity.ClientId.make(`cli_${yield* randomUuid}`)
+  const generated = Identity.ClientId.make(`cli_${yield* randomUuid(crypto)}`)
   yield* identities.store(key, generated)
   return generated
 }, Effect.scoped)
@@ -107,7 +111,7 @@ export const layer = <D extends Definition.Any, ED extends Tagged, ES extends Ta
   Layer.effectContext(Effect.gen(function*() {
     const scheduler = yield* TabScheduler.make
     return yield* build(options).pipe(Effect.provideService(Scheduler.Scheduler, scheduler))
-  })).pipe(Layer.provide(BrowserCrypto.layer))
+  }))
 
 const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends Tagged, ES extends Tagged,>(
   options: Options<D, ED, ES>
@@ -117,8 +121,8 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     ...options.definition.mutations.map((mutation) => mutation.handler),
     ...options.definition.queries.map((query) => query.handler)
   )(yield* Effect.context<MutationRuntime.Handlers<D> | QueryExecutor.Handlers<D>>())
-  const crypto = yield* Crypto.Crypto
   const platformContext = yield* Layer.build(options.layerPlatform ?? layerPlatformBrowser)
+  const crypto = Context.get(platformContext, Crypto.Crypto)
   const locks = Context.get(platformContext, platform.WebLocks)
   const channels = Context.get(platformContext, platform.TabChannel)
   const visibility = Context.get(platformContext, platform.TabVisibility)
@@ -129,12 +133,13 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
   const ephemerals = options.ephemerals ?? []
   const identity = BuildIdentity.make({ definition: options.definition, ephemerals, profiles })
   const names = lockNames.make(options.name, identity.fingerprint)
-  const host = yield* randomUuid
+  const host = yield* randomUuid(crypto)
   const clientId = yield* loadClientId(
     names,
     `@lucas-barake/effect-local-browser:${options.name}:client-id`,
     locks,
-    identities
+    identities,
+    crypto
   )
   const retryDelay = options.retryDelay ?? Duration.seconds(1)
 
@@ -146,7 +151,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
   }).pipe(
     Layer.provide(Layer.succeedContext(handlers)),
     Layer.provide(options.layerDatabase),
-    Layer.provide(BrowserCrypto.layer),
+    Layer.provide(Layer.succeed(Crypto.Crypto, crypto)),
     Layer.provideMerge(options.layerSync)
   )
   let layerOwner = layerStack
