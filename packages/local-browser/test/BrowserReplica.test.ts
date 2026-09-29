@@ -968,15 +968,12 @@ describe("BrowserReplica", () => {
         const leader = yield* environment.openTab
         const follower = yield* environment.openTab
         const space = yield* settle(follower.replica.space(spaceId))
-        const received = yield* Effect.forkChild(
-          space.settlements({ from: "live" }).pipe(Stream.runHead, Effect.timeoutOption("60 seconds"))
-        )
-        yield* TestClock.adjust("5 seconds")
+        const start = yield* settle(space.resolveSettlementStart("live"))
+        const received = yield* Effect.forkChild(space.settlements({ from: start }).pipe(Stream.runHead))
         const pending = yield* settle(space.mutate(PutTodo, { id: "6", title: "settles on the new leader" }))
         submitAllowed = true
         yield* settle(Scope.close(leader.scope, Exit.void))
-        yield* TestClock.adjust("60 seconds")
-        const settled = Option.flatten(yield* Fiber.join(received))
+        const settled = yield* settle(Fiber.join(received))
         assert.isTrue(Option.isSome(settled))
         if (Option.isSome(settled)) {
           assert.strictEqual(settled.value.settlement.pending.envelope.mutationId, pending.envelope.mutationId)
@@ -1106,6 +1103,7 @@ describe("BrowserReplica", () => {
         yield* settle(space.mutate(PutTodo, { id: "a", title: "a" }))
         yield* settle(space.mutate(PutTodo, { id: "b", title: "b" }))
         yield* settle(space.mutate(PutTodo, { id: "c", title: "c" }))
+        yield* settle(space.settlements({ from: 0 }).pipe(Stream.take(3), Stream.runDrain))
         assert.strictEqual(yield* settle(space.resolveSettlementStart("live")), 3)
         yield* space.settlements({ from: "live" }).pipe(Stream.runDrain, Effect.forkScoped)
         yield* TestClock.adjust("5 seconds")
@@ -1132,12 +1130,12 @@ describe("BrowserReplica", () => {
           Stream.runForEach((settled) => Queue.offer(delivered, settled.sequence)),
           Effect.forkScoped
         )
-        yield* TestClock.adjust("5 seconds")
         yield* settle(space.mutate(PutTodo, { id: "a", title: "a" }))
         yield* settle(space.mutate(PutTodo, { id: "b", title: "b" }))
+        assert.deepStrictEqual(yield* settle(Effect.all([Queue.take(delivered), Queue.take(delivered)])), [1, 2])
         yield* settle(Scope.close(leader.scope, Exit.void))
         yield* settle(space.mutate(PutTodo, { id: "c", title: "c" }))
-        assert.deepStrictEqual(yield* settle(Queue.takeN(delivered, 3)), [1, 2, 3])
+        assert.strictEqual(yield* settle(Queue.take(delivered)), 3)
       },
       Effect.scoped,
       provideFileSystem
