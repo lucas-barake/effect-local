@@ -161,6 +161,7 @@ jobs:
       - name: Run the web and iOS e2e
         env:
           MOBILE_PLATFORM: ios
+          MAESTRO_DRIVER_STARTUP_TIMEOUT: 600000
         run: pnpm -C examples/chat run e2e:mobile
       - uses: actions/upload-artifact@v4
         if: failure()

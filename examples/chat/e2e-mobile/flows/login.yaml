@@ -16,14 +16,18 @@ appId: dev.effectlocal.chat
     visible:
       id: "login-user-${USER}"
     timeout: 60000
-- tapOn:
-    id: "login-user-${USER}"
-- tapOn:
-    id: "login-password"
-- inputText: "${USER}123"
-- tapOn:
-    id: "login-submit"
-- extendedWaitUntil:
-    visible:
-      id: "me-name"
-    timeout: 30000
+- retry:
+    maxRetries: 2
+    commands:
+      - tapOn:
+          id: "login-user-${USER}"
+      - tapOn:
+          id: "login-password"
+      - eraseText
+      - inputText: "${USER}123"
+      - tapOn:
+          id: "login-submit"
+      - extendedWaitUntil:
+          visible:
+            id: "me-name"
+          timeout: 30000
