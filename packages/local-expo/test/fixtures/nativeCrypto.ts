@@ -1,13 +1,9 @@
 import { createHash, randomFillSync } from "node:crypto"
 
 export const cryptoProbe = {
-  randomValueCalls: 0,
   failNextDigest: false,
-  failNextRandomValues: false,
   reset() {
-    cryptoProbe.randomValueCalls = 0
     cryptoProbe.failNextDigest = false
-    cryptoProbe.failNextRandomValues = false
   }
 }
 
@@ -18,25 +14,21 @@ const algorithms: Record<string, string> = {
   "SHA-512": "sha512"
 }
 
+const bytesOf = (data: ArrayBufferView | ArrayBuffer) => {
+  if (data instanceof ArrayBuffer) return new Uint8Array(data)
+  return new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+}
+
 export const ExpoCrypto = {
   getRandomValues(array: Uint8Array<ArrayBuffer>) {
-    cryptoProbe.randomValueCalls++
-    if (cryptoProbe.failNextRandomValues) {
-      cryptoProbe.failNextRandomValues = false
-      throw new Error("native random source unavailable")
-    }
     return randomFillSync(array)
   },
-  digestAsync(algorithm: string, data: ArrayBufferView | ArrayBuffer): Promise<ArrayBuffer> {
+  digest(algorithm: string, output: ArrayBufferView, data: ArrayBufferView | ArrayBuffer) {
     if (cryptoProbe.failNextDigest) {
       cryptoProbe.failNextDigest = false
-      return Promise.reject(new Error("native digest unavailable"))
+      throw new Error("native digest unavailable")
     }
-    let bytes: Uint8Array
-    if (data instanceof ArrayBuffer) bytes = new Uint8Array(data)
-    else bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
-    const digest = createHash(algorithms[algorithm]).update(bytes).digest()
-    return Promise.resolve(digest.buffer.slice(digest.byteOffset, digest.byteOffset + digest.byteLength))
+    bytesOf(output).set(createHash(algorithms[algorithm]).update(bytesOf(data)).digest())
   }
 }
 

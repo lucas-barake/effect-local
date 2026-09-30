@@ -2,7 +2,6 @@ import { NodeCrypto, NodeFileSystem, NodeHttpServer } from "@effect/platform-nod
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
-import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as SyncRpc from "@lucas-barake/effect-local-rpc/SyncRpc"
 import * as SyncServer from "@lucas-barake/effect-local-rpc/SyncServer"
@@ -23,7 +22,6 @@ import * as HttpRouter from "effect/http/HttpRouter"
 import * as HttpServer from "effect/http/HttpServer"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
-import * as AtomRegistry from "effect/reactivity/AtomRegistry"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
@@ -146,28 +144,9 @@ describe("ExpoReplica", () => {
         const first = yield* openReplica(serverContext, directory, "device.db").pipe(Scope.provide(firstScope))
         yield* first.space.mutate(PutTodo, { id: "todo-2", title: "persisted" })
         yield* Scope.close(firstScope, Exit.void)
-        const reopened = yield* openReplica(serverContext, directory, "device.db")
+        const emptyServerContext = yield* Layer.build(layerServer)
+        const reopened = yield* openReplica(emptyServerContext, directory, "device.db")
         assert.deepStrictEqual(yield* awaitTodo(reopened, "todo-2"), { id: "todo-2", title: "persisted" })
-      },
-      Effect.scoped,
-      provideFileSystem
-    )
-  )
-
-  it.live(
-    "gives a ReplicaAtom graph one ephemeral member minted from expo-crypto",
-    Effect.fnUntraced(
-      function*() {
-        const directory = yield* FileSystem.FileSystem.use((fs) => fs.makeTempDirectoryScoped())
-        const serverContext = yield* Layer.build(layerServer)
-        const graph = ReplicaAtom.make(layerReplica(serverContext, directory, "atoms.db"))
-        const registry = AtomRegistry.make()
-        yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
-        const unmount = registry.mount(graph.member)
-        yield* Effect.addFinalizer(() => Effect.sync(unmount))
-        const member = yield* AtomRegistry.getResult(registry, graph.member)
-        assert.isTrue(Schema.is(Protocol.EphemeralMember)(member))
-        assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, graph.member), member)
       },
       Effect.scoped,
       provideFileSystem

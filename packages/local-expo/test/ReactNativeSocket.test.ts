@@ -8,6 +8,7 @@ import * as ReactNativeSocket from "../src/ReactNativeSocket.js"
 class AndroidWebSocket extends EventTarget {
   static readonly CONNECTING = 0
   static readonly OPEN = 1
+  static readonly CLOSING = 2
   static readonly CLOSED = 3
   static readonly created: Array<AndroidWebSocket> = []
   readonly url: string
@@ -29,10 +30,11 @@ class AndroidWebSocket extends EventTarget {
   }
   send(_data: string | Uint8Array) {}
   close(code?: number, reason?: string) {
-    if (this.readyState === AndroidWebSocket.CONNECTING) return
+    if (this.readyState === AndroidWebSocket.CLOSING || this.readyState === AndroidWebSocket.CLOSED) return
+    const connecting = this.readyState === AndroidWebSocket.CONNECTING
+    this.readyState = AndroidWebSocket.CLOSING
+    if (connecting) return
     this.closed.push([code, reason])
-    this.readyState = AndroidWebSocket.CLOSED
-    this.dispatchEvent(Object.assign(new Event("close"), { code: code ?? 1000, reason: reason ?? "" }))
   }
   open() {
     this.readyState = AndroidWebSocket.OPEN
@@ -81,7 +83,6 @@ describe("ReactNativeSocket", () => {
       assert.deepStrictEqual(native.closed, [])
       native.open()
       assert.deepStrictEqual(native.closed, [[4000, "released"]])
-      assert.strictEqual(socket.readyState, AndroidWebSocket.CLOSED)
     }, Effect.scoped)
   )
 

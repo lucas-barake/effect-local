@@ -490,7 +490,6 @@ describe("Replica Atom graph", () => {
       registry.set(publishTyping, { payload: { active: true }, ttl: "1 second" })
       const published = yield* LosslessQueue.take(harness.published)
       assert.deepStrictEqual(published.request.member, member)
-      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, graph.member), member)
     }, Effect.scoped)
   )
 

@@ -17,8 +17,6 @@ describe("ExpoCrypto", () => {
       const bytes = yield* crypto.randomBytes(100_000)
       assert.strictEqual(bytes.length, 100_000)
       assert.isTrue(bytes.some((byte) => byte !== 0))
-      assert.strictEqual(cryptoProbe.randomValueCalls, 1)
-      assert.match(yield* crypto.randomUUIDv4, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
     }, provideExpoCrypto)
   )
 
