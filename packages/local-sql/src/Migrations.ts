@@ -1143,6 +1143,12 @@ export const client = Effect.fnUntraced(function*(options: {
           1, 0, 0, 0, 0, 0, 0)
         ON CONFLICT (space_id) DO NOTHING`)
   }
+  if (options.clientId !== undefined && stored.client_id !== options.clientId) {
+    return yield* new ReplicaError.ReplicaIdentityMismatch({
+      expectedClientId: options.clientId,
+      actualClientId: stored.client_id
+    })
+  }
   return stored.client_id
 }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 

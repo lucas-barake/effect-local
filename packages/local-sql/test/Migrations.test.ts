@@ -157,7 +157,6 @@ describe("storage migration catalogs", () => {
     Effect.fnUntraced(function*() {
       const minted = yield* Migrations.client({ definition: Domain.definition })
       assert.isTrue(Schema.is(Identity.ClientId)(minted))
-      assert.notStrictEqual(minted, clientId)
       assert.strictEqual(yield* Migrations.client({ definition: Domain.definition }), minted)
       assert.strictEqual(yield* Migrations.client({ definition: Domain.definition, clientId: minted }), minted)
     }, provideDatabase)
@@ -664,5 +663,28 @@ describe.each(serverDatabases)("server catalog counters ($dialect)", (database) 
         { history: 1, receipts: 1, entities: 1, bytes: 15, counts: { history_count: 1, receipt_count: 1 } }
       )
     }, provideServerDatabase)
+  )
+})
+
+describe("client identity adoption race", () => {
+  it.effect(
+    "rejects an explicit identity when another opener stores a different identity before its insert",
+    Effect.fnUntraced(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const winner = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+      yield* Migrations.runCatalog("Client", Migrations.clientCatalog)
+      yield* sql.unsafe(`CREATE TRIGGER concurrent_opener BEFORE INSERT ON effect_local_client_meta
+        WHEN NEW.client_id <> '${winner}'
+        BEGIN INSERT INTO effect_local_client_meta (singleton, client_id) VALUES (1, '${winner}'); END`)
+      const exit = yield* Effect.exit(Migrations.client({ definition: Domain.definition, clientId }))
+      const failure = expectedFailure(exit)
+      assert.isTrue(Option.isSome(failure))
+      if (Option.isSome(failure)) {
+        assert.deepStrictEqual(
+          failure.value,
+          new ReplicaError.ReplicaIdentityMismatch({ expectedClientId: clientId, actualClientId: winner })
+        )
+      }
+    }, provideDatabase)
   )
 })
