@@ -10,3 +10,6 @@ playwright-report
 AGENTS.local.md
 examples/chat/server/chat.db*
 examples/chat/chat.db*
+examples/chat/mobile/.expo
+examples/chat/mobile/android
+examples/chat/mobile/ios

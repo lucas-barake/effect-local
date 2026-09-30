@@ -1,0 +1,31 @@
+{
+  "name": "@effect-local/example-chat-mobile",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Expo client for the chat example: the shared atom graph over an on-device ExpoReplica",
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios"
+  },
+  "dependencies": {
+    "@effect-local/example-chat-shared": "workspace:^",
+    "@effect/atom-react": "4.0.0-rc.118",
+    "@lucas-barake/effect-local-expo": "workspace:^",
+    "@lucas-barake/effect-local-rpc": "workspace:^",
+    "effect": "4.0.0-rc.118",
+    "expo": "57.0.26",
+    "expo-build-properties": "57.0.22",
+    "expo-crypto": "57.0.3",
+    "expo-secure-store": "57.0.4",
+    "expo-sqlite": "57.0.3",
+    "expo-status-bar": "57.0.1",
+    "react": "19.2.3",
+    "react-native": "0.86.3"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.18"
+  }
+}

@@ -110,15 +110,28 @@
       }
     },
     {
-      "files": ["examples/chat/client/**/*.tsx"],
+      "files": ["examples/chat/mobile/metro.config.cjs"],
+      "rules": { "effect/noDynamicImports": "off", "effect/noGlobals": "off", "effect/noTryCatch": "off" }
+    },
+    {
+      "files": ["examples/chat/client/**/*.tsx", "examples/chat/mobile/**/*.tsx"],
       "rules": { "effect/noTernary": "off" }
     },
     {
-      "files": ["examples/chat/client/**/*.ts", "examples/chat/test/**"],
+      "files": [
+        "examples/chat/client/**/*.ts",
+        "examples/chat/mobile/**/*.ts",
+        "examples/chat/mobile/**/*.tsx",
+        "examples/chat/test/**"
+      ],
       "rules": { "effect/noGlobals": "off", "effect-local/noManualEffectBoundary": "off" }
     },
     {
-      "files": ["examples/chat/scripts/**", "examples/chat/client/vite.config.ts", "examples/chat/e2e/**"],
+      "files": [
+        "examples/chat/scripts/**",
+        "examples/chat/client/vite.config.ts",
+        "examples/chat/e2e/**"
+      ],
       "rules": {
         "effect/noAsyncFunction": "off",
         "effect/noGlobals": "off",

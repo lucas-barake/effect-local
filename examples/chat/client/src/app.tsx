@@ -11,6 +11,7 @@ import {
   UserId,
   users
 } from "@effect-local/example-chat-shared/domain"
+import { formatTime } from "@effect-local/example-chat-shared/time"
 import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as Match from "effect/Match"
 import * as Option from "effect/Option"
@@ -20,7 +21,6 @@ import { Avatar } from "./avatar.js"
 import { ChatView } from "./chat.js"
 import type { ChatClient } from "./replica.js"
 import { clientFor, logoutAtom, reloadAtom } from "./replica.js"
-import { formatTime } from "./time.js"
 
 const conversationPeer = (conversation: Conversation, me: UserId): ChatUser | undefined => {
   if (conversation.kind === "group") return undefined

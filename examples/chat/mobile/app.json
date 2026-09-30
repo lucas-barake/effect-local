@@ -1,0 +1,31 @@
+{
+  "expo": {
+    "name": "Effect Chat",
+    "slug": "effect-local-chat",
+    "scheme": "effectchat",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "ios": {
+      "bundleIdentifier": "dev.effectlocal.chat",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "dev.effectlocal.chat"
+    },
+    "plugins": [
+      "expo-sqlite",
+      "expo-secure-store",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "updates": {
+      "enabled": false
+    }
+  }
+}

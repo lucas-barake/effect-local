@@ -5,7 +5,7 @@ import * as HttpClientResponse from "effect/http/HttpClientResponse"
 import * as Schema from "effect/Schema"
 import { type LoginRequest, LoginResponse } from "./auth.js"
 
-export const sessionKey = "effect-local-chat:session"
+export const sessionKey = "effect-local-chat.session"
 
 export const StoredSession = Schema.NullOr(LoginResponse)
 
