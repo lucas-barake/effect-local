@@ -20,7 +20,6 @@
     "@effect/platform-node": "4.0.0-rc.118",
     "@effect/sql-sqlite-node": "4.0.0-rc.118",
     "@lucas-barake/effect-local": "workspace:^",
-    "@lucas-barake/effect-local-browser": "workspace:^",
     "@lucas-barake/effect-local-rpc": "workspace:^",
     "@lucas-barake/effect-local-sql": "workspace:^",
     "effect": "4.0.0-rc.118"

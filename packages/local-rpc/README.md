@@ -6,7 +6,9 @@ One `SyncRpc.Rpcs` group carries mutation submission, ordered pulls, snapshot bo
 ephemeral join, publish, and heartbeat operations over one WebSocket. `SyncServer.layer` builds the whole server:
 the authenticated gateway, one Effect Cluster entity per space, the durable `ServerStore`, the ephemeral hub, signed
 principal assertions, and the maintenance singleton. `SyncClient.layer` implements `SyncEngine`, while
-`EphemeralClient.layer` exposes the joined ephemeral channel.
+`EphemeralClient.layer` exposes the joined ephemeral channel. `ReplicaAtom.make` turns any Layer that provides
+`Replica`, `QueryReactivity`, and `EphemeralClient` into an Effect Atom graph, so the browser, Expo, and Node replicas
+share one reactive binding.
 
 ## Server
 

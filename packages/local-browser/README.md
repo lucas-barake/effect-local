@@ -12,8 +12,8 @@ Mutations carry caller-minted ids, so a resent mutation is recorded once.
 ```ts
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
-import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
+import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as Layer from "effect/Layer"
 import * as Socket from "effect/socket/Socket"

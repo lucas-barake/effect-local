@@ -64,6 +64,7 @@
     "@effect/platform-node": "4.0.0-rc.118",
     "@effect/sql-pg": "4.0.0-rc.118",
     "@effect/sql-sqlite-node": "4.0.0-rc.118",
+    "@lucas-barake/effect-local-test": "workspace:^",
     "@testcontainers/postgresql": "^12.1.0",
     "effect": "4.0.0-rc.118"
   }

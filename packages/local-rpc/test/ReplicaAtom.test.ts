@@ -1,9 +1,6 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
-import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
-import * as ProtocolSession from "@lucas-barake/effect-local-rpc/ProtocolSession"
-import * as Transport from "@lucas-barake/effect-local-rpc/Transport"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -36,8 +33,11 @@ import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as SqlSchema from "effect/sql/SqlSchema"
+import * as EphemeralClient from "../src/EphemeralClient.js"
 import * as LosslessQueue from "../src/internal/losslessQueue.js"
+import * as ProtocolSession from "../src/ProtocolSession.js"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
+import * as Transport from "../src/Transport.js"
 
 const layerTransport = Layer.succeed(
   Transport.Transport,

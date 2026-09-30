@@ -525,7 +525,7 @@ benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1
 import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
-import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
+import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"

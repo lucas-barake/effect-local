@@ -88,9 +88,6 @@ importers:
       '@lucas-barake/effect-local':
         specifier: workspace:^
         version: link:../../packages/local
-      '@lucas-barake/effect-local-browser':
-        specifier: workspace:^
-        version: link:../../packages/local-browser
       '@lucas-barake/effect-local-rpc':
         specifier: workspace:^
         version: link:../../packages/local-rpc
@@ -229,9 +226,6 @@ importers:
       '@effect/wa-sqlite':
         specifier: 0.1.2
         version: 0.1.2
-      '@lucas-barake/effect-local-test':
-        specifier: workspace:^
-        version: link:../local-test
       effect:
         specifier: 4.0.0-rc.118
         version: 4.0.0-rc.118
@@ -254,6 +248,9 @@ importers:
       '@effect/sql-sqlite-node':
         specifier: 4.0.0-rc.118
         version: 4.0.0-rc.118(effect@4.0.0-rc.118)
+      '@lucas-barake/effect-local-test':
+        specifier: workspace:^
+        version: link:../local-test
       '@testcontainers/postgresql':
         specifier: ^12.1.0
         version: 12.1.0

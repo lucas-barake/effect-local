@@ -1,4 +1,3 @@
-import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
@@ -23,6 +22,7 @@ import type * as AtomRegistry from "effect/reactivity/AtomRegistry"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
+import * as EphemeralClient from "./EphemeralClient.js"
 
 class QueryKey implements Equal.Equal {
   readonly spaceId: Identity.SpaceId
