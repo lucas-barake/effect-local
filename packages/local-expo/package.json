@@ -47,6 +47,11 @@
     "check": "tsgo -b tsconfig.json",
     "test": "vitest --config vitest.config.ts"
   },
+  "dependencies": {
+    "@lucas-barake/effect-local": "workspace:^",
+    "@lucas-barake/effect-local-rpc": "workspace:^",
+    "@lucas-barake/effect-local-sql": "workspace:^"
+  },
   "peerDependencies": {
     "effect": ">=4.0.0-rc.118 <4.0.1",
     "expo-crypto": "^57.0.0",
@@ -54,6 +59,7 @@
   },
   "devDependencies": {
     "@effect/platform-node": "4.0.0-rc.118",
+    "@effect/sql-sqlite-node": "4.0.0-rc.118",
     "effect": "4.0.0-rc.118",
     "expo": "57.0.26",
     "expo-crypto": "57.0.3",

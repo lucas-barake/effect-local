@@ -4,5 +4,6 @@
   "include": ["src"],
   "compilerOptions": {
     "lib": ["ES2023", "DOM"]
-  }
+  },
+  "references": [{ "path": "../local" }, { "path": "../local-sql" }, { "path": "../local-rpc" }]
 }

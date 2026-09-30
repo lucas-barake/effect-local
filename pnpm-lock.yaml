@@ -231,10 +231,23 @@ importers:
         version: 4.0.0-rc.118
 
   packages/local-expo:
+    dependencies:
+      '@lucas-barake/effect-local':
+        specifier: workspace:^
+        version: link:../local
+      '@lucas-barake/effect-local-rpc':
+        specifier: workspace:^
+        version: link:../local-rpc
+      '@lucas-barake/effect-local-sql':
+        specifier: workspace:^
+        version: link:../local-sql
     devDependencies:
       '@effect/platform-node':
         specifier: 4.0.0-rc.118
         version: 4.0.0-rc.118(effect@4.0.0-rc.118)(redis@6.2.1)
+      '@effect/sql-sqlite-node':
+        specifier: 4.0.0-rc.118
+        version: 4.0.0-rc.118(effect@4.0.0-rc.118)
       effect:
         specifier: 4.0.0-rc.118
         version: 4.0.0-rc.118
