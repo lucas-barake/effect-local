@@ -1108,9 +1108,12 @@ export const client = Effect.fnUntraced(function*(options: {
       execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
     })(undefined)
   ).pipe(
-    Effect.mapError((cause) => {
-      if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
-      return new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+      SchemaError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })),
+      NoSuchElementError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause }))
     })
   )
   if (options.spaceId !== undefined) {
