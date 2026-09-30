@@ -1469,7 +1469,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const spaces = Effect.sync(() =>
         Array.from(entries.values())
           .filter((entry) => !entry.leaving)
-          .toSorted((left, right) => left.spaceId.localeCompare(right.spaceId))
+          .sort((left, right) => left.spaceId.localeCompare(right.spaceId))
           .map((entry) => entry.handle)
       )
 
@@ -1552,7 +1552,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const configured: Array<Identity.SpaceId> = []
       if (options.initialSpaces !== undefined) configured.push(...options.initialSpaces)
       if (options.spaceId !== undefined) configured.push(options.spaceId)
-      yield* Effect.forEach(Array.from(new Set(configured)).toSorted(), join, { discard: true })
+      yield* Effect.forEach(Array.from(new Set(configured)).sort(), join, { discard: true })
       for (const row of restored) {
         const entry = entries.get(row.space_id)
         if (entry !== undefined && row.count > 0) yield* enqueueBackground(entry)

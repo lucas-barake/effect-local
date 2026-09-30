@@ -71,6 +71,10 @@
   },
   "overrides": [
     {
+      "files": ["packages/*/src/**", "examples/chat/shared/**", "examples/chat/mobile/**"],
+      "rules": { "effect-local/noArrayToSorted": "error", "unicorn/no-array-sort": "off" }
+    },
+    {
       "files": ["scripts/**"],
       "rules": {
         "effect/noAsyncFunction": "off",

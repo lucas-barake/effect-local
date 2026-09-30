@@ -75,8 +75,8 @@ export const make = (options: Options): BuildIdentity => ({
   fingerprint: Canonical.hash({
     wire: wireFingerprint,
     definition: options.definition.hash,
-    ephemerals: options.ephemerals.map(ephemeralDocument).toSorted(byName),
+    ephemerals: options.ephemerals.map(ephemeralDocument).sort(byName),
     profiles: Array.from(options.profiles, ([name, profile]) => ({ name, payload: document(profile.payloadSchema) }))
-      .toSorted(byName)
+      .sort(byName)
   })
 })

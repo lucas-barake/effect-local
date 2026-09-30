@@ -1599,3 +1599,31 @@ assert.ok(jsonPolicyDiagnostics.every((diagnostic) =>
   diagnostic.message ===
     "Do not use JSON.parse or JSON.stringify. Define a JSON codec with Schema.fromJsonString and decode or encode through Effect Schema."
 ))
+
+const toSortedSource = `const numbers = [3, 1, 2]
+const sorted = numbers.toSorted((left, right) => left - right)
+const computed = numbers["toSorted"]()
+const optional = numbers?.toSorted()
+const inPlace = numbers.sort()
+const copied = [...numbers].sort((left, right) => left - right)
+const mapped = numbers.map((value) => value * 2).sort()
+const fromSet = Array.from(new Set(numbers)).sort()
+const keys = Object.keys({ b: 1, a: 2 }).sort()
+const unrelated = { sort: 1 }.sort
+numbers.sort()
+`
+const toSortedDiagnostics = runOxlintFixture(
+  "to-sorted-fixture.ts",
+  toSortedSource,
+  ["noArrayToSorted"]
+).filter((diagnostic) => diagnostic.code === "effect-local(noArrayToSorted)")
+assert.deepEqual(
+  diagnosticOffsets(toSortedDiagnostics),
+  [
+    offsetOf(toSortedSource, "numbers.toSorted"),
+    offsetOf(toSortedSource, "numbers[\"toSorted\"]"),
+    offsetOf(toSortedSource, "numbers?.toSorted"),
+    offsetOf(toSortedSource, "numbers.sort()")
+  ],
+  encodeJson(toSortedDiagnostics)
+)

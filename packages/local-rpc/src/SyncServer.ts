@@ -36,7 +36,7 @@ const makeHandlers = Effect.fnUntraced(function*(options: {
       )
     )
   )
-  const supportedVersions = [...decoded.supportedVersions].toSorted((left, right) => right - left)
+  const supportedVersions = [...decoded.supportedVersions].sort((left, right) => right - left)
   const requireVersion = (version: Protocol.ProtocolVersion) => {
     if (supportedVersions.includes(version)) return Effect.void
     return Effect.fail(new ReplicaError.ProtocolVersionRejected({ version, serverVersions: supportedVersions }))

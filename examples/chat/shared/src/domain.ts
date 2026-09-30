@@ -64,7 +64,7 @@ export const spaceId = Identity.SpaceId.make("spc_5f1c2a3e-7b4d-4f1a-9c2e-3d8a6b
 export const groupConversationId = ConversationId.make("group:everyone")
 
 export const dmConversationId = (firstUserId: UserId, secondUserId: UserId): ConversationId =>
-  ConversationId.make(`dm:${[firstUserId, secondUserId].toSorted().join(":")}`)
+  ConversationId.make(`dm:${[firstUserId, secondUserId].sort().join(":")}`)
 
 // ---------------------------------------------------------------------------
 // Models

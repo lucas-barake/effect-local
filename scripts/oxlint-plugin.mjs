@@ -160,6 +160,53 @@ export const noJsonParseStringify = Rule.define({
   }
 })
 
+export const noArrayToSortedMessage =
+  "Do not call toSorted. Hermes, the React Native engine, does not implement Array.prototype.toSorted, so the call throws on device. Copy the array and sort the copy instead."
+export const noArraySortInPlaceMessage =
+  "Sort only a fresh array. Array.prototype.sort mutates its receiver, so copy the array first, for example [...items].sort(order)."
+const freshArrayMethods = new Set(["map", "filter", "slice", "concat", "flat", "flatMap", "toReversed", "toSpliced"])
+const freshArrayStatics = new Map([
+  ["Array", new Set(["from", "of"])],
+  ["Object", new Set(["keys", "values", "entries"])]
+])
+const isFreshArray = (context, node) => {
+  const expression = unwrapExpression(node)
+  if (expression.type === "ArrayExpression") return true
+  if (expression.type !== "CallExpression") return false
+  const callee = getStaticMember(expression.callee)
+  if (callee === undefined) return false
+  const receiver = unwrapExpression(callee.expression.object)
+  if (receiver.type === "Identifier" && freshArrayStatics.has(receiver.name)) {
+    return freshArrayStatics.get(receiver.name).has(callee.name) &&
+      isUnshadowedGlobal(context, receiver, receiver.name)
+  }
+  return freshArrayMethods.has(callee.name)
+}
+export const noArrayToSorted = Rule.define({
+  name: "no-array-to-sorted",
+  meta: Rule.meta({
+    type: "problem",
+    description: "Disallow Array.prototype.toSorted and in place sorts of shared arrays in code that runs on Hermes."
+  }),
+  create: function*() {
+    const context = yield* RuleContext
+    return {
+      MemberExpression: (node) => {
+        const member = getStaticMember(node)
+        if (member?.name === "toSorted") {
+          return reportDiagnostic(context, member.expression, noArrayToSortedMessage)
+        }
+        if (member?.name !== "sort") return Effect.void
+        const [statement, parent] = context.sourceCode.getAncestors(node).slice(-2)
+        if (parent?.type !== "CallExpression" || unwrapExpression(parent.callee) !== node) return Effect.void
+        if (statement?.type === "ExpressionStatement") return Effect.void
+        if (isFreshArray(context, member.expression.object)) return Effect.void
+        return reportDiagnostic(context, member.expression, noArraySortInPlaceMessage)
+      }
+    }
+  }
+})
+
 const rootEffectModuleNames = new Map([
   ["Data", "effect/Data"],
   ["Effect", "effect/Effect"],
@@ -1847,6 +1894,7 @@ export default Plugin.define({
     requireTaggedEffectError,
     noUnknownEffectChannels,
     requireLayerName,
-    noServiceTagMap
+    noServiceTagMap,
+    noArrayToSorted
   }
 })

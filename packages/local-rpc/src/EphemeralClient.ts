@@ -262,7 +262,7 @@ const byIdentity = <A,>(left: readonly [string, A], right: readonly [string, A])
 const stateSlice = (view: RawView, channel: string): ReadonlyArray<Protocol.EphemeralStateEntry> =>
   [...view.states]
     .filter(([, entry]) => entry.channel === channel)
-    .toSorted(byIdentity)
+    .sort(byIdentity)
     .map(([, entry]) => entry)
 
 const memberSlice = (view: RawView): ReadonlyArray<Protocol.EphemeralMemberEntry> =>
@@ -271,7 +271,7 @@ const memberSlice = (view: RawView): ReadonlyArray<Protocol.EphemeralMemberEntry
       view.members.map((entry) => [`${entry.member.clientId}:${entry.member.membershipIncarnation}`, entry])
     )
   ]
-    .toSorted(byIdentity)
+    .sort(byIdentity)
     .map(([, entry]) => entry)
 
 const noProjection = (): string | undefined => undefined

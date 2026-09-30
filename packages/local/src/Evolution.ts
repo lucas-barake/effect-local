@@ -349,13 +349,13 @@ export const step = (options: {
       name: entry.from.name,
       from: entry.from.version,
       to: entry.to.version
-    })).toSorted(byName),
+    })).sort(byName),
     mutations: [...mutations.values()].map((entry) => ({
       id: entry.id,
       name: entry.from.name,
       from: entry.from.version,
       to: entry.to.version
-    })).toSorted(byName)
+    })).sort(byName)
   })
   return Object.freeze({
     id: options.id,
@@ -371,7 +371,7 @@ export const make = (options: {
   readonly current: Definition.Any
   readonly steps?: ReadonlyArray<Step> | undefined
 }): Evolution => {
-  const steps = [...(options.steps ?? [])].toSorted((left, right) => left.from.version - right.from.version)
+  const steps = [...(options.steps ?? [])].sort((left, right) => left.from.version - right.from.version)
   const stepIds = new Set<string>()
   const migrationIds = new Set<string>()
   const definitionByIdentity = new Map<string, Definition.Any>()

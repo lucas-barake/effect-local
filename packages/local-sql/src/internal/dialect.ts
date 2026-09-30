@@ -113,7 +113,7 @@ const postgres = (sql: SqlClient.SqlClient): Dialect => ({
   lockSchema: sql`SELECT pg_advisory_xact_lock(${schemaLockClass}, 0)`.pipe(Effect.asVoid),
   lockPresences: (keys) =>
     Effect.forEach(
-      [...new Set(keys.map(presenceLockKey))].toSorted((left, right) => left - right),
+      [...new Set(keys.map(presenceLockKey))].sort((left, right) => left - right),
       (key) => sql`SELECT pg_advisory_xact_lock(${presenceLockClass}, ${key})`,
       { discard: true }
     ),

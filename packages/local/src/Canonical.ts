@@ -45,7 +45,7 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   if (Array.isArray(value)) {
     result = value.map((item) => normalize(item, ancestors))
   } else {
-    const entries = Object.keys(value).toSorted().map((key) => {
+    const entries = Object.keys(value).sort().map((key) => {
       return [key, normalize(Reflect.get(value, key), ancestors)] as const
     })
     result = Object.fromEntries(entries)

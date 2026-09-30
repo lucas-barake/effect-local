@@ -182,20 +182,20 @@ const comparePartitionKeys = (left: ReplicationWindowPartition, right: Replicati
 
 export const normalizeReplicationScope = (scope: ReplicationScope): ReplicationScope => {
   if (scope.windows === undefined || scope.windows.length === 0) {
-    return ReplicationScope.make({ models: scope.models.toSorted() })
+    return ReplicationScope.make({ models: [...scope.models].sort() })
   }
   const windows = scope.windows.map((window) => {
     if (window.partitions === undefined) return window
-    const partitions = window.partitions.toSorted(comparePartitionKeys)
+    const partitions = [...window.partitions].sort(comparePartitionKeys)
     return ReplicationWindow.make({ ...window, partitions })
-  }).toSorted((left, right) => {
+  }).sort((left, right) => {
     if (left.model < right.model) return -1
     if (left.model > right.model) return 1
     if (left.index < right.index) return -1
     if (left.index > right.index) return 1
     return 0
   })
-  return ReplicationScope.make({ models: scope.models.toSorted(), windows })
+  return ReplicationScope.make({ models: [...scope.models].sort(), windows })
 }
 
 const affinityMatches = (
