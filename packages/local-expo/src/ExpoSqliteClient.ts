@@ -50,9 +50,6 @@ const sqliteCause = (cause: unknown): unknown => {
   return Object.assign(cause, { errno })
 }
 
-const classifyError = (cause: unknown, message: string, operation: string) =>
-  classifySqliteError(sqliteCause(cause), { message, operation })
-
 const bindValue = (value: unknown): SQLite.SQLiteBindValue | undefined => {
   if (value === undefined || value === null) return null
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value
@@ -101,13 +98,7 @@ const rejectSafeIntegers = Effect.withFiber<void, SqlError>((fiber) => {
   )
 })
 
-const native = <A,>(operation: string, message: string, evaluate: () => Promise<A>) =>
-  Effect.uninterruptible(
-    Effect.tryPromise({
-      try: evaluate,
-      catch: (cause) => new SqlError({ reason: classifyError(cause, message, operation) })
-    })
-  )
+const preparedCapacity = 200
 
 interface ExpoSqliteConnection extends Connection {}
 
@@ -123,42 +114,139 @@ export const make: (
     const semaphore = yield* Semaphore.make(1)
 
     const database = yield* Effect.acquireRelease(
-      native(
-        "openDatabase",
-        "Failed to open database",
-        () => SQLite.openDatabaseAsync(options.filename, { useNewConnection: true }, options.directory)
-      ),
+      Effect.tryPromise({
+        try: () => SQLite.openDatabaseAsync(options.filename, { useNewConnection: true }, options.directory),
+        catch: (cause) =>
+          new SqlError({
+            reason: classifySqliteError(sqliteCause(cause), {
+              message: "Failed to open database",
+              operation: "openDatabase"
+            })
+          })
+      }),
       (opened) =>
-        semaphore.withPermits(1)(native("close", "Failed to close database", () => opened.closeAsync())).pipe(
+        Effect.tryPromise({
+          try: () => opened.closeAsync(),
+          catch: (cause) =>
+            new SqlError({
+              reason: classifySqliteError(sqliteCause(cause), {
+                message: "Failed to close database",
+                operation: "close"
+              })
+            })
+        }).pipe(
+          Effect.uninterruptible,
+          semaphore.withPermits(1),
           Effect.catchTag("SqlError", (error) => Effect.die(error))
         )
     )
+
+    const finalize = (statement: SQLite.SQLiteStatement) =>
+      Effect.tryPromise({
+        try: () => statement.finalizeAsync(),
+        catch: (cause) =>
+          new SqlError({
+            reason: classifySqliteError(sqliteCause(cause), {
+              message: "Failed to finalize statement",
+              operation: "finalize"
+            })
+          })
+      }).pipe(
+        Effect.uninterruptible,
+        Effect.catchTag("SqlError", (error) => Effect.die(error))
+      )
+
+    const prepareStatement = (sql: string) =>
+      Effect.tryPromise({
+        try: () => database.prepareAsync(sql),
+        catch: (cause) =>
+          new SqlError({
+            reason: classifySqliteError(sqliteCause(cause), {
+              message: "Failed to prepare statement",
+              operation: "prepare"
+            })
+          })
+      }).pipe(Effect.uninterruptible)
+
+    const prepared = new Map<string, SQLite.SQLiteStatement>()
+
+    const evict = (sql: string) =>
+      Effect.suspend(() => {
+        const statement = prepared.get(sql)
+        if (statement === undefined) return Effect.void
+        prepared.delete(sql)
+        return finalize(statement)
+      })
+
+    const evictAll = Effect.suspend(() => {
+      const statements = Array.from(prepared.keys())
+      return Effect.forEach(statements, evict, { discard: true })
+    })
+
+    yield* Effect.addFinalizer(() => evictAll.pipe(semaphore.withPermits(1)))
+
+    const oldest = () => {
+      for (const sql of prepared.keys()) return sql
+      return undefined
+    }
+
+    const cached = (sql: string) =>
+      Effect.suspend(() => {
+        const statement = prepared.get(sql)
+        if (statement !== undefined) {
+          prepared.delete(sql)
+          prepared.set(sql, statement)
+          return Effect.succeed(statement)
+        }
+        return prepareStatement(sql).pipe(
+          Effect.tap((fresh) => {
+            prepared.set(sql, fresh)
+            const evicted = oldest()
+            if (prepared.size <= preparedCapacity || evicted === undefined) return Effect.void
+            return evict(evicted)
+          }),
+          Effect.uninterruptible
+        )
+      })
 
     const runStatement = (statement: SQLite.SQLiteStatement, bound: Array<SQLite.SQLiteBindValue>, values: boolean) => {
       let executed: Promise<SQLite.SQLiteExecuteAsyncResult<any>>
       if (values) executed = statement.executeForRawResultAsync<any>(bound)
       else executed = statement.executeAsync<any>(bound)
-      return executed.then((result) => result.getAllAsync()).finally(() => statement.finalizeAsync())
+      return executed.then((result) => result.getAllAsync())
     }
 
     const query = (sql: string, params: ReadonlyArray<unknown>, values: boolean) =>
       Effect.flatMap(bindParams(params), (bound) =>
         rejectSafeIntegers.pipe(
-          Effect.andThen(native(
-            "execute",
-            "Failed to execute statement",
-            () => database.prepareAsync(sql).then((statement) => runStatement(statement, bound, values))
-          ))
+          Effect.andThen(cached(sql)),
+          Effect.flatMap((statement) =>
+            Effect.tryPromise({
+              try: () => runStatement(statement, bound, values),
+              catch: (cause) =>
+                new SqlError({
+                  reason: classifySqliteError(sqliteCause(cause), {
+                    message: "Failed to execute statement",
+                    operation: "execute"
+                  })
+                })
+            }).pipe(
+              Effect.uninterruptible,
+              Effect.onError(() => evict(sql))
+            )
+          )
         ))
-
-    const finalize = (prepared: SQLite.SQLiteStatement) =>
-      native("stream", "Failed to finalize statement", () => prepared.finalizeAsync()).pipe(
-        Effect.catchTag("SqlError", (error) => Effect.die(error))
-      )
 
     const rows = (result: SQLite.SQLiteExecuteAsyncResult<any>) =>
       Stream.paginate(undefined, () =>
-        native("stream", "Failed to read row", () => result.next()).pipe(
+        Effect.tryPromise({
+          try: () => result.next(),
+          catch: (cause) =>
+            new SqlError({
+              reason: classifySqliteError(sqliteCause(cause), { message: "Failed to read row", operation: "stream" })
+            })
+        }).pipe(
+          Effect.uninterruptible,
           Effect.map((next): readonly [ReadonlyArray<any>, Option.Option<undefined>] => {
             if (next.done === true) return [[], Option.none()]
             return [[next.value], Option.some(undefined)]
@@ -169,15 +257,17 @@ export const make: (
       Stream.unwrap(Effect.gen(function*() {
         const bound = yield* bindParams(params)
         yield* rejectSafeIntegers
-        const prepared = yield* Effect.acquireRelease(
-          native("stream", "Failed to prepare statement", () => database.prepareAsync(sql)),
-          finalize
-        )
-        const result = yield* native(
-          "stream",
-          "Failed to execute statement",
-          () => prepared.executeAsync<any>(bound)
-        )
+        const statement = yield* Effect.acquireRelease(prepareStatement(sql), finalize)
+        const result = yield* Effect.tryPromise({
+          try: () => statement.executeAsync<any>(bound),
+          catch: (cause) =>
+            new SqlError({
+              reason: classifySqliteError(sqliteCause(cause), {
+                message: "Failed to execute statement",
+                operation: "stream"
+              })
+            })
+        }).pipe(Effect.uninterruptible)
         return rows(result)
       }))
 

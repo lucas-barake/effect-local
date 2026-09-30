@@ -1,6 +1,7 @@
 import { NodeFileSystem } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Cause from "effect/Cause"
+import * as Config from "effect/Config"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -316,5 +317,60 @@ describe("ExpoSqliteClient", () => {
       Effect.scoped,
       provideReactivity
     )
+  )
+
+  it.effect(
+    "prepares repeated SQL once and runs each execution in one native call",
+    Effect.fnUntraced(
+      function*() {
+        const sql = yield* client()
+        yield* sql`CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)`
+        probe.calls = []
+        for (let id = 0; id < 100; id++) yield* sql`INSERT INTO t (id, name) VALUES (${id}, ${"n"})`
+        assert.deepStrictEqual(yield* sql`SELECT COUNT(*) FROM t`.values, [[100]])
+        assert.strictEqual(nativeCalls("prepareAsync"), 2)
+        assert.strictEqual(nativeCalls("runAsync"), 101)
+        assert.strictEqual(nativeCalls("finalizeAsync"), 0)
+      },
+      Effect.scoped,
+      provideReactivity
+    )
+  )
+
+  it.effect(
+    "prepares again after a failed prepare and finalizes every prepared statement before close",
+    Effect.fnUntraced(function*() {
+      yield* resetProbe
+      const scope = yield* Scope.make()
+      const sql = yield* ExpoSqliteClient.make(memory).pipe(Scope.provide(scope))
+      const missing = yield* Effect.exit(sql`SELECT id FROM later`)
+      assert.isTrue(Exit.isFailure(missing))
+      yield* sql`CREATE TABLE later (id INTEGER)`
+      yield* sql`INSERT INTO later (id) VALUES (${1})`
+      assert.deepStrictEqual(yield* sql`SELECT id FROM later`, [{ id: 1 }])
+      const duplicate = yield* Effect.exit(
+        sql`INSERT INTO later (id) VALUES (${1})`.pipe(Effect.andThen(sql`CREATE UNIQUE INDEX u ON later (id)`))
+      )
+      assert.isTrue(Exit.isFailure(duplicate))
+      yield* Scope.close(scope, Exit.void)
+      assert.strictEqual(probe.openDatabases, 0)
+      assert.strictEqual(probe.maxInFlight, 1)
+      assert.strictEqual(nativeCalls("prepareAsync"), nativeCalls("finalizeAsync") + 1)
+      assert.isBelow(probe.calls.lastIndexOf("finalizeAsync"), probe.calls.indexOf("closeAsync"))
+    }, provideReactivity)
+  )
+
+  it.effect(
+    "reads configuration through layerConfig",
+    Effect.fnUntraced(function*() {
+      yield* resetProbe
+      const rows = yield* SqlClient.SqlClient.use((sql) => sql`SELECT 1 AS one`.values).pipe(
+        Effect.provide(
+          ExpoSqliteClient.layerConfig({ filename: Config.succeed(":memory:"), disableWAL: Config.succeed(true) })
+        )
+      )
+      assert.deepStrictEqual(rows, [[1]])
+      assert.deepStrictEqual(probe.opened, [{ path: ":memory:", useNewConnection: true }])
+    }, Effect.scoped)
   )
 })
