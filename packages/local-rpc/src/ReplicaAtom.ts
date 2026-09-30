@@ -184,7 +184,7 @@ export const make = <E extends { readonly _tag: string }, Services = never,>(
       Effect.map((fields) => Protocol.EphemeralMember.make(fields)),
       Effect.catchTag("PlatformError", (error) => Effect.die(error))
     )
-  ).pipe(Atom.keepAlive)
+  ).pipe(Atom.setIdleTTL(idleTTL))
 
   const refreshOn = (keys: ReadonlyArray<string>) =>
   <A, EA,>(

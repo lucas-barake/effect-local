@@ -596,8 +596,8 @@ projections for one member share the session atom's single joined stream: events
 replay their current decoded view to late subscribers, and a malformed remote value fails only the projection for its
 own definition with a typed decode error. Set `publishTypingAtom` with `{ payload, ttl }` and observe the command's
 `AsyncResult`. Every ephemeral session and publish target speaks for `graph.member`, one member identity the graph
-mints from the layer's `Crypto` the first time it is needed and keeps for the lifetime of the registry; pass `member`
-explicitly only to act as a different member. Pass an application factory with `options.factory` when the application already owns a deliberate
+mints from the layer's `Crypto` when an ephemeral atom first needs it and keeps while ephemeral atoms that use it stay
+mounted, so an idle graph still releases its replica; pass `member` explicitly only to act as a different member. Pass an application factory with `options.factory` when the application already owns a deliberate
 custom runtime.
 
 ### Infinite scroll

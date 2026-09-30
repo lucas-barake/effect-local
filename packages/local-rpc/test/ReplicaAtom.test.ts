@@ -461,6 +461,28 @@ describe("Replica Atom graph", () => {
   )
 
   it.effect(
+    "releases the graph's layer once the atoms that minted its ephemeral member unmount",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeEphemeralHarness()
+      const released = yield* Deferred.make<void>()
+      const layerReleaseProbe = Layer.effectDiscard(
+        Effect.addFinalizer(() => Deferred.succeed(released, undefined))
+      )
+      const graph = ReplicaAtom.make(
+        Layer.mergeAll(layerReplica, harness.layerEphemeralClient, layerReleaseProbe),
+        { idleTTL: 0 }
+      )
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const session = graph.ephemeral(StatusProfile, { spaceId, value: { status: "online" }, ttl: "10 seconds" })
+      const unmount = registry.mount(graph.ephemeralMembers(session))
+      yield* AtomRegistry.getResult(registry, graph.member)
+      unmount()
+      yield* Deferred.await(released)
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "speaks for one graph member when a session or publish target omits the member",
     Effect.fnUntraced(function*() {
       const harness = yield* makeEphemeralHarness()

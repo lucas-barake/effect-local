@@ -141,8 +141,8 @@ channel filtering, and the automatic decoding on receive. Application code never
 tags, or `Schema.decode` calls.
 
 `graph.ephemeral` returns the session atom for one `(space, member)` pair. The member defaults to `graph.member`,
-which the graph mints once per tab from the `Crypto` that `BrowserReplica.layer` exposes, so every tab of the same user
-is its own presence member. Mounting any projection derived from it
+which each tab's graph mints from the `Crypto` that `BrowserReplica.layer` exposes, so every tab of the same user is its
+own presence member. Mounting any projection derived from it
 opens exactly one joined server stream, shared by every typed projection. `ephemeralEvents` resolves to the latest
 decoded `{ member, payload }` envelope and only observes events published while it is mounted. `ephemeralState`
 resolves to the full decoded entry list for its definition, replayed immediately to late subscribers and updated
