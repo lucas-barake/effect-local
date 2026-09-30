@@ -5,6 +5,9 @@
     "examples/chat/client": {
       "entry": ["vite.e2e-next.config.ts"]
     },
+    "packages/local-expo": {
+      "entry": ["test/fixtures/{expo,expoAsset,expoModulesCore,reactNative}.ts"]
+    },
     "packages/local-browser": {
       "ignoreDependencies": ["@effect/platform-browser"]
     },

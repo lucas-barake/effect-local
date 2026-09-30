@@ -87,6 +87,18 @@
       }
     },
     {
+      "files": ["packages/local-expo/test/fixtures/**"],
+      "rules": {
+        "effect/noGlobals": "off",
+        "effect/noNewError": "off",
+        "effect/noNewPromise": "off",
+        "effect/noNodeBuiltinImport": "off",
+        "effect/noThrowStatement": "off",
+        "effect/noTryCatch": "off",
+        "typescript/no-extraneous-class": "off"
+      }
+    },
+    {
       "files": ["**/test/**", "**/tests/**", "**/test-browser/**"],
       "rules": { "eslint/no-console": "off" }
     },
