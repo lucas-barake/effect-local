@@ -28,7 +28,7 @@ const Banner = ({ connection }: { readonly connection: Connection }) => {
   const text = bannerText[connection]
   if (text === undefined) return null
   return (
-    <View testID={`banner-${connection}`} accessibilityRole="alert" style={styles.banner}>
+    <View accessibilityRole="alert" style={styles.banner}>
       <Text style={styles.bannerText}>{text}</Text>
       {connection === "needsAuthentication" && (
         <Pressable accessibilityRole="button" onPress={() => logout(undefined)}>

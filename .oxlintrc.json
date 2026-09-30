@@ -137,10 +137,6 @@
         "effect/noNodeBuiltinImport": "off",
         "eslint/no-console": "off"
       }
-    },
-    {
-      "files": ["examples/chat/e2e-mobile/**"],
-      "rules": { "effect/noAsyncFunction": "off", "effect/noGlobals": "off", "effect/noNodeBuiltinImport": "off" }
     }
   ]
 }

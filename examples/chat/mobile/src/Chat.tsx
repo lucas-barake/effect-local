@@ -82,7 +82,6 @@ const Composer = ({ client, me, conversationId }: {
   return (
     <View style={styles.composer}>
       <TextInput
-        testID="message-input"
         style={styles.input}
         value={draft}
         placeholder="Type a message"
@@ -92,7 +91,6 @@ const Composer = ({ client, me, conversationId }: {
         returnKeyType="send"
       />
       <Pressable
-        testID="send-button"
         accessibilityRole="button"
         accessibilityLabel="Send message"
         style={[styles.send, draft.trim().length === 0 && styles.sendDisabled]}
@@ -192,13 +190,13 @@ export const Chat = ({ client, me, conversationId, onBack }: {
   return (
     <View style={styles.screen}>
       <View style={styles.header}>
-        <Pressable testID="back" accessibilityRole="button" accessibilityLabel="Back to conversations" onPress={onBack}>
+        <Pressable accessibilityRole="button" accessibilityLabel="Back to conversations" onPress={onBack}>
           <Text style={styles.back}>‹</Text>
         </Pressable>
         <Avatar name={title} color={color} size={36} />
         <View style={styles.headerText}>
-          <Text testID="chat-title" style={styles.title}>{title}</Text>
-          <Text testID="chat-subtitle" accessibilityLiveRegion="polite" style={styles.subtitle}>{subtitle}</Text>
+          <Text style={styles.title}>{title}</Text>
+          <Text accessibilityLiveRegion="polite" style={styles.subtitle}>{subtitle}</Text>
         </View>
       </View>
       <FlatList
@@ -217,12 +215,11 @@ export const Chat = ({ client, me, conversationId, onBack }: {
               {conversation?.kind === "group" && !mine && (
                 <Text style={styles.sender}>{senderName(item.message.senderId)}</Text>
               )}
-              <Text testID={`message-${item.message.id}`} style={styles.text}>{item.message.text}</Text>
+              <Text style={styles.text}>{item.message.text}</Text>
               <View style={styles.meta}>
                 <Text style={styles.time}>{formatTime(item.message.createdAt)}</Text>
                 {state !== undefined && (
                   <Text
-                    testID={`tick-${item.message.id}`}
                     accessibilityLabel={state}
                     style={[styles.tick, state === "read" && styles.tickRead]}
                   >

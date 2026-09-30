@@ -7,7 +7,6 @@
     { "path": "client" },
     { "path": "mobile" },
     { "path": "test" },
-    { "path": "e2e" },
-    { "path": "e2e-mobile" }
+    { "path": "e2e" }
   ]
 }

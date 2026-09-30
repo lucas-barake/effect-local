@@ -55,8 +55,8 @@ export const Conversations = ({ client, session, onOpen }: {
     <View style={styles.screen}>
       <View style={styles.header}>
         <Avatar name={session.name} color={session.color} size={36} />
-        <Text testID="me-name" style={styles.me}>{session.name}</Text>
-        <Pressable testID="logout" accessibilityRole="button" onPress={() => logout(undefined)}>
+        <Text style={styles.me}>{session.name}</Text>
+        <Pressable accessibilityRole="button" onPress={() => logout(undefined)}>
           <Text style={styles.logout}>Log out</Text>
         </Pressable>
       </View>
@@ -71,7 +71,6 @@ export const Conversations = ({ client, session, onOpen }: {
           }
           return (
             <Pressable
-              testID={`conversation-${item.conversation.id}`}
               accessibilityRole="button"
               style={styles.row}
               onPress={() => onOpen(item.conversation.id)}
@@ -109,7 +108,6 @@ export const Conversations = ({ client, session, onOpen }: {
               {newDmUsers.map((user) => (
                 <Pressable
                   key={user.id}
-                  testID={`start-chat-${user.id}`}
                   accessibilityRole="button"
                   style={styles.startRow}
                   onPress={() => onOpen(dmConversationId(me, user.id))}
@@ -120,7 +118,6 @@ export const Conversations = ({ client, session, onOpen }: {
               ))}
               {!knownIds.has(groupConversationId) && (
                 <Pressable
-                  testID="start-chat-group"
                   accessibilityRole="button"
                   style={styles.startRow}
                   onPress={() => onOpen(groupConversationId)}

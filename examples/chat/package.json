@@ -11,8 +11,7 @@
     "build": "pnpm -C client build",
     "check": "tsc -b tsconfig.json",
     "test": "vitest run",
-    "e2e": "playwright test -c e2e/playwright.config.ts",
-    "e2e:mobile": "playwright test -c e2e-mobile/playwright.config.ts"
+    "e2e": "playwright test -c e2e/playwright.config.ts"
   },
   "dependencies": {
     "@effect-local/example-chat-server": "workspace:^",

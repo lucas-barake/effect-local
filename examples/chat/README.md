@@ -91,8 +91,6 @@ mobile/   Expo SDK 57 app
                         is an Atom.kvs over expo-secure-store
           Chat.tsx    — conversation view with ticks, typing, and read
                         receipts while the app is in the foreground
-e2e-mobile/ Playwright spec plus Maestro flows: a web user and an Android
-          user chat both ways through one server
 test/     domain.test.ts — tick-state derivation matrix, branded id invariants
           smoke.test.ts  — in-process end-to-end: real server composition plus
                            real SyncClient + SqlReplica stacks over loopback
@@ -149,12 +147,7 @@ test/     domain.test.ts — tick-state derivation matrix, branded id invariants
 pnpm -C examples/chat test    # domain unit tests + in-process e2e smoke tests
 pnpm -C examples/chat check   # project typecheck
 pnpm -C examples/chat e2e     # browser e2e
-pnpm -C examples/chat e2e:mobile  # browser plus Android e2e, needs a running emulator with the app installed
 ```
-
-`e2e:mobile` expects a release build of the app, built with
-`EXPO_PUBLIC_CHAT_SERVER_URL=http://10.0.2.2:4199`, installed on a running Android emulator, and the Maestro CLI on
-the path. The `e2e-android` job in `.github/workflows/check.yml` shows the exact steps.
 
 The smoke tests boot the real `makeServerLayer` on an ephemeral port with
 in-memory SQLite and connect real client stacks per user — no fakes. They

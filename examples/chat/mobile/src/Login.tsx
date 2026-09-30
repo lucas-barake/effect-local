@@ -28,7 +28,6 @@ export const Login = () => {
           {users.map((user) => (
             <Pressable
               key={user.id}
-              testID={`login-user-${user.id}`}
               accessibilityRole="button"
               accessibilityState={{ selected: user.id === userId }}
               onPress={() => setUserId(user.id)}
@@ -40,7 +39,6 @@ export const Login = () => {
           ))}
         </View>
         <TextInput
-          testID="login-password"
           style={styles.input}
           value={password}
           onChangeText={setPassword}
@@ -49,7 +47,7 @@ export const Login = () => {
           autoCapitalize="none"
           onSubmitEditing={submit}
         />
-        <Pressable testID="login-submit" accessibilityRole="button" style={styles.submit} onPress={submit}>
+        <Pressable accessibilityRole="button" style={styles.submit} onPress={submit}>
           <Text style={styles.submitText}>Sign in</Text>
         </Pressable>
         {error !== undefined && <Text accessibilityRole="alert" style={styles.error}>{error}</Text>}
