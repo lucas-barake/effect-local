@@ -10,39 +10,39 @@ import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as EntityId from "effect/cluster/EntityId"
+import * as MessageStorage from "effect/cluster/MessageStorage"
+import * as RunnerAddress from "effect/cluster/RunnerAddress"
+import * as RunnerHealth from "effect/cluster/RunnerHealth"
+import * as Runners from "effect/cluster/Runners"
+import * as RunnerStorage from "effect/cluster/RunnerStorage"
+import * as ShardId from "effect/cluster/ShardId"
+import * as Sharding from "effect/cluster/Sharding"
+import * as ShardingConfig from "effect/cluster/ShardingConfig"
+import * as SocketRunner from "effect/cluster/SocketRunner"
+import * as SqlMessageStorage from "effect/cluster/SqlMessageStorage"
+import * as SqlRunnerStorage from "effect/cluster/SqlRunnerStorage"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import * as HttpRouter from "effect/http/HttpRouter"
+import * as HttpServer from "effect/http/HttpServer"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
+import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Redacted from "effect/Redacted"
+import * as RpcSerialization from "effect/rpc/RpcSerialization"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
+import * as SocketServer from "effect/socket/SocketServer"
+import type * as SqlClient from "effect/sql/SqlClient"
+import type * as SqlError from "effect/sql/SqlError"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as TestClock from "effect/testing/TestClock"
 import * as Tracer from "effect/Tracer"
-import * as EntityId from "effect/unstable/cluster/EntityId"
-import * as MessageStorage from "effect/unstable/cluster/MessageStorage"
-import * as RunnerAddress from "effect/unstable/cluster/RunnerAddress"
-import * as RunnerHealth from "effect/unstable/cluster/RunnerHealth"
-import * as Runners from "effect/unstable/cluster/Runners"
-import * as RunnerStorage from "effect/unstable/cluster/RunnerStorage"
-import * as ShardId from "effect/unstable/cluster/ShardId"
-import * as Sharding from "effect/unstable/cluster/Sharding"
-import * as ShardingConfig from "effect/unstable/cluster/ShardingConfig"
-import * as SocketRunner from "effect/unstable/cluster/SocketRunner"
-import * as SqlMessageStorage from "effect/unstable/cluster/SqlMessageStorage"
-import * as SqlRunnerStorage from "effect/unstable/cluster/SqlRunnerStorage"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
-import * as HttpServer from "effect/unstable/http/HttpServer"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import * as SocketServer from "effect/unstable/socket/SocketServer"
-import type * as SqlClient from "effect/unstable/sql/SqlClient"
-import type * as SqlError from "effect/unstable/sql/SqlError"
 import * as Authentication from "../src/Authentication.js"
 import * as EphemeralClient from "../src/EphemeralClient.js"
 import * as LosslessQueue from "../src/internal/losslessQueue.js"
@@ -117,15 +117,14 @@ const layerAuthenticator = Layer.succeed(
   })
 )
 const layerAuthenticationServer = Authentication.layerServer.pipe(Layer.provide(layerAuthenticator))
-const layerWebsocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(
-  Layer.provide(HttpRouter.layer)
-)
+const layerWebsocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" })
 const layerGateway = (assertionSecret: Redacted.Redacted) =>
-  SyncServer.layer({ ...serverOptions, assertionSecret }).pipe(
-    Layer.provide(layerWebsocketProtocol),
+  HttpRouter.serve(
+    SyncServer.layer({ ...serverOptions, assertionSecret }).pipe(Layer.provide(layerWebsocketProtocol)),
+    { disableListenLog: true, disableLogger: true }
+  ).pipe(
     Layer.provide(layerAuthenticationServer),
     Layer.provide(layerHandlers),
-    Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true })),
     Layer.provide(SyncRpc.layerJson())
   )
 

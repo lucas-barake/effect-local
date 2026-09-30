@@ -2,8 +2,8 @@ import { NodeCrypto } from "@effect/platform-node"
 import { PgClient } from "@effect/sql-pg"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
+import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Redacted from "effect/Redacted"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 import { inject } from "vitest"
 
 const adminStatement = (statement: string) =>

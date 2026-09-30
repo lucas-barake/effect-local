@@ -1,14 +1,14 @@
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import * as Headers from "effect/http/Headers"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Redacted from "effect/Redacted"
+import * as RpcMiddleware from "effect/rpc/RpcMiddleware"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
-import * as Headers from "effect/unstable/http/Headers"
-import * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
 import { invalidConfiguration } from "./internal/errors.js"
 
 export class Principal extends Context.Service<Principal, typeof Schema.Json.Type>()(

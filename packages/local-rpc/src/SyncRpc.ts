@@ -3,19 +3,19 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Predicate from "effect/Predicate"
-import * as Schema from "effect/Schema"
-import * as SchemaGetter from "effect/SchemaGetter"
-import type * as Scope from "effect/Scope"
-import * as Rpc from "effect/unstable/rpc/Rpc"
+import * as Rpc from "effect/rpc/Rpc"
 import {
   type FromGroup as RpcClientFromGroup,
   make as makeClient,
   type Protocol as RpcClientProtocol
-} from "effect/unstable/rpc/RpcClient"
-import type { RpcClientError } from "effect/unstable/rpc/RpcClientError"
-import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
-import type * as RpcMiddleware from "effect/unstable/rpc/RpcMiddleware"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
+} from "effect/rpc/RpcClient"
+import type { RpcClientError } from "effect/rpc/RpcClientError"
+import * as RpcGroup from "effect/rpc/RpcGroup"
+import type * as RpcMiddleware from "effect/rpc/RpcMiddleware"
+import * as RpcSerialization from "effect/rpc/RpcSerialization"
+import * as Schema from "effect/Schema"
+import * as SchemaGetter from "effect/SchemaGetter"
+import type * as Scope from "effect/Scope"
 import * as Authentication from "./Authentication.js"
 import { invalidConfiguration } from "./internal/errors.js"
 

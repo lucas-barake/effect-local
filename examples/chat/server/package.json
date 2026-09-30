@@ -13,11 +13,11 @@
   },
   "dependencies": {
     "@effect-local/example-chat-shared": "workspace:^",
-    "@effect/platform-node": "4.0.0-rc.117",
-    "@effect/sql-sqlite-node": "4.0.0-rc.117",
+    "@effect/platform-node": "4.0.0-rc.118",
+    "@effect/sql-sqlite-node": "4.0.0-rc.118",
     "@lucas-barake/effect-local": "workspace:^",
     "@lucas-barake/effect-local-rpc": "workspace:^",
-    "effect": "4.0.0-rc.117",
+    "effect": "4.0.0-rc.118",
     "tsx": "4.20.6"
   }
 }

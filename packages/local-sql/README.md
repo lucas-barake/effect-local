@@ -59,9 +59,9 @@ The caller chooses the Workflow engine and runner. A durable single runner compo
 ```ts
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ClusterWorkflowEngine from "effect/cluster/ClusterWorkflowEngine"
+import * as SingleRunner from "effect/cluster/SingleRunner"
 import * as Layer from "effect/Layer"
-import * as ClusterWorkflowEngine from "effect/unstable/cluster/ClusterWorkflowEngine"
-import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
 import { definition, Todo } from "./domain.js"
 
 const layerWorkflowEngine = ClusterWorkflowEngine.layer.pipe(
@@ -97,7 +97,7 @@ bootstrap. Scopes support complete models and bounded secondary index windows wi
 
 `retryDelay`, `maximumRetryDelay`, and `maximumAttempts` bound exponential retries within one Workflow execution. A
 terminal failed generation stays failed until a later mutation or server wake requests a new generation. Effect
-4.0.0-rc.117 does not expose per Workflow completed history retention through `WorkflowEngine`; storage lifecycle remains
+4.0.0-rc.118 does not expose per Workflow completed history retention through `WorkflowEngine`; storage lifecycle remains
 an operational responsibility of the selected engine and runner.
 
 Provide separate `SqlClient` connections to the replica and to SQL backed `SingleRunner`. They may use the same file,

@@ -5,7 +5,7 @@ local SQLite, works while offline, and reconciles with an authoritative server a
 returns. Effect Schema defines every domain, durable, and wire contract. Effect services, Layers, scopes, streams,
 and Atom own the runtime.
 
-The library targets Effect `4.0.0-rc.117`. It has not published a stable release. Durable and public contracts may
+The library targets Effect `4.0.0-rc.118`. It has not published a stable release. Durable and public contracts may
 change before v1.
 
 ## Architecture
@@ -77,7 +77,7 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
-import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as SqlSchema from "effect/sql/SqlSchema"
 
 export const Task = Model.make("Task", {
   version: 1,
@@ -423,32 +423,33 @@ singleton. Every limit has a documented default.
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as SyncRpc from "@lucas-barake/effect-local-rpc/SyncRpc"
 import * as SyncServer from "@lucas-barake/effect-local-rpc/SyncServer"
+import * as SingleRunner from "effect/cluster/SingleRunner"
+import * as HttpRouter from "effect/http/HttpRouter"
 import * as Layer from "effect/Layer"
-import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
 
-const layerProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(Layer.provide(HttpRouter.layer))
-
-export const layerServer = SyncServer.layer({
+const layerSync = SyncServer.layer({
   definition,
   authorizeAccess,
   authorizeMutation,
   authorizeRead,
   authorizeEphemeral
-}).pipe(
-  Layer.provideMerge(layerProtocol),
+}).pipe(Layer.provideMerge(SyncServer.layerProtocolWebSocket({ path: "/sync" })))
+
+export const layerServer = HttpRouter.serve(layerSync).pipe(
   Layer.provide(Authentication.layerServer.pipe(Layer.provide(layerAuthenticator))),
   Layer.provide(SingleRunner.layer({ runnerStorage: "memory" })),
   Layer.provide(layerDomain),
   Layer.provide(layerDatabase),
-  Layer.provide(HttpRouter.serve(layerProtocol)),
   Layer.provide([layerHttpServer, SyncRpc.layerJson()])
 )
 ```
 
+`HttpRouter.serve` serves only the routes registered by the layer passed to it, so the WebSocket protocol belongs
+inside that layer. Add other routes, such as a login endpoint, to the same layer.
+
 Replace `SingleRunner.layer` with Effect Cluster's runner transport and SQL runner and message storage to run the same
 layer on several processes, and pass one `assertionSecret` to all of them. Use NDJSON runner serialization, for
-example `NodeClusterSocket.layer({ serialization: "ndjson" })`: in Effect `4.0.0-rc.117` the default SchemaBinary
+example `NodeClusterSocket.layer({ serialization: "ndjson" })`: in Effect `4.0.0-rc.118` the default SchemaBinary
 runner serialization breaks volatile streaming entity calls between runners after their first element.
 
 ### PostgreSQL server storage

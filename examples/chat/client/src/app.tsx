@@ -13,7 +13,7 @@ import {
 import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as Match from "effect/Match"
 import * as Option from "effect/Option"
-import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
+import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { useState } from "react"
 import { Avatar } from "./avatar.js"
 import { ChatView } from "./chat.js"

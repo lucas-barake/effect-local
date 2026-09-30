@@ -3,18 +3,18 @@ import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import type * as Sharding from "effect/cluster/Sharding"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
-import * as Encoding from "effect/Encoding"
+import * as Base64Url from "effect/encoding/Base64Url"
+import type * as HttpRouter from "effect/http/HttpRouter"
 import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
+import type * as RpcSerialization from "effect/rpc/RpcSerialization"
+import * as RpcServer from "effect/rpc/RpcServer"
 import * as Schema from "effect/Schema"
+import type * as SqlClient from "effect/sql/SqlClient"
 import * as Stream from "effect/Stream"
-import type * as Sharding from "effect/unstable/cluster/Sharding"
-import type * as HttpRouter from "effect/unstable/http/HttpRouter"
-import type * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
-import * as RpcServer from "effect/unstable/rpc/RpcServer"
-import type * as SqlClient from "effect/unstable/sql/SqlClient"
 import * as Authentication from "./Authentication.js"
 import * as EphemeralHub from "./EphemeralHub.js"
 import { invalidConfiguration } from "./internal/errors.js"
@@ -141,7 +141,7 @@ export interface LayerOptions<D extends Definition.Any, R = never,> {
 const assertionSecretBytes = 32
 
 const randomAssertionSecret = Crypto.Crypto.use((crypto) => crypto.randomBytes(assertionSecretBytes)).pipe(
-  Effect.map((bytes) => Redacted.make(Encoding.encodeBase64Url(bytes))),
+  Effect.map((bytes) => Redacted.make(Base64Url.encode(bytes))),
   Effect.catchTag("PlatformError", (error) => Effect.die(error))
 )
 

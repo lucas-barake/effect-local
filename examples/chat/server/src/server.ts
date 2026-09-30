@@ -18,14 +18,14 @@ import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as SyncRpc from "@lucas-barake/effect-local-rpc/SyncRpc"
 import * as SyncServer from "@lucas-barake/effect-local-rpc/SyncServer"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as SingleRunner from "effect/cluster/SingleRunner"
 import * as Effect from "effect/Effect"
+import * as HttpRouter from "effect/http/HttpRouter"
+import * as HttpServerRequest from "effect/http/HttpServerRequest"
+import * as HttpServerResponse from "effect/http/HttpServerResponse"
 import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
-import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
-import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest"
-import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
 // oxlint-disable-next-line effect/noNodeBuiltinImport -- NodeHttpServer.layer takes the platform's own http server factory; this file is the Node host boundary.
 import * as Http from "node:http"
 
@@ -167,20 +167,16 @@ const layerSync = SyncServer.layer({
 
 /** The full server composition. Launch with `Layer.launch` or `Layer.unwrap`-based test harnesses. */
 export const makeServerLayer = (options: ChatServerOptions) => {
-  // The login route and the RPC websocket upgrade share ONE router instance:
-  // a separately built router would 404 /login.
-  const layerApp = Layer.mergeAll(
-    SyncServer.layerProtocolWebSocket({ path: "/sync" }),
-    layerLoginRoute
-  ).pipe(Layer.provide(HttpRouter.layer))
+  // The login route and the RPC websocket upgrade are registered in the app
+  // that HttpRouter.serve owns: routes on any other router are not served.
+  const layerRoutes = Layer.mergeAll(SyncServer.layerProtocolWebSocket({ path: "/sync" }), layerLoginRoute)
+  const layerApp = layerSync.pipe(Layer.provideMerge(layerRoutes))
 
-  return layerSync.pipe(
-    Layer.provideMerge(layerApp),
+  return HttpRouter.serve(layerApp, { disableLogger: true }).pipe(
     Layer.provide(Authentication.layerServer.pipe(Layer.provide(layerAuthenticator))),
     Layer.provide(SingleRunner.layer({ runnerStorage: "memory" })),
     Layer.provide(layerMutations),
     Layer.provide(makeLayerDatabase(options.databaseFile)),
-    Layer.provide(HttpRouter.serve(layerApp, { disableLogger: true })),
     // provideMerge so callers (tests) can still reach HttpServer for the bound address.
     Layer.provideMerge([NodeHttpServer.layer(() => Http.createServer(), { port: options.port }), SyncRpc.layerJson()])
   )

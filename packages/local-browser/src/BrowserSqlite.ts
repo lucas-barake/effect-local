@@ -3,7 +3,7 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import type { LazyArg } from "effect/Function"
 import * as EffectLayer from "effect/Layer"
-import { classifySqliteError, SqlError } from "effect/unstable/sql/SqlError"
+import { classifySqliteError, SqlError } from "effect/sql/SqlError"
 
 export class DatabasePort extends Context.Service<DatabasePort, MessagePort>()(
   "@lucas-barake/effect-local-browser/DatabasePort"

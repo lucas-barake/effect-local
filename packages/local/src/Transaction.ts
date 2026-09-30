@@ -1,7 +1,7 @@
 import type * as Effect from "effect/Effect"
 import type * as Option from "effect/Option"
 import type * as Schema from "effect/Schema"
-import type * as Statement from "effect/unstable/sql/Statement"
+import type * as Statement from "effect/sql/Statement"
 import type * as Field from "./Field.js"
 import type * as Model from "./Model.js"
 import type * as ReplicaError from "./ReplicaError.js"

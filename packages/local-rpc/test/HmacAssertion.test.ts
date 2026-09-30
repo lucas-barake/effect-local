@@ -4,7 +4,8 @@ import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
-import * as Encoding from "effect/Encoding"
+import * as Base64Url from "effect/encoding/Base64Url"
+import * as Hex from "effect/encoding/Hex"
 import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
@@ -64,7 +65,7 @@ describe("HMAC principal assertions", () => {
       const crypto = yield* Crypto.Crypto
       for (const [name, key, message, expected] of rfc4231) {
         const mac = yield* Hmac.sha256(crypto, key, message)
-        assert.strictEqual(Encoding.encodeHex(mac), expected, name)
+        assert.strictEqual(Hex.encode(mac), expected, name)
       }
     }, provideCrypto)
   )
@@ -95,7 +96,7 @@ describe("HMAC principal assertions", () => {
           principal: { userId: "mallory" },
           expiresAtMillis: Number.MAX_SAFE_INTEGER
         })
-        const forgedPayload = Encoding.encodeBase64Url(forgedClaims)
+        const forgedPayload = Base64Url.encode(forgedClaims)
         const tamperedPayload = PrincipalAssertion.PrincipalAssertion.make(`${forgedPayload}.${signature}`)
         const tamperedSignature = PrincipalAssertion.PrincipalAssertion.make(`${payload}.${signature.slice(1)}A`)
         assert.strictEqual(yield* denialOf(verifier.verify(tamperedPayload)), "invalid principal assertion")

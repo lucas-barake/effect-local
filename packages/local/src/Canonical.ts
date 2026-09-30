@@ -1,6 +1,6 @@
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
-import * as Encoding from "effect/Encoding"
+import * as Hex from "effect/encoding/Hex"
 import * as Schema from "effect/Schema"
 import * as ReplicaError from "./ReplicaError.js"
 
@@ -33,10 +33,10 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   }
   if (value === null || typeof value !== "object") return value
   if (isDate(value)) return `${sentinel}date:${value.toISOString()}`
-  if (isUint8Array(value)) return `${sentinel}bytes:${Encoding.encodeHex(value)}`
+  if (isUint8Array(value)) return `${sentinel}bytes:${Hex.encode(value)}`
   if (ArrayBuffer.isView(value)) {
     return `${sentinel}view:${Object.prototype.toString.call(value).slice(8, -1)}:${
-      Encoding.encodeHex(new Uint8Array(value.buffer, value.byteOffset, value.byteLength))
+      Hex.encode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength))
     }`
   }
   if (ancestors.has(value)) return `${sentinel}circular`
@@ -83,7 +83,7 @@ export const digest = (value: unknown) =>
   stringifyEffect(value).pipe(
     Effect.flatMap((input) =>
       Crypto.Crypto.use((crypto) => crypto.digest("SHA-256", new TextEncoder().encode(input))).pipe(
-        Effect.map(Encoding.encodeHex),
+        Effect.map(Hex.encode),
         Effect.mapError((cause) => new ReplicaError.StorageUnavailable({ cause }))
       )
     )

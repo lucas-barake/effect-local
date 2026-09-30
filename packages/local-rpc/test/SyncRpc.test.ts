@@ -3,7 +3,7 @@ import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Result from "effect/Result"
-import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization"
+import * as RpcSerialization from "effect/rpc/RpcSerialization"
 import * as SyncRpc from "../src/SyncRpc.js"
 
 const serialization = (maximumFrameBytes: number) =>

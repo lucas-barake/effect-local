@@ -14,28 +14,29 @@ principal assertions, and the maintenance singleton. `SyncClient.layer` implemen
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as SyncRpc from "@lucas-barake/effect-local-rpc/SyncRpc"
 import * as SyncServer from "@lucas-barake/effect-local-rpc/SyncServer"
+import * as SingleRunner from "effect/cluster/SingleRunner"
+import * as HttpRouter from "effect/http/HttpRouter"
 import * as Layer from "effect/Layer"
-import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
 
-const layerProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(Layer.provide(HttpRouter.layer))
-
-export const layerServer = SyncServer.layer({
+const layerSync = SyncServer.layer({
   definition,
   authorizeAccess,
   authorizeMutation,
   authorizeRead,
   authorizeEphemeral
-}).pipe(
-  Layer.provideMerge(layerProtocol),
+}).pipe(Layer.provideMerge(SyncServer.layerProtocolWebSocket({ path: "/sync" })))
+
+export const layerServer = HttpRouter.serve(layerSync).pipe(
   Layer.provide(Authentication.layerServer.pipe(Layer.provide(layerAuthenticator))),
   Layer.provide(SingleRunner.layer({ runnerStorage: "memory" })),
   Layer.provide(layerMutationHandlers),
   Layer.provide(layerDatabase),
-  Layer.provide(HttpRouter.serve(layerProtocol)),
   Layer.provide([layerHttpServer, SyncRpc.layerJson()])
 )
 ```
+
+`HttpRouter.serve` serves only the routes registered by the layer passed to it, so the WebSocket protocol belongs
+inside that layer. Add other routes, such as a login endpoint, to the same layer.
 
 The four authorization callbacks are required. Every limit has a default: `store` takes any `ServerStore` option (see
 `ServerStore.defaults`), `ephemeral` any `EphemeralHub` option, `spaces` any `SpaceEntity.HandlerOptions` (see
@@ -53,7 +54,7 @@ SQL runner and message storage instead. `SyncServer.layer` itself is the same on
 runner forwards a request to the runner that owns the space, and the maintenance sweep runs on one runner at a time.
 
 Run the runners' socket transport with NDJSON serialization, for example
-`NodeClusterSocket.layer({ serialization: "ndjson" })`. In Effect `4.0.0-rc.117` the default SchemaBinary runner
+`NodeClusterSocket.layer({ serialization: "ndjson" })`. In Effect `4.0.0-rc.118` the default SchemaBinary runner
 serialization breaks volatile streaming entity calls between runners after their first element, which would stop
 cross-runner watches and presence. `packages/local-rpc/test/MultiRunner.test.ts` runs two real runners over sockets
 with shared SQL storage and covers batch submit, watch, presence, mismatched assertion secrets, and the maintenance
@@ -244,7 +245,7 @@ import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
-import * as Socket from "effect/unstable/socket/Socket"
+import * as Socket from "effect/socket/Socket"
 
 export const layerSync = SyncClient.layerWebSocket({ url: "wss://example.com/sync" }).pipe(
   Layer.provide(Socket.layerWebSocketConstructorGlobal),

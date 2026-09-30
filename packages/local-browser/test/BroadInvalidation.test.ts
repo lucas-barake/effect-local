@@ -16,9 +16,9 @@ import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import { AtomRegistry } from "effect/reactivity"
 import * as Schema from "effect/Schema"
-import { AtomRegistry } from "effect/unstable/reactivity"
-import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as SqlSchema from "effect/sql/SqlSchema"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
