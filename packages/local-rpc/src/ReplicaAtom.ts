@@ -164,9 +164,9 @@ class EphemeralMembersKey implements Equal.Equal {
   }
 }
 
-export const make = <E extends { readonly _tag: string },>(
+export const make = <E extends { readonly _tag: string }, Services = never,>(
   layer: Layer.Layer<
-    Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient | Crypto.Crypto,
+    Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient | Crypto.Crypto | Services,
     E,
     AtomRegistry.AtomRegistry | Reactivity.Reactivity
   >,
@@ -639,4 +639,4 @@ export const make = <E extends { readonly _tag: string },>(
   } as const
 }
 
-export type Graph<E extends { readonly _tag: string },> = ReturnType<typeof make<E>>
+export type Graph<E extends { readonly _tag: string }, Services = never,> = ReturnType<typeof make<E, Services>>

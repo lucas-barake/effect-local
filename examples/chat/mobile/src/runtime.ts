@@ -1,10 +1,10 @@
 import type { LoginRequest, LoginResponse } from "@effect-local/example-chat-shared/auth"
 import { makeChatClient } from "@effect-local/example-chat-shared/client"
+import { layerSessionCredential, renewCredential } from "@effect-local/example-chat-shared/credential"
 import { definition, spaceId, type UserId } from "@effect-local/example-chat-shared/domain"
 import { layerDomain } from "@effect-local/example-chat-shared/handlers"
 import { requestLogin, sessionKey, StoredSession } from "@effect-local/example-chat-shared/session"
 import * as ExpoReplica from "@lucas-barake/effect-local-expo/ExpoReplica"
-import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -12,7 +12,6 @@ import * as Effect from "effect/Effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as Layer from "effect/Layer"
 import * as Atom from "effect/reactivity/Atom"
-import * as Redacted from "effect/Redacted"
 import type { SqlError } from "effect/sql/SqlError"
 import { Platform } from "react-native"
 import { layerSecureStore } from "./secureStore.js"
@@ -44,21 +43,24 @@ export const loginAtom = appRuntime.fn<LoginRequest>()(
 export const logoutAtom = appRuntime.fn<void>()((_, get) => Effect.sync(() => get.set(sessionAtom, null)))
 
 const makeGraph = (session: LoginResponse) => {
-  const credential = Redacted.make(session.token)
+  const layerCredential = layerSessionCredential(session.token)
   return ReplicaAtom.make(
     ExpoReplica.layer({
       definition,
       database: { filename: `chat-${session.userId}.db` },
       initialSpaces: [spaceId],
-      layerSync: SyncClient.layerWebSocket({ url: syncUrl }).pipe(
-        Layer.provide(Authentication.layerCredentialProviderStatic(credential))
-      )
-    }).pipe(Layer.provide(layerDomain))
+      layerSync: SyncClient.layerWebSocket({ url: syncUrl }).pipe(Layer.provide(layerCredential))
+    }).pipe(Layer.provide(layerDomain), Layer.provideMerge(layerCredential))
   )
 }
 
-const makeClient = (session: LoginResponse) =>
-  makeChatClient<ReplicaError.ReplicaError | SqlError>(makeGraph(session), session.userId)
+const makeClient = (session: LoginResponse) => {
+  const graph = makeGraph(session)
+  return {
+    ...makeChatClient<ReplicaError.ReplicaError | SqlError>(graph, session.userId),
+    renewCredential: graph.runtime.fn<string>()(renewCredential)
+  }
+}
 
 export type ChatClient = ReturnType<typeof makeClient>
 

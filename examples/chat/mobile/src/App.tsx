@@ -46,6 +46,8 @@ const Home = ({ session }: { readonly session: LoginResponse }) => {
   useAtomMount(client.settlementDaemon)
   const connection = AsyncResult.getOrElse(useAtomValue(client.connectionAtom), (): Connection => "connecting")
   const startConversation = useAtomSet(client.startConversation)
+  const renew = useAtomSet(client.renewCredential)
+  useEffect(() => renew(session.token), [renew, session.token])
   const [openId, setOpenId] = useState<ConversationId | null>(null)
   const me = session.userId
 
