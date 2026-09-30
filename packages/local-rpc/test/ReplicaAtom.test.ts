@@ -194,7 +194,7 @@ const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
   clear: () => Effect.void,
   remove: () => Effect.void
 })
-const layerReplica = Layer.merge(
+const layerReplica = Layer.mergeAll(
   SqlReplica.layer({
     ...clientHistory,
     definition,
@@ -206,7 +206,8 @@ const layerReplica = Layer.merge(
     Layer.provide(layerDatabase),
     Layer.provide(layerHandlers)
   ),
-  layerEphemeralInactive
+  layerEphemeralInactive,
+  NodeCrypto.layer
 )
 
 const layerReplicaWithHeldQuery = (probe: {
@@ -257,7 +258,7 @@ const faultedReplica = (faultsReady: Deferred.Deferred<FaultInjection.Service>) 
     Layer.provide(layerDatabase),
     Layer.provide(layerHandlers)
   )
-  return Layer.merge(layerFaultedReplica, layerEphemeralInactive)
+  return Layer.mergeAll(layerFaultedReplica, layerEphemeralInactive, NodeCrypto.layer)
 }
 
 const memberA = Protocol.EphemeralMember.make({
@@ -319,12 +320,17 @@ const makeEphemeralHarness = Effect.fnUntraced(function*(options?: {
   const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
   const published = yield* Queue.unbounded<typeof Protocol.VersionedEphemeralPublishRequest.Type>()
   const joins = yield* Ref.make(0)
+  const joinRequests = yield* Queue.unbounded<typeof Protocol.VersionedEphemeralJoinRequest.Type>()
   const publishGate = yield* Deferred.make<void>()
   const publishCalls = yield* Ref.make(0)
   const gated = options?.gatePublishes ?? 0
   // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The RPC client is an external boundary. This test implements only the three ephemera calls it exercises.
   const fakeRpc = {
-    JoinEphemeral: () => Ref.update(joins, (count) => count + 1).pipe(Effect.as(messages)),
+    JoinEphemeral: (request: typeof Protocol.VersionedEphemeralJoinRequest.Type) =>
+      Ref.update(joins, (count) => count + 1).pipe(
+        Effect.andThen(Queue.offer(joinRequests, request)),
+        Effect.as(messages)
+      ),
     HeartbeatEphemeral: () => Effect.succeed(null),
     PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) =>
       Ref.updateAndGet(publishCalls, (count) => count + 1).pipe(
@@ -345,7 +351,7 @@ const makeEphemeralHarness = Effect.fnUntraced(function*(options?: {
     Layer.provide(Layer.succeed(ProtocolSession.ProtocolSession, protocolSession)),
     Layer.provide(layerTransport)
   )
-  return { messages, published, joins, publishGate, layerEphemeralClient }
+  return { messages, published, joins, joinRequests, publishGate, layerEphemeralClient }
 })
 
 const awaitSuccess = <A, E extends { readonly _tag: string },>(
@@ -451,6 +457,40 @@ describe("Replica Atom graph", () => {
       yield* Queue.offer(harness.messages, readStateSet(4, "conversation-2", { message: 7 }))
       yield* Fiber.join(stateVisible)
       assert.strictEqual(yield* Ref.get(harness.joins), 1)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "speaks for one graph member when a session or publish target omits the member",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeEphemeralHarness()
+      const graph = ReplicaAtom.make(Layer.merge(layerReplica, harness.layerEphemeralClient))
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const unmountMember = registry.mount(graph.member)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountMember))
+      const member = yield* AtomRegistry.getResult(registry, graph.member)
+      assert.isTrue(Schema.is(Protocol.EphemeralMember)(member))
+      yield* Queue.offer(harness.messages, Protocol.EphemeralSessionStarted.make({ ...ephemeralStarted, member }))
+      yield* Queue.offer(harness.messages, ephemeralSnapshot(1))
+
+      const options = { spaceId, value: { status: "online" }, ttl: "10 seconds" } as const
+      const session = graph.ephemeral(StatusProfile, options)
+      assert.strictEqual(graph.ephemeral(StatusProfile, options), session)
+      const membersAtom = graph.ephemeralMembers(session)
+      const unmount = registry.mount(membersAtom)
+      yield* Effect.addFinalizer(() => Effect.sync(unmount))
+      yield* AtomRegistry.getResult(registry, membersAtom)
+      const join = yield* LosslessQueue.take(harness.joinRequests)
+      assert.deepStrictEqual(join.member, member)
+
+      const publishTyping = graph.publishEphemeral(TypingChannel, { spaceId })
+      const unmountPublish = registry.mount(publishTyping)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountPublish))
+      registry.set(publishTyping, { payload: { active: true }, ttl: "1 second" })
+      const published = yield* LosslessQueue.take(harness.published)
+      assert.deepStrictEqual(published.request.member, member)
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, graph.member), member)
     }, Effect.scoped)
   )
 

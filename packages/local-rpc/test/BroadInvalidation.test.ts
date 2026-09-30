@@ -187,7 +187,7 @@ const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
   clear: () => Effect.void,
   remove: () => Effect.void
 })
-const layerReplica = Layer.merge(
+const layerReplica = Layer.mergeAll(
   SqlReplica.layer({
     defaultScope: Protocol.ReplicationScope.make({ models: [Message.name, Note.name] }),
     maximumActiveSpaces: 4,
@@ -208,7 +208,8 @@ const layerReplica = Layer.merge(
     Layer.provide(layerDatabase),
     Layer.provide(layerHandlers)
   ),
-  layerEphemeralInactive
+  layerEphemeralInactive,
+  NodeCrypto.layer
 )
 
 describe("broad invalidation", () => {

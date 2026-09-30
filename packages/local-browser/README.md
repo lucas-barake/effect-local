@@ -106,8 +106,6 @@ settlements, lifecycle operations, and ephemera.
 
 ```ts
 import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
-import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Schema from "effect/Schema"
 
 const ConversationId = Schema.String.pipe(Schema.brand("ConversationId"))
@@ -125,14 +123,8 @@ const ReadPosition = Ephemeral.make("ReadPosition", {
 
 const Presence = Ephemeral.member({ status: Schema.String })
 
-const member = Protocol.EphemeralMember.make({
-  clientId,
-  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
-})
-
 export const sessionAtom = graph.ephemeral(Presence, {
   spaceId,
-  member,
   value: { status: "online" },
   ttl: "30 seconds"
 })
@@ -140,15 +132,17 @@ export const sessionAtom = graph.ephemeral(Presence, {
 export const typingAtom = graph.ephemeralEvents(sessionAtom, Typing)
 export const positionsAtom = graph.ephemeralState(sessionAtom, ReadPosition)
 export const rosterAtom = graph.ephemeralMembers(sessionAtom)
-export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId, member })
-export const publishPositionAtom = graph.publishEphemeral(ReadPosition, { spaceId, member })
+export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId })
+export const publishPositionAtom = graph.publishEphemeral(ReadPosition, { spaceId })
 ```
 
 A definition is declared once and drives everything: the accepted payload type, the JSON encoding on the wire, the
 channel filtering, and the automatic decoding on receive. Application code never supplies channel strings, protocol
 tags, or `Schema.decode` calls.
 
-`graph.ephemeral` returns the session atom for one `(space, member)` pair. Mounting any projection derived from it
+`graph.ephemeral` returns the session atom for one `(space, member)` pair. The member defaults to `graph.member`,
+which the graph mints once per tab from the `Crypto` that `BrowserReplica.layer` exposes, so every tab of the same user
+is its own presence member. Mounting any projection derived from it
 opens exactly one joined server stream, shared by every typed projection. `ephemeralEvents` resolves to the latest
 decoded `{ member, payload }` envelope and only observes events published while it is mounted. `ephemeralState`
 resolves to the full decoded entry list for its definition, replayed immediately to late subscribers and updated

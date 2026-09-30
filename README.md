@@ -522,14 +522,10 @@ benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1
 ## Effect Atom
 
 ```ts
-import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
 import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
-import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Protocol from "@lucas-barake/effect-local/Protocol"
-import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 
@@ -575,23 +571,15 @@ export const spacesAtom = graph.spaces
 export const joinAtom = graph.join
 export const leaveAtom = graph.leave
 
-const member = Effect.runSync(
-  Effect.all({ clientId: Identity.makeClientId, membershipIncarnation: Identity.makeMembershipIncarnation }).pipe(
-    Effect.map((fields) => Protocol.EphemeralMember.make(fields)),
-    Effect.provide(BrowserCrypto.layer)
-  )
-)
-
 export const sessionAtom = graph.ephemeral(Presence, {
   spaceId,
-  member,
   value: { status: "online" },
   ttl: "30 seconds"
 })
 export const typingAtom = graph.ephemeralEvents(sessionAtom, Typing)
 export const positionsAtom = graph.ephemeralState(sessionAtom, ReadPosition)
 export const rosterAtom = graph.ephemeralMembers(sessionAtom)
-export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId, member })
+export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId })
 ```
 
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
@@ -607,7 +595,9 @@ and lifecycle command atoms are concurrent and preserve their typed result. Ephe
 projections for one member share the session atom's single joined stream: events are live only, state and the roster
 replay their current decoded view to late subscribers, and a malformed remote value fails only the projection for its
 own definition with a typed decode error. Set `publishTypingAtom` with `{ payload, ttl }` and observe the command's
-`AsyncResult`. Pass an application factory with `options.factory` when the application already owns a deliberate
+`AsyncResult`. Every ephemeral session and publish target speaks for `graph.member`, one member identity the graph
+mints from the layer's `Crypto` the first time it is needed and keeps for the lifetime of the registry; pass `member`
+explicitly only to act as a different member. Pass an application factory with `options.factory` when the application already owns a deliberate
 custom runtime.
 
 ### Infinite scroll

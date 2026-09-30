@@ -24,15 +24,12 @@ import {
   users
 } from "@effect-local/example-chat-shared/domain"
 import { layerDomain } from "@effect-local/example-chat-shared/handlers"
-import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
 import * as BrowserKeyValueStore from "@effect/platform-browser/BrowserKeyValueStore"
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
-import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
@@ -126,22 +123,6 @@ export const followStoredSessionAtom = Atom.make(
 )
 
 // ---------------------------------------------------------------------------
-// Ephemeral identity: deliberately decoupled from the replica client id.
-// MultiTab owns the replica identity and never exposes it outside the owner
-// callback, so presence/typing use an identity minted once per page load.
-// ---------------------------------------------------------------------------
-
-const member = Effect.runSync(
-  Effect.all({
-    clientId: Identity.makeClientId,
-    membershipIncarnation: Identity.makeMembershipIncarnation
-  }).pipe(
-    Effect.map((fields) => Protocol.EphemeralMember.make(fields)),
-    Effect.provide(BrowserCrypto.layer)
-  )
-)
-
-// ---------------------------------------------------------------------------
 // Replica stack (per session)
 // ---------------------------------------------------------------------------
 
@@ -187,8 +168,7 @@ const windowLimit = 1_000
 const findUserName = (userId: UserId): string => findUser(userId)?.name ?? userId
 
 const mintMessageId = Crypto.Crypto.use((crypto) => crypto.randomUUIDv4).pipe(
-  Effect.map((uuid) => MessageId.make(uuid)),
-  Effect.provide(BrowserCrypto.layer)
+  Effect.map((uuid) => MessageId.make(uuid))
 )
 
 const clients = new Map<UserId, ChatClient>()
@@ -204,7 +184,7 @@ export const clientFor = (session: LoginResponse): ChatClient => {
 const makeClient = (session: LoginResponse) => {
   const userId = session.userId
   const graph = makeGraph(session)
-  const target = { spaceId, member }
+  const target = { spaceId }
 
   const failedMessages = makeFailedMessages()
 

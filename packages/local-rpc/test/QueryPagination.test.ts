@@ -205,7 +205,7 @@ const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
   clear: () => Effect.void,
   remove: () => Effect.void
 })
-const layerReplica = Layer.merge(
+const layerReplica = Layer.mergeAll(
   SqlReplica.layer({
     ...clientHistory,
     definition,
@@ -217,7 +217,8 @@ const layerReplica = Layer.merge(
     Layer.provide(layerDatabase),
     Layer.provide(layerHandlers)
   ),
-  layerEphemeralInactive
+  layerEphemeralInactive,
+  NodeCrypto.layer
 )
 
 describe("query pagination", () => {

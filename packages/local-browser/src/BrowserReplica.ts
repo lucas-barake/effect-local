@@ -104,7 +104,11 @@ const loadClientId = Effect.fnUntraced(function*(
 export const layer = <D extends Definition.Any, ED extends Tagged, ES extends Tagged,>(
   options: Options<D, ED, ES>
 ): Layer.Layer<
-  Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient | Sharding.Sharding,
+  | Replica.Replica
+  | QueryReactivity.QueryReactivity
+  | EphemeralClient.EphemeralClient
+  | Sharding.Sharding
+  | Crypto.Crypto,
   BrowserStorageError,
   Reactivity.Reactivity | MutationRuntime.Handlers<D> | QueryExecutor.Handlers<D>
 > =>
@@ -213,6 +217,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
   return Context.make(Replica.Replica, proxy.replica).pipe(
     Context.add(QueryReactivity.QueryReactivity, proxy.queryReactivity),
     Context.add(EphemeralClient.EphemeralClient, proxy.ephemeral),
-    Context.add(Sharding.Sharding, sharding)
+    Context.add(Sharding.Sharding, sharding),
+    Context.add(Crypto.Crypto, crypto)
   )
 })
