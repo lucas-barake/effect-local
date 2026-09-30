@@ -111,27 +111,25 @@
     },
     {
       "files": ["examples/chat/mobile/metro.config.cjs"],
-      "rules": { "effect/noDynamicImports": "off", "effect/noGlobals": "off", "effect/noTryCatch": "off" }
+      "rules": { "effect/noDynamicImports": "off", "effect/noTryCatch": "off" }
     },
     {
       "files": ["examples/chat/client/**/*.tsx", "examples/chat/mobile/**/*.tsx"],
       "rules": { "effect/noTernary": "off" }
     },
     {
-      "files": [
-        "examples/chat/client/**/*.ts",
-        "examples/chat/mobile/**/*.ts",
-        "examples/chat/mobile/**/*.tsx",
-        "examples/chat/test/**"
-      ],
+      "files": ["examples/chat/client/**/*.ts", "examples/chat/test/**"],
       "rules": { "effect/noGlobals": "off", "effect-local/noManualEffectBoundary": "off" }
+    },
+    {
+      "files": ["examples/chat/mobile/**/*.ts", "examples/chat/mobile/**/*.tsx"],
+      "rules": { "effect/noGlobals": "off" }
     },
     {
       "files": [
         "examples/chat/scripts/**",
         "examples/chat/client/vite.config.ts",
-        "examples/chat/e2e/**",
-        "examples/chat/e2e-mobile/**"
+        "examples/chat/e2e/**"
       ],
       "rules": {
         "effect/noAsyncFunction": "off",
@@ -139,6 +137,10 @@
         "effect/noNodeBuiltinImport": "off",
         "eslint/no-console": "off"
       }
+    },
+    {
+      "files": ["examples/chat/e2e-mobile/**"],
+      "rules": { "effect/noAsyncFunction": "off", "effect/noGlobals": "off", "effect/noNodeBuiltinImport": "off" }
     }
   ]
 }
