@@ -4,8 +4,9 @@ import { type ConversationId, groupConversationId, UserId } from "@effect-local/
 import { RegistryProvider, useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { StatusBar } from "expo-status-bar"
-import { useState } from "react"
-import { Pressable, SafeAreaView, StyleSheet, Text, View } from "react-native"
+import { useEffect, useState } from "react"
+import { Keyboard, KeyboardAvoidingView, Pressable, StyleSheet, Text, View } from "react-native"
+import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context"
 import { Chat } from "./Chat.js"
 import { Conversations } from "./Conversations.js"
 import { Login } from "./Login.js"
@@ -84,12 +85,39 @@ const Root = () => {
   return <Login />
 }
 
+const useKeyboardVisible = () => {
+  const [visible, setVisible] = useState(false)
+  useEffect(() => {
+    const shown = Keyboard.addListener("keyboardDidShow", () => setVisible(true))
+    const hidden = Keyboard.addListener("keyboardDidHide", () => setVisible(false))
+    return () => {
+      shown.remove()
+      hidden.remove()
+    }
+  }, [])
+  return visible
+}
+
+const Screen = () => {
+  const keyboardVisible = useKeyboardVisible()
+  return (
+    <KeyboardAvoidingView style={styles.fill} behavior="padding">
+      <SafeAreaView
+        style={styles.root}
+        edges={keyboardVisible ? ["top", "left", "right"] : ["top", "left", "right", "bottom"]}
+      >
+        <StatusBar style="light" />
+        <Root />
+      </SafeAreaView>
+    </KeyboardAvoidingView>
+  )
+}
+
 export const App = () => (
   <RegistryProvider>
-    <SafeAreaView style={styles.root}>
-      <StatusBar style="light" />
-      <Root />
-    </SafeAreaView>
+    <SafeAreaProvider>
+      <Screen />
+    </SafeAreaProvider>
   </RegistryProvider>
 )
 

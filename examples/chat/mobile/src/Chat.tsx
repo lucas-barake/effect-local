@@ -12,17 +12,7 @@ import * as Duration from "effect/Duration"
 import * as Option from "effect/Option"
 import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { useEffect, useRef, useState } from "react"
-import {
-  AppState,
-  FlatList,
-  KeyboardAvoidingView,
-  Platform,
-  Pressable,
-  StyleSheet,
-  Text,
-  TextInput,
-  View
-} from "react-native"
+import { AppState, FlatList, Pressable, StyleSheet, Text, TextInput, View } from "react-native"
 import type { ChatClient } from "./runtime.js"
 import { Avatar, colors } from "./theme.js"
 
@@ -200,7 +190,7 @@ export const Chat = ({ client, me, conversationId, onBack }: {
   }, [conversationId, lastIncoming, myReadUpTo, markRead, me])
 
   return (
-    <KeyboardAvoidingView style={styles.screen} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+    <View style={styles.screen}>
       <View style={styles.header}>
         <Pressable testID="back" accessibilityRole="button" accessibilityLabel="Back to conversations" onPress={onBack}>
           <Text style={styles.back}>‹</Text>
@@ -255,7 +245,7 @@ export const Chat = ({ client, me, conversationId, onBack }: {
         }}
       />
       <Composer client={client} me={me} conversationId={conversationId} />
-    </KeyboardAvoidingView>
+    </View>
   )
 }
 

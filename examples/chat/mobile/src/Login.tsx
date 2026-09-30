@@ -2,7 +2,7 @@ import { type UserId, users } from "@effect-local/example-chat-shared/domain"
 import { useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { useState } from "react"
-import { Pressable, StyleSheet, Text, TextInput, View } from "react-native"
+import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native"
 import { loginAtom } from "./runtime.js"
 import { Avatar, colors } from "./theme.js"
 
@@ -20,7 +20,7 @@ export const Login = () => {
   const submit = () => login({ username: userId, password })
 
   return (
-    <View style={styles.screen}>
+    <ScrollView style={styles.screen} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
       <View style={styles.card}>
         <Text style={styles.title}>Effect Chat</Text>
         <Text style={styles.subtitle}>Local-first chat demo. Pick a user and sign in.</Text>
@@ -54,12 +54,13 @@ export const Login = () => {
         </Pressable>
         {error !== undefined && <Text accessibilityRole="alert" style={styles.error}>{error}</Text>}
       </View>
-    </View>
+    </ScrollView>
   )
 }
 
 const styles = StyleSheet.create({
-  screen: { flex: 1, justifyContent: "center", padding: 24, backgroundColor: colors.background },
+  screen: { flex: 1, backgroundColor: colors.background },
+  content: { flexGrow: 1, justifyContent: "center", padding: 24 },
   card: { backgroundColor: colors.surface, borderRadius: 16, padding: 24, gap: 12 },
   title: { fontSize: 26, fontWeight: "700", color: colors.accent },
   subtitle: { color: colors.muted },
