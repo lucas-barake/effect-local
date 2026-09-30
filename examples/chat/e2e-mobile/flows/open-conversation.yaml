@@ -1,0 +1,11 @@
+appId: dev.effectlocal.chat
+---
+- extendedWaitUntil:
+    visible:
+      id: "conversation-${CONVERSATION}"
+    timeout: 30000
+- tapOn:
+    id: "conversation-${CONVERSATION}"
+- extendedWaitUntil:
+    visible: "${TEXT}"
+    timeout: 30000

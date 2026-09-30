@@ -1,0 +1,10 @@
+appId: dev.effectlocal.chat
+---
+- tapOn:
+    id: "message-input"
+- inputText: "${TEXT}"
+- tapOn:
+    id: "send-button"
+- extendedWaitUntil:
+    visible: "${TEXT}"
+    timeout: 30000

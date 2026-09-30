@@ -130,7 +130,8 @@
       "files": [
         "examples/chat/scripts/**",
         "examples/chat/client/vite.config.ts",
-        "examples/chat/e2e/**"
+        "examples/chat/e2e/**",
+        "examples/chat/e2e-mobile/**"
       ],
       "rules": {
         "effect/noAsyncFunction": "off",

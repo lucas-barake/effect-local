@@ -51,6 +51,65 @@ jobs:
           name: e2e-results
           path: examples/chat/test-results
 
+  e2e-android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - run: pnpm install --frozen-lockfile
+      - name: Build the Expo release APK
+        working-directory: examples/chat/mobile
+        env:
+          EXPO_PUBLIC_CHAT_SERVER_URL: http://10.0.2.2:4199
+          NODE_ENV: production
+        run: |
+          pnpm exec expo prebuild --platform android --no-install
+          cd android
+          ./gradlew assembleRelease -PreactNativeArchitectures=x86_64
+      - name: Install Maestro
+        env:
+          MAESTRO_VERSION: 2.11.0
+        run: |
+          curl -Ls "https://get.maestro.mobile.dev" | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+      - run: pnpm exec playwright install --with-deps chromium
+        working-directory: examples/chat
+      - name: Run the web and Android e2e
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-audio -no-boot-anim -camera-back none
+          script: |
+            adb install examples/chat/mobile/android/app/build/outputs/apk/release/app-release.apk
+            pnpm -C examples/chat run e2e:mobile
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-android-results
+          path: |
+            examples/chat/test-results
+            ~/.maestro/tests
+
   supported-node:
     strategy:
       matrix:
