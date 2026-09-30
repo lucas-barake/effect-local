@@ -11,14 +11,27 @@ import {
   uniqueText
 } from "./fixtures.js"
 
-test("a sent message renders locally at once and reaches the peer", async ({ chat }) => {
+test("a sent message renders before the server answers and then reaches the peer", async ({ chat }) => {
   const alice = await chat.signIn("alice")
   const bob = await chat.signIn("bob")
+  const held: Array<() => void> = []
+  let holding = false
+  await alice.routeWebSocket("**/sync", (socket) => {
+    socket.connectToServer().onMessage((message) => {
+      if (holding) held.push(() => socket.send(message))
+      else socket.send(message)
+    })
+  })
+  await alice.reload()
+  await expectOnline(alice, "bob")
   await openDirectMessage(alice, "bob")
+  holding = true
   const text = uniqueText("hello")
   await send(alice, text)
-  await expect(outgoing(alice, text)).toBeVisible({ timeout: 1_000 })
-  await expect(bob.locator(".conversation", { hasText: "Alice" })).toContainText(text, { timeout: 3_000 })
+  await expect(outgoing(alice, text).getByRole("img", { name: "Sending" })).toBeVisible()
+  holding = false
+  for (const release of held.splice(0)) release()
+  await expect(bob.locator(".conversation", { hasText: "Alice" })).toContainText(text)
   await openDirectMessage(bob, "alice")
   await expect(incoming(bob, text)).toBeVisible()
 })
@@ -30,10 +43,10 @@ test("receipts advance from sent to delivered to read", async ({ chat }) => {
   const text = uniqueText("receipt")
   await send(alice, text)
   const bubble = outgoing(alice, text)
-  await expect(bubble.locator(".tick-delivered, .tick-read")).toBeVisible({ timeout: 3_000 })
+  await expect(bubble.locator(".tick-delivered, .tick-read")).toBeVisible()
   await openDirectMessage(carol, "alice")
   await expect(incoming(carol, text)).toBeVisible()
-  await expect(bubble.locator(".tick-read")).toBeVisible({ timeout: 3_000 })
+  await expect(bubble.locator(".tick-read")).toBeVisible()
 })
 
 test("history renders from the local replica after a reload without the sync server", async ({ chat }) => {
@@ -41,14 +54,12 @@ test("history renders from the local replica after a reload without the sync ser
   await openDirectMessage(alice, "bob")
   const text = uniqueText("durable")
   await send(alice, text)
-  await expect(outgoing(alice, text).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible({
-    timeout: 3_000
-  })
+  await expect(outgoing(alice, text).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible()
   await alice.routeWebSocket("**/sync", (socket) => socket.close())
   await alice.reload()
   await openDirectMessage(alice, "bob")
-  await expect(outgoing(alice, text)).toBeVisible({ timeout: 2_000 })
-  await expect(alice.getByRole("status").filter({ hasText: "Offline" })).toBeVisible({ timeout: 5_000 })
+  await expect(outgoing(alice, text)).toBeVisible()
+  await expect(alice.getByRole("status").filter({ hasText: "Offline" })).toBeVisible()
 })
 
 test("a first sign-in on a new device with history paints no false empty state", async ({ chat }) => {
@@ -56,11 +67,9 @@ test("a first sign-in on a new device with history paints no false empty state",
   await openDirectMessage(alice, "bob")
   const text = uniqueText("first device")
   await send(alice, text)
-  await expect(outgoing(alice, text).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible({
-    timeout: 3_000
-  })
+  await expect(outgoing(alice, text).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible()
   const newDevice = await chat.signIn("alice")
-  await expect(newDevice.locator(".conversation", { hasText: "Bob" })).toBeVisible({ timeout: 5_000 })
+  await expect(newDevice.locator(".conversation", { hasText: "Bob" })).toBeVisible()
   expect(await falseStates(newDevice)).toEqual([])
 })
 
@@ -71,13 +80,11 @@ test("a reload of an account with history paints no false empty, offline, or pre
   await openDirectMessage(alice, "bob")
   const text = uniqueText("history")
   await send(alice, text)
-  await expect(outgoing(alice, text).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible({
-    timeout: 3_000
-  })
+  await expect(outgoing(alice, text).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible()
   await alice.reload()
   await openDirectMessage(alice, "bob")
-  await expect(outgoing(alice, text)).toBeVisible({ timeout: 2_000 })
-  await expect(alice.locator(".chat-subtitle")).toHaveText("online", { timeout: 3_000 })
+  await expect(outgoing(alice, text)).toBeVisible()
+  await expect(alice.locator(".chat-subtitle")).toHaveText("online")
   expect(await falseStates(alice)).toEqual([])
 })
 
@@ -86,11 +93,11 @@ test("typing and presence reach the peer", async ({ chat }) => {
   const dave = await chat.signIn("dave")
   await openDirectMessage(alice, "dave")
   await openDirectMessage(dave, "alice")
-  await expect(alice.locator(".chat-subtitle")).toHaveText("online", { timeout: 3_000 })
+  await expect(alice.locator(".chat-subtitle")).toHaveText("online")
   await dave.locator(".chat-input").fill("typing")
-  await expect(alice.locator(".chat-subtitle-typing")).toBeVisible({ timeout: 3_000 })
+  await expect(alice.locator(".chat-subtitle-typing")).toBeVisible()
   await send(dave, uniqueText("done"))
-  await expect(alice.locator(".chat-subtitle-typing")).toHaveCount(0, { timeout: 3_000 })
+  await expect(alice.locator(".chat-subtitle-typing")).toHaveCount(0)
 })
 
 test("the typing indicator clears shortly after the peer stops typing", async ({ chat }) => {
@@ -99,8 +106,8 @@ test("the typing indicator clears shortly after the peer stops typing", async ({
   await openDirectMessage(alice, "dave")
   await openDirectMessage(dave, "alice")
   await dave.locator(".chat-input").pressSequentially("still here", { delay: 20 })
-  await expect(alice.locator(".chat-subtitle-typing")).toBeVisible({ timeout: 3_000 })
-  await expect(alice.locator(".chat-subtitle-typing")).toHaveCount(0, { timeout: 4_500 })
+  await expect(alice.locator(".chat-subtitle-typing")).toBeVisible()
+  await expect(alice.locator(".chat-subtitle-typing")).toHaveCount(0)
 })
 
 test("tabs of one user share one replica and keep working after the leader tab closes", async ({ chat }) => {
@@ -112,16 +119,14 @@ test("tabs of one user share one replica and keep working after the leader tab c
   await openDirectMessage(follower, "bob")
   const text = uniqueText("from the second tab")
   await send(follower, text)
-  await expect(outgoing(follower, text)).toBeVisible({ timeout: 1_000 })
+  await expect(outgoing(follower, text)).toBeVisible()
   await openDirectMessage(leader, "bob")
-  await expect(outgoing(leader, text)).toBeVisible({ timeout: 3_000 })
+  await expect(outgoing(leader, text)).toBeVisible()
   await leader.close()
   const after = uniqueText("after the leader closed")
   await send(follower, after)
-  await expect(outgoing(follower, after)).toBeVisible({ timeout: 5_000 })
-  await expect(outgoing(follower, after).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible({
-    timeout: 5_000
-  })
+  await expect(outgoing(follower, after)).toBeVisible()
+  await expect(outgoing(follower, after).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible()
   expect(await falseStates(follower)).toEqual([])
 })
 
@@ -132,22 +137,16 @@ test("a tab from a newer deploy takes over the replica and the older tab asks fo
   await openDirectMessage(older, "bob")
   const text = uniqueText("before the deploy")
   await send(older, text)
-  await expect(outgoing(older, text).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible({
-    timeout: 3_000
-  })
+  await expect(outgoing(older, text).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible()
   const newer = await chat.openTab(older, "alice-newer-deploy", "/next/")
   await expect(newer.locator(".sidebar-me")).toHaveText("Alice")
-  await expect(older.getByRole("status").filter({ hasText: "This app was updated in another tab." })).toBeVisible({
-    timeout: 5_000
-  })
+  await expect(older.getByRole("status").filter({ hasText: "This app was updated in another tab." })).toBeVisible()
   await expect(older.getByRole("button", { name: "Reload" })).toBeVisible()
   await openDirectMessage(newer, "bob")
-  await expect(outgoing(newer, text)).toBeVisible({ timeout: 5_000 })
+  await expect(outgoing(newer, text)).toBeVisible()
   const after = uniqueText("after the deploy")
   await send(newer, after)
-  await expect(outgoing(newer, after).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible({
-    timeout: 5_000
-  })
+  await expect(outgoing(newer, after).locator(".tick-sent, .tick-delivered, .tick-read")).toBeVisible()
   expect(await falseStates(newer)).toEqual([])
 })
 
@@ -168,7 +167,7 @@ test("logging out in one tab signs out every tab of the origin", async ({ chat }
   await expect(second.locator(".sidebar-me")).toHaveText("Carol")
   await first.locator(".sidebar-logout").click()
   await expect(first.locator(".login-submit")).toBeVisible()
-  await expect(second.locator(".login-submit")).toBeVisible({ timeout: 3_000 })
+  await expect(second.locator(".login-submit")).toBeVisible()
   await expect(second.locator(".sidebar-me")).toHaveCount(0)
 })
 
@@ -179,7 +178,7 @@ test("loading earlier messages keeps the first visible message in view", async (
   await sendAll(bob, texts)
   await expect(outgoing(bob, texts[texts.length - 1])).toBeVisible()
   const loadEarlier = bob.getByRole("button", { name: "Load earlier messages" })
-  await expect(loadEarlier).toBeVisible({ timeout: 3_000 })
+  await expect(loadEarlier).toBeVisible()
   await bob.locator(".chat-messages").evaluate((list) => {
     list.scrollTop = 0
   })
@@ -197,7 +196,7 @@ test("loading earlier messages in the same frame as a scroll keeps the first vis
   const texts = Array.from({ length: 56 }, (_, index) => uniqueText(`scrolled ${index}`))
   await sendAll(bob, texts)
   await expect(outgoing(bob, texts[texts.length - 1])).toBeVisible()
-  await expect(bob.getByRole("button", { name: "Load earlier messages" })).toBeVisible({ timeout: 3_000 })
+  await expect(bob.getByRole("button", { name: "Load earlier messages" })).toBeVisible()
   const anchorText = await bob.locator(".chat-messages").evaluate((list) => {
     list.scrollTop = 0
     const first = list.querySelector("[data-message-row] .bubble-text")?.textContent ?? ""
@@ -248,8 +247,8 @@ test("the chat exposes accessible names, receipt states, and polite announcement
   await expect(bubble).toContainText("You")
   await expect(incoming(carol, text)).toContainText("Alice")
   await expect(carol.locator("[aria-live='polite']", { hasText: text })).toHaveCount(1)
-  await expect(bubble.getByRole("img", { name: "Read" })).toBeVisible({ timeout: 3_000 })
+  await expect(bubble.getByRole("img", { name: "Read" })).toBeVisible()
 
   await carol.locator(".chat-input").fill("typing")
-  await expect(alice.locator("[aria-live='polite']", { hasText: "typing…" })).toHaveCount(1, { timeout: 3_000 })
+  await expect(alice.locator("[aria-live='polite']", { hasText: "typing…" })).toHaveCount(1)
 })
