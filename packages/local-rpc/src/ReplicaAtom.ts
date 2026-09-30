@@ -115,31 +115,15 @@ class EphemeralSessionKey implements Equal.Equal {
   }
 }
 
-class EphemeralEventKey implements Equal.Equal {
+class EphemeralProjectionKey<D extends Ephemeral.AnyEvent | Ephemeral.AnyState,> implements Equal.Equal {
   readonly session: object
-  readonly definition: Ephemeral.AnyEvent
-  constructor(session: object, definition: Ephemeral.AnyEvent) {
+  readonly definition: D
+  constructor(session: object, definition: D) {
     this.session = session
     this.definition = definition
   }
   [Equal.symbol](that: unknown): boolean {
-    return that instanceof EphemeralEventKey && this.session === that.session &&
-      this.definition === that.definition
-  }
-  [Hash.symbol](): number {
-    return Hash.hash(this.session) ^ Hash.hash(this.definition)
-  }
-}
-
-class EphemeralStateKey implements Equal.Equal {
-  readonly session: object
-  readonly definition: Ephemeral.AnyState
-  constructor(session: object, definition: Ephemeral.AnyState) {
-    this.session = session
-    this.definition = definition
-  }
-  [Equal.symbol](that: unknown): boolean {
-    return that instanceof EphemeralStateKey && this.session === that.session &&
+    return that instanceof EphemeralProjectionKey && this.session === that.session &&
       this.definition === that.definition
   }
   [Hash.symbol](): number {
@@ -256,7 +240,7 @@ export const make = <E extends { readonly _tag: string },>(
     // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The session family erases the member schema type; the atom for this key was built from this exact profile, so the runtime values already match M.
     ephemeralSessions(new EphemeralSessionKey(profile, request)) as unknown as SessionAtom<M>
 
-  const ephemeralEventsFamily = Atom.family((key: EphemeralEventKey) => {
+  const ephemeralEventsFamily = Atom.family((key: EphemeralProjectionKey<Ephemeral.AnyEvent>) => {
     // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- Projection keys erase the session atom type; only session atoms from this graph construct these keys.
     const source = key.session as SessionSource
     return runtime.atom((get) =>
@@ -270,11 +254,11 @@ export const make = <E extends { readonly _tag: string },>(
     definition: D
   ): Atom.Atom<AsyncResult.AsyncResult<EphemeralClient.EventEnvelope<D>, ProjectionError>> =>
     // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The projection family erases the definition type; the atom for this key decodes with this exact definition, so the runtime values already match D.
-    ephemeralEventsFamily(new EphemeralEventKey(session, definition)) as unknown as Atom.Atom<
+    ephemeralEventsFamily(new EphemeralProjectionKey(session, definition)) as unknown as Atom.Atom<
       AsyncResult.AsyncResult<EphemeralClient.EventEnvelope<D>, ProjectionError>
     >
 
-  const ephemeralStateFamily = Atom.family((key: EphemeralStateKey) => {
+  const ephemeralStateFamily = Atom.family((key: EphemeralProjectionKey<Ephemeral.AnyState>) => {
     // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- Projection keys erase the session atom type; only session atoms from this graph construct these keys.
     const source = key.session as SessionSource
     return runtime.atom((get) =>
@@ -290,7 +274,7 @@ export const make = <E extends { readonly _tag: string },>(
     AsyncResult.AsyncResult<ReadonlyArray<EphemeralClient.StateEntry<D>>, ProjectionError>
   > =>
     // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The projection family erases the definition type; the atom for this key decodes with this exact definition, so the runtime values already match D.
-    ephemeralStateFamily(new EphemeralStateKey(session, definition)) as unknown as Atom.Atom<
+    ephemeralStateFamily(new EphemeralProjectionKey(session, definition)) as unknown as Atom.Atom<
       AsyncResult.AsyncResult<ReadonlyArray<EphemeralClient.StateEntry<D>>, ProjectionError>
     >
 
