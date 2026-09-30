@@ -1,4 +1,3 @@
-import { makeFailedMessages, makeSettlementDaemonBody } from "@effect-local/example-chat-client/settlementDaemon"
 import { makeServerLayer } from "@effect-local/example-chat-server/server"
 import { LoginRequest, LoginResponse } from "@effect-local/example-chat-shared/auth"
 import {
@@ -24,6 +23,7 @@ import {
   users
 } from "@effect-local/example-chat-shared/domain"
 import { layerDomain } from "@effect-local/example-chat-shared/handlers"
+import { makeFailedMessages, makeSettlementDaemonBody } from "@effect-local/example-chat-shared/settlementDaemon"
 import { NodeCrypto, NodeSocket } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"

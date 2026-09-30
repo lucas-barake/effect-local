@@ -1,4 +1,4 @@
-import { type Connection, connectionChanges } from "@effect-local/example-chat-client/connection"
+import { type Connection, connectionChanges } from "@effect-local/example-chat-shared/connection"
 import { spaceId } from "@effect-local/example-chat-shared/domain"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"

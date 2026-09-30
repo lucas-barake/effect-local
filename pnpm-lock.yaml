@@ -70,9 +70,6 @@ importers:
 
   examples/chat:
     dependencies:
-      '@effect-local/example-chat-client':
-        specifier: workspace:^
-        version: link:client
       '@effect-local/example-chat-server':
         specifier: workspace:^
         version: link:server
@@ -128,9 +125,6 @@ importers:
       '@effect/wa-sqlite':
         specifier: 0.1.2
         version: 0.1.2
-      '@lucas-barake/effect-local':
-        specifier: workspace:^
-        version: link:../../../packages/local
       '@lucas-barake/effect-local-browser':
         specifier: workspace:^
         version: link:../../../packages/local-browser
@@ -189,6 +183,9 @@ importers:
       '@lucas-barake/effect-local':
         specifier: workspace:^
         version: link:../../../packages/local
+      '@lucas-barake/effect-local-rpc':
+        specifier: workspace:^
+        version: link:../../../packages/local-rpc
       effect:
         specifier: 4.0.0-rc.118
         version: 4.0.0-rc.118

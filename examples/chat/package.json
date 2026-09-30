@@ -14,7 +14,6 @@
     "e2e": "playwright test -c e2e/playwright.config.ts"
   },
   "dependencies": {
-    "@effect-local/example-chat-client": "workspace:^",
     "@effect-local/example-chat-server": "workspace:^",
     "@effect-local/example-chat-shared": "workspace:^",
     "@effect/platform-node": "4.0.0-rc.118",

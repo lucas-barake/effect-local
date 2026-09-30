@@ -1,4 +1,5 @@
 import type { LoginResponse } from "@effect-local/example-chat-shared/auth"
+import type { Connection } from "@effect-local/example-chat-shared/connection"
 import {
   type ChatUser,
   type Conversation,
@@ -17,8 +18,8 @@ import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { useState } from "react"
 import { Avatar } from "./avatar.js"
 import { ChatView } from "./chat.js"
-import type { Connection } from "./connection.js"
-import { type ChatClient, clientFor, logoutAtom, reloadAtom } from "./replica.js"
+import type { ChatClient } from "./replica.js"
+import { clientFor, logoutAtom, reloadAtom } from "./replica.js"
 import { formatTime } from "./time.js"
 
 const conversationPeer = (conversation: Conversation, me: UserId): ChatUser | undefined => {

@@ -3,12 +3,13 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "description": "Shared domain, auth contracts, and deterministic handlers for the chat example",
+  "description": "Shared domain, auth contracts, deterministic handlers, and the platform neutral client atom graph for the chat example",
   "exports": {
     "./*": "./src/*.ts"
   },
   "dependencies": {
     "@lucas-barake/effect-local": "workspace:^",
+    "@lucas-barake/effect-local-rpc": "workspace:^",
     "effect": "4.0.0-rc.118"
   }
 }

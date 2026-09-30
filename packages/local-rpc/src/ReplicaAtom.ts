@@ -654,3 +654,5 @@ export const make = <E extends { readonly _tag: string },>(
     removeEphemeral
   } as const
 }
+
+export type Graph<E extends { readonly _tag: string },> = ReturnType<typeof make<E>>

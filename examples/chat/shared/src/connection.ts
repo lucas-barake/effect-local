@@ -1,4 +1,3 @@
-import type * as BrowserStorageError from "@lucas-barake/effect-local-browser/BrowserStorageError"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Match from "effect/Match"
@@ -17,7 +16,7 @@ export type Connection =
 
 export const connecting: Connection = "connecting"
 
-type StatusError = ReplicaError.ReplicaError | BrowserStorageError.BrowserStorageError
+type StatusError = ReplicaError.ReplicaError | { readonly _tag: string }
 
 const connectionOf = (status: AsyncResult.AsyncResult<ReplicaStatus.SpaceStatus, StatusError>): Connection => {
   if (AsyncResult.isInitial(status)) return connecting

@@ -8,5 +8,9 @@
     // same reason packages/local sets the DOM lib.
     "lib": ["ES2023", "DOM"]
   },
-  "references": [{ "path": "../../../packages/local" }]
+  "references": [
+    { "path": "../../../packages/local" },
+    { "path": "../../../packages/local-sql" },
+    { "path": "../../../packages/local-rpc" }
+  ]
 }
