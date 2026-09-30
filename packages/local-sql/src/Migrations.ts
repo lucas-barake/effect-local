@@ -1116,6 +1116,12 @@ export const client = Effect.fnUntraced(function*(options: {
         Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause }))
     })
   )
+  if (options.clientId !== undefined && stored.client_id !== options.clientId) {
+    return yield* new ReplicaError.ReplicaIdentityMismatch({
+      expectedClientId: options.clientId,
+      actualClientId: stored.client_id
+    })
+  }
   if (options.spaceId !== undefined) {
     yield* lane.withStatement(sql`INSERT INTO effect_local_client_spaces
         (space_id, membership_incarnation, definition_hash, schema_version, schema_hash, schema_generation,
@@ -1127,12 +1133,6 @@ export const client = Effect.fnUntraced(function*(options: {
           ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash}, 0, 0, 0, 0,
           1, 0, 0, 0, 0, 0, 0)
         ON CONFLICT (space_id) DO NOTHING`)
-  }
-  if (options.clientId !== undefined && stored.client_id !== options.clientId) {
-    return yield* new ReplicaError.ReplicaIdentityMismatch({
-      expectedClientId: options.clientId,
-      actualClientId: stored.client_id
-    })
   }
   return stored.client_id
 }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))

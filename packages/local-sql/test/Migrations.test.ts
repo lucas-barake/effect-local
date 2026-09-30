@@ -688,3 +688,25 @@ describe("client identity adoption race", () => {
     }, provideDatabase)
   )
 })
+
+describe("client identity race with a space", () => {
+  it.effect(
+    "does not register the space in a database whose identity another opener stored first",
+    Effect.fnUntraced(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const winner = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+      yield* Migrations.runCatalog("Client", Migrations.clientCatalog)
+      yield* sql.unsafe(`CREATE TRIGGER concurrent_opener BEFORE INSERT ON effect_local_client_meta
+        WHEN NEW.client_id <> '${winner}'
+        BEGIN INSERT INTO effect_local_client_meta (singleton, client_id) VALUES (1, '${winner}'); END`)
+      const exit = yield* Effect.exit(Migrations.client({ definition: Domain.definition, spaceId, clientId }))
+      assert.isTrue(Exit.isFailure(exit))
+      const spaces = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
+      })(undefined)
+      assert.strictEqual(spaces.count, 0)
+    }, provideDatabase)
+  )
+})
