@@ -205,7 +205,10 @@ their own entity. `Query.make` has no static dependency list because the runtime
 ## SQLite replica
 
 `SqlReplica.layer` assembles one public `Replica` that owns one SQLite database, one synchronization transport, and
-any number of joined spaces. Supply the domain handlers, a `SqlClient`, `Crypto`, and a `SyncEngine`:
+any number of joined spaces. Supply the domain handlers, a `SqlClient`, `Crypto`, and a `SyncEngine`. The replica
+mints its client identity the first time it opens a database and keeps it there, so the identity lives exactly as long
+as the local data. Pass `clientId` only when the identity is managed elsewhere; opening a database with a different
+identity fails with `ReplicaIdentityMismatch`.
 
 ```ts
 import { NodeCrypto } from "@effect/platform-node"
@@ -219,7 +222,6 @@ import * as Layer from "effect/Layer"
 import { definition, layerDomain, ListTasks, PutTask, Task } from "./domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
-const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const scope = Protocol.ReplicationScope.make({ models: [Task.name] })
 
 const layerDatabase = Layer.mergeAll(
@@ -229,7 +231,6 @@ const layerDatabase = Layer.mergeAll(
 
 export const layerReplica = SqlReplica.layer({
   definition,
-  clientId,
   defaultScope: scope,
   initialSpaces: [spaceId]
 }).pipe(
@@ -521,12 +522,14 @@ benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1
 ## Effect Atom
 
 ```ts
+import * as BrowserCrypto from "@effect/platform-browser/BrowserCrypto"
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
 import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 
@@ -572,10 +575,12 @@ export const spacesAtom = graph.spaces
 export const joinAtom = graph.join
 export const leaveAtom = graph.leave
 
-const member = Protocol.EphemeralMember.make({
-  clientId,
-  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
-})
+const member = Effect.runSync(
+  Effect.all({ clientId: Identity.makeClientId, membershipIncarnation: Identity.makeMembershipIncarnation }).pipe(
+    Effect.map((fields) => Protocol.EphemeralMember.make(fields)),
+    Effect.provide(BrowserCrypto.layer)
+  )
+)
 
 export const sessionAtom = graph.ephemeral(Presence, {
   spaceId,

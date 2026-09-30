@@ -3,6 +3,7 @@ import { PgClient } from "@effect/sql-pg"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -149,6 +150,35 @@ describe("storage migration catalogs", () => {
       provideNodeFileSystemAndReactivity,
       Effect.scoped
     )
+  )
+
+  it.effect(
+    "mints a client identity for a fresh database and keeps it across reopenings",
+    Effect.fnUntraced(function*() {
+      const minted = yield* Migrations.client({ definition: Domain.definition })
+      assert.isTrue(Schema.is(Identity.ClientId)(minted))
+      assert.notStrictEqual(minted, clientId)
+      assert.strictEqual(yield* Migrations.client({ definition: Domain.definition }), minted)
+      assert.strictEqual(yield* Migrations.client({ definition: Domain.definition, clientId: minted }), minted)
+    }, provideDatabase)
+  )
+
+  it.effect(
+    "adopts the identity an explicit client stored and still rejects a different explicit identity",
+    Effect.fnUntraced(function*() {
+      assert.strictEqual(yield* Migrations.client({ definition: Domain.definition, clientId }), clientId)
+      assert.strictEqual(yield* Migrations.client({ definition: Domain.definition }), clientId)
+      const other = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+      const exit = yield* Effect.exit(Migrations.client({ definition: Domain.definition, clientId: other }))
+      const failure = expectedFailure(exit)
+      assert.isTrue(Option.isSome(failure))
+      if (Option.isSome(failure)) {
+        assert.deepStrictEqual(
+          failure.value,
+          new ReplicaError.ReplicaIdentityMismatch({ expectedClientId: other, actualClientId: clientId })
+        )
+      }
+    }, provideDatabase)
   )
 
   it.effect(
