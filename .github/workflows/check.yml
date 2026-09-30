@@ -110,6 +110,63 @@ jobs:
             examples/chat/test-results
             ~/.maestro/tests
 
+  e2e-ios:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.18.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - run: pnpm install --frozen-lockfile
+      - name: Build the Expo release app for the iOS simulator
+        working-directory: examples/chat/mobile
+        env:
+          EXPO_PUBLIC_CHAT_SERVER_URL: http://localhost:4199
+          NODE_ENV: production
+        run: |
+          pnpm exec expo prebuild --platform ios
+          xcodebuild -workspace ios/EffectChat.xcworkspace -scheme EffectChat -configuration Release \
+            -sdk iphonesimulator -destination "generic/platform=iOS Simulator" -derivedDataPath ios/build \
+            CODE_SIGNING_ALLOWED=NO build
+      - name: Boot a simulator and install the app
+        run: |
+          udid=$(xcrun simctl list devices available --json | node -e '
+            const devices = JSON.parse(require("fs").readFileSync(0, "utf8")).devices
+            const runtime = Object.keys(devices).filter((name) => name.includes("iOS")).sort().at(-1)
+            console.log(devices[runtime].find((device) => device.name.startsWith("iPhone")).udid)
+          ')
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          xcrun simctl install "$udid" examples/chat/mobile/ios/build/Build/Products/Release-iphonesimulator/EffectChat.app
+      - name: Install Maestro
+        env:
+          MAESTRO_VERSION: 2.11.0
+        run: |
+          curl -Ls "https://get.maestro.mobile.dev" | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+      - run: pnpm exec playwright install chromium
+        working-directory: examples/chat
+      - name: Run the web and iOS e2e
+        env:
+          MOBILE_PLATFORM: ios
+        run: pnpm -C examples/chat run e2e:mobile
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-ios-results
+          path: |
+            examples/chat/test-results
+            ~/.maestro/tests
+
   supported-node:
     strategy:
       matrix:

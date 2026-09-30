@@ -1,6 +1,17 @@
 appId: dev.effectlocal.chat
 ---
-- launchApp
+- runFlow:
+    when:
+      platform: iOS
+    commands:
+      - clearKeychain
+      - launchApp:
+          clearState: true
+- runFlow:
+    when:
+      platform: Android
+    commands:
+      - launchApp
 - extendedWaitUntil:
     visible:
       id: "login-user-${USER}"

@@ -14,11 +14,14 @@ const maestro = (flow: string, env: Readonly<Record<string, string>>) =>
     { maxBuffer: 16 * 1024 * 1024 }
   )
 
-const clearAppData = () => run("adb", ["shell", "pm", "clear", "dev.effectlocal.chat"])
+const clearAndroidAppData = async () => {
+  if (process.env.MOBILE_PLATFORM === "ios") return
+  await run("adb", ["shell", "pm", "clear", "dev.effectlocal.chat"])
+}
 
 test("a web user and an Expo user chat both ways through one server", async ({ chat }) => {
   const alice = await chat.signIn("alice")
-  await clearAppData()
+  await clearAndroidAppData()
   await maestro("login.yaml", { USER: "bob" })
 
   await openDirectMessage(alice, "bob")
