@@ -1,6 +1,7 @@
 import * as Config from "effect/Config"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import { identity } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -169,12 +170,29 @@ export const make: (
       }).pipe(Effect.uninterruptible)
 
     const prepared = new Map<string, SQLite.SQLiteStatement>()
+    const running = new Set<SQLite.SQLiteStatement>()
+
+    const discard = (statement: SQLite.SQLiteStatement) =>
+      Effect.tryPromise({
+        try: () => statement.finalizeAsync(),
+        catch: (cause) =>
+          new SqlError({
+            reason: classifySqliteError(sqliteCause(cause), {
+              message: "Failed to finalize statement",
+              operation: "finalize"
+            })
+          })
+      }).pipe(
+        Effect.uninterruptible,
+        Effect.catchTag("SqlError", () => Effect.void)
+      )
 
     const evict = (sql: string) =>
       Effect.suspend(() => {
         const statement = prepared.get(sql)
         if (statement === undefined) return Effect.void
         prepared.delete(sql)
+        if (running.has(statement)) return Effect.void
         return finalize(statement)
       })
 
@@ -190,16 +208,19 @@ export const make: (
       return undefined
     }
 
-    const cached = (sql: string) =>
+    const checkout = (sql: string) =>
       Effect.suspend(() => {
         const statement = prepared.get(sql)
-        if (statement !== undefined) {
+        if (statement !== undefined && !running.has(statement)) {
           prepared.delete(sql)
           prepared.set(sql, statement)
+          running.add(statement)
           return Effect.succeed(statement)
         }
         return prepareStatement(sql).pipe(
           Effect.tap((fresh) => {
+            running.add(fresh)
+            if (prepared.has(sql)) return Effect.void
             prepared.set(sql, fresh)
             const evicted = oldest()
             if (prepared.size <= preparedCapacity || evicted === undefined) return Effect.void
@@ -207,6 +228,18 @@ export const make: (
           }),
           Effect.uninterruptible
         )
+      })
+
+    const checkin = (sql: string, statement: SQLite.SQLiteStatement, failed: boolean) =>
+      Effect.suspend(() => {
+        running.delete(statement)
+        const cachedStatement = prepared.get(sql) === statement
+        if (failed) {
+          if (cachedStatement) prepared.delete(sql)
+          return discard(statement)
+        }
+        if (cachedStatement) return Effect.void
+        return finalize(statement)
       })
 
     const runStatement = (statement: SQLite.SQLiteStatement, bound: Array<SQLite.SQLiteBindValue>, values: boolean) => {
@@ -219,20 +252,21 @@ export const make: (
     const query = (sql: string, params: ReadonlyArray<unknown>, values: boolean) =>
       Effect.flatMap(bindParams(params), (bound) =>
         rejectSafeIntegers.pipe(
-          Effect.andThen(cached(sql)),
-          Effect.flatMap((statement) =>
-            Effect.tryPromise({
-              try: () => runStatement(statement, bound, values),
-              catch: (cause) =>
-                new SqlError({
-                  reason: classifySqliteError(sqliteCause(cause), {
-                    message: "Failed to execute statement",
-                    operation: "execute"
-                  })
-                })
-            }).pipe(
-              Effect.uninterruptible,
-              Effect.onError(() => evict(sql))
+          Effect.andThen(
+            checkout(sql).pipe(
+              Effect.flatMap((statement) =>
+                Effect.tryPromise({
+                  try: () => runStatement(statement, bound, values),
+                  catch: (cause) =>
+                    new SqlError({
+                      reason: classifySqliteError(sqliteCause(cause), {
+                        message: "Failed to execute statement",
+                        operation: "execute"
+                      })
+                    })
+                }).pipe(Effect.onExit((exit) => checkin(sql, statement, Exit.isFailure(exit))))
+              ),
+              Effect.uninterruptible
             )
           )
         ))

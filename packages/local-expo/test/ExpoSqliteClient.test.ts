@@ -361,6 +361,50 @@ describe("ExpoSqliteClient", () => {
   )
 
   it.effect(
+    "reports a constraint violation as a recoverable SqlError after finalizing its statement",
+    Effect.fnUntraced(
+      function*() {
+        const sql = yield* client()
+        yield* sql`CREATE TABLE t (id INTEGER PRIMARY KEY)`
+        yield* sql`INSERT INTO t (id) VALUES (${1})`
+        const duplicate = yield* sql`INSERT INTO t (id) VALUES (${1})`.pipe(Effect.exit)
+        assert.strictEqual(failureReason(duplicate), "ConstraintError")
+        if (Exit.isFailure(duplicate)) assert.isFalse(duplicate.cause.reasons.some((reason) => reason._tag === "Die"))
+        const recovered = yield* sql`INSERT INTO t (id) VALUES (${1})`.pipe(
+          Effect.as("inserted"),
+          Effect.catchTag("SqlError", () => Effect.succeed("recovered"))
+        )
+        assert.strictEqual(recovered, "recovered")
+        yield* sql`INSERT INTO t (id) VALUES (${2})`
+        assert.deepStrictEqual(yield* sql`SELECT id FROM t ORDER BY id`.values, [[1], [2]])
+      },
+      Effect.scoped,
+      provideReactivity
+    )
+  )
+
+  it.effect(
+    "returns each concurrent execution of the same SQL inside a transaction its own rows",
+    Effect.fnUntraced(
+      function*() {
+        const sql = yield* client()
+        yield* sql`CREATE TABLE t (id INTEGER PRIMARY KEY)`
+        yield* sql`INSERT INTO t (id) VALUES (${1}), (${2}), (${3})`
+        assert.deepStrictEqual(yield* sql`SELECT id FROM t WHERE id >= ${2} ORDER BY id`.values, [[2], [3]])
+        const results = yield* sql.withTransaction(
+          Effect.all([
+            sql`SELECT id FROM t WHERE id >= ${1} ORDER BY id`.values,
+            sql`SELECT id FROM t WHERE id >= ${3} ORDER BY id`.values
+          ], { concurrency: "unbounded" })
+        )
+        assert.deepStrictEqual(results, [[[1], [2], [3]], [[3]]])
+      },
+      Effect.scoped,
+      provideReactivity
+    )
+  )
+
+  it.effect(
     "reads configuration through layerConfig",
     Effect.fnUntraced(function*() {
       yield* resetProbe

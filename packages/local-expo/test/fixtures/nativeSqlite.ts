@@ -160,6 +160,7 @@ class NativeStatement {
   prepared: StatementSync | undefined
   owner: NativeDatabase | undefined
   iterator: Iterator<unknown> | undefined
+  failure: unknown
   runAsync(
     _database: NativeDatabase,
     bindParams: Record<string, unknown>,
@@ -177,8 +178,9 @@ class NativeStatement {
       if (shouldPassAsArray) {
         args = Array.from({ length: Object.keys(merged).length }, (_, index) => merged[String(index)])
       }
+      this.failure = undefined
       this.iterator = statement.iterate(...args)
-      const first = this.iterator.next()
+      const first = this.step()
       const counters = this.owner!.open().prepare("SELECT changes() AS changes, last_insert_rowid() AS id").get()
       const changes = counters?.changes
       const id = counters?.id
@@ -189,7 +191,7 @@ class NativeStatement {
   }
   stepAsync(_database: NativeDatabase) {
     return native("stepAsync", () => {
-      const next = this.cursor().next()
+      const next = this.step()
       if (next.done === true) return null
       return toNativeRow(next.value)
     })
@@ -197,8 +199,7 @@ class NativeStatement {
   getAllAsync(_database: NativeDatabase) {
     return native("getAllAsync", () => {
       const rows: Array<Row> = []
-      const cursor = this.cursor()
-      for (let next = cursor.next(); next.done !== true; next = cursor.next()) rows.push(toNativeRow(next.value))
+      for (let next = this.step(); next.done !== true; next = this.step()) rows.push(toNativeRow(next.value))
       return rows
     })
   }
@@ -209,10 +210,17 @@ class NativeStatement {
     return native("resetAsync", () => {
       this.iterator?.return?.()
       this.iterator = undefined
+      const failure = this.failure
+      this.failure = undefined
+      if (failure !== undefined) throw failure
     })
   }
   finalizeAsync(_database: NativeDatabase) {
-    return native("finalizeAsync", () => this.finalizeNow())
+    return native("finalizeAsync", () => {
+      const failure = this.failure
+      this.finalizeNow()
+      if (failure !== undefined) throw failure
+    })
   }
   finalizeNow() {
     this.iterator?.return?.()
@@ -223,6 +231,14 @@ class NativeStatement {
   statement(): StatementSync {
     if (this.prepared === undefined) throw new Error("Access to closed resource")
     return this.prepared
+  }
+  step(): IteratorResult<unknown> {
+    try {
+      return this.cursor().next()
+    } catch (cause) {
+      this.failure = cause
+      throw cause
+    }
   }
   cursor(): Iterator<unknown> {
     if (this.iterator === undefined) throw new Error("The statement has not been run")
