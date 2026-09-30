@@ -60,5 +60,9 @@ Native's WebSocket constructor from the layer, and `ReplicaAtom.make` mints the 
   precision, so `SqlClient.SafeIntegers` fails the statement with a `SqlError` instead of rounding, and a `bigint`
   parameter outside the safe range fails before it reaches native code. iOS binds JavaScript numbers as SQLite REAL,
   as `node:sqlite` does; Android binds whole numbers as INTEGER.
+- `expo-sqlite` prepares only the first statement of a SQL string and silently ignores the rest, so run one
+  statement per call.
+- Prepared statements are reused through a least recently used cache of 200, finalized when evicted and before the
+  database closes.
 - Native errors are classified into `SqlError` reasons from their SQLite result code. `expo-sqlite` reports primary
   codes only, so a UNIQUE violation is a `ConstraintError`.

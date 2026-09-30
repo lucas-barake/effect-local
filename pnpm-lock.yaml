@@ -162,6 +162,9 @@ importers:
       '@effect/atom-react':
         specifier: 4.0.0-rc.118
         version: 4.0.0-rc.118(effect@4.0.0-rc.118)(react@19.2.3)(scheduler@0.27.0)
+      '@lucas-barake/effect-local':
+        specifier: workspace:^
+        version: link:../../../packages/local
       '@lucas-barake/effect-local-expo':
         specifier: workspace:^
         version: link:../../../packages/local-expo

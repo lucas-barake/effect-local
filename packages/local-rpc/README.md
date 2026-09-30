@@ -7,8 +7,9 @@ ephemeral join, publish, and heartbeat operations over one WebSocket. `SyncServe
 the authenticated gateway, one Effect Cluster entity per space, the durable `ServerStore`, the ephemeral hub, signed
 principal assertions, and the maintenance singleton. `SyncClient.layer` implements `SyncEngine`, while
 `EphemeralClient.layer` exposes the joined ephemeral channel. `ReplicaAtom.make` turns any Layer that provides
-`Replica`, `QueryReactivity`, and `EphemeralClient` into an Effect Atom graph, so the browser, Expo, and Node replicas
-share one reactive binding.
+`Replica`, `QueryReactivity`, `EphemeralClient`, and `Crypto` into an Effect Atom graph, so the browser, Expo, and Node replicas
+share one reactive binding. The graph mints its ephemeral member from that `Crypto`, and any further services the
+Layer provides stay available to effects run through `graph.runtime`.
 
 ## Server
 

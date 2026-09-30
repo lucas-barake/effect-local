@@ -13,6 +13,7 @@
   "dependencies": {
     "@effect-local/example-chat-shared": "workspace:^",
     "@effect/atom-react": "4.0.0-rc.118",
+    "@lucas-barake/effect-local": "workspace:^",
     "@lucas-barake/effect-local-expo": "workspace:^",
     "@lucas-barake/effect-local-rpc": "workspace:^",
     "effect": "4.0.0-rc.118",
