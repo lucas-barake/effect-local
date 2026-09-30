@@ -1098,24 +1098,6 @@ export const client = Effect.fnUntraced(function*(options: {
     }
   }
   yield* runCatalogWith(lane, "Client", clientCatalog, options.migration ?? defaultOptions)
-  const existing = yield* lane.withStatement(
-    SqlSchema.findOneOption({
-      Request: Schema.Void,
-      Result: ClientIdentityRow,
-      execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
-    })(undefined)
-  ).pipe(
-    Effect.mapError((cause) => {
-      if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
-      return new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
-    })
-  )
-  if (options.clientId !== undefined && Option.isSome(existing) && existing.value.client_id !== options.clientId) {
-    return yield* new ReplicaError.ReplicaIdentityMismatch({
-      expectedClientId: options.clientId,
-      actualClientId: existing.value.client_id
-    })
-  }
   yield* lane.withStatement(sql`INSERT INTO effect_local_client_meta
     (singleton, client_id) VALUES (1, ${options.clientId ?? SqliteIdentifier.random(sql, "cli")})
     ON CONFLICT (singleton) DO NOTHING`)
