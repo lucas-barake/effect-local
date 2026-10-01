@@ -152,7 +152,6 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, E extends Ta
     initialSpaces: options.spaces ?? []
   }).pipe(
     Layer.provide(Layer.succeedContext(handlers)),
-    Layer.provide(Layer.succeed(Crypto.Crypto, crypto)),
     Layer.provideMerge(layerOwner)
   )
   let layerTerm = layerStack
