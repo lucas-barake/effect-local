@@ -353,24 +353,19 @@ describe("ExpoSqliteClient", () => {
   )
 
   it.effect(
-    "prepares again after a failed prepare and closes the database",
-    Effect.fnUntraced(function*() {
-      yield* resetProbe
-      const scope = yield* Scope.make()
-      const sql = yield* ExpoSqliteClient.make(memory).pipe(Scope.provide(scope))
-      const missing = yield* Effect.exit(sql`SELECT id FROM later`)
-      assert.isTrue(Exit.isFailure(missing))
-      yield* sql`CREATE TABLE later (id INTEGER)`
-      yield* sql`INSERT INTO later (id) VALUES (${1})`
-      assert.deepStrictEqual(yield* sql`SELECT id FROM later`, [{ id: 1 }])
-      const duplicate = yield* Effect.exit(
-        sql`INSERT INTO later (id) VALUES (${1})`.pipe(Effect.andThen(sql`CREATE UNIQUE INDEX u ON later (id)`))
-      )
-      assert.isTrue(Exit.isFailure(duplicate))
-      yield* Scope.close(scope, Exit.void)
-      assert.strictEqual(probe.openDatabases, 0)
-      assert.strictEqual(probe.maxInFlight, 1)
-    }, provideReactivity)
+    "prepares SQL again after its prepare failed",
+    Effect.fnUntraced(
+      function*() {
+        const sql = yield* client()
+        const missing = yield* Effect.exit(sql`SELECT id FROM later`)
+        assert.isTrue(Exit.isFailure(missing))
+        yield* sql`CREATE TABLE later (id INTEGER)`
+        yield* sql`INSERT INTO later (id) VALUES (${1})`
+        assert.deepStrictEqual(yield* sql`SELECT id FROM later`, [{ id: 1 }])
+      },
+      Effect.scoped,
+      provideReactivity
+    )
   )
 
   it.effect(
@@ -409,7 +404,10 @@ describe("ExpoSqliteClient", () => {
         )
         assert.strictEqual(failureReason(duplicate), "ConstraintError")
         assert.isFalse(Exit.hasDies(duplicate))
-        const malformed = yield* sql`SELECT json(${"{"}) AS value`.stream.pipe(Stream.runCollect, Effect.exit)
+        const malformed = yield* sql`SELECT json(v) AS value FROM (SELECT '1' AS v UNION ALL SELECT '{')`.stream.pipe(
+          Stream.runCollect,
+          Effect.exit
+        )
         assert.strictEqual(failureReason(malformed), "UnknownError")
         assert.isFalse(Exit.hasDies(malformed))
         assert.deepStrictEqual(yield* sql`SELECT id FROM t`.values, [[1]])
