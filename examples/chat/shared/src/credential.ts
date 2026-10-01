@@ -10,15 +10,14 @@ export class SessionCredential extends Context.Service<
   SubscriptionRef.SubscriptionRef<Authentication.Credential>
 >()("@effect-local/example-chat/SessionCredential") {}
 
-const layerCredentialProvider = Layer.effect(
-  Authentication.CredentialProvider,
-  SessionCredential.use((credential) => Effect.succeed(Authentication.makeCredentialProvider(credential)))
-)
-
-export const layerSessionCredential = (token: string) => {
-  const credential = SubscriptionRef.make<Authentication.Credential>({ generation: 0, bearer: Redacted.make(token) })
-  return layerCredentialProvider.pipe(Layer.provideMerge(Layer.effect(SessionCredential, credential)))
-}
+export const layerSessionCredential = (token: string) =>
+  Layer.unwrap(
+    SubscriptionRef.make<Authentication.Credential>({ generation: 0, bearer: Redacted.make(token) }).pipe(
+      Effect.map((credential) =>
+        Layer.merge(Layer.succeed(SessionCredential, credential), Authentication.layerCredentialProvider(credential))
+      )
+    )
+  )
 
 export const renewCredential = (token: string) =>
   SessionCredential.use((credential) =>
