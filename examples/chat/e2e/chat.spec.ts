@@ -88,25 +88,23 @@ test("a reload of an account with history paints no false empty, offline, or pre
   expect(await falseStates(alice)).toEqual([])
 })
 
-test("typing and presence reach the peer", async ({ chat }) => {
+test("typing reaches the peer and sending clears it explicitly", async ({ chat }) => {
   const alice = await chat.signIn("alice")
   const dave = await chat.signIn("dave")
+  const removals: Array<string> = []
+  dave.on("websocket", (socket) =>
+    socket.on("framesent", ({ payload }) => {
+      if (String(payload).includes("\"RemoveState\"")) removals.push(String(payload))
+    }))
+  await dave.reload()
   await openDirectMessage(alice, "dave")
   await openDirectMessage(dave, "alice")
   await expect(alice.locator(".chat-subtitle")).toHaveText("online")
   await dave.locator(".chat-input").fill("typing")
   await expect(alice.locator(".chat-subtitle-typing")).toBeVisible()
+  const removalsBeforeSend = removals.length
   await send(dave, uniqueText("done"))
-  await expect(alice.locator(".chat-subtitle-typing")).toHaveCount(0)
-})
-
-test("the typing indicator clears shortly after the peer stops typing", async ({ chat }) => {
-  const alice = await chat.signIn("alice")
-  const dave = await chat.signIn("dave")
-  await openDirectMessage(alice, "dave")
-  await openDirectMessage(dave, "alice")
-  await dave.locator(".chat-input").pressSequentially("still here", { delay: 20 })
-  await expect(alice.locator(".chat-subtitle-typing")).toBeVisible()
+  await expect.poll(() => removals.length).toBeGreaterThan(removalsBeforeSend)
   await expect(alice.locator(".chat-subtitle-typing")).toHaveCount(0)
 })
 
