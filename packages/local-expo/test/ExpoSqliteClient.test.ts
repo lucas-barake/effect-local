@@ -382,6 +382,29 @@ describe("ExpoSqliteClient", () => {
   )
 
   it.effect(
+    "reports a statement that fails while streaming as a recoverable SqlError",
+    Effect.fnUntraced(
+      function*() {
+        const sql = yield* client()
+        yield* sql`CREATE TABLE t (id INTEGER PRIMARY KEY)`
+        yield* sql`INSERT INTO t (id) VALUES (${1})`
+        const duplicate = yield* sql`INSERT INTO t (id) VALUES (${1}) RETURNING id`.stream.pipe(
+          Stream.runCollect,
+          Effect.exit
+        )
+        assert.strictEqual(failureReason(duplicate), "ConstraintError")
+        assert.isFalse(Exit.hasDies(duplicate))
+        const malformed = yield* sql`SELECT json(${"{"}) AS value`.stream.pipe(Stream.runCollect, Effect.exit)
+        assert.strictEqual(failureReason(malformed), "UnknownError")
+        assert.isFalse(Exit.hasDies(malformed))
+        assert.deepStrictEqual(yield* sql`SELECT id FROM t`.values, [[1]])
+      },
+      Effect.scoped,
+      provideReactivity
+    )
+  )
+
+  it.effect(
     "returns each concurrent execution of the same SQL inside a transaction its own rows",
     Effect.fnUntraced(
       function*() {

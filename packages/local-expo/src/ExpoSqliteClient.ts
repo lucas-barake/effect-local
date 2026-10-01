@@ -279,7 +279,14 @@ export const make: (
       Stream.unwrap(Effect.gen(function*() {
         const bound = yield* bindParams(params)
         yield* rejectSafeIntegers
-        const statement = yield* Effect.acquireRelease(prepareStatement(sql), finalize)
+        let stepFailed = false
+        const markStepFailed = Effect.sync(() => {
+          stepFailed = true
+        })
+        const statement = yield* Effect.acquireRelease(prepareStatement(sql), (created) => {
+          if (stepFailed) return discard(created)
+          return finalize(created)
+        })
         const result = yield* Effect.tryPromise({
           try: () => statement.executeAsync<any>(bound),
           catch: (cause) =>
@@ -289,8 +296,8 @@ export const make: (
                 operation: "stream"
               })
             })
-        }).pipe(Effect.uninterruptible)
-        return rows(result)
+        }).pipe(Effect.uninterruptible, Effect.tapError(() => markStepFailed))
+        return rows(result).pipe(Stream.tapError(() => markStepFailed))
       }))
 
     const connection = identity<ExpoSqliteConnection>({
