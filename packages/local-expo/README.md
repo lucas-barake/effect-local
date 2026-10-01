@@ -43,8 +43,8 @@ ephemeral member from the `Crypto` the layer exposes, so an app needs no global 
 ## Modules
 
 - `ExpoSqliteClient` is an Effect `SqlClient` over `expo-sqlite`, shaped like the official `@effect/sql-sqlite-*`
-  clients: `make`, `layer`, and `layerConfig`, with `filename`, `directory`, `disableWAL`, `spanAttributes`,
-  `transformResultNames`, and `transformQueryNames`.
+  clients: `make`, `layer`, and `layerConfig`, with `filename`, `directory`, `prepareCacheSize`, `disableWAL`,
+  `spanAttributes`, `transformResultNames`, and `transformQueryNames`.
 - `ExpoCrypto.layer` provides `Crypto` from `expo-crypto`: native secure random bytes of any size and SHA digests.
 - `ReactNativeSocket.layerWebSocketConstructor` provides `Socket.WebSocketConstructor` from React Native's WebSocket.
   It forwards handshake headers and delays a close requested while the socket is still connecting until the socket
@@ -66,7 +66,7 @@ ephemeral member from the `Crypto` the layer exposes, so an app needs no global 
   as `node:sqlite` does; Android binds whole numbers as INTEGER.
 - `expo-sqlite` prepares only the first statement of a SQL string and silently ignores the rest, so run one
   statement per call.
-- Prepared statements are reused through a least recently used cache of 200 and finalized when evicted. Closing the
-  database finalizes the rest, which `expo-sqlite` does by default.
+- Prepared statements are reused through a least recently used cache of `prepareCacheSize` statements (200 by default)
+  and finalized when evicted. Closing the database finalizes the rest, which `expo-sqlite` does by default.
 - Native errors are classified into `SqlError` reasons from their SQLite result code. `expo-sqlite` reports primary
   codes only, so a UNIQUE violation is a `ConstraintError`.

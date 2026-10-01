@@ -31,6 +31,7 @@ export const ExpoSqliteClient = Context.Service<ExpoSqliteClient>("@lucas-barake
 export interface ExpoSqliteClientConfig {
   readonly filename: string
   readonly directory?: string | undefined
+  readonly prepareCacheSize?: number | undefined
   readonly disableWAL?: boolean | undefined
   readonly spanAttributes?: Record<string, unknown> | undefined
   readonly transformResultNames?: ((str: string) => string) | undefined
@@ -98,8 +99,6 @@ const rejectSafeIntegers = Effect.withFiber<void, SqlError>((fiber) => {
     })
   )
 })
-
-const preparedCapacity = 200
 
 interface ExpoSqliteConnection extends Connection {}
 
@@ -169,6 +168,7 @@ export const make: (
           })
       }).pipe(Effect.uninterruptible)
 
+    const prepareCacheSize = options.prepareCacheSize ?? 200
     const prepared = new Map<string, SQLite.SQLiteStatement>()
     const running = new Set<SQLite.SQLiteStatement>()
 
@@ -204,7 +204,7 @@ export const make: (
             if (prepared.has(sql)) return Effect.void
             prepared.set(sql, fresh)
             const evicted = oldest()
-            if (prepared.size <= preparedCapacity || evicted === undefined) return Effect.void
+            if (prepared.size <= prepareCacheSize || evicted === undefined) return Effect.void
             return evict(evicted)
           }),
           Effect.uninterruptible

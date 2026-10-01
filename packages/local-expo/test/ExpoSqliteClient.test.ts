@@ -336,6 +336,23 @@ describe("ExpoSqliteClient", () => {
   )
 
   it.effect(
+    "keeps at most prepareCacheSize prepared statements",
+    Effect.fnUntraced(
+      function*() {
+        const sql = yield* client({ ...memory, prepareCacheSize: 1 })
+        probe.calls = []
+        yield* sql`SELECT 1`
+        yield* sql`SELECT 2`
+        yield* sql`SELECT 1`
+        assert.strictEqual(nativeCalls("prepareAsync"), 3)
+        assert.strictEqual(nativeCalls("finalizeAsync"), 2)
+      },
+      Effect.scoped,
+      provideReactivity
+    )
+  )
+
+  it.effect(
     "prepares again after a failed prepare and closes the database",
     Effect.fnUntraced(function*() {
       yield* resetProbe
