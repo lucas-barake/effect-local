@@ -336,7 +336,7 @@ describe("ExpoSqliteClient", () => {
   )
 
   it.effect(
-    "prepares again after a failed prepare and finalizes every prepared statement before close",
+    "prepares again after a failed prepare and closes the database",
     Effect.fnUntraced(function*() {
       yield* resetProbe
       const scope = yield* Scope.make()
@@ -353,8 +353,6 @@ describe("ExpoSqliteClient", () => {
       yield* Scope.close(scope, Exit.void)
       assert.strictEqual(probe.openDatabases, 0)
       assert.strictEqual(probe.maxInFlight, 1)
-      assert.strictEqual(nativeCalls("prepareAsync"), nativeCalls("finalizeAsync") + 1)
-      assert.isBelow(probe.calls.lastIndexOf("finalizeAsync"), probe.calls.indexOf("closeAsync"))
     }, provideReactivity)
   )
 

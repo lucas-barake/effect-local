@@ -66,7 +66,7 @@ ephemeral member from the `Crypto` the layer exposes, so an app needs no global 
   as `node:sqlite` does; Android binds whole numbers as INTEGER.
 - `expo-sqlite` prepares only the first statement of a SQL string and silently ignores the rest, so run one
   statement per call.
-- Prepared statements are reused through a least recently used cache of 200, finalized when evicted and before the
-  database closes.
+- Prepared statements are reused through a least recently used cache of 200 and finalized when evicted. Closing the
+  database finalizes the rest, which `expo-sqlite` does by default.
 - Native errors are classified into `SqlError` reasons from their SQLite result code. `expo-sqlite` reports primary
   codes only, so a UNIQUE violation is a `ConstraintError`.

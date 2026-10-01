@@ -184,13 +184,6 @@ export const make: (
         return finalize(statement)
       })
 
-    const evictAll = Effect.suspend(() => {
-      const statements = Array.from(prepared.keys())
-      return Effect.forEach(statements, evict, { discard: true })
-    })
-
-    yield* Effect.addFinalizer(() => evictAll.pipe(semaphore.withPermits(1)))
-
     const oldest = () => {
       for (const sql of prepared.keys()) return sql
       return undefined
