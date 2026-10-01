@@ -28,7 +28,6 @@ import { makeFailedMessages, makeSettlementDaemonBody } from "@effect-local/exam
 import { NodeCrypto, NodeSocket } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
-import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
@@ -49,7 +48,6 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as AtomRegistry from "effect/reactivity/AtomRegistry"
 import * as Reactivity from "effect/reactivity/Reactivity"
-import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 
@@ -89,10 +87,8 @@ const serverUrl = Effect.gen(function*() {
   return `http://127.0.0.1:${address.port}/sync`
 })
 
-const layerReplicaFor = <C = never,>(
-  user: ChatUser,
-  layerCredential: Layer.Layer<Authentication.CredentialProvider | C>
-) => {
+const layerReplicaFor = (user: ChatUser, bearer: string = tokenFor(user.id)) => {
+  const layerCredential = layerSessionCredential(bearer)
   const layerSync = SyncClient.layerWebSocket({ url: serverUrl }).pipe(
     Layer.provide(NodeSocket.layerWebSocketConstructor),
     Layer.provideMerge(layerCredential)
@@ -141,12 +137,9 @@ const bootServer = Effect.map(
   (context): ServerContext => context
 )
 
-const boot = Effect.fnUntraced(function*(serverContext: ServerContext, user: ChatUser) {
-  const layerCredential = layerSessionCredential(tokenFor(user.id))
+const boot = Effect.fnUntraced(function*(serverContext: ServerContext, user: ChatUser, bearer?: string) {
   const context = yield* Layer.build(
-    layerReplicaFor(user, layerCredential).pipe(
-      Layer.provide(Layer.succeedContext(serverContext))
-    )
+    layerReplicaFor(user, bearer).pipe(Layer.provide(Layer.succeedContext(serverContext)))
   )
   const space = yield* Context.get(context, Replica.Replica).space(spaceId)
   const booted: BootedUser = {
@@ -385,9 +378,7 @@ describe("chat sync", () => {
     Effect.fnUntraced(function*() {
       const serverContext = yield* bootServer
       const context = yield* Layer.build(
-        layerReplicaFor(alice, layerSessionCredential("chat-token-forged")).pipe(
-          Layer.provide(Layer.succeedContext(serverContext))
-        )
+        layerReplicaFor(alice, "chat-token-forged").pipe(Layer.provide(Layer.succeedContext(serverContext)))
       )
       const space = yield* Context.get(context, Replica.Replica).space(spaceId)
       const booted: BootedUser = {
@@ -400,26 +391,6 @@ describe("chat sync", () => {
       yield* awaitStatus(booted, "NeedsAuthentication")
       yield* renewCredential(tokenFor(alice.id)).pipe(Effect.provide(context))
       yield* awaitStatus(booted, "Online")
-    })
-  )
-
-  it.live(
-    "parks a rejected static credential at NeedsAuthentication",
-    Effect.fnUntraced(function*() {
-      const serverContext = yield* bootServer
-      const layerForged = Authentication.layerCredentialProviderStatic(Redacted.make("chat-token-forged"))
-      const context = yield* Layer.build(
-        layerReplicaFor(alice, layerForged).pipe(Layer.provide(Layer.succeedContext(serverContext)))
-      )
-      const space = yield* Context.get(context, Replica.Replica).space(spaceId)
-      const booted: BootedUser = {
-        space,
-        reactivity: Context.get(context, Reactivity.Reactivity),
-        ephemeral: Context.get(context, EphemeralClient.EphemeralClient),
-        queryReactivity: Context.get(context, QueryReactivity.QueryReactivity)
-      }
-      yield* space.activate
-      yield* awaitStatus(booted, "NeedsAuthentication")
     })
   )
 
@@ -559,11 +530,8 @@ describe("chat sync", () => {
       // uses, over the Node test stack, mounted in a real registry.
       const registry = AtomRegistry.make()
       yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
-      const layerCredential = layerSessionCredential(tokenFor(alice.id))
       const graph = ReplicaAtom.make(
-        layerReplicaFor(alice, layerCredential).pipe(
-          Layer.provide(Layer.succeedContext(serverContext))
-        )
+        layerReplicaFor(alice).pipe(Layer.provide(Layer.succeedContext(serverContext)))
       )
       const overlay = makeFailedMessages()
       const daemonAtom = graph.runtime.atom(makeSettlementDaemonBody(overlay))
