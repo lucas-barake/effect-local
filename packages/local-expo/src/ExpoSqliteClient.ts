@@ -247,7 +247,7 @@ export const make: (
           )
         ))
 
-    const rows = (result: SQLite.SQLiteExecuteAsyncResult<any>) =>
+    const rows = (result: SQLite.SQLiteExecuteAsyncResult<any>, onStepFailure: Effect.Effect<void>) =>
       Stream.paginate(undefined, () =>
         Effect.tryPromise({
           try: () => result.next(),
@@ -256,6 +256,7 @@ export const make: (
               reason: classifySqliteError(sqliteCause(cause), { message: "Failed to read row", operation: "stream" })
             })
         }).pipe(
+          Effect.tapError(() => onStepFailure),
           Effect.uninterruptible,
           Effect.map((next): readonly [ReadonlyArray<any>, Option.Option<undefined>] => {
             if (next.done === true) return [[], Option.none()]
@@ -284,8 +285,8 @@ export const make: (
                 operation: "stream"
               })
             })
-        }).pipe(Effect.uninterruptible, Effect.tapError(() => markStepFailed))
-        return rows(result).pipe(Stream.tapError(() => markStepFailed))
+        }).pipe(Effect.tapError(() => markStepFailed), Effect.uninterruptible)
+        return rows(result, markStepFailed)
       }))
 
     const connection = identity<Connection>({

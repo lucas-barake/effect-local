@@ -420,6 +420,31 @@ describe("ExpoSqliteClient", () => {
   )
 
   it.effect(
+    "ends a stream interrupted while a failing native step runs without a defect",
+    Effect.fnUntraced(
+      function*() {
+        const cases = [
+          { method: "runAsync", source: `SELECT json('{') AS value` },
+          { method: "stepAsync", source: `SELECT json(v) AS value FROM (SELECT '1' AS v UNION ALL SELECT '{')` }
+        ]
+        for (const { method, source } of cases) {
+          const sql = yield* client()
+          const step = held(method)
+          const fiber = yield* sql.unsafe(source).stream.pipe(Stream.runCollect, Effect.forkChild)
+          yield* step.entered
+          const interrupting = yield* Fiber.interrupt(fiber).pipe(Effect.forkChild)
+          yield* Effect.yieldNow
+          yield* step.release
+          yield* Fiber.join(interrupting)
+          assert.isFalse(Exit.hasDies(yield* Fiber.await(fiber)), method)
+        }
+      },
+      Effect.scoped,
+      provideReactivity
+    )
+  )
+
+  it.effect(
     "returns each concurrent execution of the same SQL inside a transaction its own rows",
     Effect.fnUntraced(
       function*() {
