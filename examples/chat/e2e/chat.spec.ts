@@ -103,7 +103,8 @@ test("typing reaches the peer and sending clears it explicitly", async ({ chat }
   await dave.locator(".chat-input").fill("typing")
   await expect(alice.locator(".chat-subtitle-typing")).toBeVisible()
   const removalsBeforeSend = removals.length
-  await send(dave, uniqueText("done"))
+  await dave.locator(".chat-input").fill(uniqueText("done"))
+  await dave.locator(".chat-input").press("Enter")
   await expect.poll(() => removals.length).toBeGreaterThan(removalsBeforeSend)
   await expect(alice.locator(".chat-subtitle-typing")).toHaveCount(0)
 })
