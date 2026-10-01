@@ -3,23 +3,10 @@ import { DatabaseSync, type StatementSync } from "node:sqlite"
 type Platform = "ios" | "android"
 type Row = ReadonlyArray<unknown>
 
-interface Signal {
-  readonly promise: Promise<void>
-  readonly resolve: () => void
-}
-
-const signal = (): Signal => {
-  let resolve = () => {}
-  const promise = new Promise<void>((settle) => {
-    resolve = settle
-  })
-  return { promise, resolve }
-}
-
 interface Hold {
   readonly method: string
-  readonly entered: Signal
-  readonly release: Signal
+  readonly entered: PromiseWithResolvers<void>
+  readonly release: PromiseWithResolvers<void>
 }
 
 interface Probe {
@@ -52,7 +39,7 @@ export const probe: Probe = {
     probe.holds = []
   },
   hold(method: string) {
-    const hold: Hold = { method, entered: signal(), release: signal() }
+    const hold: Hold = { method, entered: Promise.withResolvers(), release: Promise.withResolvers() }
     probe.holds.push(hold)
     return { entered: hold.entered.promise, release: () => hold.release.resolve() }
   }

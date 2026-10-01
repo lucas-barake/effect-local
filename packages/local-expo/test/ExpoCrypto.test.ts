@@ -3,6 +3,7 @@ import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Hex from "effect/encoding/Hex"
 import * as Exit from "effect/Exit"
+import * as Option from "effect/Option"
 import * as ExpoCrypto from "../src/ExpoCrypto.js"
 import { cryptoProbe } from "./fixtures/nativeCrypto.js"
 
@@ -37,11 +38,7 @@ describe("ExpoCrypto", () => {
       cryptoProbe.failNextDigest = true
       const crypto = yield* Crypto.Crypto
       const exit = yield* crypto.digest("SHA-512", new Uint8Array([1])).pipe(Effect.exit)
-      assert.isTrue(Exit.isFailure(exit))
-      if (Exit.isFailure(exit)) {
-        const failure = exit.cause.reasons.find((reason) => reason._tag === "Fail")
-        assert.strictEqual(failure?._tag === "Fail" && failure.error._tag, "PlatformError")
-      }
+      assert.strictEqual(Option.getOrUndefined(Exit.findErrorOption(exit))?._tag, "PlatformError")
     }, provideExpoCrypto)
   )
 })

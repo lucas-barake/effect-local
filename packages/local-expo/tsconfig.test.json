@@ -2,5 +2,11 @@
   "$schema": "http://json.schemastore.org/tsconfig",
   "extends": "./tsconfig.json",
   "include": ["bench/**/*.ts", "src/**/*.ts", "test/**/*.ts", "vitest.config.ts"],
-  "compilerOptions": { "rootDir": ".", "noEmit": true, "erasableSyntaxOnly": false, "types": ["node"] }
+  "compilerOptions": {
+    "rootDir": ".",
+    "lib": ["ES2023", "ES2024.Promise", "DOM"],
+    "noEmit": true,
+    "erasableSyntaxOnly": false,
+    "types": ["node"]
+  }
 }

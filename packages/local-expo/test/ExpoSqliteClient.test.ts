@@ -7,6 +7,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as FileSystem from "effect/FileSystem"
+import * as Option from "effect/Option"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -41,10 +42,7 @@ const held = (method: string) => {
 
 const failureReason = <A,>(exit: Exit.Exit<A, SqlError.SqlError>) => {
   assert.isTrue(Exit.isFailure(exit))
-  if (Exit.isSuccess(exit)) return undefined
-  const error = exit.cause.reasons.find((reason) => reason._tag === "Fail")
-  if (error?._tag !== "Fail") return undefined
-  return error.error.reason._tag
+  return Option.getOrUndefined(Exit.findErrorOption(exit))?.reason._tag
 }
 
 describe("ExpoSqliteClient", () => {
@@ -369,7 +367,7 @@ describe("ExpoSqliteClient", () => {
         yield* sql`INSERT INTO t (id) VALUES (${1})`
         const duplicate = yield* sql`INSERT INTO t (id) VALUES (${1})`.pipe(Effect.exit)
         assert.strictEqual(failureReason(duplicate), "ConstraintError")
-        if (Exit.isFailure(duplicate)) assert.isFalse(duplicate.cause.reasons.some((reason) => reason._tag === "Die"))
+        assert.isFalse(Exit.hasDies(duplicate))
         const recovered = yield* sql`INSERT INTO t (id) VALUES (${1})`.pipe(
           Effect.as("inserted"),
           Effect.catchTag("SqlError", () => Effect.succeed("recovered"))
