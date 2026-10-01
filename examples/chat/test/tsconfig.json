@@ -1,9 +1,10 @@
 {
   "$schema": "http://json.schemastore.org/tsconfig",
   "extends": "../../../tsconfig.base.json",
-  "include": ["."],
+  "include": [".", "../../../packages/local-expo/test/fixtures"],
   "compilerOptions": {
-    "rootDir": ".",
+    "rootDir": "../../..",
+    "noEmit": true,
     "types": ["node"],
     // Workspace dependencies are consumed as TypeScript source, and their
     // sources (e.g. packages/local) use web globals such as TextEncoder.

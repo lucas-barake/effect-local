@@ -4,7 +4,7 @@
   "include": ["bench/**/*.ts", "src/**/*.ts", "test/**/*.ts", "vitest.config.ts"],
   "compilerOptions": {
     "rootDir": ".",
-    "lib": ["ES2023", "ES2024.Promise", "DOM"],
+    "lib": ["ES2023", "DOM"],
     "noEmit": true,
     "erasableSyntaxOnly": false,
     "types": ["node"]
