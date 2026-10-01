@@ -142,7 +142,7 @@ export const make: (
         )
     )
 
-    const finalize = (statement: SQLite.SQLiteStatement) =>
+    const finalizeStatement = (statement: SQLite.SQLiteStatement) =>
       Effect.tryPromise({
         try: () => statement.finalizeAsync(),
         catch: (cause) =>
@@ -152,10 +152,10 @@ export const make: (
               operation: "finalize"
             })
           })
-      }).pipe(
-        Effect.uninterruptible,
-        Effect.catchTag("SqlError", (error) => Effect.die(error))
-      )
+      }).pipe(Effect.uninterruptible)
+
+    const finalize = (statement: SQLite.SQLiteStatement) =>
+      finalizeStatement(statement).pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
 
     const prepareStatement = (sql: string) =>
       Effect.tryPromise({
@@ -173,19 +173,7 @@ export const make: (
     const running = new Set<SQLite.SQLiteStatement>()
 
     const discard = (statement: SQLite.SQLiteStatement) =>
-      Effect.tryPromise({
-        try: () => statement.finalizeAsync(),
-        catch: (cause) =>
-          new SqlError({
-            reason: classifySqliteError(sqliteCause(cause), {
-              message: "Failed to finalize statement",
-              operation: "finalize"
-            })
-          })
-      }).pipe(
-        Effect.uninterruptible,
-        Effect.catchTag("SqlError", () => Effect.void)
-      )
+      finalizeStatement(statement).pipe(Effect.catchTag("SqlError", () => Effect.void))
 
     const evict = (sql: string) =>
       Effect.suspend(() => {
