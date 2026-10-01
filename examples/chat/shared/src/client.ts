@@ -104,8 +104,6 @@ export const makeChatClient = <E extends { readonly _tag: string },>(graph: Repl
         createdAt
       }
       return yield* space.mutate(SendMessage, message).pipe(
-        // Surface the failure to the caller AND record it in the local
-        // failed-message overlay so the bubble can render and retry.
         Effect.onError(() =>
           Effect.sync(() => {
             get.set(failedMessages, new Map(get(failedMessages)).set(message.id, message))
@@ -134,8 +132,6 @@ export const makeChatClient = <E extends { readonly _tag: string },>(graph: Repl
     { concurrent: true }
   )
 
-  // Discard reads the overlay at effect time: writing from a render-time
-  // snapshot would race concurrent inserts by the settlement daemon.
   const discardMessage = graph.runtime.fn<Message>()(
     Effect.fnUntraced(function*(message, get) {
       const next = new Map(get(failedMessages))
@@ -185,9 +181,6 @@ export const makeChatClient = <E extends { readonly _tag: string },>(graph: Repl
   const publishTyping = graph.publishEphemeral(Typing, target)
   const clearTyping = graph.removeEphemeral(Typing, target)
 
-  // Delivery daemon: whenever a conversation summary shows an incoming message
-  // beyond my delivered position, advance it. Monotonic-max on the server makes
-  // this converge after one write.
   const deliveryDaemon = graph.runtime.atom(
     Effect.fnUntraced(function*(get) {
       const summaries = yield* get.result(summariesAtom, { suspendOnWaiting: true })
@@ -204,8 +197,6 @@ export const makeChatClient = <E extends { readonly _tag: string },>(graph: Repl
             userId,
             upTo: incoming.createdAt
           }).pipe(
-            // A single failing advance must not kill the daemon; the error is
-            // deliberately discarded here after logging.
             Effect.catch((error) =>
               Effect.logWarning("chat: could not advance delivery").pipe(
                 Effect.annotateLogs({ conversationId: summary.conversation.id, error: String(error) })
@@ -218,8 +209,6 @@ export const makeChatClient = <E extends { readonly _tag: string },>(graph: Repl
     })
   )
 
-  // Settlement daemon: the body lives in ./settlementDaemon.ts (platform
-  // neutral) so the smoke tests mount the exact production atom.
   const settlementDaemon = graph.runtime.atom(makeSettlementDaemonBody(failedMessages))
 
   return {

@@ -3,11 +3,6 @@ import * as Layer from "effect/Layer"
 import * as KeyValueStore from "effect/persistence/KeyValueStore"
 import * as SecureStore from "expo-secure-store"
 
-const unsupported = (method: string) =>
-  Effect.fail(
-    new KeyValueStore.KeyValueStoreError({ method, message: "expo-secure-store cannot enumerate its entries" })
-  )
-
 export const layerSecureStore = Layer.sync(KeyValueStore.KeyValueStore, () =>
   KeyValueStore.makeStringOnly({
     get: (key) =>
@@ -28,6 +23,16 @@ export const layerSecureStore = Layer.sync(KeyValueStore.KeyValueStore, () =>
         catch: (cause) =>
           new KeyValueStore.KeyValueStoreError({ method: "remove", key, message: `Unable to remove ${key}`, cause })
       }),
-    clear: unsupported("clear"),
-    size: unsupported("size")
+    clear: Effect.fail(
+      new KeyValueStore.KeyValueStoreError({
+        method: "clear",
+        message: "expo-secure-store cannot enumerate its entries"
+      })
+    ),
+    size: Effect.fail(
+      new KeyValueStore.KeyValueStoreError({
+        method: "size",
+        message: "expo-secure-store cannot enumerate its entries"
+      })
+    )
   }))
