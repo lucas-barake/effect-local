@@ -100,8 +100,6 @@ const rejectSafeIntegers = Effect.withFiber<void, SqlError>((fiber) => {
   )
 })
 
-interface ExpoSqliteConnection extends Connection {}
-
 export const make: (
   options: ExpoSqliteClientConfig
 ) => Effect.Effect<ExpoSqliteClient, SqlError, Scope.Scope | Reactivity.Reactivity> = Effect.fnUntraced(
@@ -153,9 +151,6 @@ export const make: (
           })
       }).pipe(Effect.uninterruptible)
 
-    const finalize = (statement: SQLite.SQLiteStatement) =>
-      finalizeStatement(statement).pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
-
     const prepareStatement = (sql: string) =>
       Effect.tryPromise({
         try: () => database.prepareAsync(sql),
@@ -181,7 +176,7 @@ export const make: (
         if (statement === undefined) return Effect.void
         prepared.delete(sql)
         if (running.has(statement)) return Effect.void
-        return finalize(statement)
+        return finalizeStatement(statement).pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
       })
 
     const oldest = () => {
@@ -220,7 +215,7 @@ export const make: (
           return discard(statement)
         }
         if (cachedStatement) return Effect.void
-        return finalize(statement)
+        return finalizeStatement(statement).pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
       })
 
     const runStatement = (statement: SQLite.SQLiteStatement, bound: Array<SQLite.SQLiteBindValue>, values: boolean) => {
@@ -278,7 +273,7 @@ export const make: (
         })
         const statement = yield* Effect.acquireRelease(prepareStatement(sql), (created) => {
           if (stepFailed) return discard(created)
-          return finalize(created)
+          return finalizeStatement(created).pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
         })
         const result = yield* Effect.tryPromise({
           try: () => statement.executeAsync<any>(bound),
@@ -293,7 +288,7 @@ export const make: (
         return rows(result).pipe(Stream.tapError(() => markStepFailed))
       }))
 
-    const connection = identity<ExpoSqliteConnection>({
+    const connection = identity<Connection>({
       execute(sql, params, transformRows) {
         if (transformRows) return Effect.map(query(sql, params, false), transformRows)
         return query(sql, params, false)
