@@ -2,8 +2,10 @@ import { createHash, randomFillSync } from "node:crypto"
 
 export const cryptoProbe = {
   failNextDigest: false,
+  filled: new Uint8Array(0),
   reset() {
     cryptoProbe.failNextDigest = false
+    cryptoProbe.filled = new Uint8Array(0)
   }
 }
 
@@ -21,7 +23,9 @@ const bytesOf = (data: ArrayBufferView | ArrayBuffer) => {
 
 export const ExpoCrypto = {
   getRandomValues(array: Uint8Array<ArrayBuffer>) {
-    return randomFillSync(array)
+    randomFillSync(array)
+    cryptoProbe.filled = Uint8Array.from(array)
+    return array
   },
   digest(algorithm: string, output: ArrayBufferView, data: ArrayBufferView | ArrayBuffer) {
     if (cryptoProbe.failNextDigest) {

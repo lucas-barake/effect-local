@@ -17,7 +17,7 @@ describe("ExpoCrypto", () => {
       const crypto = yield* Crypto.Crypto
       const bytes = yield* crypto.randomBytes(100_000)
       assert.strictEqual(bytes.length, 100_000)
-      assert.isTrue(bytes.some((byte) => byte !== 0))
+      assert.deepStrictEqual(bytes, cryptoProbe.filled)
     }, provideExpoCrypto)
   )
 
