@@ -5,6 +5,7 @@ import { definition, spaceId, type UserId } from "@effect-local/example-chat-sha
 import { layerDomain } from "@effect-local/example-chat-shared/handlers"
 import { requestLogin, sessionKey, StoredSession } from "@effect-local/example-chat-shared/session"
 import * as ExpoReplica from "@lucas-barake/effect-local-expo/ExpoReplica"
+import * as ReactNativeSocket from "@lucas-barake/effect-local-expo/ReactNativeSocket"
 import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -48,9 +49,13 @@ const makeGraph = (session: LoginResponse) => {
     ExpoReplica.layer({
       definition,
       database: { filename: `chat-${session.userId}.db` },
-      initialSpaces: [spaceId],
-      layerSync: SyncClient.layerWebSocket({ url: syncUrl }).pipe(Layer.provide(layerCredential))
-    }).pipe(Layer.provide(layerDomain), Layer.provideMerge(layerCredential))
+      initialSpaces: [spaceId]
+    }).pipe(
+      Layer.provideMerge(SyncClient.layerWebSocket({ url: syncUrl })),
+      Layer.provide(ReactNativeSocket.layerWebSocketConstructor),
+      Layer.provide(layerDomain),
+      Layer.provideMerge(layerCredential)
+    )
   )
 }
 

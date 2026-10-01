@@ -544,15 +544,13 @@ const Presence = Ephemeral.member({ status: Schema.String })
 const ephemerals = [Typing, ReadPosition]
 
 export const graph = ReplicaAtom.make(
-  BrowserReplica.layer({
-    name: "tasks",
-    definition,
-    layerDatabase: BrowserSqlite.layerWorker(() => new Worker(new URL("./sqlite.worker.ts", import.meta.url))),
-    layerSync,
-    spaces: [spaceId],
-    ephemerals,
-    profiles: { presence: Presence }
-  }).pipe(Layer.provide(layerDomain))
+  BrowserReplica.layer(
+    Layer.merge(
+      BrowserSqlite.layerWorker(() => new Worker(new URL("./sqlite.worker.ts", import.meta.url))),
+      layerSync
+    ),
+    { name: "tasks", definition, spaces: [spaceId], ephemerals, profiles: { presence: Presence } }
+  ).pipe(Layer.provide(layerDomain), Layer.provide(BrowserReplica.layerPlatformBrowser))
 )
 
 export const taskAtom = graph.entity(spaceId, Task)("task-1")

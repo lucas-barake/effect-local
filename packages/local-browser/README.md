@@ -18,26 +18,31 @@ import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as Layer from "effect/Layer"
 import * as Socket from "effect/socket/Socket"
 
-const layerReplica = BrowserReplica.layer({
-  name: "chat",
-  definition,
-  layerDatabase: BrowserSqlite.layerWorker(() => new Worker(new URL("./sqlite.worker.ts", import.meta.url))),
-  layerSync: SyncClient.layerWebSocket({ url: "wss://example.com/sync" }).pipe(
-    Layer.provide(Socket.layerWebSocketConstructorGlobal),
-    Layer.provide(Authentication.layerCredentialProviderStatic(bearer))
+const layerReplica = BrowserReplica.layer(
+  Layer.merge(
+    BrowserSqlite.layerWorker(() => new Worker(new URL("./sqlite.worker.ts", import.meta.url))),
+    SyncClient.layerWebSocket({ url: "wss://example.com/sync" })
   ),
-  spaces: [spaceId],
-  ephemerals,
-  profiles: { presence: Presence }
-}).pipe(Layer.provide(layerHandlers))
+  { name: "chat", definition, spaces: [spaceId], ephemerals, profiles: { presence: Presence } }
+).pipe(
+  Layer.provide(layerHandlers),
+  Layer.provide(Socket.layerWebSocketConstructorGlobal),
+  Layer.provide(Authentication.layerCredentialProviderStatic(bearer)),
+  Layer.provide(BrowserReplica.layerPlatformBrowser)
+)
 
 const graph = ReplicaAtom.make(layerReplica)
 ```
 
+The first argument provides the database and the sync engine. Only the leader tab builds it, once per leadership
+term, the same way `HttpRouter.serve` builds the app Layer it is given, and whatever it requires, such as the WebSocket
+constructor and the credential provider above, becomes a requirement of the replica Layer.
+`BrowserReplica.layerPlatformBrowser` provides the Web Locks, `BroadcastChannel`, `localStorage`, and WebCrypto
+adapters. Tests provide in-memory versions instead to run several tabs in one process.
+
 `name` scopes the cluster, its locks, and the durable client id, so two replicas on one origin need different names.
 Everything else is optional. `replica` forwards `SqlReplica` options, `sharding` overrides the tab cluster's
-`ShardingConfig`, and `retryDelay` (1 second) paces leader election retries. `layerPlatform` replaces the Web Locks,
-`BroadcastChannel`, `localStorage`, and WebCrypto adapters, which is how the tests run several tabs in one process.
+`ShardingConfig`, and `retryDelay` (1 second) paces leader election retries.
 `BrowserSqlite.layerWorker` spawns and owns a dedicated SQLite WASM worker that is terminated when the Layer's scope
 closes, and `BrowserSqlite.layerMessagePort` adapts an application-owned worker port instead.
 

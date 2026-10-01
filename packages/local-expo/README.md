@@ -14,6 +14,7 @@ pnpm add @lucas-barake/effect-local @lucas-barake/effect-local-sql @lucas-barake
 
 ```ts
 import * as ExpoReplica from "@lucas-barake/effect-local-expo/ExpoReplica"
+import * as ReactNativeSocket from "@lucas-barake/effect-local-expo/ReactNativeSocket"
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
@@ -23,18 +24,21 @@ export const graph = ReplicaAtom.make(
   ExpoReplica.layer({
     definition,
     database: { filename: `chat-${userId}.db` },
-    initialSpaces: [spaceId],
-    layerSync: SyncClient.layerWebSocket({ url: "wss://example.com/sync" }).pipe(
-      Layer.provide(Authentication.layerCredentialProviderStatic(bearer))
-    )
-  }).pipe(Layer.provide(layerDomain))
+    initialSpaces: [spaceId]
+  }).pipe(
+    Layer.provideMerge(SyncClient.layerWebSocket({ url: "wss://example.com/sync" })),
+    Layer.provide(ReactNativeSocket.layerWebSocketConstructor),
+    Layer.provide(Authentication.layerCredentialProviderStatic(bearer)),
+    Layer.provide(layerDomain)
+  )
 )
 ```
 
 The replica mints its client identity the first time it opens a database file and keeps it in that file, so the
-identity lives exactly as long as the local data. Use one file per signed in account. `layerSync` receives React
-Native's WebSocket constructor from the layer, and `ReplicaAtom.make` mints the graph's ephemeral member from the
-`Crypto` the layer exposes, so an app needs no global polyfills.
+identity lives exactly as long as the local data. Use one file per signed in account. The sync engine is a requirement
+of the layer, like any other service. `Layer.provideMerge` keeps its `EphemeralClient` in the graph's context, and
+`ReactNativeSocket.layerWebSocketConstructor` gives it React Native's WebSocket. `ReplicaAtom.make` mints the graph's
+ephemeral member from the `Crypto` the layer exposes, so an app needs no global polyfills.
 
 ## Modules
 

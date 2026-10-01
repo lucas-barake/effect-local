@@ -28,6 +28,7 @@ import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as ExpoReplica from "../src/ExpoReplica.js"
+import * as ReactNativeSocket from "../src/ReactNativeSocket.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000901")
 const Todo = Model.make("Todo", {
@@ -89,11 +90,17 @@ const layerReplica = (serverContext: Context.Context<HttpServer.HttpServer>, dir
     database: { filename, directory },
     initialSpaces: [spaceId],
     defaultScope: Protocol.ReplicationScope.make({ models: [Todo.name] }),
-    migration,
-    layerSync: SyncClient.layerWebSocket({ url: syncUrl.pipe(Effect.provide(serverContext)) }).pipe(
-      Layer.provide(layerCredential)
-    )
-  }).pipe(Layer.provide(layerHandlers), Layer.provideMerge(Reactivity.layer))
+    migration
+  }).pipe(
+    Layer.provideMerge(
+      SyncClient.layerWebSocket({ url: syncUrl.pipe(Effect.provide(serverContext)) }).pipe(
+        Layer.provide(ReactNativeSocket.layerWebSocketConstructor),
+        Layer.provide(layerCredential)
+      )
+    ),
+    Layer.provide(layerHandlers),
+    Layer.provideMerge(Reactivity.layer)
+  )
 
 const openReplica = Effect.fnUntraced(function*(
   serverContext: Context.Context<HttpServer.HttpServer>,

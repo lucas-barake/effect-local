@@ -20,7 +20,7 @@ import * as LosslessQueue from "./losslessQueue.js"
 import type * as platform from "./platform.js"
 import type { OwnerResources } from "./replicaHost.js"
 
-export interface Options<E extends { readonly _tag: string },> {
+export interface Options {
   readonly host: string
   readonly names: lockNames.LockNames
   readonly locks: platform.WebLocksService
@@ -28,11 +28,6 @@ export interface Options<E extends { readonly _tag: string },> {
   readonly visibility: platform.TabVisibilityService
   readonly retryDelay: Duration.Input
   readonly gate: BuildGate.BuildGate
-  readonly layerOwner: Layer.Layer<
-    Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient,
-    E,
-    Reactivity.Reactivity
-  >
 }
 
 export interface ReplicaOwner {
@@ -69,7 +64,14 @@ const stringKeys = (keys: ReadonlyArray<unknown> | Readonly<Record<string, Reado
 
 const decodeAnnouncement = Schema.decodeUnknownEffect(Schema.String)
 
-export const make = Effect.fnUntraced(function*<E extends { readonly _tag: string },>(options: Options<E>) {
+export const make = Effect.fnUntraced(function*<E extends { readonly _tag: string }, R,>(
+  layerOwner: Layer.Layer<
+    Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient,
+    E,
+    Reactivity.Reactivity | R
+  >,
+  options: Options
+) {
   const ownerScope = yield* Effect.scope
   const names = options.names
   let terms = 0
@@ -211,7 +213,7 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
         )
     }
     const context = yield* Layer.build(
-      options.layerOwner.pipe(Layer.provide(Layer.succeed(Reactivity.Reactivity, reactivity)))
+      layerOwner.pipe(Layer.provide(Layer.succeed(Reactivity.Reactivity, reactivity)))
     )
     terms += 1
     const resources: OwnerResources = {

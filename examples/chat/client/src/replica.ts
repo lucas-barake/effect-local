@@ -83,23 +83,23 @@ const makeGraph = (session: LoginResponse) => {
   // A rejected bearer parks the space at NeedsAuthentication; the banner then
   // signs out and reloads, so the token never rotates inside one page load.
   const bearer = Redacted.make(session.token)
-  const layerSync = SyncClient.layerWebSocket({ url: syncUrl() }).pipe(
-    Layer.provide(Socket.layerWebSocketConstructorGlobal),
-    Layer.provide(Authentication.layerCredentialProviderStatic(bearer))
-  )
   const layerDatabase = BrowserSqlite.layerWorker(() =>
     new Worker(new URL("./sqlite.worker.ts", import.meta.url), { type: "module", name: session.userId })
   )
+  const layerSync = SyncClient.layerWebSocket({ url: syncUrl() })
   return ReplicaAtom.make(
-    BrowserReplica.layer({
+    BrowserReplica.layer(Layer.merge(layerDatabase, layerSync), {
       name: `chat-${session.userId}`,
       definition,
-      layerDatabase,
-      layerSync,
       spaces: [spaceId],
       ephemerals,
       profiles
-    }).pipe(Layer.provide(layerDomain))
+    }).pipe(
+      Layer.provide(layerDomain),
+      Layer.provide(Socket.layerWebSocketConstructorGlobal),
+      Layer.provide(Authentication.layerCredentialProviderStatic(bearer)),
+      Layer.provide(BrowserReplica.layerPlatformBrowser)
+    )
   )
 }
 
