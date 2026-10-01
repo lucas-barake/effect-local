@@ -16,7 +16,7 @@ import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as Layer from "effect/Layer"
-import * as Socket from "effect/unstable/socket/Socket"
+import * as Socket from "effect/socket/Socket"
 
 const layerReplica = BrowserReplica.layer({
   name: "chat",
@@ -91,7 +91,7 @@ status atoms are refreshed when it is superseded, so the app can show a reload p
 
 ```ts
 import * as Option from "effect/Option"
-import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
+import * as AsyncResult from "effect/reactivity/AsyncResult"
 
 const status = registry.get(graph.status(spaceId))
 const superseded = AsyncResult.isFailure(status) &&

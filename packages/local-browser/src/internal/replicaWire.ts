@@ -4,10 +4,10 @@ import * as Quarantine from "@lucas-barake/effect-local/Quarantine"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Entity from "effect/cluster/Entity"
+import * as Rpc from "effect/rpc/Rpc"
+import * as RpcGroup from "effect/rpc/RpcGroup"
 import * as Schema from "effect/Schema"
-import * as Entity from "effect/unstable/cluster/Entity"
-import * as Rpc from "effect/unstable/rpc/Rpc"
-import * as RpcGroup from "effect/unstable/rpc/RpcGroup"
 
 export class WireMutationRejection extends Schema.TaggedError<WireMutationRejection>(
   "@lucas-barake/effect-local-browser/WireMutationRejection"

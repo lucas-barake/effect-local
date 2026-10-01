@@ -992,7 +992,7 @@ try {
 const taggedFixtureSource = `import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 import type { unhandled as EffectUnhandled } from "effect/Types"
-import * as Socket from "effect/unstable/socket/Socket"
+import * as Socket from "effect/socket/Socket"
 
 class Tagged extends Schema.TaggedError<Tagged>()("Tagged", {}) {}
 interface OptionalTag { readonly _tag?: "OptionalTag" }
@@ -1356,7 +1356,7 @@ assert.deepEqual(
 )
 
 const packagePolicySource = `import * as Data from "effect/Data"
-import type { SqlClient } from "effect/unstable/sql/SqlClient"
+import type { SqlClient } from "effect/sql/SqlClient"
 class Bad extends Data.TaggedError("Bad")<{}> {}
 const AssignedBad = class extends Data.TaggedError("AssignedBad")<{}> {}
 declare const sql: SqlClient

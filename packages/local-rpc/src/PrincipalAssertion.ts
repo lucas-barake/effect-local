@@ -4,7 +4,7 @@ import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
-import * as Encoding from "effect/Encoding"
+import * as Base64Url from "effect/encoding/Base64Url"
 import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import * as Result from "effect/Result"
@@ -99,18 +99,18 @@ export const layerHmac = (
       const claims = yield* Schema.encodeEffect(HmacClaims)({ principal, expiresAtMillis }).pipe(
         Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "could not issue principal assertion" }))
       )
-      const payload = Encoding.encodeBase64Url(claims)
-      const signature = Encoding.encodeBase64Url(yield* sign(payload))
+      const payload = Base64Url.encode(claims)
+      const signature = Base64Url.encode(yield* sign(payload))
       return PrincipalAssertion.make(`${payload}.${signature}`)
     })
     const verify = Effect.fnUntraced(function*(assertion: PrincipalAssertion) {
       const parts = assertion.split(".")
       if (parts.length !== 2) return yield* invalid
       const [payload, encodedSignature] = parts
-      const signature = Encoding.decodeBase64Url(encodedSignature)
+      const signature = Base64Url.decode(encodedSignature)
       if (Result.isFailure(signature)) return yield* invalid
       if (!Hmac.constantTimeEqual(signature.success, yield* sign(payload))) return yield* invalid
-      const claimsJson = Encoding.decodeBase64UrlString(payload)
+      const claimsJson = Base64Url.decodeString(payload)
       if (Result.isFailure(claimsJson)) return yield* invalid
       const claims = yield* Schema.decodeUnknownEffect(HmacClaims)(claimsJson.success).pipe(
         Effect.mapError(() => invalid)

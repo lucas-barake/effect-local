@@ -17,12 +17,12 @@ import * as Equal from "effect/Equal"
 import * as Hash from "effect/Hash"
 import type * as Layer from "effect/Layer"
 import type * as Option from "effect/Option"
+import { Atom } from "effect/reactivity"
+import * as AsyncResult from "effect/reactivity/AsyncResult"
+import type * as AtomRegistry from "effect/reactivity/AtomRegistry"
+import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
-import { Atom } from "effect/unstable/reactivity"
-import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
-import type * as AtomRegistry from "effect/unstable/reactivity/AtomRegistry"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 
 class QueryKey implements Equal.Equal {
   readonly spaceId: Identity.SpaceId

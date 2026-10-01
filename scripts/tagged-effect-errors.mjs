@@ -54,7 +54,7 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
     effectUnhandledDeclaration.toLowerCase()
   ])
   const effectSocketDeclaration = realpathSync(
-    resolve(cwd, "node_modules/effect/dist/unstable/socket/Socket.d.ts")
+    resolve(cwd, "node_modules/effect/dist/socket/Socket.d.ts")
   )
   const effectSocketDeclarations = new Set([
     effectSocketDeclaration,
@@ -78,7 +78,7 @@ export const makeEffectTypePolicyChecker = ({ cwd }) => {
   const schemaDeclaration = realpathSync(resolve(cwd, "node_modules/effect/dist/Schema.d.ts"))
   const schemaDeclarations = new Set([schemaDeclaration, schemaDeclaration.toLowerCase()])
   const sqlClientDeclaration = realpathSync(
-    resolve(cwd, "node_modules/effect/dist/unstable/sql/SqlClient.d.ts")
+    resolve(cwd, "node_modules/effect/dist/sql/SqlClient.d.ts")
   )
   const sqlClientDeclarations = new Set([sqlClientDeclaration, sqlClientDeclaration.toLowerCase()])
   const sourceOverrides = new Map()

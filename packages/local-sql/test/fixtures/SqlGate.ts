@@ -2,9 +2,9 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Queue from "effect/Queue"
 import * as Schema from "effect/Schema"
-import type * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlSchema from "effect/unstable/sql/SqlSchema"
-import * as Statement from "effect/unstable/sql/Statement"
+import type * as SqlClient from "effect/sql/SqlClient"
+import * as SqlSchema from "effect/sql/SqlSchema"
+import * as Statement from "effect/sql/Statement"
 
 export type Phase = "before" | "after"
 

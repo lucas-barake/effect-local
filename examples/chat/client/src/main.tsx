@@ -1,5 +1,5 @@
 import { RegistryProvider, useAtomMount, useAtomValue } from "@effect/atom-react"
-import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
+import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { createRoot } from "react-dom/client"
 import { App } from "./app.js"
 import { Login } from "./login.js"

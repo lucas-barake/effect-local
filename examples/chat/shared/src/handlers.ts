@@ -3,7 +3,7 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
-import * as SqlSchema from "effect/unstable/sql/SqlSchema"
+import * as SqlSchema from "effect/sql/SqlSchema"
 import {
   AdvanceDelivery,
   AdvanceRead,

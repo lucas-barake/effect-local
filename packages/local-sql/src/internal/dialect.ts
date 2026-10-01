@@ -3,9 +3,9 @@ import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as SecondaryIndex from "@lucas-barake/effect-local/SecondaryIndex"
 import * as Effect from "effect/Effect"
-import type * as SqlClient from "effect/unstable/sql/SqlClient"
-import type * as SqlError from "effect/unstable/sql/SqlError"
-import type * as Statement from "effect/unstable/sql/Statement"
+import type * as SqlClient from "effect/sql/SqlClient"
+import type * as SqlError from "effect/sql/SqlError"
+import type * as Statement from "effect/sql/Statement"
 
 interface JsonField {
   readonly name: string

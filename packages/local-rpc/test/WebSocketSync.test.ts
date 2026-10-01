@@ -14,26 +14,26 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Clock from "effect/Clock"
+import * as SingleRunner from "effect/cluster/SingleRunner"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import * as HttpRouter from "effect/http/HttpRouter"
+import * as HttpServer from "effect/http/HttpServer"
 import * as Layer from "effect/Layer"
 import * as MutableRef from "effect/MutableRef"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
+import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Redacted from "effect/Redacted"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import * as Socket from "effect/socket/Socket"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as TestClock from "effect/testing/TestClock"
-import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
-import * as HttpServer from "effect/unstable/http/HttpServer"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import * as Socket from "effect/unstable/socket/Socket"
 
 const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(
@@ -47,7 +47,7 @@ const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Ef
 class TestAuthorizationError extends Schema.TaggedError<TestAuthorizationError, Schema.JsonObject>(
   "@lucas-barake/effect-local-rpc/test/WebSocketSync/TestAuthorizationError"
 )("TestAuthorizationError", { reason: Schema.String }) {}
-import * as SqlClient from "effect/unstable/sql/SqlClient"
+import * as SqlClient from "effect/sql/SqlClient"
 import * as Authentication from "../src/Authentication.js"
 import * as EphemeralClient from "../src/EphemeralClient.js"
 import * as LosslessQueue from "../src/internal/losslessQueue.js"
@@ -233,21 +233,20 @@ const revokedBearer = Redacted.make("revoked")
 const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(
   Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
 )
-const layerWebsocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(
-  Layer.provide(HttpRouter.layer)
-)
+const layerWebsocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" })
 const layerSyncServer = <R,>(
   options: SyncServer.LayerOptions<typeof definition>,
   layerAuthentication: Layer.Layer<Authentication.Authentication, never, R>,
   layerMutationHandlers: typeof layerHandlers
 ) =>
-  SyncServer.layer(options).pipe(
-    Layer.provideMerge(layerWebsocketProtocol),
+  HttpRouter.serve(
+    SyncServer.layer(options).pipe(Layer.provideMerge(layerWebsocketProtocol)),
+    { disableListenLog: true, disableLogger: true }
+  ).pipe(
     Layer.provide(layerAuthentication),
     Layer.provide(SingleRunner.layer({ runnerStorage: "memory" })),
     Layer.provide(layerMutationHandlers),
-    Layer.provide(layerDatabase),
-    Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
+    Layer.provide(layerDatabase)
   )
 const layerWebsocketServer = layerSyncServer(serverOptions, layerAuthenticationServer, layerHandlers)
 const webSocketConstructions = MutableRef.make(0)

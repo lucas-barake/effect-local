@@ -42,10 +42,18 @@ export const falseStates = (page: Page): Promise<Array<string>> =>
     return [...seen].map(String)
   })
 
-const newContext = async (browser: Browser): Promise<BrowserContext> => {
+const newContext = async (browser: Browser, contexts: Array<BrowserContext>): Promise<BrowserContext> => {
   const context = await browser.newContext()
+  contexts.push(context)
   await context.addInitScript(recordFalseStates)
   return context
+}
+
+const closeAll = async (contexts: ReadonlyArray<BrowserContext>): Promise<void> => {
+  const [head, ...rest] = contexts
+  if (head === undefined) return
+  await head.close()
+  await closeAll(rest)
 }
 
 const openTab = async (page: Page, label: string, path: string, lines: Array<string>): Promise<Page> => {
@@ -55,16 +63,25 @@ const openTab = async (page: Page, label: string, path: string, lines: Array<str
   return tab
 }
 
-const openLoginPage = async (browser: Browser, lines: Array<string>): Promise<Page> => {
-  const context = await newContext(browser)
+const openLoginPage = async (
+  browser: Browser,
+  contexts: Array<BrowserContext>,
+  lines: Array<string>
+): Promise<Page> => {
+  const context = await newContext(browser, contexts)
   const page = await context.newPage()
   capture(page, "login", lines)
   await page.goto("/")
   return page
 }
 
-const signIn = async (browser: Browser, user: UserId, lines: Array<string>): Promise<Page> => {
-  const context = await newContext(browser)
+const signIn = async (
+  browser: Browser,
+  contexts: Array<BrowserContext>,
+  user: UserId,
+  lines: Array<string>
+): Promise<Page> => {
+  const context = await newContext(browser, contexts)
   const page = await context.newPage()
   capture(page, user, lines)
   await page.goto("/")
@@ -78,11 +95,13 @@ const signIn = async (browser: Browser, user: UserId, lines: Array<string>): Pro
 export const test = base.extend<{ readonly chat: Chat }>({
   chat: async ({ browser }, use, testInfo) => {
     const lines: Array<string> = []
+    const contexts: Array<BrowserContext> = []
     await use({
-      signIn: (user) => signIn(browser, user, lines),
+      signIn: (user) => signIn(browser, contexts, user, lines),
       openTab: (page, label, path = "/") => openTab(page, label, path, lines),
-      openLoginPage: () => openLoginPage(browser, lines)
+      openLoginPage: () => openLoginPage(browser, contexts, lines)
     })
+    await closeAll(contexts)
     if (testInfo.status === testInfo.expectedStatus) return
     const path = testInfo.outputPath("console.txt")
     writeFileSync(path, lines.join("\n"))
@@ -101,7 +120,7 @@ export const openDirectMessage = async (page: Page, peer: UserId): Promise<void>
 
 export const expectOnline = async (page: Page, peer: UserId): Promise<void> => {
   const row = page.locator(".conversation, .sidebar-new-row", { hasText: names[peer] })
-  await expect(row.getByRole("img", { name: "online" })).toBeVisible({ timeout: 3_000 })
+  await expect(row.getByRole("img", { name: "online" })).toBeVisible()
 }
 
 export const send = async (page: Page, text: string): Promise<void> => {

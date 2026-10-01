@@ -43,14 +43,14 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import * as HttpServer from "effect/http/HttpServer"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as AtomRegistry from "effect/reactivity/AtomRegistry"
+import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
-import * as HttpServer from "effect/unstable/http/HttpServer"
-import * as AtomRegistry from "effect/unstable/reactivity/AtomRegistry"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
 
 /**
  * In-process end-to-end smoke tests: the real production server composition

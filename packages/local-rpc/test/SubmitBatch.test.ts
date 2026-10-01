@@ -13,25 +13,25 @@ import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as SingleRunner from "effect/cluster/SingleRunner"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
+import * as HttpRouter from "effect/http/HttpRouter"
+import * as HttpServer from "effect/http/HttpServer"
 import * as Layer from "effect/Layer"
 import * as MutableRef from "effect/MutableRef"
 import * as Option from "effect/Option"
+import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Redacted from "effect/Redacted"
 import * as Result from "effect/Result"
+import * as RpcServer from "effect/rpc/RpcServer"
 import * as Schema from "effect/Schema"
+import * as Socket from "effect/socket/Socket"
+import * as SqlClient from "effect/sql/SqlClient"
+import * as SqlSchema from "effect/sql/SqlSchema"
 import * as Stream from "effect/Stream"
-import * as SingleRunner from "effect/unstable/cluster/SingleRunner"
-import * as HttpRouter from "effect/unstable/http/HttpRouter"
-import * as HttpServer from "effect/unstable/http/HttpServer"
-import * as Reactivity from "effect/unstable/reactivity/Reactivity"
-import * as RpcServer from "effect/unstable/rpc/RpcServer"
-import * as Socket from "effect/unstable/socket/Socket"
-import * as SqlClient from "effect/unstable/sql/SqlClient"
-import * as SqlSchema from "effect/unstable/sql/SqlSchema"
 import * as Authentication from "../src/Authentication.js"
 import * as ProtocolSession from "../src/ProtocolSession.js"
 import * as SyncClient from "../src/SyncClient.js"
@@ -72,9 +72,7 @@ const layerAuthenticationServer = Authentication.layerServer.pipe(Layer.provide(
 const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(
   Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
 )
-const layerWebsocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" }).pipe(
-  Layer.provide(HttpRouter.layer)
-)
+const layerWebsocketProtocol = SyncServer.layerProtocolWebSocket({ path: "/sync" })
 const serverUrl = Effect.gen(function*() {
   const server = yield* HttpServer.HttpServer
   const address = server.address
@@ -149,13 +147,14 @@ const makeHarness = Effect.fnUntraced(function*() {
     NodeCrypto.layer,
     Reactivity.layer
   )
-  const layerServer = SyncServer.layer(serverOptions).pipe(
-    Layer.provideMerge(layerWebsocketProtocol),
+  const layerServer = HttpRouter.serve(
+    SyncServer.layer(serverOptions).pipe(Layer.provideMerge(layerWebsocketProtocol)),
+    { disableListenLog: true, disableLogger: true }
+  ).pipe(
     Layer.provide(layerObservingAuthentication),
     Layer.provide(SingleRunner.layer({ runnerStorage: "memory" })),
     Layer.provide(layerHandlers),
-    Layer.provideMerge(layerServerDatabase),
-    Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
+    Layer.provideMerge(layerServerDatabase)
   )
   const layerRemote = SyncClient.layerFromSession().pipe(
     Layer.provideMerge(ProtocolSession.layer),
@@ -261,12 +260,13 @@ const makeDefectingServer = Effect.fnUntraced(function*() {
     PublishEphemeral: () => Effect.die("unused"),
     HeartbeatEphemeral: () => Effect.die("unused")
   }))
-  const layerServer = RpcServer.layer(SyncRpc.Rpcs, { disableFatalDefects: true }).pipe(
-    Layer.provide(layerDefectingHandlers),
-    Layer.provideMerge(layerWebsocketProtocol),
-    Layer.provide(layerAuthenticationServer),
-    Layer.provide(HttpRouter.serve(layerWebsocketProtocol, { disableListenLog: true, disableLogger: true }))
-  )
+  const layerServer = HttpRouter.serve(
+    RpcServer.layer(SyncRpc.Rpcs, { disableFatalDefects: true }).pipe(
+      Layer.provide(layerDefectingHandlers),
+      Layer.provideMerge(layerWebsocketProtocol)
+    ),
+    { disableListenLog: true, disableLogger: true }
+  ).pipe(Layer.provide(layerAuthenticationServer))
   const live = yield* Layer.build(
     SyncClient.layerFromSession().pipe(
       Layer.provide(ProtocolSession.layer),

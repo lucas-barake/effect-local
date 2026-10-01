@@ -1,6 +1,6 @@
 import { type UserId, users } from "@effect-local/example-chat-shared/domain"
 import { useAtomSet, useAtomValue } from "@effect/atom-react"
-import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
+import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { useState } from "react"
 import { Avatar } from "./avatar.js"
 import { loginAtom } from "./replica.js"

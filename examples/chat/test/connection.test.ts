@@ -7,10 +7,10 @@ import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Channel from "effect/Channel"
 import * as Effect from "effect/Effect"
 import * as Queue from "effect/Queue"
+import * as AsyncResult from "effect/reactivity/AsyncResult"
 import * as Scheduler from "effect/Scheduler"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
-import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 
 type StatusResult = AsyncResult.AsyncResult<ReplicaStatus.SpaceStatus, ReplicaError.ReplicaError>
 

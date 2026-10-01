@@ -3,8 +3,8 @@ import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Match from "effect/Match"
 import * as Option from "effect/Option"
+import * as AsyncResult from "effect/reactivity/AsyncResult"
 import * as Stream from "effect/Stream"
-import * as AsyncResult from "effect/unstable/reactivity/AsyncResult"
 
 export type Connection =
   | "online"
