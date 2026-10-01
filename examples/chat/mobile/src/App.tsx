@@ -1,6 +1,6 @@
 import type { LoginResponse } from "@effect-local/example-chat-shared/auth"
-import type { Connection } from "@effect-local/example-chat-shared/connection"
-import { type ConversationId, groupConversationId, UserId } from "@effect-local/example-chat-shared/domain"
+import { connecting, type Connection } from "@effect-local/example-chat-shared/connection"
+import { type ConversationId, dmPeer, groupConversationId } from "@effect-local/example-chat-shared/domain"
 import { RegistryProvider, useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { StatusBar } from "expo-status-bar"
@@ -10,7 +10,7 @@ import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context"
 import { Chat } from "./Chat.js"
 import { Conversations } from "./Conversations.js"
 import { Login } from "./Login.js"
-import { clientFor, logoutAtom, sessionAtom } from "./runtime.js"
+import { clientFor, sessionAtom } from "./runtime.js"
 import { colors } from "./theme.js"
 
 const bannerText: Record<Connection, string | undefined> = {
@@ -24,14 +24,14 @@ const bannerText: Record<Connection, string | undefined> = {
 }
 
 const Banner = ({ connection }: { readonly connection: Connection }) => {
-  const logout = useAtomSet(logoutAtom)
+  const setSession = useAtomSet(sessionAtom)
   const text = bannerText[connection]
   if (text === undefined) return null
   return (
     <View accessibilityRole="alert" style={styles.banner}>
       <Text style={styles.bannerText}>{text}</Text>
       {connection === "needsAuthentication" && (
-        <Pressable accessibilityRole="button" onPress={() => logout(undefined)}>
+        <Pressable accessibilityRole="button" onPress={() => setSession(null)}>
           <Text style={styles.bannerAction}>Sign in again</Text>
         </Pressable>
       )}
@@ -44,7 +44,7 @@ const Home = ({ session }: { readonly session: LoginResponse }) => {
   useAtomMount(client.presenceAtom)
   useAtomMount(client.deliveryDaemon)
   useAtomMount(client.settlementDaemon)
-  const connection = AsyncResult.getOrElse(useAtomValue(client.connectionAtom), (): Connection => "connecting")
+  const connection = AsyncResult.getOrElse(useAtomValue(client.connectionAtom), () => connecting)
   const startConversation = useAtomSet(client.startConversation)
   const renew = useAtomSet(client.renewCredential)
   useEffect(() => renew(session.token), [renew, session.token])
@@ -55,8 +55,8 @@ const Home = ({ session }: { readonly session: LoginResponse }) => {
     if (conversationId === groupConversationId) {
       startConversation({ kind: "group" })
     } else {
-      const peer = conversationId.slice("dm:".length).split(":").find((memberId) => memberId !== me)
-      if (peer !== undefined) startConversation({ kind: "dm", userId: UserId.make(peer) })
+      const peer = dmPeer(conversationId, me)
+      if (peer !== undefined) startConversation({ kind: "dm", userId: peer })
     }
     setOpenId(conversationId)
   }

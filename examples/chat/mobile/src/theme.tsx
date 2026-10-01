@@ -8,7 +8,6 @@ export const colors = {
   muted: "#667781",
   read: "#53bdeb",
   warning: "#fff4ce",
-  error: "#fde2e1",
   border: "#e9edef"
 }
 

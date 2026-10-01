@@ -41,8 +41,6 @@ export const loginAtom = appRuntime.fn<LoginRequest>()(
   })
 )
 
-export const logoutAtom = appRuntime.fn<void>()((_, get) => Effect.sync(() => get.set(sessionAtom, null)))
-
 const makeGraph = (session: LoginResponse) => {
   const layerCredential = layerSessionCredential(session.token)
   return ReplicaAtom.make(

@@ -13,7 +13,7 @@ import { useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as Option from "effect/Option"
 import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { FlatList, Pressable, StyleSheet, Text, View } from "react-native"
-import { type ChatClient, logoutAtom } from "./runtime.js"
+import { type ChatClient, sessionAtom } from "./runtime.js"
 import { Avatar, colors } from "./theme.js"
 
 const peerOf = (summary: ConversationSummary, me: UserId) => {
@@ -38,7 +38,7 @@ export const Conversations = ({ client, session, onOpen }: {
   readonly onOpen: (conversationId: ConversationId) => void
 }) => {
   const me = session.userId
-  const logout = useAtomSet(logoutAtom)
+  const setSession = useAtomSet(sessionAtom)
   const summariesResult = useAtomValue(client.summariesAtom)
   const synced = useAtomValue(client.syncedAtom)
   const members = AsyncResult.getOrElse(useAtomValue(client.membersAtom), () => [])
@@ -56,7 +56,7 @@ export const Conversations = ({ client, session, onOpen }: {
       <View style={styles.header}>
         <Avatar name={session.name} color={session.color} size={36} />
         <Text style={styles.me}>{session.name}</Text>
-        <Pressable accessibilityRole="button" onPress={() => logout(undefined)}>
+        <Pressable accessibilityRole="button" onPress={() => setSession(null)}>
           <Text style={styles.logout}>Log out</Text>
         </Pressable>
       </View>

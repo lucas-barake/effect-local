@@ -1,5 +1,5 @@
 import { type UserId, users } from "@effect-local/example-chat-shared/domain"
-import { useAtomSet, useAtomValue } from "@effect/atom-react"
+import { useAtom } from "@effect/atom-react"
 import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { useState } from "react"
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native"
@@ -9,8 +9,7 @@ import { Avatar, colors } from "./theme.js"
 export const Login = () => {
   const [userId, setUserId] = useState<UserId>(users[0].id)
   const [password, setPassword] = useState("")
-  const login = useAtomSet(loginAtom)
-  const result = useAtomValue(loginAtom)
+  const [result, login] = useAtom(loginAtom)
   const error = AsyncResult.matchWithError(result, {
     onInitial: () => undefined,
     onSuccess: () => undefined,

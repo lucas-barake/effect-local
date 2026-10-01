@@ -66,6 +66,12 @@ export const groupConversationId = ConversationId.make("group:everyone")
 export const dmConversationId = (firstUserId: UserId, secondUserId: UserId): ConversationId =>
   ConversationId.make(`dm:${[firstUserId, secondUserId].sort().join(":")}`)
 
+export const dmPeer = (conversationId: ConversationId, me: UserId): UserId | undefined => {
+  const peer = conversationId.slice("dm:".length).split(":").find((memberId) => memberId !== me)
+  if (peer === undefined) return undefined
+  return UserId.make(peer)
+}
+
 // ---------------------------------------------------------------------------
 // Models
 // ---------------------------------------------------------------------------

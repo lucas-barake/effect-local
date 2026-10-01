@@ -223,7 +223,6 @@ export const makeChatClient = <E extends { readonly _tag: string },>(graph: Repl
   const settlementDaemon = graph.runtime.atom(makeSettlementDaemonBody(failedMessages))
 
   return {
-    graph,
     presenceAtom,
     membersAtom,
     summariesAtom,

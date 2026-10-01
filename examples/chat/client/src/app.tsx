@@ -1,14 +1,15 @@
 import type { LoginResponse } from "@effect-local/example-chat-shared/auth"
-import type { Connection } from "@effect-local/example-chat-shared/connection"
+import { connecting, type Connection } from "@effect-local/example-chat-shared/connection"
 import {
   type ChatUser,
   type Conversation,
   type ConversationId,
   type ConversationSummary,
   dmConversationId,
+  dmPeer,
   findUser,
   groupConversationId,
-  UserId,
+  type UserId,
   users
 } from "@effect-local/example-chat-shared/domain"
 import { formatTime } from "@effect-local/example-chat-shared/time"
@@ -195,7 +196,7 @@ export const App = ({ session }: { readonly session: LoginResponse }) => {
   useAtomMount(client.presenceAtom)
   useAtomMount(client.deliveryDaemon)
   useAtomMount(client.settlementDaemon)
-  const connection = AsyncResult.getOrElse(useAtomValue(client.connectionAtom), (): Connection => "connecting")
+  const connection = AsyncResult.getOrElse(useAtomValue(client.connectionAtom), () => connecting)
   const logout = useAtomSet(logoutAtom)
   const startConversation = useAtomSet(client.startConversation)
   const [openId, setOpenId] = useState<ConversationId | null>(null)
@@ -205,8 +206,8 @@ export const App = ({ session }: { readonly session: LoginResponse }) => {
     if (conversationId === groupConversationId) {
       startConversation({ kind: "group" })
     } else {
-      const peer = conversationId.slice("dm:".length).split(":").find((memberId) => memberId !== me)
-      if (peer !== undefined) startConversation({ kind: "dm", userId: UserId.make(peer) })
+      const peer = dmPeer(conversationId, me)
+      if (peer !== undefined) startConversation({ kind: "dm", userId: peer })
     }
     setOpenId(conversationId)
   }
