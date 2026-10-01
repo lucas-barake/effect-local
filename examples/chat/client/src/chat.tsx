@@ -8,6 +8,7 @@ import {
   tickState,
   type UserId
 } from "@effect-local/example-chat-shared/domain"
+import { formatTime } from "@effect-local/example-chat-shared/time"
 import { useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as Duration from "effect/Duration"
 import * as Match from "effect/Match"
@@ -16,7 +17,6 @@ import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { Avatar } from "./avatar.js"
 import type { ChatClient } from "./replica.js"
-import { formatTime } from "./time.js"
 
 // ---------------------------------------------------------------------------
 // Tick icons (WhatsApp semantics): clock = in the outbox, one check = server

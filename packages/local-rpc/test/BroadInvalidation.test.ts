@@ -1,7 +1,6 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
-import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -19,6 +18,7 @@ import * as Layer from "effect/Layer"
 import { AtomRegistry } from "effect/reactivity"
 import * as Schema from "effect/Schema"
 import * as SqlSchema from "effect/sql/SqlSchema"
+import * as EphemeralClient from "../src/EphemeralClient.js"
 import * as ReplicaAtom from "../src/ReplicaAtom.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
@@ -187,7 +187,7 @@ const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
   clear: () => Effect.void,
   remove: () => Effect.void
 })
-const layerReplica = Layer.merge(
+const layerReplica = Layer.mergeAll(
   SqlReplica.layer({
     defaultScope: Protocol.ReplicationScope.make({ models: [Message.name, Note.name] }),
     maximumActiveSpaces: 4,
@@ -208,7 +208,8 @@ const layerReplica = Layer.merge(
     Layer.provide(layerDatabase),
     Layer.provide(layerHandlers)
   ),
-  layerEphemeralInactive
+  layerEphemeralInactive,
+  NodeCrypto.layer
 )
 
 describe("broad invalidation", () => {

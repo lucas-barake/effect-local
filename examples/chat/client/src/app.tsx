@@ -1,15 +1,18 @@
 import type { LoginResponse } from "@effect-local/example-chat-shared/auth"
+import { connecting, type Connection } from "@effect-local/example-chat-shared/connection"
 import {
   type ChatUser,
   type Conversation,
   type ConversationId,
   type ConversationSummary,
   dmConversationId,
+  dmPeer,
   findUser,
   groupConversationId,
-  UserId,
+  type UserId,
   users
 } from "@effect-local/example-chat-shared/domain"
+import { formatTime } from "@effect-local/example-chat-shared/time"
 import { useAtomMount, useAtomSet, useAtomValue } from "@effect/atom-react"
 import * as Match from "effect/Match"
 import * as Option from "effect/Option"
@@ -17,9 +20,8 @@ import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { useState } from "react"
 import { Avatar } from "./avatar.js"
 import { ChatView } from "./chat.js"
-import type { Connection } from "./connection.js"
-import { type ChatClient, clientFor, logoutAtom, reloadAtom } from "./replica.js"
-import { formatTime } from "./time.js"
+import type { ChatClient } from "./replica.js"
+import { clientFor, logoutAtom, reloadAtom } from "./replica.js"
 
 const conversationPeer = (conversation: Conversation, me: UserId): ChatUser | undefined => {
   if (conversation.kind === "group") return undefined
@@ -194,7 +196,7 @@ export const App = ({ session }: { readonly session: LoginResponse }) => {
   useAtomMount(client.presenceAtom)
   useAtomMount(client.deliveryDaemon)
   useAtomMount(client.settlementDaemon)
-  const connection = AsyncResult.getOrElse(useAtomValue(client.connectionAtom), (): Connection => "connecting")
+  const connection = AsyncResult.getOrElse(useAtomValue(client.connectionAtom), () => connecting)
   const logout = useAtomSet(logoutAtom)
   const startConversation = useAtomSet(client.startConversation)
   const [openId, setOpenId] = useState<ConversationId | null>(null)
@@ -204,8 +206,8 @@ export const App = ({ session }: { readonly session: LoginResponse }) => {
     if (conversationId === groupConversationId) {
       startConversation({ kind: "group" })
     } else {
-      const peer = conversationId.slice("dm:".length).split(":").find((memberId) => memberId !== me)
-      if (peer !== undefined) startConversation({ kind: "dm", userId: UserId.make(peer) })
+      const peer = dmPeer(conversationId, me)
+      if (peer !== undefined) startConversation({ kind: "dm", userId: peer })
     }
     setOpenId(conversationId)
   }

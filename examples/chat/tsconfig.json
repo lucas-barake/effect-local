@@ -5,6 +5,7 @@
     { "path": "shared" },
     { "path": "server" },
     { "path": "client" },
+    { "path": "mobile" },
     { "path": "test" },
     { "path": "e2e" }
   ]

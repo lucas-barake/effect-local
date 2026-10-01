@@ -2,6 +2,7 @@ import { NodeCrypto, NodeFileSystem } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
+import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as MutationRuntime from "@lucas-barake/effect-local-sql/MutationRuntime"
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as SyncEngine from "@lucas-barake/effect-local-sql/SyncEngine"
@@ -41,7 +42,6 @@ import * as TestClock from "effect/testing/TestClock"
 import * as BrowserReplica from "../src/BrowserReplica.js"
 import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as platform from "../src/internal/platform.js"
-import * as ReplicaAtom from "../src/ReplicaAtom.js"
 import * as testKit from "./multiTabKit.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000401")
@@ -137,6 +137,23 @@ const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
   remove: () => Effect.void
 })
 
+const layerSyncIdle = Layer.succeed(SyncEngine.SyncEngine, {
+  waitForCredentialChange: () => Effect.never,
+  transportGeneration: Effect.succeed(0),
+  waitForTransportChange: () => Effect.never,
+  submitBatch: () => Effect.never,
+  discard: () => Effect.never,
+  pull: () => Effect.never,
+  bootstrap: () => Effect.never,
+  watch: () => Stream.never
+})
+
+const layerOwnerIdle = Layer.mergeAll(
+  SqliteClient.layer({ filename: ":memory:" }),
+  layerSyncIdle,
+  layerEphemeralInactive
+)
+
 const StatusProfile = Ephemeral.member({ status: Schema.String })
 const Reaction = Ephemeral.make("reaction", { kind: "event", payload: { emoji: Schema.String } })
 const Wave = Ephemeral.make("wave", { kind: "event", payload: { hand: Schema.String } })
@@ -191,11 +208,11 @@ const statusChanges = (reactivity: Reactivity.Reactivity, space: Replica.Space) 
 interface EnvironmentOptions {
   readonly layerEphemeral?: Layer.Layer<EphemeralClient.EphemeralClient>
   readonly submitAllowed?: () => boolean
-  readonly sharding?: BrowserReplica.Options<typeof definition, never, never>["sharding"]
+  readonly sharding?: BrowserReplica.Options<typeof definition>["sharding"]
   readonly runIndex?: (query: Transaction.Query) => Effect.Effect<number, ListTodosError>
   readonly name?: string
   readonly kit?: testKit.MemoryPlatform
-  readonly retryDelay?: BrowserReplica.Options<typeof definition, never, never>["retryDelay"]
+  readonly retryDelay?: BrowserReplica.Options<typeof definition>["retryDelay"]
   readonly pullGate?: Effect.Effect<void>
 }
 
@@ -233,20 +250,23 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
       Layer.provideMerge(layerDatabaseLifecycle(database)),
       Layer.tap(() => Ref.update(databaseOpens, (count) => count + 1))
     )
-  const layerReplicaWith = (visibility: platform.TabVisibilityService, build: Build = currentBuild) =>
-    BrowserReplica.layer({
+  const layerReplicaWith = (visibility: platform.TabVisibilityService, build: Build = currentBuild) => {
+    const layerOwner = Layer.merge(layerDatabaseFor(build.database), layerSync)
+    const layerVisibility = Layer.succeed(platform.TabVisibility, visibility)
+    return BrowserReplica.layer(layerOwner, {
       name: environmentOptions.name ?? "tabs",
       definition: build.definition,
-      layerDatabase: layerDatabaseFor(build.database),
-      layerSync,
       spaces: [spaceId],
       profiles: { status: StatusProfile },
       ephemerals: build.ephemerals,
-      layerPlatform: Layer.mergeAll(kit.layerAll, Layer.succeed(platform.TabVisibility, visibility), NodeCrypto.layer),
       requestPersistence: false,
       retryDelay: environmentOptions.retryDelay ?? "100 millis",
       sharding: environmentOptions.sharding
-    }).pipe(Layer.provide(layerHandlersWith(environmentOptions.runIndex ?? firstRunIndex)))
+    }).pipe(
+      Layer.provide(layerHandlersWith(environmentOptions.runIndex ?? firstRunIndex)),
+      Layer.provide(Layer.mergeAll(kit.layerAll, layerVisibility, NodeCrypto.layer))
+    )
+  }
   const layerReplica = Layer.unwrap(
     testKit.makeMemoryVisibility(true).pipe(Effect.map((visibility) => layerReplicaWith(visibility.service)))
   )
@@ -1195,26 +1215,11 @@ describe("BrowserReplica", () => {
         NodeCrypto.layer
       )
       const outcome = yield* Layer.build(
-        BrowserReplica.layer({
-          name: "corrupt-identity",
-          definition,
-          layerDatabase: SqliteClient.layer({ filename: ":memory:" }),
-          layerSync: Layer.merge(
-            Layer.succeed(SyncEngine.SyncEngine, {
-              waitForCredentialChange: () => Effect.never,
-              transportGeneration: Effect.succeed(0),
-              waitForTransportChange: () => Effect.never,
-              submitBatch: () => Effect.never,
-              discard: () => Effect.never,
-              pull: () => Effect.never,
-              bootstrap: () => Effect.never,
-              watch: () => Stream.never
-            }),
-            layerEphemeralInactive
-          ),
-          layerPlatform,
-          requestPersistence: false
-        }).pipe(Layer.provide(layerHandlers), Layer.provide(Reactivity.layer))
+        BrowserReplica.layer(layerOwnerIdle, { name: "corrupt-identity", definition, requestPersistence: false }).pipe(
+          Layer.provide(layerHandlers),
+          Layer.provide(Reactivity.layer),
+          Layer.provide(layerPlatform)
+        )
       ).pipe(
         Effect.as("built" as const),
         Effect.catchTag("BrowserStorageError", (error) => Effect.succeed(error.operation))
@@ -1244,26 +1249,11 @@ describe("BrowserReplica", () => {
         Layer.succeed(Crypto.Crypto, zeroCrypto)
       )
       yield* Layer.build(
-        BrowserReplica.layer({
-          name: "platform-crypto",
-          definition,
-          layerDatabase: SqliteClient.layer({ filename: ":memory:" }),
-          layerSync: Layer.merge(
-            Layer.succeed(SyncEngine.SyncEngine, {
-              waitForCredentialChange: () => Effect.never,
-              transportGeneration: Effect.succeed(0),
-              waitForTransportChange: () => Effect.never,
-              submitBatch: () => Effect.never,
-              discard: () => Effect.never,
-              pull: () => Effect.never,
-              bootstrap: () => Effect.never,
-              watch: () => Stream.never
-            }),
-            layerEphemeralInactive
-          ),
-          layerPlatform,
-          requestPersistence: false
-        }).pipe(Layer.provide(layerHandlers), Layer.provide(Reactivity.layer))
+        BrowserReplica.layer(layerOwnerIdle, { name: "platform-crypto", definition, requestPersistence: false }).pipe(
+          Layer.provide(layerHandlers),
+          Layer.provide(Reactivity.layer),
+          Layer.provide(layerPlatform)
+        )
       ).pipe(Effect.forkScoped)
       assert.strictEqual(yield* Deferred.await(stored), "cli_00000000-0000-4000-8000-000000000000")
     }, Effect.scoped)

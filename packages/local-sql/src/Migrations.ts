@@ -14,6 +14,7 @@ import * as SqlSchema from "effect/sql/SqlSchema"
 import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Dialect from "./internal/dialect.js"
+import * as SqliteIdentifier from "./internal/sqliteIdentifier.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 
 export type Catalog = "Client" | "Server"
@@ -1044,7 +1045,7 @@ export const serverPostgresCatalog = Object.freeze([postgresBaseline])
 export const client = Effect.fnUntraced(function*(options: {
   readonly definition: Definition.Any
   readonly spaceId?: Identity.SpaceId
-  readonly clientId: Identity.ClientId
+  readonly clientId?: Identity.ClientId | undefined
   readonly migration?: Options
 }) {
   const sql = yield* SqlClient.SqlClient
@@ -1086,7 +1087,10 @@ export const client = Effect.fnUntraced(function*(options: {
       if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
       return new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
     }))
-    if (Option.isSome(beforeMigration) && beforeMigration.value.client_id !== options.clientId) {
+    if (
+      options.clientId !== undefined && Option.isSome(beforeMigration) &&
+      beforeMigration.value.client_id !== options.clientId
+    ) {
       return yield* new ReplicaError.ReplicaIdentityMismatch({
         expectedClientId: options.clientId,
         actualClientId: beforeMigration.value.client_id
@@ -1094,27 +1098,30 @@ export const client = Effect.fnUntraced(function*(options: {
     }
   }
   yield* runCatalogWith(lane, "Client", clientCatalog, options.migration ?? defaultOptions)
-  const existing = yield* lane.withStatement(
-    SqlSchema.findOneOption({
+  yield* lane.withStatement(sql`INSERT INTO effect_local_client_meta
+    (singleton, client_id) VALUES (1, ${options.clientId ?? SqliteIdentifier.random(sql, "cli")})
+    ON CONFLICT (singleton) DO NOTHING`)
+  const stored = yield* lane.withStatement(
+    SqlSchema.findOne({
       Request: Schema.Void,
       Result: ClientIdentityRow,
       execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
     })(undefined)
   ).pipe(
-    Effect.mapError((cause) => {
-      if (SqlError.isSqlError(cause)) return StorageUnavailable.make(cause)
-      return new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+      SchemaError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })),
+      NoSuchElementError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause }))
     })
   )
-  if (Option.isSome(existing) && existing.value.client_id !== options.clientId) {
+  if (options.clientId !== undefined && stored.client_id !== options.clientId) {
     return yield* new ReplicaError.ReplicaIdentityMismatch({
       expectedClientId: options.clientId,
-      actualClientId: existing.value.client_id
+      actualClientId: stored.client_id
     })
   }
-  yield* lane.withStatement(sql`INSERT INTO effect_local_client_meta
-    (singleton, client_id) VALUES (1, ${options.clientId})
-    ON CONFLICT (singleton) DO NOTHING`)
   if (options.spaceId !== undefined) {
     yield* lane.withStatement(sql`INSERT INTO effect_local_client_spaces
         (space_id, membership_incarnation, definition_hash, schema_version, schema_hash, schema_generation,
@@ -1122,15 +1129,12 @@ export const client = Effect.fnUntraced(function*(options: {
           next_local_sequence, server_cursor, visible_revision, requested_generation, completed_generation,
           installed_snapshot_sequence, installed_snapshot_terminal_sequence)
         VALUES (${options.spaceId},
-          ('inc_' || lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
-            substr(lower(hex(randomblob(2))), 2) || '-' ||
-            substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))), 2) || '-' ||
-            lower(hex(randomblob(6)))), ${options.definition.hash},
+          ${SqliteIdentifier.random(sql, "inc")}, ${options.definition.hash},
           ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash}, 0, 0, 0, 0,
           1, 0, 0, 0, 0, 0, 0)
         ON CONFLICT (space_id) DO NOTHING`)
   }
-  return undefined
+  return stored.client_id
 }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const server = Effect.fnUntraced(function*(options: Options = defaultOptions) {

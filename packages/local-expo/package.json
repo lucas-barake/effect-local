@@ -1,0 +1,76 @@
+{
+  "name": "@lucas-barake/effect-local-expo",
+  "version": "0.1.0",
+  "description": "Expo SQLite, crypto, and WebSocket integration for Effect Local replicas on React Native",
+  "homepage": "https://github.com/lucas-barake/effect-local#readme",
+  "bugs": "https://github.com/lucas-barake/effect-local/issues",
+  "keywords": [
+    "effect",
+    "local-first",
+    "expo",
+    "react-native",
+    "sqlite"
+  ],
+  "engines": {
+    "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
+  },
+  "type": "module",
+  "license": "MIT",
+  "sideEffects": [],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lucas-barake/effect-local.git",
+    "directory": "packages/local-expo"
+  },
+  "exports": {
+    "./package.json": "./package.json",
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts",
+    "./internal/*": null
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true,
+    "exports": {
+      "./package.json": "./package.json",
+      ".": "./dist/index.js",
+      "./*": "./dist/*.js",
+      "./internal/*": null
+    }
+  },
+  "files": [
+    "README.md",
+    "LICENSE",
+    "src/**/*.ts",
+    "dist/**/*.js",
+    "dist/**/*.js.map",
+    "dist/**/*.d.ts",
+    "dist/**/*.d.ts.map"
+  ],
+  "scripts": {
+    "build": "tsgo -b tsconfig.json",
+    "build:tsc": "tsc -b tsconfig.json",
+    "check": "tsgo -b tsconfig.json",
+    "test": "vitest --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@lucas-barake/effect-local": "workspace:^",
+    "@lucas-barake/effect-local-sql": "workspace:^"
+  },
+  "peerDependencies": {
+    "effect": ">=4.0.0-rc.118 <4.0.1",
+    "expo-crypto": "^57.0.0",
+    "expo-sqlite": "^57.0.0"
+  },
+  "devDependencies": {
+    "@effect/platform-node": "4.0.0-rc.118",
+    "@effect/sql-sqlite-node": "4.0.0-rc.118",
+    "@lucas-barake/effect-local-rpc": "workspace:^",
+    "effect": "4.0.0-rc.118",
+    "expo": "57.0.26",
+    "expo-crypto": "57.0.3",
+    "expo-sqlite": "57.0.3",
+    "react": "19.2.3",
+    "react-native": "0.86.3"
+  }
+}

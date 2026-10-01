@@ -34,11 +34,9 @@ import * as TabScheduler from "./internal/tabScheduler.js"
 
 export { BrowserStorageError } from "./BrowserStorageError.js"
 
-export interface Options<D extends Definition.Any, ED extends Tagged, ES extends Tagged,> {
+export interface Options<D extends Definition.Any,> {
   readonly name: string
   readonly definition: D
-  readonly layerDatabase: Layer.Layer<SqlClient.SqlClient, ED>
-  readonly layerSync: Layer.Layer<SyncEngine.SyncEngine | EphemeralClient.EphemeralClient, ES>
   readonly spaces?: Iterable<Identity.SpaceId> | undefined
   readonly replica?: Omit<SqlReplica.Options<D>, "definition" | "clientId" | "initialSpaces"> | undefined
   readonly ephemerals?: ReadonlyArray<Ephemeral.Any> | undefined
@@ -46,7 +44,6 @@ export interface Options<D extends Definition.Any, ED extends Tagged, ES extends
   readonly requestPersistence?: boolean | undefined
   readonly retryDelay?: Duration.Input | undefined
   readonly sharding?: Partial<ShardingConfig.ShardingConfig["Service"]> | undefined
-  readonly layerPlatform?: Layer.Layer<Platform> | undefined
 }
 
 interface Tagged {
@@ -101,32 +98,37 @@ const loadClientId = Effect.fnUntraced(function*(
   return generated
 }, Effect.scoped)
 
-export const layer = <D extends Definition.Any, ED extends Tagged, ES extends Tagged,>(
-  options: Options<D, ED, ES>
+export const layer = <D extends Definition.Any, E extends Tagged, R,>(
+  layerOwner: Layer.Layer<SqlClient.SqlClient | SyncEngine.SyncEngine | EphemeralClient.EphemeralClient, E, R>,
+  options: Options<D>
 ): Layer.Layer<
-  Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient | Sharding.Sharding,
+  | Replica.Replica
+  | QueryReactivity.QueryReactivity
+  | EphemeralClient.EphemeralClient
+  | Sharding.Sharding
+  | Crypto.Crypto,
   BrowserStorageError,
-  Reactivity.Reactivity | MutationRuntime.Handlers<D> | QueryExecutor.Handlers<D>
+  Reactivity.Reactivity | MutationRuntime.Handlers<D> | QueryExecutor.Handlers<D> | Platform | R
 > =>
   Layer.effectContext(Effect.gen(function*() {
     const scheduler = yield* TabScheduler.make
-    return yield* build(options).pipe(Effect.provideService(Scheduler.Scheduler, scheduler))
+    return yield* build(layerOwner, options).pipe(Effect.provideService(Scheduler.Scheduler, scheduler))
   }))
 
-const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends Tagged, ES extends Tagged,>(
-  options: Options<D, ED, ES>
+const build = Effect.fnUntraced(function*<D extends Definition.Any, E extends Tagged, R,>(
+  layerOwner: Layer.Layer<SqlClient.SqlClient | SyncEngine.SyncEngine | EphemeralClient.EphemeralClient, E, R>,
+  options: Options<D>
 ) {
   const reactivity = yield* Reactivity.Reactivity
   const handlers = Context.pick(
     ...options.definition.mutations.map((mutation) => mutation.handler),
     ...options.definition.queries.map((query) => query.handler)
   )(yield* Effect.context<MutationRuntime.Handlers<D> | QueryExecutor.Handlers<D>>())
-  const platformContext = yield* Layer.build(options.layerPlatform ?? layerPlatformBrowser)
-  const crypto = Context.get(platformContext, Crypto.Crypto)
-  const locks = Context.get(platformContext, platform.WebLocks)
-  const channels = Context.get(platformContext, platform.TabChannel)
-  const visibility = Context.get(platformContext, platform.TabVisibility)
-  const identities = Context.get(platformContext, platform.ClientIdentityStore)
+  const crypto = yield* Crypto.Crypto
+  const locks = yield* platform.WebLocks
+  const channels = yield* platform.TabChannel
+  const visibility = yield* platform.TabVisibility
+  const identities = yield* platform.ClientIdentityStore
   const profiles = new Map<string, Ephemeral.AnyMember>(Object.entries(options.profiles ?? {}))
   const profileNames = new Map<Ephemeral.AnyMember, string>()
   for (const [name, profile] of profiles) profileNames.set(profile, name)
@@ -150,25 +152,22 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
     initialSpaces: options.spaces ?? []
   }).pipe(
     Layer.provide(Layer.succeedContext(handlers)),
-    Layer.provide(options.layerDatabase),
-    Layer.provide(Layer.succeed(Crypto.Crypto, crypto)),
-    Layer.provideMerge(options.layerSync)
+    Layer.provideMerge(layerOwner)
   )
-  let layerOwner = layerStack
+  let layerTerm = layerStack
   if (options.requestPersistence !== false) {
-    layerOwner = Layer.merge(layerStack, layerRequestPersistence)
+    layerTerm = Layer.merge(layerStack, layerRequestPersistence)
   }
 
   const gate = yield* BuildGate.make({ host, build: identity, names, locks, channels })
-  const owner = yield* ReplicaOwner.make({
+  const owner = yield* ReplicaOwner.make(layerTerm, {
     host,
     names,
     locks,
     channels,
     visibility,
     retryDelay,
-    gate,
-    layerOwner
+    gate
   })
   const cluster = yield* TabCluster.make({
     host,
@@ -213,6 +212,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, ED extends T
   return Context.make(Replica.Replica, proxy.replica).pipe(
     Context.add(QueryReactivity.QueryReactivity, proxy.queryReactivity),
     Context.add(EphemeralClient.EphemeralClient, proxy.ephemeral),
-    Context.add(Sharding.Sharding, sharding)
+    Context.add(Sharding.Sharding, sharding),
+    Context.add(Crypto.Crypto, crypto)
   )
 })

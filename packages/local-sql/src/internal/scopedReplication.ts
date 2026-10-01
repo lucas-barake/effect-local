@@ -552,7 +552,7 @@ export const make = (options: Options) => {
         selection
       )
       const visibleEntities = Array.from(projected.target.values())
-      const orderedEntities = visibleEntities.toSorted((left, right) => {
+      const orderedEntities = [...visibleEntities].sort((left, right) => {
         if (left.identity < right.identity) return -1
         if (left.identity > right.identity) return 1
         return 0
@@ -829,7 +829,7 @@ export const make = (options: Options) => {
         if (all.has(identity)) disposition = Protocol.Retract.make({ entity })
         if (row.disposition !== disposition._tag) changes.set(identity, disposition)
       }
-      return [...changes.entries()].toSorted(([left], [right]) => {
+      return [...changes.entries()].sort(([left], [right]) => {
         if (left < right) return -1
         if (left > right) return 1
         return 0
@@ -1092,7 +1092,7 @@ export const make = (options: Options) => {
           changes.set(identity, Protocol.Retract.make({ entity }))
         }
       }
-      const ordered = [...changes.entries()].toSorted(([left], [right]) => {
+      const ordered = [...changes.entries()].sort(([left], [right]) => {
         if (left < right) return -1
         if (left > right) return 1
         return 0

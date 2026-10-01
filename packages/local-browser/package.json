@@ -63,7 +63,6 @@
     "@effect/sql-sqlite-node": "4.0.0-rc.118",
     "@effect/sql-sqlite-wasm": "4.0.0-rc.118",
     "@effect/wa-sqlite": "0.1.2",
-    "@lucas-barake/effect-local-test": "workspace:^",
     "effect": "4.0.0-rc.118"
   }
 }

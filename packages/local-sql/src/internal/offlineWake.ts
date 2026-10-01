@@ -282,7 +282,7 @@ export const make = Effect.fnUntraced(function*<R,>(
       }
       uniqueRecipients.add(decoded.value)
     }
-    const recipients = [...uniqueRecipients].toSorted()
+    const recipients = [...uniqueRecipients].sort()
     const pending = yield* Effect.forEach(recipients, (clientId) =>
       Identity.makeWakeId.pipe(
         Effect.provideService(Crypto.Crypto, crypto),
@@ -603,7 +603,7 @@ export const make = Effect.fnUntraced(function*<R,>(
       }).pipe(Effect.mapError(StorageUnavailable.make))
       if (spaces.length === 0) break
       spaceClaims += spaces.length
-      const orderedSpaces = spaces.toSorted((left, right) => left.space_id.localeCompare(right.space_id))
+      const orderedSpaces = [...spaces].sort((left, right) => left.space_id.localeCompare(right.space_id))
       yield* Effect.forEach(orderedSpaces, (claimed) =>
         expand(claimed).pipe(Effect.ensuring(
           releaseSpaceClaim(claimed).pipe(
@@ -627,7 +627,7 @@ export const make = Effect.fnUntraced(function*<R,>(
       }).pipe(Effect.mapError(StorageUnavailable.make))
       if (clients.length === 0) break
       clientClaims += clients.length
-      const orderedClients = clients.toSorted((left, right) => {
+      const orderedClients = [...clients].sort((left, right) => {
         const spaceOrder = left.space_id.localeCompare(right.space_id)
         if (spaceOrder !== 0) return spaceOrder
         return left.client_id.localeCompare(right.client_id)

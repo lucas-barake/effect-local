@@ -24,6 +24,7 @@ import { runInNewContext } from "node:vm"
 import { assert, describe, test } from "vitest"
 import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as Codec from "../src/internal/codec.js"
+import * as SqliteIdentifier from "../src/internal/sqliteIdentifier.js"
 import * as Migrations from "../src/Migrations.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 import * as SyncEngine from "../src/SyncEngine.js"
@@ -153,11 +154,7 @@ const measure = async (spaceCount: Scale): Promise<Measurement> => {
             next_local_sequence, server_cursor, visible_revision, requested_generation, completed_generation,
             installed_snapshot_sequence, installed_snapshot_terminal_sequence, desired_scope_json,
             desired_scope_digest, scope_generation)
-          VALUES (${spaceId},
-            ('inc_' || lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
-              substr(lower(hex(randomblob(2))), 2) || '-' ||
-              substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))), 2) || '-' ||
-              lower(hex(randomblob(6)))), ${Domain.definition.hash},
+          VALUES (${spaceId}, ${SqliteIdentifier.random(sql, "inc")}, ${Domain.definition.hash},
             ${Domain.definition.schemaIdentity.version}, ${Domain.definition.schemaIdentity.hash}, 0, 0, 0, 0,
             1, 0, 0, 1, 0, 0, 0, ${scopeJson}, ${scopeDigest}, 1)`, { discard: true })
         )

@@ -114,7 +114,7 @@ const fromUnknown = (value: unknown, state: State): Descriptor => {
         return Defect.invalid("Schema descriptors cannot represent accessor properties")
       }
       return [[fromPropertyKey(key), property.value] as const]
-    }).toSorted(([left], [right]) => compareDescriptor(left, right))
+    }).sort(([left], [right]) => compareDescriptor(left, right))
     const entries = properties.map(([key, propertyValue]) => [key, fromUnknown(propertyValue, state)] as const)
     descriptor = { _tag: "Object", entries }
   }
@@ -169,7 +169,7 @@ const fromAnnotations = (
   const result: Record<string, Descriptor> = {}
   if (typeof annotations.identifier === "string") result.identifier = annotations.identifier
   if ("brands" in annotations && Array.isArray(annotations.brands)) {
-    result.brands = Array.from(new Set(annotations.brands.map(String))).toSorted()
+    result.brands = Array.from(new Set(annotations.brands.map(String))).sort()
   }
   if ("meta" in annotations && annotations.meta !== undefined) {
     result.meta = fromUnknown(annotations.meta, state)
@@ -256,7 +256,7 @@ const getBuiltInTransformations = (): ReadonlyArray<BuiltInTransformation> => {
     }
   }
   for (
-    const [name, value] of Object.entries(Schema).toSorted(([left], [right]) => {
+    const [name, value] of Object.entries(Schema).sort(([left], [right]) => {
       if (left < right) return -1
       if (left > right) return 1
       return 0
@@ -400,7 +400,7 @@ const fromAST = (
       break
     case "Enum":
       node.enums = ast.enums.map(([name, value]) => [name, value] as const)
-        .toSorted(compareDescriptor)
+        .sort(compareDescriptor)
       break
     case "TemplateLiteral":
       node.parts = ast.parts.map((part) => fromAST(part, state, trustedBehavior))
@@ -417,7 +417,7 @@ const fromAST = (
       node.propertySignatures = ast.propertySignatures.map((property) => [
         fromPropertyKey(property.name),
         fromAST(property.type, state, trustedBehavior)
-      ]).toSorted(([leftName, leftType], [rightName, rightType]) => {
+      ]).sort(([leftName, leftType], [rightName, rightType]) => {
         const nameOrder = compareDescriptor(leftName, rightName)
         if (nameOrder === 0) return compareDescriptor(leftType, rightType)
         return nameOrder
@@ -483,7 +483,7 @@ export const make = (schema: Schema.Constraint, options?: MakeOptions): Descript
   }
   const root = fromAST(schema.ast, state, false)
   const nodes = Array.from(state.nodes)
-    .toSorted(([left], [right]) => {
+    .sort(([left], [right]) => {
       if (left < right) return -1
       if (left > right) return 1
       return 0

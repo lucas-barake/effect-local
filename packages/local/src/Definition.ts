@@ -64,14 +64,14 @@ export function make(options: {
     version: model.version,
     key: SchemaDescriptor.make(model.key),
     schema: SchemaDescriptor.make(model.schema)
-  })).toSorted(byName)
+  })).sort(byName)
   const mutations = options.mutations.map((mutation) => ({
     name: mutation.name,
     version: mutation.version,
     payload: SchemaDescriptor.make(mutation.payloadSchema),
     success: SchemaDescriptor.make(mutation.successSchema),
     rejection: SchemaDescriptor.make(mutation.rejectionSchema)
-  })).toSorted(byName)
+  })).sort(byName)
   const schemaIdentity = Identity.SchemaIdentity.make({
     version,
     hash: Identity.SchemaHash.make(Canonical.hash({ format: 1, models, mutations }))
@@ -84,7 +84,7 @@ export function make(options: {
       payload: SchemaDescriptor.make(query.payloadSchema),
       success: SchemaDescriptor.make(query.successSchema),
       error: SchemaDescriptor.make(query.errorSchema)
-    })).toSorted(byName)
+    })).sort(byName)
   })
   const indexLayoutHash = Canonical.hash({
     format: 1,
@@ -104,7 +104,7 @@ export function make(options: {
           schema: SchemaDescriptor.make(component.schema)
         }))
       }))
-    ).toSorted((left, right) => {
+    ).sort((left, right) => {
       const leftName = `${left.model}\u0000${left.name}`
       const rightName = `${right.model}\u0000${right.name}`
       if (leftName < rightName) return -1

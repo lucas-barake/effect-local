@@ -1,16 +1,16 @@
-import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
 import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
 import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
-import type * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import type * as Query from "@lucas-barake/effect-local/Query"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Cause from "effect/Cause"
+import type * as Crypto from "effect/Crypto"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
@@ -23,6 +23,7 @@ import type * as AtomRegistry from "effect/reactivity/AtomRegistry"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
+import * as EphemeralClient from "./EphemeralClient.js"
 
 class QueryKey implements Equal.Equal {
   readonly spaceId: Identity.SpaceId
@@ -78,18 +79,33 @@ class MutationKey implements Equal.Equal {
   }
 }
 
+export interface EphemeralTarget {
+  readonly spaceId: Identity.SpaceId
+  readonly member?: Protocol.EphemeralMember | undefined
+}
+
+export interface EphemeralSessionOptions<M extends Ephemeral.AnyMember,> extends EphemeralTarget {
+  readonly value: Ephemeral.Payload<M>
+  readonly ttl: Duration.Input
+}
+
+const memberIdentity = (member: Protocol.EphemeralMember | undefined) => {
+  if (member === undefined) return "graph"
+  return `${member.clientId}:${member.membershipIncarnation}`
+}
+
 class EphemeralSessionKey implements Equal.Equal {
   readonly value: string
   readonly profile: Ephemeral.AnyMember
-  readonly options: EphemeralClient.SessionOptions<Ephemeral.AnyMember>
-  constructor(profile: Ephemeral.AnyMember, options: EphemeralClient.SessionOptions<Ephemeral.AnyMember>) {
+  readonly options: EphemeralSessionOptions<Ephemeral.AnyMember>
+  constructor(profile: Ephemeral.AnyMember, options: EphemeralSessionOptions<Ephemeral.AnyMember>) {
     this.profile = profile
     this.options = options
     // oxlint-disable-next-line effect-local/noManualEffectBoundary -- Atom family keys are built synchronously; the session effect re-encodes the value through the Effect codec, so this encode only derives the cache identity.
     const encoded = Schema.encodeSync(profile.payloadSchema)(options.value)
-    this.value = `${options.spaceId}:${options.member.clientId}:${options.member.membershipIncarnation}:${
-      Duration.toMillis(options.ttl)
-    }:${Canonical.hash(encoded)}`
+    this.value = `${options.spaceId}:${memberIdentity(options.member)}:${Duration.toMillis(options.ttl)}:${
+      Canonical.hash(encoded)
+    }`
   }
   [Equal.symbol](that: unknown): boolean {
     return that instanceof EphemeralSessionKey && this.value === that.value && this.profile === that.profile
@@ -99,31 +115,15 @@ class EphemeralSessionKey implements Equal.Equal {
   }
 }
 
-class EphemeralEventKey implements Equal.Equal {
+class EphemeralProjectionKey<D extends Ephemeral.AnyEvent | Ephemeral.AnyState,> implements Equal.Equal {
   readonly session: object
-  readonly definition: Ephemeral.AnyEvent
-  constructor(session: object, definition: Ephemeral.AnyEvent) {
+  readonly definition: D
+  constructor(session: object, definition: D) {
     this.session = session
     this.definition = definition
   }
   [Equal.symbol](that: unknown): boolean {
-    return that instanceof EphemeralEventKey && this.session === that.session &&
-      this.definition === that.definition
-  }
-  [Hash.symbol](): number {
-    return Hash.hash(this.session) ^ Hash.hash(this.definition)
-  }
-}
-
-class EphemeralStateKey implements Equal.Equal {
-  readonly session: object
-  readonly definition: Ephemeral.AnyState
-  constructor(session: object, definition: Ephemeral.AnyState) {
-    this.session = session
-    this.definition = definition
-  }
-  [Equal.symbol](that: unknown): boolean {
-    return that instanceof EphemeralStateKey && this.session === that.session &&
+    return that instanceof EphemeralProjectionKey && this.session === that.session &&
       this.definition === that.definition
   }
   [Hash.symbol](): number {
@@ -136,11 +136,11 @@ class EphemeralStateKey implements Equal.Equal {
 class EphemeralTargetKey<D extends Ephemeral.Any,> implements Equal.Equal {
   readonly value: string
   readonly definition: D
-  readonly target: EphemeralClient.PublishTarget
-  constructor(definition: D, target: EphemeralClient.PublishTarget) {
+  readonly target: EphemeralTarget
+  constructor(definition: D, target: EphemeralTarget) {
     this.definition = definition
     this.target = target
-    this.value = `${target.spaceId}:${target.member.clientId}:${target.member.membershipIncarnation}`
+    this.value = `${target.spaceId}:${memberIdentity(target.member)}`
   }
   [Equal.symbol](that: unknown): boolean {
     return that instanceof EphemeralTargetKey && this.value === that.value &&
@@ -164,9 +164,9 @@ class EphemeralMembersKey implements Equal.Equal {
   }
 }
 
-export const make = <E,>(
+export const make = <E extends { readonly _tag: string }, Services = never,>(
   layer: Layer.Layer<
-    Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient,
+    Replica.Replica | QueryReactivity.QueryReactivity | EphemeralClient.EphemeralClient | Crypto.Crypto | Services,
     E,
     AtomRegistry.AtomRegistry | Reactivity.Reactivity
   >,
@@ -179,6 +179,12 @@ export const make = <E,>(
   const runtime = factory(layer)
   const idleTTL = Duration.toMillis(options?.idleTTL ?? Duration.seconds(30))
   const reactivity = runtime.atom(Effect.service(Reactivity.Reactivity))
+  const member = runtime.atom(
+    Effect.all({ clientId: Identity.makeClientId, membershipIncarnation: Identity.makeMembershipIncarnation }).pipe(
+      Effect.map((fields) => Protocol.EphemeralMember.make(fields)),
+      Effect.catchTag("PlatformError", (error) => Effect.die(error))
+    )
+  ).pipe(Atom.setIdleTTL(idleTTL))
 
   const refreshOn = (keys: ReadonlyArray<string>) =>
   <A, EA,>(
@@ -221,18 +227,20 @@ export const make = <E,>(
   type ProjectionError = Ephemeral.DecodeError | SessionError | Cause.NoSuchElementError
 
   const ephemeralSessions = Atom.family((key: EphemeralSessionKey) =>
-    runtime.atom(
-      EphemeralClient.EphemeralClient.use((client) => client.session(key.profile, key.options))
-    ).pipe(Atom.setIdleTTL(idleTTL))
+    runtime.atom(Effect.fnUntraced(function*(get) {
+      const resolved = key.options.member ?? (yield* get.result(member))
+      const client = yield* EphemeralClient.EphemeralClient
+      return yield* client.session(key.profile, { ...key.options, member: resolved })
+    })).pipe(Atom.setIdleTTL(idleTTL))
   )
   const ephemeral = <M extends Ephemeral.AnyMember,>(
     profile: M,
-    request: EphemeralClient.SessionOptions<M>
+    request: EphemeralSessionOptions<M>
   ): SessionAtom<M> =>
     // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The session family erases the member schema type; the atom for this key was built from this exact profile, so the runtime values already match M.
     ephemeralSessions(new EphemeralSessionKey(profile, request)) as unknown as SessionAtom<M>
 
-  const ephemeralEventsFamily = Atom.family((key: EphemeralEventKey) => {
+  const ephemeralEventsFamily = Atom.family((key: EphemeralProjectionKey<Ephemeral.AnyEvent>) => {
     // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- Projection keys erase the session atom type; only session atoms from this graph construct these keys.
     const source = key.session as SessionSource
     return runtime.atom((get) =>
@@ -246,11 +254,11 @@ export const make = <E,>(
     definition: D
   ): Atom.Atom<AsyncResult.AsyncResult<EphemeralClient.EventEnvelope<D>, ProjectionError>> =>
     // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The projection family erases the definition type; the atom for this key decodes with this exact definition, so the runtime values already match D.
-    ephemeralEventsFamily(new EphemeralEventKey(session, definition)) as unknown as Atom.Atom<
+    ephemeralEventsFamily(new EphemeralProjectionKey(session, definition)) as unknown as Atom.Atom<
       AsyncResult.AsyncResult<EphemeralClient.EventEnvelope<D>, ProjectionError>
     >
 
-  const ephemeralStateFamily = Atom.family((key: EphemeralStateKey) => {
+  const ephemeralStateFamily = Atom.family((key: EphemeralProjectionKey<Ephemeral.AnyState>) => {
     // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- Projection keys erase the session atom type; only session atoms from this graph construct these keys.
     const source = key.session as SessionSource
     return runtime.atom((get) =>
@@ -266,7 +274,7 @@ export const make = <E,>(
     AsyncResult.AsyncResult<ReadonlyArray<EphemeralClient.StateEntry<D>>, ProjectionError>
   > =>
     // oxlint-disable-next-line effect/noAs, typescript/no-unsafe-type-assertion -- The projection family erases the definition type; the atom for this key decodes with this exact definition, so the runtime values already match D.
-    ephemeralStateFamily(new EphemeralStateKey(session, definition)) as unknown as Atom.Atom<
+    ephemeralStateFamily(new EphemeralProjectionKey(session, definition)) as unknown as Atom.Atom<
       AsyncResult.AsyncResult<ReadonlyArray<EphemeralClient.StateEntry<D>>, ProjectionError>
     >
 
@@ -293,30 +301,32 @@ export const make = <E,>(
       readonly ttl: Duration.Input
       readonly key?: unknown
     }>()(
-      (input) =>
-        Effect.yieldNow.pipe(Effect.andThen(EphemeralClient.EphemeralClient.use((client) => {
-          if (key.definition.kind === "event") {
-            return client.publish(key.definition, {
-              spaceId: key.target.spaceId,
-              member: key.target.member,
-              payload: input.payload,
-              ttl: input.ttl
-            })
-          }
-          return client.publish(key.definition, {
+      Effect.fnUntraced(function*(input, get) {
+        yield* Effect.yieldNow
+        const resolved = key.target.member ?? (yield* get.result(member))
+        const client = yield* EphemeralClient.EphemeralClient
+        if (key.definition.kind === "event") {
+          return yield* client.publish(key.definition, {
             spaceId: key.target.spaceId,
-            member: key.target.member,
-            key: input.key,
+            member: resolved,
             payload: input.payload,
             ttl: input.ttl
           })
-        }))),
+        }
+        return yield* client.publish(key.definition, {
+          spaceId: key.target.spaceId,
+          member: resolved,
+          key: input.key,
+          payload: input.payload,
+          ttl: input.ttl
+        })
+      }),
       { concurrent: true }
     )
   )
   function publishEphemeral<D extends Ephemeral.AnyEvent,>(
     definition: D,
-    target: EphemeralClient.PublishTarget
+    target: EphemeralTarget
   ): Atom.AtomResultFn<
     Omit<EphemeralClient.EventPublishOptions<D>, "spaceId" | "member">,
     void,
@@ -324,7 +334,7 @@ export const make = <E,>(
   >
   function publishEphemeral<D extends Ephemeral.AnyState,>(
     definition: D,
-    target: EphemeralClient.PublishTarget
+    target: EphemeralTarget
   ): Atom.AtomResultFn<
     Omit<EphemeralClient.StatePublishOptions<D>, "spaceId" | "member">,
     void,
@@ -332,7 +342,7 @@ export const make = <E,>(
   >
   function publishEphemeral(
     definition: Ephemeral.Any,
-    target: EphemeralClient.PublishTarget
+    target: EphemeralTarget
   ): Atom.AtomResultFn<
     {
       readonly payload?: unknown
@@ -347,22 +357,22 @@ export const make = <E,>(
 
   const ephemeralRemoveFamily = Atom.family((key: EphemeralTargetKey<Ephemeral.AnyState>) =>
     runtime.fn<{ readonly key: unknown }>()(
-      (input) =>
-        Effect.yieldNow.pipe(
-          Effect.andThen(EphemeralClient.EphemeralClient.use((client) =>
-            client.remove(key.definition, {
-              spaceId: key.target.spaceId,
-              member: key.target.member,
-              key: input.key
-            })
-          ))
-        ),
+      Effect.fnUntraced(function*(input, get) {
+        yield* Effect.yieldNow
+        const resolved = key.target.member ?? (yield* get.result(member))
+        const client = yield* EphemeralClient.EphemeralClient
+        return yield* client.remove(key.definition, {
+          spaceId: key.target.spaceId,
+          member: resolved,
+          key: input.key
+        })
+      }),
       { concurrent: true }
     )
   )
   function removeEphemeral<D extends Ephemeral.AnyState,>(
     definition: D,
-    target: EphemeralClient.PublishTarget
+    target: EphemeralTarget
   ): Atom.AtomResultFn<
     Omit<EphemeralClient.StateRemoveOptions<D>, "spaceId" | "member">,
     void,
@@ -370,7 +380,7 @@ export const make = <E,>(
   >
   function removeEphemeral(
     definition: Ephemeral.AnyState,
-    target: EphemeralClient.PublishTarget
+    target: EphemeralTarget
   ): Atom.AtomResultFn<{ readonly key: unknown }, void, ReplicaError.ReplicaError | Ephemeral.EncodeError | E> {
     return ephemeralRemoveFamily(new EphemeralTargetKey(definition, target))
   }
@@ -619,6 +629,7 @@ export const make = <E,>(
     aggregateStatus,
     join,
     leave,
+    member,
     ephemeral,
     ephemeralEvents,
     ephemeralState,
@@ -627,3 +638,5 @@ export const make = <E,>(
     removeEphemeral
   } as const
 }
+
+export type Graph<E extends { readonly _tag: string }, Services = never,> = ReturnType<typeof make<E, Services>>

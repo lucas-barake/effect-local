@@ -1,6 +1,6 @@
-import { makeFailedMessages, makeSettlementDaemonBody } from "@effect-local/example-chat-client/settlementDaemon"
 import { makeServerLayer } from "@effect-local/example-chat-server/server"
 import { LoginRequest, LoginResponse } from "@effect-local/example-chat-shared/auth"
+import { layerSessionCredential, renewCredential } from "@effect-local/example-chat-shared/credential"
 import {
   AdvanceDelivery,
   AdvanceRead,
@@ -24,12 +24,12 @@ import {
   users
 } from "@effect-local/example-chat-shared/domain"
 import { layerDomain } from "@effect-local/example-chat-shared/handlers"
+import { makeFailedMessages, makeSettlementDaemonBody } from "@effect-local/example-chat-shared/settlementDaemon"
 import { NodeCrypto, NodeSocket } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
-import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
-import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as EphemeralClient from "@lucas-barake/effect-local-rpc/EphemeralClient"
+import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity"
 import * as SqlReplica from "@lucas-barake/effect-local-sql/SqlReplica"
@@ -48,7 +48,6 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as AtomRegistry from "effect/reactivity/AtomRegistry"
 import * as Reactivity from "effect/reactivity/Reactivity"
-import * as Redacted from "effect/Redacted"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 
@@ -89,10 +88,10 @@ const serverUrl = Effect.gen(function*() {
 })
 
 const layerReplicaFor = (user: ChatUser, bearer: string = tokenFor(user.id)) => {
-  const credential = Redacted.make(bearer)
+  const layerCredential = layerSessionCredential(bearer)
   const layerSync = SyncClient.layerWebSocket({ url: serverUrl }).pipe(
     Layer.provide(NodeSocket.layerWebSocketConstructor),
-    Layer.provide(Authentication.layerCredentialProviderStatic(credential))
+    Layer.provideMerge(layerCredential)
   )
   const layerDatabase = Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
@@ -375,7 +374,7 @@ describe("chat sync", () => {
   )
 
   it.live(
-    "parks a rejected credential at NeedsAuthentication",
+    "resumes syncing when a later login renews a rejected credential",
     Effect.fnUntraced(function*() {
       const serverContext = yield* bootServer
       const context = yield* Layer.build(
@@ -390,6 +389,8 @@ describe("chat sync", () => {
       }
       yield* space.activate
       yield* awaitStatus(booted, "NeedsAuthentication")
+      yield* renewCredential(tokenFor(alice.id)).pipe(Effect.provide(context))
+      yield* awaitStatus(booted, "Online")
     })
   )
 

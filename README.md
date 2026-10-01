@@ -205,7 +205,10 @@ their own entity. `Query.make` has no static dependency list because the runtime
 ## SQLite replica
 
 `SqlReplica.layer` assembles one public `Replica` that owns one SQLite database, one synchronization transport, and
-any number of joined spaces. Supply the domain handlers, a `SqlClient`, `Crypto`, and a `SyncEngine`:
+any number of joined spaces. Supply the domain handlers, a `SqlClient`, `Crypto`, and a `SyncEngine`. The replica
+mints its client identity the first time it opens a database and keeps it there, so the identity lives exactly as long
+as the local data. Pass `clientId` only when the identity is managed elsewhere; opening a database with a different
+identity fails with `ReplicaIdentityMismatch`.
 
 ```ts
 import { NodeCrypto } from "@effect/platform-node"
@@ -219,7 +222,6 @@ import * as Layer from "effect/Layer"
 import { definition, layerDomain, ListTasks, PutTask, Task } from "./domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
-const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
 const scope = Protocol.ReplicationScope.make({ models: [Task.name] })
 
 const layerDatabase = Layer.mergeAll(
@@ -229,7 +231,6 @@ const layerDatabase = Layer.mergeAll(
 
 export const layerReplica = SqlReplica.layer({
   definition,
-  clientId,
   defaultScope: scope,
   initialSpaces: [spaceId]
 }).pipe(
@@ -523,10 +524,8 @@ benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1
 ```ts
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
-import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
+import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
-import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 
@@ -545,15 +544,13 @@ const Presence = Ephemeral.member({ status: Schema.String })
 const ephemerals = [Typing, ReadPosition]
 
 export const graph = ReplicaAtom.make(
-  BrowserReplica.layer({
-    name: "tasks",
-    definition,
-    layerDatabase: BrowserSqlite.layerWorker(() => new Worker(new URL("./sqlite.worker.ts", import.meta.url))),
-    layerSync,
-    spaces: [spaceId],
-    ephemerals,
-    profiles: { presence: Presence }
-  }).pipe(Layer.provide(layerDomain))
+  BrowserReplica.layer(
+    Layer.merge(
+      BrowserSqlite.layerWorker(() => new Worker(new URL("./sqlite.worker.ts", import.meta.url))),
+      layerSync
+    ),
+    { name: "tasks", definition, spaces: [spaceId], ephemerals, profiles: { presence: Presence } }
+  ).pipe(Layer.provide(layerDomain), Layer.provide(BrowserReplica.layerPlatformBrowser))
 )
 
 export const taskAtom = graph.entity(spaceId, Task)("task-1")
@@ -572,21 +569,15 @@ export const spacesAtom = graph.spaces
 export const joinAtom = graph.join
 export const leaveAtom = graph.leave
 
-const member = Protocol.EphemeralMember.make({
-  clientId,
-  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
-})
-
 export const sessionAtom = graph.ephemeral(Presence, {
   spaceId,
-  member,
   value: { status: "online" },
   ttl: "30 seconds"
 })
 export const typingAtom = graph.ephemeralEvents(sessionAtom, Typing)
 export const positionsAtom = graph.ephemeralState(sessionAtom, ReadPosition)
 export const rosterAtom = graph.ephemeralMembers(sessionAtom)
-export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId, member })
+export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId })
 ```
 
 The graph defaults to Effect's shared `Atom.runtime`, so every graph participates in one application memo map. Entity
@@ -602,7 +593,9 @@ and lifecycle command atoms are concurrent and preserve their typed result. Ephe
 projections for one member share the session atom's single joined stream: events are live only, state and the roster
 replay their current decoded view to late subscribers, and a malformed remote value fails only the projection for its
 own definition with a typed decode error. Set `publishTypingAtom` with `{ payload, ttl }` and observe the command's
-`AsyncResult`. Pass an application factory with `options.factory` when the application already owns a deliberate
+`AsyncResult`. Every ephemeral session and publish target speaks for `graph.member`, one member identity the graph
+mints from the layer's `Crypto` when an ephemeral atom first needs it and keeps while ephemeral atoms that use it stay
+mounted, so an idle graph still releases its replica; pass `member` explicitly only to act as a different member. Pass an application factory with `options.factory` when the application already owns a deliberate
 custom runtime.
 
 ### Infinite scroll

@@ -71,6 +71,10 @@
   },
   "overrides": [
     {
+      "files": ["packages/*/src/**", "examples/chat/shared/**", "examples/chat/mobile/**"],
+      "rules": { "effect-local/noArrayToSorted": "error", "unicorn/no-array-sort": "off" }
+    },
+    {
       "files": ["scripts/**"],
       "rules": {
         "effect/noAsyncFunction": "off",
@@ -80,6 +84,18 @@
         "effect/noNodeBuiltinImport": "off",
         "effect/noThrowStatement": "off",
         "effect/noTryCatch": "off"
+      }
+    },
+    {
+      "files": ["packages/local-expo/test/fixtures/**", "examples/chat/test/fixtures/**"],
+      "rules": {
+        "effect/noGlobals": "off",
+        "effect/noNewError": "off",
+        "effect/noNewPromise": "off",
+        "effect/noNodeBuiltinImport": "off",
+        "effect/noThrowStatement": "off",
+        "effect/noTryCatch": "off",
+        "typescript/no-extraneous-class": "off"
       }
     },
     {
@@ -94,7 +110,11 @@
       }
     },
     {
-      "files": ["examples/chat/client/**/*.tsx"],
+      "files": ["examples/chat/mobile/metro.config.cjs"],
+      "rules": { "effect/noDynamicImports": "off", "effect/noTryCatch": "off" }
+    },
+    {
+      "files": ["examples/chat/client/**/*.tsx", "examples/chat/mobile/**/*.tsx"],
       "rules": { "effect/noTernary": "off" }
     },
     {
@@ -102,7 +122,15 @@
       "rules": { "effect/noGlobals": "off", "effect-local/noManualEffectBoundary": "off" }
     },
     {
-      "files": ["examples/chat/scripts/**", "examples/chat/client/vite.config.ts", "examples/chat/e2e/**"],
+      "files": ["examples/chat/mobile/**/*.ts", "examples/chat/mobile/**/*.tsx"],
+      "rules": { "effect/noGlobals": "off" }
+    },
+    {
+      "files": [
+        "examples/chat/scripts/**",
+        "examples/chat/client/vite.config.ts",
+        "examples/chat/e2e/**"
+      ],
       "rules": {
         "effect/noAsyncFunction": "off",
         "effect/noGlobals": "off",

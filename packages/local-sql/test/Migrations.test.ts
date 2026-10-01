@@ -3,6 +3,7 @@ import { PgClient } from "@effect/sql-pg"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -149,6 +150,34 @@ describe("storage migration catalogs", () => {
       provideNodeFileSystemAndReactivity,
       Effect.scoped
     )
+  )
+
+  it.effect(
+    "mints a client identity for a fresh database and keeps it across reopenings",
+    Effect.fnUntraced(function*() {
+      const minted = yield* Migrations.client({ definition: Domain.definition })
+      assert.isTrue(Schema.is(Identity.ClientId)(minted))
+      assert.strictEqual(yield* Migrations.client({ definition: Domain.definition }), minted)
+      assert.strictEqual(yield* Migrations.client({ definition: Domain.definition, clientId: minted }), minted)
+    }, provideDatabase)
+  )
+
+  it.effect(
+    "adopts the identity an explicit client stored and still rejects a different explicit identity",
+    Effect.fnUntraced(function*() {
+      assert.strictEqual(yield* Migrations.client({ definition: Domain.definition, clientId }), clientId)
+      assert.strictEqual(yield* Migrations.client({ definition: Domain.definition }), clientId)
+      const other = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+      const exit = yield* Effect.exit(Migrations.client({ definition: Domain.definition, clientId: other }))
+      const failure = expectedFailure(exit)
+      assert.isTrue(Option.isSome(failure))
+      if (Option.isSome(failure)) {
+        assert.deepStrictEqual(
+          failure.value,
+          new ReplicaError.ReplicaIdentityMismatch({ expectedClientId: other, actualClientId: clientId })
+        )
+      }
+    }, provideDatabase)
   )
 
   it.effect(
@@ -634,5 +663,50 @@ describe.each(serverDatabases)("server catalog counters ($dialect)", (database) 
         { history: 1, receipts: 1, entities: 1, bytes: 15, counts: { history_count: 1, receipt_count: 1 } }
       )
     }, provideServerDatabase)
+  )
+})
+
+describe("client identity adoption race", () => {
+  it.effect(
+    "rejects an explicit identity when another opener stores a different identity before its insert",
+    Effect.fnUntraced(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const winner = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+      yield* Migrations.runCatalog("Client", Migrations.clientCatalog)
+      yield* sql.unsafe(`CREATE TRIGGER concurrent_opener BEFORE INSERT ON effect_local_client_meta
+        WHEN NEW.client_id <> '${winner}'
+        BEGIN INSERT INTO effect_local_client_meta (singleton, client_id) VALUES (1, '${winner}'); END`)
+      const exit = yield* Effect.exit(Migrations.client({ definition: Domain.definition, clientId }))
+      const failure = expectedFailure(exit)
+      assert.isTrue(Option.isSome(failure))
+      if (Option.isSome(failure)) {
+        assert.deepStrictEqual(
+          failure.value,
+          new ReplicaError.ReplicaIdentityMismatch({ expectedClientId: clientId, actualClientId: winner })
+        )
+      }
+    }, provideDatabase)
+  )
+})
+
+describe("client identity race with a space", () => {
+  it.effect(
+    "does not register the space in a database whose identity another opener stored first",
+    Effect.fnUntraced(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const winner = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
+      yield* Migrations.runCatalog("Client", Migrations.clientCatalog)
+      yield* sql.unsafe(`CREATE TRIGGER concurrent_opener BEFORE INSERT ON effect_local_client_meta
+        WHEN NEW.client_id <> '${winner}'
+        BEGIN INSERT INTO effect_local_client_meta (singleton, client_id) VALUES (1, '${winner}'); END`)
+      const exit = yield* Effect.exit(Migrations.client({ definition: Domain.definition, spaceId, clientId }))
+      assert.isTrue(Exit.isFailure(exit))
+      const spaces = yield* SqlSchema.findOne({
+        Request: Schema.Void,
+        Result: CountRow,
+        execute: () => sql`SELECT COUNT(*) AS count FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
+      })(undefined)
+      assert.strictEqual(spaces.count, 0)
+    }, provideDatabase)
   )
 })

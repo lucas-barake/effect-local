@@ -1,9 +1,9 @@
-import { Message, type MessageId, SendMessage, spaceId } from "@effect-local/example-chat-shared/domain"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import { Atom } from "effect/reactivity"
 import * as Stream from "effect/Stream"
+import { Message, type MessageId, SendMessage, spaceId } from "./domain.js"
 
 /**
  * Client-side failed-message overlay and the settlement daemon that maintains

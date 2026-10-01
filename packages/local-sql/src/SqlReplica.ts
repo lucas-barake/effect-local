@@ -34,6 +34,7 @@ import * as Configuration from "./internal/configuration.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
+import * as SqliteIdentifier from "./internal/sqliteIdentifier.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import { isTransportFailure } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
@@ -47,7 +48,7 @@ import * as SyncEngine from "./SyncEngine.js"
 
 export interface Options<D extends Definition.Any,> {
   readonly definition: D
-  readonly clientId: Identity.ClientId
+  readonly clientId?: Identity.ClientId | undefined
   readonly defaultScope?: Protocol.ReplicationScope
   readonly maximumActiveSpaces?: number
   readonly foregroundActiveSpaces?: number
@@ -321,7 +322,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const retrySchedule: Array<RetryWork> = []
       let capacityChanged = yield* Deferred.make<void>()
 
-      yield* Migrations.client({
+      const clientId = yield* Migrations.client({
         definition: options.definition,
         clientId: options.clientId,
         migration: options.migration
@@ -495,6 +496,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         const reconcilerReady = yield* Deferred.make<Reconciler.Service>()
         const layerLocalStore = LocalStore.layer({
           ...options,
+          clientId,
           scope: entry.replicationScope,
           spaceId,
           onSettlementsRecorded: publishSettlements(entry),
@@ -536,7 +538,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             if (entry.workflowRegistration === undefined) {
               return yield* Effect.die("Workflow registration was not initialized")
             }
-            const scheduler = yield* ReconciliationWorkflow.layerScheduler({ ...options, spaceId }).pipe(
+            const scheduler = yield* ReconciliationWorkflow.layerScheduler({ ...options, clientId, spaceId }).pipe(
               Layer.provide(Layer.succeed(LocalStore.Store, local)),
               Layer.provide(Layer.succeed(Reconciler.Reconciliation, reconciliation)),
               Layer.provide(
@@ -1314,6 +1316,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           )
           const built = yield* ReconciliationWorkflow.layerDetachedRegistration({
             ...options,
+            clientId,
             spaceId: row.space_id,
             membershipIncarnation: row.membership_incarnation
           }).pipe(
@@ -1334,10 +1337,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             installed_snapshot_sequence, installed_snapshot_terminal_sequence, desired_scope_json,
             desired_scope_digest, scope_generation)
           VALUES (${spaceId},
-            ('inc_' || lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' ||
-              substr(lower(hex(randomblob(2))), 2) || '-' ||
-              substr('89ab', abs(random()) % 4 + 1, 1) || substr(lower(hex(randomblob(2))), 2) || '-' ||
-              lower(hex(randomblob(6)))), ${options.definition.hash},
+            ${SqliteIdentifier.random(sql, "inc")}, ${options.definition.hash},
             ${options.definition.schemaIdentity.version}, ${options.definition.schemaIdentity.hash}, 0, 0, 0, 0,
             1, 0, 0, 1, 0, 0, 0, ${defaultScopeJson}, ${defaultScopeDigest}, 1)
           ON CONFLICT (space_id) DO NOTHING`
@@ -1469,7 +1469,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const spaces = Effect.sync(() =>
         Array.from(entries.values())
           .filter((entry) => !entry.leaving)
-          .toSorted((left, right) => left.spaceId.localeCompare(right.spaceId))
+          .sort((left, right) => left.spaceId.localeCompare(right.spaceId))
           .map((entry) => entry.handle)
       )
 
@@ -1552,7 +1552,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const configured: Array<Identity.SpaceId> = []
       if (options.initialSpaces !== undefined) configured.push(...options.initialSpaces)
       if (options.spaceId !== undefined) configured.push(options.spaceId)
-      yield* Effect.forEach(Array.from(new Set(configured)).toSorted(), join, { discard: true })
+      yield* Effect.forEach(Array.from(new Set(configured)).sort(), join, { discard: true })
       for (const row of restored) {
         const entry = entries.get(row.space_id)
         if (entry !== undefined && row.count > 0) yield* enqueueBackground(entry)

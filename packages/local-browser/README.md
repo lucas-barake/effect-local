@@ -12,32 +12,37 @@ Mutations carry caller-minted ids, so a resent mutation is recorded once.
 ```ts
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
-import * as ReplicaAtom from "@lucas-barake/effect-local-browser/ReplicaAtom"
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
+import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
 import * as Layer from "effect/Layer"
 import * as Socket from "effect/socket/Socket"
 
-const layerReplica = BrowserReplica.layer({
-  name: "chat",
-  definition,
-  layerDatabase: BrowserSqlite.layerWorker(() => new Worker(new URL("./sqlite.worker.ts", import.meta.url))),
-  layerSync: SyncClient.layerWebSocket({ url: "wss://example.com/sync" }).pipe(
-    Layer.provide(Socket.layerWebSocketConstructorGlobal),
-    Layer.provide(Authentication.layerCredentialProviderStatic(bearer))
+const layerReplica = BrowserReplica.layer(
+  Layer.merge(
+    BrowserSqlite.layerWorker(() => new Worker(new URL("./sqlite.worker.ts", import.meta.url))),
+    SyncClient.layerWebSocket({ url: "wss://example.com/sync" })
   ),
-  spaces: [spaceId],
-  ephemerals,
-  profiles: { presence: Presence }
-}).pipe(Layer.provide(layerHandlers))
+  { name: "chat", definition, spaces: [spaceId], ephemerals, profiles: { presence: Presence } }
+).pipe(
+  Layer.provide(layerHandlers),
+  Layer.provide(Socket.layerWebSocketConstructorGlobal),
+  Layer.provide(Authentication.layerCredentialProviderStatic(bearer)),
+  Layer.provide(BrowserReplica.layerPlatformBrowser)
+)
 
 const graph = ReplicaAtom.make(layerReplica)
 ```
 
+The first argument provides the database and the sync engine. Only the leader tab builds it, once per leadership
+term, the same way `HttpRouter.serve` builds the app Layer it is given, and whatever it requires, such as the WebSocket
+constructor and the credential provider above, becomes a requirement of the replica Layer.
+`BrowserReplica.layerPlatformBrowser` provides the Web Locks, `BroadcastChannel`, `localStorage`, and WebCrypto
+adapters. Tests provide in-memory versions instead to run several tabs in one process.
+
 `name` scopes the cluster, its locks, and the durable client id, so two replicas on one origin need different names.
 Everything else is optional. `replica` forwards `SqlReplica` options, `sharding` overrides the tab cluster's
-`ShardingConfig`, and `retryDelay` (1 second) paces leader election retries. `layerPlatform` replaces the Web Locks,
-`BroadcastChannel`, `localStorage`, and WebCrypto adapters, which is how the tests run several tabs in one process.
+`ShardingConfig`, and `retryDelay` (1 second) paces leader election retries.
 `BrowserSqlite.layerWorker` spawns and owns a dedicated SQLite WASM worker that is terminated when the Layer's scope
 closes, and `BrowserSqlite.layerMessagePort` adapts an application-owned worker port instead.
 
@@ -106,8 +111,6 @@ settlements, lifecycle operations, and ephemera.
 
 ```ts
 import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
-import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Schema from "effect/Schema"
 
 const ConversationId = Schema.String.pipe(Schema.brand("ConversationId"))
@@ -125,14 +128,8 @@ const ReadPosition = Ephemeral.make("ReadPosition", {
 
 const Presence = Ephemeral.member({ status: Schema.String })
 
-const member = Protocol.EphemeralMember.make({
-  clientId,
-  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000001")
-})
-
 export const sessionAtom = graph.ephemeral(Presence, {
   spaceId,
-  member,
   value: { status: "online" },
   ttl: "30 seconds"
 })
@@ -140,15 +137,17 @@ export const sessionAtom = graph.ephemeral(Presence, {
 export const typingAtom = graph.ephemeralEvents(sessionAtom, Typing)
 export const positionsAtom = graph.ephemeralState(sessionAtom, ReadPosition)
 export const rosterAtom = graph.ephemeralMembers(sessionAtom)
-export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId, member })
-export const publishPositionAtom = graph.publishEphemeral(ReadPosition, { spaceId, member })
+export const publishTypingAtom = graph.publishEphemeral(Typing, { spaceId })
+export const publishPositionAtom = graph.publishEphemeral(ReadPosition, { spaceId })
 ```
 
 A definition is declared once and drives everything: the accepted payload type, the JSON encoding on the wire, the
 channel filtering, and the automatic decoding on receive. Application code never supplies channel strings, protocol
 tags, or `Schema.decode` calls.
 
-`graph.ephemeral` returns the session atom for one `(space, member)` pair. Mounting any projection derived from it
+`graph.ephemeral` returns the session atom for one `(space, member)` pair. The member defaults to `graph.member`,
+which each tab's graph mints from the `Crypto` that `BrowserReplica.layer` exposes, so every tab of the same user is its
+own presence member. Mounting any projection derived from it
 opens exactly one joined server stream, shared by every typed projection. `ephemeralEvents` resolves to the latest
 decoded `{ member, payload }` envelope and only observes events published while it is mounted. `ephemeralState`
 resolves to the full decoded entry list for its definition, replayed immediately to late subscribers and updated

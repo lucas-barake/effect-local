@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json.schemastore.org/tsconfig",
+  "extends": "../../../tsconfig.base.json",
+  "include": ["index.ts", "src"],
+  "compilerOptions": {
+    "rootDir": ".",
+    "jsx": "react-jsx",
+    "lib": ["ES2023", "DOM"],
+    "types": ["react-native"]
+  },
+  "references": [
+    { "path": "../shared" },
+    { "path": "../../../packages/local" },
+    { "path": "../../../packages/local-sql" },
+    { "path": "../../../packages/local-rpc" },
+    { "path": "../../../packages/local-expo" }
+  ]
+}

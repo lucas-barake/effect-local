@@ -4,9 +4,10 @@
 "@lucas-barake/effect-local-rpc": minor
 "@lucas-barake/effect-local-browser": minor
 "@lucas-barake/effect-local-test": minor
+"@lucas-barake/effect-local-expo": minor
 ---
 
-Initial release of Effect Local and its core, SQL, RPC, browser, and testing packages.
+Initial release of Effect Local and its core, SQL, RPC, browser, Expo, and testing packages.
 
 Local first state uses optimistic mutations in local SQLite and an authenticated server reconciled mutation log. The
 server assigns a dense total order to accepted mutations, exact retries return durable receipts, clients replay
@@ -26,5 +27,7 @@ In the browser, `BrowserReplica.layer` turns every tab of an origin into a runne
 the leader tab that owns SQLite, fails over when that tab closes, and `ReplicaAtom.make` exposes it as an Atom graph.
 Tabs from different deploys never share a cluster: the newest build takes the database over and every tab of an older
 build fails with a typed `BuildSuperseded` error that the app can turn into a reload prompt.
+On React Native, `ExpoReplica.layer` runs the same replica over `expo-sqlite`, `expo-crypto`, and React Native's
+WebSocket, in Expo Go or a native build.
 Every limit has a documented default, so a working client or server needs a few lines, and every limit can be
 overridden.

@@ -2,7 +2,8 @@
 
 A WhatsApp-style, local-first chat app built on `effect-local`. It is the
 comprehensive end-to-end example for the stack: a React client with a durable
-per-user replica in OPFS SQLite, a Node sync server with authentication and
+per-user replica in OPFS SQLite, an Expo client with the same replica in
+on-device SQLite, a Node sync server with authentication and
 authorization, ephemeral typing and presence, and durable delivery/read
 receipts — with no loading spinners anywhere, because the UI always renders
 from the local replica.
@@ -42,6 +43,20 @@ election — only one tab owns the real replica.
 server (`CHAT_PORT`, default 4100, SQLite file `CHAT_DB`, default `chat.db`)
 and Vite together. Vite proxies `/login` and `/sync` (WebSocket) to the server.
 
+### Expo client
+
+The Expo app in `mobile/` talks to the same server. Start the server on its own and point the app at it:
+
+```sh
+pnpm -C examples/chat dev:server
+pnpm -C examples/chat/mobile start
+```
+
+Open it in Expo Go or a development build. `EXPO_PUBLIC_CHAT_SERVER_URL` sets the server; it defaults to
+`http://10.0.2.2:4100` on Android, which is the host machine as seen from the emulator, and to
+`http://localhost:4100` elsewhere. On a physical device use the host's LAN address. Sign in as bob on the phone and
+as alice in the browser, and the conversation, ticks, typing, and presence flow between them.
+
 ## Layout
 
 ```
@@ -52,6 +67,10 @@ shared/   @effect-local/example-chat-shared
           handlers.ts — deterministic mutation/query handlers shared by
                         client AND server (a replica requirement)
           auth.ts     — login wire contracts and the authenticated Principal
+          client.ts   — the per-session atom graph both clients render:
+                        queries, sends and retries, presence, typing, and the
+                        delivery and settlement daemons
+          session.ts  — the login request and the stored session schema
 server/   @effect-local/example-chat-server
           server.ts   — makeServerLayer({ port, databaseFile }): /login route,
                         authenticator, per-mutation authorization, ServerStore,
@@ -66,6 +85,12 @@ client/   Vite + React app
           chat.tsx    — conversation view: message window pagination, ticks,
                         typing publisher, failed-message overlay
           sqlite.worker.ts — OpfsWorker.run over the worker's own port
+mobile/   Expo SDK 57 app
+          runtime.ts  — per-session graph: ExpoReplica over expo-sqlite,
+                        expo-crypto, and React Native's WebSocket; the session
+                        is an Atom.kvs over expo-secure-store
+          Chat.tsx    — conversation view with ticks, typing, and read
+                        receipts while the app is in the foreground
 test/     domain.test.ts — tick-state derivation matrix, branded id invariants
           smoke.test.ts  — in-process end-to-end: real server composition plus
                            real SyncClient + SqlReplica stacks over loopback
@@ -121,6 +146,7 @@ test/     domain.test.ts — tick-state derivation matrix, branded id invariants
 ```sh
 pnpm -C examples/chat test    # domain unit tests + in-process e2e smoke tests
 pnpm -C examples/chat check   # project typecheck
+pnpm -C examples/chat e2e     # browser e2e
 ```
 
 The smoke tests boot the real `makeServerLayer` on an ephemeral port with
