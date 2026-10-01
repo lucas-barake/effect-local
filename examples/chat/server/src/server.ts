@@ -167,8 +167,6 @@ const layerSync = SyncServer.layer({
 
 /** The full server composition. Launch with `Layer.launch` or `Layer.unwrap`-based test harnesses. */
 export const makeServerLayer = (options: ChatServerOptions) => {
-  // The login route and the RPC websocket upgrade are registered in the app
-  // that HttpRouter.serve owns: routes on any other router are not served.
   const layerRoutes = Layer.mergeAll(SyncServer.layerProtocolWebSocket({ path: "/sync" }), layerLoginRoute)
   const layerApp = layerSync.pipe(Layer.provideMerge(layerRoutes))
 
