@@ -12,6 +12,7 @@
   "references": [
     { "path": "../shared" },
     { "path": "../server" },
+    { "path": "../mobile" },
     { "path": "../../../packages/local" },
     { "path": "../../../packages/local-rpc" },
     { "path": "../../../packages/local-sql" }

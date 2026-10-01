@@ -9,11 +9,11 @@ import {
   users
 } from "@effect-local/example-chat-shared/domain"
 import { formatTime } from "@effect-local/example-chat-shared/time"
-import { useAtomSet, useAtomValue } from "@effect/atom-react"
+import { useAtom, useAtomValue } from "@effect/atom-react"
 import * as Option from "effect/Option"
 import * as AsyncResult from "effect/reactivity/AsyncResult"
 import { FlatList, Pressable, StyleSheet, Text, View } from "react-native"
-import { type ChatClient, sessionAtom } from "./runtime.js"
+import { type ChatClient, logoutAtom } from "./runtime.js"
 import { Avatar, colors } from "./theme.js"
 
 const peerOf = (summary: ConversationSummary, me: UserId) => {
@@ -38,7 +38,7 @@ export const Conversations = ({ client, session, onOpen }: {
   readonly onOpen: (conversationId: ConversationId) => void
 }) => {
   const me = session.userId
-  const setSession = useAtomSet(sessionAtom)
+  const [logoutResult, logout] = useAtom(logoutAtom)
   const summariesResult = useAtomValue(client.summariesAtom)
   const synced = useAtomValue(client.syncedAtom)
   const members = AsyncResult.getOrElse(useAtomValue(client.membersAtom), () => [])
@@ -56,10 +56,13 @@ export const Conversations = ({ client, session, onOpen }: {
       <View style={styles.header}>
         <Avatar name={session.name} color={session.color} size={36} />
         <Text style={styles.me}>{session.name}</Text>
-        <Pressable accessibilityRole="button" onPress={() => setSession(null)}>
+        <Pressable accessibilityRole="button" onPress={() => logout()}>
           <Text style={styles.logout}>Log out</Text>
         </Pressable>
       </View>
+      {AsyncResult.isFailure(logoutResult) && (
+        <Text accessibilityRole="alert" style={styles.logoutError}>Could not sign out. Try again.</Text>
+      )}
       <FlatList
         data={mine}
         keyExtractor={(summary) => summary.conversation.id}
@@ -145,6 +148,7 @@ const styles = StyleSheet.create({
   },
   me: { flex: 1, color: "#ffffff", fontSize: 18, fontWeight: "600" },
   logout: { color: "#ffffff" },
+  logoutError: { padding: 10, color: "#c0392b" },
   row: {
     flexDirection: "row",
     gap: 12,

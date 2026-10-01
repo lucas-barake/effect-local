@@ -12,6 +12,7 @@ import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as FetchHttpClient from "effect/http/FetchHttpClient"
 import * as Layer from "effect/Layer"
+import * as KeyValueStore from "effect/persistence/KeyValueStore"
 import * as Atom from "effect/reactivity/Atom"
 import type { SqlError } from "effect/sql/SqlError"
 import { Platform } from "react-native"
@@ -39,6 +40,12 @@ export const loginAtom = appRuntime.fn<LoginRequest>()(
     get.set(sessionAtom, session)
     return session
   })
+)
+
+export const logoutAtom = appRuntime.fn<void>()((_, get) =>
+  KeyValueStore.KeyValueStore.use((store) => store.remove(sessionKey)).pipe(
+    Effect.andThen(Effect.sync(() => get.set(sessionAtom, null)))
+  )
 )
 
 const makeGraph = (session: LoginResponse) => {

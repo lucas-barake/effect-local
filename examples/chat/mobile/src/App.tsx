@@ -10,7 +10,7 @@ import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context"
 import { Chat } from "./Chat.js"
 import { Conversations } from "./Conversations.js"
 import { Login } from "./Login.js"
-import { clientFor, sessionAtom } from "./runtime.js"
+import { clientFor, logoutAtom, sessionAtom } from "./runtime.js"
 import { colors } from "./theme.js"
 
 const bannerText: Record<Connection, string | undefined> = {
@@ -24,14 +24,14 @@ const bannerText: Record<Connection, string | undefined> = {
 }
 
 const Banner = ({ connection }: { readonly connection: Connection }) => {
-  const setSession = useAtomSet(sessionAtom)
+  const logout = useAtomSet(logoutAtom)
   const text = bannerText[connection]
   if (text === undefined) return null
   return (
     <View accessibilityRole="alert" style={styles.banner}>
       <Text style={styles.bannerText}>{text}</Text>
       {connection === "needsAuthentication" && (
-        <Pressable accessibilityRole="button" onPress={() => setSession(null)}>
+        <Pressable accessibilityRole="button" onPress={() => logout()}>
           <Text style={styles.bannerAction}>Sign in again</Text>
         </Pressable>
       )}

@@ -2,6 +2,9 @@
   "$schema": "https://unpkg.com/knip@6.27.0/schema.json",
   "includeEntryExports": false,
   "workspaces": {
+    "examples/chat": {
+      "entry": ["test/fixtures/expoSecureStore.ts"]
+    },
     "examples/chat/client": {
       "entry": ["vite.e2e-next.config.ts"]
     },

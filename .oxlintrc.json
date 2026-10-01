@@ -87,7 +87,7 @@
       }
     },
     {
-      "files": ["packages/local-expo/test/fixtures/**"],
+      "files": ["packages/local-expo/test/fixtures/**", "examples/chat/test/fixtures/**"],
       "rules": {
         "effect/noGlobals": "off",
         "effect/noNewError": "off",
