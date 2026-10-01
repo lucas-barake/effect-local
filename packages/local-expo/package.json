@@ -4,7 +4,13 @@
   "description": "Expo SQLite, crypto, and WebSocket integration for Effect Local replicas on React Native",
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
-  "keywords": ["effect", "local-first", "expo", "react-native", "sqlite"],
+  "keywords": [
+    "effect",
+    "local-first",
+    "expo",
+    "react-native",
+    "sqlite"
+  ],
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
   },
@@ -49,7 +55,6 @@
   },
   "dependencies": {
     "@lucas-barake/effect-local": "workspace:^",
-    "@lucas-barake/effect-local-rpc": "workspace:^",
     "@lucas-barake/effect-local-sql": "workspace:^"
   },
   "peerDependencies": {
@@ -60,6 +65,7 @@
   "devDependencies": {
     "@effect/platform-node": "4.0.0-rc.118",
     "@effect/sql-sqlite-node": "4.0.0-rc.118",
+    "@lucas-barake/effect-local-rpc": "workspace:^",
     "effect": "4.0.0-rc.118",
     "expo": "57.0.26",
     "expo-crypto": "57.0.3",

@@ -281,9 +281,6 @@ importers:
       '@lucas-barake/effect-local':
         specifier: workspace:^
         version: link:../local
-      '@lucas-barake/effect-local-rpc':
-        specifier: workspace:^
-        version: link:../local-rpc
       '@lucas-barake/effect-local-sql':
         specifier: workspace:^
         version: link:../local-sql
@@ -294,6 +291,9 @@ importers:
       '@effect/sql-sqlite-node':
         specifier: 4.0.0-rc.118
         version: 4.0.0-rc.118(effect@4.0.0-rc.118)
+      '@lucas-barake/effect-local-rpc':
+        specifier: workspace:^
+        version: link:../local-rpc
       effect:
         specifier: 4.0.0-rc.118
         version: 4.0.0-rc.118
