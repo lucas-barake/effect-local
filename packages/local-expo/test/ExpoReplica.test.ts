@@ -29,6 +29,7 @@ import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as ExpoReplica from "../src/ExpoReplica.js"
 import * as ReactNativeSocket from "../src/ReactNativeSocket.js"
+import { probe } from "./fixtures/nativeSqlite.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000901")
 const Todo = Model.make("Todo", {
@@ -124,39 +125,43 @@ const awaitTodo = (
 
 const provideFileSystem = Effect.provide(NodeFileSystem.layer)
 
-describe("ExpoReplica", () => {
-  it.live(
-    "replicates a mutation between two Expo replicas through the sync server",
-    Effect.fnUntraced(
-      function*() {
-        const directory = yield* FileSystem.FileSystem.use((fs) => fs.makeTempDirectoryScoped())
-        const serverContext = yield* Layer.build(layerServer)
-        const alice = yield* openReplica(serverContext, directory, "alice.db")
-        const bob = yield* openReplica(serverContext, directory, "bob.db")
-        yield* alice.space.mutate(PutTodo, { id: "todo-1", title: "from alice" })
-        assert.deepStrictEqual(yield* awaitTodo(bob, "todo-1"), { id: "todo-1", title: "from alice" })
-      },
-      Effect.scoped,
-      provideFileSystem
+for (const platform of ["ios", "android"] as const) {
+  describe(`ExpoReplica with ${platform} parameter binding`, () => {
+    it.live(
+      "replicates a mutation between two Expo replicas through the sync server",
+      Effect.fnUntraced(
+        function*() {
+          probe.platform = platform
+          const directory = yield* FileSystem.FileSystem.use((fs) => fs.makeTempDirectoryScoped())
+          const serverContext = yield* Layer.build(layerServer)
+          const alice = yield* openReplica(serverContext, directory, "alice.db")
+          const bob = yield* openReplica(serverContext, directory, "bob.db")
+          yield* alice.space.mutate(PutTodo, { id: "todo-1", title: "from alice" })
+          assert.deepStrictEqual(yield* awaitTodo(bob, "todo-1"), { id: "todo-1", title: "from alice" })
+        },
+        Effect.scoped,
+        provideFileSystem
+      )
     )
-  )
 
-  it.live(
-    "keeps local mutations when the same database file is opened again",
-    Effect.fnUntraced(
-      function*() {
-        const directory = yield* FileSystem.FileSystem.use((fs) => fs.makeTempDirectoryScoped())
-        const serverContext = yield* Layer.build(layerServer)
-        const firstScope = yield* Scope.make()
-        const first = yield* openReplica(serverContext, directory, "device.db").pipe(Scope.provide(firstScope))
-        yield* first.space.mutate(PutTodo, { id: "todo-2", title: "persisted" })
-        yield* Scope.close(firstScope, Exit.void)
-        const emptyServerContext = yield* Layer.build(layerServer)
-        const reopened = yield* openReplica(emptyServerContext, directory, "device.db")
-        assert.deepStrictEqual(yield* awaitTodo(reopened, "todo-2"), { id: "todo-2", title: "persisted" })
-      },
-      Effect.scoped,
-      provideFileSystem
+    it.live(
+      "keeps local mutations when the same database file is opened again",
+      Effect.fnUntraced(
+        function*() {
+          probe.platform = platform
+          const directory = yield* FileSystem.FileSystem.use((fs) => fs.makeTempDirectoryScoped())
+          const serverContext = yield* Layer.build(layerServer)
+          const firstScope = yield* Scope.make()
+          const first = yield* openReplica(serverContext, directory, "device.db").pipe(Scope.provide(firstScope))
+          yield* first.space.mutate(PutTodo, { id: "todo-2", title: "persisted" })
+          yield* Scope.close(firstScope, Exit.void)
+          const emptyServerContext = yield* Layer.build(layerServer)
+          const reopened = yield* openReplica(emptyServerContext, directory, "device.db")
+          assert.deepStrictEqual(yield* awaitTodo(reopened, "todo-2"), { id: "todo-2", title: "persisted" })
+        },
+        Effect.scoped,
+        provideFileSystem
+      )
     )
-  )
-})
+  })
+}

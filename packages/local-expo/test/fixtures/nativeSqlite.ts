@@ -143,6 +143,17 @@ class NativeDatabase {
   }
 }
 
+const longMin = -(2n ** 63n)
+const longMax = 2n ** 63n - 1n
+
+const bindValue = (value: unknown) => {
+  if (probe.platform !== "android" || typeof value !== "number" || !Number.isInteger(value)) return value
+  const long = BigInt(value)
+  if (long < longMin) return longMin
+  if (long > longMax) return longMax
+  return long
+}
+
 class NativeStatement {
   prepared: StatementSync | undefined
   owner: NativeDatabase | undefined
@@ -163,7 +174,7 @@ class NativeStatement {
       }
       let args: Array<any> = []
       if (shouldPassAsArray) {
-        args = Array.from({ length: Object.keys(merged).length }, (_, index) => merged[String(index)])
+        args = Array.from({ length: Object.keys(merged).length }, (_, index) => bindValue(merged[String(index)]))
       }
       this.failure = undefined
       this.iterator = statement.iterate(...args)
