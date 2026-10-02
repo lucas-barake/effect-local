@@ -4,6 +4,7 @@ import type { TestProject } from "vitest/node"
 declare module "vitest" {
   export interface ProvidedContext {
     readonly postgresUrl: string
+    readonly postgresContainerId: string
   }
 }
 
@@ -25,6 +26,7 @@ export default function setup(project: TestProject) {
     .start()
     .then((container) => {
       project.provide("postgresUrl", container.getConnectionUri())
+      project.provide("postgresContainerId", container.getId())
       return () => container.stop().then(() => undefined)
     })
 }
