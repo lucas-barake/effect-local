@@ -117,14 +117,17 @@ const introspection = {
       WHERE connamespace = 'public'::regnamespace ORDER BY conname`,
     `SELECT tgname, pg_get_triggerdef(oid) AS definition FROM pg_trigger WHERE NOT tgisinternal ORDER BY tgname`,
     `SELECT proname, pg_get_functiondef(oid) AS definition FROM pg_proc
-      WHERE pronamespace = 'public'::regnamespace ORDER BY proname`
+      WHERE pronamespace = 'public'::regnamespace ORDER BY proname`,
+    `SELECT viewname, definition FROM pg_views WHERE schemaname = 'public' ORDER BY viewname`
   ]
 } as const
 
 const bookkeeping = [
   `SELECT id, name, checksum FROM effect_local_server_migrations ORDER BY id`,
   `SELECT model, index_name, descriptor_hash, table_name, scan_index_name
-    FROM effect_local_server_index_catalog ORDER BY descriptor_hash`
+    FROM effect_local_server_index_catalog ORDER BY descriptor_hash`,
+  `SELECT space_id, schema_generation, descriptor_hash, built FROM effect_local_server_index_state
+    ORDER BY space_id, schema_generation, descriptor_hash`
 ]
 
 const schemaOf = (database: ManualDatabase) =>
@@ -136,6 +139,8 @@ const bookkeepingOf = (database: ManualDatabase) =>
   SqlClient.SqlClient.use((sql) => Effect.forEach(bookkeeping, (statement) => sql.unsafe(statement))).pipe(
     Effect.provide(database.layer())
   )
+
+const stateOf = (database: ManualDatabase) => Effect.all([schemaOf(database), bookkeepingOf(database)])
 
 const indexTablesOf = (database: ManualDatabase) =>
   schemaOf(database).pipe(
@@ -190,7 +195,11 @@ describe.each(manualDatabases)("server migrations applied by hand on $dialect", 
           yield* space.mutate(PutNote, { id: "note-1", rank: 1 })
           return yield* space.settlements({ from: 0 }).pipe(Stream.runHead)
         }).pipe(Effect.provide(layerReplica(database)))
-        assert.isTrue(Option.isSome(settled))
+        assert.strictEqual(Option.getOrUndefined(settled)?.settlement.receipt._tag, "Accepted")
+        const stored = yield* SqlClient.SqlClient.use((sql) =>
+          sql`SELECT entity_key FROM effect_local_server_entities WHERE model = 'Note'`
+        ).pipe(Effect.provide(database.layer()))
+        assert.deepStrictEqual(stored, [{ entity_key: "\"note-1\"" }])
       },
       Effect.scoped,
       provideServices
@@ -236,9 +245,11 @@ describe.each(manualDatabases)("server migrations applied by hand on $dialect", 
       function*() {
         const database = yield* make
         assert.strictEqual(failureOf(yield* boot(database, plain, "apply")), "Success")
-        const before = yield* schemaOf(database)
+        const before = yield* stateOf(database)
         assert.strictEqual(failureOf(yield* boot(database, ranked, "verify")), "StorageMigrationPending(ServerIndex)")
-        assert.deepStrictEqual(yield* schemaOf(database), before)
+        assert.deepStrictEqual(yield* stateOf(database), before)
+        assert.isTrue(Option.isSome(yield* render(database, ranked)))
+        assert.deepStrictEqual(yield* stateOf(database), before)
         yield* renderAndApply(database, ranked)
         assert.strictEqual(failureOf(yield* boot(database, ranked, "verify")), "Success")
       },
@@ -271,10 +282,10 @@ describe.each(manualDatabases)("server migrations applied by hand on $dialect", 
       function*() {
         const database = yield* make
         assert.strictEqual(failureOf(yield* boot(database, ranked, "apply")), "Success")
-        const indexed = yield* indexTablesOf(database)
-        assert.strictEqual(indexed.length, 1)
+        assert.strictEqual((yield* indexTablesOf(database)).length, 1)
+        const before = yield* stateOf(database)
         assert.strictEqual(failureOf(yield* boot(database, plain, "verify")), "StorageMigrationPending(ServerIndex)")
-        assert.deepStrictEqual(yield* indexTablesOf(database), indexed)
+        assert.deepStrictEqual(yield* stateOf(database), before)
         yield* renderAndApply(database, plain)
         assert.strictEqual(failureOf(yield* boot(database, plain, "verify")), "Success")
         assert.deepStrictEqual(yield* indexTablesOf(database), [])
@@ -286,14 +297,30 @@ describe.each(manualDatabases)("server migrations applied by hand on $dialect", 
   )
 
   it.effect(
-    "a rendered script applied twice fails without changing the database",
+    "a rendered script applied twice is rejected",
     Effect.fnUntraced(
       function*() {
         const database = yield* make
         const script = yield* renderAndApply(database, ranked)
+        assert.strictEqual(failureOf(yield* database.apply(script).pipe(Effect.exit)), "ScriptRejected")
+        assert.strictEqual(failureOf(yield* boot(database, ranked, "verify")), "Success")
+      },
+      Effect.scoped,
+      provideServices
+    ),
+    60_000
+  )
+
+  it.effect(
+    "a rendered script that fails partway leaves the database unchanged",
+    Effect.fnUntraced(
+      function*() {
+        const database = yield* make
+        const script = yield* render(database, ranked).pipe(Effect.map(Option.getOrElse(() => "")))
+        yield* SqlClient.SqlClient.use((sql) => sql`CREATE TABLE effect_local_server_index_catalog (squatter TEXT)`)
+          .pipe(Effect.provide(database.layer()))
         const before = yield* schemaOf(database)
-        const again = yield* database.apply(script).pipe(Effect.exit)
-        assert.strictEqual(failureOf(again), "ScriptRejected")
+        assert.strictEqual(failureOf(yield* database.apply(script).pipe(Effect.exit)), "ScriptRejected")
         assert.deepStrictEqual(yield* schemaOf(database), before)
       },
       Effect.scoped,

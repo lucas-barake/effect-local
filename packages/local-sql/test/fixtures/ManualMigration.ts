@@ -15,7 +15,7 @@ import { DatabaseSync } from "node:sqlite"
 import { inject } from "vitest"
 import { type Dialect, postgresDatabaseUrl } from "./ServerDatabase.js"
 
-export class ScriptRejected extends Schema.TaggedError<ScriptRejected>(
+class ScriptRejected extends Schema.TaggedError<ScriptRejected>(
   "@lucas-barake/effect-local-sql/test/ScriptRejected"
 )("ScriptRejected", { message: Schema.String }) {}
 
