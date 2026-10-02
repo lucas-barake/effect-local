@@ -347,6 +347,24 @@ describe.each(manualDatabases)("server migrations applied by hand on $dialect", 
   )
 
   it.effect(
+    "verify rejects retry options it could not use",
+    Effect.fnUntraced(
+      function*() {
+        const database = yield* make
+        yield* renderAndApply(database, ranked)
+        const outcome = yield* Migrations.server({ mode: "verify", maximumAttempts: 0 }).pipe(
+          Effect.provide(database.layer()),
+          Effect.exit
+        )
+        assert.strictEqual(failureOf(outcome), "InvalidConfiguration")
+      },
+      Effect.scoped,
+      provideServices
+    ),
+    60_000
+  )
+
+  it.effect(
     "rendering rejects a model name SQL text cannot carry",
     Effect.fnUntraced(
       function*() {

@@ -144,6 +144,21 @@ const compareLedger = (
   return undefined
 }
 
+const retryPolicy = Effect.fnUntraced(function*(options: Options) {
+  const maximumAttempts = options.maximumAttempts ?? defaultOptions.maximumAttempts
+  if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts <= 0) {
+    return yield* new ReplicaError.InvalidConfiguration({
+      option: "migration.maximumAttempts",
+      message: "migration.maximumAttempts must be a positive safe integer"
+    })
+  }
+  const retryDelayMillis = yield* Configuration.positiveFiniteDurationMillis(
+    "migration.retryDelay",
+    options.retryDelay ?? defaultOptions.retryDelay
+  )
+  return { maximumAttempts, retryDelayMillis }
+})
+
 const ledger = (table: string, text: string) =>
   `CREATE TABLE IF NOT EXISTS ${table} (
   id INTEGER PRIMARY KEY CHECK (id > 0),
@@ -173,17 +188,7 @@ const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
   })
   const invalid = validateCatalog(catalog, migrations)
   if (invalid !== undefined) return yield* invalid
-  const maximumAttempts = options.maximumAttempts ?? defaultOptions.maximumAttempts
-  if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts <= 0) {
-    return yield* new ReplicaError.InvalidConfiguration({
-      option: "migration.maximumAttempts",
-      message: "migration.maximumAttempts must be a positive safe integer"
-    })
-  }
-  const retryDelayMillis = yield* Configuration.positiveFiniteDurationMillis(
-    "migration.retryDelay",
-    options.retryDelay ?? defaultOptions.retryDelay
-  )
+  const { maximumAttempts, retryDelayMillis } = yield* retryPolicy(options)
   const sql = yield* SqlClient.SqlClient
   const readClient = SqlSchema.findAll({
     Request: Schema.Void,
@@ -1181,6 +1186,7 @@ export const server = Effect.fnUntraced(function*(options: ServerOptions = {}) {
   const sql = yield* SqlClient.SqlClient
   const dialect = yield* Dialect.make(sql)
   if (options.mode !== "verify") return yield* runCatalog("Server", serverCatalogFor(dialect), options)
+  yield* retryPolicy(options)
   const pending = yield* planServer(sql, dialect)
   if (pending.length === 0) return yield* Effect.void
   return yield* new ReplicaError.StorageMigrationPending({
