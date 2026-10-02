@@ -183,22 +183,21 @@ export const make = (options: Options) => {
       WHERE space_id = ${spaceId} AND server_sequence > ${after}
       ORDER BY server_sequence LIMIT ${limit}`
   })
+  const snapshotColumns = sql`snapshot_id, space_id, client_id, membership_incarnation, principal_digest,
+    definition_hash, index_layout_hash, schema_version, schema_hash, scope_json, scope_digest, scope_generation,
+    view_id, view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest`
   const findSnapshot = SqlSchema.findOneOption({
     Request: Identity.SnapshotId,
     Result: Rows.ScopedSnapshotManifestRow,
     execute: (snapshotId) =>
-      sql`SELECT snapshot_id, space_id, client_id, membership_incarnation, principal_digest, definition_hash,
-        index_layout_hash, schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id,
-        view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest
+      sql`SELECT ${snapshotColumns}
       FROM effect_local_server_scoped_snapshots WHERE snapshot_id = ${snapshotId}`
   })
   const findClientSnapshot = SqlSchema.findOneOption({
     Request: Schema.Struct({ spaceId: Identity.SpaceId, clientId: Identity.ClientId }),
     Result: Rows.ScopedSnapshotManifestRow,
     execute: ({ spaceId, clientId }) =>
-      sql`SELECT snapshot_id, space_id, client_id, membership_incarnation, principal_digest, definition_hash,
-        index_layout_hash, schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id,
-        view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest
+      sql`SELECT ${snapshotColumns}
       FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId} AND client_id = ${clientId}`
   })
   const findSnapshotEntryPage = SqlSchema.findAll({
