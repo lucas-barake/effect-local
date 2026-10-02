@@ -130,6 +130,24 @@ type SupportedAnnotations =
   | Schema.Annotations.Filter
   | Schema.Annotations.Key<unknown>
 
+interface Representation {
+  readonly id: string
+  readonly payload: unknown
+  readonly schemas?: ReadonlyArray<SchemaAST.AST> | undefined
+}
+
+const representationOf = (annotations: SupportedAnnotations): Representation | undefined => {
+  const representation: unknown = Reflect.get(annotations, "representation")
+  if (typeof representation !== "object" || representation === null) return undefined
+  const id: unknown = Reflect.get(representation, "id")
+  if (typeof id !== "string") return undefined
+  const schemas: unknown = Reflect.get(representation, "schemas")
+  if (Array.isArray(schemas) && schemas.every(SchemaAST.isAST)) {
+    return { id, payload: Reflect.get(representation, "payload"), schemas }
+  }
+  return { id, payload: Reflect.get(representation, "payload") }
+}
+
 const hasStableMetadata = (annotations: SupportedAnnotations | undefined): boolean =>
   annotations !== undefined &&
   (
@@ -138,14 +156,17 @@ const hasStableMetadata = (annotations: SupportedAnnotations | undefined): boole
     ("typeConstructor" in annotations && annotations.typeConstructor !== undefined)
   )
 
+const identifiesItself = (annotations: SupportedAnnotations | undefined): boolean =>
+  annotations !== undefined && (hasStableMetadata(annotations) || representationOf(annotations) !== undefined)
+
 const hasSemanticAnnotations = (annotations: SupportedAnnotations | undefined): boolean =>
-  annotations !== undefined &&
+  identifiesItself(annotations) ||
   (
-    typeof annotations.identifier === "string" ||
-    ("meta" in annotations && annotations.meta !== undefined) ||
-    ("typeConstructor" in annotations && annotations.typeConstructor !== undefined) ||
-    ("parseOptions" in annotations && annotations.parseOptions !== undefined) ||
-    typeof Reflect.get(annotations, structuralAnnotationKey) === "boolean"
+    annotations !== undefined &&
+    (
+      ("parseOptions" in annotations && annotations.parseOptions !== undefined) ||
+      typeof Reflect.get(annotations, structuralAnnotationKey) === "boolean"
+    )
   )
 
 const hasSemanticContext = (
@@ -176,6 +197,17 @@ const fromAnnotations = (
   if ("parseOptions" in annotations && annotations.parseOptions !== undefined) {
     result.parseOptions = fromUnknown(annotations.parseOptions, state)
   }
+  const representation = representationOf(annotations)
+  if (representation !== undefined) {
+    const described: Record<string, Descriptor> = {
+      id: representation.id,
+      payload: fromUnknown(representation.payload, state)
+    }
+    if (representation.schemas !== undefined) {
+      described.schemas = representation.schemas.map((schema) => fromAST(SchemaAST.toType(schema), state, false))
+    }
+    result.representation = described
+  }
   const structural = Reflect.get(annotations, structuralAnnotationKey)
   if (typeof structural === "boolean") result.structural = structural
   if (Object.keys(result).length === 0) return undefined
@@ -191,7 +223,7 @@ const fromCheck = (
   const annotations = fromAnnotations(check.annotations, state)
   if (annotations !== undefined) result.annotations = annotations
   if (check._tag === "Filter") {
-    if (!trustedBehavior && !hasStableMetadata(check.annotations)) {
+    if (!trustedBehavior && !identifiesItself(check.annotations)) {
       return Defect.invalid("Opaque schema checks require an identifier or meta annotation")
     }
     result.aborted = check.aborted
@@ -380,7 +412,7 @@ const fromAST = (
   }
   switch (ast._tag) {
     case "Declaration": {
-      if (!identifiedBehavior) {
+      if (!identifiedBehavior && !identifiesItself(ast.annotations)) {
         return Defect.invalid("Opaque schema declarations require an identifier or meta annotation")
       }
       node.typeParameters = ast.typeParameters.map((parameter) => fromAST(parameter, state, trustedBehavior))
@@ -461,7 +493,7 @@ export interface MakeOptions {
  * Builds a deterministic structural descriptor.
  *
  * Executable schema behavior must be a recognized built-in or carry a stable
- * `identifier`, `meta`, or `typeConstructor` annotation.
+ * `identifier`, `meta`, `typeConstructor`, or Effect `representation` annotation.
  */
 export const make = (schema: Schema.Constraint, options?: MakeOptions): Descriptor => {
   const state: State = {
