@@ -183,22 +183,21 @@ export const make = (options: Options) => {
       WHERE space_id = ${spaceId} AND server_sequence > ${after}
       ORDER BY server_sequence LIMIT ${limit}`
   })
+  const snapshotColumns = sql`snapshot_id, space_id, client_id, membership_incarnation, principal_digest,
+    definition_hash, index_layout_hash, schema_version, schema_hash, scope_json, scope_digest, scope_generation,
+    view_id, view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest`
   const findSnapshot = SqlSchema.findOneOption({
     Request: Identity.SnapshotId,
     Result: Rows.ScopedSnapshotManifestRow,
     execute: (snapshotId) =>
-      sql`SELECT snapshot_id, space_id, client_id, principal_digest, definition_hash,
-        index_layout_hash, schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id,
-        view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest
+      sql`SELECT ${snapshotColumns}
       FROM effect_local_server_scoped_snapshots WHERE snapshot_id = ${snapshotId}`
   })
   const findClientSnapshot = SqlSchema.findOneOption({
     Request: Schema.Struct({ spaceId: Identity.SpaceId, clientId: Identity.ClientId }),
     Result: Rows.ScopedSnapshotManifestRow,
     execute: ({ spaceId, clientId }) =>
-      sql`SELECT snapshot_id, space_id, client_id, principal_digest, definition_hash,
-        index_layout_hash, schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id,
-        view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest
+      sql`SELECT ${snapshotColumns}
       FROM effect_local_server_scoped_snapshots WHERE space_id = ${spaceId} AND client_id = ${clientId}`
   })
   const findSnapshotEntryPage = SqlSchema.findAll({
@@ -619,10 +618,10 @@ export const make = (options: Options) => {
           read_auth_epoch = excluded.read_auth_epoch`
       yield* replaceViewEntities(request, principalHash, cursor, visibleEntities)
       yield* sql`INSERT INTO effect_local_server_scoped_snapshots
-        (snapshot_id, space_id, client_id, principal_digest, definition_hash, index_layout_hash,
-          schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id, view_revision,
-          server_sequence, terminal_sequence, entry_count, content_bytes, digest)
-        VALUES (${snapshotId}, ${request.spaceId}, ${request.clientId}, ${principalHash},
+        (snapshot_id, space_id, client_id, membership_incarnation, principal_digest, definition_hash,
+          index_layout_hash, schema_version, schema_hash, scope_json, scope_digest, scope_generation, view_id,
+          view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest)
+        VALUES (${snapshotId}, ${request.spaceId}, ${request.clientId}, ${request.membershipIncarnation}, ${principalHash},
           ${targetDefinition.hash}, ${targetDefinition.indexLayoutHash}, ${targetDefinition.schemaIdentity.version},
           ${targetDefinition.schemaIdentity.hash}, ${yield* Codec.stringify(normalized)}, ${normalizedDigest},
           ${request.scopeGeneration}, ${viewId}, 0, ${space.next_server_sequence - 1},
@@ -1321,9 +1320,12 @@ export const make = (options: Options) => {
         const normalizedDigest = yield* scopeDigest(normalized)
         const principalHash = yield* principalDigest(principal)
         let stored = yield* findSnapshot(request.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
+        let afterOrdinal = request.afterOrdinal
         if (
           Option.isNone(stored) || stored.value.space_id !== request.spaceId ||
-          stored.value.client_id !== request.clientId || stored.value.principal_digest !== principalHash ||
+          stored.value.client_id !== request.clientId ||
+          stored.value.membership_incarnation !== request.membershipIncarnation ||
+          stored.value.principal_digest !== principalHash ||
           stored.value.definition_hash !== targetDefinition.hash ||
           stored.value.index_layout_hash !== targetDefinition.indexLayoutHash ||
           stored.value.schema_version !== request.schema.version || stored.value.schema_hash !== request.schema.hash ||
@@ -1332,12 +1334,12 @@ export const make = (options: Options) => {
         ) {
           const manifest = yield* createSnapshot({ ...request, scope: normalized }, principal, principalHash)
           stored = yield* findSnapshot(manifest.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
+          afterOrdinal = -1
         }
         if (Option.isNone(stored)) {
           return yield* new ReplicaError.StorageCorrupt({ message: "Scoped snapshot disappeared" })
         }
         let row = stored.value
-        let afterOrdinal = request.afterOrdinal
         if (afterOrdinal >= row.entry_count) {
           return yield* new ReplicaError.CursorGap({
             expected: Math.max(-1, row.entry_count - 1),
