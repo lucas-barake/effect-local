@@ -223,6 +223,21 @@ const resolveOptions = <R,>(input: Options<R>): ResolvedOptions<R> => ({
   readAuthorizationCacheCapacity: input.readAuthorizationCacheCapacity ?? defaults.readAuthorizationCacheCapacity
 })
 
+const ReadAuthorizationCapture = Schema.fromJsonString(Schema.Struct({
+  spaceId: Identity.SpaceId,
+  clientId: Identity.ClientId,
+  scope: Protocol.ReplicationScope,
+  principal: Schema.Json
+}))
+
+const BootstrapAuthorizationCapture = Schema.fromJsonString(Schema.Struct({
+  request: Protocol.BootstrapRequest,
+  principal: Schema.Json
+}))
+
+const copyThrough = <S extends Schema.Codec<unknown, string>,>(schema: S, value: S["Type"]) =>
+  Codec.encode(schema, value).pipe(Effect.flatMap((encoded) => Codec.decode(schema, encoded)))
+
 const highWater = (retained: number, maximum: number) => retained + Math.ceil((maximum - retained) / 2)
 
 type NumericHistoryOption = Exclude<keyof HistoryOptions, "migration">
@@ -2066,21 +2081,12 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         principal: typeof Schema.Json.Type
       ) {
         const scope = yield* Protocol.validateReplicationScope(options.definition, request.scope)
-        const encoded = yield* Canonical.stringifyEffect({
-          spaceId: request.spaceId,
-          clientId: request.clientId,
-          scope,
-          principal
-        })
-        const captured = yield* Schema.fromJsonString(Schema.Struct({
-          spaceId: Identity.SpaceId,
-          clientId: Identity.ClientId,
-          scope: Protocol.ReplicationScope,
-          principal: Schema.Json
-        })).pipe((schema) => Codec.decode(schema, encoded))
+        const authorization = { spaceId: request.spaceId, clientId: request.clientId, scope, principal }
+        const key = yield* Canonical.stringifyEffect(authorization)
+        const captured = yield* copyThrough(ReadAuthorizationCapture, authorization)
         const capturedRequest = { ...request, ...captured }
         return {
-          key: encoded,
+          key,
           request: capturedRequest,
           principal: captured.principal,
           lookup: () => authorizeReadScope(capturedRequest, captured.principal)
@@ -2230,14 +2236,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         request: Protocol.BootstrapRequest,
         principal: typeof Schema.Json.Type
       ) {
-        const authorizationSchema = Schema.fromJsonString(Schema.Struct({
-          request: Protocol.BootstrapRequest,
-          principal: Schema.Json
-        }))
-        const captured = yield* Codec.decode(
-          authorizationSchema,
-          yield* Canonical.stringifyEffect({ request, principal })
-        )
+        const captured = yield* copyThrough(BootstrapAuthorizationCapture, { request, principal })
         const callerDefinition = yield* validateCallerSchema(captured.request.schema)
         const normalizedRequest = {
           ...captured.request,

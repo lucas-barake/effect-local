@@ -547,26 +547,28 @@ export const make = Effect.fn("ServerIndex.make")(
           const logs: Array<Record<string, unknown>> = []
           const rows: Array<Record<string, unknown>> = []
           const deleted: Array<string> = []
-          const log = (values: ReadonlyArray<SqlValue>) => {
+          const log = Effect.fnUntraced(function*(values: ReadonlyArray<SqlValue>) {
             logs.push({
               space_id: spaceId,
               schema_generation: schemaGeneration,
               server_sequence: serverSequence,
               descriptor_hash: descriptor.hash,
-              partition_json: Canonical.stringify(values)
+              partition_json: yield* Codec.stringify(values)
             })
-          }
+          })
           for (const item of prepared) {
             const previous = previousByKey.get(item.entityKey)
             if (item.change._tag === "Delete") {
-              if (previous !== undefined) log(previous)
+              if (previous !== undefined) yield* log(previous)
               deleted.push(item.entityKey)
               continue
             }
             const values = yield* encodedComponents(descriptor.index, item.value)
             const next = values.slice(0, descriptor.index.partition.length)
-            if (previous !== undefined && Canonical.stringify(previous) !== Canonical.stringify(next)) log(previous)
-            log(next)
+            if (previous !== undefined && Canonical.stringify(previous) !== Canonical.stringify(next)) {
+              yield* log(previous)
+            }
+            yield* log(next)
             rows.push(indexRow(dialect, descriptor, spaceId, schemaGeneration, item.entityKey, values))
           }
           for (let offset = 0; offset < deleted.length; offset += 100) {
@@ -671,7 +673,7 @@ export const make = Effect.fn("ServerIndex.make")(
           affinity: component.affinity
         }))
         exclusion = sql`NOT EXISTS (
-            SELECT 1 FROM ${dialect.jsonRecords(Canonical.stringify(overrideRecords), "override", overrideFields)}
+            SELECT 1 FROM ${dialect.jsonRecords(yield* Codec.stringify(overrideRecords), "override", overrideFields)}
             WHERE ${overrideMatch}
           )`
       }

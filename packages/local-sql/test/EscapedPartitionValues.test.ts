@@ -51,6 +51,7 @@ const Message = Model.make("Message", {
 const PutMessage = Mutation.make("PutMessage", { version: 1, payload: Message.schema })
 const definition = Definition.make({ version: 1, models: [Message], mutations: [PutMessage] })
 const layerHandlers = PutMessage.toLayer(({ payload, transaction }) => transaction.set(Message, payload.id, payload))
+const layerRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(layerHandlers))
 
 const put = Effect.fnUntraced(function*(sequence: number, payload: MessageValue) {
   const identity = {
@@ -96,11 +97,16 @@ const bootstrapRequest = (scope: Protocol.ReplicationScope, manifest: Protocol.S
     limit: 100
   })
 
-const keyOf = (change: Protocol.ViewChange) => String(change.entity.key)
+const keyOf = (change: Protocol.ViewChange) => {
+  const key = change.entity.key
+  if (typeof key !== "string") assert.fail("expected a string entity key")
+  return key
+}
 
 const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
 
 describe.each(serverDatabases)("partition values and principals that start with U+001D ($dialect)", (database) => {
+  const layerServices = Layer.mergeAll(database.layer(), NodeCrypto.layer, Reactivity.layer)
   const makeServer = (observed: Array<ServerStore.ReadAuthorizationInput> = []) =>
     ServerStore.layer({
       definition,
@@ -109,8 +115,8 @@ describe.each(serverDatabases)("partition values and principals that start with 
       authorizeMutation: () => Effect.void,
       authorizeRead: (input) => Effect.sync(() => observed.push(input))
     }).pipe(
-      Layer.provide(MutationRuntime.layer(definition).pipe(Layer.provide(layerHandlers))),
-      Layer.provide(Layer.mergeAll(database.layer(), NodeCrypto.layer, Reactivity.layer)),
+      Layer.provide(layerRuntime),
+      Layer.provide(layerServices),
       Layer.build,
       Effect.map(Context.get(ServerStore.ServerStore))
     )
@@ -124,7 +130,7 @@ describe.each(serverDatabases)("partition values and principals that start with 
         yield* server.submit(yield* put(2, { id: "m-2", chatId: escapedChat, sentAt: 2 }))
         const scope = windowScope(1, [Protocol.ReplicationWindowPartition.make({ key: [escapedChat], count: 2 })])
         const required = yield* server.pullAuthorized(pullRequest(scope, null), "reader")
-        if (!("_tag" in required)) return assert.fail("expected a window bootstrap")
+        if (!("_tag" in required)) assert.fail("expected a window bootstrap")
         const page = yield* server.bootstrapAuthorized(bootstrapRequest(scope, required.manifest), "reader")
         assert.strictEqual(page.manifest.scopeDigest, required.manifest.scopeDigest)
         assert.deepStrictEqual(page.entries.map((entry) => keyOf(entry.change)).toSorted(), ["m-1", "m-2"])
@@ -143,13 +149,13 @@ describe.each(serverDatabases)("partition values and principals that start with 
         yield* server.submit(yield* put(1, { id: "m-1", chatId: escapedChat, sentAt: 1 }))
         const scope = windowScope(1, [Protocol.ReplicationWindowPartition.make({ key: [escapedChat], count: 1 })])
         const required = yield* server.pullAuthorized(pullRequest(scope, null), escapedReader)
-        if (!("_tag" in required)) return assert.fail("expected a window bootstrap")
+        if (!("_tag" in required)) assert.fail("expected a window bootstrap")
         yield* server.bootstrapAuthorized(bootstrapRequest(scope, required.manifest), escapedReader)
         yield* server.watchAuthorized({ ...context(scope), cursor: required.manifest.cursor }, escapedReader)
         assert.isAbove(observed.length, 2)
         for (const input of observed) {
           assert.strictEqual(input.principal, escapedReader)
-          assert.deepStrictEqual(input.scope.windows[0]?.partitions[0]?.key, [escapedChat])
+          assert.deepStrictEqual(input.scope.windows?.[0]?.partitions?.[0]?.key, [escapedChat])
         }
       },
       Effect.scoped,
@@ -165,15 +171,15 @@ describe.each(serverDatabases)("partition values and principals that start with 
         yield* server.submit(yield* put(1, { id: "old", chatId: escapedChat, sentAt: 1 }))
         const scope = windowScope(1)
         const required = yield* server.pull(pullRequest(scope, null))
-        if (!("_tag" in required)) return assert.fail("expected a window bootstrap")
+        if (!("_tag" in required)) assert.fail("expected a window bootstrap")
         yield* server.bootstrap(bootstrapRequest(scope, required.manifest))
         const settled = yield* server.pull(pullRequest(scope, required.manifest.cursor))
-        if ("_tag" in settled) return assert.fail("expected a page")
+        if ("_tag" in settled) assert.fail("expected a page")
         const acknowledged = yield* server.pull(pullRequest(scope, settled.cursor))
-        if ("_tag" in acknowledged) return assert.fail("expected a page")
+        if ("_tag" in acknowledged) assert.fail("expected a page")
         yield* server.submit(yield* put(2, { id: "new", chatId: escapedChat, sentAt: 2 }))
         const slid = yield* server.pull(pullRequest(scope, acknowledged.cursor))
-        if ("_tag" in slid) return assert.fail("expected a page")
+        if ("_tag" in slid) assert.fail("expected a page")
         assert.deepStrictEqual(
           slid.changes.map((change) => `${change._tag}:${keyOf(change)}`).toSorted(),
           ["Retract:old", "Upsert:new"]
@@ -194,7 +200,7 @@ describe.each(serverDatabases)("partition values and principals that start with 
         }
         const scope = windowScope(3, [Protocol.ReplicationWindowPartition.make({ key: [escapedChat], count: 1 })])
         const required = yield* server.pull(pullRequest(scope, null))
-        if (!("_tag" in required)) return assert.fail("expected a window bootstrap")
+        if (!("_tag" in required)) assert.fail("expected a window bootstrap")
         const page = yield* server.bootstrap(bootstrapRequest(scope, required.manifest))
         assert.deepStrictEqual(page.entries.map((entry) => keyOf(entry.change)), ["m-3"])
       },
