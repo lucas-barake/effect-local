@@ -1472,6 +1472,32 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
   )
 
   it.effect(
+    "serves a replacement snapshot from its first entry when the presented one was partly read",
+    Effect.fnUntraced(function*() {
+      const server = yield* makeServer().pipe(Layer.build, Effect.map(Context.get(ServerStore.ServerStore)))
+      yield* server.submit(yield* envelope("first", 1))
+      yield* server.submit(yield* envelope("second", 2))
+      const previous = yield* server.pullAuthorized(pullRequest(), "reader")
+      if (!("_tag" in previous)) assert.fail("expected scoped bootstrap")
+      const firstPage = yield* server.bootstrapAuthorized(
+        { ...bootstrapRequest(previous.manifest), limit: 1 },
+        "reader"
+      )
+      assert.strictEqual(firstPage.entries.length, 1)
+      yield* server.submit(yield* deleteEnvelope("first", 3))
+      yield* server.submit(yield* deleteEnvelope("second", 4))
+
+      const rejoined = Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-0000000000b4")
+      const replaced = yield* server.bootstrapAuthorized(
+        { ...bootstrapRequest(previous.manifest), membershipIncarnation: rejoined, afterOrdinal: 0 },
+        "reader"
+      )
+      assert.notStrictEqual(replaced.manifest.snapshotId, previous.manifest.snapshotId)
+      assert.deepStrictEqual(replaced.entries, [])
+    }, provideNodeCrypto)
+  )
+
+  it.effect(
     "evicts a retracted entity without letting pending replay restore it",
     Effect.fnUntraced(function*() {
       let visible = true

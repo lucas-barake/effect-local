@@ -1321,6 +1321,7 @@ export const make = (options: Options) => {
         const normalizedDigest = yield* scopeDigest(normalized)
         const principalHash = yield* principalDigest(principal)
         let stored = yield* findSnapshot(request.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
+        let afterOrdinal = request.afterOrdinal
         if (
           Option.isNone(stored) || stored.value.space_id !== request.spaceId ||
           stored.value.client_id !== request.clientId ||
@@ -1334,12 +1335,12 @@ export const make = (options: Options) => {
         ) {
           const manifest = yield* createSnapshot({ ...request, scope: normalized }, principal, principalHash)
           stored = yield* findSnapshot(manifest.snapshotId).pipe(Effect.mapError(StorageUnavailable.make))
+          afterOrdinal = -1
         }
         if (Option.isNone(stored)) {
           return yield* new ReplicaError.StorageCorrupt({ message: "Scoped snapshot disappeared" })
         }
         let row = stored.value
-        let afterOrdinal = request.afterOrdinal
         if (afterOrdinal >= row.entry_count) {
           return yield* new ReplicaError.CursorGap({
             expected: Math.max(-1, row.entry_count - 1),
