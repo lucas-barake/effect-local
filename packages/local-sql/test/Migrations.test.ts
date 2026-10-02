@@ -13,6 +13,7 @@ import * as FileSystem from "effect/FileSystem"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Schema from "effect/Schema"
 import * as SqlClient from "effect/sql/SqlClient"
@@ -27,6 +28,7 @@ import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as Domain from "./Domain.js"
 import { postgresDatabaseUrl, postgresLayer, serverDatabases } from "./fixtures/ServerDatabase.js"
+import { gateStatements } from "./fixtures/SqlGate.js"
 
 const layerDatabase = ConnectionLane.makeLayer().pipe(
   Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
@@ -202,7 +204,7 @@ describe("storage migration catalogs", () => {
       )
       pipe(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2, 3])
+        (ids) => assert.deepStrictEqual(ids, [1])
       )
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
@@ -286,34 +288,6 @@ describe("storage migration catalogs", () => {
       })(undefined)
       assert.strictEqual(clientRetractions.count, 0)
       assert.strictEqual(serverViews.count, 0)
-    }, provideDatabase)
-  )
-
-  it.effect(
-    "claims pending migrations before executing their effects",
-    Effect.fnUntraced(function*() {
-      const sql = yield* SqlClient.SqlClient
-      const migration = Migrations.makeMigration({
-        id: 1,
-        name: "claimed-first",
-        statements: ["SELECT 1"],
-        effect: {
-          id: "assert-claim",
-          run: (transaction) =>
-            clientLedger(transaction).pipe(
-              Effect.catchTags({
-                SchemaError: (error) => Effect.die(error),
-                SqlError: (error) => Effect.die(error)
-              }),
-              Effect.flatMap((rows) => {
-                if (rows.length === 1 && rows[0]?.id === 1) return Effect.void
-                return Effect.die("Migration effect ran before its durable claim")
-              })
-            )
-        }
-      })
-      yield* Migrations.runCatalog("Client", [migration])
-      pipe((yield* clientLedger(sql)).map((row) => row.id), (ids) => assert.deepStrictEqual(ids, [1]))
     }, provideDatabase)
   )
 
@@ -411,23 +385,23 @@ describe("storage migration catalogs", () => {
     Effect.fnUntraced(
       function*() {
         const sql = yield* SqlClient.SqlClient
-        const started = yield* Deferred.make<void>()
+        const gate = yield* gateStatements(sql, (statement) => {
+          if (statement.startsWith("INSERT INTO effect_local_client_migrations")) return ["after"]
+          return []
+        })
         const interrupted = Migrations.makeMigration({
           id: 1,
           name: "interrupted",
           statements: [
             "CREATE TABLE migration_probe (value INTEGER NOT NULL)",
             "INSERT INTO migration_probe (value) VALUES (1)"
-          ],
-          effect: {
-            id: "wait-forever",
-            run: () => Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never))
-          }
+          ]
         })
         const fiber = yield* Migrations.runCatalog("Client", [interrupted]).pipe(
+          Effect.provideService(SqlClient.SqlClient, gate.sql),
           Effect.forkChild({ startImmediately: true })
         )
-        yield* Deferred.await(started)
+        yield* Queue.take(gate.pauses)
         yield* Fiber.interrupt(fiber)
         pipe((yield* tableNames(sql)).map((row) => row.name), (names) => assert.notInclude(names, "migration_probe"))
         assert.deepStrictEqual(yield* clientLedger(sql), [])
@@ -506,9 +480,7 @@ describe("postgres server catalog", () => {
 
       const ledger = yield* serverMigrationLedger(sql)
       assert.deepStrictEqual(ledger, [
-        { id: 1, name: "postgres-baseline", checksum: Migrations.serverPostgresCatalog[0].checksum },
-        { id: 2, name: "postgres-index-generations", checksum: Migrations.serverPostgresCatalog[1].checksum },
-        { id: 3, name: "postgres-view-memberships", checksum: Migrations.serverPostgresCatalog[2].checksum }
+        { id: 1, name: "postgres-baseline", checksum: Migrations.serverPostgresCatalog[0].checksum }
       ])
       const names = (yield* postgresTableNames(sql)).map((row) => row.table_name)
       assert.includeMembers(names, [
@@ -589,7 +561,7 @@ describe("postgres server catalog", () => {
         yield* Fiber.join(secondRunner)
         pipe(
           (yield* serverMigrationLedger(observer)).map((row) => row.id),
-          (ids) => assert.deepStrictEqual(ids, [1, 2, 3])
+          (ids) => assert.deepStrictEqual(ids, [1])
         )
       },
       Effect.scoped,

@@ -25,7 +25,6 @@ import { type ManualDatabase, manualDatabases } from "./fixtures/ManualMigration
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000c01")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000c01")
 const migration = { retryDelay: "1 millis", maximumAttempts: 8 } as const
-const serverCatalogs = { sqlite: Migrations.serverCatalog, pg: Migrations.serverPostgresCatalog } as const
 
 const NoteSchema = Schema.Struct({ id: Schema.String, rank: Schema.Number })
 const rankIndex = {
@@ -204,29 +203,6 @@ describe.each(manualDatabases)("server migrations applied by hand on $dialect", 
           sql`SELECT entity_key FROM effect_local_server_entities WHERE model = 'Note'`
         ).pipe(Effect.provide(database.layer()))
         assert.deepStrictEqual(stored, [{ entity_key: "\"note-1\"" }])
-      },
-      Effect.scoped,
-      provideServices
-    ),
-    60_000
-  )
-
-  it.effect(
-    "brings a database migrated by an earlier release up to date",
-    Effect.fnUntraced(
-      function*() {
-        const manual = yield* make
-        const automatic = yield* make
-        const earlier = serverCatalogs[manual.dialect].slice(0, -1)
-        for (const database of [manual, automatic]) {
-          yield* Migrations.runCatalog("Server", earlier, migration).pipe(Effect.provide(database.layer()))
-        }
-        assert.strictEqual(failureOf(yield* boot(manual, ranked, "verify")), "StorageMigrationPending(Server)")
-        yield* renderAndApply(manual, ranked)
-        assert.strictEqual(failureOf(yield* boot(manual, ranked, "verify")), "Success")
-        assert.strictEqual(failureOf(yield* boot(automatic, ranked, "apply")), "Success")
-        assert.deepStrictEqual(yield* schemaOf(manual), yield* schemaOf(automatic))
-        assert.deepStrictEqual(yield* bookkeepingOf(manual), yield* bookkeepingOf(automatic))
       },
       Effect.scoped,
       provideServices
