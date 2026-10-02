@@ -25,7 +25,6 @@ export interface Migration {
   readonly name: string
   readonly checksum: Identity.SchemaHash
   readonly statements: ReadonlyArray<string>
-  readonly effect?: ((sql: SqlClient.SqlClient) => Effect.Effect<void, ReplicaError.ReplicaError>) | undefined
 }
 
 export interface Options {
@@ -50,19 +49,12 @@ export const makeMigration = (options: {
   readonly id: number
   readonly name: string
   readonly statements: ReadonlyArray<string>
-  readonly effect?: {
-    readonly id: string
-    readonly run: (sql: SqlClient.SqlClient) => Effect.Effect<void, ReplicaError.ReplicaError>
-  } | undefined
 }): Migration => {
   if (!Number.isSafeInteger(options.id) || options.id <= 0) {
     throw new TypeError(`Storage migration id must be a positive safe integer: ${options.id}`)
   }
   if (!stableName.test(options.name)) throw new TypeError(`Storage migration name is not stable: ${options.name}`)
   if (options.statements.length === 0) throw new TypeError(`Storage migration ${options.name} has no statements`)
-  if (options.effect !== undefined && !stableName.test(options.effect.id)) {
-    throw new TypeError(`Storage migration effect id is not stable: ${options.effect.id}`)
-  }
   const statements = Object.freeze([...options.statements])
   const migration = {
     id: options.id,
@@ -71,13 +63,11 @@ export const makeMigration = (options: {
       format: 1,
       id: options.id,
       name: options.name,
-      statements,
-      effect: options.effect?.id ?? null
+      statements
     })),
     statements
   }
-  if (options.effect === undefined) return Object.freeze(migration)
-  return Object.freeze({ ...migration, effect: options.effect.run })
+  return Object.freeze(migration)
 }
 /* oxlint-enable effect/noThrowStatement, effect/noNewError */
 
@@ -233,7 +223,6 @@ const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
       for (let index = applied.length; index < migrations.length; index++) {
         const migration = migrations[index]
         yield* Effect.forEach(migration.statements, (statement) => sql.unsafe(statement), { discard: true })
-        if (migration.effect !== undefined) yield* migration.effect(sql)
       }
       return yield* Effect.void
     }))
@@ -762,6 +751,7 @@ const serverTables = (types: ServerTypes): ReadonlyArray<string> => {
       principal_digest ${text} NOT NULL CHECK (length(principal_digest) = 64),
       view_id ${text} NOT NULL,
       view_revision ${integer} NOT NULL CHECK (view_revision >= 0),
+      membership_incarnation ${text} NOT NULL,
       scope_generation ${integer} NOT NULL CHECK (scope_generation >= 0),
       scope_json ${text} NOT NULL CHECK (${json("scope_json")}),
       scope_digest ${text} NOT NULL CHECK (length(scope_digest) = 64),
@@ -862,6 +852,9 @@ const serverTables = (types: ServerTypes): ReadonlyArray<string> => {
       descriptor_hash ${text} NOT NULL,
       partition_json ${text} NOT NULL CHECK (${json("partition_json")}),
       PRIMARY KEY (space_id, server_sequence, descriptor_hash, partition_json)
+    )`,
+    `CREATE TABLE effect_local_server_index_generations (
+      generation ${integer} PRIMARY KEY CHECK (generation > 0)
     )`,
     `CREATE TABLE effect_local_server_offline_wake_acknowledgements (
       space_id ${text} NOT NULL,
@@ -984,28 +977,7 @@ const sqliteServerBaseline = makeMigration({
   ]
 })
 
-const indexGenerations = (integer: string) =>
-  `CREATE TABLE effect_local_server_index_generations (
-      generation ${integer} PRIMARY KEY CHECK (generation > 0)
-    )`
-
-const sqliteIndexGenerations = makeMigration({
-  id: 2,
-  name: "server-index-generations",
-  statements: [indexGenerations("INTEGER")]
-})
-
-const viewMemberships = (text: string) =>
-  `ALTER TABLE effect_local_server_replication_views
-    ADD COLUMN membership_incarnation ${text} NOT NULL DEFAULT ''`
-
-const sqliteViewMemberships = makeMigration({
-  id: 3,
-  name: "server-view-memberships",
-  statements: [viewMemberships("TEXT")]
-})
-
-export const serverCatalog = Object.freeze([sqliteServerBaseline, sqliteIndexGenerations, sqliteViewMemberships])
+export const serverCatalog = Object.freeze([sqliteServerBaseline])
 
 const postgresBaseline = makeMigration({
   id: 1,
@@ -1080,23 +1052,7 @@ const postgresBaseline = makeMigration({
   ]
 })
 
-const postgresIndexGenerations = makeMigration({
-  id: 2,
-  name: "postgres-index-generations",
-  statements: [indexGenerations("BIGINT")]
-})
-
-const postgresViewMemberships = makeMigration({
-  id: 3,
-  name: "postgres-view-memberships",
-  statements: [viewMemberships("TEXT COLLATE \"C\"")]
-})
-
-export const serverPostgresCatalog = Object.freeze([
-  postgresBaseline,
-  postgresIndexGenerations,
-  postgresViewMemberships
-])
+export const serverPostgresCatalog = Object.freeze([postgresBaseline])
 
 export const client = Effect.fnUntraced(function*(options: {
   readonly definition: Definition.Any
@@ -1251,12 +1207,6 @@ export const renderServer = Effect.fn("Migrations.renderServer")(function*(optio
   const statements = [...dialect.scriptPrologue]
   if (pending.length > 0) statements.push(ledger("effect_local_server_migrations", dialect.text))
   for (const migration of pending) {
-    if (migration.effect !== undefined) {
-      return yield* new ReplicaError.InvalidConfiguration({
-        option: "migration",
-        message: `Server migration ${migration.id}:${migration.name} runs an Effect and cannot be rendered as SQL`
-      })
-    }
     statements.push(
       `INSERT INTO effect_local_server_migrations (id, name, checksum) VALUES (${migration.id}, ${
         dialect.literal(migration.name)

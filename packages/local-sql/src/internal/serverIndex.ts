@@ -253,13 +253,11 @@ export const plan = Effect.fn("ServerIndex.plan")(function*(
         (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
       )
     )
-  let generation = 0
-  if (yield* exists("effect_local_server_index_generations")) generation = yield* readGeneration(sql)
   if (!(yield* exists("effect_local_server_index_catalog"))) {
-    return { missing: all, orphans: [], generation } satisfies GenerationPlan
+    return { missing: all, orphans: [], generation: 0 } satisfies GenerationPlan
   }
   const pending = yield* planCatalog(all, yield* readCatalog(sql))
-  return { ...pending, generation } satisfies GenerationPlan
+  return { ...pending, generation: yield* readGeneration(sql) } satisfies GenerationPlan
 }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const make = Effect.fn("ServerIndex.make")(

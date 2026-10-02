@@ -1448,38 +1448,6 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
   )
 
   it.effect(
-    "rebuilds a view stored before memberships were recorded and then continues it incrementally",
-    Effect.fnUntraced(function*() {
-      const context = yield* ServerStore.layer({
-        ...history,
-        definition: Domain.definition,
-        authorizeAccess: () => Effect.void,
-        authorizeMutation: () => Effect.void,
-        authorizeRead: () => Effect.void
-      }).pipe(Layer.provide(layerRuntime), Layer.provideMerge(layerServerDatabase), Layer.build)
-      const server = Context.get(context, ServerStore.ServerStore)
-      const sql = Context.get(context, SqlClient.SqlClient)
-      yield* server.submit(yield* envelope("kept", 1))
-      const initial = yield* server.pullAuthorized(pullRequest(), "reader")
-      if (!("_tag" in initial)) assert.fail("expected scoped bootstrap")
-      yield* server.bootstrapAuthorized(bootstrapRequest(initial.manifest), "reader")
-      const settled = yield* server.pullAuthorized(pullRequest(initial.manifest.cursor), "reader")
-      if ("_tag" in settled) assert.fail("expected incremental page")
-
-      yield* sql`UPDATE effect_local_server_replication_views SET membership_incarnation = ''`
-      const rebuilt = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
-      if (!("_tag" in rebuilt)) assert.fail("expected the legacy view to be rebuilt")
-      const page = yield* server.bootstrapAuthorized(bootstrapRequest(rebuilt.manifest), "reader")
-      assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["kept"])
-
-      yield* server.submit(yield* envelope("later", 2))
-      const continued = yield* server.pullAuthorized(pullRequest(rebuilt.manifest.cursor), "reader")
-      if ("_tag" in continued) assert.fail("expected the rebuilt view to continue incrementally")
-      assert.deepStrictEqual(continued.changes.map((change) => change.entity.key), ["later"])
-    }, provideNodeCrypto)
-  )
-
-  it.effect(
     "evicts a retracted entity without letting pending replay restore it",
     Effect.fnUntraced(function*() {
       let visible = true
