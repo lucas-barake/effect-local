@@ -26,7 +26,7 @@ export interface ManualDatabase {
   readonly apply: (script: string) => Effect.Effect<void, ScriptRejected>
 }
 
-export interface PostgresManualDatabase extends ManualDatabase {
+interface PostgresManualDatabase extends ManualDatabase {
   readonly applyAsOneMessage: (script: string, clientEncoding: string) => Effect.Effect<void, ScriptRejected>
 }
 
