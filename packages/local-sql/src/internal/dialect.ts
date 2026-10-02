@@ -127,7 +127,12 @@ const postgres = (sql: SqlClient.SqlClient): Dialect => ({
     ),
   decodeText: decodeEscapedText,
   lockSchema: sql.unsafe(schemaLockStatement).pipe(Effect.asVoid),
-  scriptPrologue: ["BEGIN", "SET LOCAL standard_conforming_strings = on", schemaLockStatement],
+  scriptPrologue: [
+    "BEGIN",
+    "SET LOCAL client_encoding = 'UTF8'",
+    "SET LOCAL standard_conforming_strings = on",
+    schemaLockStatement
+  ],
   tableExists: tableExists((name) => sql`SELECT 1 AS present WHERE to_regclass(${name}) IS NOT NULL`),
   lockPresences: (keys) =>
     Effect.forEach(

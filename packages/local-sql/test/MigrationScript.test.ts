@@ -340,3 +340,28 @@ describe.each(manualDatabases)("server migrations applied by hand on $dialect", 
     60_000
   )
 })
+
+describe("server migrations applied by hand through psql", () => {
+  it.effect(
+    "keep non ASCII names intact when the session uses another client encoding",
+    Effect.fnUntraced(
+      function*() {
+        const database = yield* manualDatabases[1].make
+        const Accented = Model.make("Noté", {
+          version: 1,
+          key: Schema.String,
+          schema: NoteSchema,
+          indexes: { byRank: rankIndex }
+        })
+        const definition = Definition.make({ version: 1, models: [Accented], mutations: [PutNote] })
+        const script = yield* render(database, definition).pipe(Effect.map(Option.getOrElse(() => "")))
+        assert.notStrictEqual(script, "")
+        yield* database.apply(`SET client_encoding = 'LATIN1';\n${script}`)
+        assert.strictEqual(failureOf(yield* boot(database, definition, "verify")), "Success")
+      },
+      Effect.scoped,
+      provideServices
+    ),
+    60_000
+  )
+})
