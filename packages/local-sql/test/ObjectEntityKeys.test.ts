@@ -5,6 +5,7 @@ import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
@@ -61,10 +62,13 @@ const replicaSpace = (server: ServerStore.Service, clientId: Identity.ClientId) 
     })),
     Layer.provide(layerHandlers),
     Layer.provide(layerDatabase()),
-    Layer.provide(Reactivity.layer),
+    Layer.provideMerge(Reactivity.layer),
     Layer.build,
-    Effect.map(Context.get(Replica.Replica)),
-    Effect.flatMap((replica) => replica.space(spaceId))
+    Effect.flatMap((context) =>
+      Context.get(context, Replica.Replica).space(spaceId).pipe(
+        Effect.map((space) => ({ space, reactivity: Context.get(context, Reactivity.Reactivity) }))
+      )
+    )
   )
 
 const settled = (space: Replica.Space, count: number) =>
@@ -73,8 +77,19 @@ const settled = (space: Replica.Space, count: number) =>
 const labelOf = (space: Replica.Space, key: typeof PairKey.Type) =>
   space.get(Pair, key).pipe(Effect.map(Option.map((value) => value.label)))
 
+const awaitLabel = (
+  replica: { readonly space: Replica.Space; readonly reactivity: Reactivity.Reactivity },
+  key: typeof PairKey.Type,
+  label: string
+) =>
+  replica.reactivity.stream([ReactivityKey.entity(spaceId, Pair.name, key)], labelOf(replica.space, key)).pipe(
+    Stream.filter((current) => Option.getOrUndefined(current) === label),
+    Stream.runHead,
+    Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
+  )
+
 describe("object entity keys", () => {
-  it.live(
+  it.effect(
     "treat the same object key written in either property order as one entity everywhere",
     () =>
       Effect.scoped(Effect.gen(function*() {
@@ -83,30 +98,23 @@ describe("object entity keys", () => {
         const sql = Context.get(context, SqlClient.SqlClient)
         const writer = yield* replicaSpace(server, writerId)
 
-        yield* writer.mutate(PutPair, { key: forward, label: "first" })
-        yield* writer.mutate(PutPair, { key: reversed, label: "second" })
-        assert.deepStrictEqual(yield* labelOf(writer, forward), Option.some("second"))
-        yield* settled(writer, 2)
+        yield* writer.space.mutate(PutPair, { key: forward, label: "first" })
+        yield* writer.space.mutate(PutPair, { key: reversed, label: "second" })
+        assert.deepStrictEqual(yield* labelOf(writer.space, forward), Option.some("second"))
+        yield* settled(writer.space, 2)
 
         const stored = yield* sql<{ readonly count: number }>`SELECT COUNT(*) AS count
           FROM effect_local_server_entities WHERE model = 'Pair'`
         assert.strictEqual(stored[0]?.count, 1)
 
         const reader = yield* replicaSpace(server, readerId)
-        const seen = yield* Effect.all([labelOf(reader, forward), labelOf(reader, reversed)]).pipe(
-          Effect.repeat({ until: ([a, b]) => Option.isSome(a) && Option.isSome(b) })
-        )
-        assert.deepStrictEqual(seen, [Option.some("second"), Option.some("second")])
+        assert.deepStrictEqual(yield* awaitLabel(reader, forward, "second"), Option.some("second"))
+        assert.deepStrictEqual(yield* labelOf(reader.space, reversed), Option.some("second"))
 
-        yield* writer.mutate(PutPair, { key: forward, label: "third" })
-        yield* settled(writer, 3)
-        const updated = yield* Effect.all([labelOf(reader, forward), labelOf(reader, reversed)]).pipe(
-          Effect.repeat({
-            until: ([a, b]) => Option.getOrUndefined(a) === "third" && Option.getOrUndefined(b) === "third"
-          })
-        )
-        assert.deepStrictEqual(updated, [Option.some("third"), Option.some("third")])
-      })),
-    30_000
+        yield* writer.space.mutate(PutPair, { key: forward, label: "third" })
+        yield* settled(writer.space, 3)
+        assert.deepStrictEqual(yield* awaitLabel(reader, reversed, "third"), Option.some("third"))
+        assert.deepStrictEqual(yield* labelOf(reader.space, forward), Option.some("third"))
+      }))
   )
 })
