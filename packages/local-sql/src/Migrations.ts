@@ -56,7 +56,7 @@ export const makeMigration = (options: {
   if (!stableName.test(options.name)) throw new TypeError(`Storage migration name is not stable: ${options.name}`)
   if (options.statements.length === 0) throw new TypeError(`Storage migration ${options.name} has no statements`)
   const statements = Object.freeze([...options.statements])
-  const migration = {
+  return Object.freeze({
     id: options.id,
     name: options.name,
     checksum: Identity.SchemaHash.make(Canonical.hash({
@@ -66,8 +66,7 @@ export const makeMigration = (options: {
       statements
     })),
     statements
-  }
-  return Object.freeze(migration)
+  })
 }
 /* oxlint-enable effect/noThrowStatement, effect/noNewError */
 

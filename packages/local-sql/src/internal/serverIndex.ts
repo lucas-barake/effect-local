@@ -246,14 +246,13 @@ export const plan = Effect.fn("ServerIndex.plan")(function*(
   definition: Definition.Any
 ) {
   const all = describeIndexes(dialect, definition)
-  const exists = (table: string) =>
-    dialect.tableExists(table).pipe(
-      Effect.catchTag(
-        "SchemaError",
-        (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
-      )
+  const catalogExists = yield* dialect.tableExists("effect_local_server_index_catalog").pipe(
+    Effect.catchTag(
+      "SchemaError",
+      (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
     )
-  if (!(yield* exists("effect_local_server_index_catalog"))) {
+  )
+  if (!catalogExists) {
     return { missing: all, orphans: [], generation: 0 } satisfies GenerationPlan
   }
   const pending = yield* planCatalog(all, yield* readCatalog(sql))
