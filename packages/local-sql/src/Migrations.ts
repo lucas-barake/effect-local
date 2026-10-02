@@ -153,13 +153,10 @@ const readServerLedger = (sql: SqlClient.SqlClient) =>
   })
 
 const retryPolicy = Effect.fnUntraced(function*(options: Options) {
-  const maximumAttempts = options.maximumAttempts ?? defaultOptions.maximumAttempts
-  if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts <= 0) {
-    return yield* new ReplicaError.InvalidConfiguration({
-      option: "migration.maximumAttempts",
-      message: "migration.maximumAttempts must be a positive safe integer"
-    })
-  }
+  const maximumAttempts = yield* Configuration.positiveSafeInteger(
+    "migration.maximumAttempts",
+    options.maximumAttempts ?? defaultOptions.maximumAttempts
+  )
   const retryDelayMillis = yield* Configuration.positiveFiniteDurationMillis(
     "migration.retryDelay",
     options.retryDelay ?? defaultOptions.retryDelay
