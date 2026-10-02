@@ -130,12 +130,31 @@ type SupportedAnnotations =
   | Schema.Annotations.Filter
   | Schema.Annotations.Key<unknown>
 
+interface Representation {
+  readonly id: string
+  readonly payload: unknown
+  readonly schemas?: ReadonlyArray<SchemaAST.AST> | undefined
+}
+
+const representationOf = (annotations: SupportedAnnotations): Representation | undefined => {
+  const representation: unknown = Reflect.get(annotations, "representation")
+  if (typeof representation !== "object" || representation === null) return undefined
+  const id: unknown = Reflect.get(representation, "id")
+  if (typeof id !== "string") return undefined
+  const schemas: unknown = Reflect.get(representation, "schemas")
+  if (Array.isArray(schemas) && schemas.every(SchemaAST.isAST)) {
+    return { id, payload: Reflect.get(representation, "payload"), schemas }
+  }
+  return { id, payload: Reflect.get(representation, "payload") }
+}
+
 const hasStableMetadata = (annotations: SupportedAnnotations | undefined): boolean =>
   annotations !== undefined &&
   (
     typeof annotations.identifier === "string" ||
     ("meta" in annotations && annotations.meta !== undefined) ||
-    ("typeConstructor" in annotations && annotations.typeConstructor !== undefined)
+    ("typeConstructor" in annotations && annotations.typeConstructor !== undefined) ||
+    representationOf(annotations) !== undefined
   )
 
 const hasSemanticAnnotations = (annotations: SupportedAnnotations | undefined): boolean =>
@@ -145,6 +164,7 @@ const hasSemanticAnnotations = (annotations: SupportedAnnotations | undefined): 
     ("meta" in annotations && annotations.meta !== undefined) ||
     ("typeConstructor" in annotations && annotations.typeConstructor !== undefined) ||
     ("parseOptions" in annotations && annotations.parseOptions !== undefined) ||
+    representationOf(annotations) !== undefined ||
     typeof Reflect.get(annotations, structuralAnnotationKey) === "boolean"
   )
 
@@ -175,6 +195,17 @@ const fromAnnotations = (
   }
   if ("parseOptions" in annotations && annotations.parseOptions !== undefined) {
     result.parseOptions = fromUnknown(annotations.parseOptions, state)
+  }
+  const representation = representationOf(annotations)
+  if (representation !== undefined) {
+    const described: Record<string, Descriptor> = {
+      id: representation.id,
+      payload: fromUnknown(representation.payload, state)
+    }
+    if (representation.schemas !== undefined) {
+      described.schemas = representation.schemas.map((schema) => fromAST(SchemaAST.toType(schema), state, false))
+    }
+    result.representation = described
   }
   const structural = Reflect.get(annotations, structuralAnnotationKey)
   if (typeof structural === "boolean") result.structural = structural
@@ -461,7 +492,7 @@ export interface MakeOptions {
  * Builds a deterministic structural descriptor.
  *
  * Executable schema behavior must be a recognized built-in or carry a stable
- * `identifier`, `meta`, or `typeConstructor` annotation.
+ * `identifier`, `meta`, `typeConstructor`, or Effect `representation` annotation.
  */
 export const make = (schema: Schema.Constraint, options?: MakeOptions): Descriptor => {
   const state: State = {

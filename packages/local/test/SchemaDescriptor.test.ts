@@ -1,7 +1,10 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Schema from "effect/Schema"
+import type * as SchemaAST from "effect/SchemaAST"
 import * as SchemaGetter from "effect/SchemaGetter"
 import * as Canonical from "../src/Canonical.js"
+import * as Definition from "../src/Definition.js"
+import * as Model from "../src/Model.js"
 import * as SchemaDescriptor from "../src/SchemaDescriptor.js"
 
 const UserId = Schema.String.pipe(Schema.brand("UserId"))
@@ -49,5 +52,44 @@ describe("SchemaDescriptor", () => {
       const descriptor = SchemaDescriptor.make(schema)
       assert.strictEqual(Canonical.hash(descriptor), expected, name)
     }
+  })
+
+  it("describes the filters and declarations Effect ships, keeping their parameters in the descriptor", () => {
+    const builtIns: ReadonlyArray<readonly [string, Schema.Top]> = [
+      ["NonEmptyString", Schema.NonEmptyString],
+      ["Int", Schema.Int],
+      ["Finite", Schema.Finite],
+      ["GreaterThan", Schema.Number.check(Schema.isGreaterThan(0))],
+      ["Pattern", Schema.String.check(Schema.isPattern(/^a/))],
+      ["MaxLength", Schema.String.check(Schema.isMaxLength(10))],
+      ["Date", Schema.Date],
+      ["OptionOfString", Schema.Option(Schema.String)],
+      ["OptionOfNumber", Schema.Option(Schema.Number)]
+    ]
+    const hashes = builtIns.map(([, schema]) => Canonical.hash(SchemaDescriptor.make(schema)))
+    assert.strictEqual(new Set(hashes).size, builtIns.length)
+    const hashOf = (check: SchemaAST.Check<string>) =>
+      Schema.String.check(check).pipe(SchemaDescriptor.make, Canonical.hash)
+    const minimumOne = hashOf(Schema.isMinLength(1))
+    const minimumTwo = hashOf(Schema.isMinLength(2))
+    const patternA = hashOf(Schema.isPattern(/^a/))
+    const patternB = hashOf(Schema.isPattern(/^b/))
+    assert.notStrictEqual(minimumOne, minimumTwo)
+    assert.notStrictEqual(patternA, patternB)
+  })
+
+  it("still rejects a filter that carries no stable identity", () => {
+    const Even = Schema.Number.check(Schema.makeFilter((value: number) => value % 2 === 0))
+    assert.throws(() => SchemaDescriptor.make(Even), /Opaque schema checks/)
+  })
+
+  it("lets a definition use models whose fields are refined by Effect filters", () => {
+    const Task = Model.make("Task", {
+      version: 1,
+      key: Schema.String,
+      schema: Schema.Struct({ title: Schema.NonEmptyString, rank: Schema.Int, score: Schema.Finite })
+    })
+    const definition = Definition.make({ version: 1, models: [Task], mutations: [] })
+    assert.strictEqual(definition.models.length, 1)
   })
 })
