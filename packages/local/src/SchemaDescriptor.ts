@@ -160,14 +160,13 @@ const identifiesItself = (annotations: SupportedAnnotations | undefined): boolea
   annotations !== undefined && (hasStableMetadata(annotations) || representationOf(annotations) !== undefined)
 
 const hasSemanticAnnotations = (annotations: SupportedAnnotations | undefined): boolean =>
-  annotations !== undefined &&
+  identifiesItself(annotations) ||
   (
-    typeof annotations.identifier === "string" ||
-    ("meta" in annotations && annotations.meta !== undefined) ||
-    ("typeConstructor" in annotations && annotations.typeConstructor !== undefined) ||
-    ("parseOptions" in annotations && annotations.parseOptions !== undefined) ||
-    representationOf(annotations) !== undefined ||
-    typeof Reflect.get(annotations, structuralAnnotationKey) === "boolean"
+    annotations !== undefined &&
+    (
+      ("parseOptions" in annotations && annotations.parseOptions !== undefined) ||
+      typeof Reflect.get(annotations, structuralAnnotationKey) === "boolean"
+    )
   )
 
 const hasSemanticContext = (
