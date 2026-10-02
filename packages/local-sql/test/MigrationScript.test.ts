@@ -312,6 +312,25 @@ describe.each(manualDatabases)("server migrations applied by hand on $dialect", 
   )
 
   it.effect(
+    "an index script replayed after a later deploy changed the indexes again is rejected",
+    Effect.fnUntraced(
+      function*() {
+        const database = yield* make
+        assert.strictEqual(failureOf(yield* boot(database, ranked, "apply")), "Success")
+        const dropIndexes = yield* renderAndApply(database, plain)
+        yield* renderAndApply(database, ranked)
+        const before = yield* stateOf(database)
+        assert.strictEqual(failureOf(yield* database.apply(dropIndexes).pipe(Effect.exit)), "ScriptRejected")
+        assert.deepStrictEqual(yield* stateOf(database), before)
+        assert.strictEqual(failureOf(yield* boot(database, ranked, "verify")), "Success")
+      },
+      Effect.scoped,
+      provideServices
+    ),
+    60_000
+  )
+
+  it.effect(
     "a rendered script that fails partway leaves the database unchanged",
     Effect.fnUntraced(
       function*() {
