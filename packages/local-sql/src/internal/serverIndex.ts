@@ -525,7 +525,7 @@ export const make = Effect.fn("ServerIndex.make")(
         if (model === undefined) continue
         const latest = new Map<string, Protocol.EntityChange>()
         for (const change of modelChanges) {
-          latest.set(yield* Codec.stringify(change.entity.key), change)
+          latest.set(yield* Codec.stringifyKey(change.entity.key), change)
         }
         for (const [entityKey, change] of latest) {
           let value: unknown

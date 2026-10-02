@@ -854,7 +854,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
             value: yield* decodeJson(Schema.Json, row.value_json)
           })
           yield* registerLineage(row.model, migrated)
-          const keyJson = yield* Codec.stringify(migrated.key)
+          const keyJson = yield* Codec.stringifyKey(migrated.key)
           const valueJson = yield* Codec.stringify(migrated.value)
           yield* sql`INSERT INTO effect_local_client_canonical_entities_data
               (space_id, schema_generation, model, model_version, entity_key, value_json)
@@ -1094,7 +1094,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
             key: yield* decodeJson(Schema.Json, row.entity_key)
           })
           yield* registerLineage(row.model, migrated)
-          const key = yield* Codec.stringify(migrated.key)
+          const key = yield* Codec.stringifyKey(migrated.key)
           yield* sql`INSERT INTO effect_local_client_retractions
               (space_id, generation, model, model_version, entity_key)
               VALUES (${options.spaceId}, ${state.generation}, ${row.model}, ${migrated.modelVersion}, ${key})
@@ -1479,7 +1479,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
   const registerLineage = Effect.fnUntraced(function*(model: string, migrated: Evolution.MigratedModel) {
     const aliases = yield* Effect.forEach(
       migrated.aliases,
-      (alias) => Codec.stringify(alias.key).pipe(Effect.map((key) => ({ ...alias, key })))
+      (alias) => Codec.stringifyKey(alias.key).pipe(Effect.map((key) => ({ ...alias, key })))
     )
     let sourceAliases = aliases
     if (aliases.length !== 1) sourceAliases = aliases.slice(0, -1)
@@ -1494,7 +1494,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
       }).pipe(Effect.mapError(StorageUnavailable.make))
       if (Option.isSome(found)) groups.add(found.value.lineage_id)
     }
-    const targetKey = yield* Codec.stringify(migrated.key)
+    const targetKey = yield* Codec.stringifyKey(migrated.key)
     if (groups.size > 1) return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
     const root = aliases[0]
     const lineageId = groups.values().next().value ?? Canonical.stringify({
@@ -1739,7 +1739,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
           yield* registerLineage(row.model, migrated)
           const key = migrated.key
           const value = migrated.value
-          const keyJson = yield* Codec.stringify(key)
+          const keyJson = yield* Codec.stringifyKey(key)
           const valueJson = yield* Codec.stringify(value)
           const entityBytes = yield* Protocol.encodedBytesEffect({
             model: row.model,

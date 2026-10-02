@@ -32,7 +32,7 @@ const encodeEntityEffect = Effect.fnUntraced(function*<M extends Model.Any,>(
   value?: Model.Value<M>
 ): Effect.fn.Return<EncodedEntityKey<M> | EncodedEntity<M>, ReplicaError.StorageCorrupt> {
   const encodedKey = yield* Codec.encode(model.key, key)
-  const keyJson = yield* Codec.stringify(encodedKey)
+  const keyJson = yield* Codec.stringifyKey(encodedKey)
   if (value === undefined) return { encodedKey, keyJson }
   const encodedValue = yield* Codec.encode(model.schema, value)
   return { encodedKey, keyJson, encodedValue, valueJson: yield* Codec.stringify(encodedValue) }
@@ -207,7 +207,7 @@ export const applyCanonicalChange = Effect.fnUntraced(function*(
   schemaGeneration: number,
   change: Protocol.EntityChange
 ) {
-  const keyJson = yield* Codec.stringify(change.entity.key)
+  const keyJson = yield* Codec.stringifyKey(change.entity.key)
   if (change._tag === "Delete") {
     yield* sql`DELETE FROM effect_local_client_canonical_entities_data
         WHERE space_id = ${spaceId} AND schema_generation = ${schemaGeneration}
@@ -223,7 +223,7 @@ export const applyCanonicalChange = Effect.fnUntraced(function*(
           value_json = excluded.value_json, model_version = excluded.model_version`
 }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
-export const entityKey = (entity: Protocol.EntityKey) => `${entity.model}\u0000${Canonical.stringify(entity.key)}`
+export const entityKey = (entity: Protocol.EntityKey) => Canonical.stringify([entity.model, entity.key])
 
 const maximumTransactionAttempts = 8
 
