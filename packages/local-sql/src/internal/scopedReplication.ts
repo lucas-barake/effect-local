@@ -137,20 +137,19 @@ export const make = (options: Options) => {
       ORDER BY entity.model, entity.entity_key`
   })
   const findView = SqlSchema.findOneOption({
-    Request: Schema.Struct({ spaceId: Identity.SpaceId, clientId: Identity.ClientId }),
+    Request: Schema.Struct({
+      spaceId: Identity.SpaceId,
+      clientId: Identity.ClientId,
+      membershipIncarnation: Identity.MembershipIncarnation
+    }),
     Result: Rows.ReplicationViewRow,
-    execute: ({ spaceId, clientId }) =>
-      sql`SELECT space_id, client_id, principal_digest, view_id, view_revision, membership_incarnation,
-        scope_generation, scope_json, scope_digest, definition_hash, index_layout_hash, schema_version, schema_hash,
+    execute: ({ clientId, membershipIncarnation, spaceId }) =>
+      sql`SELECT space_id, client_id, principal_digest, view_id, view_revision, scope_generation,
+        scope_json, scope_digest, definition_hash, index_layout_hash, schema_version, schema_hash,
         server_sequence, delivered_sequence, read_auth_epoch
       FROM effect_local_server_replication_views
-      WHERE space_id = ${spaceId} AND client_id = ${clientId}`
+      WHERE space_id = ${spaceId} AND client_id = ${clientId} AND membership_incarnation = ${membershipIncarnation}`
   })
-  const findMembershipView = (request: Protocol.PullRequest | Protocol.BootstrapRequest) =>
-    findView({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
-      Effect.mapError(StorageUnavailable.make),
-      Effect.map(Option.filter((view) => view.membership_incarnation === request.membershipIncarnation))
-    )
   const findViewEntities = SqlSchema.findAll({
     Request: Schema.Struct({
       spaceId: Identity.SpaceId,
@@ -538,7 +537,7 @@ export const make = (options: Options) => {
       const normalized = yield* Protocol.validateReplicationScope(targetDefinition, request.scope)
       const normalizedDigest = yield* scopeDigest(normalized)
       const space = yield* findSpace(request.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-      const previous = yield* findMembershipView(request)
+      const previous = yield* findView(request).pipe(Effect.mapError(StorageUnavailable.make))
       if (Option.isSome(previous) && request.scopeGeneration < previous.value.scope_generation) {
         return yield* new ReplicaError.StaleReplicationScope({
           expected: previous.value.scope_generation,
@@ -1124,7 +1123,7 @@ export const make = (options: Options) => {
         const schemaIsCurrent = WindowSchema.isCurrent(request.schema, options.definition.schemaIdentity)
         const normalizedDigest = yield* scopeDigest(normalized)
         const principalHash = yield* principalDigest(principal)
-        const stored = yield* findMembershipView(request)
+        const stored = yield* findView(request).pipe(Effect.mapError(StorageUnavailable.make))
         if (Option.isSome(stored) && request.scopeGeneration < stored.value.scope_generation) {
           return yield* new ReplicaError.StaleReplicationScope({
             expected: stored.value.scope_generation,
@@ -1229,7 +1228,7 @@ export const make = (options: Options) => {
         } else if (request.cursor.revision !== view.view_revision) {
           return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
         }
-        const currentView = yield* findView({ spaceId: request.spaceId, clientId: request.clientId }).pipe(
+        const currentView = yield* findView(request).pipe(
           Effect.mapError(StorageUnavailable.make),
           Effect.flatMap(Option.match({
             onNone: () => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Replication view disappeared" })),
