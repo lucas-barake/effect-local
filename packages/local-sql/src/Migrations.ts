@@ -799,6 +799,7 @@ const serverTables = (types: ServerTypes): ReadonlyArray<string> => {
       snapshot_id ${text} PRIMARY KEY,
       space_id ${text} NOT NULL,
       client_id ${text} NOT NULL,
+      membership_incarnation ${text} NOT NULL,
       principal_digest ${text} NOT NULL CHECK (length(principal_digest) = 64),
       definition_hash ${text} NOT NULL,
       index_layout_hash ${text} NOT NULL,

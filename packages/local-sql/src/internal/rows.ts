@@ -342,6 +342,7 @@ export const ScopedSnapshotManifestRow = Schema.Struct({
   snapshot_id: Identity.SnapshotId,
   space_id: Identity.SpaceId,
   client_id: Identity.ClientId,
+  membership_incarnation: Identity.MembershipIncarnation,
   principal_digest: Protocol.MutationDigest,
   definition_hash: Schema.String,
   index_layout_hash: Schema.String,

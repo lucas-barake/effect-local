@@ -1448,6 +1448,30 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
   )
 
   it.effect(
+    "serves a rejoined membership its own snapshot even when it presents the previous one",
+    Effect.fnUntraced(function*() {
+      const server = yield* makeServer().pipe(Layer.build, Effect.map(Context.get(ServerStore.ServerStore)))
+      yield* server.submit(yield* envelope("kept", 1))
+      const previous = yield* server.pullAuthorized(pullRequest(), "reader")
+      if (!("_tag" in previous)) assert.fail("expected scoped bootstrap")
+
+      const rejoined = Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-0000000000b3")
+      const page = yield* server.bootstrapAuthorized(
+        { ...bootstrapRequest(previous.manifest), membershipIncarnation: rejoined },
+        "reader"
+      )
+      assert.notStrictEqual(page.manifest.snapshotId, previous.manifest.snapshotId)
+      assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["kept"])
+      const continued = yield* server.pullAuthorized(
+        { ...pullRequest(page.manifest.cursor), membershipIncarnation: rejoined },
+        "reader"
+      )
+      if ("_tag" in continued) assert.fail("expected the rejoined membership to continue its own view")
+      assert.deepStrictEqual(continued.changes, [])
+    }, provideNodeCrypto)
+  )
+
+  it.effect(
     "evicts a retracted entity without letting pending replay restore it",
     Effect.fnUntraced(function*() {
       let visible = true
