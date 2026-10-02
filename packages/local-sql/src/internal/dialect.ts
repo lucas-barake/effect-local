@@ -62,6 +62,8 @@ const presenceLockKey = (key: PresenceKey) => {
   return hash | 0
 }
 
+export const hasUnpairedSurrogate = (value: string) => value.search(unpairedSurrogate) !== -1
+
 const decodeEscapedText = (value: string) => {
   let decoded = ""
   for (let index = 0; index < value.length; index++) {

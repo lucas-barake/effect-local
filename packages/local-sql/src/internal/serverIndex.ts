@@ -168,12 +168,12 @@ const indexRow = (
 
 type CatalogEntry = typeof CatalogRow.Type
 
-export interface Plan {
+interface Plan {
   readonly missing: ReadonlyArray<Descriptor>
   readonly orphans: ReadonlyArray<CatalogEntry>
 }
 
-export const describeIndexes = (dialect: Dialect.Dialect, definition: Definition.Any): ReadonlyArray<Descriptor> =>
+const describeIndexes = (dialect: Dialect.Dialect, definition: Definition.Any): ReadonlyArray<Descriptor> =>
   definition.models.flatMap((model) =>
     Object.entries(model.indexes).map(([indexName, index]) => makeDescriptor(dialect, model, indexName, index))
   )

@@ -144,6 +144,13 @@ const compareLedger = (
   return undefined
 }
 
+const readServerLedger = (sql: SqlClient.SqlClient) =>
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: MigrationRow,
+    execute: () => sql`SELECT id, name, checksum FROM effect_local_server_migrations ORDER BY id`
+  })
+
 const retryPolicy = Effect.fnUntraced(function*(options: Options) {
   const maximumAttempts = options.maximumAttempts ?? defaultOptions.maximumAttempts
   if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts <= 0) {
@@ -195,11 +202,7 @@ const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
     Result: MigrationRow,
     execute: () => sql`SELECT id, name, checksum FROM effect_local_client_migrations ORDER BY id`
   })
-  const readServer = SqlSchema.findAll({
-    Request: Schema.Void,
-    Result: MigrationRow,
-    execute: () => sql`SELECT id, name, checksum FROM effect_local_server_migrations ORDER BY id`
-  })
+  const readServer = readServerLedger(sql)
   const dialect = yield* Dialect.make(sql)
   let ledgerTable = "effect_local_server_migrations"
   if (catalog === "Client") ledgerTable = "effect_local_client_migrations"
@@ -1166,11 +1169,7 @@ const planServer = Effect.fn("Migrations.planServer")(
     const migrations = serverCatalogFor(dialect)
     const ledgerExists = yield* dialect.tableExists("effect_local_server_migrations")
     if (!ledgerExists) return migrations
-    const applied = yield* SqlSchema.findAll({
-      Request: Schema.Void,
-      Result: MigrationRow,
-      execute: () => sql`SELECT id, name, checksum FROM effect_local_server_migrations ORDER BY id`
-    })(undefined)
+    const applied = yield* readServerLedger(sql)(undefined)
     const mismatch = compareLedger("Server", migrations, applied)
     if (mismatch !== undefined) return yield* mismatch
     return migrations.slice(applied.length)
@@ -1197,8 +1196,6 @@ export const server = Effect.fnUntraced(function*(options: ServerOptions = {}) {
   })
 })
 
-const unpairedSurrogate = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/
-
 const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
 
 export const renderServer = Effect.fn("Migrations.renderServer")(function*(options: RenderServerOptions) {
@@ -1211,7 +1208,7 @@ export const renderServer = Effect.fn("Migrations.renderServer")(function*(optio
   }
   for (const descriptor of index.missing) {
     for (const value of [descriptor.model.name, descriptor.indexName]) {
-      if (value.includes("\u0000") || unpairedSurrogate.test(value)) {
+      if (value.includes("\u0000") || Dialect.hasUnpairedSurrogate(value)) {
         return yield* new ReplicaError.InvalidConfiguration({
           option: "definition",
           message: `Index ${descriptor.model.name}.${descriptor.indexName} cannot be written as SQL text`
