@@ -142,7 +142,6 @@ const hasSemanticAnnotations = (annotations: SupportedAnnotations | undefined): 
   annotations !== undefined &&
   (
     typeof annotations.identifier === "string" ||
-    ("brands" in annotations && Array.isArray(annotations.brands)) ||
     ("meta" in annotations && annotations.meta !== undefined) ||
     ("typeConstructor" in annotations && annotations.typeConstructor !== undefined) ||
     ("parseOptions" in annotations && annotations.parseOptions !== undefined) ||
@@ -168,9 +167,6 @@ const fromAnnotations = (
   if (annotations === undefined) return undefined
   const result: Record<string, Descriptor> = {}
   if (typeof annotations.identifier === "string") result.identifier = annotations.identifier
-  if ("brands" in annotations && Array.isArray(annotations.brands)) {
-    result.brands = Array.from(new Set(annotations.brands.map(String))).sort()
-  }
   if ("meta" in annotations && annotations.meta !== undefined) {
     result.meta = fromUnknown(annotations.meta, state)
   }

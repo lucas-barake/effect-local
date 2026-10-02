@@ -58,15 +58,15 @@
     "@lucas-barake/effect-local-sql": "workspace:^"
   },
   "peerDependencies": {
-    "effect": ">=4.0.0-rc.118 <4.0.1",
+    "effect": "~4.0.0",
     "expo-crypto": "^57.0.0",
     "expo-sqlite": "^57.0.0"
   },
   "devDependencies": {
-    "@effect/platform-node": "4.0.0-rc.118",
-    "@effect/sql-sqlite-node": "4.0.0-rc.118",
+    "@effect/platform-node": "4.0.0",
+    "@effect/sql-sqlite-node": "4.0.0",
     "@lucas-barake/effect-local-rpc": "workspace:^",
-    "effect": "4.0.0-rc.118",
+    "effect": "4.0.0",
     "expo": "57.0.26",
     "expo-crypto": "57.0.3",
     "expo-sqlite": "57.0.3",

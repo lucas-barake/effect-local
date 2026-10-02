@@ -13,13 +13,13 @@
   },
   "dependencies": {
     "@effect-local/example-chat-shared": "workspace:^",
-    "@effect/atom-react": "4.0.0-rc.118",
-    "@effect/platform-browser": "4.0.0-rc.118",
-    "@effect/sql-sqlite-wasm": "4.0.0-rc.118",
+    "@effect/atom-react": "4.0.0",
+    "@effect/platform-browser": "4.0.0",
+    "@effect/sql-sqlite-wasm": "4.0.0",
     "@effect/wa-sqlite": "0.1.2",
     "@lucas-barake/effect-local-browser": "workspace:^",
     "@lucas-barake/effect-local-rpc": "workspace:^",
-    "effect": "4.0.0-rc.118",
+    "effect": "4.0.0",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },
