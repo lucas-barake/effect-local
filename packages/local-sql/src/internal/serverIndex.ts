@@ -166,15 +166,81 @@ const indexRow = (
   return row
 }
 
+type CatalogEntry = typeof CatalogRow.Type
+
+export interface Plan {
+  readonly missing: ReadonlyArray<Descriptor>
+  readonly orphans: ReadonlyArray<CatalogEntry>
+}
+
+export const describeIndexes = (dialect: Dialect.Dialect, definition: Definition.Any): ReadonlyArray<Descriptor> =>
+  definition.models.flatMap((model) =>
+    Object.entries(model.indexes).map(([indexName, index]) => makeDescriptor(dialect, model, indexName, index))
+  )
+
+const readCatalog = (sql: SqlClient.SqlClient) =>
+  SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: CatalogRow,
+    execute: () =>
+      sql`SELECT model, index_name, descriptor_hash, table_name, scan_index_name
+      FROM effect_local_server_index_catalog`
+  })(undefined).pipe(
+    Effect.catchTag(
+      "SchemaError",
+      (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
+    )
+  )
+
+const planCatalog = (
+  all: ReadonlyArray<Descriptor>,
+  catalog: ReadonlyArray<CatalogEntry>
+): Effect.Effect<Plan, ReplicaError.StorageCorrupt> => {
+  const byHash = new Map(all.map((descriptor) => [descriptor.hash, descriptor]))
+  const recorded = new Set<string>()
+  const orphans: Array<CatalogEntry> = []
+  for (const row of catalog) {
+    const tableName = `effect_local_srvidx_${row.descriptor_hash}`
+    const descriptor = byHash.get(row.descriptor_hash)
+    if (
+      row.table_name !== tableName || row.scan_index_name !== `${tableName}_scan` ||
+      (descriptor !== undefined &&
+        (row.model !== descriptor.model.name || row.index_name !== descriptor.indexName))
+    ) {
+      return Effect.fail(
+        new ReplicaError.StorageCorrupt({ message: "Server index catalog conflicts with its descriptor metadata" })
+      )
+    }
+    recorded.add(row.descriptor_hash)
+    if (descriptor === undefined) orphans.push(row)
+  }
+  return Effect.succeed({ missing: all.filter((descriptor) => !recorded.has(descriptor.hash)), orphans })
+}
+
+export const plan = Effect.fn("ServerIndex.plan")(function*(
+  sql: SqlClient.SqlClient,
+  dialect: Dialect.Dialect,
+  definition: Definition.Any
+) {
+  const all = describeIndexes(dialect, definition)
+  const catalogExists = yield* dialect.tableExists("effect_local_server_index_catalog").pipe(
+    Effect.catchTag(
+      "SchemaError",
+      (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
+    )
+  )
+  if (!catalogExists) return { missing: all, orphans: [] } satisfies Plan
+  return yield* planCatalog(all, yield* readCatalog(sql))
+}, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+
 export const make = Effect.fn("ServerIndex.make")(
   function*(
     sql: SqlClient.SqlClient,
     dialect: Dialect.Dialect,
-    definition: Definition.Any
+    definition: Definition.Any,
+    mode: "apply" | "verify" | undefined
   ) {
-    const all = definition.models.flatMap((model) =>
-      Object.entries(model.indexes).map(([indexName, index]) => makeDescriptor(dialect, model, indexName, index))
-    )
+    const all = describeIndexes(dialect, definition)
     const byModel = new Map<string, ReadonlyArray<Descriptor>>()
     for (const model of definition.models) {
       byModel.set(model.name, all.filter((descriptor) => descriptor.model === model))
@@ -182,69 +248,41 @@ export const make = Effect.fn("ServerIndex.make")(
     const byLabel = new Map(
       all.map((descriptor) => [Canonical.stringify([descriptor.model.name, descriptor.indexName]), descriptor])
     )
-    yield* sql.withTransaction(Effect.gen(function*() {
-      yield* dialect.lockSchema
-      const existing = yield* SqlSchema.findAll({
-        Request: Schema.Void,
-        Result: CatalogRow,
-        execute: () =>
-          sql`SELECT model, index_name, descriptor_hash, table_name, scan_index_name
-          FROM effect_local_server_index_catalog`
-      })(undefined).pipe(
-        Effect.catchTag(
-          "SchemaError",
-          (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
-        )
-      )
-      const created = new Set(existing.map((row) => row.descriptor_hash))
-      for (const descriptor of all) {
-        if (created.has(descriptor.hash)) continue
-        yield* sql.unsafe(descriptor.tableDdl)
-        yield* sql.unsafe(descriptor.scanIndexDdl)
-        yield* sql`INSERT INTO effect_local_server_index_catalog
-          (model, index_name, descriptor_hash, table_name, scan_index_name)
-          VALUES (${descriptor.model.name}, ${descriptor.indexName}, ${descriptor.hash},
-            ${descriptor.tableName}, ${descriptor.scanIndexName})
-          ON CONFLICT (model, index_name, descriptor_hash) DO NOTHING`
+    if (mode === "verify") {
+      const pending = yield* plan(sql, dialect, definition)
+      if (pending.missing.length > 0 || pending.orphans.length > 0) {
+        return yield* new ReplicaError.StorageMigrationPending({
+          catalog: "ServerIndex",
+          message:
+            `Server index tables are behind the definition: ${pending.missing.length} to create, ${pending.orphans.length} to drop. Apply the script from Migrations.renderServer`
+        })
       }
-      const catalog = yield* SqlSchema.findAll({
-        Request: Schema.Void,
-        Result: CatalogRow,
-        execute: () =>
-          sql`SELECT model, index_name, descriptor_hash, table_name, scan_index_name
-          FROM effect_local_server_index_catalog`
-      })(undefined).pipe(
-        Effect.catchTag(
-          "SchemaError",
-          (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
-        )
-      )
-      const byHash = new Map(all.map((descriptor) => [descriptor.hash, descriptor]))
-      for (const row of catalog) {
-        const tableName = `effect_local_srvidx_${row.descriptor_hash}`
-        const scanIndexName = `${tableName}_scan`
-        const descriptor = byHash.get(row.descriptor_hash)
-        if (
-          row.table_name !== tableName || row.scan_index_name !== scanIndexName ||
-          (descriptor !== undefined &&
-            (row.model !== descriptor.model.name || row.index_name !== descriptor.indexName))
-        ) {
-          return yield* new ReplicaError.StorageCorrupt({
-            message: "Server index catalog conflicts with its descriptor metadata"
-          })
+    } else {
+      yield* sql.withTransaction(Effect.gen(function*() {
+        yield* dialect.lockSchema
+        const existing = yield* readCatalog(sql)
+        const created = new Set(existing.map((row) => row.descriptor_hash))
+        for (const descriptor of all) {
+          if (created.has(descriptor.hash)) continue
+          yield* sql.unsafe(descriptor.tableDdl)
+          yield* sql.unsafe(descriptor.scanIndexDdl)
+          yield* sql`INSERT INTO effect_local_server_index_catalog
+            (model, index_name, descriptor_hash, table_name, scan_index_name)
+            VALUES (${descriptor.model.name}, ${descriptor.indexName}, ${descriptor.hash},
+              ${descriptor.tableName}, ${descriptor.scanIndexName})
+            ON CONFLICT (model, index_name, descriptor_hash) DO NOTHING`
         }
-        if (descriptor !== undefined) {
-          continue
+        const current = yield* planCatalog(all, yield* readCatalog(sql))
+        for (const row of current.orphans) {
+          yield* sql.unsafe(`DROP INDEX IF EXISTS ${row.scan_index_name}`)
+          yield* sql.unsafe(`DROP TABLE IF EXISTS ${row.table_name}`)
+          yield* sql`DELETE FROM effect_local_server_index_state WHERE descriptor_hash = ${row.descriptor_hash}`
+          yield* sql`DELETE FROM effect_local_server_index_catalog
+            WHERE model = ${row.model} AND index_name = ${row.index_name}
+              AND descriptor_hash = ${row.descriptor_hash}`
         }
-        yield* sql.unsafe(`DROP INDEX IF EXISTS ${scanIndexName}`)
-        yield* sql.unsafe(`DROP TABLE IF EXISTS ${tableName}`)
-        yield* sql`DELETE FROM effect_local_server_index_state WHERE descriptor_hash = ${row.descriptor_hash}`
-        yield* sql`DELETE FROM effect_local_server_index_catalog
-          WHERE model = ${row.model} AND index_name = ${row.index_name}
-            AND descriptor_hash = ${row.descriptor_hash}`
-      }
-      return undefined
-    }))
+      }))
+    }
 
     const findState = SqlSchema.findOneOption({
       Request: Schema.Struct({

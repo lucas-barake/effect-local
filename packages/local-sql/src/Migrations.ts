@@ -28,11 +28,15 @@ export interface Migration {
 }
 
 export interface Options {
-  readonly retryDelay: Duration.Input
-  readonly maximumAttempts: number
+  readonly retryDelay?: Duration.Input | undefined
+  readonly maximumAttempts?: number | undefined
 }
 
-const defaultOptions: Options = { retryDelay: "5 millis", maximumAttempts: 8 }
+export interface ServerOptions extends Options {
+  readonly mode?: "apply" | "verify" | undefined
+}
+
+const defaultOptions = { retryDelay: "5 millis", maximumAttempts: 8 } as const satisfies Options
 
 const stableName = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$/
 
@@ -110,6 +114,31 @@ const validateCatalog = (
   return undefined
 }
 
+const compareLedger = (
+  catalog: Catalog,
+  migrations: ReadonlyArray<Migration>,
+  applied: ReadonlyArray<typeof MigrationRow.Type>
+): ReplicaError.StorageMigrationMismatch | undefined => {
+  if (applied.length > migrations.length) {
+    return new ReplicaError.StorageMigrationMismatch({
+      catalog,
+      message: `${catalog} catalog deleted ${applied.length - migrations.length} applied migration(s)`
+    })
+  }
+  for (let index = 0; index < applied.length; index++) {
+    const stored = applied[index]
+    const expected = migrations[index]
+    if (stored.id !== expected.id || stored.name !== expected.name || stored.checksum !== expected.checksum) {
+      return new ReplicaError.StorageMigrationMismatch({
+        catalog,
+        message:
+          `Applied migration ${stored.id}:${stored.name}:${stored.checksum} does not match ${expected.id}:${expected.name}:${expected.checksum}`
+      })
+    }
+  }
+  return undefined
+}
+
 const ledger = (table: string, text: string) =>
   `CREATE TABLE IF NOT EXISTS ${table} (
   id INTEGER PRIMARY KEY CHECK (id > 0),
@@ -139,7 +168,8 @@ const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
   })
   const invalid = validateCatalog(catalog, migrations)
   if (invalid !== undefined) return yield* invalid
-  if (!Number.isSafeInteger(options.maximumAttempts) || options.maximumAttempts <= 0) {
+  const maximumAttempts = options.maximumAttempts ?? defaultOptions.maximumAttempts
+  if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts <= 0) {
     return yield* new ReplicaError.InvalidConfiguration({
       option: "migration.maximumAttempts",
       message: "migration.maximumAttempts must be a positive safe integer"
@@ -147,7 +177,7 @@ const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
   }
   const retryDelayMillis = yield* Configuration.positiveFiniteDurationMillis(
     "migration.retryDelay",
-    options.retryDelay
+    options.retryDelay ?? defaultOptions.retryDelay
   )
   const sql = yield* SqlClient.SqlClient
   const readClient = SqlSchema.findAll({
@@ -178,23 +208,8 @@ const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
         })
       )
       appliedAtAttempt = applied.length
-      if (applied.length > migrations.length) {
-        return yield* new ReplicaError.StorageMigrationMismatch({
-          catalog,
-          message: `${catalog} catalog deleted ${applied.length - migrations.length} applied migration(s)`
-        })
-      }
-      for (let index = 0; index < applied.length; index++) {
-        const stored = applied[index]
-        const expected = migrations[index]
-        if (stored.id !== expected.id || stored.name !== expected.name || stored.checksum !== expected.checksum) {
-          return yield* new ReplicaError.StorageMigrationMismatch({
-            catalog,
-            message:
-              `Applied migration ${stored.id}:${stored.name}:${stored.checksum} does not match ${expected.id}:${expected.name}:${expected.checksum}`
-          })
-        }
-      }
+      const mismatch = compareLedger(catalog, migrations, applied)
+      if (mismatch !== undefined) return yield* mismatch
       for (let index = applied.length; index < migrations.length; index++) {
         const migration = migrations[index]
         if (catalog === "Client") {
@@ -232,13 +247,7 @@ const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
           return new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause })
         })
       )
-      let valid = applied.length <= migrations.length
-      for (let index = 0; valid && index < applied.length; index++) {
-        const stored = applied[index]
-        const expected = migrations[index]
-        valid = stored.id === expected.id && stored.name === expected.name && stored.checksum === expected.checksum
-      }
-      if (valid && applied.length > appliedAtAttempt) {
+      if (compareLedger(catalog, migrations, applied) === undefined && applied.length > appliedAtAttempt) {
         if (applied.length === migrations.length) return yield* Effect.void
         continue
       }
@@ -251,14 +260,14 @@ const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
       failure._tag !== "StorageUnavailable" ||
       !SqlError.isSqlError(failure.cause) ||
       failure.cause.reason._tag !== "LockTimeoutError" ||
-      attempt >= options.maximumAttempts
+      attempt >= maximumAttempts
     ) return yield* failure
     attempt += 1
     yield* Effect.sleep(retryDelayMillis)
   }
 })
 
-export const runCatalog = (catalog: Catalog, migrations: ReadonlyArray<Migration>, options: Options = defaultOptions) =>
+export const runCatalog = (catalog: Catalog, migrations: ReadonlyArray<Migration>, options: Options = {}) =>
   Effect.flatMap(
     SqlClient.SqlClient,
     (sql) =>
@@ -1097,7 +1106,7 @@ export const client = Effect.fnUntraced(function*(options: {
       })
     }
   }
-  yield* runCatalogWith(lane, "Client", clientCatalog, options.migration ?? defaultOptions)
+  yield* runCatalogWith(lane, "Client", clientCatalog, options.migration ?? {})
   yield* lane.withStatement(sql`INSERT INTO effect_local_client_meta
     (singleton, client_id) VALUES (1, ${options.clientId ?? SqliteIdentifier.random(sql, "cli")})
     ON CONFLICT (singleton) DO NOTHING`)
@@ -1137,8 +1146,42 @@ export const client = Effect.fnUntraced(function*(options: {
   return stored.client_id
 }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
-export const server = Effect.fnUntraced(function*(options: Options = defaultOptions) {
-  const dialect = yield* Dialect.make(yield* SqlClient.SqlClient)
-  if (dialect.name === "pg") return yield* runCatalog("Server", serverPostgresCatalog, options)
-  return yield* runCatalog("Server", serverCatalog, options)
+const serverCatalogFor = (dialect: Dialect.Dialect) => {
+  if (dialect.name === "pg") return serverPostgresCatalog
+  return serverCatalog
+}
+
+const planServer = Effect.fn("Migrations.planServer")(
+  function*(sql: SqlClient.SqlClient, dialect: Dialect.Dialect) {
+    const migrations = serverCatalogFor(dialect)
+    const ledgerExists = yield* dialect.tableExists("effect_local_server_migrations")
+    if (!ledgerExists) return migrations
+    const applied = yield* SqlSchema.findAll({
+      Request: Schema.Void,
+      Result: MigrationRow,
+      execute: () => sql`SELECT id, name, checksum FROM effect_local_server_migrations ORDER BY id`
+    })(undefined)
+    const mismatch = compareLedger("Server", migrations, applied)
+    if (mismatch !== undefined) return yield* mismatch
+    return migrations.slice(applied.length)
+  },
+  Effect.catchTags({
+    SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+    SchemaError: (cause) =>
+      Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server migration ledger is corrupt", cause }))
+  })
+)
+
+export const server = Effect.fnUntraced(function*(options: ServerOptions = {}) {
+  const sql = yield* SqlClient.SqlClient
+  const dialect = yield* Dialect.make(sql)
+  if (options.mode !== "verify") return yield* runCatalog("Server", serverCatalogFor(dialect), options)
+  const pending = yield* planServer(sql, dialect)
+  if (pending.length === 0) return yield* Effect.void
+  return yield* new ReplicaError.StorageMigrationPending({
+    catalog: "Server",
+    message: `Server database is behind: pending ${
+      pending.map((migration) => `${migration.id}:${migration.name}`).join(", ")
+    }. Apply the script from Migrations.renderServer`
+  })
 })
