@@ -1,17 +1,14 @@
 import { NodeCrypto } from "@effect/platform-node"
 import { assert, describe, it } from "@effect/vitest"
-import * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
-import * as Model from "@lucas-barake/effect-local/Model"
-import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Reactivity from "effect/reactivity/Reactivity"
-import * as Schema from "effect/Schema"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as ServerStore from "../src/ServerStore.js"
+import * as Domain from "./Domain.js"
 import { serverDatabases } from "./fixtures/ServerDatabase.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000b01")
@@ -22,36 +19,9 @@ const membershipIncarnation = Identity.MembershipIncarnation.make("inc_00000000-
 const escapedChat = "\u001dchat"
 const escapedReader = "\u001dreader"
 
-const MessageSchema = Schema.Struct({ id: Schema.String, chatId: Schema.String, sentAt: Schema.Number })
-type MessageValue = typeof MessageSchema.Type
+type MessageValue = typeof Domain.Message.schema.Type
 
-const Message = Model.make("Message", {
-  version: 1,
-  key: Schema.String,
-  schema: MessageSchema,
-  indexes: {
-    byChat: {
-      version: 1,
-      partition: [{
-        name: "chatId",
-        affinity: "text",
-        schema: Schema.String,
-        extract: (message: MessageValue) => message.chatId
-      }],
-      sort: [{
-        name: "sentAt",
-        affinity: "real",
-        schema: Schema.Number,
-        extract: (message: MessageValue) => message.sentAt
-      }]
-    }
-  }
-})
-
-const PutMessage = Mutation.make("PutMessage", { version: 1, payload: Message.schema })
-const definition = Definition.make({ version: 1, models: [Message], mutations: [PutMessage] })
-const layerHandlers = PutMessage.toLayer(({ payload, transaction }) => transaction.set(Message, payload.id, payload))
-const layerRuntime = MutationRuntime.layer(definition).pipe(Layer.provide(layerHandlers))
+const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
 
 const put = Effect.fnUntraced(function*(sequence: number, payload: MessageValue) {
   const identity = {
@@ -60,12 +30,12 @@ const put = Effect.fnUntraced(function*(sequence: number, payload: MessageValue)
     mutationId: Identity.MutationId.make(`mut_00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`),
     localSequence: Identity.LocalSequence.make(sequence),
     basis: Identity.ServerSequence.make(0),
-    name: PutMessage.name,
+    name: Domain.PutMessage.name,
     payload,
     digestVersion: 1 as const,
     membershipIncarnation,
-    sourceSchema: definition.schemaIdentity,
-    mutationVersion: PutMessage.version
+    sourceSchema: Domain.definition.schemaIdentity,
+    mutationVersion: Domain.PutMessage.version
   }
   return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
 })
@@ -73,13 +43,13 @@ const put = Effect.fnUntraced(function*(sequence: number, payload: MessageValue)
 const windowScope = (count: number, partitions: ReadonlyArray<Protocol.ReplicationWindowPartition> = []) =>
   Protocol.ReplicationScope.make({
     models: [],
-    windows: [Protocol.ReplicationWindow.make({ model: Message.name, index: "byChat", count, partitions })]
+    windows: [Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "byChat", count, partitions })]
   })
 
 const context = (scope: Protocol.ReplicationScope) => ({
   spaceId,
   clientId: readerId,
-  schema: definition.schemaIdentity,
+  schema: Domain.definition.schemaIdentity,
   scope,
   scopeGeneration: Identity.ReplicationScopeGeneration.make(1)
 })
@@ -109,7 +79,7 @@ describe.each(serverDatabases)("partition values and principals that start with 
   const layerServices = Layer.mergeAll(database.layer(), NodeCrypto.layer, Reactivity.layer)
   const makeServer = (observed: Array<ServerStore.ReadAuthorizationInput> = []) =>
     ServerStore.layer({
-      definition,
+      definition: Domain.definition,
       migration: { retryDelay: "1 millis", maximumAttempts: 8 },
       authorizeAccess: () => Effect.void,
       authorizeMutation: () => Effect.void,
@@ -126,8 +96,8 @@ describe.each(serverDatabases)("partition values and principals that start with 
     Effect.fnUntraced(
       function*() {
         const server = yield* makeServer()
-        yield* server.submit(yield* put(1, { id: "m-1", chatId: escapedChat, sentAt: 1 }))
-        yield* server.submit(yield* put(2, { id: "m-2", chatId: escapedChat, sentAt: 2 }))
+        yield* server.submit(yield* put(1, { id: "m-1", chatId: escapedChat, sentAt: 1, body: "" }))
+        yield* server.submit(yield* put(2, { id: "m-2", chatId: escapedChat, sentAt: 2, body: "" }))
         const scope = windowScope(1, [Protocol.ReplicationWindowPartition.make({ key: [escapedChat], count: 2 })])
         const required = yield* server.pullAuthorized(pullRequest(scope, null), "reader")
         if (!("_tag" in required)) assert.fail("expected a window bootstrap")
@@ -146,7 +116,7 @@ describe.each(serverDatabases)("partition values and principals that start with 
       function*() {
         const observed: Array<ServerStore.ReadAuthorizationInput> = []
         const server = yield* makeServer(observed)
-        yield* server.submit(yield* put(1, { id: "m-1", chatId: escapedChat, sentAt: 1 }))
+        yield* server.submit(yield* put(1, { id: "m-1", chatId: escapedChat, sentAt: 1, body: "" }))
         const scope = windowScope(1, [Protocol.ReplicationWindowPartition.make({ key: [escapedChat], count: 1 })])
         const required = yield* server.pullAuthorized(pullRequest(scope, null), escapedReader)
         if (!("_tag" in required)) assert.fail("expected a window bootstrap")
@@ -168,7 +138,7 @@ describe.each(serverDatabases)("partition values and principals that start with 
     Effect.fnUntraced(
       function*() {
         const server = yield* makeServer()
-        yield* server.submit(yield* put(1, { id: "old", chatId: escapedChat, sentAt: 1 }))
+        yield* server.submit(yield* put(1, { id: "old", chatId: escapedChat, sentAt: 1, body: "" }))
         const scope = windowScope(1)
         const required = yield* server.pull(pullRequest(scope, null))
         if (!("_tag" in required)) assert.fail("expected a window bootstrap")
@@ -177,7 +147,7 @@ describe.each(serverDatabases)("partition values and principals that start with 
         if ("_tag" in settled) assert.fail("expected a page")
         const acknowledged = yield* server.pull(pullRequest(scope, settled.cursor))
         if ("_tag" in acknowledged) assert.fail("expected a page")
-        yield* server.submit(yield* put(2, { id: "new", chatId: escapedChat, sentAt: 2 }))
+        yield* server.submit(yield* put(2, { id: "new", chatId: escapedChat, sentAt: 2, body: "" }))
         const slid = yield* server.pull(pullRequest(scope, acknowledged.cursor))
         if ("_tag" in slid) assert.fail("expected a page")
         assert.deepStrictEqual(
@@ -196,7 +166,7 @@ describe.each(serverDatabases)("partition values and principals that start with 
       function*() {
         const server = yield* makeServer()
         for (let sentAt = 1; sentAt <= 3; sentAt++) {
-          yield* server.submit(yield* put(sentAt, { id: `m-${sentAt}`, chatId: escapedChat, sentAt }))
+          yield* server.submit(yield* put(sentAt, { id: `m-${sentAt}`, chatId: escapedChat, sentAt, body: "" }))
         }
         const scope = windowScope(3, [Protocol.ReplicationWindowPartition.make({ key: [escapedChat], count: 1 })])
         const required = yield* server.pull(pullRequest(scope, null))
