@@ -27,7 +27,10 @@ export interface ManualDatabase {
 }
 
 interface PostgresManualDatabase extends ManualDatabase {
-  readonly applyAsOneMessage: (script: string, clientEncoding: string) => Effect.Effect<void, ScriptRejected>
+  readonly applyAsOneMessage: (
+    script: string,
+    environment: ReadonlyArray<string>
+  ) => Effect.Effect<void, ScriptRejected>
 }
 
 const sqliteDatabase = Effect.gen(function*() {
@@ -122,8 +125,10 @@ const postgresDatabase = Effect.gen(function*() {
           )
         )
       ),
-    applyAsOneMessage: (script, clientEncoding) =>
-      runPsql(psql(container, internal, ["--env", `PGCLIENTENCODING=${clientEncoding}`], ["--command", script]))
+    applyAsOneMessage: (script, environment) => {
+      const variables = environment.flatMap((variable) => ["--env", variable])
+      return runPsql(psql(container, internal, variables, ["--command", script]))
+    }
   } satisfies PostgresManualDatabase
 })
 

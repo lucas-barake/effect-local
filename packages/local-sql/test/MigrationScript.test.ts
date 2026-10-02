@@ -401,7 +401,30 @@ describe("server migrations applied by hand through psql", () => {
         const definition = Definition.make({ version: 1, models: [Accented], mutations: [PutNote] })
         const script = yield* render(database, definition).pipe(Effect.map(Option.getOrElse(() => "")))
         assert.notStrictEqual(script, "")
-        yield* database.applyAsOneMessage(script, "LATIN1")
+        yield* database.applyAsOneMessage(script, ["PGCLIENTENCODING=LATIN1"])
+        assert.strictEqual(failureOf(yield* boot(database, definition, "verify")), "Success")
+      },
+      Effect.scoped,
+      provideServices
+    ),
+    60_000
+  )
+
+  it.effect(
+    "keep backslashes intact when the whole script is sent as one message without standard conforming strings",
+    Effect.fnUntraced(
+      function*() {
+        const database = yield* manualDatabases[1].make
+        const Escaped = Model.make("Back\\slash\\n", {
+          version: 1,
+          key: Schema.String,
+          schema: NoteSchema,
+          indexes: { byRank: rankIndex }
+        })
+        const definition = Definition.make({ version: 1, models: [Escaped], mutations: [PutNote] })
+        const script = yield* render(database, definition).pipe(Effect.map(Option.getOrElse(() => "")))
+        assert.notStrictEqual(script, "")
+        yield* database.applyAsOneMessage(script, ["PGOPTIONS=-c standard_conforming_strings=off"])
         assert.strictEqual(failureOf(yield* boot(database, definition, "verify")), "Success")
       },
       Effect.scoped,
