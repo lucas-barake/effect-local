@@ -29,5 +29,8 @@ Tabs from different deploys never share a cluster: the newest build takes the da
 build fails with a typed `BuildSuperseded` error that the app can turn into a reload prompt.
 On React Native, `ExpoReplica.layer` runs the same replica over `expo-sqlite`, `expo-crypto`, and React Native's
 WebSocket, in Expo Go or a native build.
+Server storage migrates its own schema by default. Where the database role may not run DDL,
+`Migrations.renderServer` reads the database and returns the exact SQL a DBA applies, and
+`migration: { mode: "verify" }` refuses to serve with `StorageMigrationPending` until the schema is current.
 Every limit has a documented default, so a working client or server needs a few lines, and every limit can be
 overridden.
