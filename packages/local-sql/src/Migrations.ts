@@ -1248,9 +1248,7 @@ ON CONFLICT (model, index_name, descriptor_hash) DO NOTHING`
       `DROP INDEX IF EXISTS ${row.scan_index_name}`,
       `DROP TABLE IF EXISTS ${row.table_name}`,
       `DELETE FROM effect_local_server_index_state WHERE descriptor_hash = ${quote(row.descriptor_hash)}`,
-      `DELETE FROM effect_local_server_index_catalog WHERE model = ${quote(row.model)} AND index_name = ${
-        quote(row.index_name)
-      } AND descriptor_hash = ${quote(row.descriptor_hash)}`
+      `DELETE FROM effect_local_server_index_catalog WHERE descriptor_hash = ${quote(row.descriptor_hash)}`
     )
   }
   statements.push("COMMIT")
