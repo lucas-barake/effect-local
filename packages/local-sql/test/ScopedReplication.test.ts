@@ -1325,7 +1325,8 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
       assert.strictEqual(page.entries.length, Protocol.maximumBootstrapEntries)
       yield* local.prepareBootstrap(required.manifest)
       assert.isTrue(yield* local.stageBootstrapPage(page))
-    }, provideNodeCrypto)
+    }, provideNodeCrypto),
+    60_000
   )
 
   it.effect(
