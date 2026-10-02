@@ -1935,7 +1935,7 @@ export const layer = (
             schema_generation: activeGeneration,
             model: entity.model,
             model_version: entity.modelVersion,
-            entity_key: yield* Codec.stringify(entity.key)
+            entity_key: yield* Codec.stringifyKey(entity.key)
           })
         }
         for (let offset = 0; offset < rows.length; offset += 100) {
@@ -1974,8 +1974,8 @@ export const layer = (
               Effect.flatMap((value) => Codec.decode(Schema.Array(Protocol.EntityChange), value))
             )
             for (const change of changes) {
-              const entityKey = yield* Codec.stringify(change.entity.key)
-              const identity = `${change.entity.model}\u0000${entityKey}`
+              const entityKey = yield* Codec.stringifyKey(change.entity.key)
+              const identity = Canonical.stringify([change.entity.model, entityKey])
               if (dropped !== dirty.has(identity)) return false
               if (!dropped) replayedIdentities.set(identity, { model: change.entity.model, entityKey })
             }
@@ -2021,7 +2021,7 @@ export const layer = (
         const touched = new Map<string, { readonly model: string; readonly entityKey: string }>()
         const entities = new Map<string, Protocol.EntityKey>()
         const record = (entity: Protocol.EntityKey, entityKey: string) => {
-          const identity = `${entity.model}\u0000${entityKey}`
+          const identity = Canonical.stringify([entity.model, entityKey])
           touched.set(identity, { model: entity.model, entityKey })
           entities.set(identity, entity)
         }
@@ -2050,7 +2050,7 @@ export const layer = (
               Effect.flatMap((value) => Codec.decode(Schema.Array(Protocol.EntityChange), value))
             )
             for (const change of changes) {
-              const entityKey = yield* Codec.stringify(change.entity.key)
+              const entityKey = yield* Codec.stringifyKey(change.entity.key)
               record(change.entity, entityKey)
             }
           }
@@ -2095,7 +2095,7 @@ export const layer = (
           for (const row of batch) {
             const written = yield* replayPendingRow(row, replaySchemaGeneration, projectionGeneration, current)
             for (const change of written) {
-              const entityKey = yield* Codec.stringify(change.entity.key)
+              const entityKey = yield* Codec.stringifyKey(change.entity.key)
               record(change.entity, entityKey)
             }
           }
@@ -2817,7 +2817,7 @@ export const layer = (
           )
           valueJson = yield* Codec.stringify(change.value)
         }
-        return { keyJson: yield* Codec.stringify(change.entity.key), valueJson }
+        return { keyJson: yield* Codec.stringifyKey(change.entity.key), valueJson }
       })
 
       const applyViewChange = Effect.fnUntraced(function*(
@@ -2927,7 +2927,7 @@ export const layer = (
                 message: `Snapshot ${page.manifest.snapshotId} entry ${entry.ordinal} has invalid byte metadata`
               })
             }
-            const identity = `${entry.change.entity.model}\\u0000${validated.keyJson}`
+            const identity = Canonical.stringify([entry.change.entity.model, validated.keyJson])
             if (identities.has(identity)) {
               return yield* new ReplicaError.ProtocolInvalid({
                 message: `Snapshot ${page.manifest.snapshotId} contains a duplicate entity`
@@ -3058,7 +3058,7 @@ export const layer = (
                   message: `Snapshot ${manifest.snapshotId} durable entry ${index} has invalid byte metadata`
                 })
               }
-              const identity = `${entry.change.entity.model}\\u0000${validated.keyJson}`
+              const identity = Canonical.stringify([entry.change.entity.model, validated.keyJson])
               if (stagedIdentities.has(identity)) {
                 return yield* new ReplicaError.StorageCorrupt({
                   message: `Snapshot ${manifest.snapshotId} contains a duplicate durable entity`
@@ -3095,7 +3095,7 @@ export const layer = (
               Effect.mapError(StorageUnavailable.make)
             )
             for (const row of priorCanonical) {
-              const identity = `${row.model}\\u0000${row.entity_key}`
+              const identity = Canonical.stringify([row.model, row.entity_key])
               if (!stagedIdentities.has(identity)) {
                 yield* sql`INSERT INTO effect_local_client_retractions
                   (space_id, generation, model, model_version, entity_key)

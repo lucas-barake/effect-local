@@ -1024,12 +1024,12 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               message: `Space ${spaceId} contains unknown model ${row.model}`
             })
           }
-          const key = yield* Codec.parse(row.entity_key)
+          const key = yield* Codec.decode(Protocol.EntityKeyText, row.entity_key)
           const value = yield* Codec.parse(row.value_json)
           yield* Codec.decode(model.key, key)
           yield* Codec.decode(model.schema, value)
           if (
-            (yield* Codec.stringify(key)) !== row.entity_key || (yield* Codec.stringify(value)) !== row.value_json
+            (yield* Codec.stringifyKey(key)) !== row.entity_key || (yield* Codec.stringify(value)) !== row.value_json
           ) {
             return yield* new ReplicaError.StorageCorrupt({
               message: `Space ${spaceId} contains a noncanonical entity row`
@@ -1759,7 +1759,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                       ordinal: entity.ordinal,
                       model: entity.model,
                       model_version: entity.modelVersion,
-                      entity_key: yield* Codec.stringify(entity.key),
+                      entity_key: yield* Codec.stringifyKey(entity.key),
                       value_json: yield* Codec.stringify(entity.value),
                       entity_bytes: entity.entityBytes,
                       wire_json: wireJson,
@@ -2054,7 +2054,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         )
         if (scoped.length === 0) return false
         const identities = yield* Effect.forEach(scoped, (change) =>
-          Codec.stringify(change.entity.key).pipe(
+          Codec.stringifyKey(change.entity.key).pipe(
             Effect.map((key) => ({ model: change.entity.model, key }))
           ))
         const principalHash = yield* Canonical.digest({ format: 1, principal }).pipe(

@@ -75,7 +75,7 @@ interface StoredSnapshotEntry {
   readonly sourceValueJson: string
 }
 
-const identityOf = (model: string, entityKey: string) => `${model}\u0000${entityKey}`
+const identityOf = (model: string, entityKey: string) => Canonical.stringify([model, entityKey])
 
 const largestPagePrefix = (
   maximumLength: number,
@@ -290,7 +290,7 @@ export const make = (options: Options) => {
         )
         yield* Codec.decode(model.key, key)
         yield* Codec.decode(model.schema, value)
-        const keyJson = yield* Codec.stringify(key)
+        const keyJson = yield* Codec.stringifyKey(key)
         const valueJson = yield* Codec.stringify(value)
         if (keyJson !== row.entity_key || valueJson !== row.value_json) {
           return yield* new ReplicaError.StorageCorrupt({
@@ -345,7 +345,7 @@ export const make = (options: Options) => {
       for (const candidate of source.values()) {
         const projected = yield* options.projectEntity(targetDefinition, candidate.entity, candidate.value)
         if (Option.isNone(projected)) continue
-        const entityKey = yield* Codec.stringify(projected.value.entity.key)
+        const entityKey = yield* Codec.stringifyKey(projected.value.entity.key)
         const identity = identityOf(projected.value.entity.model, entityKey)
         if (all.has(identity)) {
           return yield* new ReplicaError.SchemaKeyCollision({
@@ -473,8 +473,8 @@ export const make = (options: Options) => {
         const sourceValue = yield* Codec.parse(row.source_value_json).pipe(
           Effect.flatMap((value) => Codec.decode(model.schema, value))
         )
-        const sourceEntityKey = yield* Codec.stringify(sourceKey)
-        const sourceValueJson = yield* Codec.stringify(sourceValue)
+        const sourceEntityKey = yield* Codec.encode(model.key, sourceKey).pipe(Effect.flatMap(Codec.stringifyKey))
+        const sourceValueJson = yield* Codec.encode(model.schema, sourceValue).pipe(Effect.flatMap(Codec.stringify))
         if (sourceEntityKey !== row.source_entity_key || sourceValueJson !== row.source_value_json) {
           return yield* new ReplicaError.StorageCorrupt({
             message: `Scoped snapshot entry ${row.ordinal} has noncanonical source metadata`
@@ -718,7 +718,7 @@ export const make = (options: Options) => {
       windowKeys: ReadonlyMap<string, ReadonlySet<string>>
     ) {
       for (const change of page.changes) {
-        const key = yield* Codec.stringify(change.entity.key)
+        const key = yield* Codec.stringifyKey(change.entity.key)
         const current = all.get(identityOf(change.entity.model, key))
         const inScope = request.scope.models.includes(change.entity.model) ||
           (windowKeys.get(change.entity.model)?.has(key) ?? false)
@@ -755,7 +755,7 @@ export const make = (options: Options) => {
       const upserts: Array<Record<string, unknown>> = []
       const removals: Array<{ readonly model: string; readonly key: string }> = []
       for (const change of page.changes) {
-        const key = yield* Codec.stringify(change.entity.key)
+        const key = yield* Codec.stringifyKey(change.entity.key)
         if (change._tag === "Upsert") {
           upserts.push({
             space_id: request.spaceId,
@@ -946,7 +946,7 @@ export const make = (options: Options) => {
       for (const row of suffix) {
         const entry = yield* AcceptedLog.decode(row)
         for (const change of entry.changes) {
-          const keyJson = yield* Codec.stringify(change.entity.key)
+          const keyJson = yield* Codec.stringifyKey(change.entity.key)
           changed.set(identityOf(change.entity.model, keyJson), {
             model: change.entity.model,
             key: keyJson
@@ -1197,7 +1197,7 @@ export const make = (options: Options) => {
               for (const change of page.changes) {
                 identities.push({
                   model: change.entity.model,
-                  key: yield* Codec.stringify(change.entity.key)
+                  key: yield* Codec.stringifyKey(change.entity.key)
                 })
               }
               all = yield* materializeByIdentity(request.spaceId, identities)
@@ -1414,7 +1414,7 @@ export const make = (options: Options) => {
           }
           let projectedKey: string | undefined
           if (Option.isSome(projected)) {
-            projectedKey = yield* Codec.stringify(projected.value.entity.key)
+            projectedKey = yield* Codec.stringifyKey(projected.value.entity.key)
           }
           if (
             entry.change._tag !== "Upsert" || current === undefined ||
@@ -1424,7 +1424,7 @@ export const make = (options: Options) => {
                 (windowKeys.get(projected.value.entity.model)?.has(projectedKey) ?? false))) ||
             entry.change.entity.model !== projected.value.entity.model ||
             entry.change.entity.modelVersion !== projected.value.entity.modelVersion ||
-            (yield* Codec.stringify(entry.change.entity.key)) !== projectedKey ||
+            (yield* Codec.stringifyKey(entry.change.entity.key)) !== projectedKey ||
             (yield* Codec.stringify(entry.change.value)) !== (yield* Codec.stringify(projected.value.value)) ||
             !(yield* options.authorization.entity(request, principal, current.sourceEntity, current.sourceValue))
           ) {

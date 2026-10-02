@@ -42,7 +42,7 @@ export const make = (sql: SqlClient.SqlClient, spaceId: Identity.SpaceId) => {
   return Effect.fnUntraced(function*(model: string, migrated: Evolution.MigratedModel) {
     const aliases = yield* Effect.forEach(
       migrated.aliases,
-      (alias) => Codec.stringify(alias.key).pipe(Effect.map((key) => ({ ...alias, key })))
+      (alias) => Codec.stringifyKey(alias.key).pipe(Effect.map((key) => ({ ...alias, key })))
     )
     const groups = new Set<string>()
     let sourceAliases = aliases
@@ -58,7 +58,7 @@ export const make = (sql: SqlClient.SqlClient, spaceId: Identity.SpaceId) => {
       if (Option.isSome(found)) groups.add(found.value.lineage_id)
     }
     if (groups.size > 1) {
-      return yield* new ReplicaError.SchemaKeyCollision({ model, key: yield* Codec.stringify(migrated.key) })
+      return yield* new ReplicaError.SchemaKeyCollision({ model, key: yield* Codec.stringifyKey(migrated.key) })
     }
     const root = aliases[0]
     const lineageId = groups.values().next().value ?? Canonical.stringify({
@@ -67,7 +67,7 @@ export const make = (sql: SqlClient.SqlClient, spaceId: Identity.SpaceId) => {
       modelVersion: root.modelVersion,
       key: root.key
     })
-    const targetKey = yield* Codec.stringify(migrated.key)
+    const targetKey = yield* Codec.stringifyKey(migrated.key)
     const target = yield* readTarget({ model, modelVersion: migrated.modelVersion, key: targetKey }).pipe(
       Effect.mapError(StorageUnavailable.make)
     )

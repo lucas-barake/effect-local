@@ -112,6 +112,20 @@ export const mutationDigestInput = (envelope: MutationDigestIdentity): unknown =
 
 export const mutationDigest = (envelope: MutationDigestIdentity) => Canonical.digest(mutationDigestInput(envelope))
 
+const compareText = (left: string, right: string) => {
+  if (left < right) return -1
+  if (left > right) return 1
+  return 0
+}
+
+const sortObjectKeys = (_name: string, value: unknown) => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value
+  const names = Object.keys(value).sort(compareText)
+  return Object.fromEntries(names.map((name) => [name, Reflect.get(value, name)]))
+}
+
+export const EntityKeyText = Schema.fromJsonString(Schema.Json, { replacer: sortObjectKeys })
+
 export const EntityKey = Schema.Struct({
   model: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
   modelVersion: Identity.SchemaVersion,

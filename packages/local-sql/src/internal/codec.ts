@@ -1,3 +1,4 @@
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
@@ -26,6 +27,9 @@ export const parse = (value: string): Effect.Effect<unknown, ReplicaError.Storag
   Schema.decodeUnknownEffect(UnknownFromJsonString)(value).pipe(
     Effect.mapError((cause) => new ReplicaError.StorageCorrupt({ message: "Stored JSON is invalid", cause }))
   )
+
+export const stringifyKey = (key: typeof Schema.Json.Type): Effect.Effect<string, ReplicaError.StorageCorrupt> =>
+  encode(Protocol.EntityKeyText, key)
 
 export const stringify = (value: unknown): Effect.Effect<string, ReplicaError.StorageCorrupt> =>
   Schema.encodeUnknownEffect(UnknownFromJsonString)(value).pipe(
