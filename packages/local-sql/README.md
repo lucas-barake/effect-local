@@ -159,13 +159,10 @@ the idiomatic implementation can be a Context service consumed by the option cal
 ```ts
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as Context from "effect/Context"
-import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 
 class ReadPolicy extends Context.Service<ReadPolicy, {
-  readonly authorize: (
-    input: ServerStore.ReadAuthorizationInput
-  ) => Effect.Effect<void, ServerStore.AuthorizationRejection>
+  readonly authorize: ServerStore.Options["authorizeRead"]
 }>()("app/ReadPolicy") {}
 
 const layerStore = ServerStore.layer({

@@ -176,15 +176,11 @@ and one column per top-level field of the model schema extracted from the JSON. 
 keeps only the entity columns and stays reachable through `value`.
 
 ```ts
-import * as Effect from "effect/Effect"
-
-const repeatedTitles = Effect.gen(function*() {
-  return yield* query.sql([Task], (sql) =>
-    sql`SELECT "title", COUNT(*) AS repeats FROM "Task"
-      WHERE "completed" = 0
-      GROUP BY "title" HAVING repeats > 1
-      ORDER BY repeats DESC`)
-})
+const repeatedTitles = query.sql([Task], (sql) =>
+  sql`SELECT "title", COUNT(*) AS repeats FROM "Task"
+    WHERE "completed" = 0
+    GROUP BY "title" HAVING repeats > 1
+    ORDER BY repeats DESC`)
 ```
 
 The statement begins with the query body (`SELECT`/`VALUES`) or continues the generated CTE list with a leading
@@ -372,13 +368,10 @@ services. Those requirements propagate to `ServerStore.layer`, where normal Laye
 ```ts
 import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as Context from "effect/Context"
-import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 
 class ReadPolicy extends Context.Service<ReadPolicy, {
-  readonly authorize: (
-    input: ServerStore.ReadAuthorizationInput
-  ) => Effect.Effect<void, ServerStore.AuthorizationRejection>
+  readonly authorize: ServerStore.Options["authorizeRead"]
 }>()("app/ReadPolicy") {}
 
 const layerStore = ServerStore.layer({
@@ -656,13 +649,10 @@ re-runs on a write anyway; one window query keeps that refresh a single consiste
 
 ```ts
 import * as Field from "@lucas-barake/effect-local/Field"
-import * as Effect from "effect/Effect"
 
-const incremented = Effect.gen(function*() {
-  return yield* transaction.applyField(Field.counter, currentCount, {
-    _tag: "Increment",
-    delta: 1
-  })
+const incremented = transaction.applyField(Field.counter, currentCount, {
+  _tag: "Increment",
+  delta: 1
 })
 ```
 
