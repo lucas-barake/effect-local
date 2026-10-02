@@ -289,15 +289,12 @@ export const make = Effect.fn("ServerIndex.make")(
     } else {
       yield* sql.withTransaction(Effect.gen(function*() {
         yield* dialect.lockSchema
-        const existing = yield* readCatalog(sql)
-        const pending = yield* planCatalog(all, existing)
+        const pending = yield* planCatalog(all, yield* readCatalog(sql))
         if (pending.missing.length > 0 || pending.orphans.length > 0) {
           yield* sql`INSERT INTO effect_local_server_index_generations (generation)
             SELECT COALESCE(MAX(generation), 0) + 1 FROM effect_local_server_index_generations`
         }
-        const created = new Set(existing.map((row) => row.descriptor_hash))
-        for (const descriptor of all) {
-          if (created.has(descriptor.hash)) continue
+        for (const descriptor of pending.missing) {
           yield* sql.unsafe(descriptor.tableDdl)
           yield* sql.unsafe(descriptor.scanIndexDdl)
           yield* sql`INSERT INTO effect_local_server_index_catalog
@@ -306,8 +303,7 @@ export const make = Effect.fn("ServerIndex.make")(
               ${descriptor.tableName}, ${descriptor.scanIndexName})
             ON CONFLICT (model, index_name, descriptor_hash) DO NOTHING`
         }
-        const current = yield* planCatalog(all, yield* readCatalog(sql))
-        for (const row of current.orphans) {
+        for (const row of pending.orphans) {
           yield* sql.unsafe(`DROP INDEX IF EXISTS ${row.scan_index_name}`)
           yield* sql.unsafe(`DROP TABLE IF EXISTS ${row.table_name}`)
           yield* sql`DELETE FROM effect_local_server_index_state WHERE descriptor_hash = ${row.descriptor_hash}`
