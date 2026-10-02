@@ -153,9 +153,11 @@ const hasStableMetadata = (annotations: SupportedAnnotations | undefined): boole
   (
     typeof annotations.identifier === "string" ||
     ("meta" in annotations && annotations.meta !== undefined) ||
-    ("typeConstructor" in annotations && annotations.typeConstructor !== undefined) ||
-    representationOf(annotations) !== undefined
+    ("typeConstructor" in annotations && annotations.typeConstructor !== undefined)
   )
+
+const identifiesItself = (annotations: SupportedAnnotations | undefined): boolean =>
+  annotations !== undefined && (hasStableMetadata(annotations) || representationOf(annotations) !== undefined)
 
 const hasSemanticAnnotations = (annotations: SupportedAnnotations | undefined): boolean =>
   annotations !== undefined &&
@@ -222,7 +224,7 @@ const fromCheck = (
   const annotations = fromAnnotations(check.annotations, state)
   if (annotations !== undefined) result.annotations = annotations
   if (check._tag === "Filter") {
-    if (!trustedBehavior && !hasStableMetadata(check.annotations)) {
+    if (!trustedBehavior && !identifiesItself(check.annotations)) {
       return Defect.invalid("Opaque schema checks require an identifier or meta annotation")
     }
     result.aborted = check.aborted
@@ -411,7 +413,7 @@ const fromAST = (
   }
   switch (ast._tag) {
     case "Declaration": {
-      if (!identifiedBehavior) {
+      if (!identifiedBehavior && !identifiesItself(ast.annotations)) {
         return Defect.invalid("Opaque schema declarations require an identifier or meta annotation")
       }
       node.typeParameters = ast.typeParameters.map((parameter) => fromAST(parameter, state, trustedBehavior))

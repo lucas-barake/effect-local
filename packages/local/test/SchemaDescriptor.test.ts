@@ -1,4 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as Effect from "effect/Effect"
+import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as SchemaAST from "effect/SchemaAST"
 import * as SchemaGetter from "effect/SchemaGetter"
@@ -81,6 +83,22 @@ describe("SchemaDescriptor", () => {
   it("still rejects a filter that carries no stable identity", () => {
     const Even = Schema.Number.check(Schema.makeFilter((value: number) => value % 2 === 0))
     assert.throws(() => SchemaDescriptor.make(Even), /Opaque schema checks/)
+  })
+
+  it("does not let a built-in declaration vouch for filters, transformations, or defaults added to it", () => {
+    const OptionalNumber = Schema.Option(Schema.Number)
+    const Present = OptionalNumber.check(Schema.makeFilter(Option.isSome))
+    const FromNumber = Schema.Number.pipe(Schema.decodeTo(OptionalNumber, {
+      decode: SchemaGetter.transform(Option.some),
+      encode: SchemaGetter.transform(Option.getOrElse(() => 0))
+    }))
+    const defaultValue = Effect.succeed(Option.some(1))
+    const Defaulted = Schema.Struct({ value: OptionalNumber.pipe(Schema.withConstructorDefault(defaultValue)) })
+    const InYear = Schema.DateFromString.check(Schema.makeFilter((date: Date) => date.getUTCFullYear() === 2025))
+    assert.throws(() => SchemaDescriptor.make(Present), /Opaque schema checks/)
+    assert.throws(() => SchemaDescriptor.make(InYear), /Opaque schema checks/)
+    assert.throws(() => SchemaDescriptor.make(FromNumber), /Opaque schema transformations/)
+    assert.throws(() => SchemaDescriptor.make(Defaulted), /Opaque constructor defaults/)
   })
 
   it("lets a definition use models whose fields are refined by Effect filters", () => {
