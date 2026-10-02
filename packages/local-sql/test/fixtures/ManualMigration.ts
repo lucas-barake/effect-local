@@ -4,7 +4,6 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import * as Effect from "effect/Effect"
 import * as FileSystem from "effect/FileSystem"
 import type * as Layer from "effect/Layer"
-import type * as PlatformError from "effect/PlatformError"
 import * as ChildProcess from "effect/process/ChildProcess"
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner"
 import * as Redacted from "effect/Redacted"
@@ -57,7 +56,13 @@ const sqliteDatabase = Effect.gen(function*() {
   } satisfies ManualDatabase
 })
 
-const psql = (container: string, url: URL, environment: ReadonlyArray<string>, input: ReadonlyArray<string>) =>
+const psql = (
+  container: string,
+  url: URL,
+  environment: ReadonlyArray<string>,
+  input: ReadonlyArray<string>,
+  stdin?: Stream.Stream<Uint8Array>
+) =>
   ChildProcessSpawner.ChildProcessSpawner.use((spawner) =>
     spawner.exitCode(
       ChildProcess.make(
@@ -75,15 +80,10 @@ const psql = (container: string, url: URL, environment: ReadonlyArray<string>, i
           "ON_ERROR_STOP=1",
           ...input
         ],
-        { stdout: "ignore", stderr: "ignore" }
+        { stdin, stdout: "ignore", stderr: "ignore" }
       )
     )
-  )
-
-const runPsql = (
-  exitCode: Effect.Effect<number, PlatformError.PlatformError, ChildProcessSpawner.ChildProcessSpawner>
-) =>
-  exitCode.pipe(
+  ).pipe(
     Effect.provide(NodeServices.layer),
     Effect.mapError((cause) => new ScriptRejected({ message: String(cause) })),
     Effect.flatMap((code) => {
@@ -101,33 +101,10 @@ const postgresDatabase = Effect.gen(function*() {
   return {
     dialect: "pg",
     layer: () => PgClient.layer({ url, maxConnections: 4 }),
-    apply: (script) =>
-      runPsql(
-        ChildProcessSpawner.ChildProcessSpawner.use((spawner) =>
-          spawner.exitCode(
-            ChildProcess.make(
-              "docker",
-              [
-                "exec",
-                "-i",
-                container,
-                "psql",
-                internal.toString(),
-                "--quiet",
-                "--no-psqlrc",
-                "--set",
-                "ON_ERROR_STOP=1",
-                "--file",
-                "-"
-              ],
-              { stdin: Stream.make(new TextEncoder().encode(script)), stdout: "ignore", stderr: "ignore" }
-            )
-          )
-        )
-      ),
+    apply: (script) => psql(container, internal, [], ["--file", "-"], Stream.make(script).pipe(Stream.encodeText)),
     applyAsOneMessage: (script, environment) => {
       const variables = environment.flatMap((variable) => ["--env", variable])
-      return runPsql(psql(container, internal, variables, ["--command", script]))
+      return psql(container, internal, variables, ["--command", script])
     }
   } satisfies PostgresManualDatabase
 })
