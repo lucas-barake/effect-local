@@ -38,17 +38,15 @@ const rankIndex = {
   }]
 } as const
 
-const RankedNote = Model.make("Note", {
-  version: 1,
-  key: Schema.String,
-  schema: NoteSchema,
-  indexes: { byRank: rankIndex }
-})
+const rankedNote = (name: string) =>
+  Model.make(name, { version: 1, key: Schema.String, schema: NoteSchema, indexes: { byRank: rankIndex } })
+const RankedNote = rankedNote("Note")
 const PlainNote = Model.make("Note", { version: 1, key: Schema.String, schema: NoteSchema })
 const PutNote = Mutation.make("PutNote", { version: 1, payload: NoteSchema, success: NoteSchema })
 
-const ranked = Definition.make({ version: 1, models: [RankedNote], mutations: [PutNote] })
-const plain = Definition.make({ version: 1, models: [PlainNote], mutations: [PutNote] })
+const definitionOf = (model: Model.Any) => Definition.make({ version: 1, models: [model], mutations: [PutNote] })
+const ranked = definitionOf(RankedNote)
+const plain = definitionOf(PlainNote)
 
 const layerHandlers = PutNote.toLayer(({ payload, transaction }) =>
   transaction.set(RankedNote, payload.id, payload).pipe(Effect.as(payload))
@@ -98,11 +96,16 @@ const failureOf = <A,>(exit: Exit.Exit<A, { readonly _tag: string; readonly cata
 const render = (database: ManualDatabase, definition: Definition.Any) =>
   Migrations.renderServer({ definition }).pipe(Effect.provide(database.layer()))
 
-const renderAndApply = Effect.fnUntraced(function*(database: ManualDatabase, definition: Definition.Any) {
+const scriptOf = Effect.fnUntraced(function*(database: ManualDatabase, definition: Definition.Any) {
   const script = yield* render(database, definition)
   if (Option.isNone(script)) return assert.fail("expected a pending script")
-  yield* database.apply(script.value)
   return script.value
+})
+
+const renderAndApply = Effect.fnUntraced(function*(database: ManualDatabase, definition: Definition.Any) {
+  const script = yield* scriptOf(database, definition)
+  yield* database.apply(script)
+  return script
 })
 
 const introspection = {
@@ -335,7 +338,7 @@ describe.each(manualDatabases)("server migrations applied by hand on $dialect", 
     Effect.fnUntraced(
       function*() {
         const database = yield* make
-        const script = yield* render(database, ranked).pipe(Effect.map(Option.getOrElse(() => "")))
+        const script = yield* scriptOf(database, ranked)
         yield* SqlClient.SqlClient.use((sql) => sql`CREATE TABLE effect_local_server_index_catalog (squatter TEXT)`)
           .pipe(Effect.provide(database.layer()))
         const before = yield* schemaOf(database)
@@ -388,13 +391,7 @@ describe.each(manualDatabases)("server migrations applied by hand on $dialect", 
     Effect.fnUntraced(
       function*() {
         const database = yield* make
-        const Unwritable = Model.make("Note\u0000", {
-          version: 1,
-          key: Schema.String,
-          schema: NoteSchema,
-          indexes: { byRank: rankIndex }
-        })
-        const definition = Definition.make({ version: 1, models: [Unwritable], mutations: [PutNote] })
+        const definition = definitionOf(rankedNote("Note\u0000"))
         const outcome = yield* render(database, definition).pipe(Effect.exit)
         assert.strictEqual(failureOf(outcome), "InvalidConfiguration")
       },
@@ -411,15 +408,8 @@ describe("server migrations applied by hand through psql", () => {
     Effect.fnUntraced(
       function*() {
         const database = yield* manualDatabases[1].make
-        const Accented = Model.make("No'té\\ \u{1F600}", {
-          version: 1,
-          key: Schema.String,
-          schema: NoteSchema,
-          indexes: { byRank: rankIndex }
-        })
-        const definition = Definition.make({ version: 1, models: [Accented], mutations: [PutNote] })
-        const script = yield* render(database, definition).pipe(Effect.map(Option.getOrElse(() => "")))
-        assert.notStrictEqual(script, "")
+        const definition = definitionOf(rankedNote("No'té\\ \u{1F600}"))
+        const script = yield* scriptOf(database, definition)
         yield* database.applyAsOneMessage(script, ["PGCLIENTENCODING=LATIN1"])
         assert.strictEqual(failureOf(yield* boot(database, definition, "verify")), "Success")
       },
@@ -434,15 +424,8 @@ describe("server migrations applied by hand through psql", () => {
     Effect.fnUntraced(
       function*() {
         const database = yield* manualDatabases[1].make
-        const Escaped = Model.make("Back\\slash\\n", {
-          version: 1,
-          key: Schema.String,
-          schema: NoteSchema,
-          indexes: { byRank: rankIndex }
-        })
-        const definition = Definition.make({ version: 1, models: [Escaped], mutations: [PutNote] })
-        const script = yield* render(database, definition).pipe(Effect.map(Option.getOrElse(() => "")))
-        assert.notStrictEqual(script, "")
+        const definition = definitionOf(rankedNote("Back\\slash\\n"))
+        const script = yield* scriptOf(database, definition)
         yield* database.applyAsOneMessage(script, ["PGOPTIONS=-c standard_conforming_strings=off"])
         assert.strictEqual(failureOf(yield* boot(database, definition, "verify")), "Success")
       },
@@ -457,15 +440,8 @@ describe("server migrations applied by hand through psql", () => {
     Effect.fnUntraced(
       function*() {
         const database = yield* manualDatabases[1].make
-        const Accented = Model.make("Noté", {
-          version: 1,
-          key: Schema.String,
-          schema: NoteSchema,
-          indexes: { byRank: rankIndex }
-        })
-        const definition = Definition.make({ version: 1, models: [Accented], mutations: [PutNote] })
-        const script = yield* render(database, definition).pipe(Effect.map(Option.getOrElse(() => "")))
-        assert.notStrictEqual(script, "")
+        const definition = definitionOf(rankedNote("Noté"))
+        const script = yield* scriptOf(database, definition)
         yield* database.apply(`SET client_encoding = 'LATIN1';\n${script}`)
         assert.strictEqual(failureOf(yield* boot(database, definition, "verify")), "Success")
       },
