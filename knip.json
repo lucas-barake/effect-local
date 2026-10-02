@@ -10,12 +10,6 @@
     },
     "packages/local-expo": {
       "entry": ["test/fixtures/{expo,expoAsset,expoModulesCore,reactNative}.ts"]
-    },
-    "packages/local-browser": {
-      "ignoreDependencies": ["@effect/platform-browser"]
-    },
-    "packages/local-test": {
-      "ignoreDependencies": ["@effect/platform-node-shared"]
     }
   }
 }

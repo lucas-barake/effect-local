@@ -365,15 +365,6 @@ importers:
 
   packages/local-test:
     dependencies:
-      '@effect/platform-node':
-        specifier: 4.0.0
-        version: 4.0.0(effect@4.0.0)(redis@6.2.1)
-      '@effect/platform-node-shared':
-        specifier: 4.0.0
-        version: 4.0.0(effect@4.0.0)
-      '@effect/sql-sqlite-node':
-        specifier: 4.0.0
-        version: 4.0.0(effect@4.0.0)
       '@lucas-barake/effect-local':
         specifier: workspace:^
         version: link:../local
@@ -381,6 +372,12 @@ importers:
         specifier: workspace:^
         version: link:../local-sql
     devDependencies:
+      '@effect/platform-node':
+        specifier: 4.0.0
+        version: 4.0.0(effect@4.0.0)(redis@6.2.1)
+      '@effect/sql-sqlite-node':
+        specifier: 4.0.0
+        version: 4.0.0(effect@4.0.0)
       effect:
         specifier: 4.0.0
         version: 4.0.0
