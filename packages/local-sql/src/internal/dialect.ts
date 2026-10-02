@@ -31,6 +31,7 @@ export interface Dialect {
   readonly decodeText: (value: string) => string
   readonly lockSchema: Effect.Effect<void, SqlError.SqlError>
   readonly scriptPrologue: ReadonlyArray<string>
+  readonly literal: (value: string) => string
   readonly tableExists: (table: string) => Effect.Effect<boolean, SqlError.SqlError | Schema.SchemaError>
   readonly lockPresences: (keys: ReadonlyArray<PresenceKey>) => Effect.Effect<void, SqlError.SqlError>
   readonly beginSnapshotRead: Effect.Effect<void, SqlError.SqlError>
@@ -60,6 +61,22 @@ const presenceLockKey = (key: PresenceKey) => {
     hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193)
   }
   return hash | 0
+}
+
+const quoteText = (value: string) => `'${value.replaceAll("'", "''")}'`
+
+const unicodeEscape = (character: string) => {
+  const code = character.codePointAt(0) ?? 0
+  if (character === "\\") return "\\\\"
+  if (character === "'") return "''"
+  if (code < 0x80) return character
+  if (code <= 0xffff) return `\\${code.toString(16).padStart(4, "0")}`
+  return `\\+${code.toString(16).padStart(6, "0")}`
+}
+
+const postgresText = (value: string) => {
+  if (!/[\u0080-\uffff]/.test(value)) return quoteText(value)
+  return `U&'${Array.from(value, unicodeEscape).join("")}'`
 }
 
 export const hasUnpairedSurrogate = (value: string) => value.search(unpairedSurrogate) !== -1
@@ -93,6 +110,7 @@ const sqlite = (sql: SqlClient.SqlClient): Dialect => ({
   decodeText: (value) => value,
   lockSchema: Effect.void,
   scriptPrologue: ["BEGIN IMMEDIATE"],
+  literal: quoteText,
   tableExists: tableExists((name) =>
     sql`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ${name}`
   ),
@@ -129,12 +147,8 @@ const postgres = (sql: SqlClient.SqlClient): Dialect => ({
     ),
   decodeText: decodeEscapedText,
   lockSchema: sql.unsafe(schemaLockStatement).pipe(Effect.asVoid),
-  scriptPrologue: [
-    "BEGIN",
-    "SET LOCAL client_encoding = 'UTF8'",
-    "SET LOCAL standard_conforming_strings = on",
-    schemaLockStatement
-  ],
+  scriptPrologue: ["BEGIN", "SET LOCAL standard_conforming_strings = on", schemaLockStatement],
+  literal: postgresText,
   tableExists: tableExists((name) => sql`SELECT 1 AS present WHERE to_regclass(${name}) IS NOT NULL`),
   lockPresences: (keys) =>
     Effect.forEach(

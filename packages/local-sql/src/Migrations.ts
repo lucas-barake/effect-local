@@ -1196,8 +1196,6 @@ export const server = Effect.fnUntraced(function*(options: ServerOptions = {}) {
   })
 })
 
-const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
-
 export const renderServer = Effect.fn("Migrations.renderServer")(function*(options: RenderServerOptions) {
   const sql = yield* SqlClient.SqlClient
   const dialect = yield* Dialect.make(sql)
@@ -1227,8 +1225,8 @@ export const renderServer = Effect.fn("Migrations.renderServer")(function*(optio
     }
     statements.push(
       `INSERT INTO effect_local_server_migrations (id, name, checksum) VALUES (${migration.id}, ${
-        quote(migration.name)
-      }, ${quote(migration.checksum)})`
+        dialect.literal(migration.name)
+      }, ${dialect.literal(migration.checksum)})`
     )
   }
   for (const migration of pending) statements.push(...migration.statements)
@@ -1237,9 +1235,9 @@ export const renderServer = Effect.fn("Migrations.renderServer")(function*(optio
       descriptor.tableDdl,
       descriptor.scanIndexDdl,
       `INSERT INTO effect_local_server_index_catalog (model, index_name, descriptor_hash, table_name, scan_index_name)
-VALUES (${quote(descriptor.model.name)}, ${quote(descriptor.indexName)}, ${quote(descriptor.hash)}, ${
-        quote(descriptor.tableName)
-      }, ${quote(descriptor.scanIndexName)})
+VALUES (${dialect.literal(descriptor.model.name)}, ${dialect.literal(descriptor.indexName)}, ${
+        dialect.literal(descriptor.hash)
+      }, ${dialect.literal(descriptor.tableName)}, ${dialect.literal(descriptor.scanIndexName)})
 ON CONFLICT (model, index_name, descriptor_hash) DO NOTHING`
     )
   }
@@ -1247,8 +1245,8 @@ ON CONFLICT (model, index_name, descriptor_hash) DO NOTHING`
     statements.push(
       `DROP INDEX IF EXISTS ${row.scan_index_name}`,
       `DROP TABLE IF EXISTS ${row.table_name}`,
-      `DELETE FROM effect_local_server_index_state WHERE descriptor_hash = ${quote(row.descriptor_hash)}`,
-      `DELETE FROM effect_local_server_index_catalog WHERE descriptor_hash = ${quote(row.descriptor_hash)}`
+      `DELETE FROM effect_local_server_index_state WHERE descriptor_hash = ${dialect.literal(row.descriptor_hash)}`,
+      `DELETE FROM effect_local_server_index_catalog WHERE descriptor_hash = ${dialect.literal(row.descriptor_hash)}`
     )
   }
   statements.push("COMMIT")
