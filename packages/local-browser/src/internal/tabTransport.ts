@@ -46,7 +46,7 @@ const WireExit = Schema.Union([
     cause: Schema.Array(Schema.Union([
       Schema.Struct({ _tag: Schema.Literal("Fail"), error: Schema.Unknown }),
       Schema.Struct({ _tag: Schema.Literal("Die"), defect: Schema.Unknown }),
-      Schema.Struct({ _tag: Schema.Literal("Interrupt"), fiberId: Schema.UndefinedOr(Schema.Number) })
+      Schema.Struct({ _tag: Schema.Literal("Interrupt"), fiberId: Schema.NullishOr(Schema.Number) })
     ]))
   })
 ])

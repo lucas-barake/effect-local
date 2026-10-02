@@ -16,15 +16,15 @@
   "dependencies": {
     "@effect-local/example-chat-server": "workspace:^",
     "@effect-local/example-chat-shared": "workspace:^",
-    "@effect/platform-node": "4.0.0-rc.118",
-    "@effect/sql-sqlite-node": "4.0.0-rc.118",
+    "@effect/platform-node": "4.0.0",
+    "@effect/sql-sqlite-node": "4.0.0",
     "@lucas-barake/effect-local": "workspace:^",
     "@lucas-barake/effect-local-rpc": "workspace:^",
     "@lucas-barake/effect-local-sql": "workspace:^",
-    "effect": "4.0.0-rc.118"
+    "effect": "4.0.0"
   },
   "devDependencies": {
-    "@effect/vitest": "4.0.0-rc.118",
+    "@effect/vitest": "4.0.0",
     "@playwright/test": "1.63.0",
     "@types/node": "^25.7.0",
     "vitest": "5.0.2"

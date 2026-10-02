@@ -53,16 +53,16 @@
     "@lucas-barake/effect-local-sql": "workspace:^"
   },
   "peerDependencies": {
-    "@effect/platform-browser": "^4.0.0-rc.118",
-    "@effect/sql-sqlite-wasm": "^4.0.0-rc.118",
-    "effect": ">=4.0.0-rc.118 <4.0.1"
+    "@effect/platform-browser": "~4.0.0",
+    "@effect/sql-sqlite-wasm": "~4.0.0",
+    "effect": "~4.0.0"
   },
   "devDependencies": {
-    "@effect/platform-browser": "4.0.0-rc.118",
-    "@effect/platform-node": "4.0.0-rc.118",
-    "@effect/sql-sqlite-node": "4.0.0-rc.118",
-    "@effect/sql-sqlite-wasm": "4.0.0-rc.118",
+    "@effect/platform-browser": "4.0.0",
+    "@effect/platform-node": "4.0.0",
+    "@effect/sql-sqlite-node": "4.0.0",
+    "@effect/sql-sqlite-wasm": "4.0.0",
     "@effect/wa-sqlite": "0.1.2",
-    "effect": "4.0.0-rc.118"
+    "effect": "4.0.0"
   }
 }

@@ -57,13 +57,13 @@
     "@lucas-barake/effect-local": "workspace:^"
   },
   "peerDependencies": {
-    "effect": ">=4.0.0-rc.118 <4.0.1"
+    "effect": "~4.0.0"
   },
   "devDependencies": {
-    "@effect/platform-node": "4.0.0-rc.118",
-    "@effect/sql-pg": "4.0.0-rc.118",
-    "@effect/sql-sqlite-node": "4.0.0-rc.118",
+    "@effect/platform-node": "4.0.0",
+    "@effect/sql-pg": "4.0.0",
+    "@effect/sql-sqlite-node": "4.0.0",
     "@testcontainers/postgresql": "^12.1.0",
-    "effect": "4.0.0-rc.118"
+    "effect": "4.0.0"
   }
 }

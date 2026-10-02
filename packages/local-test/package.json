@@ -48,16 +48,16 @@
     "test": "vitest --config vitest.config.ts"
   },
   "dependencies": {
-    "@effect/platform-node": "4.0.0-rc.118",
-    "@effect/platform-node-shared": "4.0.0-rc.118",
-    "@effect/sql-sqlite-node": "4.0.0-rc.118",
+    "@effect/platform-node": "4.0.0",
+    "@effect/platform-node-shared": "4.0.0",
+    "@effect/sql-sqlite-node": "4.0.0",
     "@lucas-barake/effect-local": "workspace:^",
     "@lucas-barake/effect-local-sql": "workspace:^"
   },
   "peerDependencies": {
-    "effect": ">=4.0.0-rc.118 <4.0.1"
+    "effect": "~4.0.0"
   },
   "devDependencies": {
-    "effect": "4.0.0-rc.118"
+    "effect": "4.0.0"
   }
 }

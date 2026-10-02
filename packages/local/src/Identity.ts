@@ -2,65 +2,70 @@ import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
 
-const identifier = <const Name extends string,>(name: Name, prefix: string) =>
+const identifier = (prefix: string) =>
   Schema.String.check(
     Schema.isPattern(new RegExp(`^${prefix}_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`))
-  ).pipe(Schema.brand(`@lucas-barake/effect-local/${name}`))
-
-const sequence = <const Name extends string,>(name: Name, minimum: number) =>
-  Schema.Int.check(Schema.isGreaterThanOrEqualTo(minimum)).pipe(
-    Schema.brand(`@lucas-barake/effect-local/${name}`)
   )
 
-export const SpaceId = identifier("SpaceId", "spc")
+const sequence = (minimum: number) => Schema.Int.check(Schema.isGreaterThanOrEqualTo(minimum))
+
+export const SpaceId = identifier("spc").pipe(Schema.brand("@lucas-barake/effect-local/SpaceId"))
 export type SpaceId = typeof SpaceId.Type
 
-export const ClientId = identifier("ClientId", "cli")
+export const ClientId = identifier("cli").pipe(Schema.brand("@lucas-barake/effect-local/ClientId"))
 export type ClientId = typeof ClientId.Type
 
-export const MembershipIncarnation = identifier("MembershipIncarnation", "inc")
+export const MembershipIncarnation = identifier("inc").pipe(
+  Schema.brand("@lucas-barake/effect-local/MembershipIncarnation")
+)
 export type MembershipIncarnation = typeof MembershipIncarnation.Type
 
-export const MutationId = identifier("MutationId", "mut")
+export const MutationId = identifier("mut").pipe(Schema.brand("@lucas-barake/effect-local/MutationId"))
 export type MutationId = typeof MutationId.Type
 
-export const SnapshotId = identifier("SnapshotId", "snp")
+export const SnapshotId = identifier("snp").pipe(Schema.brand("@lucas-barake/effect-local/SnapshotId"))
 export type SnapshotId = typeof SnapshotId.Type
 
-export const ReplicationViewId = identifier("ReplicationViewId", "viw")
+export const ReplicationViewId = identifier("viw").pipe(Schema.brand("@lucas-barake/effect-local/ReplicationViewId"))
 export type ReplicationViewId = typeof ReplicationViewId.Type
 
-export const WakeId = identifier("WakeId", "wak")
+export const WakeId = identifier("wak").pipe(Schema.brand("@lucas-barake/effect-local/WakeId"))
 export type WakeId = typeof WakeId.Type
 
-export const LocalSequence = sequence("LocalSequence", 1)
+export const LocalSequence = sequence(1).pipe(Schema.brand("@lucas-barake/effect-local/LocalSequence"))
 export type LocalSequence = typeof LocalSequence.Type
 
-export const ServerSequence = sequence("ServerSequence", 0)
+export const ServerSequence = sequence(0).pipe(Schema.brand("@lucas-barake/effect-local/ServerSequence"))
 export type ServerSequence = typeof ServerSequence.Type
 
-export const SettlementSequence = sequence("SettlementSequence", 0)
+export const SettlementSequence = sequence(0).pipe(Schema.brand("@lucas-barake/effect-local/SettlementSequence"))
 export type SettlementSequence = typeof SettlementSequence.Type
 
-export const TerminalSequence = sequence("TerminalSequence", 0)
+export const TerminalSequence = sequence(0).pipe(Schema.brand("@lucas-barake/effect-local/TerminalSequence"))
 export type TerminalSequence = typeof TerminalSequence.Type
 
-export const VisibleRevision = sequence("VisibleRevision", 0)
+export const VisibleRevision = sequence(0).pipe(Schema.brand("@lucas-barake/effect-local/VisibleRevision"))
 export type VisibleRevision = typeof VisibleRevision.Type
 
-export const ReplicationViewRevision = sequence("ReplicationViewRevision", 0)
+export const ReplicationViewRevision = sequence(0).pipe(
+  Schema.brand("@lucas-barake/effect-local/ReplicationViewRevision")
+)
 export type ReplicationViewRevision = typeof ReplicationViewRevision.Type
 
-export const ReplicationScopeGeneration = sequence("ReplicationScopeGeneration", 0)
+export const ReplicationScopeGeneration = sequence(0).pipe(
+  Schema.brand("@lucas-barake/effect-local/ReplicationScopeGeneration")
+)
 export type ReplicationScopeGeneration = typeof ReplicationScopeGeneration.Type
 
-export const EphemeralRevision = sequence("EphemeralRevision", 0)
+export const EphemeralRevision = sequence(0).pipe(Schema.brand("@lucas-barake/effect-local/EphemeralRevision"))
 export type EphemeralRevision = typeof EphemeralRevision.Type
 
-export const EphemeralSessionToken = identifier("EphemeralSessionToken", "eps")
+export const EphemeralSessionToken = identifier("eps").pipe(
+  Schema.brand("@lucas-barake/effect-local/EphemeralSessionToken")
+)
 export type EphemeralSessionToken = typeof EphemeralSessionToken.Type
 
-export const SchemaVersion = sequence("SchemaVersion", 1)
+export const SchemaVersion = sequence(1).pipe(Schema.brand("@lucas-barake/effect-local/SchemaVersion"))
 export type SchemaVersion = typeof SchemaVersion.Type
 
 export const SchemaHash = Schema.String.check(Schema.isPattern(/^[0-9a-f]{16}$/)).pipe(

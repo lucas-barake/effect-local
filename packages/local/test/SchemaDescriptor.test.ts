@@ -22,7 +22,7 @@ const persistedHashes: ReadonlyArray<readonly [string, Schema.Top, string]> = [
   ["Null", Schema.Null, "0e177ab8a35325b4"],
   ["Literal", Schema.Literal("x"), "7b47772f88579375"],
   ["Literals", Schema.Literals(["dm", "group"]), "079fa2ca0ddab917"],
-  ["Brand", UserId, "3b24619d1c9f37d8"],
+  ["Brand", UserId, "3c4f845888eade9c"],
   [
     "Struct",
     Schema.Struct({
@@ -34,7 +34,7 @@ const persistedHashes: ReadonlyArray<readonly [string, Schema.Top, string]> = [
       u: Schema.optional(Schema.Number),
       un: Schema.UndefinedOr(Schema.String)
     }),
-    "60794e1918166958"
+    "d8e803504cb198b7"
   ],
   ["TaggedStruct", Schema.TaggedStruct("T", { v: Schema.String }), "facc735253850c12"],
   ["Union", Schema.Union([Schema.String, Schema.Number]), "4a60ac8936df1799"],

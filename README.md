@@ -5,7 +5,7 @@ local SQLite, works while offline, and reconciles with an authoritative server a
 returns. Effect Schema defines every domain, durable, and wire contract. Effect services, Layers, scopes, streams,
 and Atom own the runtime.
 
-The library targets Effect `4.0.0-rc.118`. It has not published a stable release. Durable and public contracts may
+The library targets Effect `4.0.x`. It has not published a stable release. Durable and public contracts may
 change before v1.
 
 ## Architecture
@@ -450,7 +450,7 @@ inside that layer. Add other routes, such as a login endpoint, to the same layer
 
 Replace `SingleRunner.layer` with Effect Cluster's runner transport and SQL runner and message storage to run the same
 layer on several processes, and pass one `assertionSecret` to all of them. Use NDJSON runner serialization, for
-example `NodeClusterSocket.layer({ serialization: "ndjson" })`: in Effect `4.0.0-rc.118` the default SchemaBinary
+example `NodeClusterSocket.layer({ serialization: "ndjson" })`: in Effect `4.0.0` the default SchemaBinary
 runner serialization breaks volatile streaming entity calls between runners after their first element.
 
 ### PostgreSQL server storage
