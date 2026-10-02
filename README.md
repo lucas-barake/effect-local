@@ -467,7 +467,9 @@ const layerDatabase = PgClient.layerConfig({ url: Config.Redacted("DATABASE_URL"
 ```
 
 `Migrations.server` picks the PostgreSQL catalog from the client's dialect and fails with `InvalidConfiguration` for
-any other dialect. Pass the client without `transformResultNames` or `transformQueryNames`, because server rows are
+any other dialect. When the server may not run DDL, `Migrations.renderServer` writes the pending schema as a script for
+a DBA and `store: { migration: { mode: "verify" } }` refuses to serve until it is applied. See
+[migrations applied by a DBA](packages/local-sql/README.md#migrations-applied-by-a-dba). Pass the client without `transformResultNames` or `transformQueryNames`, because server rows are
 decoded by their snake case column names. See the
 [`effect-local-sql` guide](packages/local-sql/README.md#postgresql-server-storage) for the storage and locking details.
 

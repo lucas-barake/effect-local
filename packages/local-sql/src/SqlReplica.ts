@@ -107,7 +107,11 @@ export const defaults = {
 const resolveOptions = <D extends Definition.Any,>(input: Options<D>): ResolvedOptions<D> => ({
   ...defaults,
   defaultScope: Protocol.ReplicationScope.make({ models: input.definition.models.map((model) => model.name) }),
-  ...input
+  ...input,
+  migration: {
+    retryDelay: input.migration?.retryDelay ?? defaults.migration.retryDelay,
+    maximumAttempts: input.migration?.maximumAttempts ?? defaults.migration.maximumAttempts
+  }
 })
 
 type BaseRequirements<D extends Definition.Any,> =

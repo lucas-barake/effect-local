@@ -3,8 +3,11 @@ import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as SecondaryIndex from "@lucas-barake/effect-local/SecondaryIndex"
 import * as Effect from "effect/Effect"
+import * as Option from "effect/Option"
+import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/sql/SqlClient"
 import type * as SqlError from "effect/sql/SqlError"
+import * as SqlSchema from "effect/sql/SqlSchema"
 import type * as Statement from "effect/sql/Statement"
 
 interface JsonField {
@@ -27,6 +30,9 @@ export interface Dialect {
   readonly encodeText: (value: string) => string
   readonly decodeText: (value: string) => string
   readonly lockSchema: Effect.Effect<void, SqlError.SqlError>
+  readonly scriptPrologue: ReadonlyArray<string>
+  readonly literal: (value: string) => string
+  readonly tableExists: (table: string) => Effect.Effect<boolean, SqlError.SqlError | Schema.SchemaError>
   readonly lockPresences: (keys: ReadonlyArray<PresenceKey>) => Effect.Effect<void, SqlError.SqlError>
   readonly beginSnapshotRead: Effect.Effect<void, SqlError.SqlError>
   readonly forNoKeyUpdate: Statement.Fragment
@@ -39,6 +45,13 @@ export interface Dialect {
 }
 
 const schemaLockClass = 0x656c6f63
+const schemaLockStatement = `SELECT pg_advisory_xact_lock(${schemaLockClass}, 0)`
+const PresentRow = Schema.Struct({ present: Schema.Literal(1) })
+
+const tableExists = (query: (table: string) => Statement.Statement<object>) => (table: string) =>
+  SqlSchema.findOneOption({ Request: Schema.String, Result: PresentRow, execute: query })(table).pipe(
+    Effect.map(Option.isSome)
+  )
 const presenceLockClass = 0x656c7072
 
 const presenceLockKey = (key: PresenceKey) => {
@@ -49,6 +62,21 @@ const presenceLockKey = (key: PresenceKey) => {
   }
   return hash | 0
 }
+
+const quoteText = (value: string) => `'${value.replaceAll("'", "''")}'`
+
+const escapeCharacter = (character: string) => {
+  const code = character.codePointAt(0) ?? 0
+  if (character === "\\") return "\\\\"
+  if (character === "'") return "''"
+  if (code < 0x80) return character
+  if (code <= 0xffff) return `\\u${code.toString(16).padStart(4, "0")}`
+  return `\\U${code.toString(16).padStart(8, "0")}`
+}
+
+const postgresText = (value: string) => `E'${Array.from(value, escapeCharacter).join("")}'`
+
+export const hasUnpairedSurrogate = (value: string) => value.search(unpairedSurrogate) !== -1
 
 const decodeEscapedText = (value: string) => {
   let decoded = ""
@@ -78,6 +106,11 @@ const sqlite = (sql: SqlClient.SqlClient): Dialect => ({
   encodeText: (value) => value,
   decodeText: (value) => value,
   lockSchema: Effect.void,
+  scriptPrologue: ["BEGIN IMMEDIATE"],
+  literal: quoteText,
+  tableExists: tableExists((name) =>
+    sql`SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ${name}`
+  ),
   lockPresences: () => Effect.void,
   beginSnapshotRead: Effect.void,
   forNoKeyUpdate: sql.literal(""),
@@ -110,7 +143,10 @@ const postgres = (sql: SqlClient.SqlClient): Dialect => ({
       "\u0001\u0001"
     ),
   decodeText: decodeEscapedText,
-  lockSchema: sql`SELECT pg_advisory_xact_lock(${schemaLockClass}, 0)`.pipe(Effect.asVoid),
+  lockSchema: sql.unsafe(schemaLockStatement).pipe(Effect.asVoid),
+  scriptPrologue: ["BEGIN", schemaLockStatement],
+  literal: postgresText,
+  tableExists: tableExists((name) => sql`SELECT 1 AS present WHERE to_regclass(${name}) IS NOT NULL`),
   lockPresences: (keys) =>
     Effect.forEach(
       [...new Set(keys.map(presenceLockKey))].sort((left, right) => left - right),

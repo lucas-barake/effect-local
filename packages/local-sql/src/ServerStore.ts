@@ -49,7 +49,7 @@ import type * as OfflineWake from "./OfflineWake.js"
 import * as SchemaEvolution from "./SchemaEvolution.js"
 
 export interface HistoryOptions {
-  readonly migration?: Migrations.Options | undefined
+  readonly migration?: Migrations.ServerOptions | undefined
   readonly retainedHistoryEntries?: number | undefined
   readonly maximumHistoryEntries?: number | undefined
   readonly retainedReceipts?: number | undefined
@@ -170,7 +170,7 @@ interface GlobalSnapshotManifest {
 }
 
 export const defaults = {
-  migration: { retryDelay: "100 millis", maximumAttempts: 8 },
+  migration: { retryDelay: "100 millis", maximumAttempts: 8, mode: "apply" },
   retainedHistoryEntries: 256,
   maximumHistoryEntries: 10_000,
   retainedReceipts: 256,
@@ -198,7 +198,11 @@ type ResolvedOptions<R,> =
 
 const resolveOptions = <R,>(input: Options<R>): ResolvedOptions<R> => ({
   ...input,
-  migration: input.migration ?? defaults.migration,
+  migration: {
+    retryDelay: input.migration?.retryDelay ?? defaults.migration.retryDelay,
+    maximumAttempts: input.migration?.maximumAttempts ?? defaults.migration.maximumAttempts,
+    mode: input.migration?.mode ?? defaults.migration.mode
+  },
   retainedHistoryEntries: input.retainedHistoryEntries ?? defaults.retainedHistoryEntries,
   maximumHistoryEntries: input.maximumHistoryEntries ?? defaults.maximumHistoryEntries,
   retainedReceipts: input.retainedReceipts ?? defaults.retainedReceipts,
@@ -390,7 +394,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
       const dialect = yield* Dialect.make(sql)
       yield* Migrations.server(options.migration)
       const offlineWake = yield* OfflineWakeRuntime.make(options.offlineWake, context)
-      const serverIndexes = yield* ServerIndex.make(sql, dialect, options.definition)
+      const serverIndexes = yield* ServerIndex.make(sql, dialect, options.definition, options.migration.mode)
       const metrics = ServerMetrics.make({
         history: options.maximumHistoryEntries,
         receipts: options.maximumReceipts

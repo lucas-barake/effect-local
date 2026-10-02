@@ -141,11 +141,10 @@ describe("storage migration catalogs", () => {
         yield* TestClock.adjust("1 second")
         yield* Fiber.join(migrationFiber)
         const ledger = yield* serverMigrationLedger(migratorClient)
-        assert.deepStrictEqual(ledger, [{
-          id: 1,
-          name: Migrations.serverCatalog[0].name,
-          checksum: Migrations.serverCatalog[0].checksum
-        }])
+        assert.deepStrictEqual(
+          ledger,
+          Migrations.serverCatalog.map(({ checksum, id, name }) => ({ id, name, checksum }))
+        )
       },
       provideNodeFileSystemAndReactivity,
       Effect.scoped
@@ -203,7 +202,7 @@ describe("storage migration catalogs", () => {
       )
       pipe(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1])
+        (ids) => assert.deepStrictEqual(ids, [1, 2])
       )
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
@@ -506,11 +505,10 @@ describe("postgres server catalog", () => {
       yield* Migrations.server()
 
       const ledger = yield* serverMigrationLedger(sql)
-      assert.deepStrictEqual(ledger, [{
-        id: 1,
-        name: "postgres-baseline",
-        checksum: Migrations.serverPostgresCatalog[0].checksum
-      }])
+      assert.deepStrictEqual(ledger, [
+        { id: 1, name: "postgres-baseline", checksum: Migrations.serverPostgresCatalog[0].checksum },
+        { id: 2, name: "postgres-index-generations", checksum: Migrations.serverPostgresCatalog[1].checksum }
+      ])
       const names = (yield* postgresTableNames(sql)).map((row) => row.table_name)
       assert.includeMembers(names, [
         "effect_local_authoritative_log",
@@ -588,7 +586,10 @@ describe("postgres server catalog", () => {
         yield* blocker`COMMIT`
         yield* Fiber.join(firstRunner)
         yield* Fiber.join(secondRunner)
-        pipe((yield* serverMigrationLedger(observer)).map((row) => row.id), (ids) => assert.deepStrictEqual(ids, [1]))
+        pipe(
+          (yield* serverMigrationLedger(observer)).map((row) => row.id),
+          (ids) => assert.deepStrictEqual(ids, [1, 2])
+        )
       },
       Effect.scoped,
       provideReactivity
