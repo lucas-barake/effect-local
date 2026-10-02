@@ -78,7 +78,7 @@ const layerReplica = SqlReplica.layerWorkflow({
 )
 ```
 
-Only `definition` and `clientId` are required. `SqlReplica.defaults` lists the rest: 16 active spaces with 4 reserved
+Only `definition` is required. `SqlReplica.defaults` lists the rest: 16 active spaces with 4 reserved
 for foreground work, 256 retained receipts under a cap of 10000, 256 retained history entries, bootstrap bounds of
 100000 entities, 64 MiB, and 4 MiB pages. `defaultScope` defaults to every model in the definition. A caller-minted
 `mutationId` stays idempotent while its receipt is retained, and after that for the next `retainedMutationIds` (100000)
@@ -161,12 +161,11 @@ import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import * as Schema from "effect/Schema"
 
 class ReadPolicy extends Context.Service<ReadPolicy, {
   readonly authorize: (
     input: ServerStore.ReadAuthorizationInput
-  ) => Effect.Effect<void, typeof Schema.Json.Type>
+  ) => Effect.Effect<void, ServerStore.AuthorizationRejection>
 }>()("app/ReadPolicy") {}
 
 const layerStore = ServerStore.layer({
@@ -220,6 +219,7 @@ SQLite only.
 
 ```ts
 import { PgClient } from "@effect/sql-pg"
+import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as Config from "effect/Config"
 import * as Layer from "effect/Layer"
 
@@ -265,6 +265,7 @@ DDL and schema changes go through a DBA, render the pending schema as a script a
 
 ```ts
 import * as Migrations from "@lucas-barake/effect-local-sql/Migrations"
+import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as Effect from "effect/Effect"
 import * as FileSystem from "effect/FileSystem"
 import * as Option from "effect/Option"

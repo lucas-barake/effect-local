@@ -118,7 +118,7 @@ export const ToggleTask = Mutation.make("ToggleTask", {
 })
 
 export const ListTasks = Query.make("ListTasks", {
-  payload: { completed: Schema.Boolean, titleFrom: Schema.optional(Schema.NonEmptyString) },
+  payload: { completed: Schema.Boolean, titleFrom: Schema.optionalKey(Schema.NonEmptyString) },
   success: Schema.Array(Task.schema)
 })
 
@@ -205,7 +205,7 @@ their own entity. `Query.make` has no static dependency list because the runtime
 ## SQLite replica
 
 `SqlReplica.layer` assembles one public `Replica` that owns one SQLite database, one synchronization transport, and
-any number of joined spaces. Supply the domain handlers, a `SqlClient`, `Crypto`, and a `SyncEngine`. The replica
+any number of joined spaces. Supply the domain handlers, a `SqlClient`, `Crypto`, `Reactivity`, and a `SyncEngine`. The replica
 mints its client identity the first time it opens a database and keeps it there, so the identity lives exactly as long
 as the local data. Pass `clientId` only when the identity is managed elsewhere; opening a database with a different
 identity fails with `ReplicaIdentityMismatch`.
@@ -219,6 +219,7 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
+import * as Reactivity from "effect/reactivity/Reactivity"
 import { definition, layerDomain, ListTasks, PutTask, Task } from "./domain.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
@@ -226,7 +227,8 @@ const scope = Protocol.ReplicationScope.make({ models: [Task.name] })
 
 const layerDatabase = Layer.mergeAll(
   SqliteClient.layer({ filename: "tasks.sqlite" }),
-  NodeCrypto.layer
+  NodeCrypto.layer,
+  Reactivity.layer
 )
 
 export const layerReplica = SqlReplica.layer({
@@ -368,12 +370,11 @@ import * as ServerStore from "@lucas-barake/effect-local-sql/ServerStore"
 import * as Context from "effect/Context"
 import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
-import * as Schema from "effect/Schema"
 
 class ReadPolicy extends Context.Service<ReadPolicy, {
   readonly authorize: (
     input: ServerStore.ReadAuthorizationInput
-  ) => Effect.Effect<void, typeof Schema.Json.Type>
+  ) => Effect.Effect<void, ServerStore.AuthorizationRejection>
 }>()("app/ReadPolicy") {}
 
 const layerStore = ServerStore.layer({
@@ -522,6 +523,9 @@ depth. Labels use bounded categories and never include space or principal identi
 benchmark at `packages/local-rpc/bench/Fanout.bench.ts` exercises 64, 256, and 1,024 watchers.
 
 ## Effect Atom
+
+`BrowserReplica.layer` takes one Layer that provides the worker `SqlClient`, the `SyncEngine`, and the
+`EphemeralClient`. The RPC client Layer, `SyncClient.layerWebSocket`, provides both network services.
 
 ```ts
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
