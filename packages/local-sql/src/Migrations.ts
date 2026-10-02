@@ -14,6 +14,7 @@ import * as SqlSchema from "effect/sql/SqlSchema"
 import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Dialect from "./internal/dialect.js"
+import * as ServerIndex from "./internal/serverIndex.js"
 import * as SqliteIdentifier from "./internal/sqliteIdentifier.js"
 import * as StorageUnavailable from "./internal/storageUnavailable.js"
 
@@ -34,6 +35,10 @@ export interface Options {
 
 export interface ServerOptions extends Options {
   readonly mode?: "apply" | "verify" | undefined
+}
+
+export interface RenderServerOptions {
+  readonly definition: Definition.Any
 }
 
 const defaultOptions = { retryDelay: "5 millis", maximumAttempts: 8 } as const satisfies Options
@@ -1184,4 +1189,67 @@ export const server = Effect.fnUntraced(function*(options: ServerOptions = {}) {
       pending.map((migration) => `${migration.id}:${migration.name}`).join(", ")
     }. Apply the script from Migrations.renderServer`
   })
+})
+
+const unpairedSurrogate = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/
+
+const quote = (value: string) => `'${value.replaceAll("'", "''")}'`
+
+export const renderServer = Effect.fn("Migrations.renderServer")(function*(options: RenderServerOptions) {
+  const sql = yield* SqlClient.SqlClient
+  const dialect = yield* Dialect.make(sql)
+  const pending = yield* planServer(sql, dialect)
+  const index = yield* ServerIndex.plan(sql, dialect, options.definition)
+  if (pending.length === 0 && index.missing.length === 0 && index.orphans.length === 0) {
+    return Option.none<string>()
+  }
+  for (const descriptor of index.missing) {
+    for (const value of [descriptor.model.name, descriptor.indexName]) {
+      if (value.includes("\u0000") || unpairedSurrogate.test(value)) {
+        return yield* new ReplicaError.InvalidConfiguration({
+          option: "definition",
+          message: `Index ${descriptor.model.name}.${descriptor.indexName} cannot be written as SQL text`
+        })
+      }
+    }
+  }
+  const statements = [...dialect.scriptPrologue]
+  if (pending.length > 0) statements.push(ledger("effect_local_server_migrations", dialect.text))
+  for (const migration of pending) {
+    if (migration.effect !== undefined) {
+      return yield* new ReplicaError.InvalidConfiguration({
+        option: "migration",
+        message: `Server migration ${migration.id}:${migration.name} runs an Effect and cannot be rendered as SQL`
+      })
+    }
+    statements.push(
+      `INSERT INTO effect_local_server_migrations (id, name, checksum) VALUES (${migration.id}, ${
+        quote(migration.name)
+      }, ${quote(migration.checksum)})`
+    )
+  }
+  for (const migration of pending) statements.push(...migration.statements)
+  for (const descriptor of index.missing) {
+    statements.push(
+      descriptor.tableDdl,
+      descriptor.scanIndexDdl,
+      `INSERT INTO effect_local_server_index_catalog (model, index_name, descriptor_hash, table_name, scan_index_name)
+VALUES (${quote(descriptor.model.name)}, ${quote(descriptor.indexName)}, ${quote(descriptor.hash)}, ${
+        quote(descriptor.tableName)
+      }, ${quote(descriptor.scanIndexName)})
+ON CONFLICT (model, index_name, descriptor_hash) DO NOTHING`
+    )
+  }
+  for (const row of index.orphans) {
+    statements.push(
+      `DROP INDEX IF EXISTS ${row.scan_index_name}`,
+      `DROP TABLE IF EXISTS ${row.table_name}`,
+      `DELETE FROM effect_local_server_index_state WHERE descriptor_hash = ${quote(row.descriptor_hash)}`,
+      `DELETE FROM effect_local_server_index_catalog WHERE model = ${quote(row.model)} AND index_name = ${
+        quote(row.index_name)
+      } AND descriptor_hash = ${quote(row.descriptor_hash)}`
+    )
+  }
+  statements.push("COMMIT")
+  return Option.some(statements.map((statement) => `${statement};\n`).join("\n"))
 })
