@@ -42,7 +42,8 @@ export const layerServer = HttpRouter.serve(layerSync).pipe(
 inside that layer. Add other routes, such as a login endpoint, to the same layer.
 
 The four authorization callbacks are required. Every limit has a default: `store` takes any `ServerStore` option (see
-`ServerStore.defaults`), `ephemeral` any `EphemeralHub` option, `spaces` any `SpaceEntity.HandlerOptions` (see
+`ServerStore.defaults`; `store: { migration: { mode: "verify" } }` checks the schema instead of migrating it, see
+[migrations applied by a DBA](../local-sql/README.md#migrations-applied-by-a-dba)), `ephemeral` any `EphemeralHub` option, `spaces` any `SpaceEntity.HandlerOptions` (see
 `SpaceEntity.defaults`), and `maintenance.interval` defaults to one hour. The layer exposes `ServerStore`, so an
 application can call `invalidateReadAuthorization` after a permission change or `maintain` from an admin task.
 

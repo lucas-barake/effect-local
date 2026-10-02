@@ -110,7 +110,7 @@ ordinary shutdown because it durably cancels the reconciliation.
 retries, deduplicates stable mutation identities, stores terminal rejections, assigns the next dense sequence to
 accepted mutations, and materializes authoritative state in the same SQL transaction. Its history options set
 retained targets, hard admission caps, snapshot capacity, bootstrap page capacity, prune batches, retained snapshots,
-migration retry, maintenance concurrency, and the keyset page size used to enumerate spaces. `maximumWatchersPerSpace`,
+migration retry and mode, maintenance concurrency, and the keyset page size used to enumerate spaces. `maximumWatchersPerSpace`,
 `readAuthorizationRefreshInterval`, `maximumConcurrentReadAuthorizations`, `maximumPendingReadAuthorizations`, and
 `readAuthorizationCacheCapacity` bound live sync streams and their policy work. Every one of them is optional and
 `ServerStore.defaults` lists the values used. `ServerStore.layerTrusted` is the explicit allow all composition.
@@ -257,6 +257,55 @@ runners can share one database:
 Pass the client without `transformResultNames` or `transformQueryNames`, because rows are decoded by their snake case
 column names. The test suite runs every server test on both dialects against a PostgreSQL container started through
 testcontainers, so running the tests requires Docker.
+
+## Migrations applied by a DBA
+
+By default `ServerStore` migrates its own schema when the layer builds. Where the server's database role may not run
+DDL and schema changes go through a DBA, render the pending schema as a script and start the server in verify mode:
+
+```ts
+import * as Migrations from "@lucas-barake/effect-local-sql/Migrations"
+import * as Effect from "effect/Effect"
+import * as FileSystem from "effect/FileSystem"
+import * as Option from "effect/Option"
+
+export const writeMigrationScript = Effect.gen(function*() {
+  const script = yield* Migrations.renderServer({ definition })
+  if (Option.isNone(script)) return
+  yield* FileSystem.FileSystem.use((fs) => fs.writeFileString("effect-local-server.sql", script.value))
+})
+
+const layerStore = ServerStore.layer({ ...options, migration: { mode: "verify" } })
+```
+
+`Migrations.renderServer` reads the database in context and never writes to it or locks it, so it can run against
+production with a read only connection. It returns `Option.none()` when the database is already current. Otherwise
+the script holds exactly what automatic migration would do, in one transaction:
+
+- On PostgreSQL it takes the same advisory lock automatic migration takes.
+- It inserts the migration ledger rows, with the checksums of the catalog, before the statements they record. A second
+  run of the same script fails on the ledger key before any DDL.
+- It copies the pending migration statements verbatim.
+- It creates the index tables the definition declares and records them in the index catalog.
+- It drops index tables the definition no longer declares, with their build state. Indexes are not part of the schema
+  identity, so an index that is removed and later added back must start from an empty table.
+
+Apply it with `psql -v ON_ERROR_STOP=1 -f effect-local-server.sql` on PostgreSQL, or with `sqlite3 -bail` on SQLite,
+so the first failing statement stops the script. Render again after every deploy that adds migrations or changes the
+definition's indexes.
+
+`migration: { mode: "verify" }` (in `SyncServer.layer` this is `store: { migration: { mode: "verify" } }`) reads the
+ledger and the index catalog instead of migrating, without writing or locking. The layer then fails, so the server
+does not serve:
+
+- `StorageMigrationPending` with `catalog: "Server"` when migrations are pending, or `catalog: "ServerIndex"` when
+  index tables must be created or dropped.
+- `StorageMigrationMismatch` when the ledger diverges from the catalog, for example an edited checksum or a migration
+  the code does not know.
+- `StorageCorrupt` when the index catalog contradicts its descriptors.
+
+Both cover the tables this package owns. Effect Cluster's SQL runner and message storage create their own tables with
+Effect's migrator when they start.
 
 ## Operational metrics
 
