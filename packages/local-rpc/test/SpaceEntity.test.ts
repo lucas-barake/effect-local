@@ -168,9 +168,18 @@ describe("SpaceEntity", () => {
           writer
         )
         assert.deepStrictEqual(result.receipts.map((receipt) => receipt._tag), ["Accepted"])
-        const pullA = yield* client.pull(spaceA, { ...watchRequest, limit: 10 }, reader)
+        const pullA = yield* client.pull(spaceA, {
+          ...watchRequest,
+          membershipIncarnation: member.membershipIncarnation,
+          limit: 10
+        }, reader)
         assert.isTrue("_tag" in pullA)
-        const pullB = yield* client.pull(spaceB, { ...watchRequest, spaceId: spaceB, limit: 10 }, reader)
+        const pullB = yield* client.pull(spaceB, {
+          ...watchRequest,
+          spaceId: spaceB,
+          membershipIncarnation: member.membershipIncarnation,
+          limit: 10
+        }, reader)
         assert.isTrue("_tag" in pullB)
       }).pipe(Effect.provide(layerCluster))
     })).pipe(TestClock.withLive, provideShardingConfig, provideNodeCrypto))
@@ -246,6 +255,7 @@ describe("SpaceEntity", () => {
           clientId,
           schema: definition.schemaIdentity,
           scope,
+          membershipIncarnation: member.membershipIncarnation,
           scopeGeneration,
           cursor: null,
           limit: 10
@@ -260,6 +270,7 @@ describe("SpaceEntity", () => {
           clientId,
           schema: definition.schemaIdentity,
           scope,
+          membershipIncarnation: member.membershipIncarnation,
           scopeGeneration,
           cursor: page.manifest.cursor,
           snapshotId: page.manifest.snapshotId,
@@ -472,6 +483,7 @@ describe("SpaceEntity", () => {
             clientId,
             schema: definition.schemaIdentity,
             scope,
+            membershipIncarnation: member.membershipIncarnation,
             scopeGeneration,
             cursor: null,
             limit: 10
@@ -489,6 +501,7 @@ describe("SpaceEntity", () => {
             clientId,
             schema: definition.schemaIdentity,
             scope,
+            membershipIncarnation: member.membershipIncarnation,
             scopeGeneration,
             cursor: {
               viewId: Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000001"),
@@ -598,6 +611,7 @@ describe("SpaceEntity", () => {
         clientId,
         schema: definition.schemaIdentity,
         scope,
+        membershipIncarnation: member.membershipIncarnation,
         scopeGeneration,
         cursor: page.manifest.cursor,
         snapshotId,
@@ -700,6 +714,7 @@ describe("SpaceEntity", () => {
         clientId,
         schema: definition.schemaIdentity,
         scope,
+        membershipIncarnation: member.membershipIncarnation,
         scopeGeneration,
         cursor: page.manifest.cursor,
         snapshotId,
@@ -821,6 +836,7 @@ describe("SpaceEntity", () => {
         clientId,
         schema: definition.schemaIdentity,
         scope,
+        membershipIncarnation: member.membershipIncarnation,
         scopeGeneration,
         cursor: page.manifest.cursor,
         snapshotId,

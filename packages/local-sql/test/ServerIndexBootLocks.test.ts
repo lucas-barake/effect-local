@@ -50,6 +50,7 @@ const windowedPull = Protocol.PullRequest.make({
       Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "byChat", count: 1 })
     ]
   }),
+  membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-0000000000aa"),
   scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
   cursor: null,
   limit: 100

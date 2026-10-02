@@ -189,6 +189,7 @@ const pullRequest = (
     clientId: readerId,
     schema: Domain.definition.schemaIdentity,
     scope: requestedScope,
+    membershipIncarnation,
     scopeGeneration: Identity.ReplicationScopeGeneration.make(generation),
     cursor,
     limit: 100
@@ -200,6 +201,7 @@ const bootstrapRequest = (manifest: Protocol.SnapshotManifest): Protocol.Bootstr
     clientId: readerId,
     schema: Domain.definition.schemaIdentity,
     scope,
+    membershipIncarnation,
     scopeGeneration: manifest.scopeGeneration,
     cursor: manifest.cursor,
     snapshotId: manifest.snapshotId,
@@ -1420,6 +1422,60 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
       const stale = yield* server.pullAuthorized(pullRequest(empty.cursor, scope, 0), "reader").pipe(Effect.result)
       assert.isTrue(Result.isFailure(stale))
       if (Result.isFailure(stale)) assert.strictEqual(stale.failure._tag, "StaleReplicationScope")
+    }, provideNodeCrypto)
+  )
+
+  it.effect(
+    "starts a new view for a rejoined membership even at a lower scope generation",
+    Effect.fnUntraced(function*() {
+      const server = yield* makeServer().pipe(Layer.build, Effect.map(Context.get(ServerStore.ServerStore)))
+      yield* server.submit(yield* envelope("kept", 1))
+      const previous = yield* server.pullAuthorized(pullRequest(null, scope, 2), "reader")
+      if (!("_tag" in previous)) assert.fail("expected scoped bootstrap")
+      yield* server.bootstrapAuthorized(bootstrapRequest(previous.manifest), "reader")
+
+      const rejoined = Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-0000000000b2")
+      const fresh = yield* server.pullAuthorized({ ...pullRequest(), membershipIncarnation: rejoined }, "reader")
+      if (!("_tag" in fresh)) assert.fail("expected a fresh bootstrap for the new membership")
+      assert.strictEqual(fresh.manifest.scopeGeneration, 1)
+      assert.notStrictEqual(fresh.manifest.cursor.viewId, previous.manifest.cursor.viewId)
+      const page = yield* server.bootstrapAuthorized(
+        { ...bootstrapRequest(fresh.manifest), membershipIncarnation: rejoined },
+        "reader"
+      )
+      assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["kept"])
+    }, provideNodeCrypto)
+  )
+
+  it.effect(
+    "rebuilds a view stored before memberships were recorded and then continues it incrementally",
+    Effect.fnUntraced(function*() {
+      const context = yield* ServerStore.layer({
+        ...history,
+        definition: Domain.definition,
+        authorizeAccess: () => Effect.void,
+        authorizeMutation: () => Effect.void,
+        authorizeRead: () => Effect.void
+      }).pipe(Layer.provide(layerRuntime), Layer.provideMerge(layerServerDatabase), Layer.build)
+      const server = Context.get(context, ServerStore.ServerStore)
+      const sql = Context.get(context, SqlClient.SqlClient)
+      yield* server.submit(yield* envelope("kept", 1))
+      const initial = yield* server.pullAuthorized(pullRequest(), "reader")
+      if (!("_tag" in initial)) assert.fail("expected scoped bootstrap")
+      yield* server.bootstrapAuthorized(bootstrapRequest(initial.manifest), "reader")
+      const settled = yield* server.pullAuthorized(pullRequest(initial.manifest.cursor), "reader")
+      if ("_tag" in settled) assert.fail("expected incremental page")
+
+      yield* sql`UPDATE effect_local_server_replication_views SET membership_incarnation = ''`
+      const rebuilt = yield* server.pullAuthorized(pullRequest(settled.cursor), "reader")
+      if (!("_tag" in rebuilt)) assert.fail("expected the legacy view to be rebuilt")
+      const page = yield* server.bootstrapAuthorized(bootstrapRequest(rebuilt.manifest), "reader")
+      assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["kept"])
+
+      yield* server.submit(yield* envelope("later", 2))
+      const continued = yield* server.pullAuthorized(pullRequest(rebuilt.manifest.cursor), "reader")
+      if ("_tag" in continued) assert.fail("expected the rebuilt view to continue incrementally")
+      assert.deepStrictEqual(continued.changes.map((change) => change.entity.key), ["later"])
     }, provideNodeCrypto)
   )
 

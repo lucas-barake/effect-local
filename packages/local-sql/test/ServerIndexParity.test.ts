@@ -101,6 +101,7 @@ const pull = (server: ServerStore.Service, scope: Protocol.ReplicationScope) =>
       clientId: readerId,
       schema: definition.schemaIdentity,
       scope,
+      membershipIncarnation,
       scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
       cursor: null,
       limit: 100
@@ -195,6 +196,7 @@ describe.each(serverDatabases)("server index parity ($dialect)", (database) => {
             clientId: readerId,
             schema: definition.schemaIdentity,
             scope: windowOfOne,
+            membershipIncarnation,
             scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
             cursor: null,
             limit: 100
@@ -208,6 +210,7 @@ describe.each(serverDatabases)("server index parity ($dialect)", (database) => {
             clientId: readerId,
             schema: definition.schemaIdentity,
             scope: windowOfOne,
+            membershipIncarnation,
             scopeGeneration: required.manifest.scopeGeneration,
             cursor: required.manifest.cursor,
             snapshotId: required.manifest.snapshotId,

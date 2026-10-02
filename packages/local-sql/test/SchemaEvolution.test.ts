@@ -155,6 +155,7 @@ const pullRequest = (
     clientId: requestedClientId,
     schema: definition.schemaIdentity,
     scope: Protocol.ReplicationScope.make({ models: [model] }),
+    membershipIncarnation,
     scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
     cursor,
     limit: 10
@@ -171,6 +172,7 @@ const bootstrapRequest = (
     clientId: manifest.clientId,
     schema: definition.schemaIdentity,
     scope: Protocol.ReplicationScope.make({ models: [model] }),
+    membershipIncarnation,
     scopeGeneration: manifest.scopeGeneration,
     cursor: manifest.cursor,
     snapshotId: manifest.snapshotId,
@@ -2477,6 +2479,7 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
             clientId,
             schema: definitionV1.schemaIdentity,
             scope,
+            membershipIncarnation,
             scopeGeneration,
             cursor: null,
             limit: 10
@@ -2491,6 +2494,7 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
             clientId,
             schema: definitionV1.schemaIdentity,
             scope,
+            membershipIncarnation,
             scopeGeneration,
             cursor: initial.manifest.cursor,
             snapshotId: initial.manifest.snapshotId,
@@ -2507,6 +2511,7 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
             clientId,
             schema: definitionV1.schemaIdentity,
             scope,
+            membershipIncarnation,
             scopeGeneration,
             cursor: initial.manifest.cursor,
             limit: 10
@@ -2525,6 +2530,7 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
               clientId: scopedClientId,
               schema: definitionV1.schemaIdentity,
               scope,
+              membershipIncarnation,
               scopeGeneration,
               cursor: null,
               limit: 10
@@ -2539,6 +2545,7 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
               clientId: scopedClientId,
               schema: definitionV1.schemaIdentity,
               scope,
+              membershipIncarnation,
               scopeGeneration,
               cursor: required.manifest.cursor,
               snapshotId: required.manifest.snapshotId,
@@ -2554,6 +2561,7 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
               clientId: scopedClientId,
               schema: definitionV1.schemaIdentity,
               scope,
+              membershipIncarnation,
               scopeGeneration,
               cursor: required.manifest.cursor,
               limit: 10
@@ -2625,6 +2633,7 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
           clientId,
           schema: definitionV2.schemaIdentity,
           scope: Protocol.ReplicationScope.make({ models: [TodoV2.name] }),
+          membershipIncarnation,
           scopeGeneration,
           cursor: outstanding.cursor,
           limit: 10
@@ -2675,6 +2684,7 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
           clientId,
           schema: definitionV1.schemaIdentity,
           scope: Protocol.ReplicationScope.make({ models: [TodoV1.name] }),
+          membershipIncarnation,
           scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
           cursor: null,
           limit: 10

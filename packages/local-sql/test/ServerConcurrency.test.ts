@@ -61,6 +61,7 @@ const pullRequest = Protocol.PullRequest.make({
   clientId: readerId,
   schema: Domain.definition.schemaIdentity,
   scope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
+  membershipIncarnation,
   scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
   cursor: null,
   limit: 100

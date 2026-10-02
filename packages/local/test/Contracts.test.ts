@@ -161,6 +161,7 @@ describe("domain contracts", () => {
         schema: { version: 1, hash: "0123456789abcdef" },
         scope: { models: ["Todo"] },
         scopeGeneration: 1,
+        membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
         cursor: null,
         limit: Protocol.maximumBatchEntries + 1
       }).pipe(Effect.result)
@@ -461,6 +462,7 @@ describe("domain contracts", () => {
         schema,
         scope,
         scopeGeneration: 1,
+        membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
         cursor,
         limit: 10
       })
@@ -475,6 +477,7 @@ describe("domain contracts", () => {
         schema,
         scope,
         scopeGeneration: 1,
+        membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
         cursor,
         snapshotId: "snp_00000000-0000-4000-8000-000000000004",
         afterOrdinal: -1,
@@ -496,6 +499,7 @@ describe("domain contracts", () => {
         schema,
         scope,
         scopeGeneration: -1,
+        membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
         cursor: { viewId, revision: -1 },
         limit: 10
       }).pipe(Effect.result)
@@ -576,6 +580,7 @@ describe("domain contracts", () => {
           schema,
           scope,
           scopeGeneration,
+          membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
           cursor,
           limit: 1
         }],
@@ -593,6 +598,7 @@ describe("domain contracts", () => {
           schema,
           scope,
           scopeGeneration,
+          membershipIncarnation: "inc_00000000-0000-4000-8000-000000000001",
           cursor: {
             viewId: "viw_00000000-0000-4000-8000-000000000001",
             revision: 0

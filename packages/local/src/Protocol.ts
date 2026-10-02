@@ -444,6 +444,7 @@ const ReplicationRequestContext = {
 
 export const PullRequest = Schema.Struct({
   ...ReplicationRequestContext,
+  membershipIncarnation: Identity.MembershipIncarnation,
   cursor: Schema.NullOr(ReplicationCursor),
   limit: Schema.Int.check(Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(maximumBatchEntries))
 })
@@ -524,6 +525,7 @@ export type PullResult = typeof PullResult.Type
 
 export const BootstrapRequest = Schema.Struct({
   ...ReplicationRequestContext,
+  membershipIncarnation: Identity.MembershipIncarnation,
   cursor: ReplicationCursor,
   snapshotId: Identity.SnapshotId,
   afterOrdinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(-1)),

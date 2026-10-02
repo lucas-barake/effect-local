@@ -404,6 +404,7 @@ const pullRequest = (spaceId: Identity.SpaceId) =>
     clientId: readerClientId,
     schema: definition.schemaIdentity,
     scope: replicationScope,
+    membershipIncarnation: memberViaB.membershipIncarnation,
     scopeGeneration,
     cursor: null,
     limit: 10
@@ -417,6 +418,7 @@ const readTodos = Effect.fnUntraced(function*(remote: SyncEngine.Service, spaceI
     clientId: readerClientId,
     schema: definition.schemaIdentity,
     scope: replicationScope,
+    membershipIncarnation: memberViaB.membershipIncarnation,
     scopeGeneration,
     cursor: pulled.manifest.cursor,
     snapshotId: pulled.manifest.snapshotId,
