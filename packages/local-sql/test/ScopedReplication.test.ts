@@ -189,6 +189,7 @@ const pullRequest = (
     clientId: readerId,
     schema: Domain.definition.schemaIdentity,
     scope: requestedScope,
+    membershipIncarnation,
     scopeGeneration: Identity.ReplicationScopeGeneration.make(generation),
     cursor,
     limit: 100
@@ -200,6 +201,7 @@ const bootstrapRequest = (manifest: Protocol.SnapshotManifest): Protocol.Bootstr
     clientId: readerId,
     schema: Domain.definition.schemaIdentity,
     scope,
+    membershipIncarnation,
     scopeGeneration: manifest.scopeGeneration,
     cursor: manifest.cursor,
     snapshotId: manifest.snapshotId,
@@ -1420,6 +1422,28 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
       const stale = yield* server.pullAuthorized(pullRequest(empty.cursor, scope, 0), "reader").pipe(Effect.result)
       assert.isTrue(Result.isFailure(stale))
       if (Result.isFailure(stale)) assert.strictEqual(stale.failure._tag, "StaleReplicationScope")
+    }, provideNodeCrypto)
+  )
+
+  it.effect(
+    "starts a new view for a rejoined membership even at a lower scope generation",
+    Effect.fnUntraced(function*() {
+      const server = yield* makeServer().pipe(Layer.build, Effect.map(Context.get(ServerStore.ServerStore)))
+      yield* server.submit(yield* envelope("kept", 1))
+      const previous = yield* server.pullAuthorized(pullRequest(null, scope, 2), "reader")
+      if (!("_tag" in previous)) assert.fail("expected scoped bootstrap")
+      yield* server.bootstrapAuthorized(bootstrapRequest(previous.manifest), "reader")
+
+      const rejoined = Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-0000000000b2")
+      const fresh = yield* server.pullAuthorized({ ...pullRequest(), membershipIncarnation: rejoined }, "reader")
+      if (!("_tag" in fresh)) assert.fail("expected a fresh bootstrap for the new membership")
+      assert.strictEqual(fresh.manifest.scopeGeneration, 1)
+      assert.notStrictEqual(fresh.manifest.cursor.viewId, previous.manifest.cursor.viewId)
+      const page = yield* server.bootstrapAuthorized(
+        { ...bootstrapRequest(fresh.manifest), membershipIncarnation: rejoined },
+        "reader"
+      )
+      assert.deepStrictEqual(page.entries.map((entry) => entry.change.entity.key), ["kept"])
     }, provideNodeCrypto)
   )
 

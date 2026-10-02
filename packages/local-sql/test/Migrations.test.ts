@@ -202,7 +202,7 @@ describe("storage migration catalogs", () => {
       )
       pipe(
         (yield* serverMigrationLedger(sql)).map((row) => row.id),
-        (ids) => assert.deepStrictEqual(ids, [1, 2])
+        (ids) => assert.deepStrictEqual(ids, [1, 2, 3])
       )
       const names = (yield* tableNames(sql)).map((row) => row.name)
       assert.includeMembers(names, [
@@ -507,7 +507,8 @@ describe("postgres server catalog", () => {
       const ledger = yield* serverMigrationLedger(sql)
       assert.deepStrictEqual(ledger, [
         { id: 1, name: "postgres-baseline", checksum: Migrations.serverPostgresCatalog[0].checksum },
-        { id: 2, name: "postgres-index-generations", checksum: Migrations.serverPostgresCatalog[1].checksum }
+        { id: 2, name: "postgres-index-generations", checksum: Migrations.serverPostgresCatalog[1].checksum },
+        { id: 3, name: "postgres-view-memberships", checksum: Migrations.serverPostgresCatalog[2].checksum }
       ])
       const names = (yield* postgresTableNames(sql)).map((row) => row.table_name)
       assert.includeMembers(names, [
@@ -588,7 +589,7 @@ describe("postgres server catalog", () => {
         yield* Fiber.join(secondRunner)
         pipe(
           (yield* serverMigrationLedger(observer)).map((row) => row.id),
-          (ids) => assert.deepStrictEqual(ids, [1, 2])
+          (ids) => assert.deepStrictEqual(ids, [1, 2, 3])
         )
       },
       Effect.scoped,

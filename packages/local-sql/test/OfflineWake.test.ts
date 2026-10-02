@@ -143,6 +143,7 @@ const pullRequest = (cursor: Protocol.ReplicationCursor | null = null): Protocol
     clientId: readerId,
     schema: Domain.definition.schemaIdentity,
     scope,
+    membershipIncarnation,
     scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
     cursor,
     limit: 10

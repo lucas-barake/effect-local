@@ -106,6 +106,7 @@ const pullRequest = (requestedSpaceId = spaceId): Protocol.PullRequest =>
     clientId,
     schema: definition.schemaIdentity,
     scope,
+    membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-0000000000aa"),
     scopeGeneration,
     cursor: null,
     limit: 10
@@ -869,6 +870,7 @@ describe("WebSocket synchronization", () => {
           schema: definition.schemaIdentity,
           scope,
           scopeGeneration,
+          membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000901"),
           cursor: pulled.manifest.cursor,
           snapshotId: pulled.manifest.snapshotId,
           afterOrdinal: -1,
@@ -943,6 +945,7 @@ describe("WebSocket synchronization", () => {
           clientId,
           schema: definition.schemaIdentity,
           scope,
+          membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-0000000000aa"),
           scopeGeneration,
           cursor: page.manifest.cursor,
           snapshotId: page.manifest.snapshotId,

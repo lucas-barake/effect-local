@@ -55,11 +55,12 @@ const context = (scope: Protocol.ReplicationScope) => ({
 })
 
 const pullRequest = (scope: Protocol.ReplicationScope, cursor: Protocol.ReplicationCursor | null) =>
-  Protocol.PullRequest.make({ ...context(scope), cursor, limit: 100 })
+  Protocol.PullRequest.make({ ...context(scope), membershipIncarnation, cursor, limit: 100 })
 
 const bootstrapRequest = (scope: Protocol.ReplicationScope, manifest: Protocol.SnapshotManifest) =>
   Protocol.BootstrapRequest.make({
     ...context(scope),
+    membershipIncarnation,
     scopeGeneration: manifest.scopeGeneration,
     cursor: manifest.cursor,
     snapshotId: manifest.snapshotId,

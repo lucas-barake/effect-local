@@ -124,12 +124,13 @@ const makeServices = Effect.gen(function*() {
   return { faults, local, sync }
 })
 
-const pullRequest = (state: LocalStore.ReplicationState) =>
+const pullRequest = (state: LocalStore.ReplicationState, membershipIncarnation: Identity.MembershipIncarnation) =>
   Protocol.PullRequest.make({
     spaceId,
     clientId: state.clientId,
     schema: definition.schemaIdentity,
     scope: state.scope,
+    membershipIncarnation,
     scopeGeneration: state.scopeGeneration,
     cursor: state.cursor,
     limit: 10
@@ -275,7 +276,7 @@ describe("test synchronization faults", () => {
       yield* faults.heal(spaceId)
       const { receipts } = yield* sync.submitBatch(request)
       yield* local.applyReceipts(receipts)
-      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
+      const page = yield* sync.pull(pullRequest(yield* local.replicationState, local.membershipIncarnation))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
       yield* local.applyViewPage(page)
       yield* local.settleReceipts
@@ -299,7 +300,7 @@ describe("test synchronization faults", () => {
       assert.strictEqual(error._tag, "ServerUnavailable")
       const { receipts } = yield* sync.submitBatch(request)
       assert.deepStrictEqual(receipts.map(acceptedSequence), [1])
-      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
+      const page = yield* sync.pull(pullRequest(yield* local.replicationState, local.membershipIncarnation))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
       assert.strictEqual(page.changes.length, 1)
     })
@@ -317,7 +318,7 @@ describe("test synchronization faults", () => {
       })
       yield* local.applyReceipts(receipts)
       yield* faults.duplicateNextPage(spaceId)
-      const page = yield* sync.pull(pullRequest(yield* local.replicationState))
+      const page = yield* sync.pull(pullRequest(yield* local.replicationState, local.membershipIncarnation))
       if ("_tag" in page) assert.fail("unexpected bootstrap")
       assert.deepStrictEqual(page.changes.map((change) => change._tag), ["Upsert", "Upsert"])
       yield* local.applyViewPage(page)

@@ -302,6 +302,7 @@ export const ReplicationViewRow = Schema.Struct({
   principal_digest: Protocol.MutationDigest,
   view_id: Identity.ReplicationViewId,
   view_revision: integer(Identity.ReplicationViewRevision),
+  membership_incarnation: Schema.String,
   scope_generation: integer(Identity.ReplicationScopeGeneration),
   scope_json: Schema.String,
   scope_digest: Protocol.MutationDigest,

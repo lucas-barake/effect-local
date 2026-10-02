@@ -995,7 +995,17 @@ const sqliteIndexGenerations = makeMigration({
   statements: [indexGenerations("INTEGER")]
 })
 
-export const serverCatalog = Object.freeze([sqliteServerBaseline, sqliteIndexGenerations])
+const viewMemberships = (text: string) =>
+  `ALTER TABLE effect_local_server_replication_views
+    ADD COLUMN membership_incarnation ${text} NOT NULL DEFAULT ''`
+
+const sqliteViewMemberships = makeMigration({
+  id: 3,
+  name: "server-view-memberships",
+  statements: [viewMemberships("TEXT")]
+})
+
+export const serverCatalog = Object.freeze([sqliteServerBaseline, sqliteIndexGenerations, sqliteViewMemberships])
 
 const postgresBaseline = makeMigration({
   id: 1,
@@ -1076,7 +1086,17 @@ const postgresIndexGenerations = makeMigration({
   statements: [indexGenerations("BIGINT")]
 })
 
-export const serverPostgresCatalog = Object.freeze([postgresBaseline, postgresIndexGenerations])
+const postgresViewMemberships = makeMigration({
+  id: 3,
+  name: "postgres-view-memberships",
+  statements: [viewMemberships("TEXT COLLATE \"C\"")]
+})
+
+export const serverPostgresCatalog = Object.freeze([
+  postgresBaseline,
+  postgresIndexGenerations,
+  postgresViewMemberships
+])
 
 export const client = Effect.fnUntraced(function*(options: {
   readonly definition: Definition.Any

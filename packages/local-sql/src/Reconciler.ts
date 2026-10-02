@@ -627,6 +627,7 @@ export const layerOnePass = (
           const page = yield* remote.bootstrap({
             spaceId: options.spaceId,
             clientId: state.clientId,
+            membershipIncarnation: local.membershipIncarnation,
             schema: options.definition.schemaIdentity,
             scope: state.scope,
             scopeGeneration: state.scopeGeneration,
@@ -668,6 +669,7 @@ export const layerOnePass = (
           const firstPage = yield* remote.bootstrap({
             spaceId: options.spaceId,
             clientId: state.clientId,
+            membershipIncarnation: local.membershipIncarnation,
             schema: options.definition.schemaIdentity,
             scope: state.scope,
             scopeGeneration: state.scopeGeneration,
@@ -705,6 +707,7 @@ export const layerOnePass = (
           const result = yield* remote.pull({
             spaceId: options.spaceId,
             clientId: state.clientId,
+            membershipIncarnation: local.membershipIncarnation,
             schema: options.definition.schemaIdentity,
             scope: state.scope,
             scopeGeneration: state.scopeGeneration,
