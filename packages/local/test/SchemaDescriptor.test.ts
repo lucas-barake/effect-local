@@ -45,7 +45,17 @@ const persistedHashes: ReadonlyArray<readonly [string, Schema.Top, string]> = [
   ["Union", Schema.Union([Schema.String, Schema.Number]), "4a60ac8936df1799"],
   ["Tuple", Schema.Tuple([Schema.String, Schema.Number]), "37856878c2d2dad5"],
   ["NonEmptyArray", Schema.NonEmptyArray(Schema.String), "f1ad3176fe07a07a"],
-  ["IdentifiedTransformation", Opaque, "2ee1ec72ca22ca82"]
+  ["IdentifiedTransformation", Opaque, "2ee1ec72ca22ca82"],
+  ["NonEmptyString", Schema.NonEmptyString, "f82c79d6f7e9f637"],
+  ["Int", Schema.Int, "6c1001a202fb5c1a"],
+  ["Pattern", Schema.String.check(Schema.isPattern(/^[a-z]+$/u)), "623d94ab462f4b13"],
+  [
+    "Between",
+    Schema.Number.check(Schema.isBetween({ minimum: 0, maximum: 10, exclusiveMaximum: true })),
+    "4c918973a53775ba"
+  ],
+  ["Date", Schema.Date, "fc0257e2c27b809e"],
+  ["OptionOfString", Schema.Option(Schema.String), "9c7417be976c0538"]
 ]
 
 describe("SchemaDescriptor", () => {
