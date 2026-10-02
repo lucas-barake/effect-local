@@ -69,6 +69,10 @@ export class StorageMigrationMismatch extends Schema.TaggedError<StorageMigratio
   "@lucas-barake/effect-local/StorageMigrationMismatch"
 )("StorageMigrationMismatch", { catalog: Schema.String, message: Schema.String }) {}
 
+export class StorageMigrationPending extends Schema.TaggedError<StorageMigrationPending>(
+  "@lucas-barake/effect-local/StorageMigrationPending"
+)("StorageMigrationPending", { catalog: Schema.String, message: Schema.String }) {}
+
 export class SchemaKeyCollision extends Schema.TaggedError<SchemaKeyCollision>(
   "@lucas-barake/effect-local/SchemaKeyCollision"
 )("SchemaKeyCollision", { model: Schema.String, key: Schema.String }) {}
@@ -212,6 +216,7 @@ export const ReplicaError = Schema.Union([
   SchemaEvolutionUnsupported,
   SchemaEvolutionFailed,
   StorageMigrationMismatch,
+  StorageMigrationPending,
   SchemaKeyCollision,
   PendingMutationEvolutionRejected,
   ReplicaIdentityMismatch,
