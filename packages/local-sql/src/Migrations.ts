@@ -2,7 +2,6 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import * as Crypto from "effect/Crypto"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import { identity } from "effect/Function"
@@ -985,16 +984,18 @@ const sqliteServerBaseline = makeMigration({
   ]
 })
 
-const migrationScripts = (text: string) =>
-  `CREATE TABLE effect_local_server_migration_scripts (script_id ${text} PRIMARY KEY)`
+const indexGenerations = (integer: string) =>
+  `CREATE TABLE effect_local_server_index_generations (
+      generation ${integer} PRIMARY KEY CHECK (generation > 0)
+    )`
 
-const sqliteMigrationScripts = makeMigration({
+const sqliteIndexGenerations = makeMigration({
   id: 2,
-  name: "server-migration-scripts",
-  statements: [migrationScripts("TEXT")]
+  name: "server-index-generations",
+  statements: [indexGenerations("INTEGER")]
 })
 
-export const serverCatalog = Object.freeze([sqliteServerBaseline, sqliteMigrationScripts])
+export const serverCatalog = Object.freeze([sqliteServerBaseline, sqliteIndexGenerations])
 
 const postgresBaseline = makeMigration({
   id: 1,
@@ -1069,13 +1070,13 @@ const postgresBaseline = makeMigration({
   ]
 })
 
-const postgresMigrationScripts = makeMigration({
+const postgresIndexGenerations = makeMigration({
   id: 2,
-  name: "postgres-migration-scripts",
-  statements: [migrationScripts("TEXT COLLATE \"C\"")]
+  name: "postgres-index-generations",
+  statements: [indexGenerations("BIGINT")]
 })
 
-export const serverPostgresCatalog = Object.freeze([postgresBaseline, postgresMigrationScripts])
+export const serverPostgresCatalog = Object.freeze([postgresBaseline, postgresIndexGenerations])
 
 export const client = Effect.fnUntraced(function*(options: {
   readonly definition: Definition.Any
@@ -1243,12 +1244,9 @@ export const renderServer = Effect.fn("Migrations.renderServer")(function*(optio
     )
   }
   for (const migration of pending) statements.push(...migration.statements)
-  const scriptId = yield* Crypto.Crypto.use((crypto) => crypto.randomUUIDv4).pipe(
-    Effect.mapError(StorageUnavailable.make)
-  )
-  statements.push(
-    `INSERT INTO effect_local_server_migration_scripts (script_id) VALUES (${dialect.literal(scriptId)})`
-  )
+  if (index.missing.length > 0 || index.orphans.length > 0) {
+    statements.push(`INSERT INTO effect_local_server_index_generations (generation) VALUES (${index.generation + 1})`)
+  }
   for (const descriptor of index.missing) {
     statements.push(
       descriptor.tableDdl,

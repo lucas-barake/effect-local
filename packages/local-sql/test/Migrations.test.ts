@@ -507,7 +507,7 @@ describe("postgres server catalog", () => {
       const ledger = yield* serverMigrationLedger(sql)
       assert.deepStrictEqual(ledger, [
         { id: 1, name: "postgres-baseline", checksum: Migrations.serverPostgresCatalog[0].checksum },
-        { id: 2, name: "postgres-migration-scripts", checksum: Migrations.serverPostgresCatalog[1].checksum }
+        { id: 2, name: "postgres-index-generations", checksum: Migrations.serverPostgresCatalog[1].checksum }
       ])
       const names = (yield* postgresTableNames(sql)).map((row) => row.table_name)
       assert.includeMembers(names, [

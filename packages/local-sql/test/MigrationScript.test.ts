@@ -334,6 +334,47 @@ describe.each(manualDatabases)("server migrations applied by hand on $dialect", 
   )
 
   it.effect(
+    "an index script rendered before another script changed the indexes is rejected",
+    Effect.fnUntraced(
+      function*() {
+        const database = yield* make
+        assert.strictEqual(failureOf(yield* boot(database, ranked, "apply")), "Success")
+        const first = yield* scriptOf(database, plain)
+        const stale = yield* scriptOf(database, plain)
+        yield* database.apply(first)
+        yield* renderAndApply(database, ranked)
+        const before = yield* stateOf(database)
+        assert.strictEqual(failureOf(yield* database.apply(stale).pipe(Effect.exit)), "ScriptRejected")
+        assert.deepStrictEqual(yield* stateOf(database), before)
+        assert.strictEqual(failureOf(yield* boot(database, ranked, "verify")), "Success")
+      },
+      Effect.scoped,
+      provideServices
+    ),
+    60_000
+  )
+
+  it.effect(
+    "an index script rendered before automatic migration changed the indexes is rejected",
+    Effect.fnUntraced(
+      function*() {
+        const database = yield* make
+        assert.strictEqual(failureOf(yield* boot(database, ranked, "apply")), "Success")
+        const stale = yield* scriptOf(database, plain)
+        assert.strictEqual(failureOf(yield* boot(database, plain, "apply")), "Success")
+        assert.strictEqual(failureOf(yield* boot(database, ranked, "apply")), "Success")
+        const before = yield* stateOf(database)
+        assert.strictEqual(failureOf(yield* database.apply(stale).pipe(Effect.exit)), "ScriptRejected")
+        assert.deepStrictEqual(yield* stateOf(database), before)
+        assert.strictEqual(failureOf(yield* boot(database, ranked, "verify")), "Success")
+      },
+      Effect.scoped,
+      provideServices
+    ),
+    60_000
+  )
+
+  it.effect(
     "a rendered script that fails partway leaves the database unchanged",
     Effect.fnUntraced(
       function*() {

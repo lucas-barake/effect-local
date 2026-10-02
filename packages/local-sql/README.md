@@ -285,9 +285,10 @@ the script holds exactly what automatic migration would do, in one transaction:
 - On PostgreSQL it takes the same advisory lock automatic migration takes.
 - It inserts the migration ledger rows, with the checksums of the catalog, before the statements they record.
 - It copies the pending migration statements verbatim.
-- It records a random script id in `effect_local_server_migration_scripts` before any index change. Running the same
-  script a second time fails on that key or on the ledger key, so an old script cannot undo index changes a later
-  deploy made.
+- When it changes index tables it first inserts the next row of `effect_local_server_index_generations`, numbered
+  from the database it was rendered against. Automatic migration inserts a row whenever it changes index tables too.
+  A script applied a second time, or after anything else changed the index tables, fails on that key, so a stale
+  script cannot undo a later deploy.
 - It creates the index tables the definition declares and records them in the index catalog.
 - It drops index tables the definition no longer declares, with their build state. Indexes are not part of the schema
   identity, so an index that is removed and later added back must start from an empty table.

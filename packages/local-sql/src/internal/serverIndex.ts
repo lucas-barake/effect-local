@@ -14,6 +14,7 @@ import type * as Statement from "effect/sql/Statement"
 import * as Codec from "./codec.js"
 import type * as Dialect from "./dialect.js"
 import { encodedComponents, encodedPrimitive, type SqlValue } from "./indexComponents.js"
+import * as Rows from "./rows.js"
 import * as StorageUnavailable from "./storageUnavailable.js"
 
 interface Descriptor {
@@ -73,6 +74,9 @@ const CatalogRow = Schema.Struct({
   table_name: Schema.String,
   scan_index_name: Schema.String
 })
+
+const Generation = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+const GenerationRow = Schema.Struct({ generation: Rows.integer(Generation) })
 
 const BackfillRow = Schema.Struct({
   entity_key: Schema.String,
@@ -173,6 +177,10 @@ interface Plan {
   readonly orphans: ReadonlyArray<CatalogEntry>
 }
 
+interface GenerationPlan extends Plan {
+  readonly generation: number
+}
+
 const describeIndexes = (dialect: Dialect.Dialect, definition: Definition.Any): ReadonlyArray<Descriptor> =>
   definition.models.flatMap((model) =>
     Object.entries(model.indexes).map(([indexName, index]) => makeDescriptor(dialect, model, indexName, index))
@@ -190,6 +198,21 @@ const readCatalog = (sql: SqlClient.SqlClient) =>
       "SchemaError",
       (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
     )
+  )
+
+const readGeneration = (sql: SqlClient.SqlClient) =>
+  SqlSchema.findOne({
+    Request: Schema.Void,
+    Result: GenerationRow,
+    execute: () => sql`SELECT COALESCE(MAX(generation), 0) AS generation FROM effect_local_server_index_generations`
+  })(undefined).pipe(
+    Effect.map((row) => row.generation),
+    Effect.catchTags({
+      SchemaError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index generations are invalid", cause })),
+      NoSuchElementError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index generations are invalid", cause }))
+    })
   )
 
 const planCatalog = (
@@ -223,14 +246,20 @@ export const plan = Effect.fn("ServerIndex.plan")(function*(
   definition: Definition.Any
 ) {
   const all = describeIndexes(dialect, definition)
-  const catalogExists = yield* dialect.tableExists("effect_local_server_index_catalog").pipe(
-    Effect.catchTag(
-      "SchemaError",
-      (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
+  const exists = (table: string) =>
+    dialect.tableExists(table).pipe(
+      Effect.catchTag(
+        "SchemaError",
+        (cause) => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server index catalog is invalid", cause }))
+      )
     )
-  )
-  if (!catalogExists) return { missing: all, orphans: [] } satisfies Plan
-  return yield* planCatalog(all, yield* readCatalog(sql))
+  let generation = 0
+  if (yield* exists("effect_local_server_index_generations")) generation = yield* readGeneration(sql)
+  if (!(yield* exists("effect_local_server_index_catalog"))) {
+    return { missing: all, orphans: [], generation } satisfies GenerationPlan
+  }
+  const pending = yield* planCatalog(all, yield* readCatalog(sql))
+  return { ...pending, generation } satisfies GenerationPlan
 }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
 export const make = Effect.fn("ServerIndex.make")(
@@ -261,6 +290,11 @@ export const make = Effect.fn("ServerIndex.make")(
       yield* sql.withTransaction(Effect.gen(function*() {
         yield* dialect.lockSchema
         const existing = yield* readCatalog(sql)
+        const pending = yield* planCatalog(all, existing)
+        if (pending.missing.length > 0 || pending.orphans.length > 0) {
+          yield* sql`INSERT INTO effect_local_server_index_generations (generation)
+            SELECT COALESCE(MAX(generation), 0) + 1 FROM effect_local_server_index_generations`
+        }
         const created = new Set(existing.map((row) => row.descriptor_hash))
         for (const descriptor of all) {
           if (created.has(descriptor.hash)) continue
