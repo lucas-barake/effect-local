@@ -530,6 +530,7 @@ describe("multi space Replica", () => {
       >
       const reconciliation = Reconciler.Reconciliation.of({
         sync: Effect.void,
+        generation: Effect.succeed(0),
         failed: () => Effect.void,
         watchFailed: () => Effect.void,
         succeeded: Effect.void,

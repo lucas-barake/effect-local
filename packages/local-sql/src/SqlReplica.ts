@@ -140,7 +140,6 @@ interface ActiveRuntime {
 interface RememberedEntry {
   readonly spaceId: Identity.SpaceId
   handle: Replica.Space
-  replicationScope: Protocol.ReplicationScope
   activation: Replica.Activation
   runtime: ActiveRuntime | undefined
   transition: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
@@ -174,6 +173,10 @@ const RememberedRow = Schema.Struct({
   desired_scope_json: Schema.String,
   replication_view_id: Schema.NullOr(Identity.ReplicationViewId),
   count: Schema.Int
+})
+
+const DesiredScopeRow = Schema.Struct({
+  desired_scope_json: Schema.String
 })
 
 const addressedStatus = (
@@ -448,6 +451,27 @@ const makeLayer = <D extends Definition.Any, R,>(
           Effect.flatMap((value) => Codec.decode(Protocol.ReplicationScope, value)),
           Effect.flatMap((value) => Protocol.validateReplicationScope(options.definition, value))
         )
+      const readDesiredScope = SqlSchema.findOneOption({
+        Request: Identity.SpaceId,
+        Result: DesiredScopeRow,
+        execute: (spaceId) => sql`SELECT desired_scope_json FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
+      })
+      const durableScope = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
+        const row = yield* lane.withStatement(readDesiredScope(spaceId)).pipe(
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({
+                  message: "Client membership row is corrupt",
+                  cause
+                })
+              )
+          })
+        )
+        if (Option.isNone(row)) return yield* new ReplicaError.SpaceUnavailable({ spaceId })
+        return yield* decodeScope(row.value.desired_scope_json)
+      })
 
       const signalCapacity = Effect.sync(() => {
         const previous = capacityChanged
@@ -496,12 +520,13 @@ const makeLayer = <D extends Definition.Any, R,>(
             { interruptible: true }
           ).pipe(Scope.provide(childScope))
         }
+        const replicationScope = yield* durableScope(spaceId)
         const layerMutationRuntime = MutationRuntime.layer(options.definition, options.evolution)
         const reconcilerReady = yield* Deferred.make<Reconciler.Service>()
         const layerLocalStore = LocalStore.layer({
           ...options,
           clientId,
-          scope: entry.replicationScope,
+          scope: replicationScope,
           spaceId,
           onSettlementsRecorded: publishSettlements(entry),
           onReplicationView: (installed) => recordReplicationView(entry, installed),
@@ -1099,23 +1124,15 @@ const makeLayer = <D extends Definition.Any, R,>(
             if (entries.get(entry.spaceId) !== entry || entry.leaving) {
               return Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId }))
             }
-            return Effect.succeed(entry.replicationScope)
+            return durableScope(entry.spaceId)
           }),
           setScope: (nextScope) =>
-            withActive(entry, (runtime) =>
-              runtime.local.setScope(nextScope).pipe(
-                Effect.andThen(runtime.local.replicationState),
-                Effect.tap((state) =>
-                  Effect.sync(() => {
-                    entry.replicationScope = state.scope
-                  })
-                )
-              )).pipe(
-                Effect.flatMap(() => deactivate(entry, true)),
-                Effect.andThen(activate(entry, true)),
-                Effect.flatMap((runtime) => runtime.reconciler.notify),
-                Effect.andThen(reactivity.invalidate([ReactivityKey.scope(entry.spaceId)]))
-              ),
+            withActive(entry, (runtime) => runtime.local.setScope(nextScope)).pipe(
+              Effect.flatMap(() => deactivate(entry, true)),
+              Effect.andThen(activate(entry, true)),
+              Effect.flatMap((runtime) => runtime.reconciler.notify),
+              Effect.andThen(reactivity.invalidate([ReactivityKey.scope(entry.spaceId)]))
+            ),
           activation: Effect.suspend(() => {
             if (entries.get(entry.spaceId) !== entry || entry.leaving) {
               return Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId }))
@@ -1262,7 +1279,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       }
 
       const createEntry = Effect.fnUntraced(function*(row: typeof RememberedRow.Type) {
-        const replicationScope = yield* decodeScope(row.desired_scope_json)
+        yield* decodeScope(row.desired_scope_json)
         let handle: Replica.Space | undefined
         const entry: RememberedEntry = {
           spaceId: row.space_id,
@@ -1270,7 +1287,6 @@ const makeLayer = <D extends Definition.Any, R,>(
             if (handle === undefined) handle = makeHandle(entry)
             return handle
           },
-          replicationScope,
           activation: "Inactive",
           runtime: undefined,
           transition: undefined,

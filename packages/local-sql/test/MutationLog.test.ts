@@ -4508,7 +4508,10 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const reconciliation = Context.get(context, Reconciler.Reconciliation)
       const syncing = yield* reconciliation.sync.pipe(Effect.forkChild({ startImmediately: true }))
       yield* Deferred.await(pullEntered)
-      yield* reconciliation.failed(new ReplicaError.CredentialRejected({ credentialGeneration: 0 }))
+      yield* reconciliation.failed(
+        new ReplicaError.CredentialRejected({ credentialGeneration: 0 }),
+        yield* reconciliation.generation
+      )
       yield* Deferred.succeed(releasePull, undefined)
       yield* Fiber.join(syncing)
 
@@ -4537,8 +4540,11 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
         )
       )
       const reconciliation = Context.get(context, Reconciler.Reconciliation)
-      yield* reconciliation.failed(new ReplicaError.CredentialRejected({ credentialGeneration: 0 }))
-      yield* reconciliation.failed(new ReplicaError.ServerUnavailable())
+      yield* reconciliation.failed(
+        new ReplicaError.CredentialRejected({ credentialGeneration: 0 }),
+        yield* reconciliation.generation
+      )
+      yield* reconciliation.failed(new ReplicaError.ServerUnavailable(), yield* reconciliation.generation)
 
       assert.strictEqual((yield* reconciliation.status)._tag, "NeedsAuthentication")
     }, Effect.scoped))
