@@ -12,7 +12,9 @@ import * as Equal from "effect/Equal"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Hash from "effect/Hash"
+import * as HashMap from "effect/HashMap"
 import * as Layer from "effect/Layer"
+import * as Option from "effect/Option"
 import * as Order from "effect/Order"
 import * as PubSub from "effect/PubSub"
 import * as Pull from "effect/Pull"
@@ -25,8 +27,8 @@ import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import type * as Authentication from "./Authentication.js"
-import { positiveFiniteDurationMillis, reconnectPolicy } from "./internal/configuration.js"
-import { invalidConfiguration } from "./internal/errors.js"
+import { positiveFiniteDurationMillis, positiveSafeInteger, reconnectPolicy } from "./internal/configuration.js"
+import { capacityExceeded, invalidConfiguration } from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSession from "./ProtocolSession.js"
@@ -130,6 +132,7 @@ export interface Options extends ProtocolSession.Options {
   readonly rpcTimeout?: Duration.Input
   readonly heartbeatInterval?: Duration.Input
   readonly rejoinPolicy?: Schedule.Schedule<unknown, ReplicaError.ReplicaError>
+  readonly eventCapacity?: number
 }
 
 const boundedTtlMillis = Effect.fnUntraced(function*(
@@ -174,32 +177,34 @@ class SessionIdentity implements Equal.Equal {
   }
 }
 
-interface RawView {
-  readonly members: ReadonlyArray<Protocol.EphemeralMemberEntry>
-  readonly states: ReadonlyMap<string, Protocol.EphemeralStateEntry>
+interface ChannelStates {
+  readonly changedAt: number
+  readonly entries: HashMap.HashMap<string, Protocol.EphemeralStateEntry>
 }
 
-type ViewScope =
-  | { readonly kind: "all" }
-  | { readonly kind: "members" }
-  | { readonly kind: "state"; readonly channel: string }
+interface RawView {
+  readonly sequence: number
+  readonly resetAt: number
+  readonly membersChangedAt: number
+  readonly members: HashMap.HashMap<string, Protocol.EphemeralMemberEntry>
+  readonly channels: HashMap.HashMap<string, ChannelStates>
+}
 
-interface ViewEmission {
-  readonly view: RawView
-  readonly scope: ViewScope
+interface EventDelivery {
+  readonly sequence: number
+  readonly entry: Protocol.EphemeralEventEntry
 }
 
 interface SessionRuntime {
   readonly requestHash: string
-  readonly views: PubSub.PubSub<ViewEmission>
-  readonly events: PubSub.PubSub<Protocol.EphemeralEventEntry>
+  readonly views: PubSub.PubSub<RawView>
+  readonly events: PubSub.PubSub<EventDelivery>
   readonly ready: Deferred.Deferred<void, ReplicaError.ReplicaError>
   readonly failure: Deferred.Deferred<never, ReplicaError.ReplicaError>
   readonly recordMemberValue: (value: typeof Schema.Json.Type) => void
 }
 
-const sameMember = (left: Protocol.EphemeralMember, right: Protocol.EphemeralMember) =>
-  left.clientId === right.clientId && left.membershipIncarnation === right.membershipIncarnation
+const memberIdentity = (member: Protocol.EphemeralMember) => `${member.clientId}:${member.membershipIncarnation}`
 
 const stateIdentity = (
   member: Protocol.EphemeralMember,
@@ -210,71 +215,90 @@ const stateIdentity = (
     .map((component) => `${component.length}:${component}`)
     .join("")
 
+const emptyView = (sequence: number): RawView => ({
+  sequence,
+  resetAt: sequence,
+  membersChangedAt: sequence,
+  members: HashMap.empty(),
+  channels: HashMap.empty()
+})
+
+const snapshotView = (sequence: number, message: Protocol.EphemeralSnapshot): RawView => {
+  const grouped = new Map<string, Array<readonly [string, Protocol.EphemeralStateEntry]>>()
+  for (const entry of message.states) {
+    const identified = [stateIdentity(entry.member, entry.channel, entry.key), entry] as const
+    const group = grouped.get(entry.channel)
+    if (group === undefined) grouped.set(entry.channel, [identified])
+    else group.push(identified)
+  }
+  const channels = [...grouped].map(([channel, entries]) =>
+    [channel, { changedAt: sequence, entries: HashMap.fromIterable(entries) }] as const
+  )
+  return {
+    ...emptyView(sequence),
+    members: HashMap.fromIterable(message.members.map((entry) => [memberIdentity(entry.member), entry] as const)),
+    channels: HashMap.fromIterable(channels)
+  }
+}
+
+const channelEntries = (view: RawView, channel: string) =>
+  Option.match(HashMap.get(view.channels, channel), {
+    onNone: () => HashMap.empty<string, Protocol.EphemeralStateEntry>(),
+    onSome: (states) => states.entries
+  })
+
+const channelChangedAt = (view: RawView, channel: string) =>
+  Option.match(HashMap.get(view.channels, channel), {
+    onNone: () => view.resetAt,
+    onSome: (states) => states.changedAt
+  })
+
+const withChannel = (
+  view: RawView,
+  sequence: number,
+  channel: string,
+  entries: HashMap.HashMap<string, Protocol.EphemeralStateEntry>
+): RawView => ({
+  ...view,
+  sequence,
+  channels: HashMap.set(view.channels, channel, { changedAt: sequence, entries })
+})
+
 const reduceView = (
   current: RawView | undefined,
+  sequence: number,
   message: Exclude<Protocol.EphemeralMessage, Protocol.EphemeralEvent | Protocol.EphemeralEventCleared>
-): ViewEmission | undefined => {
-  if (message._tag === "Snapshot") {
-    return {
-      view: {
-        members: message.members,
-        states: new Map(
-          message.states.map((entry) => [stateIdentity(entry.member, entry.channel, entry.key), entry])
-        )
-      },
-      scope: { kind: "all" }
-    }
-  }
+): RawView | undefined => {
+  if (message._tag === "Snapshot") return snapshotView(sequence, message)
   if (current === undefined) return undefined
   if (message._tag === "MemberUpserted") {
-    return {
-      view: {
-        ...current,
-        members: [
-          ...current.members.filter((entry) => !sameMember(entry.member, message.entry.member)),
-          message.entry
-        ]
-      },
-      scope: { kind: "members" }
-    }
+    const members = HashMap.set(current.members, memberIdentity(message.entry.member), message.entry)
+    return { ...current, sequence, membersChangedAt: sequence, members }
   }
   if (message._tag === "MemberLeft") {
-    return {
-      view: {
-        ...current,
-        members: current.members.filter((entry) => !sameMember(entry.member, message.member))
-      },
-      scope: { kind: "members" }
-    }
+    const members = HashMap.remove(current.members, memberIdentity(message.member))
+    return { ...current, sequence, membersChangedAt: sequence, members }
   }
   if (message._tag === "StateSet") {
-    const states = new Map(current.states)
-    states.set(stateIdentity(message.entry.member, message.entry.channel, message.entry.key), message.entry)
-    return { view: { ...current, states }, scope: { kind: "state", channel: message.entry.channel } }
+    const { entry } = message
+    const entries = HashMap.set(
+      channelEntries(current, entry.channel),
+      stateIdentity(entry.member, entry.channel, entry.key),
+      entry
+    )
+    return withChannel(current, sequence, entry.channel, entries)
   }
-  const states = new Map(current.states)
-  states.delete(stateIdentity(message.member, message.channel, message.key))
-  return { view: { ...current, states }, scope: { kind: "state", channel: message.channel } }
+  const entries = HashMap.remove(
+    channelEntries(current, message.channel),
+    stateIdentity(message.member, message.channel, message.key)
+  )
+  return withChannel(current, sequence, message.channel, entries)
 }
 
 const byIdentity = <A,>(left: readonly [string, A], right: readonly [string, A]) => Order.String(left[0], right[0])
 
-const stateSlice = (view: RawView, channel: string): ReadonlyArray<Protocol.EphemeralStateEntry> =>
-  [...view.states]
-    .filter(([, entry]) => entry.channel === channel)
-    .sort(byIdentity)
-    .map(([, entry]) => entry)
-
-const memberSlice = (view: RawView): ReadonlyArray<Protocol.EphemeralMemberEntry> =>
-  [
-    ...new Map(
-      view.members.map((entry) => [`${entry.member.clientId}:${entry.member.membershipIncarnation}`, entry])
-    )
-  ]
-    .sort(byIdentity)
-    .map(([, entry]) => entry)
-
-const noProjection = (): string | undefined => undefined
+const sortedValues = <A,>(entries: HashMap.HashMap<string, A>): ReadonlyArray<A> =>
+  [...entries].sort(byIdentity).map(([, entry]) => entry)
 
 const isTransportFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "ServerUnavailable" || error._tag === "OperationTimeout"
@@ -284,20 +308,29 @@ const isTransientFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "OperationTimeout" ||
   error._tag === "AuthenticatorUnavailable"
 
+interface Projection {
+  readonly sequence: number
+  readonly fingerprint: string
+}
+
+const noProjection = (): Projection | undefined => undefined
+
 const projectSlice = <A,>(
-  affects: (scope: ViewScope) => boolean,
+  changedAt: (view: RawView) => number,
   slice: (view: RawView) => A
 ) =>
-(fingerprint: string | undefined, emission: ViewEmission) => {
-  if (fingerprint !== undefined && !affects(emission.scope)) return [fingerprint, []] as const
-  const next = slice(emission.view)
-  const nextFingerprint = Canonical.hash(next)
-  if (nextFingerprint === fingerprint) return [fingerprint, []] as const
-  return [nextFingerprint, [next]] as const
+(projection: Projection | undefined, view: RawView) => {
+  if (projection !== undefined && changedAt(view) <= projection.sequence) {
+    return [{ ...projection, sequence: view.sequence }, []] as const
+  }
+  const next = slice(view)
+  const fingerprint = Canonical.hash(next)
+  if (fingerprint === projection?.fingerprint) return [{ sequence: view.sequence, fingerprint }, []] as const
+  return [{ sequence: view.sequence, fingerprint }, [next]] as const
 }
 
 export const layerFromSession = (
-  options?: Pick<Options, "rpcTimeout" | "heartbeatInterval" | "rejoinPolicy">
+  options?: Pick<Options, "rpcTimeout" | "heartbeatInterval" | "rejoinPolicy" | "eventCapacity">
 ): Layer.Layer<
   EphemeralClient,
   ReplicaError.InvalidConfiguration,
@@ -314,6 +347,7 @@ export const layerFromSession = (
         "heartbeatInterval",
         options?.heartbeatInterval ?? "20 seconds"
       )
+      const eventCapacity = yield* positiveSafeInteger("eventCapacity", options?.eventCapacity ?? 1_024)
       const rejoinPolicy = Schedule.while(
         options?.rejoinPolicy ?? reconnectPolicy,
         ({ input }) => isTransientFailure(input)
@@ -587,19 +621,25 @@ export const layerFromSession = (
 
       const runtimes = yield* RcMap.make({
         lookup: Effect.fnUntraced(function*(identity: SessionIdentity) {
-          const views = yield* PubSub.unbounded<ViewEmission>({ replay: 1 })
-          const events = yield* PubSub.unbounded<Protocol.EphemeralEventEntry>()
+          const views = yield* PubSub.sliding<RawView>({ capacity: 1, replay: 1 })
+          const events = yield* PubSub.sliding<EventDelivery>(eventCapacity)
           const ready = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           const failure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
           let view: RawView | undefined
+          let viewSequence = 0
+          let eventSequence = 0
           let unknownPresented = false
           let memberValue = identity.request.value
           const consume = (message: Protocol.EphemeralMessage) => {
-            if (message._tag === "Event") return PubSub.publish(events, message.entry).pipe(Effect.asVoid)
+            if (message._tag === "Event") {
+              eventSequence = eventSequence + 1
+              return PubSub.publish(events, { sequence: eventSequence, entry: message.entry }).pipe(Effect.asVoid)
+            }
             if (message._tag === "EventCleared") return Effect.void
-            const next = reduceView(view, message)
+            const next = reduceView(view, viewSequence + 1, message)
             if (next === undefined) return Effect.void
-            view = next.view
+            view = next
+            viewSequence = next.sequence
             unknownPresented = false
             return PubSub.publish(views, next).pipe(
               Effect.andThen(Deferred.succeed(ready, undefined)),
@@ -609,8 +649,9 @@ export const layerFromSession = (
           const presentUnknown = Effect.suspend(() => {
             if (unknownPresented) return Effect.void
             view = undefined
+            viewSequence = viewSequence + 1
             unknownPresented = true
-            return PubSub.publish(views, { view: { members: [], states: new Map() }, scope: { kind: "all" } }).pipe(
+            return PubSub.publish(views, emptyView(viewSequence)).pipe(
               Effect.andThen(Deferred.succeed(ready, undefined)),
               Effect.asVoid
             )
@@ -685,6 +726,15 @@ export const layerFromSession = (
           LosslessQueue.merge(stream, failureStream)
         const events = (definition: Ephemeral.AnyEvent) =>
           Stream.fromPubSub(runtime.events).pipe(
+            Stream.mapAccumEffect(
+              (): number | undefined => undefined,
+              (previous, delivery) => {
+                if (previous !== undefined && delivery.sequence !== previous + 1) {
+                  return Effect.fail(capacityExceeded("ephemeral events", eventCapacity))
+                }
+                return Effect.succeed([delivery.sequence, [delivery.entry]] as const)
+              }
+            ),
             Stream.filter((entry) => entry.channel === definition.name),
             Stream.mapEffect((entry) =>
               Schema.decodeUnknownEffect(definition.payloadSchema)(entry.value).pipe(
@@ -700,9 +750,9 @@ export const layerFromSession = (
             Stream.mapAccum(
               noProjection,
               projectSlice(
-                (scope) =>
-                  scope.kind === "all" || (scope.kind === "state" && scope.channel === definition.name),
-                (view) => stateSlice(view, definition.name)
+                (view) =>
+                  channelChangedAt(view, definition.name),
+                (view) => sortedValues(channelEntries(view, definition.name))
               )
             ),
             Stream.mapEffect(Effect.forEach((entry) =>
@@ -725,8 +775,12 @@ export const layerFromSession = (
         const members = Stream.fromPubSub(runtime.views).pipe(
           Stream.mapAccum(
             noProjection,
-            projectSlice((scope) =>
-              scope.kind === "all" || scope.kind === "members", memberSlice)
+            projectSlice(
+              (view) =>
+                view.membersChangedAt,
+              (view) =>
+                sortedValues(view.members)
+            )
           ),
           Stream.mapEffect(Effect.forEach((entry) =>
             Schema.decodeUnknownEffect(profile.payloadSchema)(entry.value).pipe(
@@ -743,9 +797,7 @@ export const layerFromSession = (
         )
         const updateMember = (value: Ephemeral.Payload<M>) =>
           Schema.encodeEffect(profile.payloadSchema)(value).pipe(
-            Effect.flatMap((encoded) =>
-              Schema.decodeUnknownEffect(Schema.Json)(encoded)
-            ),
+            Effect.flatMap((encoded) => Schema.decodeUnknownEffect(Schema.Json)(encoded)),
             Effect.catchTag(
               "SchemaError",
               (cause) => Effect.fail(new Ephemeral.EncodeError({ definition: "member", cause }))

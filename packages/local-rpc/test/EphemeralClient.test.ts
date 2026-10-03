@@ -340,7 +340,9 @@ const stateSet = (
     }
   })
 
-const makeTypedHarness = Effect.fnUntraced(function*() {
+const makeTypedHarness = Effect.fnUntraced(function*(
+  options?: Parameters<typeof EphemeralClient.layerFromSession>[0]
+) {
   const messagesA = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
   const messagesB = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
   const published = yield* Queue.unbounded<typeof Protocol.VersionedEphemeralPublishRequest.Type>()
@@ -356,7 +358,7 @@ const makeTypedHarness = Effect.fnUntraced(function*() {
     PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) =>
       Queue.offer(published, request).pipe(Effect.as(null))
   }
-  const layerClient = layerFromFakeClient(fakeClient)
+  const layerClient = layerFromFakeClient(fakeClient, options)
   return { messagesA, messagesB, published, joins, layerClient }
 })
 
@@ -971,6 +973,97 @@ describe("EphemeralClient projection work", () => {
       for (const maxOpsBeforeYield of [7, 8, 12]) {
         for (let spacing = 0; spacing < 6; spacing++) yield* deliver(maxOpsBeforeYield, spacing)
       }
+    })
+  )
+
+  it.effect(
+    "hands a blocked state subscriber only the latest view, including channels changed before the last update",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeTypedHarness()
+      yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
+      yield* Queue.offer(harness.messagesA, snapshot(spaceId, 1))
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const session = yield* client.session(Profile, sessionOptions)
+        const gate = yield* Deferred.make<void>()
+        const emissions = yield* Queue.unbounded<number>()
+        const blocked = yield* session.state(ReadPosition).pipe(
+          Stream.mapEffect((entries) =>
+            Queue.offer(emissions, entries.length).pipe(Effect.andThen(Deferred.await(gate)))
+          ),
+          Stream.runDrain,
+          Effect.forkChild({ startImmediately: true })
+        )
+        assert.strictEqual(yield* Queue.take(emissions), 0)
+        for (let index = 0; index < 200; index = index + 1) {
+          yield* Queue.offer(
+            harness.messagesA,
+            stateSet(spaceId, index + 2, "ReadPosition", `conversation-${index}`, { messageId: `message-${index}` })
+          )
+        }
+        yield* Queue.offer(harness.messagesA, stateSet(spaceId, 202, "Sentinel", "probe", { marker: "done" }))
+        yield* session.state(Sentinel).pipe(
+          Stream.filter((entries) => entries.length > 0),
+          Stream.runHead
+        )
+        yield* Deferred.succeed(gate, undefined)
+        const delivered: Array<number> = []
+        while (delivered.length < 2 && delivered.at(-1) !== 200) delivered.push(yield* Queue.take(emissions))
+        assert.strictEqual(
+          delivered.at(-1),
+          200,
+          `the blocked subscriber replayed stale views ${delivered.join(", ")}`
+        )
+        yield* Fiber.interrupt(blocked)
+      })
+      yield* program.pipe(Effect.provide(harness.layerClient))
+    })
+  )
+
+  it.effect(
+    "fails an event subscriber that falls further behind than the event capacity",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeTypedHarness({ eventCapacity: 4 })
+      yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
+      yield* Queue.offer(harness.messagesA, snapshot(spaceId, 1))
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const session = yield* client.session(Profile, sessionOptions)
+        const subscribed = yield* Deferred.make<void>()
+        const gate = yield* Deferred.make<void>()
+        const lagging = yield* session.events(Pings).pipe(
+          Stream.mapEffect((event) =>
+            Deferred.succeed(subscribed, undefined).pipe(
+              Effect.andThen(Deferred.await(gate)),
+              Effect.as(event)
+            )
+          ),
+          Stream.takeUntil((event) => event.payload.count === 10),
+          Stream.runDrain,
+          Effect.result,
+          Effect.forkChild({ startImmediately: true })
+        )
+        let revision = 2
+        while (!(yield* Deferred.isDone(subscribed))) {
+          yield* Queue.offer(harness.messagesA, eventMessage(spaceId, revision++, "Pings", { count: -1 }))
+          yield* Effect.yieldNow
+        }
+        for (let count = 1; count <= 10; count = count + 1) {
+          yield* Queue.offer(harness.messagesA, eventMessage(spaceId, revision++, "Pings", { count }))
+        }
+        yield* Queue.offer(harness.messagesA, stateSet(spaceId, revision, "Sentinel", "probe", { marker: "done" }))
+        yield* session.state(Sentinel).pipe(
+          Stream.filter((entries) => entries.length > 0),
+          Stream.runHead
+        )
+        yield* Deferred.succeed(gate, undefined)
+        const result = yield* Fiber.join(lagging)
+        assert.isTrue(Result.isFailure(result), "the lagging subscriber received every event")
+        if (Result.isFailure(result)) {
+          assert.strictEqual(result.failure._tag, "CapacityExceeded")
+        }
+      })
+      yield* program.pipe(Effect.provide(harness.layerClient))
     })
   )
 })
