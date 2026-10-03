@@ -803,8 +803,8 @@ export const layerOnePass = (
           yield* submitPending
           yield* catchUp
           syncing = false
-          yield* options.onReconciled ?? Effect.void
           yield* succeeded
+          yield* options.onReconciled ?? Effect.void
         }).pipe(
           Effect.ensuring(Effect.sync(() => {
             syncing = false

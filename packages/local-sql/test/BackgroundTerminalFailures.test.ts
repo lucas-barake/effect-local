@@ -590,6 +590,30 @@ describe("background sync terminal failures", () => {
     }, Effect.scoped)
   )
 
+  it.effect.each(constructors)(
+    "retries a background turn whose final status read hits a lock timeout with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* pendingBackgroundSpace(constructor)
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (attempts.count() === 1) {
+            services.lockNext("SELECT COUNT(*) AS count FROM effect_local_client_pending_data")
+          }
+          return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
+        }
+      }))
+      yield* attempts.reached(2)
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(3)).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.isTrue(Option.isSome(retried))
+      assert.strictEqual((yield* replica.status).counts.failed, 0)
+    }, Effect.scoped)
+  )
+
   it.effect(
     "retries a terminally failed background space once each time it is activated and released",
     Effect.fnUntraced(function*() {
