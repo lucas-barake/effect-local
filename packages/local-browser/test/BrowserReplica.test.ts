@@ -157,6 +157,7 @@ const layerOwnerIdle = Layer.mergeAll(
 const StatusProfile = Ephemeral.member({ status: Schema.String })
 const Reaction = Ephemeral.make("reaction", { kind: "event", payload: { emoji: Schema.String } })
 const Wave = Ephemeral.make("wave", { kind: "event", payload: { hand: Schema.String } })
+const Cursor = Ephemeral.make("cursor", { kind: "state", key: Schema.String, payload: { x: Schema.Number } })
 
 interface Build {
   readonly definition: typeof definition
@@ -357,6 +358,26 @@ const openStatusSession = (context: Context.Context<EphemeralClient.EphemeralCli
     value: { status: "online" },
     ttl: "30 seconds"
   })
+
+const sessionStreamEndsWithItsScope = Effect.fnUntraced(
+  function*(
+    select: (
+      session: EphemeralClient.Session<typeof StatusProfile>
+    ) => Stream.Stream<unknown, Ephemeral.DecodeError | ReplicaError.ReplicaError>
+  ) {
+    const updates = yield* Ref.make<ReadonlyArray<readonly [string, unknown]>>([])
+    const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralOpening(Effect.void, updates) })
+    const leader = yield* environment.openTab
+    const sessionScope = yield* Scope.make()
+    const session = yield* settle(openStatusSession(leader.context).pipe(Scope.provide(sessionScope)))
+    const consumer = yield* Effect.forkChild(select(session).pipe(Stream.runDrain))
+    assert.strictEqual(yield* settledOutcome(Fiber.join(consumer)), "pending")
+    yield* settle(Scope.close(sessionScope, Exit.void))
+    assert.strictEqual(yield* settledOutcome(Fiber.join(consumer)), "succeeded")
+  },
+  Effect.scoped,
+  provideFileSystem
+)
 
 const listFrom = (replica: Replica.Service) =>
   replica.space(spaceId).pipe(Effect.flatMap((space) => space.query(ListTodos, undefined)))
@@ -1425,6 +1446,21 @@ describe("BrowserReplica across builds", () => {
       Effect.scoped,
       provideFileSystem
     )
+  )
+
+  it.effect(
+    "ends a session's event stream when the session scope closes",
+    () => sessionStreamEndsWithItsScope((session) => session.events(Reaction))
+  )
+
+  it.effect(
+    "ends a session's member stream when the session scope closes",
+    () => sessionStreamEndsWithItsScope((session) => session.members)
+  )
+
+  it.effect(
+    "ends a session's state stream when the session scope closes",
+    () => sessionStreamEndsWithItsScope((session) => session.state(Cursor))
   )
 
   it.effect(
