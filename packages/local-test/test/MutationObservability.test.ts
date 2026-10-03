@@ -193,13 +193,12 @@ describe("mutation observability", () => {
   )
 
   it.effect(
-    "emits one settlement when the same receipt is persisted twice across reconnect",
+    "emits one settlement when the server returns the same receipt twice across reconnect",
     Effect.fnUntraced(function*() {
       const { faults, replica } = yield* makeServices
       const space = yield* replica.space(spaceId)
       const firstCollector = yield* Stream.toQueue(space.settlementsFor(PutTodo), { capacity: "unbounded" })
       const secondCollector = yield* Stream.toQueue(space.settlementsFor(PutTodo), { capacity: "unbounded" })
-      yield* faults.withholdPullEvidence(spaceId)
       yield* faults.dropNextReceipt(spaceId)
 
       const pending = yield* space.mutate(PutTodo, { id: "duplicate", title: "once" })
@@ -213,14 +212,12 @@ describe("mutation observability", () => {
       const barrier = yield* space.mutate(PutTodo, { id: "trigger", title: "next reconciliation" })
       yield* faults.partitionAfterNextReceipt(spaceId)
       yield* faults.releaseHeldReceipt(spaceId)
-      const firstReturned = yield* faults.awaitReceiptReturned(spaceId)
+      const returned = yield* faults.awaitReceiptReturned(spaceId)
+      assert.deepStrictEqual(returned.receipt, firstCommitted.receipt)
       yield* faults.awaitRequestRejectedOffline(spaceId)
       yield* faults.heal(spaceId)
-      const duplicateReturned = yield* advanceClockUntil(faults.awaitReceiptReturned(spaceId))
-      assert.strictEqual(firstReturned.receipt.mutationId, pending.envelope.mutationId)
-      assert.strictEqual(duplicateReturned.receipt.mutationId, pending.envelope.mutationId)
-      assert.deepStrictEqual(duplicateReturned.receipt, firstReturned.receipt)
-      yield* faults.releasePullEvidence(spaceId)
+      const barrierReturned = yield* advanceClockUntil(faults.awaitReceiptReturned(spaceId))
+      assert.strictEqual(barrierReturned.receipt.mutationId, barrier.envelope.mutationId)
       yield* faults.awaitPullCompletedAfterReceipt(spaceId)
 
       const collectThroughBarrier = Effect.fnUntraced(function*(collector: typeof firstCollector) {

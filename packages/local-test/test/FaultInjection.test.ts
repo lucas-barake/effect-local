@@ -32,6 +32,7 @@ import * as TestServer from "../src/TestServer.js"
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const writerClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
 const Todo = Model.make("Todo", {
   version: 1,
   key: Schema.String,
@@ -112,15 +113,18 @@ const makeSyncServices = Effect.gen(function*() {
   return { faults, sync }
 })
 
-const makeServices = Effect.gen(function*() {
-  const { faults, sync } = yield* makeSyncServices
-  const local = yield* service(
+const makeLocal = (localClientId: Identity.ClientId) =>
+  service(
     LocalStore.Store,
-    LocalStore.layer({ ...clientHistory, definition, spaceId, clientId }).pipe(
+    LocalStore.layer({ ...clientHistory, definition, spaceId, clientId: localClientId }).pipe(
       Layer.provide(layerRuntime),
       Layer.provide(database())
     )
   )
+
+const makeServices = Effect.gen(function*() {
+  const { faults, sync } = yield* makeSyncServices
+  const local = yield* makeLocal(clientId)
   return { faults, local, sync }
 })
 
@@ -355,6 +359,28 @@ describe("test synchronization faults", () => {
       assert.deepStrictEqual(sequences, [Option.some(1), Option.some(2), Option.some(3)])
       assert.strictEqual((yield* local.progress).cursor, 3)
       assert.strictEqual(yield* local.pendingCount, 0)
+    })
+  )
+
+  it.effect(
+    "delivers withheld pull evidence intact once released",
+    Effect.fnUntraced(function*() {
+      const { faults, local: reader, sync } = yield* makeServices
+      const writer = yield* makeLocal(writerClientId)
+      yield* synchronize(reader, sync)
+      yield* synchronize(writer, sync)
+      yield* writer.mutate(PutTodo, { id: "1", title: "withheld" })
+      yield* synchronize(writer, sync)
+
+      yield* faults.withholdPullEvidence(spaceId)
+      const withheld = yield* synchronize(reader, sync).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* faults.awaitPullEvidenceWithheld(spaceId)
+      yield* faults.releasePullEvidence(spaceId)
+      yield* Fiber.join(withheld)
+      yield* synchronize(reader, sync)
+
+      assert.deepStrictEqual(yield* reader.get(Todo, "1"), Option.some({ id: "1", title: "withheld" }))
+      assert.strictEqual((yield* reader.progress).cursor, 1)
     })
   )
 })

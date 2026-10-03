@@ -40,16 +40,20 @@ export type Event =
     readonly _tag: "RequestRejectedOffline"
     readonly spaceId: Identity.SpaceId
   }
+  | {
+    readonly _tag: "PullEvidenceWithheld"
+    readonly spaceId: Identity.SpaceId
+  }
 
 type ReceiptCommitted = Extract<Event, { readonly _tag: "ReceiptCommitted" }>
 type ReceiptDropped = Extract<Event, { readonly _tag: "ReceiptDropped" }>
 type ReceiptReturned = Extract<Event, { readonly _tag: "ReceiptReturned" }>
 type PullCompletedAfterReceipt = Extract<Event, { readonly _tag: "PullCompletedAfterReceipt" }>
 type RequestRejectedOffline = Extract<Event, { readonly _tag: "RequestRejectedOffline" }>
+type PullEvidenceWithheld = Extract<Event, { readonly _tag: "PullEvidenceWithheld" }>
 
 interface FaultState extends State {
   readonly partitionAfterNextReceipt: boolean
-  readonly withholdPullEvidence: boolean
   readonly postReceiptPullPending: boolean
 }
 
@@ -59,6 +63,7 @@ interface EventQueues {
   readonly receiptReturned: Queue.Queue<ReceiptReturned>
   readonly pullCompletedAfterReceipt: Queue.Queue<PullCompletedAfterReceipt>
   readonly requestRejectedOffline: Queue.Queue<RequestRejectedOffline>
+  readonly pullEvidenceWithheld: Queue.Queue<PullEvidenceWithheld>
 }
 
 export interface Service {
@@ -75,7 +80,7 @@ export interface Service {
   readonly takeDroppedReceipt: (spaceId: Identity.SpaceId) => Effect.Effect<boolean>
   readonly takeDuplicatePage: (spaceId: Identity.SpaceId) => Effect.Effect<boolean>
   readonly takePartitionAfterReceipt: (spaceId: Identity.SpaceId) => Effect.Effect<boolean>
-  readonly shouldWithholdPullEvidence: (spaceId: Identity.SpaceId) => Effect.Effect<boolean>
+  readonly awaitPullEvidenceRelease: (spaceId: Identity.SpaceId) => Effect.Effect<void>
   readonly awaitReceiptRelease: (spaceId: Identity.SpaceId) => Effect.Effect<void>
   readonly markReceiptReturned: (spaceId: Identity.SpaceId) => Effect.Effect<void>
   readonly takePostReceiptPull: (spaceId: Identity.SpaceId) => Effect.Effect<boolean>
@@ -85,6 +90,7 @@ export interface Service {
   readonly awaitReceiptReturned: (spaceId: Identity.SpaceId) => Effect.Effect<ReceiptReturned>
   readonly awaitPullCompletedAfterReceipt: (spaceId: Identity.SpaceId) => Effect.Effect<PullCompletedAfterReceipt>
   readonly awaitRequestRejectedOffline: (spaceId: Identity.SpaceId) => Effect.Effect<RequestRejectedOffline>
+  readonly awaitPullEvidenceWithheld: (spaceId: Identity.SpaceId) => Effect.Effect<PullEvidenceWithheld>
 }
 
 export class FaultInjection extends Context.Service<FaultInjection, Service>()(
@@ -99,11 +105,11 @@ export const layer: Layer.Layer<FaultInjection> = Layer.effect(
       dropNextReceipt: false,
       duplicateNextPage: false,
       partitionAfterNextReceipt: false,
-      withholdPullEvidence: false,
       postReceiptPullPending: false
     })
     const state = yield* Ref.make(new Map<Identity.SpaceId, FaultState>())
     const receiptGates = yield* Ref.make(new Map<Identity.SpaceId, Deferred.Deferred<void>>())
+    const pullEvidenceGates = yield* Ref.make(new Map<Identity.SpaceId, Deferred.Deferred<void>>())
     const eventQueues = yield* SynchronizedRef.make(new Map<Identity.SpaceId, EventQueues>())
     const queuesFor = (spaceId: Identity.SpaceId) =>
       SynchronizedRef.modifyEffect(
@@ -116,7 +122,8 @@ export const layer: Layer.Layer<FaultInjection> = Layer.effect(
             receiptDropped: yield* Queue.unbounded<ReceiptDropped>(),
             receiptReturned: yield* Queue.unbounded<ReceiptReturned>(),
             pullCompletedAfterReceipt: yield* Queue.unbounded<PullCompletedAfterReceipt>(),
-            requestRejectedOffline: yield* Queue.unbounded<RequestRejectedOffline>()
+            requestRejectedOffline: yield* Queue.unbounded<RequestRejectedOffline>(),
+            pullEvidenceWithheld: yield* Queue.unbounded<PullEvidenceWithheld>()
           }
           const next = new Map(spaces)
           next.set(spaceId, queues)
@@ -132,7 +139,8 @@ export const layer: Layer.Layer<FaultInjection> = Layer.effect(
               Queue.shutdown(queues.receiptDropped),
               Queue.shutdown(queues.receiptReturned),
               Queue.shutdown(queues.pullCompletedAfterReceipt),
-              Queue.shutdown(queues.requestRejectedOffline)
+              Queue.shutdown(queues.requestRejectedOffline),
+              Queue.shutdown(queues.pullEvidenceWithheld)
             ], { discard: true }))
         ),
         Effect.asVoid
@@ -168,8 +176,23 @@ export const layer: Layer.Layer<FaultInjection> = Layer.effect(
       dropNextReceipt: (spaceId) => set(spaceId, { dropNextReceipt: true }),
       duplicateNextPage: (spaceId) => set(spaceId, { duplicateNextPage: true }),
       partitionAfterNextReceipt: (spaceId) => set(spaceId, { partitionAfterNextReceipt: true }),
-      withholdPullEvidence: (spaceId) => set(spaceId, { withholdPullEvidence: true }),
-      releasePullEvidence: (spaceId) => set(spaceId, { withholdPullEvidence: false }),
+      withholdPullEvidence: Effect.fnUntraced(function*(spaceId) {
+        const gate = yield* Deferred.make<void>()
+        yield* Ref.update(pullEvidenceGates, (gates) => {
+          if (gates.has(spaceId)) return gates
+          const next = new Map(gates)
+          next.set(spaceId, gate)
+          return next
+        })
+      }),
+      releasePullEvidence: (spaceId) =>
+        Ref.modify(pullEvidenceGates, (gates) => {
+          const gate = gates.get(spaceId)
+          if (gate === undefined) return [Effect.void, gates] as const
+          const next = new Map(gates)
+          next.delete(spaceId)
+          return [Deferred.succeed(gate, undefined).pipe(Effect.asVoid), next] as const
+        }).pipe(Effect.flatten),
       holdNextReceipt: Effect.fnUntraced(function*(spaceId) {
         const gate = yield* Deferred.make<void>()
         yield* Ref.update(receiptGates, (gates) => {
@@ -189,10 +212,16 @@ export const layer: Layer.Layer<FaultInjection> = Layer.effect(
       takeDroppedReceipt: (spaceId) => take(spaceId, "dropNextReceipt"),
       takeDuplicatePage: (spaceId) => take(spaceId, "duplicateNextPage"),
       takePartitionAfterReceipt: (spaceId) => take(spaceId, "partitionAfterNextReceipt"),
-      shouldWithholdPullEvidence: (spaceId) =>
-        Ref.get(state).pipe(
-          Effect.map((spaces) => (spaces.get(spaceId) ?? initial()).withholdPullEvidence)
-        ),
+      awaitPullEvidenceRelease: Effect.fnUntraced(function*(spaceId) {
+        const gate = (yield* Ref.get(pullEvidenceGates)).get(spaceId)
+        if (gate === undefined) return
+        yield* queuesFor(spaceId).pipe(
+          Effect.flatMap((queues) =>
+            Queue.offer(queues.pullEvidenceWithheld, { _tag: "PullEvidenceWithheld", spaceId })
+          )
+        )
+        yield* Deferred.await(gate)
+      }),
       awaitReceiptRelease: (spaceId) =>
         Ref.get(receiptGates).pipe(
           Effect.flatMap((gates) => {
@@ -237,6 +266,11 @@ export const layer: Layer.Layer<FaultInjection> = Layer.effect(
               Effect.flatMap((queues) => Queue.offer(queues.requestRejectedOffline, event)),
               Effect.asVoid
             )
+          case "PullEvidenceWithheld":
+            return queuesFor(event.spaceId).pipe(
+              Effect.flatMap((queues) => Queue.offer(queues.pullEvidenceWithheld, event)),
+              Effect.asVoid
+            )
           default:
             return absurd(event)
         }
@@ -250,7 +284,9 @@ export const layer: Layer.Layer<FaultInjection> = Layer.effect(
       awaitPullCompletedAfterReceipt: (spaceId) =>
         queuesFor(spaceId).pipe(Effect.flatMap((queues) => LosslessQueue.take(queues.pullCompletedAfterReceipt))),
       awaitRequestRejectedOffline: (spaceId) =>
-        queuesFor(spaceId).pipe(Effect.flatMap((queues) => LosslessQueue.take(queues.requestRejectedOffline)))
+        queuesFor(spaceId).pipe(Effect.flatMap((queues) => LosslessQueue.take(queues.requestRejectedOffline))),
+      awaitPullEvidenceWithheld: (spaceId) =>
+        queuesFor(spaceId).pipe(Effect.flatMap((queues) => LosslessQueue.take(queues.pullEvidenceWithheld)))
     })
   })
 )
