@@ -99,6 +99,7 @@ export interface Session<M extends Ephemeral.AnyMember,> {
 }
 
 export interface Service {
+  /** The member stays joined until the caller's scope closes, so the caller owns the presence lifetime. */
   readonly session: <M extends Ephemeral.AnyMember,>(
     profile: M,
     options: SessionOptions<M>

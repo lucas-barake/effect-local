@@ -16,10 +16,12 @@ export interface WebLockHold {
 }
 
 export interface WebLocksService {
+  /** The lock is held until the caller's scope closes, so the caller decides how long it owns the name. */
   readonly acquire: (
     name: string,
     options?: { readonly steal?: boolean }
   ) => Effect.Effect<WebLockHold, never, Scope.Scope>
+  /** A granted lock is held until the caller's scope closes, so the caller decides how long it owns the name. */
   readonly tryAcquire: (name: string) => Effect.Effect<Option.Option<WebLockHold>, never, Scope.Scope>
   readonly held: Effect.Effect<ReadonlyArray<string>>
   readonly released: (name: string) => Effect.Effect<void>
@@ -122,10 +124,12 @@ export const layerWebLocksNavigator: EffectLayer.Layer<WebLocks> = EffectLayer.s
 
 export interface TabChannelConnection {
   readonly post: (frame: unknown) => Effect.Effect<void>
+  /** Each call attaches its own listener and queue, which the caller's scope detaches and shuts down. */
   readonly messages: Effect.Effect<Queue.Dequeue<unknown>, never, Scope.Scope>
 }
 
 export interface TabChannelService {
+  /** Each call opens its own BroadcastChannel, which stays open until the caller's scope closes. */
   readonly open: (name: string) => Effect.Effect<TabChannelConnection, never, Scope.Scope>
 }
 

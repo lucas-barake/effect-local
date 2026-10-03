@@ -10,6 +10,7 @@ export type InvalidationBatch =
 
 export interface InvalidationHub {
   readonly publish: (keys: ReadonlyArray<string>) => Effect.Effect<void>
+  /** Each call registers its own subscriber, which stays registered until the caller's scope closes. */
   readonly subscribe: Effect.Effect<Stream.Stream<InvalidationBatch>, never, Scope.Scope>
   readonly shutdown: Effect.Effect<void>
 }

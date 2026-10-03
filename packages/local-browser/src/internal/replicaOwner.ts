@@ -31,7 +31,9 @@ export interface Options {
 }
 
 export interface ReplicaOwner {
+  /** Pins the current term until the caller's scope closes. A fence interrupts the holder. */
   readonly lease: Effect.Effect<OwnerResources, never, Scope.Scope>
+  /** Pins the current term until the caller's scope closes. A fence waits for the holder to release it. */
   readonly drainingLease: Effect.Effect<OwnerResources, never, Scope.Scope>
   readonly isDraining: () => boolean
 }
