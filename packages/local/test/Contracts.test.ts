@@ -1,5 +1,8 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as Chunk from "effect/Chunk"
 import * as Effect from "effect/Effect"
+import * as HashMap from "effect/HashMap"
+import * as HashSet from "effect/HashSet"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Canonical from "../src/Canonical.js"
@@ -17,6 +20,9 @@ const Todo = Model.make("Todo", {
 })
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
 const ListTodos = Query.make("ListTodos", { success: Schema.Array(Todo.schema) })
+
+const collidingA = "a=U"
+const collidingB = "a@H"
 
 describe("domain contracts", () => {
   it.effect(
@@ -150,6 +156,132 @@ describe("domain contracts", () => {
       )
     })
   )
+
+  it.effect(
+    "keeps distinct Set items in a grow only set and deduplicates equal ones in any order",
+    Effect.fnUntraced(function*() {
+      const semantics = Field.growOnlySet(Schema.ReadonlySet(Schema.String))
+      const grown = yield* semantics.apply([new Set(["a"])], { _tag: "Add", value: new Set(["b"]) })
+      assert.deepStrictEqual(grown, [new Set(["a"]), new Set(["b"])])
+      assert.strictEqual(
+        yield* semantics.apply([new Set(["a", "b"])], { _tag: "Add", value: new Set(["b", "a"]) }).pipe(
+          Effect.map((current) => current.length)
+        ),
+        1
+      )
+    })
+  )
+
+  it.effect(
+    "keeps distinct Map items in a grow only set and deduplicates equal ones in any order",
+    Effect.fnUntraced(function*() {
+      const semantics = Field.growOnlySet(Schema.ReadonlyMap(Schema.String, Schema.Number))
+      const grown = yield* semantics.apply([new Map([["a", 1]])], { _tag: "Add", value: new Map([["a", 2]]) })
+      assert.deepStrictEqual(grown, [new Map([["a", 1]]), new Map([["a", 2]])])
+      const deduplicated = yield* semantics.apply([new Map([["a", 1], ["b", 2]])], {
+        _tag: "Add",
+        value: new Map([["b", 2], ["a", 1]])
+      })
+      assert.strictEqual(deduplicated.length, 1)
+    })
+  )
+
+  it("encodes Maps and Sets injectively regardless of insertion order", () => {
+    const encodings = [
+      new Set(),
+      new Set(["a"]),
+      new Set(["b"]),
+      new Set([1]),
+      new Map(),
+      new Map([["a", 1]]),
+      new Map([["a", 2]]),
+      new Map([["b", 1]]),
+      new Map([[new Set(["a"]), 1]]),
+      new Map([[new Set(["b"]), 1]]),
+      {},
+      [],
+      ["a"],
+      [["a", 1]],
+      ["\u001dset", "a"],
+      ["\u001dmap", ["a", 1]]
+    ].map(Canonical.stringify)
+    assert.strictEqual(new Set(encodings).size, encodings.length)
+    assert.strictEqual(Canonical.stringify(new Set(["a", "b"])), Canonical.stringify(new Set(["b", "a"])))
+    assert.strictEqual(
+      Canonical.hash(new Map([["a", 1], ["b", 2]])),
+      Canonical.hash(new Map([["b", 2], ["a", 1]]))
+    )
+    assert.notStrictEqual(Canonical.hash(new Set(["a"])), Canonical.hash(new Set(["b"])))
+  })
+
+  it.effect(
+    "deduplicates equal Effect collection items in a grow only set whatever their construction history",
+    Effect.fnUntraced(function*() {
+      const hashSets = Field.growOnlySet(Schema.HashSet(Schema.String))
+      const grownSets = yield* hashSets.apply([HashSet.make(collidingA, collidingB)], {
+        _tag: "Add",
+        value: HashSet.make(collidingB, collidingA)
+      })
+      assert.strictEqual(grownSets.length, 1)
+      const hashMaps = Field.growOnlySet(Schema.HashMap(Schema.String, Schema.Number))
+      const grownMaps = yield* hashMaps.apply([HashMap.make(["a", 2], ["b", 1])], {
+        _tag: "Add",
+        value: HashMap.mutate(HashMap.make(["b", 1]), (draft) => {
+          HashMap.set(draft, "a", 2)
+        })
+      })
+      assert.strictEqual(grownMaps.length, 1)
+      const chunks = Field.growOnlySet(Schema.Chunk(Schema.Number))
+      const grownChunks = yield* chunks.apply([Chunk.make(1, 2)], {
+        _tag: "Add",
+        value: Chunk.append(Chunk.of(1), 2)
+      })
+      assert.strictEqual(grownChunks.length, 1)
+      const distinct = yield* hashSets.apply([HashSet.make(collidingA)], {
+        _tag: "Add",
+        value: HashSet.make(collidingB)
+      })
+      assert.strictEqual(distinct.length, 2)
+    })
+  )
+
+  it("encodes Effect collections by their members rather than their internal structure", () => {
+    const equalPairs = [
+      [HashSet.make(collidingA, collidingB), HashSet.make(collidingB, collidingA)],
+      [HashMap.make([collidingA, 1], [collidingB, 2]), HashMap.make([collidingB, 2], [collidingA, 1])],
+      [
+        HashMap.make(["a", 2], ["b", 1]),
+        HashMap.mutate(HashMap.make(["b", 1]), (draft) => {
+          HashMap.set(draft, "a", 2)
+        })
+      ],
+      [Chunk.make(1, 2), Chunk.append(Chunk.of(1), 2)]
+    ] as const
+    for (const [left, right] of equalPairs) {
+      assert.strictEqual(Canonical.stringify(left), Canonical.stringify(right))
+    }
+    const encodings = [
+      HashSet.empty(),
+      HashSet.make(collidingA),
+      HashSet.make(collidingB),
+      HashMap.empty(),
+      HashMap.make(["a", 1]),
+      HashMap.make(["a", 2]),
+      Chunk.empty(),
+      Chunk.make(1, 2),
+      Chunk.make(2, 1),
+      new Set([collidingA]),
+      new Map([["a", 1]]),
+      [1, 2],
+      ["\u001dhashset", collidingA],
+      ["\u001dhashmap", ["a", 1]],
+      ["\u001dchunk", 1, 2],
+      { "~effect/HashSet": "~effect/HashSet" },
+      { "~effect/HashMap": "~effect/HashMap" },
+      { "~effect/Chunk": "~effect/Chunk" }
+    ].map(Canonical.stringify)
+    assert.strictEqual(new Set(encodings).size, encodings.length)
+  })
 
   it.effect(
     "canonicalizes object order and enforces protocol page limits",
