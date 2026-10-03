@@ -1,7 +1,7 @@
 import type * as Schema from "effect/Schema"
 import * as Identity from "./Identity.js"
 import * as ComponentName from "./internal/componentName.js"
-import type * as SchemaInput from "./internal/schemaInput.js"
+import * as SchemaInput from "./internal/schemaInput.js"
 import * as SecondaryIndex from "./SecondaryIndex.js"
 
 export interface Model<
@@ -61,6 +61,8 @@ export function make(
   }
 ): Any {
   ComponentName.validate("Model", name)
+  SchemaInput.requireStringKeys(options.key)
+  SchemaInput.requireStringKeys(options.schema)
   const indexes = options.indexes ?? {}
   for (const [indexName, index] of Object.entries(indexes)) {
     SecondaryIndex.validate(indexName, index)

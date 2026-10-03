@@ -78,6 +78,8 @@ export function make(name: string, options: {
   if (options.payload !== undefined) payloadSchema = SchemaInput.normalize(options.payload)
   const successSchema = options.success ?? SchemaInput.Void
   const errorSchema: ErrorSchema = options.error ?? Schema.Never
+  SchemaInput.requireStringKeys(successSchema)
+  SchemaInput.requireStringKeys(errorSchema)
   const handler = Context.Service<
     HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema>,
     HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema>

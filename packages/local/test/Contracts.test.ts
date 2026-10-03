@@ -4,6 +4,7 @@ import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Canonical from "../src/Canonical.js"
 import * as Definition from "../src/Definition.js"
+import * as Ephemeral from "../src/Ephemeral.js"
 import * as Field from "../src/Field.js"
 import * as Model from "../src/Model.js"
 import * as Mutation from "../src/Mutation.js"
@@ -195,6 +196,30 @@ describe("domain contracts", () => {
       assert.throws(() => Mutation.make(tooLong, { version: 1 }), /at most 256/)
     })
   )
+
+  it("rejects symbol keyed fields in wire schemas at construction", () => {
+    const tag = Symbol.for("effect-local/test/tag")
+    const symbolStruct = Schema.Struct({ id: Schema.String, [tag]: Schema.String })
+    const nested = Schema.Struct({ id: Schema.String, inner: symbolStruct })
+    const symbolRecord = Schema.Record(Schema.Symbol, Schema.String)
+    assert.throws(() => Mutation.make("SymbolPayload", { version: 1, payload: symbolStruct }), /symbol/)
+    assert.throws(() => Mutation.make("NestedPayload", { version: 1, payload: { value: nested } }), /symbol/)
+    assert.throws(() => Mutation.make("SymbolSuccess", { version: 1, success: symbolRecord }), /symbol/)
+    assert.throws(() => Model.make("SymbolModel", { version: 1, key: Schema.String, schema: nested }), /symbol/)
+    assert.throws(() => Query.make("SymbolQuery", { success: Schema.Array(symbolStruct) }), /symbol/)
+    assert.throws(() => Ephemeral.make("SymbolEvent", { kind: "event", payload: symbolStruct }), /symbol/)
+
+    type Tree = {
+      readonly label: string
+      readonly children: ReadonlyArray<Tree>
+    }
+    const Tree: Schema.Codec<Tree> = Schema.Struct({
+      label: Schema.String,
+      children: Schema.Array(Schema.suspend((): Schema.Codec<Tree> => Tree))
+    })
+    const TreeModel = Model.make("Tree", { version: 1, key: Schema.String, schema: Tree })
+    assert.strictEqual(TreeModel.schema, Tree)
+  })
 
   it.effect(
     "applies opt in field semantics without replication metadata",
