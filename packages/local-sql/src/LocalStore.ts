@@ -1689,9 +1689,17 @@ export const layer = (
         projectionGeneration: number,
         installed: typeof Rows.ClientMetaRow.Type
       ) {
+        const touched = new Map<string, Protocol.EntityKey>()
         for (const row of rows) {
-          yield* replayPendingRow(row, replaySchemaGeneration, projectionGeneration, installed)
+          const prior = yield* Codec.parse(row.changes_json).pipe(
+            Effect.flatMap((value) => Codec.decode(Schema.Array(Protocol.EntityChange), value))
+          )
+          const written = yield* replayPendingRow(row, replaySchemaGeneration, projectionGeneration, installed)
+          for (const change of [...prior, ...written]) {
+            touched.set(SqlTransaction.entityKey(change.entity), change.entity)
+          }
         }
+        yield* markProjectionDirty(touched.values())
         yield* sql`DELETE FROM effect_local_client_visible_entities_data
           WHERE space_id = ${options.spaceId} AND schema_generation = ${replaySchemaGeneration}
             AND projection_generation = ${projectionGeneration} AND EXISTS (
@@ -1704,7 +1712,10 @@ export const layer = (
 
       const rebuildProjection = Effect.gen(function*() {
         let current = yield* meta
-        if (current.projection_replay_generation === null) return yield* Effect.void
+        if (current.projection_replay_generation === null) {
+          const unchanged: ReadonlyArray<Protocol.EntityKey> = []
+          return unchanged
+        }
         yield* validateFence(current)
         let target = current.projection_replay_generation
         if (target === current.active_projection_generation) {
@@ -1811,7 +1822,7 @@ export const layer = (
           yield* Effect.yieldNow
         }
 
-        yield* lane.withTransaction(Effect.gen(function*() {
+        const rebuilt = yield* lane.withTransaction(Effect.gen(function*() {
           const row = yield* meta
           yield* validateFence(row)
           if (
@@ -1819,6 +1830,15 @@ export const layer = (
             row.projection_replay_cursor !== `pending:${after}`
           ) {
             return yield* new ReplicaError.StorageCorrupt({ message: "Projection promotion fence changed" })
+          }
+          const dirtyRows = yield* findDirtyEntities(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const entities: Array<Protocol.EntityKey> = []
+          for (const dirtyRow of dirtyRows) {
+            entities.push(Protocol.EntityKey.make({
+              model: dirtyRow.model,
+              modelVersion: dirtyRow.model_version,
+              key: yield* Codec.parse(dirtyRow.entity_key)
+            }))
           }
           yield* sql`UPDATE effect_local_client_spaces SET
             active_projection_generation = ${target},
@@ -1829,26 +1849,28 @@ export const layer = (
             WHERE space_id = ${options.spaceId}`
           yield* sql`DELETE FROM effect_local_client_projection_dirty
             WHERE space_id = ${options.spaceId}`
-          return yield* Effect.void
+          return entities
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
 
-        while (true) {
-          const deleted = yield* lane.withTransaction(Effect.gen(function*() {
-            const ids = yield* findProjectionRowIds({
-              schemaGeneration: replaySchemaGeneration,
-              projectionGeneration: target,
-              keep: true,
-              limit: projectionReplayBatchSize
-            }).pipe(Effect.mapError(StorageUnavailable.make))
-            if (ids.length === 0) return false
-            yield* sql`DELETE FROM effect_local_client_visible_entities_data
-              WHERE rowid IN ${sql.in(ids.map((id) => id.row_id))}`
-            return true
-          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
-          if (!deleted) break
-          yield* Effect.yieldNow
-        }
-        return yield* Effect.void
+        yield* Effect.gen(function*() {
+          while (true) {
+            const deleted = yield* lane.withTransaction(Effect.gen(function*() {
+              const ids = yield* findProjectionRowIds({
+                schemaGeneration: replaySchemaGeneration,
+                projectionGeneration: target,
+                keep: true,
+                limit: projectionReplayBatchSize
+              }).pipe(Effect.mapError(StorageUnavailable.make))
+              if (ids.length === 0) return false
+              yield* sql`DELETE FROM effect_local_client_visible_entities_data
+                WHERE rowid IN ${sql.in(ids.map((id) => id.row_id))}`
+              return true
+            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            if (!deleted) break
+            yield* Effect.yieldNow
+          }
+        }).pipe(Effect.onError(() => deferInvalidation(rebuilt, [])))
+        return rebuilt
       })
 
       const inProjectionGate = <A, E extends Mutation.TaggedError, R,>(effect: Effect.Effect<A, E, R>) =>
@@ -1869,6 +1891,7 @@ export const layer = (
 
       const withProjectionGate = <A, E extends Mutation.TaggedError, R,>(effect: Effect.Effect<A, E, R>) =>
         withProjectionPermit(rebuildProjection.pipe(
+          Effect.flatMap((rebuilt) => deferInvalidation(rebuilt, [])),
           Effect.andThen(flushDeferredInvalidations),
           Effect.andThen(effect)
         ))
@@ -1908,6 +1931,7 @@ export const layer = (
       ) =>
         withProjectionPermitThen(
           rebuildProjection.pipe(
+            Effect.flatMap((rebuilt) => deferInvalidation(rebuilt, [])),
             Effect.andThen(flushDeferredInvalidations),
             Effect.andThen(effect)
           ),
@@ -2373,7 +2397,7 @@ export const layer = (
           if (Option.isSome(delta)) {
             entities = [...delta.value.entities]
           } else {
-            yield* rebuildProjection
+            entities = [...entities, ...(yield* rebuildProjection)]
           }
         }
         if (Option.isSome(page)) yield* flushDeferredInvalidations
@@ -2728,7 +2752,7 @@ export const layer = (
             const pendingChanged = Option.isSome(transactionResult.canceledReplacement)
             yield* deferInvalidation(invalidationEntities, invalidationReceiptIds, pendingChanged)
             const preparedSettlements = yield* prepareSettlementsInGate
-            yield* rebuildProjection
+            yield* deferInvalidation(yield* rebuildProjection, [])
             const preparedInvalidations = yield* prepareDeferredInvalidations
             const settlements = yield* finalizeSettlementsInGate(preparedSettlements)
             yield* notifyDeferredInvalidations(preparedInvalidations)
@@ -3200,6 +3224,7 @@ export const layer = (
               installed_snapshot_sequence = ${manifest.sequence},
               installed_snapshot_terminal_sequence = ${manifest.terminalSequenceThrough}
               WHERE space_id = ${options.spaceId}`
+            yield* markProjectionDirty(dirty.values())
             yield* requestProjectionReplay(yield* meta)
             yield* sql`DELETE FROM effect_local_client_scoped_bootstrap_entries
               WHERE space_id = ${options.spaceId}`
@@ -3211,8 +3236,7 @@ export const layer = (
         ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         return yield* Effect.gen(function*() {
           yield* recordBootstrapInstallMetric
-          const entities = Array.from(dirty.values())
-          yield* rebuildProjection
+          const entities = yield* rebuildProjection
           const deletedSettlements = yield* deleteSettledPending(settlements)
           yield* reactivity.withBatch(
             invalidate(entities, prunedReceiptIds, pendingChanged || deletedSettlements.length > 0)
@@ -3326,12 +3350,11 @@ export const layer = (
           yield* sql`UPDATE effect_local_client_spaces SET
             replication_view_id = NULL, replication_view_revision = 0
             WHERE space_id = ${options.spaceId}`
+          yield* markProjectionDirty(dirty.values())
           yield* requestProjectionReplay(yield* meta)
         })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
         yield* reportReplicationView(false)
-        yield* rebuildProjection
-        const entities = Array.from(dirty.values())
-        yield* invalidate(entities)
+        yield* invalidate(yield* rebuildProjection)
       }).pipe(
         withProjectionPermit,
         Effect.uninterruptible,
@@ -3610,7 +3633,9 @@ export const layer = (
           }
         })),
         Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
-        Effect.andThen(rebuildProjection)
+        Effect.andThen(rebuildProjection),
+        Effect.flatMap((rebuilt) => deferInvalidation(rebuilt, [])),
+        Effect.andThen(flushDeferredInvalidations)
       )
       yield* withProjectionPermit(restoreProjection)
       yield* initializePendingMetric(yield* readPendingCount)
@@ -3888,7 +3913,7 @@ export const layer = (
             Effect.gen(function*() {
               if (entries.length === 0) {
                 if (applyOptions?.publishProjection !== false) {
-                  yield* rebuildProjection
+                  yield* deferInvalidation(yield* rebuildProjection, [])
                   const preparedInvalidations = yield* prepareDeferredInvalidations
                   const deletedSettlements = yield* deleteSettledPending(deferredSettlements)
                   deferredSettlements.length = 0
@@ -4022,7 +4047,7 @@ export const layer = (
                 deferredSettlements.length > 0
               )
               if (applyOptions?.publishProjection !== false) {
-                yield* rebuildProjection
+                yield* deferInvalidation(yield* rebuildProjection, [])
                 const preparedInvalidations = yield* prepareDeferredInvalidations
                 const deletedSettlements = yield* deleteSettledPending(deferredSettlements)
                 deferredSettlements.length = 0
