@@ -81,40 +81,21 @@ export const hasUnpairedSurrogate = (value: string) => value.search(unpairedSurr
 const surrogateEscape = 0xd7ff
 const surrogateEscapeOffset = 0x100
 
-const isHighSurrogate = (code: number) => code >= 0xd800 && code <= 0xdbff
-const isLowSurrogate = (code: number) => code >= 0xdc00 && code <= 0xdfff
+const escapableSurrogate = new RegExp(`\\ud7ff|${unpairedSurrogate.source}`, "g")
+const escapedSurrogate = /\ud7ff[\s\S]?/g
 
-const escapeSurrogates = (value: string) => {
-  let escaped = ""
-  for (let index = 0; index < value.length; index++) {
-    const code = value.charCodeAt(index)
-    if (isHighSurrogate(code) && isLowSurrogate(value.charCodeAt(index + 1))) {
-      escaped += value.slice(index, index + 2)
-      index += 1
-      continue
-    }
-    if (code < surrogateEscape || code > 0xdfff) {
-      escaped += value[index]
-      continue
-    }
-    escaped += String.fromCharCode(surrogateEscape, code - surrogateEscape + surrogateEscapeOffset)
-  }
-  return escaped
-}
+const escapeSurrogates = (value: string) =>
+  value.replaceAll(
+    escapableSurrogate,
+    (character) =>
+      String.fromCharCode(surrogateEscape, character.charCodeAt(0) - surrogateEscape + surrogateEscapeOffset)
+  )
 
-const unescapeSurrogates = (value: string) => {
-  let decoded = ""
-  for (let index = 0; index < value.length; index++) {
-    const code = value.charCodeAt(index)
-    if (code !== surrogateEscape) {
-      decoded += value[index]
-      continue
-    }
-    index += 1
-    decoded += String.fromCharCode(value.charCodeAt(index) - surrogateEscapeOffset + surrogateEscape)
-  }
-  return decoded
-}
+const unescapeSurrogates = (value: string) =>
+  value.replaceAll(
+    escapedSurrogate,
+    (escaped) => String.fromCharCode(escaped.charCodeAt(1) - surrogateEscapeOffset + surrogateEscape)
+  )
 
 const decodeEscapedText = (value: string) => {
   let decoded = ""
