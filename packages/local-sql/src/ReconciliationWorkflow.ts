@@ -283,18 +283,11 @@ const handler = (
     })
     const runActivity = Effect.fnUntraced(function*(
       name: string,
-      execute: (
-        runtime: RuntimeServices,
-        observeGeneration: Effect.Effect<void>
-      ) => Effect.Effect<void, ReplicaError.ReplicaError>
+      execute: (runtime: RuntimeServices) => Effect.Effect<void, ReplicaError.ReplicaError>
     ) {
       let attempt = 1
       while (true) {
         let observedGeneration: number | undefined
-        const observeGeneration = (runtime: RuntimeServices) =>
-          Effect.map(runtime.reconciliation.generation, (generation) => {
-            observedGeneration = generation
-          })
         const result = yield* Activity.make({
           name: `${name}/${attempt}`,
           error: ReplicaError.ReplicaError,
@@ -303,9 +296,8 @@ const handler = (
             if (runtime.local.membershipIncarnation !== membershipIncarnation) {
               return yield* new ReplicaError.SpaceUnavailable({ spaceId: payload.spaceId })
             }
-            const observe = observeGeneration(runtime)
-            yield* observe
-            return yield* lease.admit(execute(runtime, observe))
+            observedGeneration = yield* runtime.reconciliation.generation
+            return yield* lease.admit(execute(runtime))
           }))
         }).pipe(Effect.result)
         if (Result.isSuccess(result)) return
@@ -336,12 +328,7 @@ const handler = (
       }
     })
 
-    yield* runActivity("sync", ({ local, reconciliation }, observeGeneration) =>
-      validateScope(local).pipe(
-        Effect.andThen(reconciliation.sync),
-        Effect.andThen(observeGeneration),
-        Effect.andThen(validateScope(local))
-      ))
+    yield* runActivity("sync", ({ local, reconciliation }) => Effect.andThen(validateScope(local), reconciliation.sync))
     yield* runActivity("complete", ({ local }) =>
       Effect.andThen(validateScope(local), local.completeReconciliation(payload.generation)))
     yield* Effect.scoped(Effect.gen(function*() {
