@@ -1193,6 +1193,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             withActive(entry, (runtime) =>
               runtime.quarantineGate.withPermit(
                 Effect.fnUntraced(function*() {
+                  yield* MutationDescriptor.validate(options.definition, mutation)
                   const found = yield* runtime.local.quarantineByMutation(mutationId)
                   if (Option.isNone(found)) {
                     const continuation = yield* runtime.local.quarantineCancellation(mutationId)

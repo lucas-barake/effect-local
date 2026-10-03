@@ -3530,6 +3530,7 @@ export const layer = (
         payload: Mutation.Payload<M>
       ) =>
         withProjectionGate(Effect.gen(function*() {
+          yield* MutationDescriptor.validate(options.definition, mutation)
           const result = yield* lane.withTransaction(Effect.gen(function*() {
             const quarantined = yield* findQuarantineByMutation(mutationId).pipe(
               Effect.mapError(StorageUnavailable.make)
@@ -3761,6 +3762,7 @@ export const layer = (
           "space.id": options.spaceId,
           "client.id": options.clientId
         })
+        yield* MutationDescriptor.validate(options.definition, mutation)
         const result = yield* Deferred.make<
           Protocol.PendingMutation,
           ReplicaError.ReplicaError | Mutation.Rejection<M>
