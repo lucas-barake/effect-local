@@ -33,6 +33,7 @@ import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as FaultInjection from "../src/FaultInjection.js"
 import * as TestServer from "../src/TestServer.js"
+import * as VirtualTime from "./fixtures/VirtualTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
@@ -169,14 +170,6 @@ const synchronize = (local: LocalStore.Service, sync: SyncEngine.Service) =>
       Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
     )
   ).pipe(Effect.flatMap((reconciliation) => reconciliation.sync))
-
-const advanceClockUntil = Effect.fnUntraced(
-  function*<A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) {
-    const fiber = yield* Effect.forkChild(effect, { startImmediately: true })
-    while (fiber.pollUnsafe() === undefined) yield* TestClock.adjust("1 millis")
-    return yield* Fiber.join(fiber)
-  }
-)
 
 describe("test synchronization faults", () => {
   it.effect(
@@ -454,7 +447,7 @@ describe("test synchronization faults", () => {
         Stream.filter((status) => status._tag !== "Online" && status._tag !== "Connecting"),
         Stream.runHead,
         Effect.map(Option.getOrThrow),
-        advanceClockUntil
+        VirtualTime.advanceClockUntil
       )
       assert.deepStrictEqual(settled, { _tag: "Failed", pending: 0, message: "CapacityExceeded" })
     })

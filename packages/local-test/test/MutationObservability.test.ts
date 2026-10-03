@@ -20,11 +20,11 @@ import * as Option from "effect/Option"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
-import * as TestClock from "effect/testing/TestClock"
 import * as FaultInjection from "../src/FaultInjection.js"
 import * as LosslessQueue from "../src/internal/losslessQueue.js"
 import * as TestReplica from "../src/TestReplica.js"
 import * as TestServer from "../src/TestServer.js"
+import * as VirtualTime from "./fixtures/VirtualTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
@@ -151,14 +151,6 @@ const makeServices = Effect.gen(function*() {
   return { faults, replica }
 })
 
-const advanceClockUntil = Effect.fnUntraced(
-  function*<A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) {
-    const fiber = yield* Effect.forkChild(effect, { startImmediately: true })
-    while (fiber.pollUnsafe() === undefined) yield* TestClock.adjust("1 millis")
-    return yield* Fiber.join(fiber)
-  }
-)
-
 const subscribe = <A, E,>(stream: Stream.Stream<A, E>) =>
   stream.pipe(
     Stream.runHead,
@@ -207,7 +199,7 @@ describe("mutation observability", () => {
       assert.strictEqual(firstCommitted.receipt.mutationId, pending.envelope.mutationId)
       assert.strictEqual(dropped.receipt.mutationId, pending.envelope.mutationId)
       yield* faults.holdNextReceipt(spaceId)
-      const secondCommitted = yield* advanceClockUntil(faults.awaitReceiptCommitted(spaceId))
+      const secondCommitted = yield* VirtualTime.advanceClockUntil(faults.awaitReceiptCommitted(spaceId))
       assert.deepStrictEqual(secondCommitted.receipt, firstCommitted.receipt)
       const barrier = yield* space.mutate(PutTodo, { id: "trigger", title: "next reconciliation" })
       yield* faults.partitionAfterNextReceipt(spaceId)
@@ -216,7 +208,7 @@ describe("mutation observability", () => {
       assert.deepStrictEqual(returned.receipt, firstCommitted.receipt)
       yield* faults.awaitRequestRejectedOffline(spaceId)
       yield* faults.heal(spaceId)
-      const barrierReturned = yield* advanceClockUntil(faults.awaitReceiptReturned(spaceId))
+      const barrierReturned = yield* VirtualTime.advanceClockUntil(faults.awaitReceiptReturned(spaceId))
       assert.strictEqual(barrierReturned.receipt.mutationId, barrier.envelope.mutationId)
       yield* faults.awaitPullCompletedAfterReceipt(spaceId)
 

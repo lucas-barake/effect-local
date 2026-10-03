@@ -169,6 +169,42 @@ export const layer: Layer.Layer<FaultInjection> = Layer.effect(
         next.set(spaceId, { ...current, [key]: false })
         return [current[key], next]
       })
+    const emit = (event: Event): Effect.Effect<void> => {
+      switch (event._tag) {
+        case "ReceiptCommitted":
+          return queuesFor(event.spaceId).pipe(
+            Effect.flatMap((queues) => Queue.offer(queues.receiptCommitted, event)),
+            Effect.asVoid
+          )
+        case "ReceiptDropped":
+          return queuesFor(event.spaceId).pipe(
+            Effect.flatMap((queues) => Queue.offer(queues.receiptDropped, event)),
+            Effect.asVoid
+          )
+        case "ReceiptReturned":
+          return queuesFor(event.spaceId).pipe(
+            Effect.flatMap((queues) => Queue.offer(queues.receiptReturned, event)),
+            Effect.asVoid
+          )
+        case "PullCompletedAfterReceipt":
+          return queuesFor(event.spaceId).pipe(
+            Effect.flatMap((queues) => Queue.offer(queues.pullCompletedAfterReceipt, event)),
+            Effect.asVoid
+          )
+        case "RequestRejectedOffline":
+          return queuesFor(event.spaceId).pipe(
+            Effect.flatMap((queues) => Queue.offer(queues.requestRejectedOffline, event)),
+            Effect.asVoid
+          )
+        case "PullEvidenceWithheld":
+          return queuesFor(event.spaceId).pipe(
+            Effect.flatMap((queues) => Queue.offer(queues.pullEvidenceWithheld, event)),
+            Effect.asVoid
+          )
+        default:
+          return absurd(event)
+      }
+    }
     return FaultInjection.of({
       state: get,
       partition: (spaceId) => set(spaceId, { online: false }),
@@ -215,11 +251,7 @@ export const layer: Layer.Layer<FaultInjection> = Layer.effect(
       awaitPullEvidenceRelease: Effect.fnUntraced(function*(spaceId) {
         const gate = (yield* Ref.get(pullEvidenceGates)).get(spaceId)
         if (gate === undefined) return
-        yield* queuesFor(spaceId).pipe(
-          Effect.flatMap((queues) =>
-            Queue.offer(queues.pullEvidenceWithheld, { _tag: "PullEvidenceWithheld", spaceId })
-          )
-        )
+        yield* emit({ _tag: "PullEvidenceWithheld", spaceId })
         yield* Deferred.await(gate)
       }),
       awaitReceiptRelease: (spaceId) =>
@@ -239,42 +271,7 @@ export const layer: Layer.Layer<FaultInjection> = Layer.effect(
         ),
       markReceiptReturned: (spaceId) => set(spaceId, { postReceiptPullPending: true }),
       takePostReceiptPull: (spaceId) => take(spaceId, "postReceiptPullPending"),
-      emit: (event) => {
-        switch (event._tag) {
-          case "ReceiptCommitted":
-            return queuesFor(event.spaceId).pipe(
-              Effect.flatMap((queues) => Queue.offer(queues.receiptCommitted, event)),
-              Effect.asVoid
-            )
-          case "ReceiptDropped":
-            return queuesFor(event.spaceId).pipe(
-              Effect.flatMap((queues) => Queue.offer(queues.receiptDropped, event)),
-              Effect.asVoid
-            )
-          case "ReceiptReturned":
-            return queuesFor(event.spaceId).pipe(
-              Effect.flatMap((queues) => Queue.offer(queues.receiptReturned, event)),
-              Effect.asVoid
-            )
-          case "PullCompletedAfterReceipt":
-            return queuesFor(event.spaceId).pipe(
-              Effect.flatMap((queues) => Queue.offer(queues.pullCompletedAfterReceipt, event)),
-              Effect.asVoid
-            )
-          case "RequestRejectedOffline":
-            return queuesFor(event.spaceId).pipe(
-              Effect.flatMap((queues) => Queue.offer(queues.requestRejectedOffline, event)),
-              Effect.asVoid
-            )
-          case "PullEvidenceWithheld":
-            return queuesFor(event.spaceId).pipe(
-              Effect.flatMap((queues) => Queue.offer(queues.pullEvidenceWithheld, event)),
-              Effect.asVoid
-            )
-          default:
-            return absurd(event)
-        }
-      },
+      emit,
       awaitReceiptCommitted: (spaceId) =>
         queuesFor(spaceId).pipe(Effect.flatMap((queues) => LosslessQueue.take(queues.receiptCommitted))),
       awaitReceiptDropped: (spaceId) =>
