@@ -283,26 +283,37 @@ const handler = (
     })
     const runActivity = Effect.fnUntraced(function*(
       name: string,
-      execute: (runtime: RuntimeServices) => Effect.Effect<void, ReplicaError.ReplicaError>
+      execute: (
+        runtime: RuntimeServices,
+        observeGeneration: Effect.Effect<void>
+      ) => Effect.Effect<void, ReplicaError.ReplicaError>
     ) {
       let attempt = 1
       while (true) {
+        let observedGeneration: number | undefined
+        const observeGeneration = (runtime: RuntimeServices) =>
+          Effect.map(runtime.reconciliation.generation, (generation) => {
+            observedGeneration = generation
+          })
         const result = yield* Activity.make({
           name: `${name}/${attempt}`,
           error: ReplicaError.ReplicaError,
-          execute: Effect.scoped(lease.acquire.pipe(
-            Effect.flatMap((runtime) => {
-              if (runtime.local.membershipIncarnation !== membershipIncarnation) {
-                return Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: payload.spaceId }))
-              }
-              return lease.admit(execute(runtime))
-            })
-          ))
+          execute: Effect.scoped(Effect.gen(function*() {
+            const runtime = yield* lease.acquire
+            if (runtime.local.membershipIncarnation !== membershipIncarnation) {
+              return yield* new ReplicaError.SpaceUnavailable({ spaceId: payload.spaceId })
+            }
+            const observe = observeGeneration(runtime)
+            yield* observe
+            return yield* lease.admit(execute(runtime, observe))
+          }))
         }).pipe(Effect.result)
         if (Result.isSuccess(result)) return
-        yield* Effect.scoped(lease.acquire.pipe(
-          Effect.flatMap((runtime) => runtime.reconciliation.failed(result.failure))
-        ))
+        yield* Effect.scoped(Effect.gen(function*() {
+          const runtime = yield* lease.acquire
+          const generation = observedGeneration ?? (yield* runtime.reconciliation.generation)
+          yield* runtime.reconciliation.failed(result.failure, generation)
+        }))
         if (
           result.failure._tag === "CredentialRejected" ||
           result.failure._tag === "ProtocolInvalid" ||
@@ -325,18 +336,23 @@ const handler = (
       }
     })
 
-    yield* runActivity("sync", ({ local, reconciliation }) =>
+    yield* runActivity("sync", ({ local, reconciliation }, observeGeneration) =>
       validateScope(local).pipe(
         Effect.andThen(reconciliation.sync),
+        Effect.andThen(observeGeneration),
         Effect.andThen(validateScope(local))
       ))
     yield* runActivity("complete", ({ local }) =>
       Effect.andThen(validateScope(local), local.completeReconciliation(payload.generation)))
-    yield* Effect.scoped(lease.acquire.pipe(
-      Effect.flatMap((runtime) =>
-        runtime.reconciliation.succeeded
+    yield* Effect.scoped(Effect.gen(function*() {
+      const runtime = yield* lease.acquire
+      const generation = yield* runtime.reconciliation.generation
+      yield* runtime.reconciliation.succeeded.pipe(
+        Effect.tapError((error) =>
+          runtime.reconciliation.failed(error, generation)
+        )
       )
-    ))
+    }))
     return undefined
   }, Effect.provideService(ConnectionLane.Priority, "Background"))
 
@@ -568,9 +584,11 @@ const layerSchedulerWithConfiguration = (
         while (true) {
           yield* LosslessQueue.take(wake)
           yield* awaitAuthenticationChange
+          let observedGeneration = yield* reconciliation.generation
           const result = yield* Effect.gen(function*() {
             while (true) {
               yield* awaitAuthenticationChange
+              observedGeneration = yield* reconciliation.generation
               const generations = yield* local.reconciliationGenerations
               if (generations.completed >= generations.requested) return
               const state = yield* local.replicationState
@@ -595,12 +613,12 @@ const layerSchedulerWithConfiguration = (
           const error = result.failure
           if (error._tag === "CredentialRejected") {
             if (error.credentialGeneration === undefined) {
-              yield* reconciliation.failed(error)
+              yield* reconciliation.failed(error, observedGeneration)
               yield* Effect.logWarning("Rejected credential did not include its generation")
               return
             }
             const admission = yield* admitCredentialPause
-            yield* reconciliation.failed(error)
+            yield* reconciliation.failed(error, observedGeneration)
             yield* startCredentialWait(error.credentialGeneration, admission)
             yield* Deferred.await(admission.gate)
             retryAttempt = 0
@@ -613,7 +631,7 @@ const layerSchedulerWithConfiguration = (
             yield* requestAndNotify
             continue
           }
-          yield* reconciliation.failed(error)
+          yield* reconciliation.failed(error, observedGeneration)
           if (
             error._tag === "AuthenticatorUnavailable" ||
             error._tag === "ServerUnavailable" ||

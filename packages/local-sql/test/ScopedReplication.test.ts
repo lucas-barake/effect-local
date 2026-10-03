@@ -2285,6 +2285,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
       const syncCalls = yield* Ref.make(0)
       const reconciliation = Reconciler.Reconciliation.of({
         sync: Ref.update(syncCalls, (count) => count + 1),
+        generation: Effect.succeed(0),
         failed: () => Effect.void,
         watchFailed: () => Effect.void,
         succeeded: Effect.void,

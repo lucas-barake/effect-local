@@ -26,7 +26,8 @@ import * as SyncEngine from "./SyncEngine.js"
 
 export interface ReconciliationService {
   readonly sync: Effect.Effect<void, ReplicaError.ReplicaError>
-  readonly failed: (error: ReplicaError.ReplicaError) => Effect.Effect<void>
+  readonly generation: Effect.Effect<number>
+  readonly failed: (error: ReplicaError.ReplicaError, observedGeneration: number) => Effect.Effect<void>
   readonly watchFailed: (error: ReplicaError.ReplicaError) => Effect.Effect<void>
   readonly succeeded: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly status: Effect.Effect<ReplicaStatus.ReplicaStatus>
@@ -348,11 +349,12 @@ export const makeManager = Effect.fnUntraced(function*(options: {
   const handleFailure = Effect.fnUntraced(function*(
     space: ManagedState,
     error: ReplicaError.ReplicaError,
-    transportGeneration: number
+    transportGeneration: number,
+    observedGeneration: number
   ) {
     if (error._tag === "CredentialRejected") {
       const admission = yield* admitCredentialPause(space, error)
-      yield* space.reconciliation.failed(error)
+      yield* space.reconciliation.failed(error, observedGeneration)
       if (admission !== undefined) yield* startCredentialWait(space, admission)
       return
     }
@@ -364,16 +366,18 @@ export const makeManager = Effect.fnUntraced(function*(options: {
         space.halted = true
       })
     }
-    yield* space.reconciliation.failed(error).pipe(Effect.andThen(policy))
+    yield* space.reconciliation.failed(error, observedGeneration).pipe(Effect.andThen(policy))
   })
 
   const runTurn = Effect.fnUntraced(function*(space: ManagedState, epoch: number) {
     const transportGeneration = yield* remote.transportGeneration
+    let observedGeneration = yield* space.reconciliation.generation
     const turn = Effect.gen(function*() {
       yield* space.requests.observe
       const generations = yield* space.local.reconciliationGenerations
       if (generations.completed >= generations.requested) return
       yield* space.reconciliation.sync
+      observedGeneration = yield* space.reconciliation.generation
       yield* space.local.completeReconciliation(generations.requested)
       yield* space.reconciliation.succeeded
       space.retryAttempt = 0
@@ -393,7 +397,9 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       yield* Queue.offer(queue, { spaceId: current.spaceId, generation: current.generation })
     }).pipe(Effect.uninterruptible)
     yield* turn.pipe(
-      Effect.catch((error) => handleFailure(space, error, transportGeneration).pipe(Effect.catch(() => Effect.void))),
+      Effect.catch((error) =>
+        handleFailure(space, error, transportGeneration, observedGeneration).pipe(Effect.catch(() => Effect.void))
+      ),
       Effect.ensuring(finishTurn)
     )
   })
@@ -548,20 +554,25 @@ export const layerOnePass = (
       let syncAttempted = false
       let syncing = false
       let failedSinceSyncStarted = false
-      const reportedSyncFailures = new WeakSet<ReplicaError.ReplicaError>()
+      let syncGeneration = 0
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
       const setStatus = (value: ReplicaStatus.ReplicaStatus) =>
         Ref.set(status, value).pipe(
           Effect.andThen(local.invalidateStatus),
           Effect.andThen(options.onStatusChange?.(value) ?? Effect.void)
         )
-      const reportFailure = (error: ReplicaError.ReplicaError, preserveConnecting: boolean) =>
+      const reportFailure = (
+        error: ReplicaError.ReplicaError,
+        preserveConnecting: boolean,
+        observedGeneration: number
+      ) =>
         local.pendingCount.pipe(
           Effect.catch(() => Effect.succeed(0)),
           Effect.flatMap((pending) =>
             Ref.modify(
               status,
               (current): readonly [ReplicaStatus.ReplicaStatus | undefined, ReplicaStatus.ReplicaStatus] => {
+                if (syncGeneration > observedGeneration) return [undefined, current]
                 if (error._tag === "CredentialRejected") {
                   const next = { _tag: "NeedsAuthentication", pending } as const
                   return [next, next]
@@ -592,22 +603,20 @@ export const layerOnePass = (
             )
           )
         )
-      const failed = (error: ReplicaError.ReplicaError) =>
+      const failed = (error: ReplicaError.ReplicaError, observedGeneration: number) =>
+        reportFailure(error, false, observedGeneration)
+      const watchFailed = (error: ReplicaError.ReplicaError) =>
         Effect.suspend(() => {
-          if (reportedSyncFailures.has(error)) return Effect.void
-          return reportFailure(error, false)
-        })
-      const watchFailed = (error: ReplicaError.ReplicaError) => {
-        if (error._tag !== "AuthorizationDenied") return reportFailure(error, true)
-        return gate.withPermit(
-          local.revokeReplication.pipe(
-            Effect.matchEffect({
-              onFailure: (revokeError) => reportFailure(revokeError, false),
-              onSuccess: () => reportFailure(error, true)
-            })
+          if (error._tag !== "AuthorizationDenied") return reportFailure(error, true, Number.POSITIVE_INFINITY)
+          return gate.withPermit(
+            local.revokeReplication.pipe(
+              Effect.matchEffect({
+                onFailure: (revokeError) => reportFailure(revokeError, false, Number.POSITIVE_INFINITY),
+                onSuccess: () => reportFailure(error, true, Number.POSITIVE_INFINITY)
+              })
+            )
           )
-        )
-      }
+        })
       const succeeded = Effect.gen(function*() {
         if (!syncAttempted || failedSinceSyncStarted) return
         const { cursor, pending } = yield* local.progress
@@ -811,6 +820,7 @@ export const layerOnePass = (
 
       const sync = gate.withPermit(
         Effect.gen(function*() {
+          syncGeneration += 1
           syncAttempted = true
           syncing = true
           failedSinceSyncStarted = false
@@ -823,14 +833,18 @@ export const layerOnePass = (
           Effect.ensuring(Effect.sync(() => {
             syncing = false
           })),
-          Effect.tapError((error) => {
-            reportedSyncFailures.add(error)
-            return reportFailure(error, false)
-          })
+          Effect.tapError((error) => reportFailure(error, false, syncGeneration))
         )
       ).pipe(Effect.withSpan("Reconciliation.sync"))
 
-      return Reconciliation.of({ sync, failed, watchFailed, succeeded, status: Ref.get(status) })
+      return Reconciliation.of({
+        sync,
+        generation: Effect.sync(() => syncGeneration),
+        failed,
+        watchFailed,
+        succeeded,
+        status: Ref.get(status)
+      })
     })
   )
 
@@ -902,34 +916,33 @@ export const layerInMemoryScheduler = (
           const delay = Configuration.retryMillis(retryTiming, retryAttempt)
           return backoff(remote, delay, error, transportGeneration).pipe(Effect.andThen(notify))
         })
-      const turn = (transportGeneration: number) =>
-        requests.observe.pipe(
-          Effect.andThen(local.reconciliationGenerations),
-          Effect.flatMap((generations) => {
-            if (generations.completed >= generations.requested) return Effect.void
-            return reconciliation.sync.pipe(
-              Effect.forkChild({ startImmediately: true }),
-              Effect.flatMap(Fiber.await),
-              Effect.flatMap((exit) => {
-                if (exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause)) {
-                  return Effect.fail(new ReplicaError.ServerUnavailable())
-                }
-                return exit
-              }),
-              Effect.andThen(local.completeReconciliation(generations.requested)),
-              Effect.andThen(reconciliation.succeeded),
-              Effect.tap(() =>
-                Effect.sync(() => {
-                  retryAttempt = 0
-                })
-              )
-            )
-          }),
+      const turn = Effect.fnUntraced(function*(transportGeneration: number) {
+        let observedGeneration = yield* reconciliation.generation
+        yield* Effect.gen(function*() {
+          yield* requests.observe
+          const generations = yield* local.reconciliationGenerations
+          if (generations.completed >= generations.requested) return
+          const exit = yield* reconciliation.sync.pipe(
+            Effect.forkChild({ startImmediately: true }),
+            Effect.flatMap(Fiber.await)
+          )
+          if (exit._tag === "Failure" && Cause.hasInterruptsOnly(exit.cause)) {
+            observedGeneration = yield* reconciliation.generation
+            yield* new ReplicaError.ServerUnavailable()
+          }
+          yield* exit
+          observedGeneration = yield* reconciliation.generation
+          yield* local.completeReconciliation(generations.requested)
+          yield* reconciliation.succeeded
+          retryAttempt = 0
+        }).pipe(
           Effect.catch(Effect.fnUntraced(function*(error) {
             if (error._tag === "CredentialRejected") {
-              if (error.credentialGeneration === undefined) return yield* reconciliation.failed(error)
+              if (error.credentialGeneration === undefined) {
+                return yield* reconciliation.failed(error, observedGeneration)
+              }
               const admission = yield* admitCredentialPause
-              yield* reconciliation.failed(error)
+              yield* reconciliation.failed(error, observedGeneration)
               yield* startCredentialWait(error.credentialGeneration, admission)
               yield* Deferred.await(admission.gate)
               retryAttempt = 0
@@ -940,13 +953,14 @@ export const layerInMemoryScheduler = (
               yield* Deferred.await(pause.value)
               return yield* notify
             }
-            if (!isTransientFailure(error)) return yield* reconciliation.failed(error)
-            return yield* reconciliation.failed(error).pipe(
+            if (!isTransientFailure(error)) return yield* reconciliation.failed(error, observedGeneration)
+            return yield* reconciliation.failed(error, observedGeneration).pipe(
               Effect.andThen(Effect.logWarning("Reconciliation failed", error)),
               Effect.andThen(retryAfterBackoff(error, transportGeneration))
             )
           }))
         )
+      })
       const worker = Effect.andThen(LosslessQueue.take(wake), awaitAuthenticationChange).pipe(
         Effect.andThen(remote.transportGeneration),
         Effect.flatMap(turn),
@@ -980,7 +994,9 @@ export const layerInMemoryScheduler = (
                   onFailure: Effect.fnUntraced(function*(error) {
                     if (watchEpoch !== authenticationEpoch) return yield* watch()
                     if (error._tag === "CredentialRejected") {
-                      if (error.credentialGeneration === undefined) return yield* reconciliation.failed(error)
+                      if (error.credentialGeneration === undefined) {
+                        return yield* reconciliation.failed(error, yield* reconciliation.generation)
+                      }
                       const admission = yield* admitCredentialPause
                       yield* reconciliation.watchFailed(error)
                       yield* startCredentialWait(error.credentialGeneration, admission)

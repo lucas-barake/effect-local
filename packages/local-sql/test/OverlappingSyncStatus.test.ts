@@ -13,11 +13,13 @@ import * as Queue from "effect/Queue"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as SqlClient from "effect/sql/SqlClient"
 import * as Stream from "effect/Stream"
+import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
 import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as LocalStore from "../src/LocalStore.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
 import * as Reconciler from "../src/Reconciler.js"
+import * as ReconciliationWorkflow from "../src/ReconciliationWorkflow.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
@@ -94,27 +96,19 @@ const harness = Effect.fnUntraced(function*() {
     bootstrap: server.bootstrap,
     watch: () => Stream.never
   })
-  const reconciliation = Context.get(
-    yield* Layer.build(
-      Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
-        Layer.provide(
-          LocalStore.layer(localOptions).pipe(
-            Layer.provide(layerRuntime),
-            Layer.provide(Layer.succeedContext(gatedDatabase))
-          )
-        ),
-        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote))
-      )
-    ),
-    Reconciler.Reconciliation
+  const layerLocal = LocalStore.layer(localOptions).pipe(
+    Layer.provide(layerRuntime),
+    Layer.provide(Layer.succeedContext(gatedDatabase))
   )
+  const layerRemote = Layer.succeed(SyncEngine.SyncEngine, remote)
   const holdNextPull = Effect.fnUntraced(function*(fail: boolean) {
     const release = yield* Deferred.make<void>()
     nextPull = { fail, release }
     return release
   })
   return {
-    reconciliation,
+    layerLocal,
+    layerRemote,
     heldPulls,
     pendingCountPauses: gate.pauses,
     holdNextPull,
@@ -124,11 +118,25 @@ const harness = Effect.fnUntraced(function*() {
   }
 })
 
+const onePass = Effect.fnUntraced(function*(
+  controls: Effect.Success<ReturnType<typeof harness>>
+) {
+  const context = yield* Layer.build(
+    Reconciler.layerOnePass({ definition: Domain.definition, spaceId }).pipe(
+      Layer.provide(controls.layerLocal),
+      Layer.provide(controls.layerRemote)
+    )
+  )
+  return Context.get(context, Reconciler.Reconciliation)
+})
+
 describe("overlapping sync passes", () => {
   it.effect(
     "reports Online after a pass that starts while an earlier pass reports its failure",
     Effect.fnUntraced(function*() {
-      const { heldPulls, holdNextPull, pauseNextPendingCount, pendingCountPauses, reconciliation } = yield* harness()
+      const controls = yield* harness()
+      const { heldPulls, holdNextPull, pauseNextPendingCount, pendingCountPauses } = controls
+      const reconciliation = yield* onePass(controls)
       yield* reconciliation.sync
       assert.strictEqual((yield* reconciliation.status)._tag, "Online")
 
@@ -150,11 +158,14 @@ describe("overlapping sync passes", () => {
   it.effect(
     "keeps a later pass Online when a scheduler reports the earlier pass failure again",
     Effect.fnUntraced(function*() {
-      const { heldPulls, holdNextPull, reconciliation } = yield* harness()
+      const controls = yield* harness()
+      const { heldPulls, holdNextPull } = controls
+      const reconciliation = yield* onePass(controls)
       yield* reconciliation.sync
 
       const releaseFailure = yield* holdNextPull(true)
       yield* Deferred.succeed(releaseFailure, undefined)
+      const observedBeforeEarlier = yield* reconciliation.generation
       const earlierFailure = yield* reconciliation.sync.pipe(
         Effect.andThen(Effect.die("expected the earlier pass to fail")),
         Effect.catchTag("ServerUnavailable", Effect.succeed)
@@ -165,11 +176,47 @@ describe("overlapping sync passes", () => {
       const releaseLater = yield* holdNextPull(false)
       const later = yield* reconciliation.sync.pipe(Effect.forkChild({ startImmediately: true }))
       yield* Queue.take(heldPulls)
-      yield* reconciliation.failed(earlierFailure)
+      yield* reconciliation.failed(earlierFailure, observedBeforeEarlier)
       yield* Deferred.succeed(releaseLater, undefined)
 
       yield* Fiber.join(later)
       assert.strictEqual((yield* reconciliation.status)._tag, "Online")
+    })
+  )
+
+  it.effect(
+    "keeps a later pass Online when the workflow reports its failed activity after a later pass started",
+    Effect.fnUntraced(function*() {
+      const controls = yield* harness()
+      const { heldPulls, holdNextPull, pauseNextPendingCount, pendingCountPauses } = controls
+      const releaseFailure = yield* holdNextPull(true)
+      const context = yield* Layer.build(
+        ReconciliationWorkflow.layer({
+          definition: Domain.definition,
+          spaceId,
+          clientId,
+          retryDelay: "1 minute",
+          maximumRetryDelay: "1 minute"
+        }).pipe(
+          Layer.provide(controls.layerLocal),
+          Layer.provide(controls.layerRemote),
+          Layer.provide(WorkflowEngine.layerMemory)
+        )
+      )
+      const reconciler = Context.get(context, Reconciler.Reconciler)
+      yield* Queue.take(heldPulls)
+
+      yield* pauseNextPendingCount
+      yield* Deferred.succeed(releaseFailure, undefined)
+      const activityReport = yield* Queue.take(pendingCountPauses)
+      yield* pauseNextPendingCount
+      yield* Deferred.succeed(activityReport.release, undefined)
+      const workflowReport = yield* Queue.take(pendingCountPauses)
+      const later = yield* reconciler.sync.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.succeed(workflowReport.release, undefined)
+
+      yield* Fiber.join(later)
+      assert.strictEqual((yield* reconciler.status)._tag, "Online")
     })
   )
 })
