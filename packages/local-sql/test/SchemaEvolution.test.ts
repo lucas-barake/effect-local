@@ -2020,6 +2020,32 @@ describe("client schema evolution", () => {
   )
 
   it.effect(
+    "rejects a resubmission whose descriptor is not the registered mutation",
+    Effect.fnUntraced(
+      function*() {
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const original = yield* v1.mutate(PutTodoV1, { id: "47", title: "original" })
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        const writable = yield* buildStore(definitionV2, layerHandlersV2, evolution)
+        const replica = yield* buildReplica(definitionV2, layerHandlersV2, unavailableSync, evolution)
+
+        const outcome = yield* replica.resubmitQuarantined(original.envelope.mutationId, PutTodoV1, {
+          id: "47",
+          title: "replacement"
+        }).pipe(Effect.flip)
+
+        assert.isTrue(pipe(outcome, Schema.is(ReplicaError.ProtocolInvalid)))
+        assert.deepStrictEqual(yield* writable.pending, [])
+        assert.deepStrictEqual((yield* replica.quarantine).map(({ envelope }) => envelope.mutationId), [
+          original.envelope.mutationId
+        ])
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect(
     "keeps the original recoverable when its replacement is quarantined by promotion",
     Effect.fnUntraced(
       function*() {
@@ -2057,11 +2083,7 @@ describe("client schema evolution", () => {
           title: "replacement",
           done: false
         }).pipe(Effect.result)
-        const rejectedError = expectFailure(rejectedResult)
-        assert.strictEqual(rejectedError._tag, "SchemaPolicyRejectedError")
-        if (rejectedError._tag === "SchemaPolicyRejectedError") {
-          assert.strictEqual(rejectedError.reason, "schema-policy-rejected-v3")
-        }
+        assert.strictEqual(expectFailure(rejectedResult)._tag, "ProtocolInvalid")
         const replacementQuarantineIsPresent = Option.isSome(
           yield* v3.quarantineByMutation(original.envelope.mutationId)
         )

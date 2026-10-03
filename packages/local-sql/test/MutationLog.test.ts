@@ -29,8 +29,9 @@ import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Ref from "effect/Ref"
 import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
+import * as SchemaGetter from "effect/SchemaGetter"
 import * as SqlClient from "effect/sql/SqlClient"
-import type * as SqlError from "effect/sql/SqlError"
+import * as SqlError from "effect/sql/SqlError"
 import * as SqlSchema from "effect/sql/SqlSchema"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
@@ -98,6 +99,39 @@ const envelope = Effect.fnUntraced(function*(
   }
   return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
 })
+
+const MirrorTodo = Mutation.make("MirrorTodo", { version: 1, payload: { id: Schema.String } })
+const mirrorDefinition = Definition.make({
+  version: 1,
+  models: [Domain.Todo],
+  mutations: [Domain.PutTodo, MirrorTodo]
+})
+const layerMirrorPutTodoHandler = Domain.PutTodo.toLayer(({ payload, transaction }) =>
+  transaction.set(Domain.Todo, payload.id, payload).pipe(Effect.as(payload))
+)
+const layerMirrorTodoHandler = MirrorTodo.toLayer(Effect.fnUntraced(function*({ payload, transaction }) {
+  const source = yield* transaction.get(Domain.Todo, payload.id)
+  if (Option.isNone(source)) return
+  const mirrorId = `${payload.id}-mirror`
+  yield* transaction.set(Domain.Todo, mirrorId, { ...source.value, id: mirrorId })
+}))
+const layerMirrorRuntime = MutationRuntime.layer(mirrorDefinition).pipe(
+  Layer.provide(Layer.merge(layerMirrorPutTodoHandler, layerMirrorTodoHandler))
+)
+
+const Marker = Model.make("Marker", {
+  version: 1,
+  key: Schema.String,
+  schema: Schema.Null.pipe(Schema.decodeTo(Schema.Undefined, {
+    decode: SchemaGetter.transform(() => undefined),
+    encode: SchemaGetter.transform(() => null)
+  })).annotate({ identifier: "UndefinedFromNull" })
+})
+const PutMarker = Mutation.make("PutMarker", { version: 1, payload: { id: Schema.String } })
+const markerDefinition = Definition.make({ version: 1, models: [Marker], mutations: [PutMarker] })
+const layerMarkerRuntime = MutationRuntime.layer(markerDefinition).pipe(
+  Layer.provide(PutMarker.toLayer(({ payload, transaction }) => transaction.set(Marker, payload.id, undefined)))
+)
 
 const withServices = (layerSql: Layer.Layer<SqlClient.SqlClient, SqlError.SqlError>) =>
   Layer.mergeAll(
@@ -3584,6 +3618,192 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       const receipts = yield* Effect.forEach(pending, (mutation) => local.receipt(mutation.envelope.mutationId))
       assert.isTrue(receipts.every(Option.isSome))
       assert.strictEqual(yield* local.pendingCount, 0)
+    })))
+
+  const mirrorServer = Effect.fnUntraced(function*() {
+    const server = yield* service(
+      ServerStore.ServerStore,
+      ServerStore.layerTrusted({ ...serverHistory, definition: mirrorDefinition }).pipe(
+        Layer.provide(layerMirrorRuntime),
+        Layer.provide(serverDatabase())
+      )
+    )
+    const sourceIdentity = {
+      spaceId,
+      clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+      mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000051"),
+      localSequence: Identity.LocalSequence.make(1),
+      basis: Identity.ServerSequence.make(0),
+      name: Domain.PutTodo.name,
+      payload: Domain.todo("source"),
+      digestVersion: 1 as const,
+      membershipIncarnation: defaultMembershipIncarnation,
+      sourceSchema: mirrorDefinition.schemaIdentity,
+      mutationVersion: Domain.PutTodo.version
+    }
+    const admitted = yield* server.admitBatch(
+      Protocol.SubmitBatchRequest.make({
+        envelopes: [
+          Protocol.MutationEnvelope.make({
+            ...sourceIdentity,
+            digest: yield* Protocol.mutationDigest(sourceIdentity).pipe(Effect.provide(NodeCrypto.layer))
+          })
+        ],
+        schema: mirrorDefinition.schemaIdentity
+      }),
+      null
+    )
+    assert.deepStrictEqual(admitted.receipts.map((receipt) => receipt._tag), ["Accepted"])
+    return server
+  })
+
+  const installMirrorView = Effect.fnUntraced(function*(local: LocalStore.Service, server: ServerStore.Service) {
+    const required = yield* server.pull(Protocol.PullRequest.make({
+      ...pullRequest(),
+      schema: mirrorDefinition.schemaIdentity
+    }))
+    if (!("_tag" in required)) assert.fail("expected bootstrap")
+    const page = yield* server.bootstrap(Protocol.BootstrapRequest.make({
+      ...bootstrapRequest(required.manifest),
+      schema: mirrorDefinition.schemaIdentity
+    }))
+    yield* local.prepareBootstrap(page.manifest)
+    assert.isTrue(yield* local.stageBootstrapPage(page))
+    return yield* local.installBootstrap(page.manifest)
+  })
+
+  const countInvalidations = Effect.fnUntraced(function*(reactivity: Reactivity.Reactivity, key: string) {
+    const count = { value: 0 }
+    const cancel = reactivity.registerUnsafe([ReactivityKey.entity(spaceId, Domain.Todo.name, key)], () => {
+      count.value += 1
+    })
+    yield* Effect.addFinalizer(() => Effect.sync(cancel))
+    return count
+  })
+
+  it.effect("stores a model value that decodes to undefined on the client and the server", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const markerScope = Protocol.ReplicationScope.make({ models: [Marker.name] })
+      const markerLocal = (id: Identity.ClientId) =>
+        service(
+          LocalStore.Store,
+          LocalStore.layer({
+            ...clientHistory,
+            definition: markerDefinition,
+            spaceId,
+            clientId: id,
+            scope: markerScope
+          }).pipe(
+            Layer.provide(layerMarkerRuntime),
+            Layer.provide(clientDatabase())
+          )
+        )
+      const server = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layerTrusted({ ...serverHistory, definition: markerDefinition }).pipe(
+          Layer.provide(layerMarkerRuntime),
+          Layer.provide(serverDatabase())
+        )
+      )
+      const writer = yield* markerLocal(clientId)
+      const pending = yield* writer.mutate(PutMarker, { id: "marker" })
+      assert.isTrue(Option.isSome(yield* writer.get(Marker, "marker")))
+
+      const receipt = yield* server.submit(pending.envelope)
+      assert.strictEqual(receipt._tag, "Accepted")
+
+      const readerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000003")
+      const reader = yield* markerLocal(readerId)
+      const required = yield* server.pull(Protocol.PullRequest.make({
+        ...pullRequest(null, 10, readerId, markerScope),
+        schema: markerDefinition.schemaIdentity
+      }))
+      if (!("_tag" in required)) assert.fail("expected bootstrap")
+      const page = yield* server.bootstrap(Protocol.BootstrapRequest.make({
+        ...bootstrapRequest(required.manifest, -1, 10, markerScope),
+        schema: markerDefinition.schemaIdentity
+      }))
+      yield* reader.prepareBootstrap(page.manifest)
+      assert.isTrue(yield* reader.stageBootstrapPage(page))
+      yield* reader.installBootstrap(page.manifest)
+      assert.isTrue(Option.isSome(yield* reader.get(Marker, "marker")))
+    })))
+
+  it.effect("invalidates entities that pending replay creates while installing a bootstrap", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const server = yield* mirrorServer()
+      const layerClientDatabase = clientDatabase()
+      const layerLocal = LocalStore.layer({ ...clientHistory, definition: mirrorDefinition, spaceId, clientId }).pipe(
+        Layer.provide(layerMirrorRuntime),
+        Layer.provide(layerClientDatabase)
+      )
+      const context = yield* Layer.build(Layer.merge(layerLocal, layerClientDatabase))
+      const local = Context.get(context, LocalStore.Store)
+      const pending = yield* local.mutate(MirrorTodo, { id: "source" })
+      assert.deepStrictEqual(pending.changes, [])
+      const mirrorInvalidations = yield* countInvalidations(
+        Context.get(context, Reactivity.Reactivity),
+        "source-mirror"
+      )
+
+      yield* installMirrorView(local, server)
+
+      const mirrored = yield* local.get(Domain.Todo, "source-mirror")
+      assert.strictEqual(Option.getOrThrow(mirrored).id, "source-mirror")
+      assert.isAbove(mirrorInvalidations.value, 0)
+    })))
+
+  it.effect("invalidates bootstrap and replayed entities when an interrupted replay resumes", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const server = yield* mirrorServer()
+      const actualSql = yield* SqliteClient.make({ filename: ":memory:", disableWAL: true }).pipe(
+        Effect.provide(Reactivity.layer)
+      )
+      let failReplayCursor = false
+      const failingSql = new Proxy(actualSql, {
+        apply: (target, thisArgument, argumentsList: Parameters<typeof actualSql>) => {
+          const source: unknown = argumentsList[0]
+          if (
+            failReplayCursor && Array.isArray(source) && source.join("").includes("SET projection_replay_cursor") &&
+            argumentsList.includes("pending:2")
+          ) {
+            failReplayCursor = false
+            return Effect.fail(
+              new SqlError.SqlError({ reason: new SqlError.UnknownError({ cause: "injected replay failure" }) })
+            )
+          }
+          return Reflect.apply(target, thisArgument, argumentsList)
+        }
+      })
+      const layerClientDatabase = withServices(Layer.succeed(SqlClient.SqlClient, failingSql))
+      const layerLocal = LocalStore.layer({
+        ...clientHistory,
+        definition: mirrorDefinition,
+        spaceId,
+        clientId,
+        projectionReplayBatchSize: 1
+      }).pipe(
+        Layer.provide(layerMirrorRuntime),
+        Layer.provide(layerClientDatabase)
+      )
+      const context = yield* Layer.build(Layer.merge(layerLocal, layerClientDatabase))
+      const local = Context.get(context, LocalStore.Store)
+      const reactivity = Context.get(context, Reactivity.Reactivity)
+      yield* local.mutate(MirrorTodo, { id: "source" })
+      yield* local.mutate(Domain.PutTodo, Domain.todo("second"))
+      const sourceInvalidations = yield* countInvalidations(reactivity, "source")
+      const mirrorInvalidations = yield* countInvalidations(reactivity, "source-mirror")
+
+      failReplayCursor = true
+      const interrupted = yield* expectedFailure(installMirrorView(local, server))
+      assert.strictEqual(interrupted._tag, "StorageUnavailable")
+
+      yield* local.mutate(Domain.PutTodo, Domain.todo("third"))
+
+      const mirrored = yield* local.get(Domain.Todo, "source-mirror")
+      assert.strictEqual(Option.getOrThrow(mirrored).id, "source-mirror")
+      assert.isAbove(sourceInvalidations.value, 0)
+      assert.isAbove(mirrorInvalidations.value, 0)
     })))
 
   it.effect("invalidates the receipt dependency when a terminal receipt is stored", () =>

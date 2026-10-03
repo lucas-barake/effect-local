@@ -2,6 +2,7 @@ import { NodeCrypto } from "@effect/platform-node"
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
@@ -88,6 +89,12 @@ const layerReplica = <E,>(
     Layer.provide(Reactivity.layer)
   )
 
+const UnregisteredPutTodo = Mutation.make("PutTodo", {
+  version: 2,
+  payload: Domain.Todo.schema,
+  success: Domain.Todo.schema
+})
+
 const space = Replica.Replica.use((replica) => replica.space(spaceId))
 const provideOffline = Effect.provide(layerReplica(layerDisconnectedSync))
 const provideOnline = Effect.provide(layerReplica(layerConnectedSync))
@@ -122,6 +129,37 @@ describe("caller-minted mutation ids", () => {
       assert.strictEqual(outcome, "conflict")
       const pending = yield* target.pending
       assert.strictEqual(pending.length, 1)
+    }, provideOffline)
+  )
+
+  it.effect(
+    "rejects a descriptor that is not the registered mutation without consuming a local sequence",
+    Effect.fnUntraced(function*() {
+      const target = yield* space
+      const outcome = yield* target.mutate(UnregisteredPutTodo, Domain.todo("todo-1")).pipe(
+        Effect.as("admitted" as const),
+        Effect.catchTag("ProtocolInvalid", () => Effect.succeed("rejected" as const))
+      )
+      assert.strictEqual(outcome, "rejected")
+      assert.deepStrictEqual(yield* target.pending, [])
+      const admitted = yield* target.mutate(Domain.PutTodo, Domain.todo("todo-2"))
+      assert.strictEqual(admitted.envelope.localSequence, 1)
+      assert.deepStrictEqual((yield* target.pending).map((entry) => entry.envelope.mutationId), [
+        admitted.envelope.mutationId
+      ])
+    }, provideOffline)
+  )
+
+  it.effect(
+    "rejects a descriptor that is not the registered mutation before replaying a recorded id",
+    Effect.fnUntraced(function*() {
+      const target = yield* space
+      yield* target.mutate(Domain.PutTodo, Domain.todo("todo-1"), { mutationId })
+      const outcome = yield* target.mutate(UnregisteredPutTodo, Domain.todo("todo-1"), { mutationId }).pipe(
+        Effect.as("replayed" as const),
+        Effect.catchTag("ProtocolInvalid", () => Effect.succeed("rejected" as const))
+      )
+      assert.strictEqual(outcome, "rejected")
     }, provideOffline)
   )
 

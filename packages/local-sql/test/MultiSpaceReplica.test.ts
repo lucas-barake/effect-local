@@ -1665,6 +1665,63 @@ describe("multi space Replica", () => {
   )
 
   it.effect(
+    "removes projection dirty rows from a partial catch up page when the space is left",
+    Effect.fnUntraced(function*() {
+      const services = yield* probedServices(() => undefined)
+      const viewId = Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000004")
+      const replicaLayer = (remote: SyncEngine.SyncEngine["Service"]) =>
+        SqlReplica.layer({
+          ...clientHistory,
+          definition: Domain.definition,
+          clientId,
+          initialSpaces: [spaceA],
+          retryDelay: "1 hour",
+          maximumRetryDelay: "1 hour"
+        }).pipe(
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+          Layer.provide(services.layer)
+        )
+
+      const seedScope = yield* Scope.make()
+      const seedContext = yield* Layer.buildWithScope(replicaLayer(remoteService), seedScope)
+      const seedSpace = yield* Context.get(seedContext, Replica.Replica).space(spaceA)
+      yield* seedSpace.mutate(Domain.PutTodo, Domain.todo("local"))
+      yield* seedSpace.deactivate
+      yield* Scope.close(seedScope, Exit.void)
+      yield* services.sql`UPDATE effect_local_client_spaces
+        SET replication_view_id = ${viewId}, replication_view_revision = 0`
+
+      const remoteChange = Protocol.Upsert.make({
+        entity: Protocol.EntityKey.make({
+          model: Domain.Todo.name,
+          modelVersion: Domain.Todo.version,
+          key: "remote"
+        }),
+        value: Domain.todo("remote", "from server")
+      })
+      const secondPullEntered = yield* Deferred.make<void>()
+      let pulls = 0
+      const remote = SyncEngine.SyncEngine.of({
+        ...remoteService,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          pulls += 1
+          if (pulls === 1) return viewPage(services.crypto, viewId, request, [remoteChange], true)
+          return Deferred.succeed(secondPullEntered, undefined).pipe(Effect.andThen(Effect.never))
+        }
+      })
+      const replica = Context.get(yield* Layer.build(replicaLayer(remote)), Replica.Replica)
+      yield* Deferred.await(secondPullEntered)
+      yield* replica.leave(spaceA)
+
+      const residue = yield* services.sql<{ readonly count: number }>`SELECT COUNT(*) AS count
+        FROM effect_local_client_projection_dirty WHERE space_id = ${spaceA}`
+      assert.strictEqual(residue[0].count, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "serves a get on another space while settlement streams stay open on every foreground slot",
     Effect.fnUntraced(function*() {
       const spaceC = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000003")
