@@ -142,7 +142,7 @@ export type ViewChange = typeof ViewChange.Type
 
 const ReplicationModelName = Schema.NonEmptyString.check(Schema.isMaxLength(256))
 
-const WindowComponentValue = Schema.Union([Schema.String, Schema.Number, Schema.Boolean])
+const WindowComponentValue = Schema.Union([Schema.String, Schema.Finite, Schema.Boolean])
 export type WindowComponentValue = typeof WindowComponentValue.Type
 
 export const ReplicationWindowBounds = Schema.Struct({

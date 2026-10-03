@@ -1529,6 +1529,58 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
   )
 
   it.effect(
+    "rejects a non-finite replication window bound before it reaches the view",
+    Effect.fnUntraced(function*() {
+      const server = yield* service(ServerStore.ServerStore, makeServer())
+      const windowed = {
+        models: [],
+        windows: [{
+          model: Domain.Message.name,
+          index: "byChat",
+          count: 1,
+          partitions: [{ key: ["chat-a"], bounds: { gt: Number.POSITIVE_INFINITY } }]
+        }]
+      }
+      const outcome = yield* server.pullAuthorized({ ...pullRequest(), scope: windowed }, "reader").pipe(
+        Effect.result
+      )
+      if (outcome._tag !== "Failure") assert.fail("expected a protocol rejection")
+      assert.strictEqual(outcome.failure._tag, "ProtocolInvalid")
+    }, provideNodeCrypto)
+  )
+
+  it.effect(
+    "rejects a non-finite replication window bound without corrupting the durable scope",
+    Effect.fnUntraced(function*() {
+      const local = yield* LocalStore.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId: readerId,
+        scope
+      }).pipe(
+        Layer.provide(layerRuntime),
+        Layer.provide(layerClientDatabase),
+        Layer.build,
+        Effect.map(Context.get(LocalStore.Store))
+      )
+      const before = yield* local.replicationState
+      const outcome = yield* local.setScope({
+        models: [],
+        windows: [{
+          model: Domain.Message.name,
+          index: "byChat",
+          count: 1,
+          partitions: [{ key: ["chat-a"], bounds: { lt: Number.NaN } }]
+        }]
+      }).pipe(Effect.result)
+      if (outcome._tag !== "Failure") assert.fail("expected a protocol rejection")
+      assert.strictEqual(outcome.failure._tag, "ProtocolInvalid")
+      assert.deepStrictEqual(yield* local.replicationState, before)
+    }, provideNodeCrypto)
+  )
+
+  it.effect(
     "denies the whole scope before disclosing a manifest",
     Effect.fnUntraced(function*() {
       const server = yield* makeServer((input) => {

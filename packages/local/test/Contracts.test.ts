@@ -285,6 +285,31 @@ describe("domain contracts", () => {
   )
 
   it.effect(
+    "rejects non-finite replication window values",
+    Effect.fnUntraced(function*() {
+      for (const value of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN]) {
+        const decoded = yield* Schema.decodeUnknownEffect(Protocol.ReplicationWindowPartition)({
+          key: [value],
+          bounds: { gt: value }
+        }).pipe(Effect.result)
+        assert.strictEqual(decoded._tag, "Failure")
+
+        const validated = yield* Protocol.validateReplicationScope(chatDefinition, {
+          models: [],
+          windows: [{
+            model: ChatMessage.name,
+            index: "byChat",
+            count: 1,
+            partitions: [{ key: ["a"], bounds: { gt: value } }]
+          }]
+        }).pipe(Effect.result)
+        if (validated._tag !== "Failure") assert.fail(`expected ${value} to be rejected`)
+        assert.strictEqual(validated.failure._tag, "ProtocolInvalid")
+      }
+    })
+  )
+
+  it.effect(
     "rejects duplicate replication window partition keys",
     Effect.fnUntraced(function*() {
       const IndexedTodo = Model.make("IndexedTodo", {
