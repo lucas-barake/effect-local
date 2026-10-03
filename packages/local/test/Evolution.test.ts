@@ -77,7 +77,169 @@ const evolution = Evolution.make({
   steps: [oneToTwo]
 })
 
+const expectFailure = <A, E,>(result: Result.Result<A, E>): E => {
+  if (Result.isFailure(result)) return result.failure
+  return assert.fail("expected Effect failure")
+}
+
+const PriceCents = Model.make("Price", {
+  version: 1,
+  key: Schema.String,
+  schema: Schema.Struct({ amount: Schema.Number })
+})
+const PriceDollars = Model.make("Price", {
+  version: 2,
+  key: Schema.String,
+  schema: Schema.Struct({ amount: Schema.Number })
+})
+const SkuV1 = Model.make("Sku", { version: 1, key: Schema.String, schema: Schema.Struct({ id: Schema.String }) })
+const SkuV2 = Model.make("Sku", { version: 2, key: Schema.String, schema: Schema.Struct({ id: Schema.String }) })
+const ChargeCents = Mutation.make("Charge", { version: 1, payload: Schema.String, success: Schema.Number })
+const ChargeDollars = Mutation.make("Charge", { version: 2, payload: Schema.String, success: Schema.Number })
+const centsDefinition = Definition.make({ version: 1, models: [PriceCents, SkuV1], mutations: [ChargeCents] })
+const dollarsDefinition = Definition.make({ version: 2, models: [PriceDollars, SkuV2], mutations: [ChargeDollars] })
+const centsToDollars = (reversible: boolean) => {
+  if (reversible) {
+    return Evolution.step({
+      id: "price/cents-to-dollars",
+      from: centsDefinition,
+      to: dollarsDefinition,
+      models: [
+        Evolution.model({
+          id: "price/cents-to-dollars",
+          from: PriceCents,
+          to: PriceDollars,
+          value: ({ value }) => ({ amount: value.amount / 100 }),
+          downgradeValue: ({ value }) => ({ amount: value.amount * 100 })
+        }),
+        Evolution.model({
+          id: "sku/prefix",
+          from: SkuV1,
+          to: SkuV2,
+          key: (key) => `sku:${key}`,
+          downgradeKey: (key) => key.slice(4)
+        })
+      ],
+      mutations: [Evolution.mutation({
+        id: "charge/cents-to-dollars",
+        from: ChargeCents,
+        to: ChargeDollars,
+        success: (cents) => cents / 100,
+        downgradeSuccess: (dollars) => dollars * 100
+      })]
+    })
+  }
+  return Evolution.step({
+    id: "price/cents-to-dollars",
+    from: centsDefinition,
+    to: dollarsDefinition,
+    models: [
+      Evolution.model({
+        id: "price/cents-to-dollars",
+        from: PriceCents,
+        to: PriceDollars,
+        value: ({ value }) => ({ amount: value.amount / 100 })
+      }),
+      Evolution.model({ id: "sku/prefix", from: SkuV1, to: SkuV2, key: (key) => `sku:${key}` })
+    ],
+    mutations: [Evolution.mutation({
+      id: "charge/cents-to-dollars",
+      from: ChargeCents,
+      to: ChargeDollars,
+      success: (cents) => cents / 100
+    })]
+  })
+}
+
 describe("schema evolution", () => {
+  it.effect(
+    "refuses to project a transformed part back without its reverse hook even when the schemas match",
+    Effect.fnUntraced(function*() {
+      const forwardOnly = Evolution.make({ current: dollarsDefinition, steps: [centsToDollars(false)] })
+      const forward = yield* Evolution.migrateModel({
+        evolution: forwardOnly,
+        source: centsDefinition.schemaIdentity,
+        model: "Price",
+        modelVersion: Identity.SchemaVersion.make(1),
+        key: "coffee",
+        value: { amount: 100 }
+      })
+      assert.deepStrictEqual(forward.value, { amount: 1 })
+
+      const price = yield* Evolution.migrateModelTo({
+        evolution: forwardOnly,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        model: "Price",
+        modelVersion: Identity.SchemaVersion.make(2),
+        key: "coffee",
+        value: { amount: 1 }
+      }).pipe(Effect.result)
+      assert.strictEqual(expectFailure(price)._tag, "SchemaEvolutionUnsupported")
+
+      const sku = yield* Evolution.migrateModelTo({
+        evolution: forwardOnly,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        model: "Sku",
+        modelVersion: Identity.SchemaVersion.make(2),
+        key: "sku:coffee"
+      }).pipe(Effect.result)
+      assert.strictEqual(expectFailure(sku)._tag, "SchemaEvolutionUnsupported")
+
+      const charge = yield* Evolution.migrateMutationSuccessTo({
+        evolution: forwardOnly,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        mutation: "Charge",
+        mutationVersion: Identity.SchemaVersion.make(2),
+        value: 1
+      }).pipe(Effect.result)
+      assert.strictEqual(expectFailure(charge)._tag, "SchemaEvolutionUnsupported")
+
+      const admission = yield* Evolution.validateDowngradeTarget(forwardOnly, centsDefinition.schemaIdentity).pipe(
+        Effect.result
+      )
+      assert.strictEqual(expectFailure(admission)._tag, "SchemaEvolutionUnsupported")
+    })
+  )
+
+  it.effect(
+    "projects a transformed part back through its explicit reverse hook",
+    Effect.fnUntraced(function*() {
+      const reversible = Evolution.make({ current: dollarsDefinition, steps: [centsToDollars(true)] })
+      yield* Evolution.validateDowngradeTarget(reversible, centsDefinition.schemaIdentity)
+      const price = yield* Evolution.migrateModelTo({
+        evolution: reversible,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        model: "Price",
+        modelVersion: Identity.SchemaVersion.make(2),
+        key: "coffee",
+        value: { amount: 1 }
+      })
+      assert.deepStrictEqual(price.value, { amount: 100 })
+      const sku = yield* Evolution.migrateModelTo({
+        evolution: reversible,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        model: "Sku",
+        modelVersion: Identity.SchemaVersion.make(2),
+        key: "sku:coffee"
+      })
+      assert.strictEqual(sku.key, "coffee")
+      const charge = yield* Evolution.migrateMutationSuccessTo({
+        evolution: reversible,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        mutation: "Charge",
+        mutationVersion: Identity.SchemaVersion.make(2),
+        value: 1
+      })
+      assert.strictEqual(charge.value, 100)
+    })
+  )
+
   it("uses an order independent schema identity and excludes queries from it", () => {
     const First = Mutation.make("First", { version: 1 })
     const Second = Mutation.make("Second", { version: 1 })

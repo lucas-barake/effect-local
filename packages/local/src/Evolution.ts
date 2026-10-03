@@ -495,13 +495,10 @@ export const validateDowngradeTarget = Effect.fnUntraced(function*(
       })
     }
     const entry = traversal.step
-    for (const older of entry.from.models) {
-      const newer = entry.to.modelByName.get(older.name)
-      if (newer === undefined) continue
-      const migration = entry.models.get(older.name)
+    for (const migration of entry.models.values()) {
       if (
-        (!sameSchema(newer.key, older.key) && migration?.downgradeKey === undefined) ||
-        (!sameSchema(newer.schema, older.schema) && migration?.downgradeValue === undefined)
+        (migration.migrateKey !== undefined && migration.downgradeKey === undefined) ||
+        (migration.migrateValue !== undefined && migration.downgradeValue === undefined)
       ) {
         return yield* new ReplicaError.SchemaEvolutionUnsupported({
           sourceVersion: evolution.current.schemaIdentity.version,
@@ -511,13 +508,10 @@ export const validateDowngradeTarget = Effect.fnUntraced(function*(
         })
       }
     }
-    for (const older of entry.from.mutations) {
-      const newer = entry.to.mutationByName.get(older.name)
-      if (newer === undefined) continue
-      const migration = entry.mutations.get(older.name)
+    for (const migration of entry.mutations.values()) {
       if (
-        (!sameSchema(newer.successSchema, older.successSchema) && migration?.downgradeSuccess === undefined) ||
-        (!sameSchema(newer.rejectionSchema, older.rejectionSchema) && migration?.downgradeRejection === undefined)
+        (migration.migrateSuccess !== undefined && migration.downgradeSuccess === undefined) ||
+        (migration.migrateRejection !== undefined && migration.downgradeRejection === undefined)
       ) {
         return yield* new ReplicaError.SchemaEvolutionUnsupported({
           sourceVersion: evolution.current.schemaIdentity.version,
@@ -579,7 +573,7 @@ export const migrateModelTo = Effect.fnUntraced(function*(options: {
     }
     const migration = entry.models.get(options.model)
     if (traversal.direction === "Backward") {
-      if (!sameSchema(source.key, target.key) && migration?.downgradeKey === undefined) {
+      if (migration?.migrateKey !== undefined && migration.downgradeKey === undefined) {
         return yield* new ReplicaError.SchemaEvolutionUnsupported({
           sourceVersion: options.source.version,
           sourceHash: options.source.hash,
@@ -587,9 +581,7 @@ export const migrateModelTo = Effect.fnUntraced(function*(options: {
           targetHash: options.target.hash
         })
       }
-      if (
-        value !== undefined && !sameSchema(source.schema, target.schema) && migration?.downgradeValue === undefined
-      ) {
+      if (value !== undefined && migration?.migrateValue !== undefined && migration.downgradeValue === undefined) {
         return yield* new ReplicaError.SchemaEvolutionUnsupported({
           sourceVersion: options.source.version,
           sourceHash: options.source.hash,
@@ -791,7 +783,7 @@ const migrateMutationPart = Effect.fnUntraced(function*(options: {
           if (migration?.migratePayload === undefined) migrate = (input) => input
           else migrate = migration.migratePayload.bind(undefined)
         } else if (migration?.downgradePayload === undefined) {
-          if (!sameSchema(fromSchema, toSchema)) {
+          if (migration?.migratePayload !== undefined) {
             return yield* new ReplicaError.SchemaEvolutionUnsupported({
               sourceVersion: options.source.version,
               sourceHash: options.source.hash,
@@ -809,7 +801,7 @@ const migrateMutationPart = Effect.fnUntraced(function*(options: {
           if (migration?.migrateSuccess === undefined) migrate = (input) => input
           else migrate = migration.migrateSuccess.bind(undefined)
         } else if (migration?.downgradeSuccess === undefined) {
-          if (!sameSchema(fromSchema, toSchema)) {
+          if (migration?.migrateSuccess !== undefined) {
             return yield* new ReplicaError.SchemaEvolutionUnsupported({
               sourceVersion: options.source.version,
               sourceHash: options.source.hash,
@@ -827,7 +819,7 @@ const migrateMutationPart = Effect.fnUntraced(function*(options: {
           if (migration?.migrateRejection === undefined) migrate = (input) => input
           else migrate = migration.migrateRejection.bind(undefined)
         } else if (migration?.downgradeRejection === undefined) {
-          if (!sameSchema(fromSchema, toSchema)) {
+          if (migration?.migrateRejection !== undefined) {
             return yield* new ReplicaError.SchemaEvolutionUnsupported({
               sourceVersion: options.source.version,
               sourceHash: options.source.hash,
