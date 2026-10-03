@@ -910,8 +910,9 @@ describe("EphemeralClient projection work", () => {
             stateSet(spaceId, revision + 2, "Sentinel", `sentinel-${revision}`, { marker: `m${revision}` })
           )
         }
-        for (let received = 0; received < 30; received = received + 1) {
-          yield* Queue.take(sentinelEmissions)
+        let latest: ReadonlyArray<unknown> = []
+        while (latest.length < 30) {
+          latest = yield* Queue.take(sentinelEmissions)
         }
         assert.strictEqual(
           reads - settled,
