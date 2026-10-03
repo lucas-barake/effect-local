@@ -614,7 +614,11 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     let latestValue: Json = initialValue
     let openedValue: Json = initialValue
     const handle = yield* SubscriptionRef.make(Option.none<string>())
-    const members = yield* SubscriptionRef.make(
+    const makeSessionRef = <A,>(initial: A) =>
+      Effect.acquireRelease(SubscriptionRef.make(initial), (ref) => PubSub.shutdown(ref.pubsub)).pipe(
+        Scope.provide(sessionScope)
+      )
+    const members = yield* makeSessionRef(
       Option.none<ReadonlyArray<typeof replicaWire.EphemeralMemberFrame.Type>>()
     )
     const states = new Map<
@@ -625,11 +629,14 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       Effect.suspend(() => {
         const existing = states.get(stateName)
         if (existing !== undefined) return Effect.succeed(existing)
-        return SubscriptionRef.make(
+        return makeSessionRef(
           Option.none<ReadonlyArray<typeof replicaWire.EphemeralStateFrame.Type>>()
         ).pipe(Effect.tap((created) => Effect.sync(() => states.set(stateName, created))))
       })
-    const events = yield* PubSub.unbounded<Extract<replicaWire.EphemeralSessionFrame, { readonly _tag: "Event" }>>()
+    const events = yield* Effect.acquireRelease(
+      PubSub.unbounded<Extract<replicaWire.EphemeralSessionFrame, { readonly _tag: "Event" }>>(),
+      PubSub.shutdown
+    )
     const opened = yield* Deferred.make<void, ReplicaError.ReplicaError | Ephemeral.EncodeError>()
 
     const updateRemote = (value: Json) =>
