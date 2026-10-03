@@ -4,6 +4,7 @@ import * as Struct from "effect/Struct"
 import * as Canonical from "./Canonical.js"
 import type * as Definition from "./Definition.js"
 import * as Identity from "./Identity.js"
+import * as ComponentName from "./internal/componentName.js"
 import * as ReplicaError from "./ReplicaError.js"
 import type * as SecondaryIndex from "./SecondaryIndex.js"
 
@@ -56,7 +57,7 @@ const MutationIdentity = {
   mutationId: Identity.MutationId,
   localSequence: Identity.LocalSequence,
   basis: Identity.ServerSequence,
-  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  name: ComponentName.ComponentName,
   payload: Schema.Json
 }
 
@@ -122,7 +123,7 @@ const sortObjectKeys = (_name: string, value: unknown) => {
 export const EntityKeyText = Schema.fromJsonString(Schema.Json, { replacer: sortObjectKeys })
 
 export const EntityKey = Schema.Struct({
-  model: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  model: ComponentName.ComponentName,
   modelVersion: Identity.SchemaVersion,
   key: Schema.Json
 })
@@ -139,8 +140,6 @@ export type EntityChange = typeof EntityChange.Type
 export const Retract = Schema.TaggedStruct("Retract", { entity: EntityKey })
 export const ViewChange = Schema.Union([Upsert, Delete, Retract])
 export type ViewChange = typeof ViewChange.Type
-
-const ReplicationModelName = Schema.NonEmptyString.check(Schema.isMaxLength(256))
 
 const WindowComponentValue = Schema.Union([Schema.String, Schema.Finite, Schema.Boolean])
 export type WindowComponentValue = typeof WindowComponentValue.Type
@@ -161,8 +160,8 @@ export const ReplicationWindowPartition = Schema.Struct({
 export type ReplicationWindowPartition = typeof ReplicationWindowPartition.Type
 
 export const ReplicationWindow = Schema.Struct({
-  model: ReplicationModelName,
-  index: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  model: ComponentName.ComponentName,
+  index: ComponentName.ComponentName,
   count: Schema.Int.check(Schema.isGreaterThan(0)),
   partitions: Schema.Array(ReplicationWindowPartition).check(
     Schema.isMaxLength(maximumReplicationWindowPartitions)
@@ -171,7 +170,7 @@ export const ReplicationWindow = Schema.Struct({
 export type ReplicationWindow = typeof ReplicationWindow.Type
 
 export const ReplicationScope = Schema.Struct({
-  models: Schema.Array(ReplicationModelName).check(Schema.isUnique()),
+  models: Schema.Array(ComponentName.ComponentName).check(Schema.isUnique()),
   windows: Schema.Array(ReplicationWindow).check(Schema.isMaxLength(maximumReplicationWindows)).pipe(
     Schema.optionalKey
   )
@@ -399,7 +398,7 @@ const ReceiptIdentity = {
 
 export const AcceptedReceipt = Schema.TaggedStruct("Accepted", {
   ...ReceiptIdentity,
-  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  name: ComponentName.ComponentName,
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
   serverSequence: Identity.ServerSequence,
@@ -413,7 +412,7 @@ export type RejectionOrigin = typeof RejectionOrigin.Type
 
 export const RejectedReceipt = Schema.TaggedStruct("Rejected", {
   ...ReceiptIdentity,
-  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  name: ComponentName.ComponentName,
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
   origin: RejectionOrigin,
@@ -424,7 +423,7 @@ export type RejectedReceipt = typeof RejectedReceipt.Type
 
 export const ExpiredReceipt = Schema.TaggedStruct("Expired", {
   ...ReceiptIdentity,
-  name: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  name: ComponentName.ComponentName,
   sourceSchema: Identity.SchemaIdentity,
   mutationVersion: Identity.SchemaVersion,
   snapshotId: Identity.SnapshotId,
@@ -529,7 +528,7 @@ export const snapshotEntryDigest = (previous: SnapshotDigest, entry: SnapshotEnt
 
 export const SnapshotEntity = Schema.Struct({
   ordinal: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  model: Schema.NonEmptyString.check(Schema.isMaxLength(256)),
+  model: ComponentName.ComponentName,
   modelVersion: Identity.SchemaVersion,
   key: Schema.Json,
   value: Schema.Json,

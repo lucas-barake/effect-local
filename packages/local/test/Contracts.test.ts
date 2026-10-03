@@ -157,6 +157,46 @@ describe("domain contracts", () => {
   })
 
   it.effect(
+    "accepts only definition names that fit the protocol name fields",
+    Effect.fnUntraced(function*() {
+      const longest = "n".repeat(256)
+      const tooLong = "n".repeat(257)
+      const component = {
+        version: 1,
+        partition: [],
+        sort: [{
+          name: "rank",
+          affinity: "real" as const,
+          schema: Schema.Number,
+          extract: (value: { readonly rank: number }) => value.rank
+        }]
+      }
+      const schema = Schema.Struct({ rank: Schema.Number })
+      const Longest = Model.make(longest, { version: 1, key: Schema.String, schema, indexes: { [longest]: component } })
+      const LongestMutation = Mutation.make(longest, { version: 1 })
+      const definition = Definition.make({ version: 1, models: [Longest], mutations: [LongestMutation] })
+      const entity = yield* Schema.decodeUnknownEffect(Protocol.EntityKey)({
+        model: Longest.name,
+        modelVersion: 1,
+        key: "a"
+      })
+      assert.strictEqual(entity.model, longest)
+      const scope = yield* Protocol.validateReplicationScope(definition, {
+        models: [],
+        windows: [{ model: Longest.name, index: longest, count: 1 }]
+      })
+      assert.strictEqual(scope.windows?.[0].index, longest)
+
+      assert.throws(() => Model.make(tooLong, { version: 1, key: Schema.String, schema }), /at most 256/)
+      assert.throws(
+        () => Model.make("Indexed", { version: 1, key: Schema.String, schema, indexes: { [tooLong]: component } }),
+        /at most 256/
+      )
+      assert.throws(() => Mutation.make(tooLong, { version: 1 }), /at most 256/)
+    })
+  )
+
+  it.effect(
     "applies opt in field semantics without replication metadata",
     Effect.fnUntraced(function*() {
       assert.strictEqual(yield* Field.counter.apply(10, { _tag: "Increment", delta: 3 }), 13)

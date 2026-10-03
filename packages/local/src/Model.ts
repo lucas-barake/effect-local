@@ -1,6 +1,6 @@
 import type * as Schema from "effect/Schema"
 import * as Identity from "./Identity.js"
-import * as Defect from "./internal/defect.js"
+import * as ComponentName from "./internal/componentName.js"
 import type * as SchemaInput from "./internal/schemaInput.js"
 import * as SecondaryIndex from "./SecondaryIndex.js"
 
@@ -60,8 +60,7 @@ export function make(
     readonly indexes?: SecondaryIndex.AnyRecord
   }
 ): Any {
-  if (name.length === 0) return Defect.invalid("Model name must be nonempty")
-  if (name.startsWith("$")) return Defect.invalid(`Model name must not start with $: ${name}`)
+  ComponentName.validate("Model", name)
   const indexes = options.indexes ?? {}
   for (const [indexName, index] of Object.entries(indexes)) {
     SecondaryIndex.validate(indexName, index)
