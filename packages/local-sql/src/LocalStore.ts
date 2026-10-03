@@ -1889,9 +1889,12 @@ export const layer = (
           )
         )
 
+      const rebuildProjectionDeferred = rebuildProjection.pipe(
+        Effect.flatMap((rebuilt) => deferInvalidation(rebuilt, []))
+      )
+
       const withProjectionGate = <A, E extends Mutation.TaggedError, R,>(effect: Effect.Effect<A, E, R>) =>
-        withProjectionPermit(rebuildProjection.pipe(
-          Effect.flatMap((rebuilt) => deferInvalidation(rebuilt, [])),
+        withProjectionPermit(rebuildProjectionDeferred.pipe(
           Effect.andThen(flushDeferredInvalidations),
           Effect.andThen(effect)
         ))
@@ -1930,8 +1933,7 @@ export const layer = (
         then: (value: A) => Effect.Effect<unknown, E2, R2>
       ) =>
         withProjectionPermitThen(
-          rebuildProjection.pipe(
-            Effect.flatMap((rebuilt) => deferInvalidation(rebuilt, [])),
+          rebuildProjectionDeferred.pipe(
             Effect.andThen(flushDeferredInvalidations),
             Effect.andThen(effect)
           ),
@@ -2752,7 +2754,7 @@ export const layer = (
             const pendingChanged = Option.isSome(transactionResult.canceledReplacement)
             yield* deferInvalidation(invalidationEntities, invalidationReceiptIds, pendingChanged)
             const preparedSettlements = yield* prepareSettlementsInGate
-            yield* deferInvalidation(yield* rebuildProjection, [])
+            yield* rebuildProjectionDeferred
             const preparedInvalidations = yield* prepareDeferredInvalidations
             const settlements = yield* finalizeSettlementsInGate(preparedSettlements)
             yield* notifyDeferredInvalidations(preparedInvalidations)
@@ -3633,8 +3635,7 @@ export const layer = (
           }
         })),
         Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
-        Effect.andThen(rebuildProjection),
-        Effect.flatMap((rebuilt) => deferInvalidation(rebuilt, [])),
+        Effect.andThen(rebuildProjectionDeferred),
         Effect.andThen(flushDeferredInvalidations)
       )
       yield* withProjectionPermit(restoreProjection)
@@ -3913,7 +3914,7 @@ export const layer = (
             Effect.gen(function*() {
               if (entries.length === 0) {
                 if (applyOptions?.publishProjection !== false) {
-                  yield* deferInvalidation(yield* rebuildProjection, [])
+                  yield* rebuildProjectionDeferred
                   const preparedInvalidations = yield* prepareDeferredInvalidations
                   const deletedSettlements = yield* deleteSettledPending(deferredSettlements)
                   deferredSettlements.length = 0
@@ -4047,7 +4048,7 @@ export const layer = (
                 deferredSettlements.length > 0
               )
               if (applyOptions?.publishProjection !== false) {
-                yield* deferInvalidation(yield* rebuildProjection, [])
+                yield* rebuildProjectionDeferred
                 const preparedInvalidations = yield* prepareDeferredInvalidations
                 const deletedSettlements = yield* deleteSettledPending(deferredSettlements)
                 deferredSettlements.length = 0
