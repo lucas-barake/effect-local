@@ -4,11 +4,13 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
-import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
+import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
@@ -26,6 +28,7 @@ import * as ServerStore from "../src/ServerStore.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
+import { gateStatements } from "./fixtures/SqlGate.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-0000000000e1")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-0000000000e1")
@@ -61,6 +64,7 @@ const harness = Effect.fnUntraced(function*() {
   const database = yield* Layer.build(layerClientDatabase)
   const sql = Context.get(database, SqlClient.SqlClient)
   let failStatement: (statement: string) => boolean = () => false
+  let pauseStatement: (statement: string) => boolean = () => false
   const injected = yield* Queue.unbounded<void>()
   const failingSql = new Proxy(sql, {
     apply: (target, thisArg, args: Parameters<typeof sql>) => {
@@ -75,6 +79,11 @@ const harness = Effect.fnUntraced(function*() {
       return Reflect.apply(target, thisArg, args)
     }
   })
+  const gate = yield* gateStatements(failingSql, (statement) => {
+    if (pauseStatement(statement)) return ["before"]
+    return []
+  })
+  const watchFailure = yield* Deferred.make<ReplicaError.ReplicaError>()
   let pullMode: PullMode = "Pass"
   const heldPulls = yield* Queue.unbounded<void>()
   const transportWaits = yield* Queue.unbounded<void>()
@@ -94,14 +103,16 @@ const harness = Effect.fnUntraced(function*() {
         return server.pull(request)
       }),
     bootstrap: server.bootstrap,
-    watch: () => Stream.never
+    watch: () => Stream.fromEffect(Deferred.await(watchFailure).pipe(Effect.flatMap(Effect.fail)))
   })
   return {
-    database: Context.add(database, SqlClient.SqlClient, failingSql),
+    database: Context.add(database, SqlClient.SqlClient, gate.sql),
     layerRemote: Layer.succeed(SyncEngine.SyncEngine, remote),
     heldPulls,
     transportWaits,
     injected,
+    paused: gate.pauses,
+    failWatch: (error: ReplicaError.ReplicaError) => Deferred.succeed(watchFailure, error),
     setPullMode: (mode: PullMode) =>
       Effect.sync(() => {
         pullMode = mode
@@ -109,6 +120,10 @@ const harness = Effect.fnUntraced(function*() {
     failWhen: (decide: (statement: string) => boolean) =>
       Effect.sync(() => {
         failStatement = decide
+      }),
+    pauseWhen: (decide: (statement: string) => boolean) =>
+      Effect.sync(() => {
+        pauseStatement = decide
       })
   }
 })
@@ -287,6 +302,22 @@ describe("in-memory scheduler failure reports", () => {
       yield* Queue.take(controls.transportWaits)
 
       assert.strictEqual((yield* reconciler.status)._tag, "Offline")
+    })
+  )
+
+  it.effect(
+    "keeps a rejected watch credential reported while a sync starts",
+    Effect.fnUntraced(function*() {
+      const controls = yield* harness()
+      const { reconciler } = yield* inMemory(controls)
+      yield* controls.pauseWhen(failOnce((statement) => statement.includes(countStatement)))
+      yield* controls.failWatch(new ReplicaError.CredentialRejected({}))
+      const reporting = yield* Queue.take(controls.paused)
+      const later = yield* reconciler.sync.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.succeed(reporting.release, undefined)
+
+      yield* Fiber.join(later)
+      assert.strictEqual((yield* reconciler.status)._tag, "NeedsAuthentication")
     })
   )
 })

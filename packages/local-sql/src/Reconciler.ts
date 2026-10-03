@@ -994,9 +994,7 @@ export const layerInMemoryScheduler = (
                   onFailure: Effect.fnUntraced(function*(error) {
                     if (watchEpoch !== authenticationEpoch) return yield* watch()
                     if (error._tag === "CredentialRejected") {
-                      if (error.credentialGeneration === undefined) {
-                        return yield* reconciliation.failed(error, yield* reconciliation.generation)
-                      }
+                      if (error.credentialGeneration === undefined) return yield* reconciliation.watchFailed(error)
                       const admission = yield* admitCredentialPause
                       yield* reconciliation.watchFailed(error)
                       yield* startCredentialWait(error.credentialGeneration, admission)
