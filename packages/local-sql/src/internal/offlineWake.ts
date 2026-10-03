@@ -675,43 +675,41 @@ export const make = Effect.fnUntraced(function*<R,>(
   ) {
     yield* Effect.annotateCurrentSpan({ "space.id": spaceId, "client.id": clientId })
     const watcherId = yield* randomToken(crypto)
-    const register = Effect.gen(function*() {
-      let registered = false
-      while (!registered) {
-        const now = yield* Clock.currentTimeMillis
-        const inserted = yield* SqlTransaction.withServerTransaction(
-          sql,
-          Effect.gen(function*() {
-            yield* dialect.lockPresences([{ spaceId, clientId }])
-            yield* sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
-                VALUES (${runtimeId}, ${now + presenceLeaseMillis})
-                ON CONFLICT (runtime_id) DO UPDATE SET expires_at = excluded.expires_at`
-            const presenceInserted = yield* insertPresence({
-              spaceId,
-              clientId,
-              watcherId,
-              databaseRuntimeId: runtimeId,
-              now
-            })
-            if (Option.isSome(presenceInserted)) {
-              yield* sql`UPDATE effect_local_server_offline_wakes SET
-              next_attempt_at = ${dialect.greatest(sql`next_attempt_at`, sql`${now + presenceLeaseMillis}`)}
-              WHERE space_id = ${spaceId} AND client_id = ${clientId}`
-            }
-            return presenceInserted
+    const attempt = presenceGate.withPermit(Effect.gen(function*() {
+      const now = yield* Clock.currentTimeMillis
+      const inserted = yield* SqlTransaction.withServerTransaction(
+        sql,
+        Effect.gen(function*() {
+          yield* dialect.lockPresences([{ spaceId, clientId }])
+          yield* sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
+              VALUES (${runtimeId}, ${now + presenceLeaseMillis})
+              ON CONFLICT (runtime_id) DO UPDATE SET expires_at = excluded.expires_at`
+          const presenceInserted = yield* insertPresence({
+            spaceId,
+            clientId,
+            watcherId,
+            databaseRuntimeId: runtimeId,
+            now
           })
-        ).pipe(Effect.mapError(StorageUnavailable.make))
-        if (Option.isSome(inserted)) {
-          registered = true
-        } else {
-          yield* Effect.sleep(presenceRegistrationRetryMillis).pipe(Effect.interruptible)
-        }
-      }
+          if (Option.isSome(presenceInserted)) {
+            yield* sql`UPDATE effect_local_server_offline_wakes SET
+            next_attempt_at = ${dialect.greatest(sql`next_attempt_at`, sql`${now + presenceLeaseMillis}`)}
+            WHERE space_id = ${spaceId} AND client_id = ${clientId}`
+          }
+          return presenceInserted
+        })
+      ).pipe(Effect.mapError(StorageUnavailable.make))
+      if (Option.isNone(inserted)) return false
       presences.set(watcherId, { spaceId, clientId })
-      return watcherId
+      return true
+    }))
+    const register = Effect.gen(function*() {
+      while (!(yield* attempt)) {
+        yield* Effect.sleep(presenceRegistrationRetryMillis).pipe(Effect.interruptible)
+      }
     })
     yield* Effect.acquireRelease(
-      presenceGate.withPermit(register),
+      register,
       () =>
         presenceGate.withPermit(Effect.gen(function*() {
           presences.delete(watcherId)
