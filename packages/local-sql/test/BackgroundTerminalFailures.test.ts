@@ -140,7 +140,31 @@ const backgroundServices = Effect.fnUntraced(function*(constructor: Constructor)
     retryDelay: "1 second",
     maximumRetryDelay: "1 second"
   } satisfies SqlReplica.Options<typeof Domain.definition>
-  const lockingContext = Context.add(databaseContext, SqlClient.SqlClient, lockingSql)
+  let heldRelease:
+    | { remaining: number; readonly entered: Deferred.Deferred<void>; readonly release: Deferred.Deferred<void> }
+    | undefined
+  const gatedReactivity = new Proxy(reactivity, {
+    get: (target, property, receiver) => {
+      if (property !== "invalidate") return Reflect.get(target, property, receiver)
+      return (keys: Parameters<typeof reactivity.invalidate>[0]) => {
+        const held = heldRelease
+        if (held === undefined || !Array.isArray(keys) || !keys.includes(ReactivityKey.activation(spaceId))) {
+          return target.invalidate(keys)
+        }
+        held.remaining -= 1
+        if (held.remaining > 0) return target.invalidate(keys)
+        heldRelease = undefined
+        return target.invalidate(keys).pipe(
+          Effect.andThen(Deferred.succeed(held.entered, undefined)),
+          Effect.andThen(Deferred.await(held.release))
+        )
+      }
+    }
+  })
+  const lockingContext = databaseContext.pipe(
+    Context.add(SqlClient.SqlClient, lockingSql),
+    Context.add(Reactivity.Reactivity, gatedReactivity)
+  )
   const start = (remote: Remote) => {
     const layerServices = Layer.mergeAll(
       Domain.layerHandlers,
@@ -156,7 +180,15 @@ const backgroundServices = Effect.fnUntraced(function*(constructor: Constructor)
   const lockNext = (statement: string) => {
     lockedStatement = statement
   }
-  return { sql, crypto, reactivity, start, lockNext }
+  const holdRelease = Effect.fnUntraced(function*() {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const arm = () => {
+      heldRelease = { remaining: 2, entered, release }
+    }
+    return { arm, entered: Deferred.await(entered), release: Deferred.succeed(release, undefined) }
+  })
+  return { sql, crypto, reactivity, start, lockNext, holdRelease }
 })
 
 const pendingBackgroundSpace = Effect.fnUntraced(function*(constructor: Constructor) {
@@ -840,6 +872,131 @@ describe("background sync terminal failures", () => {
     }, Effect.scoped)
   )
 
+  it.effect.each(
+    [
+      ["layer", "ProtocolInvalid"],
+      ["layer", "CredentialRejected"],
+      ["layerWorkflow", "ProtocolInvalid"],
+      ["layerWorkflow", "CredentialRejected"]
+    ] as const
+  )(
+    "ignores a background failure settled after the foreground reconciled and released the space with %s and %s",
+    Effect.fnUntraced(function*([constructor, tag]) {
+      const services = yield* pendingBackgroundSpace(constructor)
+      const bookkeeping = yield* services.holdRelease()
+      let failure: ReplicaError.ReplicaError = protocolInvalid
+      if (tag === "CredentialRejected") failure = new ReplicaError.CredentialRejected({ credentialGeneration: 7 })
+      let pulls = 0
+      let credentialWaits = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () => {
+          credentialWaits += 1
+          return Effect.never
+        },
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          pulls += 1
+          if (pulls > 1) return emptyPage(services.crypto, request)
+          bookkeeping.arm()
+          return Effect.fail(failure)
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* bookkeeping.entered
+      assert.strictEqual(yield* space.activation, "Inactive")
+      yield* space.activate
+      const online = awaitSpaceStatusWhere(
+        space,
+        services.reactivity,
+        (status) => status._tag === "Online" && status.pending === 0
+      ).pipe(Effect.scoped)
+      yield* VirtualTime.advanceUntil(online)
+      yield* space.deactivate
+      assert.strictEqual((yield* space.status)._tag, "Idle")
+
+      yield* bookkeeping.release
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.strictEqual((yield* space.status)._tag, "Idle")
+      const aggregate = yield* replica.status
+      assert.strictEqual(aggregate.counts.idle, 1)
+      assert.strictEqual(aggregate.counts.failed, 0)
+      assert.strictEqual(aggregate.counts.needsAuthentication, 0)
+      assert.strictEqual(credentialWaits, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "drops a scheduled background retry once the foreground takes the space over",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => {
+          if (attempts.count() === 0) {
+            return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+          }
+          return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* attempts.reached(1)
+      yield* awaitActivation(space, services.reactivity, "Inactive")
+      yield* space.activate
+      yield* attempts.reached(2)
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(3)).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.isTrue(Option.isNone(retried))
+      assert.strictEqual(attempts.count(), 2)
+      assert.strictEqual(yield* space.activation, "Active")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "ignores a background failure settled after a workflow attempt drained and released the space",
+    Effect.fnUntraced(function*() {
+      const services = yield* backgroundServices("layerWorkflow")
+      const attempts = yield* makeAttempts
+      const bookkeeping = yield* services.holdRelease()
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (attempts.count() === 0) {
+            return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+          }
+          if (attempts.count() > 1) return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
+          bookkeeping.arm()
+          return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* services.sql`UPDATE effect_local_client_spaces
+        SET replication_view_id = ${viewId}, replication_view_revision = 0`
+      yield* space.mutate(Domain.PutTodo, Domain.todo("pending"))
+      yield* attempts.reached(1)
+      yield* space.deactivate
+      yield* bookkeeping.entered
+      const drained = awaitAggregate(replica, services.reactivity, (aggregate) => aggregate.totalPending === 0)
+      yield* VirtualTime.advanceUntil(Effect.scoped(drained))
+      const idle = awaitAggregate(replica, services.reactivity, (aggregate) => aggregate.counts.idle === 1)
+      yield* VirtualTime.advanceUntil(Effect.scoped(idle))
+
+      yield* bookkeeping.release
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+
+      const status = yield* space.status
+      assert.strictEqual(status._tag, "Idle")
+      assert.strictEqual(status.pending, 0)
+      const aggregate = yield* replica.status
+      assert.strictEqual(aggregate.counts.idle, 1)
+      assert.strictEqual(aggregate.counts.failed, 0)
+    }, Effect.scoped)
+  )
+
   it.effect(
     "keeps a background space failed after a workflow attempt on it fails and releases it",
     Effect.fnUntraced(function*() {
@@ -1000,6 +1157,75 @@ describe("background sync terminal failures", () => {
         Effect.timeoutOption("1 minute")
       )
       assert.isTrue(Option.isSome(interrupted))
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "starts no credential wait for a background turn that ran while the foreground owned the space",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      const credentialChanged = yield* Deferred.make<void>()
+      let credentialWaits = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () => {
+          credentialWaits += 1
+          return Deferred.await(credentialChanged)
+        },
+        pull: () => {
+          if (attempts.count() === 1 || attempts.count() > 2) {
+            return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+          }
+          return Effect.andThen(
+            attempts.record,
+            Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
+          )
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* awaitSpaceStatus(space, services.reactivity, "NeedsAuthentication")
+      yield* space.activate
+      yield* attempts.reached(2)
+
+      yield* Deferred.succeed(credentialChanged, undefined)
+      yield* attempts.reached(3)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.strictEqual(yield* space.activation, "Active")
+      assert.strictEqual(credentialWaits, 1)
+      assert.strictEqual(attempts.count(), 3)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "starts no credential wait when the space is left while its background turn fails",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const held = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let credentialWaits = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () => {
+          credentialWaits += 1
+          return Effect.never
+        },
+        pull: () =>
+          Deferred.succeed(held, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))),
+            Effect.uninterruptible
+          )
+      }))
+      yield* Deferred.await(held)
+      const leaving = yield* Effect.forkChild(replica.leave(spaceId), { startImmediately: true })
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(leaving)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.strictEqual(credentialWaits, 0)
+      assert.strictEqual((yield* replica.status).spaces, 0)
     }, Effect.scoped)
   )
 

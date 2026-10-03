@@ -153,7 +153,7 @@ interface RememberedEntry {
   summaryStatus: ReplicaStatus.ReplicaStatus
   synced: boolean
   retryAttempt: number
-  retryVersion: number
+  backgroundGeneration: number
   backgroundFailure: ReplicaError.ReplicaError | undefined
 }
 
@@ -691,7 +691,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (entry.leaving || backgroundQueued.has(entry.spaceId)) return Effect.void
           if (resetRetry) {
             entry.retryAttempt = 0
-            entry.retryVersion += 1
+            entry.backgroundGeneration += 1
           }
           backgroundQueued.add(entry.spaceId)
           return Queue.offer(backgroundQueue, { _tag: "Sync", spaceId: entry.spaceId }).pipe(Effect.asVoid)
@@ -702,13 +702,14 @@ const makeLayer = <D extends Definition.Any, R,>(
         transportGeneration: Option.Option<number>
       ) {
         entry.retryAttempt += 1
-        entry.retryVersion += 1
+        entry.backgroundGeneration += 1
         const readyAt = (yield* Clock.currentTimeMillis) + Configuration.retryMillis(retryTiming, entry.retryAttempt)
-        yield* Queue.offer(retryQueue, { entry, version: entry.retryVersion, readyAt, transportGeneration })
+        yield* Queue.offer(retryQueue, { entry, version: entry.backgroundGeneration, readyAt, transportGeneration })
       })
 
       const forgetBackgroundFailure = (entry: RememberedEntry) =>
         Effect.suspend(() => {
+          entry.backgroundGeneration += 1
           entry.backgroundFailure = undefined
           return FiberMap.remove(credentialWaits, entry.spaceId)
         })
@@ -728,19 +729,18 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const settleBackgroundTurn = Effect.fnUntraced(function*(
         entry: RememberedEntry,
-        failure: ReplicaError.ReplicaError | undefined,
+        generation: number,
+        failure: ReplicaError.ReplicaError,
         transportGeneration: Option.Option<number>
       ) {
-        if (entries.get(entry.spaceId) !== entry || entry.leaving || entry.foreground) return
-        if (failure !== undefined && Reconciler.isTransientFailure(failure)) {
+        if (entry.backgroundGeneration !== generation || entry.foreground) return
+        if (Reconciler.isTransientFailure(failure)) {
           yield* reportBackgroundFailure(entry, undefined)
           let retryTransport = Option.none<number>()
           if (isTransportFailure(failure)) retryTransport = transportGeneration
           yield* scheduleBackgroundRetry(entry, retryTransport)
           return
         }
-        entry.retryVersion += 1
-        if (failure === undefined) return
         yield* reportBackgroundFailure(entry, failure)
         if (failure._tag !== "CredentialRejected" || failure.credentialGeneration === undefined) return
         const wait = remote.waitForCredentialChange(failure.credentialGeneration).pipe(
@@ -791,12 +791,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             const next = retrySchedule[0]
             if (next.readyAt <= now) {
               retrySchedule.shift()
-              if (
-                entries.get(next.entry.spaceId) !== next.entry ||
-                next.entry.leaving ||
-                next.entry.foreground ||
-                next.entry.retryVersion !== next.version
-              ) return Effect.void
+              if (next.entry.backgroundGeneration !== next.version) return Effect.void
               return enqueueBackground(next.entry, false)
             }
             return Effect.raceAllFirst([
@@ -940,6 +935,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           }
           if (foreground && !hasForegroundRuntime(entry)) {
             entry.foreground = true
+            entry.backgroundGeneration += 1
             foregroundResidents.delete(entry.spaceId)
             foregroundResidents.set(entry.spaceId, entry)
             yield* restore(ensureForegroundCapacity(entry))
@@ -1350,7 +1346,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           summaryStatus: { _tag: "Idle", pending: row.count },
           synced: row.replication_view_id !== null,
           retryAttempt: 0,
-          retryVersion: 0,
+          backgroundGeneration: 0,
           backgroundFailure: undefined
         }
         if (workflow !== undefined) {
@@ -1554,13 +1550,17 @@ const makeLayer = <D extends Definition.Any, R,>(
         const work = yield* LosslessQueue.take(backgroundQueue)
         if (work._tag === "Deactivate") {
           const result = yield* deactivate(work.entry, false, work.runtime, false).pipe(Effect.result)
-          if (Result.isFailure(result)) yield* settleBackgroundTurn(work.entry, result.failure, Option.none())
+          if (Result.isFailure(result)) {
+            const generation = work.entry.backgroundGeneration
+            yield* settleBackgroundTurn(work.entry, generation, result.failure, Option.none())
+          }
           return
         }
         const spaceId = work.spaceId
         backgroundQueued.delete(spaceId)
         const entry = entries.get(spaceId)
         if (entry === undefined || entry.leaving) return
+        const generation = entry.backgroundGeneration
         let activeRuntime: ActiveRuntime | undefined
         const transportGeneration = yield* remote.transportGeneration
         const result = yield* withLease(entry, false, (runtime) => {
@@ -1577,13 +1577,13 @@ const makeLayer = <D extends Definition.Any, R,>(
             Result.isSuccess(result)
           ).pipe(Effect.result)
           if (Result.isFailure(deactivation)) {
-            yield* settleBackgroundTurn(entry, deactivation.failure, Option.none())
+            yield* settleBackgroundTurn(entry, generation, deactivation.failure, Option.none())
             return
           }
         }
-        let failure: ReplicaError.ReplicaError | undefined
-        if (Result.isFailure(result)) failure = result.failure
-        yield* settleBackgroundTurn(entry, failure, Option.some(transportGeneration))
+        if (Result.isFailure(result)) {
+          yield* settleBackgroundTurn(entry, generation, result.failure, Option.some(transportGeneration))
+        }
       })
 
       yield* Effect.forEach(
