@@ -512,12 +512,10 @@ export const layer = <R = never,>(
       })
       const acquireSpace = (spaceId: Identity.SpaceId) =>
         RcMap.get(spaces, spaceId).pipe(
-          Effect.mapError((error) => {
-            if (Cause.isExceededCapacityError(error)) {
-              return capacityExceeded("ephemeral spaces", resolved.maximumSpaces)
-            }
-            return error
-          })
+          Effect.catchTag(
+            "ExceededCapacityError",
+            () => Effect.fail(capacityExceeded("ephemeral spaces", resolved.maximumSpaces))
+          )
         )
       const authorize = (input: AuthorizationInput) => options.authorize(input).pipe(Effect.provide(context))
 
