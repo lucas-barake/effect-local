@@ -171,6 +171,8 @@ class NativeStatement {
   prepared: StatementSync | undefined
   owner: NativeDatabase | undefined
   iterator: Iterator<unknown> | undefined
+  args: Array<any> = []
+  halted = false
   failure: unknown
   runAsync(
     _database: NativeDatabase,
@@ -190,6 +192,8 @@ class NativeStatement {
         args = Array.from({ length: Object.keys(merged).length }, (_, index) => bindValue(merged[String(index)]))
       }
       this.failure = undefined
+      this.args = args
+      this.halted = false
       this.iterator = statement.iterate(...args)
       const first = this.step()
       const counters = this.owner!.open().prepare("SELECT changes() AS changes, last_insert_rowid() AS id").get()
@@ -221,6 +225,7 @@ class NativeStatement {
     return native("resetAsync", () => {
       this.iterator?.return?.()
       this.iterator = undefined
+      this.halted = false
       const failure = this.failure
       this.failure = undefined
       if (failure !== undefined) throw failure
@@ -245,7 +250,13 @@ class NativeStatement {
   }
   step(): IteratorResult<unknown> {
     try {
-      return this.cursor().next()
+      if (this.halted) {
+        this.halted = false
+        this.iterator = this.statement().iterate(...this.args)
+      }
+      const next = this.cursor().next()
+      if (next.done === true) this.halted = true
+      return next
     } catch (cause) {
       this.failure = cause
       throw cause
