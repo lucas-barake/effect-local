@@ -1,6 +1,6 @@
 {
   "name": "@lucas-barake/effect-local-expo",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Expo SQLite, crypto, and WebSocket integration for Effect Local replicas on React Native",
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
