@@ -6,6 +6,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Equal from "effect/Equal"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
@@ -13,6 +14,7 @@ import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
+import * as Schedule from "effect/Schedule"
 import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -195,6 +197,133 @@ describe("EphemeralClient", () => {
   )
 
   it.effect(
+    "abandons and rejoins a join whose snapshot never arrives within the rpc timeout",
+    Effect.fnUntraced(function*() {
+      const joins = yield* Ref.make(0)
+      const firstJoined = yield* Deferred.make<void>()
+      const firstClosed = yield* Deferred.make<void>()
+      const fakeClient = {
+        JoinEphemeral: Effect.fnUntraced(function*() {
+          const join = yield* Ref.updateAndGet(joins, (count) => count + 1)
+          const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage, Cause.Done>()
+          yield* Queue.offer(
+            messages,
+            Protocol.EphemeralSessionStarted.make({
+              spaceId,
+              member,
+              sessionToken: Identity.EphemeralSessionToken.make(
+                "eps_00000000-0000-4000-8000-000000000001"
+              ),
+              leaseMillis: 60_000
+            })
+          )
+          if (join === 1) {
+            yield* Effect.addFinalizer(() => Deferred.succeed(firstClosed, undefined))
+            yield* Deferred.succeed(firstJoined, undefined)
+            return messages
+          }
+          yield* Queue.offer(
+            messages,
+            Protocol.EphemeralSnapshot.make({
+              spaceId,
+              revision: Identity.EphemeralRevision.make(1),
+              members: [{ member: memberB, value: null, expiresAtMillis: 60_000 }],
+              states: []
+            })
+          )
+          return messages
+        }),
+        HeartbeatEphemeral: () => Effect.succeed(null),
+        PublishEphemeral: () => Effect.succeed(null)
+      }
+      const layerClient = layerFromFakeClient(fakeClient, {
+        rpcTimeout: "5 seconds",
+        rejoinPolicy: Schedule.spaced("1 second")
+      })
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const opening = yield* client.session(Anonymous, {
+          spaceId,
+          member,
+          value: undefined,
+          ttl: "1 minute"
+        }).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(firstJoined)
+        yield* TestClock.adjust("5 seconds")
+        yield* Deferred.await(firstClosed)
+        const opened = yield* Fiber.join(opening)
+        const rejoined = yield* opened.members.pipe(
+          Stream.filter((roster) => roster.some((entry) => entry.member.clientId === memberB.clientId)),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* TestClock.adjust("1 second")
+        assert.isDefined(Option.getOrUndefined(yield* Fiber.join(rejoined)))
+        assert.strictEqual(yield* Ref.get(joins), 2)
+      })
+      yield* program.pipe(Effect.provide(layerClient), Effect.scoped)
+    })
+  )
+
+  it.effect(
+    "runs a saved clear effect against the session that is current when it executes",
+    Effect.fnUntraced(function*() {
+      const tokenFor = (join: number) =>
+        Identity.EphemeralSessionToken.make(`eps_00000000-0000-4000-8000-00000000000${join}`)
+      const joins = yield* Ref.make(0)
+      const firstQueue = yield* Deferred.make<Queue.Queue<Protocol.EphemeralJoinMessage, Cause.Done>>()
+      const sentTokens = yield* Queue.unbounded<Identity.EphemeralSessionToken>()
+      const fakeClient = {
+        JoinEphemeral: Effect.fnUntraced(function*() {
+          const join = yield* Ref.updateAndGet(joins, (count) => count + 1)
+          const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage, Cause.Done>()
+          yield* Queue.offer(
+            messages,
+            Protocol.EphemeralSessionStarted.make({
+              spaceId,
+              member,
+              sessionToken: tokenFor(join),
+              leaseMillis: 60_000
+            })
+          )
+          const roster = [{ member, value: null, expiresAtMillis: 60_000 }]
+          if (join === 2) roster.push({ member: memberB, value: null, expiresAtMillis: 60_000 })
+          yield* Queue.offer(
+            messages,
+            Protocol.EphemeralSnapshot.make({
+              spaceId,
+              revision: Identity.EphemeralRevision.make(join),
+              members: roster,
+              states: []
+            })
+          )
+          if (join === 1) yield* Deferred.succeed(firstQueue, messages)
+          return messages
+        }),
+        HeartbeatEphemeral: () => Effect.succeed(null),
+        PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) =>
+          Queue.offer(sentTokens, request.sessionToken).pipe(Effect.as(null))
+      }
+      const layerClient = layerFromFakeClient(fakeClient)
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const opened = yield* client.session(Anonymous, { spaceId, member, value: undefined, ttl: "1 minute" })
+        const clearTyping = client.clear(Typing, { spaceId, member })
+        const rejoined = yield* opened.members.pipe(
+          Stream.filter((roster) => roster.some((entry) => entry.member.clientId === memberB.clientId)),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Queue.end(yield* Deferred.await(firstQueue))
+        yield* Fiber.join(rejoined)
+        yield* clearTyping
+        assert.strictEqual(yield* Queue.take(sentTokens), tokenFor(2))
+      })
+      yield* program.pipe(Effect.provide(layerClient), Effect.scoped)
+    })
+  )
+
+  it.effect(
     "does not rejoin after the server rejects a replaced session",
     Effect.fnUntraced(function*() {
       const joins = yield* Ref.make(0)
@@ -340,7 +469,9 @@ const stateSet = (
     }
   })
 
-const makeTypedHarness = Effect.fnUntraced(function*() {
+const makeTypedHarness = Effect.fnUntraced(function*(
+  options?: Parameters<typeof EphemeralClient.layerFromSession>[0]
+) {
   const messagesA = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
   const messagesB = yield* Queue.unbounded<Protocol.EphemeralJoinMessage>()
   const published = yield* Queue.unbounded<typeof Protocol.VersionedEphemeralPublishRequest.Type>()
@@ -356,7 +487,7 @@ const makeTypedHarness = Effect.fnUntraced(function*() {
     PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) =>
       Queue.offer(published, request).pipe(Effect.as(null))
   }
-  const layerClient = layerFromFakeClient(fakeClient)
+  const layerClient = layerFromFakeClient(fakeClient, options)
   return { messagesA, messagesB, published, joins, layerClient }
 })
 
@@ -779,8 +910,9 @@ describe("EphemeralClient projection work", () => {
             stateSet(spaceId, revision + 2, "Sentinel", `sentinel-${revision}`, { marker: `m${revision}` })
           )
         }
-        for (let received = 0; received < 30; received = received + 1) {
-          yield* Queue.take(sentinelEmissions)
+        let latest: ReadonlyArray<unknown> = []
+        while (latest.length < 30) {
+          latest = yield* Queue.take(sentinelEmissions)
         }
         assert.strictEqual(
           reads - settled,
@@ -796,6 +928,66 @@ describe("EphemeralClient projection work", () => {
         yield* Fiber.interrupt(sentinelConsumer)
       })
       yield* program.pipe(Effect.provide(harness.layerClient))
+    })
+  )
+
+  it.effect(
+    "rejoins with the member value the server accepted last when updates overlap",
+    Effect.fnUntraced(function*() {
+      const joinValues = yield* Queue.unbounded<typeof Schema.Json.Type>()
+      const accepted = yield* Ref.make<typeof Schema.Json.Type>(null)
+      const graceReceived = yield* Deferred.make<void>()
+      const firstQueue = yield* Deferred.make<Queue.Queue<Protocol.EphemeralJoinMessage, Cause.Done>>()
+      const joins = yield* Ref.make(0)
+      const fakeClient = {
+        JoinEphemeral: Effect.fnUntraced(function*(
+          request: typeof Protocol.VersionedEphemeralJoinRequest.Type
+        ) {
+          const join = yield* Ref.updateAndGet(joins, (count) => count + 1)
+          yield* Queue.offer(joinValues, request.value)
+          const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage, Cause.Done>()
+          yield* Queue.offer(messages, sessionStarted(spaceId, member))
+          yield* Queue.offer(
+            messages,
+            snapshot(spaceId, join, {
+              members: [{ member, value: request.value, expiresAtMillis: 60_000 }]
+            })
+          )
+          if (join === 1) yield* Deferred.succeed(firstQueue, messages)
+          return messages
+        }),
+        HeartbeatEphemeral: () => Effect.succeed(null),
+        PublishEphemeral: Effect.fnUntraced(function*(
+          request: typeof Protocol.VersionedEphemeralPublishRequest.Type
+        ) {
+          if (request.request._tag !== "UpdateMember") return null
+          yield* Ref.set(accepted, request.request.value)
+          if (Equal.equals(request.request.value, { displayName: "Grace" })) {
+            yield* Deferred.succeed(graceReceived, undefined)
+            yield* Effect.sleep("1 second")
+          }
+          return null
+        })
+      }
+      const layerClient = layerFromFakeClient(fakeClient)
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const opened = yield* client.session(Profile, sessionOptions)
+        assert.deepStrictEqual(yield* Queue.take(joinValues), { displayName: "Ada" })
+        const grace = yield* opened.updateMember({ displayName: "Grace" }).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(graceReceived)
+        const hopper = yield* opened.updateMember({ displayName: "Hopper" }).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* TestClock.adjust("1 second")
+        yield* Fiber.join(grace)
+        yield* Fiber.join(hopper)
+        yield* Queue.end(yield* Deferred.await(firstQueue))
+        assert.deepStrictEqual(yield* Queue.take(joinValues), yield* Ref.get(accepted))
+      })
+      yield* program.pipe(Effect.provide(layerClient), Effect.scoped)
     })
   )
 
@@ -971,6 +1163,97 @@ describe("EphemeralClient projection work", () => {
       for (const maxOpsBeforeYield of [7, 8, 12]) {
         for (let spacing = 0; spacing < 6; spacing++) yield* deliver(maxOpsBeforeYield, spacing)
       }
+    })
+  )
+
+  it.effect(
+    "hands a blocked state subscriber only the latest view, including channels changed before the last update",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeTypedHarness()
+      yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
+      yield* Queue.offer(harness.messagesA, snapshot(spaceId, 1))
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const session = yield* client.session(Profile, sessionOptions)
+        const gate = yield* Deferred.make<void>()
+        const emissions = yield* Queue.unbounded<number>()
+        const blocked = yield* session.state(ReadPosition).pipe(
+          Stream.mapEffect((entries) =>
+            Queue.offer(emissions, entries.length).pipe(Effect.andThen(Deferred.await(gate)))
+          ),
+          Stream.runDrain,
+          Effect.forkChild({ startImmediately: true })
+        )
+        assert.strictEqual(yield* Queue.take(emissions), 0)
+        for (let index = 0; index < 200; index = index + 1) {
+          yield* Queue.offer(
+            harness.messagesA,
+            stateSet(spaceId, index + 2, "ReadPosition", `conversation-${index}`, { messageId: `message-${index}` })
+          )
+        }
+        yield* Queue.offer(harness.messagesA, stateSet(spaceId, 202, "Sentinel", "probe", { marker: "done" }))
+        yield* session.state(Sentinel).pipe(
+          Stream.filter((entries) => entries.length > 0),
+          Stream.runHead
+        )
+        yield* Deferred.succeed(gate, undefined)
+        const delivered: Array<number> = []
+        while (delivered.length < 2 && delivered.at(-1) !== 200) delivered.push(yield* Queue.take(emissions))
+        assert.strictEqual(
+          delivered.at(-1),
+          200,
+          `the blocked subscriber replayed stale views ${delivered.join(", ")}`
+        )
+        yield* Fiber.interrupt(blocked)
+      })
+      yield* program.pipe(Effect.provide(harness.layerClient))
+    })
+  )
+
+  it.effect(
+    "fails an event subscriber that falls further behind than the event capacity",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeTypedHarness({ eventCapacity: 4 })
+      yield* Queue.offer(harness.messagesA, sessionStarted(spaceId, member))
+      yield* Queue.offer(harness.messagesA, snapshot(spaceId, 1))
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const session = yield* client.session(Profile, sessionOptions)
+        const subscribed = yield* Deferred.make<void>()
+        const gate = yield* Deferred.make<void>()
+        const lagging = yield* session.events(Pings).pipe(
+          Stream.mapEffect((event) =>
+            Deferred.succeed(subscribed, undefined).pipe(
+              Effect.andThen(Deferred.await(gate)),
+              Effect.as(event)
+            )
+          ),
+          Stream.takeUntil((event) => event.payload.count === 10),
+          Stream.runDrain,
+          Effect.result,
+          Effect.forkChild({ startImmediately: true })
+        )
+        let revision = 2
+        while (!(yield* Deferred.isDone(subscribed))) {
+          yield* Queue.offer(harness.messagesA, eventMessage(spaceId, revision++, "Pings", { count: -1 }))
+          yield* Effect.yieldNow
+        }
+        for (let count = 1; count <= 10; count = count + 1) {
+          yield* Queue.offer(harness.messagesA, eventMessage(spaceId, revision++, "Pings", { count }))
+        }
+        yield* Queue.offer(harness.messagesA, stateSet(spaceId, revision, "Sentinel", "probe", { marker: "done" }))
+        yield* session.state(Sentinel).pipe(
+          Stream.filter((entries) => entries.length > 0),
+          Stream.runHead
+        )
+        yield* Deferred.succeed(gate, undefined)
+        const result = yield* Fiber.join(lagging)
+        assert.isTrue(Result.isFailure(result), "the lagging subscriber received every event")
+        if (Result.isFailure(result)) {
+          assert.strictEqual(result.failure._tag, "CapacityExceeded")
+        }
+      })
+      yield* program.pipe(Effect.provide(harness.layerClient))
     })
   )
 })

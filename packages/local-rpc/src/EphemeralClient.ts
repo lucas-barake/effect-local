@@ -10,10 +10,8 @@ import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Exit from "effect/Exit"
-import * as Fiber from "effect/Fiber"
 import * as Hash from "effect/Hash"
 import * as Layer from "effect/Layer"
-import * as Order from "effect/Order"
 import * as PubSub from "effect/PubSub"
 import * as Pull from "effect/Pull"
 import * as RcMap from "effect/RcMap"
@@ -23,12 +21,15 @@ import type * as RpcMiddleware from "effect/rpc/RpcMiddleware"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
+import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import type * as Authentication from "./Authentication.js"
-import { positiveFiniteDurationMillis, reconnectPolicy } from "./internal/configuration.js"
+import { positiveFiniteDurationMillis, positiveSafeInteger, reconnectPolicy } from "./internal/configuration.js"
+import * as EphemeralView from "./internal/ephemeralView.js"
 import { invalidConfiguration } from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
+import * as SequencedPubSub from "./internal/sequencedPubSub.js"
 import * as ProtocolSession from "./ProtocolSession.js"
 import * as Transport from "./Transport.js"
 
@@ -130,6 +131,7 @@ export interface Options extends ProtocolSession.Options {
   readonly rpcTimeout?: Duration.Input
   readonly heartbeatInterval?: Duration.Input
   readonly rejoinPolicy?: Schedule.Schedule<unknown, ReplicaError.ReplicaError>
+  readonly eventCapacity?: number
 }
 
 const boundedTtlMillis = Effect.fnUntraced(function*(
@@ -174,107 +176,15 @@ class SessionIdentity implements Equal.Equal {
   }
 }
 
-interface RawView {
-  readonly members: ReadonlyArray<Protocol.EphemeralMemberEntry>
-  readonly states: ReadonlyMap<string, Protocol.EphemeralStateEntry>
-}
-
-type ViewScope =
-  | { readonly kind: "all" }
-  | { readonly kind: "members" }
-  | { readonly kind: "state"; readonly channel: string }
-
-interface ViewEmission {
-  readonly view: RawView
-  readonly scope: ViewScope
-}
-
 interface SessionRuntime {
   readonly requestHash: string
-  readonly views: PubSub.PubSub<ViewEmission>
-  readonly events: PubSub.PubSub<Protocol.EphemeralEventEntry>
+  readonly views: PubSub.PubSub<EphemeralView.View>
+  readonly events: SequencedPubSub.SequencedPubSub<Protocol.EphemeralEventEntry>
   readonly ready: Deferred.Deferred<void, ReplicaError.ReplicaError>
   readonly failure: Deferred.Deferred<never, ReplicaError.ReplicaError>
+  readonly memberUpdates: Semaphore.Semaphore
   readonly recordMemberValue: (value: typeof Schema.Json.Type) => void
 }
-
-const sameMember = (left: Protocol.EphemeralMember, right: Protocol.EphemeralMember) =>
-  left.clientId === right.clientId && left.membershipIncarnation === right.membershipIncarnation
-
-const stateIdentity = (
-  member: Protocol.EphemeralMember,
-  channel: Protocol.EphemeralChannel,
-  key: Protocol.EphemeralKey
-) =>
-  [member.clientId, member.membershipIncarnation, channel, key]
-    .map((component) => `${component.length}:${component}`)
-    .join("")
-
-const reduceView = (
-  current: RawView | undefined,
-  message: Exclude<Protocol.EphemeralMessage, Protocol.EphemeralEvent | Protocol.EphemeralEventCleared>
-): ViewEmission | undefined => {
-  if (message._tag === "Snapshot") {
-    return {
-      view: {
-        members: message.members,
-        states: new Map(
-          message.states.map((entry) => [stateIdentity(entry.member, entry.channel, entry.key), entry])
-        )
-      },
-      scope: { kind: "all" }
-    }
-  }
-  if (current === undefined) return undefined
-  if (message._tag === "MemberUpserted") {
-    return {
-      view: {
-        ...current,
-        members: [
-          ...current.members.filter((entry) => !sameMember(entry.member, message.entry.member)),
-          message.entry
-        ]
-      },
-      scope: { kind: "members" }
-    }
-  }
-  if (message._tag === "MemberLeft") {
-    return {
-      view: {
-        ...current,
-        members: current.members.filter((entry) => !sameMember(entry.member, message.member))
-      },
-      scope: { kind: "members" }
-    }
-  }
-  if (message._tag === "StateSet") {
-    const states = new Map(current.states)
-    states.set(stateIdentity(message.entry.member, message.entry.channel, message.entry.key), message.entry)
-    return { view: { ...current, states }, scope: { kind: "state", channel: message.entry.channel } }
-  }
-  const states = new Map(current.states)
-  states.delete(stateIdentity(message.member, message.channel, message.key))
-  return { view: { ...current, states }, scope: { kind: "state", channel: message.channel } }
-}
-
-const byIdentity = <A,>(left: readonly [string, A], right: readonly [string, A]) => Order.String(left[0], right[0])
-
-const stateSlice = (view: RawView, channel: string): ReadonlyArray<Protocol.EphemeralStateEntry> =>
-  [...view.states]
-    .filter(([, entry]) => entry.channel === channel)
-    .sort(byIdentity)
-    .map(([, entry]) => entry)
-
-const memberSlice = (view: RawView): ReadonlyArray<Protocol.EphemeralMemberEntry> =>
-  [
-    ...new Map(
-      view.members.map((entry) => [`${entry.member.clientId}:${entry.member.membershipIncarnation}`, entry])
-    )
-  ]
-    .sort(byIdentity)
-    .map(([, entry]) => entry)
-
-const noProjection = (): string | undefined => undefined
 
 const isTransportFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "ServerUnavailable" || error._tag === "OperationTimeout"
@@ -284,20 +194,8 @@ const isTransientFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "OperationTimeout" ||
   error._tag === "AuthenticatorUnavailable"
 
-const projectSlice = <A,>(
-  affects: (scope: ViewScope) => boolean,
-  slice: (view: RawView) => A
-) =>
-(fingerprint: string | undefined, emission: ViewEmission) => {
-  if (fingerprint !== undefined && !affects(emission.scope)) return [fingerprint, []] as const
-  const next = slice(emission.view)
-  const nextFingerprint = Canonical.hash(next)
-  if (nextFingerprint === fingerprint) return [fingerprint, []] as const
-  return [nextFingerprint, [next]] as const
-}
-
 export const layerFromSession = (
-  options?: Pick<Options, "rpcTimeout" | "heartbeatInterval" | "rejoinPolicy">
+  options?: Pick<Options, "rpcTimeout" | "heartbeatInterval" | "rejoinPolicy" | "eventCapacity">
 ): Layer.Layer<
   EphemeralClient,
   ReplicaError.InvalidConfiguration,
@@ -314,6 +212,7 @@ export const layerFromSession = (
         "heartbeatInterval",
         options?.heartbeatInterval ?? "20 seconds"
       )
+      const eventCapacity = yield* positiveSafeInteger("eventCapacity", options?.eventCapacity ?? 1_024)
       const rejoinPolicy = Schedule.while(
         options?.rejoinPolicy ?? reconnectPolicy,
         ({ input }) => isTransientFailure(input)
@@ -330,17 +229,18 @@ export const layerFromSession = (
         `${request.spaceId}:${request.member.clientId}:${request.member.membershipIncarnation}`
       const requireSession = (
         request: Protocol.EphemeralHeartbeatRequest
-      ): Effect.Effect<ActiveSession, ReplicaError.EphemeralSessionUnavailable> => {
-        const active = sessions.get(sessionKey(request))
-        if (active !== undefined) return Effect.succeed(active)
-        return Effect.fail(
-          new ReplicaError.EphemeralSessionUnavailable({
-            spaceId: request.spaceId,
-            clientId: request.member.clientId,
-            membershipIncarnation: request.member.membershipIncarnation
-          })
-        )
-      }
+      ): Effect.Effect<ActiveSession, ReplicaError.EphemeralSessionUnavailable> =>
+        Effect.suspend(() => {
+          const active = sessions.get(sessionKey(request))
+          if (active !== undefined) return Effect.succeed(active)
+          return Effect.fail(
+            new ReplicaError.EphemeralSessionUnavailable({
+              spaceId: request.spaceId,
+              clientId: request.member.clientId,
+              membershipIncarnation: request.member.membershipIncarnation
+            })
+          )
+        })
 
       const publishWire = (request: Protocol.EphemeralPublishRequest) =>
         requireSession(request).pipe(
@@ -482,21 +382,107 @@ export const layerFromSession = (
           })
         )
 
+      const joinAttempt = (
+        request: Protocol.EphemeralJoinRequest,
+        memberUpdates: Semaphore.Semaphore,
+        memberValue: () => typeof Schema.Json.Type,
+        version: Protocol.ProtocolVersion,
+        synchronized: Deferred.Deferred<void>
+      ) =>
+        Stream.unwrap(Effect.gen(function*() {
+          const owner = {}
+          const started = yield* Deferred.make<Protocol.EphemeralSessionStarted>()
+          const holding = yield* Deferred.make<void>()
+          yield* Deferred.succeed(holding, undefined).pipe(
+            Effect.andThen(Deferred.await(started)),
+            Semaphore.withPermit(memberUpdates),
+            Effect.forkScoped({ startImmediately: true })
+          )
+          yield* Deferred.await(holding)
+          const queue = yield* client.JoinEphemeral(
+            { ...request, value: memberValue(), protocolVersion: version },
+            { asQueue: true }
+          )
+          const messages = LosslessQueue.stream(queue).pipe(
+            Stream.catchReasons(
+              "RpcClientError",
+              {
+                WorkerSpawnError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                WorkerSendError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                WorkerReceiveError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                WorkerUnknownError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                SocketReadError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                SocketWriteError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                SocketOpenError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                SocketCloseError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                SocketUpgradeError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                HttpError: (reason, error) => {
+                  if (reason.kind === "TransportError") {
+                    return Stream.fail(new ReplicaError.ServerUnavailable())
+                  }
+                  return Stream.fail(
+                    new ReplicaError.ProtocolInvalid({
+                      message: "The JoinEphemeral RPC failed",
+                      cause: error
+                    })
+                  )
+                },
+                RpcClientDefect: (_, error) =>
+                  Stream.fail(
+                    new ReplicaError.ProtocolInvalid({
+                      message: "The JoinEphemeral RPC failed",
+                      cause: error
+                    })
+                  )
+              },
+              (_, error) => Stream.die(error)
+            ),
+            Stream.catchCause((cause) => {
+              if (Cause.hasInterruptsOnly(cause)) return Stream.fail(new ReplicaError.ServerUnavailable())
+              return Stream.failCause(cause)
+            })
+          )
+          const visible = messages.pipe(
+            Stream.tap((message) => {
+              if (message._tag === "Snapshot") return Deferred.succeed(synchronized, undefined)
+              if (message._tag !== "SessionStarted") return Effect.void
+              sessions.set(sessionKey(request), { owner, sessionToken: message.sessionToken })
+              return Deferred.succeed(started, message)
+            }),
+            Stream.filter(
+              (message): message is Protocol.EphemeralMessage => message._tag !== "SessionStarted"
+            )
+          )
+          const heartbeatLoop = Deferred.await(started).pipe(
+            Effect.flatMap((accepted) => {
+              const halfLeaseMillis = Math.floor(accepted.leaseMillis / 2)
+              const interval = Math.max(1, Math.min(heartbeatIntervalMillis, halfLeaseMillis))
+              return Effect.sleep(interval).pipe(
+                Effect.andThen(heartbeat({ spaceId: request.spaceId, member: request.member })),
+                Effect.forever
+              )
+            })
+          )
+          return LosslessQueue.mergeEffect(visible, heartbeatLoop).pipe(
+            Stream.ensuring(Effect.sync(() => {
+              if (sessions.get(sessionKey(request))?.owner === owner) {
+                sessions.delete(sessionKey(request))
+              }
+            }))
+          )
+        }))
+
       const joinWire = (
         request: Protocol.EphemeralJoinRequest,
+        memberUpdates: Semaphore.Semaphore,
         memberValue: () => typeof Schema.Json.Type
       ) =>
         ProtocolSessionRetry.runStream(
           session,
           (version) =>
             Stream.unwrap(Effect.gen(function*() {
-              const owner = {}
-              const started = yield* Deferred.make<Protocol.EphemeralSessionStarted>()
-              const acquisition = yield* client.JoinEphemeral(
-                { ...request, value: memberValue(), protocolVersion: version },
-                { asQueue: true }
-              ).pipe(Effect.forkScoped({ startImmediately: true }))
-              const queue = yield* Fiber.join(acquisition).pipe(
+              const synchronized = yield* Deferred.make<void>()
+              const handshakeDeadline = Deferred.await(synchronized).pipe(
                 Effect.timeoutOrElse({
                   duration: rpcTimeoutMillis,
                   orElse: () =>
@@ -506,74 +492,11 @@ export const layerFromSession = (
                         timeoutMillis: rpcTimeoutMillis
                       })
                     )
-                }),
-                Effect.ensuring(Fiber.interrupt(acquisition))
-              )
-              const messages = LosslessQueue.stream(queue).pipe(
-                Stream.catchReasons(
-                  "RpcClientError",
-                  {
-                    WorkerSpawnError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    WorkerSendError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    WorkerReceiveError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    WorkerUnknownError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    SocketReadError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    SocketWriteError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    SocketOpenError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    SocketCloseError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    SocketUpgradeError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    HttpError: (reason, error) => {
-                      if (reason.kind === "TransportError") {
-                        return Stream.fail(new ReplicaError.ServerUnavailable())
-                      }
-                      return Stream.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The JoinEphemeral RPC failed",
-                          cause: error
-                        })
-                      )
-                    },
-                    RpcClientDefect: (_, error) =>
-                      Stream.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The JoinEphemeral RPC failed",
-                          cause: error
-                        })
-                      )
-                  },
-                  (_, error) => Stream.die(error)
-                ),
-                Stream.catchCause((cause) => {
-                  if (Cause.hasInterruptsOnly(cause)) return Stream.fail(new ReplicaError.ServerUnavailable())
-                  return Stream.failCause(cause)
                 })
               )
-              const visible = messages.pipe(
-                Stream.tap((message) => {
-                  if (message._tag !== "SessionStarted") return Effect.void
-                  sessions.set(sessionKey(request), { owner, sessionToken: message.sessionToken })
-                  return Deferred.succeed(started, message)
-                }),
-                Stream.filter(
-                  (message): message is Protocol.EphemeralMessage => message._tag !== "SessionStarted"
-                )
-              )
-              const heartbeatLoop = Deferred.await(started).pipe(
-                Effect.flatMap((accepted) => {
-                  const halfLeaseMillis = Math.floor(accepted.leaseMillis / 2)
-                  const interval = Math.max(1, Math.min(heartbeatIntervalMillis, halfLeaseMillis))
-                  return Effect.sleep(interval).pipe(
-                    Effect.andThen(heartbeat({ spaceId: request.spaceId, member: request.member })),
-                    Effect.forever
-                  )
-                })
-              )
-              return LosslessQueue.mergeEffect(visible, heartbeatLoop).pipe(
-                Stream.ensuring(Effect.sync(() => {
-                  if (sessions.get(sessionKey(request))?.owner === owner) {
-                    sessions.delete(sessionKey(request))
-                  }
-                }))
+              return LosslessQueue.mergeEffect(
+                joinAttempt(request, memberUpdates, memberValue, version, synchronized),
+                handshakeDeadline
               )
             }))
         ).pipe(
@@ -587,19 +510,20 @@ export const layerFromSession = (
 
       const runtimes = yield* RcMap.make({
         lookup: Effect.fnUntraced(function*(identity: SessionIdentity) {
-          const views = yield* PubSub.unbounded<ViewEmission>({ replay: 1 })
-          const events = yield* PubSub.unbounded<Protocol.EphemeralEventEntry>()
+          const views = yield* PubSub.sliding<EphemeralView.View>({ capacity: 1, replay: 1 })
+          const events = yield* SequencedPubSub.sliding<Protocol.EphemeralEventEntry>("ephemeral events", eventCapacity)
           const ready = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           const failure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
-          let view: RawView | undefined
+          let view: EphemeralView.View | undefined
           let unknownPresented = false
           let memberValue = identity.request.value
+          const memberUpdates = yield* Semaphore.make(1)
           const consume = (message: Protocol.EphemeralMessage) => {
-            if (message._tag === "Event") return PubSub.publish(events, message.entry).pipe(Effect.asVoid)
+            if (message._tag === "Event") return SequencedPubSub.publish(events, message.entry)
             if (message._tag === "EventCleared") return Effect.void
-            const next = reduceView(view, message)
+            const next = EphemeralView.reduce(view, message)
             if (next === undefined) return Effect.void
-            view = next.view
+            view = next
             unknownPresented = false
             return PubSub.publish(views, next).pipe(
               Effect.andThen(Deferred.succeed(ready, undefined)),
@@ -610,7 +534,7 @@ export const layerFromSession = (
             if (unknownPresented) return Effect.void
             view = undefined
             unknownPresented = true
-            return PubSub.publish(views, { view: { members: [], states: new Map() }, scope: { kind: "all" } }).pipe(
+            return PubSub.publish(views, EphemeralView.empty()).pipe(
               Effect.andThen(Deferred.succeed(ready, undefined)),
               Effect.asVoid
             )
@@ -620,7 +544,7 @@ export const layerFromSession = (
             while (true) {
               let joined = false
               const transportGeneration = yield* transport.generation
-              const attempt = yield* joinWire(identity.request, () => memberValue).pipe(
+              const attempt = yield* joinWire(identity.request, memberUpdates, () => memberValue).pipe(
                 Stream.runForEach((message) => {
                   joined = true
                   return consume(message)
@@ -658,7 +582,7 @@ export const layerFromSession = (
             return Deferred.fail(ready, closed).pipe(
               Effect.andThen(Deferred.fail(failure, closed)),
               Effect.andThen(PubSub.shutdown(views)),
-              Effect.andThen(PubSub.shutdown(events))
+              Effect.andThen(SequencedPubSub.shutdown(events))
             )
           })
           const runtime: SessionRuntime = {
@@ -667,6 +591,7 @@ export const layerFromSession = (
             events,
             ready,
             failure,
+            memberUpdates,
             recordMemberValue: (value) => {
               memberValue = value
             }
@@ -684,7 +609,7 @@ export const layerFromSession = (
         const orFailure = <A, E extends { readonly _tag: string },>(stream: Stream.Stream<A, E>) =>
           LosslessQueue.merge(stream, failureStream)
         const events = (definition: Ephemeral.AnyEvent) =>
-          Stream.fromPubSub(runtime.events).pipe(
+          Stream.unwrap(SequencedPubSub.subscribe(runtime.events)).pipe(
             Stream.filter((entry) => entry.channel === definition.name),
             Stream.mapEffect((entry) =>
               Schema.decodeUnknownEffect(definition.payloadSchema)(entry.value).pipe(
@@ -698,11 +623,11 @@ export const layerFromSession = (
         const state = (definition: Ephemeral.AnyState) =>
           Stream.fromPubSub(runtime.views).pipe(
             Stream.mapAccum(
-              noProjection,
-              projectSlice(
-                (scope) =>
-                  scope.kind === "all" || (scope.kind === "state" && scope.channel === definition.name),
-                (view) => stateSlice(view, definition.name)
+              EphemeralView.noProjection,
+              EphemeralView.projectSlice(
+                (view) =>
+                  EphemeralView.channelStates(view, definition.name),
+                (view) => EphemeralView.channelSlice(view, definition.name)
               )
             ),
             Stream.mapEffect(Effect.forEach((entry) =>
@@ -724,9 +649,13 @@ export const layerFromSession = (
           )
         const members = Stream.fromPubSub(runtime.views).pipe(
           Stream.mapAccum(
-            noProjection,
-            projectSlice((scope) =>
-              scope.kind === "all" || scope.kind === "members", memberSlice)
+            EphemeralView.noProjection,
+            EphemeralView.projectSlice(
+              (view) =>
+                view.members,
+              (view) =>
+                EphemeralView.sortedValues(view.members)
+            )
           ),
           Stream.mapEffect(Effect.forEach((entry) =>
             Schema.decodeUnknownEffect(profile.payloadSchema)(entry.value).pipe(
@@ -743,9 +672,7 @@ export const layerFromSession = (
         )
         const updateMember = (value: Ephemeral.Payload<M>) =>
           Schema.encodeEffect(profile.payloadSchema)(value).pipe(
-            Effect.flatMap((encoded) =>
-              Schema.decodeUnknownEffect(Schema.Json)(encoded)
-            ),
+            Effect.flatMap((encoded) => Schema.decodeUnknownEffect(Schema.Json)(encoded)),
             Effect.catchTag(
               "SchemaError",
               (cause) => Effect.fail(new Ephemeral.EncodeError({ definition: "member", cause }))
@@ -755,7 +682,10 @@ export const layerFromSession = (
                 spaceId: target.spaceId,
                 member: target.member,
                 value: encoded
-              })).pipe(Effect.andThen(Effect.sync(() => runtime.recordMemberValue(encoded))))
+              })).pipe(
+                Effect.andThen(Effect.sync(() => runtime.recordMemberValue(encoded))),
+                Semaphore.withPermit(runtime.memberUpdates)
+              )
             )
           )
         return {

@@ -18,7 +18,7 @@ import * as RcMap from "effect/RcMap"
 import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
-import { positiveFiniteDurationMillis } from "./internal/configuration.js"
+import { positiveFiniteDurationMillis, positiveSafeInteger } from "./internal/configuration.js"
 import { capacityExceeded, invalidConfiguration } from "./internal/errors.js"
 
 export const JoinAuthorization = Schema.TaggedStruct("Join", {
@@ -176,13 +176,6 @@ const nextRevision = (runtime: SpaceRuntime): Identity.EphemeralRevision => {
   runtime.revision += 1
   return Identity.EphemeralRevision.make(runtime.revision)
 }
-
-const positiveSafeInteger = Effect.fnUntraced(function*(option: string, value: number) {
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    return yield* invalidConfiguration(option, `${option} must be a positive safe integer`)
-  }
-  return value
-})
 
 const resolveOptions = Effect.fnUntraced(function*(options: Options) {
   const counts = {

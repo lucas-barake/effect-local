@@ -232,7 +232,9 @@ export const layerClientRpc = Layer.merge(
 )
 ```
 
-The actual heartbeat interval is no longer than half the server-accepted member lease. Negotiation selects the highest shared
+The actual heartbeat interval is no longer than half the server-accepted member lease. Roster and state streams always
+resume at the latest view, so a slow subscriber skips intermediate views. Event streams buffer up to `eventCapacity`
+events per session, default 1,024, and a subscriber that falls further behind fails with `CapacityExceeded`. Negotiation selects the highest shared
 version. A peer rejection causes one renegotiation and retry. No common version returns terminal `UpgradeRequired`.
 
 `ProtocolSession` and `SyncServer` default to `Protocol.supportedProtocolVersions`, which is `[1]`. `SyncEngine.submitBatch`
@@ -242,7 +244,8 @@ one SQL transaction per envelope and returns a shorter prefix when the response 
 or the batch has run for the store's `maximumSubmitBatchDuration`, default 1 second. The client resubmits the rest.
 
 `sessionAcquisitionTimeout` and `rpcTimeout` accept `Duration.Input` and default to 10 seconds. They bound negotiation,
-unary RPCs, and stream acquisition. Established join and watch streams may remain idle. Expiry returns typed
+unary RPCs, and stream acquisition. An ephemeral join must also deliver its session and first snapshot within
+`rpcTimeout`, or the attempt is abandoned and rejoined. Established join and watch streams may remain idle. Expiry returns typed
 `OperationTimeout`. Socket ping and reconnect detect dead connections without converting healthy idle streams into
 retry traffic.
 
