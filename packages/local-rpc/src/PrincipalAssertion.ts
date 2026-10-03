@@ -45,7 +45,7 @@ export const layerVerifier = (
   verify: VerifierService["verify"]
 ): Layer.Layer<Verifier> => Layer.succeed(Verifier, Verifier.of({ verify }))
 
-const jsonAssertion = Schema.fromJsonString(Schema.Json)
+const JsonAssertion = Schema.fromJsonString(Schema.Json)
 
 /**
  * Carries the principal as its JSON encoding with no signature. Only for
@@ -54,13 +54,13 @@ const jsonAssertion = Schema.fromJsonString(Schema.Json)
  */
 export const layerJson: Layer.Layer<Issuer | Verifier> = Layer.merge(
   layerIssuer((principal) =>
-    Schema.encodeUnknownEffect(jsonAssertion)(principal).pipe(
+    Schema.encodeUnknownEffect(JsonAssertion)(principal).pipe(
       Effect.map((assertion) => PrincipalAssertion.make(assertion)),
       Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "could not issue principal assertion" }))
     )
   ),
   layerVerifier((assertion) =>
-    Schema.decodeUnknownEffect(jsonAssertion)(assertion).pipe(
+    Schema.decodeUnknownEffect(JsonAssertion)(assertion).pipe(
       Effect.mapError(() => new ReplicaError.AuthorizationDenied({ reason: "invalid principal assertion" }))
     )
   )

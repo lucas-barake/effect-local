@@ -78,12 +78,12 @@ export function make(name: string, options: {
   readonly rejection?: ErrorSchema
 }): Mutation<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema> {
   ComponentName.validate("Mutation", name)
-  let payloadSchema: SchemaInput.WireSchema = SchemaInput.Void
-  if (options.payload !== undefined) payloadSchema = SchemaInput.normalize(options.payload)
-  const successSchema = options.success ?? SchemaInput.Void
-  const rejectionSchema: ErrorSchema = options.rejection ?? Schema.Never
-  SchemaInput.requireStringKeys(successSchema)
-  SchemaInput.requireStringKeys(rejectionSchema)
+  let PayloadSchema: SchemaInput.WireSchema = SchemaInput.Void
+  if (options.payload !== undefined) PayloadSchema = SchemaInput.normalize(options.payload)
+  const SuccessSchema = options.success ?? SchemaInput.Void
+  const RejectionSchema: ErrorSchema = options.rejection ?? Schema.Never
+  SchemaInput.requireStringKeys(SuccessSchema)
+  SchemaInput.requireStringKeys(RejectionSchema)
   const handler = Context.Service<
     HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema>,
     HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema>
@@ -125,9 +125,9 @@ export function make(name: string, options: {
   const mutation: Mutation<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema> = {
     name,
     version: Identity.SchemaVersion.make(options.version),
-    payloadSchema,
-    successSchema,
-    rejectionSchema,
+    payloadSchema: PayloadSchema,
+    successSchema: SuccessSchema,
+    rejectionSchema: RejectionSchema,
     handler,
     of: (implementation) => implementation,
     toLayer

@@ -24,20 +24,20 @@ const wireProtocolRevision = 1
 const document = (schema: Schema.Constraint) => Schema.toJsonSchemaDocument(schema)
 
 const rpcDocument = (rpc: Rpc.AnyWithProps) => {
-  const success = rpc.successSchema
-  if (RpcSchema.isStreamSchema(success)) {
+  const Success = rpc.successSchema
+  if (RpcSchema.isStreamSchema(Success)) {
     return {
       tag: rpc._tag,
       payload: document(rpc.payloadSchema),
-      success: document(success.success),
+      success: document(Success.success),
       error: document(rpc.errorSchema),
-      streamError: document(success.error)
+      streamError: document(Success.error)
     }
   }
   return {
     tag: rpc._tag,
     payload: document(rpc.payloadSchema),
-    success: document(success),
+    success: document(Success),
     error: document(rpc.errorSchema),
     streamError: null
   }

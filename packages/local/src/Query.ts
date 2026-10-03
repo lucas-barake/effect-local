@@ -74,12 +74,12 @@ export function make(name: string, options: {
 }): Query<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema> {
   if (name.length === 0) return Defect.invalid("Query name must be nonempty")
   if (name.startsWith("$")) return Defect.invalid(`Query name must not start with $: ${name}`)
-  let payloadSchema: SchemaInput.WireSchema = SchemaInput.Void
-  if (options.payload !== undefined) payloadSchema = SchemaInput.normalize(options.payload)
-  const successSchema = options.success ?? SchemaInput.Void
-  const errorSchema: ErrorSchema = options.error ?? Schema.Never
-  SchemaInput.requireStringKeys(successSchema)
-  SchemaInput.requireStringKeys(errorSchema)
+  let PayloadSchema: SchemaInput.WireSchema = SchemaInput.Void
+  if (options.payload !== undefined) PayloadSchema = SchemaInput.normalize(options.payload)
+  const SuccessSchema = options.success ?? SchemaInput.Void
+  const QueryErrorSchema: ErrorSchema = options.error ?? Schema.Never
+  SchemaInput.requireStringKeys(SuccessSchema)
+  SchemaInput.requireStringKeys(QueryErrorSchema)
   const handler = Context.Service<
     HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema>,
     HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema>
@@ -120,9 +120,9 @@ export function make(name: string, options: {
     )
   const query: Query<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema> = {
     name,
-    payloadSchema,
-    successSchema,
-    errorSchema,
+    payloadSchema: PayloadSchema,
+    successSchema: SuccessSchema,
+    errorSchema: QueryErrorSchema,
     handler,
     toLayer
   }

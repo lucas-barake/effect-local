@@ -69,13 +69,13 @@ export function make(name: string, options: {
       `Ephemeral name must be at most ${Protocol.maximumEphemeralChannelLength} characters: ${name}`
     )
   }
-  let payloadSchema: SchemaInput.WireSchema = SchemaInput.Void
-  if (options.payload !== undefined) payloadSchema = SchemaInput.normalize(options.payload)
+  let PayloadSchema: SchemaInput.WireSchema = SchemaInput.Void
+  if (options.payload !== undefined) PayloadSchema = SchemaInput.normalize(options.payload)
   if (options.kind === "state") {
     if (options.key === undefined) return Defect.invalid(`Ephemeral state definition requires a key codec: ${name}`)
-    return { kind: "state", name, keySchema: options.key, payloadSchema }
+    return { kind: "state", name, keySchema: options.key, payloadSchema: PayloadSchema }
   }
-  return { kind: "event", name, payloadSchema }
+  return { kind: "event", name, payloadSchema: PayloadSchema }
 }
 
 export interface Member<P extends Schema.Top,> {
@@ -92,9 +92,9 @@ export function member<P extends SchemaInput.Input = typeof SchemaInput.Void,>(
   payload?: SchemaInput.Valid<P>
 ): Member<SchemaInput.Wire<P>>
 export function member(payload?: SchemaInput.Input): AnyMember {
-  let payloadSchema: SchemaInput.WireSchema = SchemaInput.Void
-  if (payload !== undefined) payloadSchema = SchemaInput.normalize(payload)
-  return { kind: "member", payloadSchema }
+  let PayloadSchema: SchemaInput.WireSchema = SchemaInput.Void
+  if (payload !== undefined) PayloadSchema = SchemaInput.normalize(payload)
+  return { kind: "member", payloadSchema: PayloadSchema }
 }
 
 export interface Group<Definitions extends ReadonlyArray<Any>,> {
