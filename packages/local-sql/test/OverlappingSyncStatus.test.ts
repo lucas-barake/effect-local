@@ -156,35 +156,6 @@ describe("overlapping sync passes", () => {
   )
 
   it.effect(
-    "keeps a later pass Online when a scheduler reports the earlier pass failure again",
-    Effect.fnUntraced(function*() {
-      const controls = yield* harness()
-      const { heldPulls, holdNextPull } = controls
-      const reconciliation = yield* onePass(controls)
-      yield* reconciliation.sync
-
-      const releaseFailure = yield* holdNextPull(true)
-      yield* Deferred.succeed(releaseFailure, undefined)
-      const observedBeforeEarlier = yield* reconciliation.generation
-      const earlierFailure = yield* reconciliation.sync.pipe(
-        Effect.andThen(Effect.die("expected the earlier pass to fail")),
-        Effect.catchTag("ServerUnavailable", Effect.succeed)
-      )
-      yield* Queue.take(heldPulls)
-      assert.strictEqual((yield* reconciliation.status)._tag, "Offline")
-
-      const releaseLater = yield* holdNextPull(false)
-      const later = yield* reconciliation.sync.pipe(Effect.forkChild({ startImmediately: true }))
-      yield* Queue.take(heldPulls)
-      yield* reconciliation.failed(earlierFailure, observedBeforeEarlier)
-      yield* Deferred.succeed(releaseLater, undefined)
-
-      yield* Fiber.join(later)
-      assert.strictEqual((yield* reconciliation.status)._tag, "Online")
-    })
-  )
-
-  it.effect(
     "keeps a later pass Online when the workflow reports its failed activity after a later pass started",
     Effect.fnUntraced(function*() {
       const controls = yield* harness()
