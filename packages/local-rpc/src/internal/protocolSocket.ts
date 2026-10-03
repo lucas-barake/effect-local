@@ -225,7 +225,10 @@ const makeProtocol = (
         const encoded = parser.encode(request)
         if (encoded === undefined) return Effect.void
         return writer.write(encoded).pipe(
-          Effect.catchTag("SocketError", (error) => Effect.die(error))
+          Effect.catchTag("SocketError", (error) => {
+            if (request._tag === "Request") requestClientMap.delete(request.id)
+            return Effect.fail(new RpcClientError.RpcClientError({ reason: error.reason }))
+          })
         )
       },
       supportsAck: true,
