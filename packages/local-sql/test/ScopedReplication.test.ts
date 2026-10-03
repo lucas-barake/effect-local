@@ -1500,6 +1500,35 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
   )
 
   it.effect(
+    "rejects a replication scope that repeats a model as a protocol error",
+    Effect.fnUntraced(function*() {
+      const server = yield* service(ServerStore.ServerStore, makeServer())
+      const duplicated = { models: [Domain.Todo.name, Domain.Todo.name] }
+      const pulled = yield* server.pullAuthorized({ ...pullRequest(), scope: duplicated }, "reader").pipe(Effect.result)
+      if (pulled._tag !== "Failure") assert.fail("expected a protocol rejection")
+      assert.strictEqual(pulled.failure._tag, "ProtocolInvalid")
+
+      const local = yield* LocalStore.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId: readerId,
+        scope
+      }).pipe(
+        Layer.provide(layerRuntime),
+        Layer.provide(layerClientDatabase),
+        Layer.build,
+        Effect.map(Context.get(LocalStore.Store))
+      )
+      const before = yield* local.replicationState
+      const updated = yield* local.setScope(duplicated).pipe(Effect.result)
+      if (updated._tag !== "Failure") assert.fail("expected a protocol rejection")
+      assert.strictEqual(updated.failure._tag, "ProtocolInvalid")
+      assert.deepStrictEqual(yield* local.replicationState, before)
+    }, provideNodeCrypto)
+  )
+
+  it.effect(
     "denies the whole scope before disclosing a manifest",
     Effect.fnUntraced(function*() {
       const server = yield* makeServer((input) => {

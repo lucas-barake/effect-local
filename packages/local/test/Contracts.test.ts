@@ -201,7 +201,12 @@ describe("domain contracts", () => {
     Effect.fnUntraced(function*() {
       const decoded = yield* Schema.decodeUnknownEffect(Protocol.ReplicationScope)({ models: ["Todo", "Other"] })
       assert.deepStrictEqual(decoded, { models: ["Todo", "Other"] })
-      assert.deepStrictEqual(Protocol.normalizeReplicationScope({ models: ["Todo", "Other"] }), {
+      const definition = Definition.make({
+        version: 1,
+        models: [Todo, Model.make("Other", { version: 1, key: Schema.String, schema: Todo.schema })],
+        mutations: []
+      })
+      assert.deepStrictEqual(yield* Protocol.validateReplicationScope(definition, decoded), {
         models: ["Other", "Todo"]
       })
       const result = yield* Schema.decodeUnknownEffect(Protocol.ReplicationScope)({
@@ -264,6 +269,18 @@ describe("domain contracts", () => {
 
       assert.deepStrictEqual(yield* Protocol.validateReplicationScope(chatDefinition, emptyBounds), emptyBounds)
       assert.deepStrictEqual(yield* Protocol.validateReplicationScope(chatDefinition, emptyPartitions), emptyPartitions)
+    })
+  )
+
+  it.effect(
+    "fails a replication scope that violates its schema as a protocol error",
+    Effect.fnUntraced(function*() {
+      const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo] })
+      const exit = yield* Protocol.validateReplicationScope(definition, { models: ["Todo", "Todo"] }).pipe(Effect.exit)
+      if (exit._tag !== "Failure") assert.fail("expected a duplicate model to be rejected")
+      const failure = exit.cause.reasons.find((reason) => reason._tag === "Fail")
+      if (failure?._tag !== "Fail") assert.fail("expected a typed failure instead of a defect")
+      assert.strictEqual(failure.error._tag, "ProtocolInvalid")
     })
   )
 

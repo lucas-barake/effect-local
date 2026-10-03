@@ -191,19 +191,19 @@ const comparePartitionKeys = (left: ReplicationWindowPartition, right: Replicati
 
 const normalizePartition = (partition: ReplicationWindowPartition): ReplicationWindowPartition => {
   if (partition.bounds === undefined || Object.keys(partition.bounds).length > 0) return partition
-  return ReplicationWindowPartition.make(Struct.omit(partition, ["bounds"]))
+  return Struct.omit(partition, ["bounds"])
 }
 
 const normalizeWindow = (window: ReplicationWindow): ReplicationWindow => {
   if (window.partitions === undefined) return window
-  if (window.partitions.length === 0) return ReplicationWindow.make(Struct.omit(window, ["partitions"]))
+  if (window.partitions.length === 0) return Struct.omit(window, ["partitions"])
   const partitions = window.partitions.map(normalizePartition).sort(comparePartitionKeys)
-  return ReplicationWindow.make({ ...window, partitions })
+  return { ...window, partitions }
 }
 
-export const normalizeReplicationScope = (scope: ReplicationScope): ReplicationScope => {
+const normalizeReplicationScope = (scope: ReplicationScope): ReplicationScope => {
   if (scope.windows === undefined || scope.windows.length === 0) {
-    return ReplicationScope.make({ models: [...scope.models].sort() })
+    return { models: [...scope.models].sort() }
   }
   const windows = scope.windows.map(normalizeWindow).sort((left, right) => {
     if (left.model < right.model) return -1
@@ -212,7 +212,7 @@ export const normalizeReplicationScope = (scope: ReplicationScope): ReplicationS
     if (left.index > right.index) return 1
     return 0
   })
-  return ReplicationScope.make({ models: [...scope.models].sort(), windows })
+  return { models: [...scope.models].sort(), windows }
 }
 
 const affinityMatches = (
@@ -244,7 +244,13 @@ export const validateReplicationScope = Effect.fnUntraced(function*(
       message: `Replication scope exceeds ${maximumReplicationScopeBytes} encoded bytes`
     })
   }
-  const normalized = normalizeReplicationScope(scope)
+  const decodedScope = yield* Schema.decodeUnknownEffect(ReplicationScope)(scope).pipe(
+    Effect.catchTag(
+      "SchemaError",
+      (cause) => Effect.fail(new ReplicaError.ProtocolInvalid({ message: "Replication scope is invalid", cause }))
+    )
+  )
+  const normalized = normalizeReplicationScope(decodedScope)
   for (const model of normalized.models) {
     if (!definition.modelByName.has(model)) {
       return yield* new ReplicaError.ProtocolInvalid({ message: `Unknown replication model: ${model}` })
