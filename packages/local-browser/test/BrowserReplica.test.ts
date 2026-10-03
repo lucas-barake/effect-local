@@ -602,6 +602,184 @@ describe("BrowserReplica retryDelay", () => {
   )
 })
 
+const ttlBuild: Build = { definition, ephemerals: [Reaction, Cursor], database: "replica" }
+
+const layerEphemeralRecording = (received: Ref.Ref<ReadonlyArray<readonly [string, number]>>) =>
+  Layer.succeed(EphemeralClient.EphemeralClient, {
+    session: (_profile, options) =>
+      Ref.update(received, (recorded) => [...recorded, ["session", Duration.toMillis(options.ttl)] as const]).pipe(
+        Effect.as({
+          spaceId: options.spaceId,
+          member: options.member,
+          events: () => Stream.never,
+          state: () => Stream.never,
+          members: Stream.never,
+          updateMember: () => Effect.void
+        })
+      ),
+    publish: (ephemeralDefinition: Ephemeral.Any, options: { readonly ttl: Duration.Input }) =>
+      Ref.update(
+        received,
+        (recorded) => [...recorded, [ephemeralDefinition.name, Duration.toMillis(options.ttl)] as const]
+      ),
+    clear: () => Effect.void,
+    remove: () => Effect.void
+  })
+
+type TtlFailure = ReplicaError.ReplicaError | Ephemeral.EncodeError
+
+const describeTtlFailure = (error: TtlFailure) => {
+  if (error._tag === "InvalidConfiguration") return `InvalidConfiguration ${error.option}: ${error.message}`
+  return error._tag
+}
+
+const describeTtlExit = (exit: Exit.Exit<unknown, TtlFailure>) =>
+  Exit.match(exit, {
+    onSuccess: () => "succeeded",
+    onFailure: (cause) =>
+      Option.match(Cause.findErrorOption(cause), {
+        onNone: () => `defect: ${String(Cause.squash(cause))}`,
+        onSome: describeTtlFailure
+      })
+  })
+
+const ttlOutcome = Effect.fnUntraced(function*(operation: () => Effect.Effect<unknown, TtlFailure, Scope.Scope>) {
+  const fiber = yield* Effect.forkChild(Effect.suspend(operation))
+  for (let step = 0; step < 100; step++) yield* TestClock.adjust("50 millis")
+  const exit = fiber.pollUnsafe()
+  if (exit === undefined) {
+    yield* Fiber.interrupt(fiber)
+    return "pending"
+  }
+  return describeTtlExit(exit)
+})
+
+interface TtlOperation {
+  readonly label: string
+  readonly wireName: string
+  readonly minimum: number
+  readonly maximum: number
+  readonly run: (
+    ephemeral: EphemeralClient.Service,
+    ttl: Duration.Input
+  ) => Effect.Effect<unknown, TtlFailure, Scope.Scope>
+}
+
+const ttlOperations: ReadonlyArray<TtlOperation> = [
+  {
+    label: "a session",
+    wireName: "session",
+    minimum: Protocol.minimumEphemeralMemberTtlMillis,
+    maximum: Protocol.maximumEphemeralMemberTtlMillis,
+    run: (ephemeral, ttl) => ephemeral.session(StatusProfile, { spaceId, member, value: { status: "here" }, ttl })
+  },
+  {
+    label: "an event publish",
+    wireName: Reaction.name,
+    minimum: 1,
+    maximum: Protocol.maximumEphemeralEventTtlMillis,
+    run: (ephemeral, ttl) => ephemeral.publish(Reaction, { spaceId, member, payload: { emoji: "+1" }, ttl })
+  },
+  {
+    label: "a state publish",
+    wireName: Cursor.name,
+    minimum: 1,
+    maximum: Protocol.maximumEphemeralStateTtlMillis,
+    run: (ephemeral, ttl) => ephemeral.publish(Cursor, { spaceId, member, key: "pointer", payload: { x: 1 }, ttl })
+  }
+]
+
+const ttlAttempt = Effect.fnUntraced(function*(operation: TtlOperation, ttl: Duration.Input) {
+  const received = yield* Ref.make<ReadonlyArray<readonly [string, number]>>([])
+  const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralRecording(received) })
+  yield* environment.openBuild(ttlBuild)
+  const follower = yield* environment.openBuild(ttlBuild)
+  const ephemeral = Context.get(follower.context, EphemeralClient.EphemeralClient)
+  const outcome = yield* ttlOutcome(() => operation.run(ephemeral, ttl))
+  return { outcome, received: yield* Ref.get(received) }
+})
+
+describe("BrowserReplica ephemeral ttl", () => {
+  const notADuration = "InvalidConfiguration ttl: ttl must be a valid positive finite duration"
+  const outOfBounds = (operation: TtlOperation) =>
+    `InvalidConfiguration ttl: ttl must resolve to between ${operation.minimum} and ${operation.maximum} milliseconds`
+
+  const invalidDurations: ReadonlyArray<readonly [string, Duration.Input]> = [
+    ["zero millis", 0],
+    ["negative millis", -1],
+    ["an unparseable unit string", "1e3 seconds"],
+    ["millis beyond the safe integer range", Number.MAX_VALUE]
+  ]
+
+  interface TtlCase {
+    readonly title: (operation: TtlOperation) => string
+    readonly ttl: (operation: TtlOperation) => Duration.Input
+    readonly outcome: (operation: TtlOperation) => string
+    readonly sent: (operation: TtlOperation) => ReadonlyArray<number>
+  }
+
+  const ttlCases: ReadonlyArray<TtlCase> = [
+    ...invalidDurations.map(([label, ttl]): TtlCase => ({
+      title: (operation) => `rejects ${operation.label} with a ttl of ${label} before reaching the leader`,
+      ttl: () => ttl,
+      outcome: () => notADuration,
+      sent: () => []
+    })),
+    {
+      title: (operation) =>
+        `rejects ${operation.label} with a fractional ttl that rounds above the maximum before reaching the leader`,
+      ttl: (operation) => operation.maximum + 0.25,
+      outcome: outOfBounds,
+      sent: () => []
+    },
+    {
+      title: (operation) => `rounds a fractional ttl up to the minimum for ${operation.label}`,
+      ttl: (operation) => operation.minimum - 0.75,
+      outcome: () => "succeeded",
+      sent: (operation) => [operation.minimum]
+    },
+    {
+      title: (operation) => `sends the maximum ttl for ${operation.label} given as a Duration`,
+      ttl: (operation) => Duration.millis(operation.maximum),
+      outcome: () => "succeeded",
+      sent: (operation) => [operation.maximum]
+    }
+  ]
+
+  for (const operation of ttlOperations) {
+    for (const ttlCase of ttlCases) {
+      it.effect(
+        ttlCase.title(operation),
+        Effect.fnUntraced(
+          function*() {
+            assert.deepStrictEqual(yield* ttlAttempt(operation, ttlCase.ttl(operation)), {
+              outcome: ttlCase.outcome(operation),
+              received: ttlCase.sent(operation).map((millis) => [operation.wireName, millis] as const)
+            })
+          },
+          Effect.scoped,
+          provideFileSystem
+        )
+      )
+    }
+  }
+
+  it.effect(
+    "rejects a session with a ttl below the member minimum before reaching the leader",
+    Effect.fnUntraced(
+      function*() {
+        const [session] = ttlOperations
+        assert.deepStrictEqual(yield* ttlAttempt(session, Protocol.minimumEphemeralMemberTtlMillis - 1), {
+          outcome: outOfBounds(session),
+          received: []
+        })
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+})
+
 describe("BrowserReplica", () => {
   it.effect(
     "reports the leader replica's first sync to a follower tab through the synced status",
