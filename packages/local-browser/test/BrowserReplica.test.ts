@@ -400,6 +400,64 @@ const followerMemberUpdatesAfterLeaderCloses = Effect.fnUntraced(
   provideFileSystem
 )
 
+const layerEphemeralRecording = (updates: Ref.Ref<ReadonlyArray<readonly [string, unknown]>>) =>
+  Layer.succeed(EphemeralClient.EphemeralClient, {
+    session: (_profile, options) =>
+      Effect.succeed({
+        spaceId: options.spaceId,
+        member: options.member,
+        events: () => Stream.never,
+        state: () => Stream.never,
+        members: Stream.never,
+        updateMember: (value: unknown) =>
+          Ref.update(updates, (recorded) => [...recorded, [options.member.clientId, value] as const])
+      }),
+    publish: () => Effect.void,
+    clear: () => Effect.void,
+    remove: () => Effect.void
+  })
+
+const followerSessionUpdatesReachTheirOwnSessionsAfterHandover = Effect.fnUntraced(
+  function*() {
+    const updates = yield* Ref.make<ReadonlyArray<readonly [string, unknown]>>([])
+    const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralRecording(updates) })
+    const leader = yield* environment.openTabWith(true)
+    const follower = yield* environment.openTabWith(false)
+    const ephemeral = Context.get(follower.context, EphemeralClient.EphemeralClient)
+    const members = [0, 1, 2, 3].map((index) =>
+      Protocol.EphemeralMember.make({
+        clientId: Identity.ClientId.make(`cli_00000000-0000-4000-8000-00000000041${index}`),
+        membershipIncarnation: member.membershipIncarnation
+      })
+    )
+    const scope = yield* Effect.scope
+    const sessions = yield* settle(Effect.forEach(
+      members,
+      (sessionMember) =>
+        ephemeral.session(StatusProfile, {
+          spaceId,
+          member: sessionMember,
+          value: { status: "online" },
+          ttl: "30 seconds"
+        }).pipe(Scope.provide(scope)),
+      { concurrency: "unbounded" }
+    ))
+    yield* settle(Scope.close(leader.scope, Exit.void))
+    yield* settle(Effect.forEach(
+      sessions,
+      (session, index) => session.updateMember({ status: `away ${index}` }),
+      { discard: true }
+    ))
+    const recorded = (yield* Ref.get(updates)).toSorted(([left], [right]) => left.localeCompare(right))
+    assert.deepStrictEqual(
+      recorded,
+      members.map((sessionMember, index) => [sessionMember.clientId, { status: `away ${index}` }] as const)
+    )
+  },
+  Effect.scoped,
+  provideFileSystem
+)
+
 const rapidVisibilityFlips = Effect.fnUntraced(
   function*() {
     const environment = yield* makeEnvironment
@@ -1272,6 +1330,13 @@ describe("BrowserReplica at small scheduler budgets", () => {
   it.effect(
     "serves the visible tab through rapid visibility flips without losing or repeating a mutation at a scheduler budget of 31 operations",
     () => rapidVisibilityFlips().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 31))
+  )
+  it.effect(
+    "delivers each follower ephemeral session's member update to that session after a handover at a scheduler budget of 9 operations",
+    () =>
+      followerSessionUpdatesReachTheirOwnSessionsAfterHandover().pipe(
+        Effect.provideService(Scheduler.MaxOpsBeforeYield, 9)
+      )
   )
 })
 

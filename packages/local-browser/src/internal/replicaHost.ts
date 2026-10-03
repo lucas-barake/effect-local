@@ -97,7 +97,7 @@ export const encodeSettlement = Effect.fnUntraced(function*(
   return settlement
 })
 
-export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(options: HostOptions) {
+export const makeHandlers = (options: HostOptions) => {
   const definition = options.definition
   const resources = options.resources
   const ephemeralByName = new Map<string, Ephemeral.Any>()
@@ -501,9 +501,9 @@ export const makeHandlers = Effect.fn("localBrowser.replicaHost")(function*(opti
       )
     })
   })
-})
+}
 
-export type TermHandlers = Effect.Success<ReturnType<typeof makeHandlers>>
+export type TermHandlers = ReturnType<typeof makeHandlers>
 
 interface Tagged {
   readonly _tag: string

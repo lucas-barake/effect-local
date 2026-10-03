@@ -179,12 +179,12 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, E extends Ta
   })
   const termHandlers = new WeakMap<replicaHost.OwnerResources, replicaHost.TermHandlers>()
   const handlersFor = (resources: replicaHost.OwnerResources) =>
-    Effect.suspend(() => {
+    Effect.sync(() => {
       const known = termHandlers.get(resources)
-      if (known !== undefined) return Effect.succeed(known)
-      return replicaHost.makeHandlers({ definition: options.definition, ephemerals, profiles, resources }).pipe(
-        Effect.tap((built) => Effect.sync(() => termHandlers.set(resources, built)))
-      )
+      if (known !== undefined) return known
+      const built = replicaHost.makeHandlers({ definition: options.definition, ephemerals, profiles, resources })
+      termHandlers.set(resources, built)
+      return built
     })
   const layerEntity = replicaWire.ReplicaEntity.toLayer(
     Effect.sync(() =>
