@@ -9,6 +9,7 @@ import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Sharding from "effect/cluster/Sharding"
 import type * as ShardingConfig from "effect/cluster/ShardingConfig"
 import * as Context from "effect/Context"
@@ -23,6 +24,7 @@ import type * as SqlClient from "effect/sql/SqlClient"
 import { BrowserStorageError } from "./BrowserStorageError.js"
 import * as BuildGate from "./internal/buildGate.js"
 import * as BuildIdentity from "./internal/buildIdentity.js"
+import * as configuration from "./internal/configuration.js"
 import * as lockNames from "./internal/lockNames.js"
 import * as platform from "./internal/platform.js"
 import * as replicaHost from "./internal/replicaHost.js"
@@ -107,17 +109,24 @@ export const layer = <D extends Definition.Any, E extends Tagged, R,>(
   | EphemeralClient.EphemeralClient
   | Sharding.Sharding
   | Crypto.Crypto,
-  BrowserStorageError,
+  BrowserStorageError | ReplicaError.InvalidConfiguration,
   Reactivity.Reactivity | MutationRuntime.Handlers<D> | QueryExecutor.Handlers<D> | Platform | R
 > =>
   Layer.effectContext(Effect.gen(function*() {
+    const retryDelayMillis = yield* configuration.positiveFiniteDurationMillis(
+      "retryDelay",
+      options.retryDelay ?? Duration.seconds(1)
+    )
     const scheduler = yield* TabScheduler.make
-    return yield* build(layerOwner, options).pipe(Effect.provideService(Scheduler.Scheduler, scheduler))
+    return yield* build(layerOwner, options, retryDelayMillis).pipe(
+      Effect.provideService(Scheduler.Scheduler, scheduler)
+    )
   }))
 
 const build = Effect.fnUntraced(function*<D extends Definition.Any, E extends Tagged, R,>(
   layerOwner: Layer.Layer<SqlClient.SqlClient | SyncEngine.SyncEngine | EphemeralClient.EphemeralClient, E, R>,
-  options: Options<D>
+  options: Options<D>,
+  retryDelayMillis: number
 ) {
   const reactivity = yield* Reactivity.Reactivity
   const handlers = Context.pick(
@@ -143,7 +152,6 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, E extends Ta
     identities,
     crypto
   )
-  const retryDelay = options.retryDelay ?? Duration.seconds(1)
 
   const layerStack = SqlReplica.layer({
     ...options.replica,
@@ -166,7 +174,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, E extends Ta
     locks,
     channels,
     visibility,
-    retryDelay,
+    retryDelayMillis,
     gate
   })
   const cluster = yield* TabCluster.make({
@@ -205,7 +213,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, E extends Ta
     consumer: host,
     reactivity,
     crypto,
-    retryDelay: Duration.fromInputUnsafe(retryDelay),
+    retryDelayMillis,
     awaitRouted: cluster.awaitRouted,
     superseded: gate.superseded
   })
