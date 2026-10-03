@@ -517,7 +517,8 @@ describe("BrowserReplica retryDelay", () => {
     ["a negative seconds tuple", [-1, 0]],
     ["a NaN seconds tuple", [Number.NaN, 0]],
     ["a negative duration object", { seconds: -1 }],
-    ["an infinite Duration", Duration.infinity]
+    ["an infinite Duration", Duration.infinity],
+    ["an unparseable unit string", "1e3 seconds"]
   ]
 
   for (const [label, retryDelay] of invalidRetryDelays) {
