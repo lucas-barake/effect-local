@@ -694,6 +694,8 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         if (receipt._tag === "Accepted") {
           receiptSequenceMismatch = row.server_sequence === null || receipt.serverSequence !== row.server_sequence
         }
+        let receiptOrigin: Protocol.RejectionOrigin | null = null
+        if (receipt._tag === "Rejected") receiptOrigin = receipt.origin
         if (
           row.space_id !== envelope.spaceId ||
           row.client_id !== envelope.clientId ||
@@ -711,6 +713,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           receipt.name !== row.mutation_name ||
           ((receipt._tag === "Accepted" || receipt._tag === "Rejected") &&
             receipt.terminalSequence !== undefined && receipt.terminalSequence !== row.terminal_sequence) ||
+          receiptOrigin !== row.rejection_origin ||
           receiptSequenceMismatch
         ) {
           return yield* new ReplicaError.StorageCorrupt({

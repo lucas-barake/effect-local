@@ -3278,6 +3278,57 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
   )
 
   it.effect(
+    "rejects a retry whose SQL rejection origin conflicts with its durable receipt",
+    pipe(Effect.fnUntraced(
+      function*() {
+        const layerServerDatabase = serverDatabase()
+        const layerLive = ServerStore.layer({
+          definition: Domain.definition,
+          ...serverHistory,
+          authorizeAccess: () => Effect.void,
+          authorizeMutation: ({ mutation }) => {
+            if (mutation.localSequence === 1) return Effect.void
+            return Effect.fail(new TestAuthorizationError({ reason: "denied" }))
+          },
+          authorizeRead: () => Effect.void
+        }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
+        const server = Context.get(context, ServerStore.ServerStore)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const accepted = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("origin-accepted"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000034")
+        )
+        const rejected = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("origin-rejected"),
+          2,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000035")
+        )
+        assert.strictEqual((yield* server.submit(accepted))._tag, "Accepted")
+        assert.strictEqual((yield* server.submit(rejected))._tag, "Rejected")
+        yield* sql`UPDATE effect_local_server_receipts SET rejection_origin = ${"Mutation"}
+          WHERE space_id = ${spaceId} AND mutation_id = ${accepted.mutationId}`
+        yield* sql`UPDATE effect_local_server_receipts SET rejection_origin = ${"Capacity"}
+          WHERE space_id = ${spaceId} AND mutation_id = ${rejected.mutationId}`
+
+        for (const submitted of [accepted, rejected]) {
+          const error = yield* expectedFailure(server.submit(submitted))
+          if (error._tag !== "StorageCorrupt") assert.fail(`expected StorageCorrupt, got ${error._tag}`)
+          assert.strictEqual(error.message, `Durable receipt ${submitted.mutationId} conflicts with its SQL identity`)
+        }
+      },
+      Effect.provide(NodeCrypto.layer),
+      Effect.scoped
+    ))
+  )
+
+  it.effect(
     "rejects a pending row whose durable digest does not match its reconstructed identity",
     pipe(Effect.fnUntraced(
       function*() {
