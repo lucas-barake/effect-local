@@ -78,6 +78,44 @@ const postgresText = (value: string) => `E'${Array.from(value, escapeCharacter).
 
 export const hasUnpairedSurrogate = (value: string) => value.search(unpairedSurrogate) !== -1
 
+const surrogateEscape = 0xd7ff
+const surrogateEscapeOffset = 0x100
+
+const isHighSurrogate = (code: number) => code >= 0xd800 && code <= 0xdbff
+const isLowSurrogate = (code: number) => code >= 0xdc00 && code <= 0xdfff
+
+const escapeSurrogates = (value: string) => {
+  let escaped = ""
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index)
+    if (isHighSurrogate(code) && isLowSurrogate(value.charCodeAt(index + 1))) {
+      escaped += value.slice(index, index + 2)
+      index += 1
+      continue
+    }
+    if (code < surrogateEscape || code > 0xdfff) {
+      escaped += value[index]
+      continue
+    }
+    escaped += String.fromCharCode(surrogateEscape, code - surrogateEscape + surrogateEscapeOffset)
+  }
+  return escaped
+}
+
+const unescapeSurrogates = (value: string) => {
+  let decoded = ""
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index)
+    if (code !== surrogateEscape) {
+      decoded += value[index]
+      continue
+    }
+    index += 1
+    decoded += String.fromCharCode(value.charCodeAt(index) - surrogateEscapeOffset + surrogateEscape)
+  }
+  return decoded
+}
+
 const decodeEscapedText = (value: string) => {
   let decoded = ""
   for (let index = 0; index < value.length; index++) {
@@ -90,7 +128,7 @@ const decodeEscapedText = (value: string) => {
     if (value[index] === "\u0001") decoded += "\u0000"
     else decoded += "\u0001"
   }
-  return decoded
+  return unescapeSurrogates(decoded)
 }
 
 const sqlite = (sql: SqlClient.SqlClient): Dialect => ({
@@ -103,8 +141,8 @@ const sqlite = (sql: SqlClient.SqlClient): Dialect => ({
     if (affinity === "real") return "REAL"
     return "INTEGER"
   },
-  encodeText: (value) => value,
-  decodeText: (value) => value,
+  encodeText: escapeSurrogates,
+  decodeText: unescapeSurrogates,
   lockSchema: Effect.void,
   scriptPrologue: ["BEGIN IMMEDIATE"],
   literal: quoteText,
@@ -138,10 +176,7 @@ const postgres = (sql: SqlClient.SqlClient): Dialect => ({
   tableOptions: "",
   indexColumn: postgresType,
   encodeText: (value) =>
-    value.replaceAll(unpairedSurrogate, "\ufffd").replaceAll("\u0001", "\u0001\u0002").replaceAll(
-      "\u0000",
-      "\u0001\u0001"
-    ),
+    escapeSurrogates(value).replaceAll("\u0001", "\u0001\u0002").replaceAll("\u0000", "\u0001\u0001"),
   decodeText: decodeEscapedText,
   lockSchema: sql.unsafe(schemaLockStatement).pipe(Effect.asVoid),
   scriptPrologue: ["BEGIN", schemaLockStatement],
