@@ -85,9 +85,13 @@ export const layer: Layer.Layer<
       }),
       bootstrap: (request) => online(request.spaceId).pipe(Effect.andThen(server.bootstrap(request))),
       watch: (request) =>
-        server.watch(request).pipe(
-          Stream.filterEffect(() => faults.state(request.spaceId).pipe(Effect.map((state) => state.online))),
-          Stream.mapError(() => new ReplicaError.ServerUnavailable())
+        online(request.spaceId).pipe(
+          Effect.as(
+            server.watch(request).pipe(
+              Stream.filterEffect(() => faults.state(request.spaceId).pipe(Effect.map((state) => state.online)))
+            )
+          ),
+          Stream.unwrap
         )
     })
   })
