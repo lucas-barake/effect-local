@@ -669,9 +669,6 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         }
         const manifest = manifestFromRow(stored.value)
         if (
-          manifest.definitionHash !== meta.definition_hash ||
-          manifest.schema.version !== meta.schema_version ||
-          manifest.schema.hash !== meta.schema_hash ||
           manifest.sequence !== meta.snapshot_sequence ||
           manifest.terminalSequenceThrough !== meta.snapshot_terminal_sequence
         ) {
