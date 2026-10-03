@@ -1,9 +1,11 @@
+import * as Arr from "effect/Array"
 import * as Chunk from "effect/Chunk"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Hex from "effect/encoding/Hex"
 import * as HashMap from "effect/HashMap"
 import * as HashSet from "effect/HashSet"
+import * as Order from "effect/Order"
 import * as Schema from "effect/Schema"
 import * as ReplicaError from "./ReplicaError.js"
 
@@ -29,15 +31,10 @@ const isUint8Array = (value: object): value is Uint8Array =>
 // oxlint-disable-next-line effect-local/noManualEffectBoundary
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
 
-const sortedMembers = (tag: string, members: Array<unknown>): Array<unknown> => {
-  const keyed = members.map((member) => [encodeJson(member), member] as const)
-  keyed.sort(([left], [right]) => {
-    if (left < right) return -1
-    if (left > right) return 1
-    return 0
-  })
-  return [tag, ...keyed.map(([, member]) => member)]
-}
+const sortedMembers = (tag: string, members: Array<unknown>): Array<unknown> => [
+  tag,
+  ...Arr.sortWith(members, encodeJson, Order.String)
+]
 
 const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   switch (typeof value) {
