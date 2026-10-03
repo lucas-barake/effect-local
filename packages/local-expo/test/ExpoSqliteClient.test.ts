@@ -283,6 +283,32 @@ describe("ExpoSqliteClient", () => {
   )
 
   it.effect(
+    "refuses integral numbers outside the signed 64-bit range that Android would saturate",
+    Effect.fnUntraced(
+      function*() {
+        const sql = yield* client()
+        probe.platform = "android"
+        yield* sql`CREATE TABLE t (id INTEGER PRIMARY KEY, value)`
+        yield* sql`INSERT INTO t (id, value) VALUES (${1}, ${-(2 ** 63)}), (${2}, ${2 ** 63 - 1024})`
+        const prepared = nativeCalls("prepareAsync")
+        for (const value of [1e20, 2 ** 63, -1e20, -(2 ** 64)]) {
+          const written = yield* sql`INSERT INTO t (id, value) VALUES (${3}, ${value})`.pipe(Effect.exit)
+          assert.strictEqual(failureReason(written), "UnknownError", String(value))
+          const streamed = yield* sql`SELECT ${value} AS value`.stream.pipe(Stream.runCollect, Effect.exit)
+          assert.strictEqual(failureReason(streamed), "UnknownError", String(value))
+        }
+        assert.strictEqual(nativeCalls("prepareAsync"), prepared)
+        assert.deepStrictEqual(yield* sql`SELECT id, CAST(value AS TEXT) FROM t ORDER BY id`.values, [
+          [1, "-9223372036854775808"],
+          [2, "9223372036854774784"]
+        ])
+      },
+      Effect.scoped,
+      provideReactivity
+    )
+  )
+
+  it.effect(
     "streams rows and keeps other statements off the connection until the stream ends",
     Effect.fnUntraced(
       function*() {

@@ -52,9 +52,16 @@ const sqliteCause = (cause: unknown): unknown => {
   return Object.assign(cause, { errno })
 }
 
+const minInt64 = -(2n ** 63n)
+const maxInt64 = 2n ** 63n - 1n
+
 const bindValue = (value: unknown): SQLite.SQLiteBindValue | undefined => {
   if (value === undefined || value === null) return null
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return value
+  if (typeof value === "number") {
+    if (Number.isInteger(value) && (BigInt(value) < minInt64 || BigInt(value) > maxInt64)) return undefined
+    return value
+  }
+  if (typeof value === "string" || typeof value === "boolean") return value
   if (typeof value === "bigint") {
     if (value > BigInt(Number.MAX_SAFE_INTEGER) || value < BigInt(Number.MIN_SAFE_INTEGER)) return undefined
     return Number(value)
