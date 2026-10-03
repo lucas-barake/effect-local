@@ -14,24 +14,31 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Context from "effect/Context"
+import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
+import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as FaultInjection from "../src/FaultInjection.js"
 import * as TestServer from "../src/TestServer.js"
+import * as VirtualTime from "./fixtures/VirtualTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000001")
 const secondSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000002")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000001")
+const writerClientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002")
 const Todo = Model.make("Todo", {
   version: 1,
   key: Schema.String,
@@ -92,10 +99,10 @@ const service = <I, S, E extends { readonly _tag: string }, R,>(
   layer: Layer.Layer<I, E, R>
 ) => Layer.build(layer).pipe(Effect.map(Context.get(tag)))
 
-const makeSyncServices = Effect.gen(function*() {
+const makeSyncServicesWith = Effect.fnUntraced(function*(history: typeof serverHistory) {
   const server = yield* service(
     ServerStore.ServerStore,
-    ServerStore.layerTrusted({ ...serverHistory, definition }).pipe(
+    ServerStore.layerTrusted({ ...history, definition }).pipe(
       Layer.provide(layerRuntime),
       Layer.provide(database())
     )
@@ -112,15 +119,20 @@ const makeSyncServices = Effect.gen(function*() {
   return { faults, sync }
 })
 
-const makeServices = Effect.gen(function*() {
-  const { faults, sync } = yield* makeSyncServices
-  const local = yield* service(
+const makeSyncServices = makeSyncServicesWith(serverHistory)
+
+const makeLocal = (localClientId: Identity.ClientId) =>
+  service(
     LocalStore.Store,
-    LocalStore.layer({ ...clientHistory, definition, spaceId, clientId }).pipe(
+    LocalStore.layer({ ...clientHistory, definition, spaceId, clientId: localClientId }).pipe(
       Layer.provide(layerRuntime),
       Layer.provide(database())
     )
   )
+
+const makeServices = Effect.gen(function*() {
+  const { faults, sync } = yield* makeSyncServices
+  const local = yield* makeLocal(clientId)
   return { faults, local, sync }
 })
 
@@ -205,8 +217,7 @@ describe("test synchronization faults", () => {
     Effect.fnUntraced(function*() {
       const { faults, sync } = yield* makeSyncServices
       yield* faults.partition(spaceId)
-      const root = yield* service(
-        Replica.Replica,
+      const context = yield* Layer.build(
         SqlReplica.layer({
           ...clientHistory,
           definition,
@@ -215,28 +226,29 @@ describe("test synchronization faults", () => {
           retryDelay: "1 millis"
         }).pipe(
           Layer.provide(layerHandlers),
-          Layer.provide(database()),
+          Layer.provideMerge(database()),
           Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
         )
       )
+      const root = Context.get(context, Replica.Replica)
+      const reactivity = Context.get(context, Reactivity.Reactivity)
       const first = yield* root.space(spaceId)
       const second = yield* root.space(secondSpaceId)
       const firstPending = yield* first.mutate(PutTodo, { id: "shared", title: "first" })
       const secondPending = yield* second.mutate(PutTodo, { id: "shared", title: "second" })
-      const awaitReceipt = Effect.fnUntraced(function*(space: Replica.Space, mutationId: Identity.MutationId) {
-        while (true) {
-          const receipt = yield* space.receipt(PutTodo, mutationId)
-          if (Option.isSome(receipt)) return receipt.value
-          yield* Effect.yieldNow
-        }
-      })
-      const awaitStatus = Effect.fnUntraced(function*(space: Replica.Space, tag: "Offline" | "Online") {
-        while (true) {
-          const status = yield* space.status
-          if (status._tag === tag) return status
-          yield* Effect.yieldNow
-        }
-      })
+      const awaitReceipt = (space: Replica.Space, mutationId: Identity.MutationId) =>
+        reactivity.stream([ReactivityKey.receipt(space.spaceId, mutationId)], space.receipt(PutTodo, mutationId)).pipe(
+          Stream.filter(Option.isSome),
+          Stream.map((receipt) => receipt.value),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow)
+        )
+      const awaitStatus = (space: Replica.Space, tag: "Offline" | "Online") =>
+        reactivity.stream([ReactivityKey.status(space.spaceId)], space.status).pipe(
+          Stream.filter((status) => status._tag === tag),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow)
+        )
 
       const secondReceipt = yield* awaitReceipt(second, secondPending.envelope.mutationId)
       assert.strictEqual(secondReceipt._tag, "Accepted")
@@ -355,6 +367,109 @@ describe("test synchronization faults", () => {
       assert.deepStrictEqual(sequences, [Option.some(1), Option.some(2), Option.some(3)])
       assert.strictEqual((yield* local.progress).cursor, 3)
       assert.strictEqual(yield* local.pendingCount, 0)
+    })
+  )
+
+  it.effect(
+    "delivers withheld pull evidence intact once released",
+    Effect.fnUntraced(function*() {
+      const { faults, local: reader, sync } = yield* makeServices
+      const writer = yield* makeLocal(writerClientId)
+      yield* synchronize(reader, sync)
+      yield* synchronize(writer, sync)
+      yield* writer.mutate(PutTodo, { id: "1", title: "withheld" })
+      yield* synchronize(writer, sync)
+
+      yield* faults.withholdPullEvidence(spaceId)
+      const withheld = yield* synchronize(reader, sync).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* faults.awaitPullEvidenceWithheld(spaceId)
+      yield* faults.releasePullEvidence(spaceId)
+      yield* Fiber.join(withheld)
+      yield* synchronize(reader, sync)
+
+      assert.deepStrictEqual(yield* reader.get(Todo, "1"), Option.some({ id: "1", title: "withheld" }))
+      assert.strictEqual((yield* reader.progress).cursor, 1)
+    })
+  )
+
+  it.effect(
+    "fails a watch with the server's terminal failure instead of reporting the transport unavailable",
+    Effect.fnUntraced(function*() {
+      const { local, sync } = yield* makeServices
+      const state = yield* local.replicationState
+      const error = yield* failureOf(
+        sync.watch({
+          spaceId,
+          clientId: state.clientId,
+          schema: definition.schemaIdentity,
+          scope: Protocol.ReplicationScope.make({ models: ["Unknown"] }),
+          scopeGeneration: state.scopeGeneration,
+          cursor: state.cursor
+        }).pipe(Stream.runDrain)
+      )
+      assert.strictEqual(error._tag, "ProtocolInvalid")
+    })
+  )
+
+  it.effect(
+    "marks a space failed when the server refuses its watch",
+    Effect.fnUntraced(function*() {
+      const { sync } = yield* makeSyncServicesWith({ ...serverHistory, maximumWatchersPerSpace: 1 })
+      const local = yield* makeLocal(clientId)
+      const occupied = yield* Deferred.make<void>()
+      const state = yield* local.replicationState
+      yield* sync.watch({
+        spaceId,
+        clientId: writerClientId,
+        schema: definition.schemaIdentity,
+        scope: state.scope,
+        scopeGeneration: state.scopeGeneration,
+        cursor: state.cursor
+      }).pipe(
+        Stream.runForEach(() => Deferred.succeed(occupied, undefined)),
+        Effect.forkScoped
+      )
+      yield* Deferred.await(occupied)
+      const statuses = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
+      yield* Layer.build(
+        Reconciler.layer({
+          definition,
+          spaceId,
+          pageSize: 10,
+          retryDelay: "1 millis",
+          onStatusChange: (status) => Queue.offer(statuses, status).pipe(Effect.asVoid)
+        }).pipe(
+          Layer.provide(Layer.succeed(LocalStore.Store, local)),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
+        )
+      )
+      const settled = yield* Stream.fromQueue(statuses).pipe(
+        Stream.filter((status) => status._tag !== "Online" && status._tag !== "Connecting"),
+        Stream.runHead,
+        Effect.map(Option.getOrThrow),
+        VirtualTime.advanceClockUntil
+      )
+      assert.deepStrictEqual(settled, { _tag: "Failed", pending: 0, message: "CapacityExceeded" })
+    })
+  )
+
+  it.effect(
+    "refuses to open a watch across a partition",
+    Effect.fnUntraced(function*() {
+      const { faults, local, sync } = yield* makeServices
+      const state = yield* local.replicationState
+      yield* faults.partition(spaceId)
+      const opened = yield* sync.watch({
+        spaceId,
+        clientId: state.clientId,
+        schema: definition.schemaIdentity,
+        scope: state.scope,
+        scopeGeneration: state.scopeGeneration,
+        cursor: state.cursor
+      }).pipe(Stream.runDrain, Effect.timeout("1 second"), failureOf, Effect.forkChild({ startImmediately: true }))
+      yield* TestClock.adjust("1 second")
+      assert.strictEqual((yield* Fiber.join(opened))._tag, "ServerUnavailable")
+      yield* faults.awaitRequestRejectedOffline(spaceId)
     })
   )
 })
