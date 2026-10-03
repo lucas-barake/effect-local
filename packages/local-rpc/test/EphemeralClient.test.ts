@@ -13,6 +13,7 @@ import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
+import * as Schedule from "effect/Schedule"
 import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
@@ -188,6 +189,75 @@ describe("EphemeralClient", () => {
           Effect.forkChild({ startImmediately: true })
         )
         yield* Fiber.join(rejoined)
+        assert.strictEqual(yield* Ref.get(joins), 2)
+      })
+      yield* program.pipe(Effect.provide(layerClient), Effect.scoped)
+    })
+  )
+
+  it.effect(
+    "abandons and rejoins a join whose snapshot never arrives within the rpc timeout",
+    Effect.fnUntraced(function*() {
+      const joins = yield* Ref.make(0)
+      const firstJoined = yield* Deferred.make<void>()
+      const firstClosed = yield* Deferred.make<void>()
+      const fakeClient = {
+        JoinEphemeral: Effect.fnUntraced(function*() {
+          const join = yield* Ref.updateAndGet(joins, (count) => count + 1)
+          const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage, Cause.Done>()
+          yield* Queue.offer(
+            messages,
+            Protocol.EphemeralSessionStarted.make({
+              spaceId,
+              member,
+              sessionToken: Identity.EphemeralSessionToken.make(
+                "eps_00000000-0000-4000-8000-000000000001"
+              ),
+              leaseMillis: 60_000
+            })
+          )
+          if (join === 1) {
+            yield* Effect.addFinalizer(() => Deferred.succeed(firstClosed, undefined))
+            yield* Deferred.succeed(firstJoined, undefined)
+            return messages
+          }
+          yield* Queue.offer(
+            messages,
+            Protocol.EphemeralSnapshot.make({
+              spaceId,
+              revision: Identity.EphemeralRevision.make(1),
+              members: [{ member: memberB, value: null, expiresAtMillis: 60_000 }],
+              states: []
+            })
+          )
+          return messages
+        }),
+        HeartbeatEphemeral: () => Effect.succeed(null),
+        PublishEphemeral: () => Effect.succeed(null)
+      }
+      const layerClient = layerFromFakeClient(fakeClient, {
+        rpcTimeout: "5 seconds",
+        rejoinPolicy: Schedule.spaced("1 second")
+      })
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const opening = yield* client.session(Anonymous, {
+          spaceId,
+          member,
+          value: undefined,
+          ttl: "1 minute"
+        }).pipe(Effect.forkChild({ startImmediately: true }))
+        yield* Deferred.await(firstJoined)
+        yield* TestClock.adjust("5 seconds")
+        yield* Deferred.await(firstClosed)
+        const opened = yield* Fiber.join(opening)
+        const rejoined = yield* opened.members.pipe(
+          Stream.filter((roster) => roster.some((entry) => entry.member.clientId === memberB.clientId)),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* TestClock.adjust("1 second")
+        assert.isDefined(Option.getOrUndefined(yield* Fiber.join(rejoined)))
         assert.strictEqual(yield* Ref.get(joins), 2)
       })
       yield* program.pipe(Effect.provide(layerClient), Effect.scoped)

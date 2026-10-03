@@ -10,7 +10,6 @@ import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
 import * as Exit from "effect/Exit"
-import * as Fiber from "effect/Fiber"
 import * as Hash from "effect/Hash"
 import * as HashMap from "effect/HashMap"
 import * as Layer from "effect/Layer"
@@ -516,6 +515,88 @@ export const layerFromSession = (
           })
         )
 
+      const joinAttempt = (
+        request: Protocol.EphemeralJoinRequest,
+        memberValue: () => typeof Schema.Json.Type,
+        version: Protocol.ProtocolVersion,
+        synchronized: Deferred.Deferred<void>
+      ) =>
+        Stream.unwrap(Effect.gen(function*() {
+          const owner = {}
+          const started = yield* Deferred.make<Protocol.EphemeralSessionStarted>()
+          const queue = yield* client.JoinEphemeral(
+            { ...request, value: memberValue(), protocolVersion: version },
+            { asQueue: true }
+          )
+          const messages = LosslessQueue.stream(queue).pipe(
+            Stream.catchReasons(
+              "RpcClientError",
+              {
+                WorkerSpawnError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                WorkerSendError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                WorkerReceiveError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                WorkerUnknownError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                SocketReadError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                SocketWriteError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                SocketOpenError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                SocketCloseError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                SocketUpgradeError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                HttpError: (reason, error) => {
+                  if (reason.kind === "TransportError") {
+                    return Stream.fail(new ReplicaError.ServerUnavailable())
+                  }
+                  return Stream.fail(
+                    new ReplicaError.ProtocolInvalid({
+                      message: "The JoinEphemeral RPC failed",
+                      cause: error
+                    })
+                  )
+                },
+                RpcClientDefect: (_, error) =>
+                  Stream.fail(
+                    new ReplicaError.ProtocolInvalid({
+                      message: "The JoinEphemeral RPC failed",
+                      cause: error
+                    })
+                  )
+              },
+              (_, error) => Stream.die(error)
+            ),
+            Stream.catchCause((cause) => {
+              if (Cause.hasInterruptsOnly(cause)) return Stream.fail(new ReplicaError.ServerUnavailable())
+              return Stream.failCause(cause)
+            })
+          )
+          const visible = messages.pipe(
+            Stream.tap((message) => {
+              if (message._tag === "Snapshot") return Deferred.succeed(synchronized, undefined)
+              if (message._tag !== "SessionStarted") return Effect.void
+              sessions.set(sessionKey(request), { owner, sessionToken: message.sessionToken })
+              return Deferred.succeed(started, message)
+            }),
+            Stream.filter(
+              (message): message is Protocol.EphemeralMessage => message._tag !== "SessionStarted"
+            )
+          )
+          const heartbeatLoop = Deferred.await(started).pipe(
+            Effect.flatMap((accepted) => {
+              const halfLeaseMillis = Math.floor(accepted.leaseMillis / 2)
+              const interval = Math.max(1, Math.min(heartbeatIntervalMillis, halfLeaseMillis))
+              return Effect.sleep(interval).pipe(
+                Effect.andThen(heartbeat({ spaceId: request.spaceId, member: request.member })),
+                Effect.forever
+              )
+            })
+          )
+          return LosslessQueue.mergeEffect(visible, heartbeatLoop).pipe(
+            Stream.ensuring(Effect.sync(() => {
+              if (sessions.get(sessionKey(request))?.owner === owner) {
+                sessions.delete(sessionKey(request))
+              }
+            }))
+          )
+        }))
+
       const joinWire = (
         request: Protocol.EphemeralJoinRequest,
         memberValue: () => typeof Schema.Json.Type
@@ -524,13 +605,8 @@ export const layerFromSession = (
           session,
           (version) =>
             Stream.unwrap(Effect.gen(function*() {
-              const owner = {}
-              const started = yield* Deferred.make<Protocol.EphemeralSessionStarted>()
-              const acquisition = yield* client.JoinEphemeral(
-                { ...request, value: memberValue(), protocolVersion: version },
-                { asQueue: true }
-              ).pipe(Effect.forkScoped({ startImmediately: true }))
-              const queue = yield* Fiber.join(acquisition).pipe(
+              const synchronized = yield* Deferred.make<void>()
+              const handshakeDeadline = Deferred.await(synchronized).pipe(
                 Effect.timeoutOrElse({
                   duration: rpcTimeoutMillis,
                   orElse: () =>
@@ -540,74 +616,11 @@ export const layerFromSession = (
                         timeoutMillis: rpcTimeoutMillis
                       })
                     )
-                }),
-                Effect.ensuring(Fiber.interrupt(acquisition))
-              )
-              const messages = LosslessQueue.stream(queue).pipe(
-                Stream.catchReasons(
-                  "RpcClientError",
-                  {
-                    WorkerSpawnError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    WorkerSendError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    WorkerReceiveError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    WorkerUnknownError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    SocketReadError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    SocketWriteError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    SocketOpenError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    SocketCloseError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    SocketUpgradeError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                    HttpError: (reason, error) => {
-                      if (reason.kind === "TransportError") {
-                        return Stream.fail(new ReplicaError.ServerUnavailable())
-                      }
-                      return Stream.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The JoinEphemeral RPC failed",
-                          cause: error
-                        })
-                      )
-                    },
-                    RpcClientDefect: (_, error) =>
-                      Stream.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The JoinEphemeral RPC failed",
-                          cause: error
-                        })
-                      )
-                  },
-                  (_, error) => Stream.die(error)
-                ),
-                Stream.catchCause((cause) => {
-                  if (Cause.hasInterruptsOnly(cause)) return Stream.fail(new ReplicaError.ServerUnavailable())
-                  return Stream.failCause(cause)
                 })
               )
-              const visible = messages.pipe(
-                Stream.tap((message) => {
-                  if (message._tag !== "SessionStarted") return Effect.void
-                  sessions.set(sessionKey(request), { owner, sessionToken: message.sessionToken })
-                  return Deferred.succeed(started, message)
-                }),
-                Stream.filter(
-                  (message): message is Protocol.EphemeralMessage => message._tag !== "SessionStarted"
-                )
-              )
-              const heartbeatLoop = Deferred.await(started).pipe(
-                Effect.flatMap((accepted) => {
-                  const halfLeaseMillis = Math.floor(accepted.leaseMillis / 2)
-                  const interval = Math.max(1, Math.min(heartbeatIntervalMillis, halfLeaseMillis))
-                  return Effect.sleep(interval).pipe(
-                    Effect.andThen(heartbeat({ spaceId: request.spaceId, member: request.member })),
-                    Effect.forever
-                  )
-                })
-              )
-              return LosslessQueue.mergeEffect(visible, heartbeatLoop).pipe(
-                Stream.ensuring(Effect.sync(() => {
-                  if (sessions.get(sessionKey(request))?.owner === owner) {
-                    sessions.delete(sessionKey(request))
-                  }
-                }))
+              return LosslessQueue.mergeEffect(
+                joinAttempt(request, memberValue, version, synchronized),
+                handshakeDeadline
               )
             }))
         ).pipe(
