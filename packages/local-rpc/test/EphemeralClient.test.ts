@@ -266,6 +266,64 @@ describe("EphemeralClient", () => {
   )
 
   it.effect(
+    "runs a saved clear effect against the session that is current when it executes",
+    Effect.fnUntraced(function*() {
+      const tokenFor = (join: number) =>
+        Identity.EphemeralSessionToken.make(`eps_00000000-0000-4000-8000-00000000000${join}`)
+      const joins = yield* Ref.make(0)
+      const firstQueue = yield* Deferred.make<Queue.Queue<Protocol.EphemeralJoinMessage, Cause.Done>>()
+      const sentTokens = yield* Queue.unbounded<Identity.EphemeralSessionToken>()
+      const fakeClient = {
+        JoinEphemeral: Effect.fnUntraced(function*() {
+          const join = yield* Ref.updateAndGet(joins, (count) => count + 1)
+          const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage, Cause.Done>()
+          yield* Queue.offer(
+            messages,
+            Protocol.EphemeralSessionStarted.make({
+              spaceId,
+              member,
+              sessionToken: tokenFor(join),
+              leaseMillis: 60_000
+            })
+          )
+          const roster = [{ member, value: null, expiresAtMillis: 60_000 }]
+          if (join === 2) roster.push({ member: memberB, value: null, expiresAtMillis: 60_000 })
+          yield* Queue.offer(
+            messages,
+            Protocol.EphemeralSnapshot.make({
+              spaceId,
+              revision: Identity.EphemeralRevision.make(join),
+              members: roster,
+              states: []
+            })
+          )
+          if (join === 1) yield* Deferred.succeed(firstQueue, messages)
+          return messages
+        }),
+        HeartbeatEphemeral: () => Effect.succeed(null),
+        PublishEphemeral: (request: typeof Protocol.VersionedEphemeralPublishRequest.Type) =>
+          Queue.offer(sentTokens, request.sessionToken).pipe(Effect.as(null))
+      }
+      const layerClient = layerFromFakeClient(fakeClient)
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const opened = yield* client.session(Anonymous, { spaceId, member, value: undefined, ttl: "1 minute" })
+        const clearTyping = client.clear(Typing, { spaceId, member })
+        const rejoined = yield* opened.members.pipe(
+          Stream.filter((roster) => roster.some((entry) => entry.member.clientId === memberB.clientId)),
+          Stream.runHead,
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Queue.end(yield* Deferred.await(firstQueue))
+        yield* Fiber.join(rejoined)
+        yield* clearTyping
+        assert.strictEqual(yield* Queue.take(sentTokens), tokenFor(2))
+      })
+      yield* program.pipe(Effect.provide(layerClient), Effect.scoped)
+    })
+  )
+
+  it.effect(
     "does not rejoin after the server rejects a replaced session",
     Effect.fnUntraced(function*() {
       const joins = yield* Ref.make(0)

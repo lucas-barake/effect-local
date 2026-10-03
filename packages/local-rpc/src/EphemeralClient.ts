@@ -365,17 +365,18 @@ export const layerFromSession = (
         `${request.spaceId}:${request.member.clientId}:${request.member.membershipIncarnation}`
       const requireSession = (
         request: Protocol.EphemeralHeartbeatRequest
-      ): Effect.Effect<ActiveSession, ReplicaError.EphemeralSessionUnavailable> => {
-        const active = sessions.get(sessionKey(request))
-        if (active !== undefined) return Effect.succeed(active)
-        return Effect.fail(
-          new ReplicaError.EphemeralSessionUnavailable({
-            spaceId: request.spaceId,
-            clientId: request.member.clientId,
-            membershipIncarnation: request.member.membershipIncarnation
-          })
-        )
-      }
+      ): Effect.Effect<ActiveSession, ReplicaError.EphemeralSessionUnavailable> =>
+        Effect.suspend(() => {
+          const active = sessions.get(sessionKey(request))
+          if (active !== undefined) return Effect.succeed(active)
+          return Effect.fail(
+            new ReplicaError.EphemeralSessionUnavailable({
+              spaceId: request.spaceId,
+              clientId: request.member.clientId,
+              membershipIncarnation: request.member.membershipIncarnation
+            })
+          )
+        })
 
       const publishWire = (request: Protocol.EphemeralPublishRequest) =>
         requireSession(request).pipe(
