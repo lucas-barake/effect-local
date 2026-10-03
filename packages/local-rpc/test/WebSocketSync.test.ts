@@ -382,12 +382,48 @@ const layerConfigurableLive = layerConfigurableClient.pipe(
   Layer.provideMerge(layerProtocol2Server),
   Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
 )
+class BobSyncEngine extends Context.Service<BobSyncEngine, SyncEngine.Service>()(
+  "@lucas-barake/effect-local-rpc/test/BobSyncEngine"
+) {}
+const layerMembersAuthenticator = Layer.succeed(
+  Authentication.Authenticator,
+  Authentication.Authenticator.of({
+    authenticate: (credential) => {
+      if (Redacted.value(credential) === "alice") return Effect.succeed({ subject: "alice" })
+      if (Redacted.value(credential) === "bob") return Effect.succeed({ subject: "bob" })
+      return Effect.fail(new ReplicaError.CredentialRejected())
+    }
+  })
+)
+const layerMembersAuthenticationServer = Authentication.layerServer.pipe(Layer.provide(layerMembersAuthenticator))
+const layerWatcherQuotaServer = layerSyncServer(
+  {
+    ...serverOptions,
+    store: { ...serverOptions.store, maximumWatchersPerSpace: 3, maximumWatchersPerPrincipal: 2 },
+    authorizeRead: () => Effect.void
+  },
+  layerMembersAuthenticationServer,
+  layerHandlers
+)
+const layerMemberClient = (bearer: Redacted.Redacted) =>
+  SyncClient.layerWebSocket({ url: serverUrl }).pipe(
+    Layer.provide(layerCountedConstructor),
+    Layer.provide(Authentication.layerCredentialProviderStatic(bearer))
+  )
+const layerAliceClient = layerMemberClient(Redacted.make("alice"))
+const layerBobSyncClient = layerMemberClient(Redacted.make("bob"))
+const layerBobClient = Layer.effect(BobSyncEngine, SyncEngine.SyncEngine).pipe(Layer.provide(layerBobSyncClient))
+const layerWatcherQuotaLive = Layer.merge(layerAliceClient, layerBobClient).pipe(
+  Layer.provideMerge(layerWatcherQuotaServer),
+  Layer.provide([NodeHttpServer.layerTest, SyncRpc.layerJson()])
+)
 const layerBootstrapDependencies = Layer.merge(layerLive, layerDatabase)
 const layerRetryDependencies = Layer.merge(layerLive, layerDatabase)
 const provideBootstrapDependencies = Effect.provide(layerBootstrapDependencies)
 const provideConfigurableLive = Effect.provide(layerConfigurableLive)
 const provideIncompatibleLive = Effect.provide(layerIncompatibleLive)
 const provideLive = Effect.provide(layerLive)
+const provideWatcherQuotaLive = Effect.provide(layerWatcherQuotaLive)
 const provideNodeCrypto = Effect.provide(NodeCrypto.layer)
 const provideRetryDependencies = Effect.provide(layerRetryDependencies)
 const restoreReadAuthorization = Effect.ensuring(Effect.sync(() => MutableRef.set(readAuthorized, true)))
@@ -1002,6 +1038,45 @@ describe("WebSocket synchronization", () => {
       },
       restoreReadAuthorization,
       provideLive,
+      provideNodeCrypto
+    )
+  )
+
+  it.effect(
+    "keeps another member's watch admitted while one member holds its watcher quota over one socket",
+    Effect.fnUntraced(
+      function*() {
+        const alice = yield* SyncEngine.SyncEngine
+        const bob = yield* BobSyncEngine
+        const openWatch = Effect.fnUntraced(function*(engine: SyncEngine.Service, watchClientId: Identity.ClientId) {
+          const started = yield* Deferred.make<void, ReplicaError.ReplicaError>()
+          yield* engine.watch({
+            spaceId,
+            clientId: watchClientId,
+            schema: definition.schemaIdentity,
+            scope,
+            scopeGeneration,
+            cursor: null
+          }).pipe(
+            Stream.runForEach(() => Deferred.succeed(started, undefined)),
+            Effect.tapError((error) => Deferred.fail(started, error)),
+            Effect.forkChild({ startImmediately: true })
+          )
+          return yield* Deferred.await(started).pipe(Effect.result)
+        })
+        const aliceWatches = yield* Effect.forEach([
+          Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000201"),
+          Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000202"),
+          Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000203")
+        ], (watchClientId) => openWatch(alice, watchClientId))
+        const bobWatch = yield* openWatch(bob, Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000204"))
+
+        assert.deepStrictEqual(bobWatch, Result.succeed(undefined))
+        assert.deepStrictEqual(aliceWatches.slice(0, 2).map(Result.isSuccess), [true, true])
+        const quotaExceeded = new ReplicaError.CapacityExceeded({ resource: "sync watchers per principal", limit: 2 })
+        assert.deepStrictEqual(aliceWatches[2], Result.fail(quotaExceeded))
+      },
+      provideWatcherQuotaLive,
       provideNodeCrypto
     )
   )

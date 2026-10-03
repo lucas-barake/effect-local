@@ -23,7 +23,6 @@ import * as RcMap from "effect/RcMap"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
-import * as Semaphore from "effect/Semaphore"
 import * as SqlClient from "effect/sql/SqlClient"
 import * as SqlSchema from "effect/sql/SqlSchema"
 import * as Stream from "effect/Stream"
@@ -136,10 +135,16 @@ export interface Options<R = never,> extends HistoryOptions {
   readonly maximumSubmitBatchDuration?: Duration.Input | undefined
   readonly wakeCapacity?: number
   readonly maximumWatchersPerSpace?: number | undefined
+  readonly maximumWatchersPerPrincipal?: number | undefined
   readonly maximumConcurrentReadAuthorizations?: number | undefined
   readonly maximumPendingReadAuthorizations?: number | undefined
   readonly readAuthorizationCacheCapacity?: number | undefined
   readonly offlineWake?: OfflineWake.Options<R>
+}
+
+interface WatcherAdmission {
+  active: number
+  readonly byPrincipal: Map<string, number>
 }
 
 interface ReadAuthorizationCommon {
@@ -185,6 +190,7 @@ export const defaults = {
   readAuthorizationRefreshInterval: "30 seconds",
   maximumSubmitBatchDuration: "1 second",
   maximumWatchersPerSpace: 1_024,
+  maximumWatchersPerPrincipal: 64,
   maximumConcurrentReadAuthorizations: 64,
   maximumPendingReadAuthorizations: 4_096,
   readAuthorizationCacheCapacity: 4_096
@@ -217,6 +223,7 @@ const resolveOptions = <R,>(input: Options<R>): ResolvedOptions<R> => ({
   readAuthorizationRefreshInterval: input.readAuthorizationRefreshInterval ?? defaults.readAuthorizationRefreshInterval,
   maximumSubmitBatchDuration: input.maximumSubmitBatchDuration ?? defaults.maximumSubmitBatchDuration,
   maximumWatchersPerSpace: input.maximumWatchersPerSpace ?? defaults.maximumWatchersPerSpace,
+  maximumWatchersPerPrincipal: input.maximumWatchersPerPrincipal ?? defaults.maximumWatchersPerPrincipal,
   maximumConcurrentReadAuthorizations: input.maximumConcurrentReadAuthorizations ??
     defaults.maximumConcurrentReadAuthorizations,
   maximumPendingReadAuthorizations: input.maximumPendingReadAuthorizations ?? defaults.maximumPendingReadAuthorizations,
@@ -378,6 +385,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
       for (
         const option of [
           "maximumWatchersPerSpace",
+          "maximumWatchersPerPrincipal",
           "maximumConcurrentReadAuthorizations",
           "maximumPendingReadAuthorizations",
           "readAuthorizationCacheCapacity"
@@ -494,7 +502,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
       const wakes = yield* RcMap.make({
         lookup: Effect.fnUntraced(function*(_spaceId: Identity.SpaceId) {
           const channel = yield* Effect.acquireRelease(PubSub.sliding<PublishedWake>(wakeCapacity), PubSub.shutdown)
-          const watchers = yield* Semaphore.make(options.maximumWatchersPerSpace)
+          const watchers: WatcherAdmission = { active: 0, byPrincipal: new Map() }
           return { channel, watchers }
         })
       })
@@ -2075,15 +2083,54 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         const scope = yield* Protocol.validateReplicationScope(options.definition, request.scope)
         const authorization = { spaceId: request.spaceId, clientId: request.clientId, scope, principal }
         const key = yield* Canonical.stringifyEffect(authorization)
+        const principalKey = yield* Canonical.stringifyEffect(principal)
         const captured = yield* copyThrough(ReadAuthorizationCapture, authorization)
         const capturedRequest = { ...request, ...captured }
         return {
           key,
+          principalKey,
           request: capturedRequest,
           principal: captured.principal,
           lookup: () => authorizeReadScope(capturedRequest, captured.principal)
         }
       })
+      const admitWatcher = (watchers: WatcherAdmission, principalKey: string | undefined) => {
+        if (watchers.active >= options.maximumWatchersPerSpace) {
+          return Effect.fail(
+            new ReplicaError.CapacityExceeded({
+              resource: "sync watchers",
+              limit: options.maximumWatchersPerSpace
+            })
+          )
+        }
+        if (principalKey === undefined) {
+          watchers.active += 1
+          return Effect.void
+        }
+        const held = watchers.byPrincipal.get(principalKey) ?? 0
+        if (held >= options.maximumWatchersPerPrincipal) {
+          return Effect.fail(
+            new ReplicaError.CapacityExceeded({
+              resource: "sync watchers per principal",
+              limit: options.maximumWatchersPerPrincipal
+            })
+          )
+        }
+        watchers.active += 1
+        watchers.byPrincipal.set(principalKey, held + 1)
+        return Effect.void
+      }
+      const releaseWatcher = (watchers: WatcherAdmission, principalKey: string | undefined) =>
+        Effect.sync(() => {
+          watchers.active -= 1
+          if (principalKey === undefined) return
+          const remaining = (watchers.byPrincipal.get(principalKey) ?? 0) - 1
+          if (remaining === 0) {
+            watchers.byPrincipal.delete(principalKey)
+            return
+          }
+          watchers.byPrincipal.set(principalKey, remaining)
+        })
       const watch = (
         request: Protocol.WatchRequest,
         principal: typeof Schema.Json.Type,
@@ -2101,16 +2148,10 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           const childScope = yield* Scope.make()
           yield* Effect.addFinalizer(() => Scope.close(childScope, Exit.void))
           const state = yield* RcMap.get(wakes, request.spaceId).pipe(Scope.provide(childScope))
-          yield* Effect.gen(function*() {
-            if (!(yield* state.watchers.takeIfAvailable(1))) {
-              yield* metrics.recordRejection("CapacityExceeded")
-              yield* new ReplicaError.CapacityExceeded({
-                resource: "sync watchers",
-                limit: options.maximumWatchersPerSpace
-              })
-            }
-          }).pipe(
-            (acquire) => Effect.acquireRelease(acquire, () => state.watchers.release(1).pipe(Effect.asVoid)),
+          const principalKey = authorization?.principalKey
+          yield* Effect.suspend(() => admitWatcher(state.watchers, principalKey)).pipe(
+            Effect.tapErrorTag("CapacityExceeded", () => metrics.recordRejection("CapacityExceeded")),
+            (acquire) => Effect.acquireRelease(acquire, () => releaseWatcher(state.watchers, principalKey)),
             Scope.provide(childScope)
           )
           yield* metrics.changeWatchers(1).pipe(

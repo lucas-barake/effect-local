@@ -517,6 +517,64 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
   )
 
   it.effect(
+    "caps one principal's sync watchers so other principals keep live sync",
+    pipe(Effect.fnUntraced(
+      function*() {
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layer({
+            ...serverHistory,
+            definition: Domain.definition,
+            maximumWatchersPerSpace: 3,
+            maximumWatchersPerPrincipal: 2,
+            authorizeAccess: () => Effect.void,
+            authorizeMutation: () => Effect.void,
+            authorizeRead: () => Effect.void
+          }).pipe(
+            Layer.provide(layerRuntime),
+            Layer.provide(serverDatabase())
+          )
+        )
+        const holdWatch = Effect.fnUntraced(function*(watchClientId: Identity.ClientId, principal: Schema.Json) {
+          const ready = yield* Deferred.make<void>()
+          const fiber = yield* server.watchAuthorized(watchRequest(watchClientId), principal).pipe(
+            Effect.flatMap(Stream.runForEach(() => Deferred.succeed(ready, undefined))),
+            Effect.forkChild({ startImmediately: true })
+          )
+          yield* Deferred.await(ready)
+          return fiber
+        })
+        const firstClient = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000101")
+        const secondClient = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000102")
+        const thirdClient = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000103")
+        const otherClient = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000104")
+        const alice = { subject: "alice" }
+        const first = yield* holdWatch(firstClient, alice)
+        yield* holdWatch(secondClient, { subject: "alice" })
+
+        const error = yield* server.watchAuthorized(watchRequest(thirdClient), alice).pipe(
+          Effect.flatMap(Stream.runHead),
+          expectedFailure
+        )
+        assert.deepStrictEqual(
+          error,
+          new ReplicaError.CapacityExceeded({ resource: "sync watchers per principal", limit: 2 })
+        )
+
+        yield* holdWatch(otherClient, { subject: "bob" })
+
+        yield* Fiber.interrupt(first)
+        const readmitted = yield* server.watchAuthorized(watchRequest(thirdClient), alice).pipe(
+          Effect.flatMap(Stream.runHead)
+        )
+        assert.isTrue(Option.isSome(readmitted))
+      },
+      Effect.provide(NodeCrypto.layer),
+      Effect.scoped
+    ))
+  )
+
+  it.effect(
     "keeps watcher admission available when its metric update defects",
     Effect.fnUntraced(function*() {
       const registry = new Map<string, Metric.Metric.Metadata<any, any>>()
@@ -3924,6 +3982,22 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       assert.strictEqual(pendingReadAuthorizationError._tag, "InvalidConfiguration")
       if (pendingReadAuthorizationError._tag === "InvalidConfiguration") {
         assert.strictEqual(pendingReadAuthorizationError.option, "maximumPendingReadAuthorizations")
+      }
+
+      const principalWatcherError = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layerTrusted({
+          ...serverHistory,
+          definition: Domain.definition,
+          maximumWatchersPerPrincipal: 0
+        }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(serverDatabase())
+        )
+      ).pipe(expectedFailure)
+      assert.strictEqual(principalWatcherError._tag, "InvalidConfiguration")
+      if (principalWatcherError._tag === "InvalidConfiguration") {
+        assert.strictEqual(principalWatcherError.option, "maximumWatchersPerPrincipal")
       }
 
       const server = yield* service(ServerStore.ServerStore, serverLayer())
