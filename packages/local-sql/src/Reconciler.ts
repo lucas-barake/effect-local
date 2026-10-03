@@ -548,6 +548,7 @@ export const layerOnePass = (
       let syncAttempted = false
       let syncing = false
       let failedSinceSyncStarted = false
+      const reportedSyncFailures = new WeakSet<ReplicaError.ReplicaError>()
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
       const setStatus = (value: ReplicaStatus.ReplicaStatus) =>
         Ref.set(status, value).pipe(
@@ -591,7 +592,11 @@ export const layerOnePass = (
             )
           )
         )
-      const failed = (error: ReplicaError.ReplicaError) => reportFailure(error, false)
+      const failed = (error: ReplicaError.ReplicaError) =>
+        Effect.suspend(() => {
+          if (reportedSyncFailures.has(error)) return Effect.void
+          return reportFailure(error, false)
+        })
       const watchFailed = (error: ReplicaError.ReplicaError) => reportFailure(error, true)
       const succeeded = Effect.gen(function*() {
         if (!syncAttempted || failedSinceSyncStarted) return
@@ -807,12 +812,13 @@ export const layerOnePass = (
         }).pipe(
           Effect.ensuring(Effect.sync(() => {
             syncing = false
-          }))
+          })),
+          Effect.tapError((error) => {
+            reportedSyncFailures.add(error)
+            return reportFailure(error, false)
+          })
         )
-      ).pipe(
-        Effect.tapError(failed),
-        Effect.withSpan("Reconciliation.sync")
-      )
+      ).pipe(Effect.withSpan("Reconciliation.sync"))
 
       return Reconciliation.of({ sync, failed, watchFailed, succeeded, status: Ref.get(status) })
     })
