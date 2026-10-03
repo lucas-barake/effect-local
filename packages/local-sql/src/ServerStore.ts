@@ -784,19 +784,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           rejection
         })
         if ((yield* Protocol.encodedBytesEffect(receipt)) <= Protocol.maximumReceiptBytes) return receipt
-        return Protocol.RejectedReceipt.make({
-          spaceId: envelope.spaceId,
-          clientId: envelope.clientId,
-          membershipIncarnation: envelope.membershipIncarnation,
-          mutationId: envelope.mutationId,
-          localSequence: envelope.localSequence,
-          name: mutation.name,
-          sourceSchema: options.definition.schemaIdentity,
-          mutationVersion: mutation.mutationVersion,
-          origin: "Capacity",
-          terminalSequence,
-          rejection: receiptCapacityRejection
-        })
+        return Protocol.RejectedReceipt.make({ ...receipt, origin: "Capacity", rejection: receiptCapacityRejection })
       })
       const authorizeAccess = (envelope: Protocol.MutationEnvelope, principal: typeof Schema.Json.Type) =>
         options.authorizeAccess({
