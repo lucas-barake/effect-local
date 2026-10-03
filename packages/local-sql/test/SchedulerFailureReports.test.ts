@@ -90,6 +90,7 @@ const harness = Effect.fnUntraced(function*() {
   const watchEnd = yield* Deferred.make<void>()
   const credentialChange = yield* Deferred.make<void>()
   let pullMode: PullMode = "Pass"
+  let pullFailure: ReplicaError.ReplicaError | undefined
   const heldPulls = yield* Queue.unbounded<void>()
   const transportWaits = yield* Queue.unbounded<void>()
   const watchStarts = yield* Queue.unbounded<void>()
@@ -106,6 +107,11 @@ const harness = Effect.fnUntraced(function*() {
         if (pullMode === "Interrupt") {
           pullMode = "Pass"
           return Effect.interrupt
+        }
+        if (pullFailure !== undefined) {
+          const failure = pullFailure
+          pullFailure = undefined
+          return Effect.fail(failure)
         }
         if (pullMode === "Reject") {
           pullMode = "Pass"
@@ -133,6 +139,10 @@ const harness = Effect.fnUntraced(function*() {
     failWatch: (error: ReplicaError.ReplicaError) => Deferred.succeed(watchFailure, error),
     endWatch: Deferred.succeed(watchEnd, undefined),
     changeCredential: Deferred.succeed(credentialChange, undefined),
+    failNextPull: (error: ReplicaError.ReplicaError) =>
+      Effect.sync(() => {
+        pullFailure = error
+      }),
     setPullMode: (mode: PullMode) =>
       Effect.sync(() => {
         pullMode = mode
@@ -601,6 +611,37 @@ describe("in-memory scheduler failure reports", () => {
       )
 
       assert.isTrue(Option.isSome(watchedAgain))
+    })
+  )
+
+  it.effect.each(
+    [
+      new ReplicaError.UnknownCommitOutcome({ mutationId: "mutation", cause: "injected" }),
+      new ReplicaError.CapacityExceeded({ resource: "read authorizations", limit: 1 }),
+      new ReplicaError.OwnerUnavailable({ reason: "transport" })
+    ]
+  )(
+    "drains a pending mutation after one sync fails with a retryable failure",
+    Effect.fnUntraced(function*(failure) {
+      const controls = yield* harness()
+      const { local, reconciler, statuses } = yield* inMemory(controls)
+      yield* controls.failNextPull(failure)
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* reconciler.schedule
+      let reported = yield* Queue.take(statuses)
+      while (reported._tag !== "Failed") reported = yield* Queue.take(statuses)
+      assert.strictEqual(reported.message, failure._tag)
+      const awaitDrained = Effect.gen(function*() {
+        let status = yield* Queue.take(statuses)
+        while (status._tag !== "Online" || status.pending !== 0) status = yield* Queue.take(statuses)
+        return status
+      })
+
+      const drained = yield* VirtualTime.advanceUntil(awaitDrained, "10 seconds").pipe(
+        Effect.timeoutOption("10 minutes")
+      )
+
+      assert.isTrue(Option.isSome(drained))
     })
   )
 

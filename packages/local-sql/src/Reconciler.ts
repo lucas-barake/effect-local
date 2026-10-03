@@ -134,17 +134,58 @@ const makeReconciliationRequests = (request: Effect.Effect<number, ReplicaError.
   return { run, observe }
 }
 
-const isConnectivityFailure = (error: ReplicaError.ReplicaError) =>
-  error._tag === "AuthenticatorUnavailable" ||
-  error._tag === "ServerUnavailable" ||
-  error._tag === "OperationTimeout"
+type FailureClass = "Unreachable" | "Retryable" | "NeedsCredential" | "Terminal"
 
-export const isTransientFailure = (error: ReplicaError.ReplicaError) =>
-  isConnectivityFailure(error) || error._tag === "StorageUnavailable"
+const failureClasses: { readonly [Tag in ReplicaError.ReplicaError["_tag"]]: FailureClass } = {
+  ServerUnavailable: "Unreachable",
+  OperationTimeout: "Unreachable",
+  AuthenticatorUnavailable: "Unreachable",
+  StorageUnavailable: "Retryable",
+  UnknownCommitOutcome: "Retryable",
+  CapacityExceeded: "Retryable",
+  OwnerUnavailable: "Retryable",
+  CredentialRejected: "NeedsCredential",
+  StorageCorrupt: "Terminal",
+  CanonicalEncodeError: "Terminal",
+  DefinitionMismatch: "Terminal",
+  StaleSchema: "Terminal",
+  SchemaGenerationConflict: "Terminal",
+  SchemaEvolutionUnsupported: "Terminal",
+  SchemaEvolutionFailed: "Terminal",
+  StorageMigrationMismatch: "Terminal",
+  StorageMigrationPending: "Terminal",
+  SchemaKeyCollision: "Terminal",
+  PendingMutationEvolutionRejected: "Terminal",
+  ReplicaIdentityMismatch: "Terminal",
+  SpaceNotJoined: "Terminal",
+  SpaceUnavailable: "Terminal",
+  EphemeralSessionUnavailable: "Terminal",
+  MutationIdentityConflict: "Terminal",
+  QuarantineResubmissionConflict: "Terminal",
+  OutOfOrderMutation: "Terminal",
+  CursorGap: "Terminal",
+  SettlementReplayTruncated: "Terminal",
+  StaleReplicationScope: "Terminal",
+  SnapshotUnavailable: "Terminal",
+  InvalidConfiguration: "Terminal",
+  ProtocolInvalid: "Terminal",
+  UpgradeRequired: "Terminal",
+  ProtocolVersionRejected: "Terminal",
+  AuthorizationDenied: "Terminal",
+  BuildSuperseded: "Terminal"
+}
+
+const failureClass = (error: ReplicaError.ReplicaError): FailureClass => failureClasses[error._tag]
+
+export const isTransientFailure = (error: ReplicaError.ReplicaError) => {
+  const classified = failureClass(error)
+  return classified === "Unreachable" || classified === "Retryable"
+}
 
 export const failureStatus = (error: ReplicaError.ReplicaError, pending: number): ReplicaStatus.ReplicaStatus => {
-  if (error._tag === "CredentialRejected") return { _tag: "NeedsAuthentication", pending }
-  if (isConnectivityFailure(error)) return { _tag: "Offline", pending }
+  const classified = failureClass(error)
+  if (classified === "NeedsCredential") return { _tag: "NeedsAuthentication", pending }
+  if (classified === "Unreachable") return { _tag: "Offline", pending }
   return { _tag: "Failed", pending, message: error._tag }
 }
 

@@ -21,6 +21,7 @@ import * as Scope from "effect/Scope"
 import * as SqlClient from "effect/sql/SqlClient"
 import * as SqlError from "effect/sql/SqlError"
 import * as Stream from "effect/Stream"
+import * as Struct from "effect/Struct"
 import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
 import * as SqlReplica from "../src/SqlReplica.js"
 import * as SyncEngine from "../src/SyncEngine.js"
@@ -171,6 +172,90 @@ const pendingBackgroundSpace = Effect.fnUntraced(function*(constructor: Construc
   return services
 })
 
+type FailureTag = ReplicaError.ReplicaError["_tag"]
+
+const failures: { readonly [Tag in FailureTag]: Extract<ReplicaError.ReplicaError, { readonly _tag: Tag }> } = {
+  StorageUnavailable: new ReplicaError.StorageUnavailable({ cause: "injected" }),
+  StorageCorrupt: new ReplicaError.StorageCorrupt({ message: "injected" }),
+  CanonicalEncodeError: new ReplicaError.CanonicalEncodeError({ cause: "injected" }),
+  DefinitionMismatch: new ReplicaError.DefinitionMismatch({ expected: "expected", actual: "actual" }),
+  StaleSchema: new ReplicaError.StaleSchema({
+    expectedVersion: 2,
+    expectedHash: "expected",
+    actualVersion: 1,
+    actualHash: "actual"
+  }),
+  SchemaGenerationConflict: new ReplicaError.SchemaGenerationConflict({ expected: 2, actual: 1 }),
+  SchemaEvolutionUnsupported: new ReplicaError.SchemaEvolutionUnsupported({
+    sourceVersion: 1,
+    sourceHash: "source",
+    targetVersion: 2,
+    targetHash: "target"
+  }),
+  SchemaEvolutionFailed: new ReplicaError.SchemaEvolutionFailed({
+    stepId: null,
+    componentKind: "Model",
+    componentName: "Todo",
+    part: "Value",
+    fromVersion: 1,
+    toVersion: 2,
+    cause: "injected"
+  }),
+  StorageMigrationMismatch: new ReplicaError.StorageMigrationMismatch({ catalog: "Client", message: "injected" }),
+  StorageMigrationPending: new ReplicaError.StorageMigrationPending({ catalog: "Client", message: "injected" }),
+  SchemaKeyCollision: new ReplicaError.SchemaKeyCollision({ model: "Todo", key: "key" }),
+  PendingMutationEvolutionRejected: new ReplicaError.PendingMutationEvolutionRejected({
+    mutationId: "mutation",
+    rejection: null
+  }),
+  ReplicaIdentityMismatch: new ReplicaError.ReplicaIdentityMismatch({
+    expectedClientId: "expected",
+    actualClientId: "actual"
+  }),
+  SpaceNotJoined: new ReplicaError.SpaceNotJoined({ spaceId }),
+  SpaceUnavailable: new ReplicaError.SpaceUnavailable({ spaceId }),
+  EphemeralSessionUnavailable: new ReplicaError.EphemeralSessionUnavailable({
+    spaceId,
+    clientId,
+    membershipIncarnation: "incarnation"
+  }),
+  MutationIdentityConflict: new ReplicaError.MutationIdentityConflict({ mutationId: "mutation" }),
+  QuarantineResubmissionConflict: new ReplicaError.QuarantineResubmissionConflict({ mutationId: "mutation" }),
+  OutOfOrderMutation: new ReplicaError.OutOfOrderMutation({ expected: 2, actual: 1 }),
+  CursorGap: new ReplicaError.CursorGap({ expected: 2, actual: 1 }),
+  SettlementReplayTruncated: new ReplicaError.SettlementReplayTruncated({ requested: 1, oldestAvailable: 2 }),
+  StaleReplicationScope: new ReplicaError.StaleReplicationScope({ expected: 2, actual: 1 }),
+  SnapshotUnavailable: new ReplicaError.SnapshotUnavailable({ snapshotId: "snapshot" }),
+  CapacityExceeded: new ReplicaError.CapacityExceeded({ resource: "read authorizations", limit: 1 }),
+  InvalidConfiguration: new ReplicaError.InvalidConfiguration({ option: "option", message: "injected" }),
+  UnknownCommitOutcome: new ReplicaError.UnknownCommitOutcome({ mutationId: "mutation", cause: "injected" }),
+  ProtocolInvalid: new ReplicaError.ProtocolInvalid({ message: "rejected by the server" }),
+  UpgradeRequired: new ReplicaError.UpgradeRequired({ clientVersions: [1], serverVersions: [2] }),
+  ProtocolVersionRejected: new ReplicaError.ProtocolVersionRejected({ version: 1, serverVersions: [2] }),
+  ServerUnavailable: new ReplicaError.ServerUnavailable(),
+  CredentialRejected: new ReplicaError.CredentialRejected({}),
+  AuthenticatorUnavailable: new ReplicaError.AuthenticatorUnavailable(),
+  OperationTimeout: new ReplicaError.OperationTimeout({ operation: "pull", timeoutMillis: 1 }),
+  AuthorizationDenied: new ReplicaError.AuthorizationDenied({ reason: null }),
+  OwnerUnavailable: new ReplicaError.OwnerUnavailable({ reason: "transport" }),
+  BuildSuperseded: new ReplicaError.BuildSuperseded({ version: 1, supersedingVersion: 2 })
+}
+
+const retryingTags: ReadonlyArray<FailureTag> = [
+  "ServerUnavailable",
+  "OperationTimeout",
+  "AuthenticatorUnavailable",
+  "StorageUnavailable",
+  "UnknownCommitOutcome",
+  "CapacityExceeded",
+  "OwnerUnavailable"
+]
+
+const stoppingTags = Struct.keys(failures).filter((tag) => !retryingTags.includes(tag))
+
+const schedulerCases = (tags: ReadonlyArray<FailureTag>) =>
+  tags.flatMap((tag) => constructors.map((constructor) => [tag, constructor] as const))
+
 const pendingCountStatement = "SELECT COUNT(p.mutation_id) AS count"
 
 const awaitAggregate = Effect.fnUntraced(function*(
@@ -212,7 +297,7 @@ const awaitActivation = Effect.fnUntraced(function*(
   while ((yield* space.activation) !== activation) yield* Queue.take(changes)
 })
 
-const protocolInvalid = new ReplicaError.ProtocolInvalid({ message: "rejected by the server" })
+const protocolInvalid = failures.ProtocolInvalid
 
 const workflowRetryAfterRelease = Effect.fnUntraced(function*(workflowRetry: "fails" | "succeeds") {
   const services = yield* backgroundServices("layerWorkflow")
@@ -306,23 +391,14 @@ describe("background sync terminal failures", () => {
     }, Effect.scoped)
   )
 
-  it.effect.each(["ProtocolInvalid", "StaleSchema"] as const)(
-    "stops retrying a background space whose sync fails with %s",
-    Effect.fnUntraced(function*(tag) {
-      const services = yield* pendingBackgroundSpace("layer")
+  it.effect.each(schedulerCases(stoppingTags))(
+    "stops a background space after one attempt that fails with %s on %s",
+    Effect.fnUntraced(function*([tag, constructor]) {
+      const services = yield* pendingBackgroundSpace(constructor)
       const attempts = yield* makeAttempts
-      let failure: ReplicaError.ReplicaError = new ReplicaError.ProtocolInvalid({ message: "rejected by the server" })
-      if (tag === "StaleSchema") {
-        failure = new ReplicaError.StaleSchema({
-          expectedVersion: 2,
-          expectedHash: "expected",
-          actualVersion: 1,
-          actualHash: "actual"
-        })
-      }
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
-        pull: () => Effect.andThen(attempts.record, Effect.fail(failure))
+        pull: () => Effect.andThen(attempts.record, Effect.fail(failures[tag]))
       }))
       const space = yield* replica.space(spaceId)
       yield* attempts.reached(1)
@@ -331,8 +407,72 @@ describe("background sync terminal failures", () => {
 
       assert.strictEqual(attempts.count(), 1)
       assert.isTrue(Option.isNone(retried))
-      const status = yield* awaitSpaceStatus(space, services.reactivity, "Failed")
-      if (status._tag === "Failed") assert.strictEqual(status.message, tag)
+      const status = yield* awaitSpaceStatusWhere(space, services.reactivity, (current) => current._tag !== "Idle")
+      if (tag === "CredentialRejected") {
+        assert.strictEqual(status._tag, "NeedsAuthentication")
+      } else {
+        assert.strictEqual(status._tag, "Failed")
+        if (status._tag === "Failed") assert.strictEqual(status.message, tag)
+      }
+    }, Effect.scoped)
+  )
+
+  it.effect.each(schedulerCases(retryingTags))(
+    "keeps retrying a background space whose sync fails with %s on %s",
+    Effect.fnUntraced(function*([tag, constructor]) {
+      const services = yield* pendingBackgroundSpace(constructor)
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => Effect.andThen(attempts.record, Effect.fail(failures[tag]))
+      }))
+      yield* attempts.reached(1)
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(3)).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.isTrue(Option.isSome(retried))
+      const aggregate = yield* replica.status
+      assert.strictEqual(aggregate.counts.failed, 0)
+      assert.strictEqual(aggregate.totalPending, 1)
+    }, Effect.scoped)
+  )
+
+  it.effect.each(schedulerCases(stoppingTags))(
+    "stops a foreground space after one attempt that fails with %s on %s",
+    Effect.fnUntraced(function*([tag, constructor]) {
+      const services = yield* backgroundServices(constructor)
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => Effect.andThen(attempts.record, Effect.fail(failures[tag]))
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* space.activate
+      yield* attempts.reached(1)
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.strictEqual(attempts.count(), 1)
+      assert.isTrue(Option.isNone(retried))
+    }, Effect.scoped)
+  )
+
+  it.effect.each(schedulerCases(retryingTags))(
+    "keeps retrying a foreground space whose sync fails with %s on %s",
+    Effect.fnUntraced(function*([tag, constructor]) {
+      const services = yield* backgroundServices(constructor)
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => Effect.andThen(attempts.record, Effect.fail(failures[tag]))
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* space.activate
+      yield* attempts.reached(1)
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(3)).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.isTrue(Option.isSome(retried))
     }, Effect.scoped)
   )
 
@@ -382,6 +522,39 @@ describe("background sync terminal failures", () => {
       const aggregate = yield* replica.status
       assert.strictEqual(aggregate.counts.failed, 0)
       assert.strictEqual(aggregate.totalPending, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "submits again and drains after the server reports an unknown commit outcome with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* pendingBackgroundSpace(constructor)
+      let submissions = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: (request) => {
+          submissions += 1
+          if (submissions > 1) return acceptSubmission(request)
+          return Effect.fail(
+            new ReplicaError.UnknownCommitOutcome({
+              mutationId: request.envelopes[0].mutationId,
+              cause: "injected commit failure"
+            })
+          )
+        },
+        pull: (request) => emptyPage(services.crypto, request)
+      }))
+      const space = yield* replica.space(spaceId)
+      const idleWithoutPending = awaitSpaceStatusWhere(
+        space,
+        services.reactivity,
+        (status) => status._tag === "Idle" && status.pending === 0
+      ).pipe(Effect.scoped)
+
+      const drained = yield* VirtualTime.advanceUntil(idleWithoutPending).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.strictEqual(submissions, 2)
+      assert.isTrue(Option.isSome(drained))
     }, Effect.scoped)
   )
 

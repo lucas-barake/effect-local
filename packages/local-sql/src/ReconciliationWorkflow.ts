@@ -306,17 +306,7 @@ const handler = (
           const generation = observedGeneration ?? (yield* runtime.reconciliation.generation)
           yield* runtime.reconciliation.failed(result.failure, generation)
         }))
-        if (
-          result.failure._tag === "CredentialRejected" ||
-          result.failure._tag === "ProtocolInvalid" ||
-          result.failure._tag === "StaleSchema" ||
-          result.failure._tag === "SpaceUnavailable" ||
-          result.failure._tag === "StorageCorrupt" ||
-          result.failure._tag === "StaleReplicationScope" ||
-          result.failure._tag === "UpgradeRequired" ||
-          result.failure._tag === "AuthorizationDenied" ||
-          attempt >= configuration.maximumAttempts
-        ) {
+        if (!Reconciler.isTransientFailure(result.failure) || attempt >= configuration.maximumAttempts) {
           yield* result.failure
           return
         }
