@@ -28,9 +28,10 @@ import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import type * as Authentication from "./Authentication.js"
 import { positiveFiniteDurationMillis, positiveSafeInteger, reconnectPolicy } from "./internal/configuration.js"
-import { capacityExceeded, invalidConfiguration } from "./internal/errors.js"
+import { invalidConfiguration } from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
+import * as SequencedPubSub from "./internal/sequencedPubSub.js"
 import * as ProtocolSession from "./ProtocolSession.js"
 import * as Transport from "./Transport.js"
 
@@ -190,15 +191,10 @@ interface RawView {
   readonly channels: HashMap.HashMap<string, ChannelStates>
 }
 
-interface EventDelivery {
-  readonly sequence: number
-  readonly entry: Protocol.EphemeralEventEntry
-}
-
 interface SessionRuntime {
   readonly requestHash: string
   readonly views: PubSub.PubSub<RawView>
-  readonly events: PubSub.PubSub<EventDelivery>
+  readonly events: SequencedPubSub.SequencedPubSub<Protocol.EphemeralEventEntry>
   readonly ready: Deferred.Deferred<void, ReplicaError.ReplicaError>
   readonly failure: Deferred.Deferred<never, ReplicaError.ReplicaError>
   readonly memberUpdates: Semaphore.Semaphore
@@ -647,20 +643,16 @@ export const layerFromSession = (
       const runtimes = yield* RcMap.make({
         lookup: Effect.fnUntraced(function*(identity: SessionIdentity) {
           const views = yield* PubSub.sliding<RawView>({ capacity: 1, replay: 1 })
-          const events = yield* PubSub.sliding<EventDelivery>(eventCapacity)
+          const events = yield* SequencedPubSub.sliding<Protocol.EphemeralEventEntry>("ephemeral events", eventCapacity)
           const ready = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           const failure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
           let view: RawView | undefined
           let viewSequence = 0
-          let eventSequence = 0
           let unknownPresented = false
           let memberValue = identity.request.value
           const memberUpdates = yield* Semaphore.make(1)
           const consume = (message: Protocol.EphemeralMessage) => {
-            if (message._tag === "Event") {
-              eventSequence = eventSequence + 1
-              return PubSub.publish(events, { sequence: eventSequence, entry: message.entry }).pipe(Effect.asVoid)
-            }
+            if (message._tag === "Event") return SequencedPubSub.publish(events, message.entry)
             if (message._tag === "EventCleared") return Effect.void
             const next = reduceView(view, viewSequence + 1, message)
             if (next === undefined) return Effect.void
@@ -725,7 +717,7 @@ export const layerFromSession = (
             return Deferred.fail(ready, closed).pipe(
               Effect.andThen(Deferred.fail(failure, closed)),
               Effect.andThen(PubSub.shutdown(views)),
-              Effect.andThen(PubSub.shutdown(events))
+              Effect.andThen(SequencedPubSub.shutdown(events))
             )
           })
           const runtime: SessionRuntime = {
@@ -752,16 +744,7 @@ export const layerFromSession = (
         const orFailure = <A, E extends { readonly _tag: string },>(stream: Stream.Stream<A, E>) =>
           LosslessQueue.merge(stream, failureStream)
         const events = (definition: Ephemeral.AnyEvent) =>
-          Stream.fromPubSub(runtime.events).pipe(
-            Stream.mapAccumEffect(
-              (): number | undefined => undefined,
-              (previous, delivery) => {
-                if (previous !== undefined && delivery.sequence !== previous + 1) {
-                  return Effect.fail(capacityExceeded("ephemeral events", eventCapacity))
-                }
-                return Effect.succeed([delivery.sequence, [delivery.entry]] as const)
-              }
-            ),
+          Stream.unwrap(SequencedPubSub.subscribe(runtime.events)).pipe(
             Stream.filter((entry) => entry.channel === definition.name),
             Stream.mapEffect((entry) =>
               Schema.decodeUnknownEffect(definition.payloadSchema)(entry.value).pipe(
