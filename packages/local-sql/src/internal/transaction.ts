@@ -216,7 +216,7 @@ export const entityKey = (entity: Protocol.EntityKey) => Canonical.stringify([en
 
 const maximumTransactionAttempts = 8
 
-export type ServerTransactionFailure = ReplicaError.ReplicaError | SqlError.SqlError | Schema.SchemaError
+type ServerTransactionFailure = ReplicaError.ReplicaError | SqlError.SqlError | Schema.SchemaError
 
 const isTransientConflict = (error: SqlError.SqlError) =>
   error.reason._tag === "DeadlockError" || error.reason._tag === "SerializationError"
@@ -241,7 +241,7 @@ export function withServerTransaction<R,>(
         committing = true
       })
       return sql.withTransaction(Effect.tap(effect, markCommitting)).pipe(
-        Effect.catchCause((cause): Effect.Effect<never, ServerTransactionFailure> => {
+        Effect.catchCause((cause) => {
           const commitErrors = cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect).filter(
             SqlError.isSqlError
           )
