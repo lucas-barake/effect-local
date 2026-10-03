@@ -348,6 +348,22 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       BEGIN SELECT RAISE(ABORT, 'pruning refused'); END`)
     return sql.unsafe(`DROP TRIGGER refuse_pruning`).pipe(Effect.asVoid)
   })
+  const failCommitAfterReceipt = Effect.fnUntraced(function*(sql: SqlClient.SqlClient) {
+    yield* sql.unsafe("CREATE TABLE commit_probe_parent (id BIGINT PRIMARY KEY)")
+    yield* sql.unsafe(`CREATE TABLE commit_probe_child (parent_id BIGINT
+      REFERENCES commit_probe_parent (id) DEFERRABLE INITIALLY DEFERRED)`)
+    if (database.dialect === "pg") {
+      yield* sql.unsafe(`CREATE FUNCTION orphan_commit_probe() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN INSERT INTO commit_probe_child VALUES (1); RETURN NEW; END $$`)
+      yield* sql.unsafe(`CREATE TRIGGER orphan_commit_probe AFTER INSERT ON effect_local_server_receipts
+        FOR EACH ROW EXECUTE FUNCTION orphan_commit_probe()`)
+      return sql.unsafe("DROP TRIGGER orphan_commit_probe ON effect_local_server_receipts").pipe(Effect.asVoid)
+    }
+    yield* sql.unsafe("PRAGMA foreign_keys = ON")
+    yield* sql.unsafe(`CREATE TRIGGER orphan_commit_probe AFTER INSERT ON effect_local_server_receipts
+      BEGIN INSERT INTO commit_probe_child VALUES (1); END`)
+    return sql.unsafe("DROP TRIGGER orphan_commit_probe").pipe(Effect.asVoid)
+  })
 
   it.effect(
     "does not scale SQL writes or transactions with watcher fanout",
@@ -3061,6 +3077,93 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
   )
 
   it.effect(
+    "counts the terminal sequence when bounding a rejection that fills the receipt limit",
+    pipe(Effect.fnUntraced(
+      function*() {
+        const submitted = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("limit-sized-authorization"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000031")
+        )
+        const unpadded = Protocol.RejectedReceipt.make({
+          spaceId,
+          clientId,
+          membershipIncarnation: submitted.membershipIncarnation,
+          mutationId: submitted.mutationId,
+          localSequence: submitted.localSequence,
+          name: submitted.name,
+          sourceSchema: submitted.sourceSchema,
+          mutationVersion: submitted.mutationVersion,
+          origin: "Authorization",
+          rejection: { _tag: "TestAuthorizationError", reason: "" }
+        })
+        const reason = "x".repeat(Protocol.maximumReceiptBytes - (yield* Protocol.encodedBytesEffect(unpadded)))
+        const server = yield* service(
+          ServerStore.ServerStore,
+          serverLayer(() => Effect.fail(new TestAuthorizationError({ reason })))
+        )
+        const receipt = yield* server.submit(submitted)
+
+        assert.isAtMost(yield* Protocol.encodedBytesEffect(receipt), Protocol.maximumReceiptBytes)
+        assert.deepStrictEqual(receipt, {
+          ...unpadded,
+          origin: "Capacity",
+          rejection: { _tag: "CapacityExceeded", resource: "receipt bytes", limit: Protocol.maximumReceiptBytes },
+          terminalSequence: Identity.TerminalSequence.make(1)
+        })
+        assert.deepStrictEqual(yield* server.submit(submitted), receipt)
+      },
+      Effect.provide(NodeCrypto.layer),
+      Effect.scoped
+    ))
+  )
+
+  it.effect(
+    "reports an unknown commit outcome when COMMIT fails after the receipt is written",
+    pipe(Effect.fnUntraced(
+      function*() {
+        const sql = yield* database.client
+        const layerSql = Layer.succeed(SqlClient.SqlClient, sql)
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+            Layer.provide(layerRuntime),
+            Layer.provide(withServices(layerSql))
+          )
+        )
+        const removeProbe = yield* failCommitAfterReceipt(sql)
+        const submitted = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("deferred-violation"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000032")
+        )
+        const discarded = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("deferred-discard"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000033")
+        )
+
+        const submitFailure = yield* expectedFailure(server.submit(submitted))
+        const discardFailure = yield* expectedFailure(
+          server.discard({ envelope: discarded, schema: Domain.definition.schemaIdentity }, null)
+        )
+        assert.strictEqual(submitFailure._tag, "UnknownCommitOutcome")
+        assert.strictEqual(discardFailure._tag, "UnknownCommitOutcome")
+
+        yield* removeProbe
+        const retried = yield* server.submit(submitted)
+        assert.strictEqual(retried._tag, "Accepted")
+        if (retried._tag === "Accepted") assert.strictEqual(retried.serverSequence, 1)
+      },
+      Effect.provide(NodeCrypto.layer),
+      Effect.scoped
+    ))
+  )
+
+  it.effect(
     "assigns dense authoritative log sequences",
     pipe(Effect.fnUntraced(
       function*() {
@@ -3168,6 +3271,57 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
 
         const error = yield* server.submit(submitted).pipe(Effect.flip)
         assert.strictEqual(error._tag, "StorageCorrupt")
+      },
+      Effect.provide(NodeCrypto.layer),
+      Effect.scoped
+    ))
+  )
+
+  it.effect(
+    "rejects a retry whose SQL rejection origin conflicts with its durable receipt",
+    pipe(Effect.fnUntraced(
+      function*() {
+        const layerServerDatabase = serverDatabase()
+        const layerLive = ServerStore.layer({
+          definition: Domain.definition,
+          ...serverHistory,
+          authorizeAccess: () => Effect.void,
+          authorizeMutation: ({ mutation }) => {
+            if (mutation.localSequence === 1) return Effect.void
+            return Effect.fail(new TestAuthorizationError({ reason: "denied" }))
+          },
+          authorizeRead: () => Effect.void
+        }).pipe(
+          Layer.provide(layerRuntime),
+          Layer.provide(layerServerDatabase)
+        )
+        const context = yield* Layer.build(Layer.merge(layerLive, layerServerDatabase))
+        const server = Context.get(context, ServerStore.ServerStore)
+        const sql = Context.get(context, SqlClient.SqlClient)
+        const accepted = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("origin-accepted"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000034")
+        )
+        const rejected = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("origin-rejected"),
+          2,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000035")
+        )
+        assert.strictEqual((yield* server.submit(accepted))._tag, "Accepted")
+        assert.strictEqual((yield* server.submit(rejected))._tag, "Rejected")
+        yield* sql`UPDATE effect_local_server_receipts SET rejection_origin = ${"Mutation"}
+          WHERE space_id = ${spaceId} AND mutation_id = ${accepted.mutationId}`
+        yield* sql`UPDATE effect_local_server_receipts SET rejection_origin = ${"Capacity"}
+          WHERE space_id = ${spaceId} AND mutation_id = ${rejected.mutationId}`
+
+        for (const submitted of [accepted, rejected]) {
+          const error = yield* expectedFailure(server.submit(submitted))
+          if (error._tag !== "StorageCorrupt") assert.fail(`expected StorageCorrupt, got ${error._tag}`)
+          assert.strictEqual(error.message, `Durable receipt ${submitted.mutationId} conflicts with its SQL identity`)
+        }
       },
       Effect.provide(NodeCrypto.layer),
       Effect.scoped

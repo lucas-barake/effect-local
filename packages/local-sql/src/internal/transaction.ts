@@ -5,6 +5,7 @@ import type * as Model from "@lucas-barake/effect-local/Model"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
+import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as Predicate from "effect/Predicate"
@@ -241,11 +242,35 @@ export const withServerTransaction = <A, E extends { readonly _tag: string }, R,
   effect: Effect.Effect<A, E, R>
 ): Effect.Effect<A, E | SqlError.SqlError, R> => {
   const attempt = (remaining: number): Effect.Effect<A, E | SqlError.SqlError, R> =>
-    sql.withTransaction(effect).pipe(
-      Effect.catch((error) => {
-        if (remaining > 1 && transientConflict(error)) return attempt(remaining - 1)
-        return Effect.fail(error)
+    Effect.suspend(() => {
+      let committing = false
+      const markCommitting = Effect.sync(() => {
+        committing = true
       })
-    )
+      return sql.withTransaction(Effect.tap(effect, markCommitting)).pipe(
+        Effect.catchCause((cause) => {
+          const commitErrors = cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect).filter(
+            SqlError.isSqlError
+          )
+          if (!committing || commitErrors.length === 0 || commitErrors.length !== cause.reasons.length) {
+            return Effect.failCause(cause)
+          }
+          if (commitErrors.length === 1) return Effect.fail(commitErrors[0])
+          return Effect.fail(
+            new SqlError.SqlError({
+              reason: new SqlError.UnknownError({
+                message: "COMMIT failed and its cleanup ROLLBACK failed",
+                operation: "commit",
+                cause
+              })
+            })
+          )
+        }),
+        Effect.catch((error) => {
+          if (remaining > 1 && transientConflict(error)) return attempt(remaining - 1)
+          return Effect.fail(error)
+        })
+      )
+    })
   return attempt(maximumTransactionAttempts)
 }

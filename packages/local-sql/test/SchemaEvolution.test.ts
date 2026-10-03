@@ -2154,6 +2154,42 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
   )
 
   it.effect(
+    "returns an expired receipt for a pruned mutation retried before maintenance republishes the snapshot",
+    Effect.fnUntraced(
+      function*() {
+        const retention = { retainedReceipts: 0, retainedHistoryEntries: 0 }
+        const serverV1 = yield* buildServer(definitionV1, layerHandlersV1, undefined, retention)
+        const first = yield* v1Envelope(
+          clientId,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000172"),
+          1,
+          { id: "72", title: "first" }
+        )
+        const second = yield* v1Envelope(
+          clientId,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000173"),
+          2,
+          { id: "73", title: "second" }
+        )
+        assert.strictEqual((yield* serverV1.submit(first))._tag, "Accepted")
+        assert.strictEqual((yield* serverV1.submit(second))._tag, "Accepted")
+        yield* serverV1.maintain(spaceId)
+
+        const serverV2 = yield* buildServer(definitionV2, layerHandlersV2, evolution, {
+          ...retention,
+          acceptedSchemaVersions: 1
+        })
+        yield* serverV2.pull(pullRequest(definitionV2))
+        const retried = yield* serverV2.submit(first).pipe(Effect.result)
+        if (Result.isFailure(retried)) assert.fail(retried.failure._tag)
+        assert.strictEqual(retried.success._tag, "Expired")
+      },
+      Effect.scoped,
+      provideServerDatabase
+    )
+  )
+
+  it.effect(
     "serves schemas inside the configured window across source schema evolution",
     Effect.fnUntraced(
       function*() {
