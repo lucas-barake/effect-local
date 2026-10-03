@@ -515,17 +515,15 @@ export const layerFromSession = (
           const ready = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           const failure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
           let view: EphemeralView.View | undefined
-          let viewSequence = 0
           let unknownPresented = false
           let memberValue = identity.request.value
           const memberUpdates = yield* Semaphore.make(1)
           const consume = (message: Protocol.EphemeralMessage) => {
             if (message._tag === "Event") return SequencedPubSub.publish(events, message.entry)
             if (message._tag === "EventCleared") return Effect.void
-            const next = EphemeralView.reduce(view, viewSequence + 1, message)
+            const next = EphemeralView.reduce(view, message)
             if (next === undefined) return Effect.void
             view = next
-            viewSequence = next.sequence
             unknownPresented = false
             return PubSub.publish(views, next).pipe(
               Effect.andThen(Deferred.succeed(ready, undefined)),
@@ -535,9 +533,8 @@ export const layerFromSession = (
           const presentUnknown = Effect.suspend(() => {
             if (unknownPresented) return Effect.void
             view = undefined
-            viewSequence = viewSequence + 1
             unknownPresented = true
-            return PubSub.publish(views, EphemeralView.empty(viewSequence)).pipe(
+            return PubSub.publish(views, EphemeralView.empty()).pipe(
               Effect.andThen(Deferred.succeed(ready, undefined)),
               Effect.asVoid
             )
@@ -629,8 +626,8 @@ export const layerFromSession = (
               EphemeralView.noProjection,
               EphemeralView.projectSlice(
                 (view) =>
-                  EphemeralView.channelChangedAt(view, definition.name),
-                (view) => EphemeralView.sortedValues(EphemeralView.channelEntries(view, definition.name))
+                  EphemeralView.channelStates(view, definition.name),
+                (view) => EphemeralView.channelSlice(view, definition.name)
               )
             ),
             Stream.mapEffect(Effect.forEach((entry) =>
@@ -655,7 +652,7 @@ export const layerFromSession = (
             EphemeralView.noProjection,
             EphemeralView.projectSlice(
               (view) =>
-                view.membersChangedAt,
+                view.members,
               (view) =>
                 EphemeralView.sortedValues(view.members)
             )

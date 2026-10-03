@@ -41,17 +41,17 @@ const stateRemoved = (revision: number, channel: string, key: string) =>
 
 const apply = (
   view: EphemeralView.View | undefined,
-  message: Parameters<typeof EphemeralView.reduce>[2]
+  message: Parameters<typeof EphemeralView.reduce>[1]
 ): EphemeralView.View => {
-  const next = EphemeralView.reduce(view, (view?.sequence ?? 0) + 1, message)
+  const next = EphemeralView.reduce(view, message)
   assert.isDefined(next)
   return next
 }
 
 const projectChannel = (channel: string) =>
   EphemeralView.projectSlice(
-    (view) => EphemeralView.channelChangedAt(view, channel),
-    (view) => EphemeralView.sortedValues(EphemeralView.channelEntries(view, channel))
+    (view) => EphemeralView.channelStates(view, channel),
+    (view) => EphemeralView.channelSlice(view, channel)
   )
 
 describe("EphemeralView", () => {
