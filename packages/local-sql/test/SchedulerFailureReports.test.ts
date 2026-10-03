@@ -58,8 +58,9 @@ const layerClientDatabase = Layer.mergeAll(
 const completeStatement = "SET completed_generation"
 const countStatement = "SELECT COUNT(*) AS count FROM effect_local_client_pending_data"
 const claimStatement = "AND attempt_count >= "
+const admissionStatement = "SET requested_generation = ?"
 
-type PullMode = "Pass" | "Hold" | "Interrupt"
+type PullMode = "Pass" | "Hold" | "Interrupt" | "Reject"
 
 const harness = Effect.fnUntraced(function*() {
   const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
@@ -86,12 +87,16 @@ const harness = Effect.fnUntraced(function*() {
     return []
   })
   const watchFailure = yield* Deferred.make<ReplicaError.ReplicaError>()
+  const watchEnd = yield* Deferred.make<void>()
+  const credentialChange = yield* Deferred.make<void>()
   let pullMode: PullMode = "Pass"
   const heldPulls = yield* Queue.unbounded<void>()
   const transportWaits = yield* Queue.unbounded<void>()
   const watchStarts = yield* Queue.unbounded<void>()
+  const watchFailed = Effect.flip(Deferred.await(watchFailure))
+  const watchOutcome = Effect.raceFirst(watchFailed, Deferred.await(watchEnd))
   const remote = SyncEngine.SyncEngine.of({
-    waitForCredentialChange: () => Effect.never,
+    waitForCredentialChange: () => Deferred.await(credentialChange),
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Queue.offer(transportWaits, undefined).pipe(Effect.andThen(Effect.never)),
     submitBatch: (request) => server.admitBatch(request, null),
@@ -102,6 +107,10 @@ const harness = Effect.fnUntraced(function*() {
           pullMode = "Pass"
           return Effect.interrupt
         }
+        if (pullMode === "Reject") {
+          pullMode = "Pass"
+          return Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 1 }))
+        }
         if (pullMode === "Hold") return Queue.offer(heldPulls, undefined).pipe(Effect.andThen(Effect.never))
         return server.pull(request)
       }),
@@ -109,10 +118,9 @@ const harness = Effect.fnUntraced(function*() {
     watch: () =>
       Stream.fromEffect(
         Queue.offer(watchStarts, undefined).pipe(
-          Effect.andThen(Deferred.await(watchFailure)),
-          Effect.flatMap(Effect.fail)
+          Effect.andThen(watchOutcome)
         )
-      )
+      ).pipe(Stream.drain)
   })
   return {
     database: Context.add(database, SqlClient.SqlClient, gate.sql),
@@ -123,6 +131,8 @@ const harness = Effect.fnUntraced(function*() {
     injected,
     paused: gate.pauses,
     failWatch: (error: ReplicaError.ReplicaError) => Deferred.succeed(watchFailure, error),
+    endWatch: Deferred.succeed(watchEnd, undefined),
+    changeCredential: Deferred.succeed(credentialChange, undefined),
     setPullMode: (mode: PullMode) =>
       Effect.sync(() => {
         pullMode = mode
@@ -155,6 +165,16 @@ const failAfter = (trigger: string, target: (statement: string) => boolean) => {
   })
 }
 
+const failEach = (statements: ReadonlyArray<string>) => {
+  let next = 0
+  return (statement: string) => {
+    const expected = statements[next]
+    if (expected === undefined || !statement.includes(expected)) return false
+    next += 1
+    return true
+  }
+}
+
 const awaitStatus = (
   reactivity: Reactivity.Reactivity,
   space: Replica.Space,
@@ -177,6 +197,14 @@ const replicaOptions = {
   retryDelay: "1 minute",
   maximumRetryDelay: "1 minute"
 } as const
+
+const schedulerLayer = (constructor: "layer" | "layerWorkflow") => {
+  if (constructor === "layer") return SqlReplica.layer(replicaOptions).pipe(Layer.provide(Domain.layerHandlers))
+  return SqlReplica.layerWorkflow({ ...replicaOptions, maximumAttempts: 1 }).pipe(
+    Layer.provide(Domain.layerHandlers),
+    Layer.provide(WorkflowEngine.layerMemory)
+  )
+}
 
 const activeSpace = Effect.fnUntraced(function*(
   controls: Effect.Success<ReturnType<typeof harness>>,
@@ -392,6 +420,82 @@ describe("scheduler failure reports", () => {
       )
       yield* Queue.take(controls.watchStarts)
       yield* controls.failWatch(new ReplicaError.StorageUnavailable({ cause: "injected" }))
+
+      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts), "10 seconds").pipe(
+        Effect.timeoutOption("10 minutes")
+      )
+
+      assert.isTrue(Option.isSome(watchedAgain))
+    })
+  )
+
+  it.effect.each(
+    [
+      ["layer", "on its own"],
+      ["layer", "after another mutation"],
+      ["layerWorkflow", "on its own"],
+      ["layerWorkflow", "after another mutation"]
+    ] as const
+  )(
+    "drains pending mutations after storage was still unavailable when the retry was admitted with %s %s",
+    Effect.fnUntraced(function*([constructor, trigger]) {
+      const controls = yield* harness()
+      const space = yield* activeSpace(controls, schedulerLayer(constructor))
+      yield* controls.failWhen(failEach([claimStatement, admissionStatement]))
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* Queue.take(controls.injected)
+      yield* VirtualTime.advanceUntil(Queue.take(controls.injected), "10 seconds")
+      if (trigger === "after another mutation") yield* space.mutate(Domain.PutTodo, Domain.todo("second"))
+      const onlineWithoutPending = awaitStatus(
+        Context.get(controls.database, Reactivity.Reactivity),
+        space,
+        (status) => status._tag === "Online" && status.pending === 0
+      )
+
+      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending, "10 seconds").pipe(
+        Effect.timeoutOption("10 minutes")
+      )
+
+      assert.isTrue(Option.isSome(drained))
+    })
+  )
+
+  it.effect.each(["layer", "layerWorkflow"] as const)(
+    "drains pending mutations after storage was unavailable when a new credential was admitted with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const controls = yield* harness()
+      const space = yield* activeSpace(controls, schedulerLayer(constructor))
+      const reactivity = Context.get(controls.database, Reactivity.Reactivity)
+      yield* controls.setPullMode("Reject")
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* awaitStatus(reactivity, space, (status) => status._tag === "NeedsAuthentication")
+      yield* controls.failWhen(failEach([admissionStatement]))
+      yield* controls.changeCredential
+      yield* Queue.take(controls.injected)
+      const onlineWithoutPending = awaitStatus(
+        reactivity,
+        space,
+        (status) => status._tag === "Online" && status.pending === 0
+      )
+
+      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending, "10 seconds").pipe(
+        Effect.timeoutOption("10 minutes")
+      )
+
+      assert.isTrue(Option.isSome(drained))
+    })
+  )
+
+  it.effect(
+    "watches again after storage was unavailable when an ended watch was admitted (workflow)",
+    Effect.fnUntraced(function*() {
+      const controls = yield* harness()
+      yield* activeSpace(controls, schedulerLayer("layerWorkflow"))
+      yield* Queue.take(controls.watchStarts)
+      yield* controls.failWhen(failEach([admissionStatement]))
+      yield* controls.endWatch
+      yield* Queue.take(controls.injected)
+      yield* Queue.clear(controls.watchStarts)
 
       const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts), "10 seconds").pipe(
         Effect.timeoutOption("10 minutes")

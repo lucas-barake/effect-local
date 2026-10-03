@@ -569,11 +569,15 @@ const layerSchedulerWithConfiguration = (
 
       const supervise = Effect.gen(function*() {
         let retryAttempt = 0
+        let readmit = false
         while (true) {
-          yield* LosslessQueue.take(wake)
+          if (!readmit) yield* LosslessQueue.take(wake)
           yield* awaitAuthenticationChange
           let observedGeneration = yield* reconciliation.generation
+          const requestFirst = readmit
+          readmit = false
           const result = yield* Effect.gen(function*() {
+            if (requestFirst) yield* local.requestReconciliation
             while (true) {
               yield* awaitAuthenticationChange
               observedGeneration = yield* reconciliation.generation
@@ -610,13 +614,13 @@ const layerSchedulerWithConfiguration = (
             yield* startCredentialWait(error.credentialGeneration, admission)
             yield* Deferred.await(admission.gate)
             retryAttempt = 0
-            yield* requestAndNotify
+            readmit = true
             continue
           }
           const pause = yield* Ref.get(authenticationPause)
           if (Option.isSome(pause)) {
             yield* Deferred.await(pause.value)
-            yield* requestAndNotify
+            readmit = true
             continue
           }
           yield* reconciliation.failed(error, observedGeneration)
@@ -624,7 +628,7 @@ const layerSchedulerWithConfiguration = (
             retryAttempt += 1
             yield* Effect.logWarning("Reconciliation supervisor will retry", error)
             yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
-            yield* requestAndNotify
+            readmit = true
             continue
           }
           yield* Effect.logWarning("Reconciliation supervisor stopped", error)
@@ -653,11 +657,11 @@ const layerSchedulerWithConfiguration = (
                 retryAttempt = 0
                 return requestAndNotify
               }),
+              Effect.andThen(requestAndNotify),
               Effect.result
             )
           if (Result.isSuccess(result)) {
             retryAttempt += 1
-            yield* requestAndNotify
             yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
             continue
           }

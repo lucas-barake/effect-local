@@ -236,51 +236,13 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       current.authenticationGate = undefined
       current.retryAttempt = 0
       yield* Deferred.succeed(gate, undefined)
-      yield* enqueue(current)
+      yield* readmit(current)
     }).pipe(Effect.uninterruptible)
     yield* FiberMap.run(
       authenticationWaiters,
       key,
       remote.waitForCredentialChange(admission.generation).pipe(
         Effect.andThen(finishWait),
-        Effect.catchTags({
-          StorageUnavailable: (error) => Effect.die(error),
-          StorageCorrupt: (error) => Effect.die(error),
-          CanonicalEncodeError: (error) => Effect.die(error),
-          SpaceNotJoined: (error) => Effect.die(error),
-          DefinitionMismatch: (error) => Effect.die(error),
-          StaleSchema: (error) => Effect.die(error),
-          SchemaGenerationConflict: (error) => Effect.die(error),
-          SchemaEvolutionUnsupported: (error) => Effect.die(error),
-          SchemaEvolutionFailed: (error) => Effect.die(error),
-          StorageMigrationMismatch: (error) => Effect.die(error),
-          StorageMigrationPending: (error) => Effect.die(error),
-          SchemaKeyCollision: (error) => Effect.die(error),
-          PendingMutationEvolutionRejected: (error) => Effect.die(error),
-          ReplicaIdentityMismatch: (error) => Effect.die(error),
-          SpaceUnavailable: (error) => Effect.die(error),
-          EphemeralSessionUnavailable: (error) => Effect.die(error),
-          MutationIdentityConflict: (error) => Effect.die(error),
-          QuarantineResubmissionConflict: (error) => Effect.die(error),
-          OutOfOrderMutation: (error) => Effect.die(error),
-          CursorGap: (error) => Effect.die(error),
-          SettlementReplayTruncated: (error) => Effect.die(error),
-          StaleReplicationScope: (error) => Effect.die(error),
-          SnapshotUnavailable: (error) => Effect.die(error),
-          CapacityExceeded: (error) => Effect.die(error),
-          InvalidConfiguration: (error) => Effect.die(error),
-          UnknownCommitOutcome: (error) => Effect.die(error),
-          ProtocolInvalid: (error) => Effect.die(error),
-          UpgradeRequired: (error) => Effect.die(error),
-          ProtocolVersionRejected: (error) => Effect.die(error),
-          ServerUnavailable: (error) => Effect.die(error),
-          CredentialRejected: (error) => Effect.die(error),
-          AuthenticatorUnavailable: (error) => Effect.die(error),
-          OperationTimeout: (error) => Effect.die(error),
-          AuthorizationDenied: (error) => Effect.die(error),
-          OwnerUnavailable: (error) => Effect.die(error),
-          BuildSuperseded: (error) => Effect.die(error)
-        }),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
           return Effect.failCause(cause)
@@ -302,51 +264,13 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       const current = spaces.get(space.spaceId)
       if (current !== space) return
       current.retrying = false
-      yield* enqueue(current)
+      yield* readmit(current)
     }).pipe(Effect.uninterruptible)
     yield* FiberMap.run(
       retries,
       key,
       backoff(remote, delay, failure, transportGeneration).pipe(
         Effect.andThen(finishRetry),
-        Effect.catchTags({
-          StorageUnavailable: (error) => Effect.die(error),
-          StorageCorrupt: (error) => Effect.die(error),
-          CanonicalEncodeError: (error) => Effect.die(error),
-          SpaceNotJoined: (error) => Effect.die(error),
-          DefinitionMismatch: (error) => Effect.die(error),
-          StaleSchema: (error) => Effect.die(error),
-          SchemaGenerationConflict: (error) => Effect.die(error),
-          SchemaEvolutionUnsupported: (error) => Effect.die(error),
-          SchemaEvolutionFailed: (error) => Effect.die(error),
-          StorageMigrationMismatch: (error) => Effect.die(error),
-          StorageMigrationPending: (error) => Effect.die(error),
-          SchemaKeyCollision: (error) => Effect.die(error),
-          PendingMutationEvolutionRejected: (error) => Effect.die(error),
-          ReplicaIdentityMismatch: (error) => Effect.die(error),
-          SpaceUnavailable: (error) => Effect.die(error),
-          EphemeralSessionUnavailable: (error) => Effect.die(error),
-          MutationIdentityConflict: (error) => Effect.die(error),
-          QuarantineResubmissionConflict: (error) => Effect.die(error),
-          OutOfOrderMutation: (error) => Effect.die(error),
-          CursorGap: (error) => Effect.die(error),
-          SettlementReplayTruncated: (error) => Effect.die(error),
-          StaleReplicationScope: (error) => Effect.die(error),
-          SnapshotUnavailable: (error) => Effect.die(error),
-          CapacityExceeded: (error) => Effect.die(error),
-          InvalidConfiguration: (error) => Effect.die(error),
-          UnknownCommitOutcome: (error) => Effect.die(error),
-          ProtocolInvalid: (error) => Effect.die(error),
-          UpgradeRequired: (error) => Effect.die(error),
-          ProtocolVersionRejected: (error) => Effect.die(error),
-          ServerUnavailable: (error) => Effect.die(error),
-          CredentialRejected: (error) => Effect.die(error),
-          AuthenticatorUnavailable: (error) => Effect.die(error),
-          OperationTimeout: (error) => Effect.die(error),
-          AuthorizationDenied: (error) => Effect.die(error),
-          OwnerUnavailable: (error) => Effect.die(error),
-          BuildSuperseded: (error) => Effect.die(error)
-        }),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
           return Effect.failCause(cause)
@@ -377,6 +301,17 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     }
     yield* space.reconciliation.failed(error, observedGeneration).pipe(Effect.andThen(policy))
   })
+
+  const readmit = (space: ManagedState): Effect.Effect<void> =>
+    enqueue(space).pipe(
+      Effect.catch(Effect.fnUntraced(function*(error) {
+        const transportGeneration = yield* remote.transportGeneration
+        const observedGeneration = yield* space.reconciliation.generation
+        yield* handleFailure(space, error, transportGeneration, observedGeneration).pipe(
+          Effect.catch(() => Effect.void)
+        )
+      }))
+    )
 
   const runTurn = Effect.fnUntraced(function*(space: ManagedState, epoch: number) {
     const transportGeneration = yield* remote.transportGeneration
