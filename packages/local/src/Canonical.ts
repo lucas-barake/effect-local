@@ -1,6 +1,9 @@
+import * as Chunk from "effect/Chunk"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
 import * as Hex from "effect/encoding/Hex"
+import * as HashMap from "effect/HashMap"
+import * as HashSet from "effect/HashSet"
 import * as Schema from "effect/Schema"
 import * as ReplicaError from "./ReplicaError.js"
 
@@ -16,6 +19,8 @@ const isMap = (value: object): value is Map<unknown, unknown> =>
   Object.prototype.toString.call(value) === "[object Map]"
 
 const isSet = (value: object): value is Set<unknown> => Object.prototype.toString.call(value) === "[object Set]"
+
+const isIterable = (value: object): boolean => Symbol.iterator in value
 
 const isUint8Array = (value: object): value is Uint8Array =>
   ArrayBuffer.isView(value) && Object.prototype.toString.call(value) === "[object Uint8Array]"
@@ -70,6 +75,15 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   } else if (isSet(value)) {
     const items = Set.prototype.values.call(value)
     result = sortedMembers(`${sentinel}set`, Array.from(items, (item) => normalize(item, ancestors)))
+  } else if (HashSet.isHashSet(value) && isIterable(value)) {
+    result = sortedMembers(`${sentinel}hashset`, Array.from(value, (item) => normalize(item, ancestors)))
+  } else if (HashMap.isHashMap(value) && isIterable(value)) {
+    const entries = HashMap.entries(value)
+    const members = Array.from(entries, ([key, item]) => [normalize(key, ancestors), normalize(item, ancestors)])
+    result = sortedMembers(`${sentinel}hashmap`, members)
+  } else if (Chunk.isChunk(value) && isIterable(value)) {
+    const items = Chunk.toReadonlyArray(value).map((item) => normalize(item, ancestors))
+    result = [`${sentinel}chunk`, ...items]
   } else {
     const entries = Object.keys(value).sort().map((key) => {
       return [key, normalize(Reflect.get(value, key), ancestors)] as const
