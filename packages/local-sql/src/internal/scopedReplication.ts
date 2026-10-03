@@ -1554,11 +1554,22 @@ export const make = (options: Options) => {
     request: Protocol.BootstrapRequest,
     principal: typeof Schema.Json.Type,
     expectedGeneration: number
-  ) =>
-    options.authorization.scope(request, principal).pipe(
+  ) => {
+    if (
+      !Number.isSafeInteger(request.afterOrdinal) || request.afterOrdinal < -1 ||
+      !Number.isSafeInteger(request.limit) || request.limit <= 0
+    ) {
+      return Effect.fail(
+        new ReplicaError.ProtocolInvalid({
+          message: "Bootstrap page position must be an integer of at least -1 and its limit a positive integer"
+        })
+      )
+    }
+    return options.authorization.scope(request, principal).pipe(
       Effect.andThen(bootstrapLocked(request, principal, expectedGeneration)),
       Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
     )
+  }
 
   return { pull, bootstrap } as const
 }

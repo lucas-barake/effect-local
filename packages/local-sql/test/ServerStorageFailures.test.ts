@@ -33,6 +33,8 @@ const envelope = Effect.fnUntraced(function*(localSequence: number) {
   return Protocol.MutationEnvelope.make({ ...identity, digest: yield* Protocol.mutationDigest(identity) })
 }, Effect.provide(NodeCrypto.layer))
 
+const unexpectedSuccess = { _tag: "UnexpectedSuccess" } as const
+
 const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
 
 const buildStore = Effect.fnUntraced(function*(database: ServerDatabase) {
@@ -70,6 +72,41 @@ describe.each(serverDatabases)("server storage failures ($dialect)", (database) 
       const { store } = yield* buildStore(database)
 
       yield* store.maintain(unknownSpaceId)
+    })
+  )
+
+  it.effect(
+    "rejects a fractional bootstrap page limit as an invalid request",
+    Effect.fnUntraced(function*() {
+      const { store } = yield* buildStore(database)
+      assert.strictEqual((yield* store.submit(yield* envelope(1)))._tag, "Accepted")
+      const scope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
+      const required = yield* store.pull(Protocol.PullRequest.make({
+        spaceId,
+        clientId,
+        schema: Domain.definition.schemaIdentity,
+        scope,
+        membershipIncarnation,
+        scopeGeneration: Identity.ReplicationScopeGeneration.make(1),
+        cursor: null,
+        limit: 10
+      }))
+      if (!("_tag" in required)) assert.fail("expected a required bootstrap")
+
+      const error = yield* store.bootstrap({
+        spaceId,
+        clientId,
+        schema: Domain.definition.schemaIdentity,
+        scope,
+        membershipIncarnation,
+        scopeGeneration: required.manifest.scopeGeneration,
+        cursor: required.manifest.cursor,
+        snapshotId: required.manifest.snapshotId,
+        afterOrdinal: -1,
+        limit: 1.5
+      }).pipe(Effect.as(unexpectedSuccess), Effect.flip)
+
+      assert.strictEqual(error._tag, "ProtocolInvalid")
     })
   )
 })
