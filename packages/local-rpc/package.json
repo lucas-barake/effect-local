@@ -1,6 +1,6 @@
 {
   "name": "@lucas-barake/effect-local-rpc",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Effect RPC WebSocket synchronization for Effect Local",
   "homepage": "https://github.com/lucas-barake/effect-local#readme",
   "bugs": "https://github.com/lucas-barake/effect-local/issues",
