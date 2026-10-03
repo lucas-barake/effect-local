@@ -17,6 +17,29 @@ const Todo = Model.make("Todo", {
 })
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
 const ListTodos = Query.make("ListTodos", { success: Schema.Array(Todo.schema) })
+const ChatMessage = Model.make("ChatMessage", {
+  version: 1,
+  key: Schema.String,
+  schema: Schema.Struct({ id: Schema.String, chat: Schema.String, sentAt: Schema.Number }),
+  indexes: {
+    byChat: {
+      version: 1,
+      partition: [{
+        name: "chat",
+        affinity: "text",
+        schema: Schema.String,
+        extract: (value: { readonly chat: string }) => value.chat
+      }],
+      sort: [{
+        name: "sentAt",
+        affinity: "real",
+        schema: Schema.Number,
+        extract: (value: { readonly sentAt: number }) => value.sentAt
+      }]
+    }
+  }
+})
+const chatDefinition = Definition.make({ version: 1, models: [ChatMessage], mutations: [] })
 
 describe("domain contracts", () => {
   it.effect(
@@ -206,6 +229,41 @@ describe("domain contracts", () => {
         assert.strictEqual(result.failure._tag, "ProtocolInvalid")
         assert.match(result.failure.message, /Unknown replication model: Missing/)
       }
+    })
+  )
+
+  it.effect(
+    "normalizes empty partition overrides and empty bounds to the absent spelling",
+    Effect.fnUntraced(function*() {
+      const plain = yield* Protocol.validateReplicationScope(chatDefinition, {
+        models: [],
+        windows: [{ model: ChatMessage.name, index: "byChat", count: 1 }]
+      })
+      const emptyPartitions = yield* Protocol.validateReplicationScope(chatDefinition, {
+        models: [],
+        windows: [{ model: ChatMessage.name, index: "byChat", count: 1, partitions: [] }]
+      })
+      assert.deepStrictEqual(emptyPartitions, plain)
+      assert.strictEqual(Canonical.stringify(emptyPartitions), Canonical.stringify(plain))
+
+      const override = yield* Protocol.validateReplicationScope(chatDefinition, {
+        models: [],
+        windows: [{ model: ChatMessage.name, index: "byChat", count: 1, partitions: [{ key: ["a"], count: 2 }] }]
+      })
+      const emptyBounds = yield* Protocol.validateReplicationScope(chatDefinition, {
+        models: [],
+        windows: [{
+          model: ChatMessage.name,
+          index: "byChat",
+          count: 1,
+          partitions: [{ key: ["a"], count: 2, bounds: {} }]
+        }]
+      })
+      assert.deepStrictEqual(emptyBounds, override)
+      assert.strictEqual(Canonical.stringify(emptyBounds), Canonical.stringify(override))
+
+      assert.deepStrictEqual(yield* Protocol.validateReplicationScope(chatDefinition, emptyBounds), emptyBounds)
+      assert.deepStrictEqual(yield* Protocol.validateReplicationScope(chatDefinition, emptyPartitions), emptyPartitions)
     })
   )
 

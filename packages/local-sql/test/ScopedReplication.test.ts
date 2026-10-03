@@ -1387,6 +1387,119 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
   )
 
   it.effect(
+    "reuses a snapshot when a retried pull spells empty window overrides explicitly",
+    Effect.fnUntraced(function*() {
+      const server = yield* service(ServerStore.ServerStore, makeServer())
+      const plain = Protocol.ReplicationScope.make({
+        models: [],
+        windows: [Protocol.ReplicationWindow.make({
+          model: Domain.Message.name,
+          index: "byChat",
+          count: 1,
+          partitions: [Protocol.ReplicationWindowPartition.make({ key: ["chat-a"], count: 2 })]
+        })]
+      })
+      const explicit = Protocol.ReplicationScope.make({
+        models: [],
+        windows: [Protocol.ReplicationWindow.make({
+          model: Domain.Message.name,
+          index: "byChat",
+          count: 1,
+          partitions: [Protocol.ReplicationWindowPartition.make({
+            key: ["chat-a"],
+            count: 2,
+            bounds: Protocol.ReplicationWindowBounds.make({})
+          })]
+        })]
+      })
+      const first = yield* server.pullAuthorized(pullRequest(null, plain), "reader")
+      if (!("_tag" in first)) assert.fail("expected scoped bootstrap")
+      const retry = yield* server.pullAuthorized(pullRequest(null, explicit), "reader")
+      if (!("_tag" in retry)) assert.fail("expected scoped bootstrap retry")
+      assert.strictEqual(retry.manifest.snapshotId, first.manifest.snapshotId)
+
+      const unpartitioned = Protocol.ReplicationScope.make({
+        models: [],
+        windows: [Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "byChat", count: 1 })]
+      })
+      const emptyPartitions = Protocol.ReplicationScope.make({
+        models: [],
+        windows: [Protocol.ReplicationWindow.make({
+          model: Domain.Message.name,
+          index: "byChat",
+          count: 1,
+          partitions: []
+        })]
+      })
+      const second = yield* server.pullAuthorized(pullRequest(null, unpartitioned, 2), "reader")
+      if (!("_tag" in second)) assert.fail("expected scoped bootstrap")
+      const secondRetry = yield* server.pullAuthorized(pullRequest(null, emptyPartitions, 2), "reader")
+      if (!("_tag" in secondRetry)) assert.fail("expected scoped bootstrap retry")
+      assert.strictEqual(secondRetry.manifest.snapshotId, second.manifest.snapshotId)
+    }, provideNodeCrypto)
+  )
+
+  it.effect(
+    "keeps the scope generation when an equivalent scope spells empty window overrides explicitly",
+    Effect.fnUntraced(function*() {
+      const windowed = Protocol.ReplicationScope.make({
+        models: [],
+        windows: [Protocol.ReplicationWindow.make({ model: Domain.Message.name, index: "byChat", count: 1 })]
+      })
+      const local = yield* LocalStore.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId: readerId,
+        scope: windowed
+      }).pipe(
+        Layer.provide(layerRuntime),
+        Layer.provide(layerClientDatabase),
+        Layer.build,
+        Effect.map(Context.get(LocalStore.Store))
+      )
+      const before = yield* local.replicationState
+      yield* local.setScope(Protocol.ReplicationScope.make({
+        models: [],
+        windows: [Protocol.ReplicationWindow.make({
+          model: Domain.Message.name,
+          index: "byChat",
+          count: 1,
+          partitions: []
+        })]
+      }))
+      assert.strictEqual((yield* local.replicationState).scopeGeneration, before.scopeGeneration)
+
+      const overridden = Protocol.ReplicationScope.make({
+        models: [],
+        windows: [Protocol.ReplicationWindow.make({
+          model: Domain.Message.name,
+          index: "byChat",
+          count: 1,
+          partitions: [Protocol.ReplicationWindowPartition.make({ key: ["chat-a"], count: 2 })]
+        })]
+      })
+      yield* local.setScope(overridden)
+      const changed = yield* local.replicationState
+      assert.strictEqual(changed.scopeGeneration, before.scopeGeneration + 1)
+      yield* local.setScope(Protocol.ReplicationScope.make({
+        models: [],
+        windows: [Protocol.ReplicationWindow.make({
+          model: Domain.Message.name,
+          index: "byChat",
+          count: 1,
+          partitions: [Protocol.ReplicationWindowPartition.make({
+            key: ["chat-a"],
+            count: 2,
+            bounds: Protocol.ReplicationWindowBounds.make({})
+          })]
+        })]
+      }))
+      assert.strictEqual((yield* local.replicationState).scopeGeneration, changed.scopeGeneration)
+    }, provideNodeCrypto)
+  )
+
+  it.effect(
     "denies the whole scope before disclosing a manifest",
     Effect.fnUntraced(function*() {
       const server = yield* makeServer((input) => {

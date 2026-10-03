@@ -1,5 +1,6 @@
 import * as Effect from "effect/Effect"
 import * as Schema from "effect/Schema"
+import * as Struct from "effect/Struct"
 import * as Canonical from "./Canonical.js"
 import type * as Definition from "./Definition.js"
 import * as Identity from "./Identity.js"
@@ -188,15 +189,23 @@ const comparePartitionKeys = (left: ReplicationWindowPartition, right: Replicati
   return 0
 }
 
+const normalizePartition = (partition: ReplicationWindowPartition): ReplicationWindowPartition => {
+  if (partition.bounds === undefined || Object.keys(partition.bounds).length > 0) return partition
+  return ReplicationWindowPartition.make(Struct.omit(partition, ["bounds"]))
+}
+
+const normalizeWindow = (window: ReplicationWindow): ReplicationWindow => {
+  if (window.partitions === undefined) return window
+  if (window.partitions.length === 0) return ReplicationWindow.make(Struct.omit(window, ["partitions"]))
+  const partitions = window.partitions.map(normalizePartition).sort(comparePartitionKeys)
+  return ReplicationWindow.make({ ...window, partitions })
+}
+
 export const normalizeReplicationScope = (scope: ReplicationScope): ReplicationScope => {
   if (scope.windows === undefined || scope.windows.length === 0) {
     return ReplicationScope.make({ models: [...scope.models].sort() })
   }
-  const windows = scope.windows.map((window) => {
-    if (window.partitions === undefined) return window
-    const partitions = [...window.partitions].sort(comparePartitionKeys)
-    return ReplicationWindow.make({ ...window, partitions })
-  }).sort((left, right) => {
+  const windows = scope.windows.map(normalizeWindow).sort((left, right) => {
     if (left.model < right.model) return -1
     if (left.model > right.model) return 1
     if (left.index < right.index) return -1
