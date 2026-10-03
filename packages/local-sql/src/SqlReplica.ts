@@ -334,6 +334,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         Queue.shutdown
       )
       const backgroundQueued = new Set<Identity.SpaceId>()
+      const leaveRejections = new WeakSet<ReplicaError.ReplicaError>()
       const credentialWaits = yield* FiberMap.make<Identity.MembershipIncarnation, void, never>()
       const retrySchedule: Array<RetryWork> = []
       let capacityChanged = yield* Deferred.make<void>()
@@ -937,7 +938,12 @@ const makeLayer = <D extends Definition.Any, R,>(
       ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
         Effect.uninterruptibleMask(Effect.fnUntraced(function*(restore) {
           if (entries.get(entry.spaceId) !== entry || entry.leaving) {
-            return yield* new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId })
+            const rejection = new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId })
+            if (!foreground) {
+              entry.dueWhileLeaving = true
+              leaveRejections.add(rejection)
+            }
+            return yield* rejection
           }
           if (foreground && !hasForegroundRuntime(entry)) {
             entry.foreground = true
@@ -1600,7 +1606,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             return
           }
         }
-        if (Result.isFailure(result)) {
+        if (Result.isFailure(result) && !leaveRejections.has(result.failure)) {
           yield* settleBackgroundTurn(entry, generation, result.failure, Option.some(transportGeneration))
         }
       })

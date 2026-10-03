@@ -615,6 +615,30 @@ describe("background sync terminal failures", () => {
   )
 
   it.effect(
+    "stops a background space whose membership row is gone from storage",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+      }))
+      yield* attempts.reached(1)
+      const idle = awaitAggregate(replica, services.reactivity, (aggregate) => aggregate.counts.idle === 1)
+      yield* Effect.scoped(idle)
+      yield* services.sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
+
+      const failed = awaitAggregate(replica, services.reactivity, (aggregate) => aggregate.counts.failed === 1)
+      const stopped = yield* VirtualTime.advanceUntil(Effect.scoped(failed)).pipe(Effect.timeoutOption("1 minute"))
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.isTrue(Option.isSome(stopped))
+      assert.isTrue(Option.isNone(retried))
+      assert.strictEqual(attempts.count(), 1)
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "retries a terminally failed background space once each time it is activated and released",
     Effect.fnUntraced(function*() {
       const services = yield* pendingBackgroundSpace("layer")
