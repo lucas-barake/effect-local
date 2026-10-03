@@ -12,8 +12,27 @@ const sentinel = "\u001d"
 // objects; these brand checks keep one logical value on one encoding across realms.
 const isDate = (value: object): value is Date => Object.prototype.toString.call(value) === "[object Date]"
 
+const isMap = (value: object): value is Map<unknown, unknown> =>
+  Object.prototype.toString.call(value) === "[object Map]"
+
+const isSet = (value: object): value is Set<unknown> => Object.prototype.toString.call(value) === "[object Set]"
+
 const isUint8Array = (value: object): value is Uint8Array =>
   ArrayBuffer.isView(value) && Object.prototype.toString.call(value) === "[object Uint8Array]"
+
+// Canonical hashing, cache keys, and SQL interpolation require this public codec to return synchronously.
+// oxlint-disable-next-line effect-local/noManualEffectBoundary
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
+
+const sortedMembers = (tag: string, members: Array<unknown>): Array<unknown> => {
+  const keyed = members.map((member) => [encodeJson(member), member] as const)
+  keyed.sort(([left], [right]) => {
+    if (left < right) return -1
+    if (left > right) return 1
+    return 0
+  })
+  return [tag, ...keyed.map(([, member]) => member)]
+}
 
 const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   switch (typeof value) {
@@ -44,6 +63,13 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   let result: unknown
   if (Array.isArray(value)) {
     result = value.map((item) => normalize(item, ancestors))
+  } else if (isMap(value)) {
+    const entries = Map.prototype.entries.call(value)
+    const members = Array.from(entries, ([key, item]) => [normalize(key, ancestors), normalize(item, ancestors)])
+    result = sortedMembers(`${sentinel}map`, members)
+  } else if (isSet(value)) {
+    const items = Set.prototype.values.call(value)
+    result = sortedMembers(`${sentinel}set`, Array.from(items, (item) => normalize(item, ancestors)))
   } else {
     const entries = Object.keys(value).sort().map((key) => {
       return [key, normalize(Reflect.get(value, key), ancestors)] as const
@@ -54,14 +80,7 @@ const normalize = (value: unknown, ancestors: WeakSet<object>): unknown => {
   return result
 }
 
-const UnknownFromJsonString = Schema.fromJsonString(Schema.Unknown)
-
-export const stringify = (value: unknown): string => {
-  // Canonical hashing, cache keys, and SQL interpolation require this public codec to return synchronously.
-  // oxlint-disable-next-line effect-local/noManualEffectBoundary
-  const encode = Schema.encodeSync(UnknownFromJsonString)
-  return encode(normalize(value, new WeakSet()))
-}
+export const stringify = (value: unknown): string => encodeJson(normalize(value, new WeakSet()))
 
 export const stringifyEffect = (value: unknown): Effect.Effect<string, ReplicaError.CanonicalEncodeError> =>
   Effect.try({

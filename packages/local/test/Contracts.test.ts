@@ -152,6 +152,63 @@ describe("domain contracts", () => {
   )
 
   it.effect(
+    "keeps distinct Set items in a grow only set and deduplicates equal ones in any order",
+    Effect.fnUntraced(function*() {
+      const semantics = Field.growOnlySet(Schema.ReadonlySet(Schema.String))
+      const grown = yield* semantics.apply([new Set(["a"])], { _tag: "Add", value: new Set(["b"]) })
+      assert.deepStrictEqual(grown, [new Set(["a"]), new Set(["b"])])
+      assert.strictEqual(
+        yield* semantics.apply([new Set(["a", "b"])], { _tag: "Add", value: new Set(["b", "a"]) }).pipe(
+          Effect.map((current) => current.length)
+        ),
+        1
+      )
+    })
+  )
+
+  it.effect(
+    "keeps distinct Map items in a grow only set and deduplicates equal ones in any order",
+    Effect.fnUntraced(function*() {
+      const semantics = Field.growOnlySet(Schema.ReadonlyMap(Schema.String, Schema.Number))
+      const grown = yield* semantics.apply([new Map([["a", 1]])], { _tag: "Add", value: new Map([["a", 2]]) })
+      assert.deepStrictEqual(grown, [new Map([["a", 1]]), new Map([["a", 2]])])
+      const deduplicated = yield* semantics.apply([new Map([["a", 1], ["b", 2]])], {
+        _tag: "Add",
+        value: new Map([["b", 2], ["a", 1]])
+      })
+      assert.strictEqual(deduplicated.length, 1)
+    })
+  )
+
+  it("encodes Maps and Sets injectively regardless of insertion order", () => {
+    const encodings = [
+      new Set(),
+      new Set(["a"]),
+      new Set(["b"]),
+      new Set([1]),
+      new Map(),
+      new Map([["a", 1]]),
+      new Map([["a", 2]]),
+      new Map([["b", 1]]),
+      new Map([[new Set(["a"]), 1]]),
+      new Map([[new Set(["b"]), 1]]),
+      {},
+      [],
+      ["a"],
+      [["a", 1]],
+      ["\u001dset", "a"],
+      ["\u001dmap", ["a", 1]]
+    ].map(Canonical.stringify)
+    assert.strictEqual(new Set(encodings).size, encodings.length)
+    assert.strictEqual(Canonical.stringify(new Set(["a", "b"])), Canonical.stringify(new Set(["b", "a"])))
+    assert.strictEqual(
+      Canonical.hash(new Map([["a", 1], ["b", 2]])),
+      Canonical.hash(new Map([["b", 2], ["a", 1]]))
+    )
+    assert.notStrictEqual(Canonical.hash(new Set(["a"])), Canonical.hash(new Set(["b"])))
+  })
+
+  it.effect(
     "canonicalizes object order and enforces protocol page limits",
     Effect.fnUntraced(function*() {
       assert.strictEqual(Canonical.stringify({ b: 2, a: 1 }), Canonical.stringify({ a: 1, b: 2 }))

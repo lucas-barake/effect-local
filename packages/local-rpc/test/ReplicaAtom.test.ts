@@ -18,6 +18,7 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Query from "@lucas-barake/effect-local/Query"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
+import * as Arr from "effect/Array"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
@@ -88,6 +89,10 @@ const TitlesEcho = Query.make("TitlesEcho", {
   payload: { titles: Schema.toCodecJson(Schema.ReadonlySet(Schema.String)).annotate({ identifier: "TitleSet" }) },
   success: Schema.Array(Schema.String)
 })
+const TodosByIds = Query.make("TodosByIds", {
+  payload: { ids: Schema.toCodecJson(Schema.ReadonlySet(Schema.String)).annotate({ identifier: "TodoIdSet" }) },
+  success: Schema.Array(Todo.schema)
+})
 const rangeReads = new Map<string, number>()
 const TodoRows = Schema.Struct({ value: Schema.fromJsonString(TodoSchema) })
 const todosVia = (
@@ -107,7 +112,7 @@ const definition = Definition.make({
   version: 1,
   models: [Todo, Numbered],
   mutations: [PutTodo, PutNumbered],
-  queries: [ListTodos, RangeTodos, TitlesEcho]
+  queries: [ListTodos, RangeTodos, TitlesEcho, TodosByIds]
 })
 const layerHandlers = Layer.mergeAll(
   PutTodo.toLayer(({ payload, transaction }) => transaction.set(Todo, payload.id, payload).pipe(Effect.as(payload))),
@@ -115,6 +120,9 @@ const layerHandlers = Layer.mergeAll(
     transaction.set(Numbered, payload.id, payload).pipe(Effect.as(payload))
   ),
   TitlesEcho.toLayer(({ payload }) => Effect.succeed(Array.from(payload.titles))),
+  TodosByIds.toLayer(({ payload, query }) =>
+    Effect.forEach(payload.ids, (id) => query.get(Todo, id)).pipe(Effect.map(Arr.getSomes))
+  ),
   ListTodos.toLayer(({ query }) =>
     todosVia(query, (sql) => sql`SELECT "value" FROM "Todo" ORDER BY "title" ASC LIMIT 100`)
   ),
@@ -805,6 +813,40 @@ describe("Replica Atom graph", () => {
       )
       assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, first, { suspendOnWaiting: true }), ["a"])
       assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, second, { suspendOnWaiting: true }), ["b"])
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "refreshes each mounted query whose Set payload reads a different entity",
+    Effect.fnUntraced(function*() {
+      const graph = ReplicaAtom.make(layerReplica)
+      const registry = AtomRegistry.make()
+      yield* Effect.addFinalizer(() => Effect.sync(() => registry.dispose()))
+      const first = graph.query(spaceId, TodosByIds)({ ids: new Set(["first"]) })
+      const second = graph.query(spaceId, TodosByIds)({ ids: new Set(["second"]) })
+      const mutation = graph.mutation(spaceId, PutTodo)
+      const unmountFirst = registry.mount(first)
+      const unmountMutation = registry.mount(mutation)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountMutation))
+      yield* Effect.addFinalizer(() => Effect.sync(unmountFirst))
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, first, { suspendOnWaiting: true }), [])
+      const unmountSecond = registry.mount(second)
+      yield* Effect.addFinalizer(() => Effect.sync(unmountSecond))
+      assert.deepStrictEqual(yield* AtomRegistry.getResult(registry, second, { suspendOnWaiting: true }), [])
+
+      registry.set(mutation, { id: "first", title: "first title" })
+      yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      assert.deepStrictEqual(
+        yield* awaitSuccess(registry, first, (todos) => todos.length === 1),
+        [{ id: "first", title: "first title" }]
+      )
+
+      registry.set(mutation, { id: "second", title: "second title" })
+      yield* AtomRegistry.getResult(registry, mutation, { suspendOnWaiting: true })
+      assert.deepStrictEqual(
+        yield* awaitSuccess(registry, second, (todos) => todos.length === 1),
+        [{ id: "second", title: "second title" }]
+      )
     }, Effect.scoped)
   )
 
