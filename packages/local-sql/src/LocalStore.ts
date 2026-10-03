@@ -37,7 +37,6 @@ import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as PriorityLock from "./internal/priorityLock.js"
 import * as Rows from "./internal/rows.js"
-import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as TerminalRejection from "./internal/TerminalRejection.js"
 import * as SqlTransaction from "./internal/transaction.js"
 import * as Migrations from "./Migrations.js"
@@ -887,7 +886,12 @@ export const layer = (
             SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})`
       })
 
-      const meta = lane.withStatement(findMeta(undefined)).pipe(Effect.mapError(StorageUnavailable.make))
+      const meta = lane.withStatement(findMeta(undefined)).pipe(Effect.catchTags({
+        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+        SchemaError: (cause) =>
+          Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
+        NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
+      }))
       const normalizedScope = yield* Protocol.validateReplicationScope(options.definition, options.scope)
       const desiredScopeJson = yield* Codec.stringify(normalizedScope)
       const desiredScopeDigest = yield* Protocol.replicationScopeDigest(normalizedScope).pipe(
@@ -917,7 +921,7 @@ export const layer = (
           yield* sql`DELETE FROM effect_local_client_scoped_bootstrap_entries
             WHERE space_id = ${options.spaceId}`
           yield* sql`DELETE FROM effect_local_client_scoped_bootstrap WHERE space_id = ${options.spaceId}`
-        })).pipe(Effect.mapError(StorageUnavailable.make))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
         initializedMeta = yield* meta
       }
       const schemaGeneration = initializedMeta.schema_generation
@@ -926,7 +930,7 @@ export const layer = (
       yield* lane.withStatement(sql`UPDATE effect_local_client_pending_data SET submission_state = 'Retrying'
         WHERE space_id = ${options.spaceId} AND schema_generation = ${activeGeneration}
           AND submission_state = 'Submitting'`).pipe(
-        Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+        Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
       )
       const validateFence = (current: typeof Rows.ClientMetaRow.Type) => {
         if (current.membership_incarnation !== initializedMeta.membership_incarnation) {
@@ -967,8 +971,16 @@ export const layer = (
       }
       const readPendingCount = lane.withTransaction(Effect.gen(function*() {
         yield* validateFence(yield* meta)
-        return (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
-      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        return (yield* countPending(undefined).pipe(Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(
+              new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is corrupt", cause })
+            ),
+          NoSuchElementError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is missing", cause }))
+        }))).count
+      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
       const initializePendingMetric = (count: number) =>
         metrics.initializePending(count).pipe(
           Effect.catchCause((cause) => {
@@ -1171,7 +1183,13 @@ export const layer = (
         return lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
           const deletedRows = yield* deletePendingByMutationIds(mutationIds).pipe(
-            Effect.mapError(StorageUnavailable.make)
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                )
+            })
           )
           const rowByMutation = new Map(deletedRows.map((row) => [row.mutation_id, row]))
           const deleted: Array<{
@@ -1187,7 +1205,12 @@ export const layer = (
               message: "Deleted settlement rows did not match the requested pending mutations"
             })
           }
-          const state = yield* findSettlementState(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const state = yield* findSettlementState(undefined).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
+            NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
+          }))
           let sequence = state.next_settled_sequence
           for (const { row } of deleted) {
             yield* persistSettledSnapshot(row, sequence)
@@ -1199,7 +1222,7 @@ export const layer = (
           }
           return deleted.map(({ settlement }) => settlement)
         })).pipe(
-          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
           Effect.tap((deletedSettlements) => updatePendingMetric(-deletedSettlements.length))
         )
       }
@@ -1239,7 +1262,12 @@ export const layer = (
         if (mutationName === undefined) {
           return findSettlementState(undefined).pipe(
             Effect.map((state) => state.settlement_prune_sequence),
-            Effect.mapError(StorageUnavailable.make)
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
+              NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
+            })
           )
         }
         return findNamedPruneMark(mutationName).pipe(
@@ -1247,13 +1275,24 @@ export const layer = (
             onNone: () => 0,
             onSome: (mark) => mark.pruned_sequence
           })),
-          Effect.mapError(StorageUnavailable.make)
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Client settlement prune mark is corrupt", cause })
+              )
+          })
         )
       }
 
       const resolveSettlementStart = Effect.fnUntraced(function*(from: Replica.SettlementStart) {
         const state = yield* lane.withStatement(findSettlementState(undefined)).pipe(
-          Effect.mapError(StorageUnavailable.make)
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
+            NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
+          })
         )
         if (from === "live") return state.next_settled_sequence - 1
         if (from === "acknowledged") return state.settlement_floor
@@ -1270,6 +1309,11 @@ export const layer = (
         readonly mutationName?: string | undefined
       }) =>
         lane.withTransaction(Effect.gen(function*() {
+          if (!Number.isSafeInteger(readOptions.after) || readOptions.after < 0) {
+            return yield* new ReplicaError.ProtocolInvalid({
+              message: "Settlement replay position must be a nonnegative safe integer"
+            })
+          }
           const mark = yield* readPruneMark(readOptions.mutationName)
           if (readOptions.after < mark) {
             return yield* new ReplicaError.SettlementReplayTruncated({
@@ -1281,9 +1325,15 @@ export const layer = (
             after: readOptions.after,
             limit: settlementPageSize,
             name: readOptions.mutationName ?? null
-          }).pipe(Effect.mapError(StorageUnavailable.make))
+          }).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
+            })
+          )
         })).pipe(
-          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
           Effect.flatMap(Effect.forEach(decodeSettledRow))
         )
 
@@ -1320,7 +1370,7 @@ export const layer = (
             SET settlement_floor = MAX(settlement_floor, MIN(${sequence}, next_settled_sequence - 1))
             WHERE space_id = ${options.spaceId}`).pipe(
           Effect.asVoid,
-          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+          Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
         )
       }
 
@@ -1373,23 +1423,39 @@ export const layer = (
       const pendingToSubmit = lane.withTransaction(Effect.gen(function*() {
         yield* validateFence(yield* meta)
         return yield* findPendingToSubmit(undefined).pipe(
-          Effect.mapError(StorageUnavailable.make),
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause }))
+          }),
           Effect.flatMap(Effect.forEach(decodePendingRow))
         )
-      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const pending = lane.withTransaction(Effect.gen(function*() {
         yield* validateFence(yield* meta)
         return yield* findAllPending(undefined).pipe(
-          Effect.mapError(StorageUnavailable.make),
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause }))
+          }),
           Effect.flatMap(Effect.forEach((row) => decodePendingRow(row).pipe(Effect.flatMap(decodeClientPending))))
         )
-      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const claimSubmitBatch = Effect.fnUntraced(function*(request: SubmitClaim) {
         const claim = yield* lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
-          const rows = yield* findPendingToSubmit(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const rows = yield* findPendingToSubmit(undefined).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                )
+            })
+          )
           const through = request.through ?? rows.at(-1)?.local_sequence ?? request.after
           const envelopes: Array<Protocol.MutationEnvelope> = []
           let requestBytes = 1
@@ -1411,16 +1477,32 @@ export const layer = (
           }
           if (envelopes.length === 0) return { envelopes, through, more, marked: 0 }
           const mutationIds = envelopes.map((envelope) => envelope.mutationId)
-          const exhausted = yield* findExhaustedSubmissions(mutationIds).pipe(Effect.mapError(StorageUnavailable.make))
+          const exhausted = yield* findExhaustedSubmissions(mutationIds).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                )
+            })
+          )
           if (exhausted.length > 0) {
             return yield* new ReplicaError.CapacityExceeded({
               resource: "mutation submission attempts",
               limit: Number.MAX_SAFE_INTEGER
             })
           }
-          const marked = yield* updateSubmitting(mutationIds).pipe(Effect.mapError(StorageUnavailable.make))
+          const marked = yield* updateSubmitting(mutationIds).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                )
+            })
+          )
           return { envelopes, through, more, marked: marked.length }
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
         if (claim.marked > 0) yield* invalidate([], [], true)
         return { envelopes: claim.envelopes, through: claim.through, more: claim.more } satisfies SubmitBatchClaim
       })
@@ -1428,36 +1510,64 @@ export const layer = (
       const markRetrying = Effect.fnUntraced(function*(mutationIds: ReadonlyArray<Identity.MutationId>) {
         const marked = yield* lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
-          return yield* updateRetrying(mutationIds).pipe(Effect.mapError(StorageUnavailable.make))
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          return yield* updateRetrying(mutationIds).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                )
+            })
+          )
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
         if (marked.length > 0) yield* invalidate([], [], true)
       })
 
       const quarantine = lane.withTransaction(Effect.gen(function*() {
         yield* validateFence(yield* meta)
         return yield* findQuarantine(undefined).pipe(
-          Effect.mapError(StorageUnavailable.make),
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client quarantine row is corrupt", cause }))
+          }),
           Effect.flatMap(Effect.forEach(decodeQuarantineRow))
         )
-      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const quarantineByMutation = (mutationId: Identity.MutationId) =>
         lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
-          const found = yield* findQuarantineByMutation(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
-          if (Option.isNone(found)) return Option.none()
+          const found = yield* findQuarantineByMutation(mutationId).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client quarantine row is corrupt", cause }))
+          }))
+          if (Option.isNone(found)) {
+            return Option.none()
+          }
           return Option.some(yield* decodeQuarantineRow(found.value))
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const quarantineCancellation = (mutationId: Identity.MutationId) =>
         lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
           const continuation = yield* findQuarantineCancellationByRoot(mutationId).pipe(
-            Effect.mapError(StorageUnavailable.make)
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client quarantine cancellation row is corrupt", cause })
+                )
+            })
           )
           if (Option.isNone(continuation)) return Option.none()
           const found = yield* findQuarantineByMutation(continuation.value.current_mutation_id).pipe(
-            Effect.mapError(StorageUnavailable.make)
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client quarantine row is corrupt", cause }))
+            })
           )
           if (Option.isNone(found)) {
             return yield* new ReplicaError.StorageCorrupt({
@@ -1465,7 +1575,7 @@ export const layer = (
             })
           }
           return Option.some(yield* decodeQuarantineRow(found.value))
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const prepareInvalidation = Effect.fnUntraced(function*(
         entities: ReadonlyArray<Protocol.EntityKey>,
@@ -1723,7 +1833,7 @@ export const layer = (
           yield* lane.withTransaction(sql`UPDATE effect_local_client_spaces
             SET projection_replay_generation = ${target}, projection_replay_cursor = NULL
             WHERE space_id = ${options.spaceId}`).pipe(
-            Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+            Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
           )
           current = { ...current, projection_replay_generation: target, projection_replay_cursor: null }
         }
@@ -1743,7 +1853,15 @@ export const layer = (
                 projectionGeneration: target,
                 keep: false,
                 limit: projectionReplayBatchSize
-              }).pipe(Effect.mapError(StorageUnavailable.make))
+              }).pipe(
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                  SchemaError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({ message: "Client visible entity row is corrupt", cause })
+                    )
+                })
+              )
               if (ids.length === 0) {
                 yield* sql`UPDATE effect_local_client_spaces SET projection_replay_cursor = 'canonical'
                   WHERE space_id = ${options.spaceId}`
@@ -1752,7 +1870,9 @@ export const layer = (
               yield* sql`DELETE FROM effect_local_client_visible_entities_data
                 WHERE rowid IN ${sql.in(ids.map((id) => id.row_id))}`
               return true
-            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            })).pipe(
+              Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+            )
             if (!deleted) break
             yield* Effect.yieldNow
           }
@@ -1783,7 +1903,9 @@ export const layer = (
                 return false
               }
               return true
-            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            })).pipe(
+              Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+            )
             if (!copied) break
             yield* Effect.yieldNow
           }
@@ -1808,7 +1930,13 @@ export const layer = (
               return yield* new ReplicaError.StorageCorrupt({ message: "Projection replay fence changed" })
             }
             const rows = yield* findReplayPendingBatch({ after, limit: projectionReplayBatchSize }).pipe(
-              Effect.mapError(StorageUnavailable.make)
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                  )
+              })
             )
             if (rows.length === 0) return null
             yield* replayPendingBatch(rows, replaySchemaGeneration, target, row)
@@ -1816,7 +1944,7 @@ export const layer = (
             yield* sql`UPDATE effect_local_client_spaces SET projection_replay_cursor = ${`pending:${next}`}
               WHERE space_id = ${options.spaceId}`
             return next
-          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
           if (replayed === null) break
           after = replayed
           yield* Effect.yieldNow
@@ -1831,7 +1959,15 @@ export const layer = (
           ) {
             return yield* new ReplicaError.StorageCorrupt({ message: "Projection promotion fence changed" })
           }
-          const dirtyRows = yield* findDirtyEntities(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const dirtyRows = yield* findDirtyEntities(undefined).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client projection dirty row is corrupt", cause })
+                )
+            })
+          )
           const entities: Array<Protocol.EntityKey> = []
           for (const dirtyRow of dirtyRows) {
             entities.push(Protocol.EntityKey.make({
@@ -1850,7 +1986,7 @@ export const layer = (
           yield* sql`DELETE FROM effect_local_client_projection_dirty
             WHERE space_id = ${options.spaceId}`
           return entities
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
         yield* Effect.gen(function*() {
           while (true) {
@@ -1860,12 +1996,22 @@ export const layer = (
                 projectionGeneration: target,
                 keep: true,
                 limit: projectionReplayBatchSize
-              }).pipe(Effect.mapError(StorageUnavailable.make))
+              }).pipe(
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                  SchemaError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({ message: "Client visible entity row is corrupt", cause })
+                    )
+                })
+              )
               if (ids.length === 0) return false
               yield* sql`DELETE FROM effect_local_client_visible_entities_data
                 WHERE rowid IN ${sql.in(ids.map((id) => id.row_id))}`
               return true
-            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            })).pipe(
+              Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+            )
             if (!deleted) break
             yield* Effect.yieldNow
           }
@@ -1982,7 +2128,13 @@ export const layer = (
         let after = 0
         while (true) {
           const batch = yield* findProjectionPendingBatch({ after, limit: projectionReplayBatchSize }).pipe(
-            Effect.mapError(StorageUnavailable.make)
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                )
+            })
           )
           if (batch.length === 0) break
           for (const row of batch) {
@@ -2016,7 +2168,13 @@ export const layer = (
               replayed.slice(offset, offset + 100).map((entity) => ({ model: entity.model, key: entity.entityKey }))
             ),
             schemaGeneration: current.active_schema_generation
-          }).pipe(Effect.mapError(StorageUnavailable.make))
+          }).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client retraction count is corrupt", cause })),
+            NoSuchElementError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client retraction count is missing", cause }))
+          }))
           if (retracted.count > 0) return false
         }
         const identities = [...dirty.values()]
@@ -2027,7 +2185,17 @@ export const layer = (
             ),
             schemaGeneration: current.active_schema_generation,
             projectionGeneration: current.active_projection_generation
-          }).pipe(Effect.mapError(StorageUnavailable.make))
+          }).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Client projection divergence count is corrupt", cause })
+              ),
+            NoSuchElementError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Client projection divergence count is missing", cause })
+              )
+          }))
           if (divergence.count > 0) return false
         }
         return true
@@ -2043,7 +2211,13 @@ export const layer = (
         }
         const replaySchemaGeneration = current.active_schema_generation
         const projectionGeneration = current.active_projection_generation
-        const dirtyRows = yield* findDirtyEntities(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        const dirtyRows = yield* findDirtyEntities(undefined).pipe(
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client projection dirty row is corrupt", cause }))
+          })
+        )
         const touched = new Map<string, { readonly model: string; readonly entityKey: string }>()
         const entities = new Map<string, Protocol.EntityKey>()
         const record = (entity: Protocol.EntityKey, entityKey: string) => {
@@ -2068,7 +2242,13 @@ export const layer = (
         let after = 0
         while (true) {
           const batch = yield* findReplayPendingChangesBatch({ after, limit: projectionReplayBatchSize }).pipe(
-            Effect.mapError(StorageUnavailable.make)
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                )
+            })
           )
           if (batch.length === 0) break
           for (const row of batch) {
@@ -2115,7 +2295,13 @@ export const layer = (
         after = 0
         while (true) {
           const batch = yield* findReplayPendingBatch({ after, limit: projectionReplayBatchSize }).pipe(
-            Effect.mapError(StorageUnavailable.make)
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                )
+            })
           )
           if (batch.length === 0) break
           for (const row of batch) {
@@ -2155,29 +2341,58 @@ export const layer = (
         const dirtyEntities: ReadonlyArray<Protocol.EntityKey> = [...entities.values()]
         return Option.some({ entities: dirtyEntities })
       })).pipe(
-        Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+        Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
       )
 
       const pruneReceipts = Effect.fnUntraced(function*(target: number) {
-        const count = yield* countReceipts(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        const count = yield* countReceipts(undefined).pipe(Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is corrupt", cause })),
+          NoSuchElementError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is missing", cause }))
+        }))
         const excess = Math.max(0, count.count - target)
         if (excess === 0) return []
-        const state = yield* findSettlementState(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        const state = yield* findSettlementState(undefined).pipe(Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
+          NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
+        }))
         const rows = Array.from(
-          yield* findPrunableUnsettled(excess).pipe(Effect.mapError(StorageUnavailable.make))
+          yield* findPrunableUnsettled(excess).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
+            })
+          )
         )
         if (rows.length < excess) {
           const acknowledged = yield* findPrunableAcknowledged({
             limit: excess - rows.length,
             floor: state.settlement_floor
-          }).pipe(Effect.mapError(StorageUnavailable.make))
+          }).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
+            })
+          )
           rows.push(...acknowledged)
         }
         if (rows.length < excess) {
           const unacknowledged = yield* findPrunableUnacknowledged({
             limit: excess - rows.length,
             floor: state.settlement_floor
-          }).pipe(Effect.mapError(StorageUnavailable.make))
+          }).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
+            })
+          )
           rows.push(...unacknowledged)
         }
         for (let offset = 0; offset < rows.length; offset += 500) {
@@ -2284,7 +2499,11 @@ export const layer = (
         }
         yield* validateReceiptProvenance(receipt)
         const storedReceipt = yield* findReceipt(receipt.mutationId).pipe(
-          Effect.mapError(StorageUnavailable.make)
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
+          })
         )
         if (Option.isSome(storedReceipt)) {
           const decoded = yield* Codec.parse(storedReceipt.value.receipt_json).pipe(
@@ -2299,7 +2518,13 @@ export const layer = (
             })
           }
           const storedPending = yield* findPendingByMutation(receipt.mutationId).pipe(
-            Effect.mapError(StorageUnavailable.make)
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                )
+            })
           )
           if (Option.isSome(storedPending) && storedPending.value.submission_state !== "AwaitingReceipt") {
             yield* sql`UPDATE effect_local_client_pending_data SET submission_state = 'Submitted'
@@ -2310,7 +2535,11 @@ export const layer = (
           return { inserted: false, pruned: [] }
         }
         const storedPending = yield* findPendingByMutation(receipt.mutationId).pipe(
-          Effect.mapError(StorageUnavailable.make)
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause }))
+          })
         )
         if (Option.isNone(storedPending)) {
           return yield* new ReplicaError.ProtocolInvalid({
@@ -2327,7 +2556,13 @@ export const layer = (
           })
         }
         const pruned = yield* pruneReceipts(options.retainedReceipts)
-        const receiptCount = yield* countReceipts(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        const receiptCount = yield* countReceipts(undefined).pipe(Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is corrupt", cause })),
+          NoSuchElementError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is missing", cause }))
+        }))
         if (receiptCount.count >= options.maximumReceipts) {
           return yield* new ReplicaError.CapacityExceeded({
             resource: "client receipts",
@@ -2356,7 +2591,7 @@ export const layer = (
             while (next < receipts.length) {
               const receipt = receipts[next]
               const persisted = yield* lane.withTransaction(persistReceiptInTransaction(receipt)).pipe(
-                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+                Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
                 Effect.result
               )
               if (Result.isFailure(persisted)) return Option.some(persisted.failure)
@@ -2369,7 +2604,7 @@ export const layer = (
               if (next % receiptPersistBatchSize === 0 && (yield* lane.foregroundWaiting)) break
             }
             return Option.none()
-          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
           receiptIds.push(...chunkIds)
           pendingChanged ||= chunkPendingChanged
           return failure
@@ -2417,7 +2652,15 @@ export const layer = (
           yield* validateFence(installed)
           let after = 0
           while (true) {
-            const found = yield* findPendingReceipt({ after }).pipe(Effect.mapError(StorageUnavailable.make))
+            const found = yield* findPendingReceipt({ after }).pipe(
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                  )
+              })
+            )
             if (Option.isNone(found)) break
             const row = found.value
             after = row.local_sequence
@@ -2493,7 +2736,7 @@ export const layer = (
           prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
           return yield* Effect.void
         })).pipe(
-          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
           Effect.tapError(() => {
             if (Option.isNone(page)) return Effect.void
             return projectSettlements(page, []).pipe(
@@ -2577,7 +2820,7 @@ export const layer = (
           scopeGeneration: Identity.ReplicationScopeGeneration.make(current.scope_generation),
           cursor
         }
-      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const setScope = Effect.fn("LocalStore.setScope")(function*(scope: Protocol.ReplicationScope) {
         const normalized = yield* Protocol.validateReplicationScope(options.definition, scope)
@@ -2609,7 +2852,7 @@ export const layer = (
           yield* sql`DELETE FROM effect_local_client_scoped_bootstrap WHERE space_id = ${options.spaceId}`
           return yield* Effect.void
         }))
-      }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const resolveQuarantine = (receipt: Protocol.Receipt, disposition: QuarantineDisposition = "Resubmit") =>
         withProjectionGateThen(
@@ -2617,7 +2860,11 @@ export const layer = (
             const transactionResult = yield* lane.withTransaction(Effect.gen(function*() {
               yield* validateFence(yield* meta)
               const found = yield* findQuarantineByMutation(receipt.mutationId).pipe(
-                Effect.mapError(StorageUnavailable.make)
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                  SchemaError: (cause) =>
+                    Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client quarantine row is corrupt", cause }))
+                })
               )
               if (Option.isNone(found)) {
                 return yield* new ReplicaError.ProtocolInvalid({
@@ -2645,13 +2892,28 @@ export const layer = (
               let pendingDelta = 0
               let canceledReplacement: Option.Option<Quarantine.QuarantinedMutation> = Option.none()
               const intent = yield* findQuarantineResubmission(receipt.mutationId).pipe(
-                Effect.mapError(StorageUnavailable.make)
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                  SchemaError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({
+                        message: "Client quarantine resubmission row is corrupt",
+                        cause
+                      })
+                    )
+                })
               )
               const preservesReplacement = disposition === "Resubmit" &&
                 receipt._tag === "Rejected" && receipt.origin === "Quarantine"
               if (Option.isSome(intent) && !preservesReplacement) {
                 const pendingReplacement = yield* findPendingByMutation(intent.value.replacement_mutation_id).pipe(
-                  Effect.mapError(StorageUnavailable.make)
+                  Effect.catchTags({
+                    SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                    SchemaError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                      )
+                  })
                 )
                 if (Option.isSome(pendingReplacement)) {
                   const replacement = yield* decodePendingRow(pendingReplacement.value)
@@ -2676,7 +2938,13 @@ export const layer = (
                     ${yield* Codec.stringify(canceled.rejection)}, ${canceled.targetSchema.version},
                     ${canceled.targetSchema.hash})`
                   const deleted = yield* deletePendingByMutationIds([replacement.envelope.mutationId]).pipe(
-                    Effect.mapError(StorageUnavailable.make)
+                    Effect.catchTags({
+                      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                      SchemaError: (cause) =>
+                        Effect.fail(
+                          new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                        )
+                    })
                   )
                   pendingDelta -= deleted.length
                   canceledReplacement = Option.some(canceled)
@@ -2684,7 +2952,15 @@ export const layer = (
                 } else {
                   const quarantinedReplacement = yield* findQuarantineByMutation(
                     intent.value.replacement_mutation_id
-                  ).pipe(Effect.mapError(StorageUnavailable.make))
+                  ).pipe(
+                    Effect.catchTags({
+                      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                      SchemaError: (cause) =>
+                        Effect.fail(
+                          new ReplicaError.StorageCorrupt({ message: "Client quarantine row is corrupt", cause })
+                        )
+                    })
+                  )
                   if (Option.isNone(quarantinedReplacement)) {
                     return yield* new ReplicaError.StorageCorrupt({
                       message: `Quarantine resubmission ${receipt.mutationId} is missing its replacement`
@@ -2694,7 +2970,16 @@ export const layer = (
                 }
               }
               const existingCancellation = yield* findQuarantineCancellationByCurrent(receipt.mutationId).pipe(
-                Effect.mapError(StorageUnavailable.make)
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                  SchemaError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({
+                        message: "Client quarantine cancellation row is corrupt",
+                        cause
+                      })
+                    )
+                })
               )
               if (Option.isSome(canceledReplacement)) {
                 if (Option.isSome(existingCancellation)) {
@@ -2729,7 +3014,13 @@ export const layer = (
                 })
               }
               const pruned = yield* pruneReceipts(options.retainedReceipts)
-              const receiptCount = yield* countReceipts(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+              const receiptCount = yield* countReceipts(undefined).pipe(Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is corrupt", cause })),
+                NoSuchElementError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is missing", cause }))
+              }))
               if (receiptCount.count >= options.maximumReceipts) {
                 return yield* new ReplicaError.CapacityExceeded({
                   resource: "client receipts",
@@ -2747,7 +3038,9 @@ export const layer = (
                 touched: Array.from(canceledTouched.values()),
                 receiptIds: pruned
               }
-            })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+            })).pipe(
+              Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+            )
             yield* updatePendingMetric(transactionResult.pendingDelta)
             const invalidationEntities = transactionResult.touched
             const invalidationReceiptIds = [receipt.mutationId, ...transactionResult.receiptIds]
@@ -2893,7 +3186,15 @@ export const layer = (
         yield* Effect.annotateCurrentSpan({ "snapshot.id": manifest.snapshotId })
         yield* validateManifest(manifest)
         return yield* lane.withTransaction(Effect.gen(function*() {
-          const current = yield* findScopedBootstrap(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const current = yield* findScopedBootstrap(undefined).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client scoped bootstrap row is corrupt", cause })
+                )
+            })
+          )
           if (Option.isSome(current) && bootstrapMatches(current.value, manifest)) {
             return current.value.next_ordinal - 1
           }
@@ -2912,7 +3213,7 @@ export const layer = (
                 ${Protocol.initialSnapshotDigest})`
           return -1
         }))
-      }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const stageBootstrapPage = Effect.fn("LocalStore.stageBootstrapPage")(function*(page: Protocol.BootstrapPage) {
         yield* Effect.annotateCurrentSpan({
@@ -2927,7 +3228,15 @@ export const layer = (
           })
         }
         return yield* lane.withTransaction(Effect.gen(function*() {
-          const found = yield* findScopedBootstrap(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const found = yield* findScopedBootstrap(undefined).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client scoped bootstrap row is corrupt", cause })
+                )
+            })
+          )
           if (Option.isNone(found) || !bootstrapMatches(found.value, page.manifest)) {
             return yield* new ReplicaError.ProtocolInvalid({
               message: `Bootstrap page does not match durable snapshot ${page.manifest.snapshotId}`
@@ -2986,7 +3295,17 @@ export const layer = (
               identitiesJson: yield* Codec.stringify(
                 stagedRows.map((row) => ({ model: row.model, key: row.entity_key }))
               )
-            }).pipe(Effect.mapError(StorageUnavailable.make))
+            }).pipe(Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client scoped bootstrap entry count is corrupt", cause })
+                ),
+              NoSuchElementError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client scoped bootstrap entry count is missing", cause })
+                )
+            }))
             if (staged.count > 0) {
               return yield* new ReplicaError.ProtocolInvalid({
                 message: `Snapshot ${page.manifest.snapshotId} contains a duplicate entity`
@@ -3027,7 +3346,7 @@ export const layer = (
               WHERE space_id = ${options.spaceId}`
           return complete
         }))
-      }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const installBootstrapInGate = Effect.fnUntraced(function*(manifest: Protocol.SnapshotManifest) {
         yield* validateManifest(manifest)
@@ -3037,7 +3356,15 @@ export const layer = (
         let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
         yield* pipe(
           Effect.gen(function*() {
-            const found = yield* findScopedBootstrap(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            const found = yield* findScopedBootstrap(undefined).pipe(
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({ message: "Client scoped bootstrap row is corrupt", cause })
+                  )
+              })
+            )
             if (Option.isNone(found) || !bootstrapMatches(found.value, manifest)) {
               return yield* new ReplicaError.ProtocolInvalid({
                 message: `Snapshot ${manifest.snapshotId} is not staged for installation`
@@ -3053,7 +3380,15 @@ export const layer = (
                 message: `Snapshot ${manifest.snapshotId} is incomplete`
               })
             }
-            const rows = yield* findScopedBootstrapEntries(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            const rows = yield* findScopedBootstrapEntries(undefined).pipe(
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({ message: "Client scoped bootstrap entry row is corrupt", cause })
+                  )
+              })
+            )
             if (rows.length !== manifest.entityCount) {
               return yield* new ReplicaError.StorageCorrupt({
                 message: `Snapshot ${manifest.snapshotId} durable entry count is incomplete`
@@ -3108,7 +3443,15 @@ export const layer = (
                 message: `Snapshot ${manifest.snapshotId} is older than the local server watermark`
               })
             }
-            const prior = yield* findEntityIdentities(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            const prior = yield* findEntityIdentities(undefined).pipe(
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({ message: "Client entity identity row is corrupt", cause })
+                  )
+              })
+            )
             for (const row of prior) {
               const entity = yield* Codec.decode(Protocol.EntityKey, {
                 model: row.model,
@@ -3118,7 +3461,13 @@ export const layer = (
               dirty.set(SqlTransaction.entityKey(entity), entity)
             }
             const priorCanonical = yield* findCanonicalEntityIdentities(undefined).pipe(
-              Effect.mapError(StorageUnavailable.make)
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({ message: "Client canonical entity row is corrupt", cause })
+                  )
+              })
             )
             for (const row of priorCanonical) {
               const identity = Canonical.stringify([row.model, row.entity_key])
@@ -3135,7 +3484,13 @@ export const layer = (
             let after = 0
             while (true) {
               const pendingReceipt = yield* findPendingReceipt({ after }).pipe(
-                Effect.mapError(StorageUnavailable.make)
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                  SchemaError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                    )
+                })
               )
               if (Option.isNone(pendingReceipt)) {
                 break
@@ -3183,7 +3538,15 @@ export const layer = (
               }
             }
 
-            const pendingLogs = yield* findPendingLog(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+            const pendingLogs = yield* findPendingLog(undefined).pipe(
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                  )
+              })
+            )
             for (const row of pendingLogs) {
               const pendingMutation = yield* decodePendingRow(row)
               const entry = yield* Codec.parse(row.entry_json).pipe(
@@ -3235,7 +3598,7 @@ export const layer = (
             return yield* Effect.void
           }),
           lane.withTransaction
-        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
         return yield* Effect.gen(function*() {
           yield* recordBootstrapInstallMetric
           const entities = yield* rebuildProjection
@@ -3306,7 +3669,7 @@ export const layer = (
                 WHERE space_id = ${options.spaceId}`
           }
           return yield* Effect.void
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
         if (page.hasMore) {
           yield* pipe(Array.from(touched.values()), (entities) => deferInvalidation(entities, []))
           return []
@@ -3330,7 +3693,15 @@ export const layer = (
         yield* lane.withTransaction(Effect.gen(function*() {
           const current = yield* meta
           yield* validateFence(current)
-          const identities = yield* findEntityIdentities(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const identities = yield* findEntityIdentities(undefined).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client entity identity row is corrupt", cause })
+                )
+            })
+          )
           for (const row of identities) {
             const entity = yield* Codec.decode(Protocol.EntityKey, {
               model: row.model,
@@ -3354,7 +3725,7 @@ export const layer = (
             WHERE space_id = ${options.spaceId}`
           yield* markProjectionDirty(dirty.values())
           yield* requestProjectionReplay(yield* meta)
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
         yield* reportReplicationView(false)
         yield* invalidate(yield* rebuildProjection)
       }).pipe(
@@ -3367,7 +3738,7 @@ export const layer = (
         const row = yield* meta
         yield* validateFence(row)
         return { requested: row.requested_generation, completed: row.completed_generation }
-      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const nextReconciliationGeneration = Effect.fnUntraced(function*(requested: number) {
         if (requested >= Number.MAX_SAFE_INTEGER) {
@@ -3388,7 +3759,7 @@ export const layer = (
           WHERE space_id = ${options.spaceId}`
         return requested
       })).pipe(
-        Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+        Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
         Effect.withSpan("LocalStore.requestReconciliation")
       )
 
@@ -3411,7 +3782,7 @@ export const layer = (
             SET completed_generation = MAX(completed_generation, ${generation})
             WHERE space_id = ${options.spaceId}`
           return yield* Effect.void
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
         return yield* Effect.void
       })
 
@@ -3428,19 +3799,43 @@ export const layer = (
           if (recorded.envelope.name !== mutation.name) return false
           return (yield* Canonical.stringifyEffect(recorded.envelope.payload)) === requestedPayload
         })
-        const pendingRow = yield* findPendingByMutation(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
+        const pendingRow = yield* findPendingByMutation(mutationId).pipe(
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause }))
+          })
+        )
         if (Option.isSome(pendingRow)) {
           const recordedPending = yield* decodePendingRow(pendingRow.value)
           if (!(yield* sameMutation(recordedPending))) return yield* conflict
           return Option.some(recordedPending)
         }
-        const quarantined = yield* findQuarantineByMutation(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
+        const quarantined = yield* findQuarantineByMutation(mutationId).pipe(
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client quarantine row is corrupt", cause }))
+          })
+        )
         if (Option.isSome(quarantined)) return yield* conflict
         const settledRow = yield* findSettledPendingByMutation(mutationId).pipe(
-          Effect.mapError(StorageUnavailable.make)
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
+          })
         )
         if (Option.isNone(settledRow)) {
-          const retired = yield* findRetiredMutation(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
+          const retired = yield* findRetiredMutation(mutationId).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client retired mutation row is corrupt", cause })
+                )
+            })
+          )
           if (Option.isSome(retired)) return yield* conflict
           return Option.none<Protocol.PendingMutation>()
         }
@@ -3468,8 +3863,22 @@ export const layer = (
             limit: Number.MAX_SAFE_INTEGER - 1
           })
         }
-        const pendingCount = yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))
-        const quarantineCount = yield* countQuarantine(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        const pendingCount = yield* countPending(undefined).pipe(Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(
+              new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is corrupt", cause })
+            ),
+          NoSuchElementError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is missing", cause }))
+        }))
+        const quarantineCount = yield* countQuarantine(undefined).pipe(Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client quarantine count is corrupt", cause })),
+          NoSuchElementError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client quarantine count is missing", cause }))
+        }))
         let unresolvedCount = pendingCount.count + quarantineCount.count
         if (replacingQuarantine) unresolvedCount -= 1
         if (unresolvedCount >= maximumPending) {
@@ -3558,7 +3967,11 @@ export const layer = (
           yield* MutationDescriptor.validate(options.definition, mutation)
           const result = yield* lane.withTransaction(Effect.gen(function*() {
             const quarantined = yield* findQuarantineByMutation(mutationId).pipe(
-              Effect.mapError(StorageUnavailable.make)
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client quarantine row is corrupt", cause }))
+              })
             )
             if (Option.isNone(quarantined)) {
               return yield* new ReplicaError.ProtocolInvalid({
@@ -3578,18 +3991,36 @@ export const layer = (
               )
             )
             const existing = yield* findQuarantineResubmission(mutationId).pipe(
-              Effect.mapError(StorageUnavailable.make)
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({ message: "Client quarantine resubmission row is corrupt", cause })
+                  )
+              })
             )
             if (Option.isSome(existing)) {
               const pendingRow = yield* findPendingByMutation(existing.value.replacement_mutation_id).pipe(
-                Effect.mapError(StorageUnavailable.make)
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                  SchemaError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause })
+                    )
+                })
               )
               let replacement: Protocol.PendingMutation | Quarantine.QuarantinedMutation
               if (Option.isSome(pendingRow)) {
                 replacement = yield* decodePendingRow(pendingRow.value)
               } else {
                 const quarantineRow = yield* findQuarantineByMutation(existing.value.replacement_mutation_id).pipe(
-                  Effect.mapError(StorageUnavailable.make)
+                  Effect.catchTags({
+                    SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                    SchemaError: (cause) =>
+                      Effect.fail(
+                        new ReplicaError.StorageCorrupt({ message: "Client quarantine row is corrupt", cause })
+                      )
+                  })
                 )
                 if (Option.isNone(quarantineRow)) {
                   return yield* new ReplicaError.StorageCorrupt({
@@ -3617,7 +4048,7 @@ export const layer = (
               (space_id, original_mutation_id, replacement_mutation_id)
               VALUES (${options.spaceId}, ${mutationId}, ${mutationResult.pendingMutation.envelope.mutationId})`
             return { ...mutationResult, pendingDelta: 1 }
-          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
           yield* updatePendingMetric(result.pendingDelta)
           const entities = result.pendingMutation.changes.map((change) => change.entity)
           yield* reactivity.withBatch(invalidate(entities, [], true))
@@ -3628,13 +4059,21 @@ export const layer = (
 
       const restoreProjection = pipe(
         lane.withTransaction(Effect.gen(function*() {
-          const dirty = yield* findDirtyEntities(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const dirty = yield* findDirtyEntities(undefined).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client projection dirty row is corrupt", cause })
+                )
+            })
+          )
           if (dirty.length > 0) {
             const current = yield* meta
             yield* requestProjectionReplay(current)
           }
         })),
-        Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+        Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
         Effect.andThen(rebuildProjectionDeferred),
         Effect.andThen(flushDeferredInvalidations)
       )
@@ -3644,14 +4083,20 @@ export const layer = (
       const receipt = (mutationId: Identity.MutationId) =>
         lane.withTransaction(Effect.gen(function*() {
           yield* validateFence(yield* meta)
-          const row = yield* findReceipt(mutationId).pipe(Effect.mapError(StorageUnavailable.make))
+          const row = yield* findReceipt(mutationId).pipe(
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
+            })
+          )
           if (Option.isNone(row)) return Option.none<Protocol.Receipt>()
           return Option.some(
             yield* Codec.parse(row.value.receipt_json).pipe(
               Effect.flatMap((value) => Codec.decode(Protocol.Receipt, value))
             )
           )
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       let admittedCommits = 0
       let releasedCommits = 0
@@ -3720,10 +4165,20 @@ export const layer = (
             const created = applied.flatMap((item) => Option.toArray(item.created))
             let pendingAfter = created.at(-1)?.pending
             if (pendingAfter === undefined && applied.some((item) => item.succeeded)) {
-              pendingAfter = (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
+              pendingAfter = (yield* countPending(undefined).pipe(Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is corrupt", cause })
+                  ),
+                NoSuchElementError: (cause) =>
+                  Effect.fail(
+                    new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is missing", cause })
+                  )
+              }))).count
             }
             return { applied, created, pending: pendingAfter }
-          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
           if (committed.created.length > 0) {
             yield* updatePendingMetric(committed.created.length)
             const entities = committed.created.flatMap((created) =>
@@ -3810,7 +4265,7 @@ export const layer = (
             Effect.exit,
             Effect.flatMap((raw) =>
               raw.pipe(
-                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+                Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
                 Effect.exit,
                 Effect.map((exit) => ({
                   created: Exit.match(exit, {
@@ -3863,7 +4318,7 @@ export const layer = (
               model,
               key
             )
-          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+          })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))),
         pendingToSubmit: afterLocalCommits(pendingToSubmit),
         pending,
         settlements: settlementsStream,
@@ -3889,12 +4344,22 @@ export const layer = (
         progress: lane.withTransaction(Effect.gen(function*() {
           const row = yield* meta
           yield* validateFence(row)
-          const pendingRow = yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const pendingRow = yield* countPending(undefined).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is corrupt", cause })
+              ),
+            NoSuchElementError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is missing", cause })
+              )
+          }))
           return {
             pending: pendingRow.count,
             cursor: Identity.ServerSequence.make(row.server_cursor)
           } satisfies Progress
-        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+        })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))),
         replicationState,
         setScope,
         applyViewPage: (page) => afterLocalCommits(applyViewPage(page)),
@@ -3902,10 +4367,20 @@ export const layer = (
         pendingCount: pipe(
           Effect.gen(function*() {
             yield* validateFence(yield* meta)
-            return (yield* countPending(undefined).pipe(Effect.mapError(StorageUnavailable.make))).count
+            return (yield* countPending(undefined).pipe(Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is corrupt", cause })
+                ),
+              NoSuchElementError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is missing", cause })
+                )
+            }))).count
           }),
           lane.withTransaction
-        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))),
         reconciliationGenerations,
         requestReconciliation,
         completeReconciliation,
@@ -3938,7 +4413,15 @@ export const layer = (
                     })
                   }
                   if (entry.sequence <= cursor) {
-                    const stored = yield* findLogEntry(entry.sequence).pipe(Effect.mapError(StorageUnavailable.make))
+                    const stored = yield* findLogEntry(entry.sequence).pipe(
+                      Effect.catchTags({
+                        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                        SchemaError: (cause) =>
+                          Effect.fail(
+                            new ReplicaError.StorageCorrupt({ message: "Client server log row is corrupt", cause })
+                          )
+                      })
+                    )
                     if (Option.isNone(stored)) {
                       return yield* new ReplicaError.StorageCorrupt({
                         message: `Server cursor covers missing log entry ${entry.sequence}`
@@ -3980,7 +4463,16 @@ export const layer = (
                   }
                   if (entry.clientId === options.clientId) {
                     const storedPending = yield* findPendingByMutation(entry.mutationId).pipe(
-                      Effect.mapError(StorageUnavailable.make)
+                      Effect.catchTags({
+                        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                        SchemaError: (cause) =>
+                          Effect.fail(
+                            new ReplicaError.StorageCorrupt({
+                              message: "Client pending mutation row is corrupt",
+                              cause
+                            })
+                          )
+                      })
                     )
                     if (Option.isSome(storedPending)) {
                       const decodedPending = yield* decodePendingRow(storedPending.value)
@@ -3998,7 +4490,13 @@ export const layer = (
                       }
                     }
                     const storedReceipt = yield* findReceipt(entry.mutationId).pipe(
-                      Effect.mapError(StorageUnavailable.make)
+                      Effect.catchTags({
+                        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                        SchemaError: (cause) =>
+                          Effect.fail(
+                            new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause })
+                          )
+                      })
                     )
                     if (Option.isSome(storedReceipt)) {
                       const storedTerminalReceipt = yield* Codec.parse(storedReceipt.value.receipt_json).pipe(
@@ -4040,7 +4538,9 @@ export const layer = (
                 )`
                 prunedReceiptIds = yield* pruneReceipts(options.retainedReceipts)
                 return yield* Effect.void
-              })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+              })).pipe(
+                Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+              )
               deferredSettlements.push(...pageSettlements)
               yield* deferInvalidation(
                 touched,
