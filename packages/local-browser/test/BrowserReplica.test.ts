@@ -174,7 +174,7 @@ const member = Protocol.EphemeralMember.make({
 
 const layerEphemeralOpening = (
   opening: Effect.Effect<void, ReplicaError.ReplicaError>,
-  updates: Ref.Ref<ReadonlyArray<unknown>>
+  updates: Ref.Ref<ReadonlyArray<readonly [string, unknown]>>
 ) =>
   Layer.succeed(EphemeralClient.EphemeralClient, {
     session: (_profile, options) =>
@@ -184,7 +184,8 @@ const layerEphemeralOpening = (
         events: () => Stream.never,
         state: () => Stream.never,
         members: Stream.never,
-        updateMember: (value: unknown) => Ref.update(updates, (values) => [...values, value])
+        updateMember: (value: unknown) =>
+          Ref.update(updates, (recorded) => [...recorded, [options.member.clientId, value] as const])
       })),
     publish: () => Effect.void,
     clear: () => Effect.void,
@@ -384,7 +385,7 @@ const followerMemberUpdatesAfterLeaderCloses = Effect.fnUntraced(
         return Deferred.await(reopened)
       })
     )
-    const updates = yield* Ref.make<ReadonlyArray<unknown>>([])
+    const updates = yield* Ref.make<ReadonlyArray<readonly [string, unknown]>>([])
     const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralOpening(opening, updates) })
     const leader = yield* environment.openTab
     const follower = yield* environment.openTab
@@ -394,7 +395,48 @@ const followerMemberUpdatesAfterLeaderCloses = Effect.fnUntraced(
     const updated = yield* settle(session.updateMember({ status: "away" }).pipe(Effect.exit))
     assert.isTrue(Exit.isSuccess(updated), String(updated))
     yield* settle(Deferred.succeed(reopened, undefined))
-    assert.deepStrictEqual(yield* Ref.get(updates), [{ status: "away" }])
+    assert.deepStrictEqual(yield* Ref.get(updates), [[member.clientId, { status: "away" }]])
+  },
+  Effect.scoped,
+  provideFileSystem
+)
+
+const followerSessionUpdatesReachTheirOwnSessionsAfterHandover = Effect.fnUntraced(
+  function*() {
+    const updates = yield* Ref.make<ReadonlyArray<readonly [string, unknown]>>([])
+    const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralOpening(Effect.void, updates) })
+    const leader = yield* environment.openTabWith(true)
+    const follower = yield* environment.openTabWith(false)
+    const ephemeral = Context.get(follower.context, EphemeralClient.EphemeralClient)
+    const members = [0, 1, 2, 3].map((index) =>
+      Protocol.EphemeralMember.make({
+        clientId: Identity.ClientId.make(`cli_00000000-0000-4000-8000-00000000041${index}`),
+        membershipIncarnation: member.membershipIncarnation
+      })
+    )
+    const scope = yield* Effect.scope
+    const sessions = yield* settle(Effect.forEach(
+      members,
+      (sessionMember) =>
+        ephemeral.session(StatusProfile, {
+          spaceId,
+          member: sessionMember,
+          value: { status: "online" },
+          ttl: "30 seconds"
+        }).pipe(Scope.provide(scope)),
+      { concurrency: "unbounded" }
+    ))
+    yield* settle(Scope.close(leader.scope, Exit.void))
+    yield* settle(Effect.forEach(
+      sessions,
+      (session, index) => session.updateMember({ status: `away ${index}` }),
+      { discard: true }
+    ))
+    const recorded = (yield* Ref.get(updates)).toSorted(([left], [right]) => left.localeCompare(right))
+    assert.deepStrictEqual(
+      recorded,
+      members.map((sessionMember, index) => [sessionMember.clientId, { status: `away ${index}` }] as const)
+    )
   },
   Effect.scoped,
   provideFileSystem
@@ -1017,7 +1059,7 @@ describe("BrowserReplica", () => {
           })
         )
         const environment = yield* makeEnvironmentWith({
-          layerEphemeral: layerEphemeralOpening(opening, yield* Ref.make<ReadonlyArray<unknown>>([]))
+          layerEphemeral: layerEphemeralOpening(opening, yield* Ref.make<ReadonlyArray<readonly [string, unknown]>>([]))
         })
         const tab = yield* environment.openTab
         const outcome = yield* settle(
@@ -1273,6 +1315,13 @@ describe("BrowserReplica at small scheduler budgets", () => {
     "serves the visible tab through rapid visibility flips without losing or repeating a mutation at a scheduler budget of 31 operations",
     () => rapidVisibilityFlips().pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 31))
   )
+  it.effect(
+    "delivers each follower ephemeral session's member update to that session after a handover at a scheduler budget of 9 operations",
+    () =>
+      followerSessionUpdatesReachTheirOwnSessionsAfterHandover().pipe(
+        Effect.provideService(Scheduler.MaxOpsBeforeYield, 9)
+      )
+  )
 })
 
 describe("BrowserReplica across builds", () => {
@@ -1382,7 +1431,7 @@ describe("BrowserReplica across builds", () => {
     "fails an older build tab's ephemeral session projections with BuildSuperseded",
     Effect.fnUntraced(
       function*() {
-        const updates = yield* Ref.make<ReadonlyArray<unknown>>([])
+        const updates = yield* Ref.make<ReadonlyArray<readonly [string, unknown]>>([])
         const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralOpening(Effect.void, updates) })
         const leader = yield* environment.openTab
         const session = yield* settle(openStatusSession(leader.context).pipe(Scope.provide(yield* Effect.scope)))
@@ -1407,7 +1456,7 @@ describe("BrowserReplica across builds", () => {
             return Deferred.await(reopened)
           })
         )
-        const updates = yield* Ref.make<ReadonlyArray<unknown>>([])
+        const updates = yield* Ref.make<ReadonlyArray<readonly [string, unknown]>>([])
         const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralOpening(opening, updates) })
         const leader = yield* environment.openTab
         const follower = yield* environment.openTab
