@@ -218,7 +218,7 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
     ),
     spaceIdleTtlMillis: yield* positiveFiniteDurationMillis(
       "spaceIdleTtl",
-      options.spaceIdleTtl ?? Protocol.maximumEphemeralStateTtlMillis
+      options.spaceIdleTtl ?? memberTtlMillis
     )
   } satisfies ResolvedOptions
   if (resolved.memberTtlMillis < Protocol.minimumEphemeralMemberTtlMillis) {
@@ -255,12 +255,6 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
     return yield* invalidConfiguration(
       "maximumStateTtl",
       `maximumStateTtl must not exceed ${Protocol.maximumEphemeralStateTtlMillis} milliseconds`
-    )
-  }
-  if (resolved.spaceIdleTtlMillis < resolved.maximumStateTtlMillis) {
-    return yield* invalidConfiguration(
-      "spaceIdleTtl",
-      "spaceIdleTtl must be at least maximumStateTtl"
     )
   }
   return resolved
@@ -848,7 +842,11 @@ export const layer = <R = never,>(
                   yield* FiberMap.run(
                     runtime.stateTimers,
                     identity,
-                    Effect.sleep(ttlMillis).pipe(Effect.andThen(expireState))
+                    acquireSpace(request.spaceId).pipe(
+                      Effect.andThen(Effect.sleep(ttlMillis)),
+                      Effect.andThen(expireState),
+                      Effect.scoped
+                    )
                   )
                   yield* publishDelta(
                     runtime,

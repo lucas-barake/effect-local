@@ -182,8 +182,8 @@ policy belongs to the application rather than this generic best-effort transport
 `maximumSpaces`, `maximumWatchersPerSpace`, and `maximumMembersPerSpace` default to 1024, `maximumEventKeysPerMember`
 to 64, `maximumEventKeysPerSpace` to 4096, `maximumStateKeysPerMember` to 256, `maximumStateKeysPerSpace` to 16384,
 `maximumBytesPerMember` to 1 MiB, `maximumBytesPerSpace` to 16 MiB, and `maximumSnapshotBytes` to the 4 MiB frame
-limit. TTL bounds default to the wire maxima. `spaceIdleTtl` must be at least `maximumStateTtl`, so idle eviction
-cannot shorten promised state replay.
+limit. TTL bounds default to the wire maxima. Retained state keeps its space alive until the state expires, and a space
+that no watcher, request, or retained state occupies is released after `spaceIdleTtl`, which defaults to `memberTtl`.
 
 The wire contract also caps each encoded join or publish payload at 16 KiB, channel and key strings at 256 characters,
 member and event TTLs at 60 seconds, and state TTLs at seven days. The server takes the smaller of the requested TTL
