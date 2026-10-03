@@ -255,7 +255,16 @@ export const withServerTransaction = <A, E extends { readonly _tag: string }, R,
           if (!committing || commitErrors.length === 0 || commitErrors.length !== cause.reasons.length) {
             return Effect.failCause(cause)
           }
-          return Effect.fail(commitErrors[0])
+          if (commitErrors.length === 1) return Effect.fail(commitErrors[0])
+          return Effect.fail(
+            new SqlError.SqlError({
+              reason: new SqlError.UnknownError({
+                message: "COMMIT failed and its cleanup ROLLBACK failed",
+                operation: "commit",
+                cause
+              })
+            })
+          )
         }),
         Effect.catch((error) => {
           if (remaining > 1 && transientConflict(error)) return attempt(remaining - 1)
