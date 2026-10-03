@@ -149,6 +149,7 @@ interface RememberedEntry {
   settlementsRecorded: Deferred.Deferred<void>
   leases: number
   leaving: boolean
+  dueWhileLeaving: boolean
   leaveCompletion: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
   workflowRegistration: ReconciliationWorkflow.RegistrationService | undefined
   summaryStatus: ReplicaStatus.ReplicaStatus
@@ -689,7 +690,11 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const enqueueBackground = (entry: RememberedEntry, resetRetry = true) =>
         Effect.suspend(() => {
-          if (entry.leaving || backgroundQueued.has(entry.spaceId)) return Effect.void
+          if (entry.leaving) {
+            entry.dueWhileLeaving = true
+            return Effect.void
+          }
+          if (backgroundQueued.has(entry.spaceId)) return Effect.void
           if (resetRetry) {
             entry.retryAttempt = 0
             entry.backgroundGeneration += 1
@@ -886,7 +891,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             })
           )
           yield* updateContribution(entry, inactiveStatus(entry, count.count))
-          if (enqueuePending && count.count > 0 && !entry.leaving) yield* enqueueBackground(entry)
+          if (enqueuePending && count.count > 0) yield* enqueueBackground(entry)
           return true
         }))
 
@@ -1343,6 +1348,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           settlementsRecorded: Deferred.makeUnsafe<void>(),
           leases: 0,
           leaving: false,
+          dueWhileLeaving: false,
           leaveCompletion: undefined,
           workflowRegistration: undefined,
           summaryStatus: { _tag: "Idle", pending: row.count },
@@ -1522,9 +1528,12 @@ const makeLayer = <D extends Definition.Any, R,>(
             ),
             Effect.asVoid,
             Effect.tapError(() =>
-              Effect.sync(() => {
+              Effect.suspend(() => {
                 current.leaving = false
                 current.leaveCompletion = undefined
+                if (!current.dueWhileLeaving) return Effect.void
+                current.dueWhileLeaving = false
+                return enqueueBackground(current)
               })
             ),
             Effect.exit,
@@ -1564,7 +1573,11 @@ const makeLayer = <D extends Definition.Any, R,>(
         const spaceId = work.spaceId
         backgroundQueued.delete(spaceId)
         const entry = entries.get(spaceId)
-        if (entry === undefined || entry.leaving) return
+        if (entry === undefined) return
+        if (entry.leaving) {
+          entry.dueWhileLeaving = true
+          return
+        }
         const generation = entry.backgroundGeneration
         let activeRuntime: ActiveRuntime | undefined
         const transportGeneration = yield* remote.transportGeneration

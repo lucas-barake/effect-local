@@ -480,6 +480,75 @@ describe("background turns that settle after their space was left", () => {
   )
 })
 
+describe("work that comes due during a leave that later fails", () => {
+  it.effect(
+    "retries after a new credential that arrived while a leave that later failed was in progress",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer", singleSpace)
+      const attempts = yield* makeAttempts
+      const credentialChanged = yield* Deferred.make<void>()
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () => Deferred.await(credentialChanged),
+        pull: () => {
+          if (attempts.count() === 0) {
+            return Effect.andThen(
+              attempts.record,
+              Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
+            )
+          }
+          return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* awaitSpaceStatus(space, services.reactivity, "NeedsAuthentication")
+      const removal = yield* services.holdStatement("DELETE FROM effect_local_client_spaces")
+      const leaving = yield* replica.leave(spaceId).pipe(
+        Effect.result,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* removal.entered
+
+      yield* Deferred.succeed(credentialChanged, undefined)
+      yield* settle("1 second")
+      yield* removal.release
+      const left = yield* Fiber.join(leaving)
+
+      assert.strictEqual(left._tag, "Failure")
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
+      assert.isTrue(Option.isSome(retried))
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "retries a background space whose retry came due while a leave that later failed was in progress",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer", singleSpace)
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+      }))
+      yield* attempts.reached(1)
+      yield* settle("1 second")
+      const removal = yield* services.holdStatement("DELETE FROM effect_local_client_spaces")
+      const leaving = yield* replica.leave(spaceId).pipe(
+        Effect.result,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* removal.entered
+
+      yield* settle("5 minutes")
+      yield* removal.release
+      const left = yield* Fiber.join(leaving)
+
+      assert.strictEqual(left._tag, "Failure")
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
+      assert.isTrue(Option.isSome(retried))
+    }, Effect.scoped)
+  )
+})
+
 describe("review 225 suspicions that did not reproduce", () => {
   it.effect(
     "keeps waiting for a new credential when leaving the space fails",
