@@ -8,14 +8,19 @@ import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Queue from "effect/Queue"
+import * as Redacted from "effect/Redacted"
 import * as Ref from "effect/Ref"
+import * as Result from "effect/Result"
 import * as RpcClient from "effect/rpc/RpcClient"
 import * as RpcSerialization from "effect/rpc/RpcSerialization"
 import * as Schedule from "effect/Schedule"
 import * as Socket from "effect/socket/Socket"
 import * as TestClock from "effect/testing/TestClock"
+import * as Authentication from "../src/Authentication.js"
 import * as LosslessQueue from "../src/internal/losslessQueue.js"
+import * as ProtocolSession from "../src/ProtocolSession.js"
 import * as SyncClient from "../src/SyncClient.js"
+import * as SyncRpc from "../src/SyncRpc.js"
 import * as Transport from "../src/Transport.js"
 import * as RecordingClock from "./fixtures/recordingClock.js"
 
@@ -55,6 +60,25 @@ const failingReader = (
   pull: Deferred.await(gate).pipe(Effect.andThen(failure)),
   upgrade: () => Effect.void
 })
+
+const secretBearer = Redacted.make("secret")
+const layerAuthenticationClient = Layer.fresh(Authentication.layerClient).pipe(
+  Layer.provide(Authentication.layerCredentialProviderStatic(secretBearer))
+)
+
+const writerFailingAfterPing = (pinged: Deferred.Deferred<void>): Effect.Effect<Socket.Writer> =>
+  Effect.map(Ref.make(0), (writes) => ({
+    write: () =>
+      Ref.updateAndGet(writes, (count) => count + 1).pipe(
+        Effect.flatMap((count) => {
+          if (count === 1) return Deferred.succeed(pinged, undefined)
+          return Effect.fail(
+            new Socket.SocketError({ reason: new Socket.SocketWriteError({ cause: "connection reset" }) })
+          )
+        })
+      ),
+    writeAll: () => Effect.void
+  }))
 
 describe("SyncClient", () => {
   it.effect(
@@ -497,5 +521,130 @@ describe("SyncClient", () => {
       const defect = Cause.findDefect(cause)
       assert.isTrue(defect._tag === "Success")
       if (defect._tag === "Success") assert.strictEqual(defect.success, "socket defect")
+    })))
+
+  it.effect("reconnects and keeps serving requests after the server sends a frame that cannot be decoded", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const incoming = yield* Queue.unbounded<Frame>()
+      const pings = yield* Queue.unbounded<void>()
+      const sawProtocolError = yield* Deferred.make<void>()
+      const answered = yield* Deferred.make<void>()
+      const socket = Socket.make({
+        reader: Effect.succeed(queueReader(incoming)),
+        writer: Effect.succeed({ write: () => Queue.offer(pings, undefined), writeAll: () => Effect.void })
+      })
+      const recording = yield* RecordingClock.make
+      const context = yield* Layer.build(
+        SyncClient.layerProtocolSocket({ retryPolicy: Schedule.spaced("1 second") }).pipe(
+          Layer.provide(Layer.succeed(Socket.Socket, socket)),
+          Layer.provide(RpcSerialization.layerJson)
+        )
+      ).pipe(Effect.provideService(Clock.Clock, recording.clock))
+      const protocol = Context.get(context, RpcClient.Protocol)
+      yield* protocol.run(1, (response) => {
+        if (response._tag === "ClientProtocolError") return Deferred.succeed(sawProtocolError, undefined)
+        if (response._tag === "Exit" && response.requestId === 2) return Deferred.succeed(answered, undefined)
+        return Effect.void
+      }).pipe(Effect.forkScoped({ startImmediately: true }))
+      yield* Queue.take(pings)
+
+      yield* Queue.offer(incoming, { message: "not a json frame" })
+      yield* Deferred.await(sawProtocolError)
+      const retry = yield* recording.nextSleep((request) => request.millis === 1_000)
+      yield* recording.advanceTo(retry.deadline)
+      yield* Queue.take(pings)
+
+      yield* protocol.send(1, {
+        _tag: "Request",
+        id: 2,
+        tag: "Test",
+        payload: undefined,
+        headers: []
+      })
+      yield* Queue.offer(incoming, {
+        message: RpcSerialization.json.makeUnsafe().encode({
+          _tag: "Exit",
+          requestId: 2,
+          exit: { _tag: "Success", value: null }
+        })!
+      })
+      yield* Deferred.await(answered)
+    })))
+
+  it.effect("fails a request whose socket write fails with a typed error and forgets its route", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const incoming = yield* Queue.unbounded<Frame>()
+      const pinged = yield* Deferred.make<void>()
+      const socket = Socket.make({
+        reader: Effect.succeed(queueReader(incoming)),
+        writer: writerFailingAfterPing(pinged)
+      })
+      const context = yield* Layer.build(
+        SyncClient.layerProtocolSocket().pipe(
+          Layer.provide(Layer.succeed(Socket.Socket, socket)),
+          Layer.provide(RpcSerialization.layerJson)
+        )
+      )
+      const protocol = Context.get(context, RpcClient.Protocol)
+      const firstClientResponses = yield* Ref.make<Array<string>>([])
+      const secondClientResponses = yield* Ref.make<Array<string>>([])
+      yield* protocol.run(1, (response) => Ref.update(firstClientResponses, (tags) => [...tags, response._tag])).pipe(
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* protocol.run(2, (response) => Ref.update(secondClientResponses, (tags) => [...tags, response._tag])).pipe(
+        Effect.forkScoped({ startImmediately: true })
+      )
+      yield* Deferred.await(pinged)
+
+      const sent = yield* Effect.result(protocol.send(1, {
+        _tag: "Request",
+        id: 1,
+        tag: "Test",
+        payload: undefined,
+        headers: []
+      }))
+      assert.strictEqual(
+        Result.match(sent, { onSuccess: () => "sent", onFailure: (error) => error.reason._tag }),
+        "SocketWriteError"
+      )
+
+      const processed = yield* Deferred.make<void>()
+      yield* Queue.offer(incoming, {
+        message: RpcSerialization.json.makeUnsafe().encode({
+          _tag: "Exit",
+          requestId: 1,
+          exit: { _tag: "Success", value: null }
+        })!,
+        processed
+      })
+      yield* Deferred.await(processed)
+
+      assert.deepStrictEqual(yield* Ref.get(firstClientResponses), ["Exit"])
+      assert.deepStrictEqual(yield* Ref.get(secondClientResponses), ["Exit"])
+    })))
+
+  it.effect("reports a socket write failure during negotiation as an unavailable server", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const pinged = yield* Deferred.make<void>()
+      const socket = Socket.make({
+        reader: Effect.succeed(queueReader(yield* Queue.unbounded<Frame>())),
+        writer: writerFailingAfterPing(pinged)
+      })
+      const context = yield* Layer.build(
+        ProtocolSession.layer.pipe(
+          Layer.provide(SyncClient.layerProtocolSocket()),
+          Layer.provide(Layer.succeed(Socket.Socket, socket)),
+          Layer.provide(SyncRpc.layerJson()),
+          Layer.provide(layerAuthenticationClient)
+        )
+      )
+      const session = Context.get(context, ProtocolSession.ProtocolSession)
+      yield* Deferred.await(pinged)
+
+      const negotiated = yield* Effect.result(session.version)
+      assert.strictEqual(
+        Result.match(negotiated, { onSuccess: () => "negotiated", onFailure: (error) => error._tag }),
+        "ServerUnavailable"
+      )
     })))
 })
