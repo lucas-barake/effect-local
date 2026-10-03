@@ -35,7 +35,6 @@ import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as SqliteIdentifier from "./internal/sqliteIdentifier.js"
-import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import { isTransportFailure } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Migrations from "./Migrations.js"
@@ -459,7 +458,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const durableScope = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
         const row = yield* lane.withStatement(readDesiredScope(spaceId)).pipe(
           Effect.catchTags({
-            SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
             SchemaError: (cause) =>
               Effect.fail(
                 new ReplicaError.StorageCorrupt({
@@ -818,7 +817,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           }
           const count = yield* lane.withStatement(pendingCount(entry.spaceId)).pipe(
             Effect.catchTags({
-              SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
               SchemaError: (cause) =>
                 Effect.fail(
                   new ReplicaError.StorageCorrupt({
@@ -928,7 +927,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               Effect.andThen(restore(
                 lane.withStatement(pendingCount(entry.spaceId)).pipe(
                   Effect.catchTags({
-                    SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                    SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
                     SchemaError: (cause) =>
                       Effect.fail(
                         new ReplicaError.StorageCorrupt({
@@ -1251,7 +1250,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             }
             return lane.withStatement(pendingCount(entry.spaceId)).pipe(
               Effect.catchTags({
-                SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
                 SchemaError: (cause) =>
                   Effect.fail(
                     new ReplicaError.StorageCorrupt({
@@ -1381,11 +1380,11 @@ const makeLayer = <D extends Definition.Any, R,>(
             joining.set(spaceId, completion)
             const result = yield* restore(
               lane.withTransaction(insertMembership(spaceId)).pipe(
-                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+                Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
                 Effect.andThen(
                   lane.withStatement(readMembership(spaceId)).pipe(
                     Effect.catchTags({
-                      SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+                      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
                       SchemaError: (cause) =>
                         Effect.fail(
                           new ReplicaError.StorageCorrupt({
@@ -1438,7 +1437,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               lane.withTransaction(
                 sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
               ).pipe(
-                Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+                Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
                 Effect.asVoid
               )
             )
@@ -1451,7 +1450,9 @@ const makeLayer = <D extends Definition.Any, R,>(
             Effect.andThen(
               lane.withTransaction(
                 sql`DELETE FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
-              ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+              ).pipe(
+                Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
+              )
             ),
             Effect.tap(() =>
               removeContribution(current).pipe(
@@ -1555,7 +1556,7 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const restored = yield* lane.withStatement(readMemberships(undefined)).pipe(
         Effect.catchTags({
-          SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
           SchemaError: (cause) =>
             Effect.fail(
               new ReplicaError.StorageCorrupt({

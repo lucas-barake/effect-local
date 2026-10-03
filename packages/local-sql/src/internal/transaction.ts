@@ -3,7 +3,7 @@ import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
-import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
@@ -14,7 +14,6 @@ import * as SqlError from "effect/sql/SqlError"
 import * as SqlSchema from "effect/sql/SqlSchema"
 import * as Codec from "./codec.js"
 import * as Rows from "./rows.js"
-import * as StorageUnavailable from "./storageUnavailable.js"
 
 interface EncodedEntityKey<M extends Model.Any,> {
   readonly encodedKey: M["key"]["Encoded"]
@@ -76,7 +75,11 @@ export const local = (
     get: Effect.fnUntraced(function*(model, key) {
       const { keyJson } = yield* encodeEntityKey(model, key)
       const row = yield* find({ model: model.name, key: keyJson }).pipe(
-        Effect.mapError(StorageUnavailable.make)
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client entity row is corrupt", cause }))
+        })
       )
       if (Option.isNone(row)) return Option.none()
       const value = yield* Codec.parse(row.value.value_json).pipe(
@@ -106,7 +109,7 @@ export const local = (
         entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
         value: encoded.encodedValue
       })
-    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))),
     delete: Effect.fnUntraced(function*(model, key) {
       const encoded = yield* encodeEntityKey(model, key)
       if (options.table === "visible") {
@@ -123,7 +126,7 @@ export const local = (
         _tag: "Delete",
         entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }
       })
-    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)
   }
 }
@@ -147,7 +150,11 @@ export const server = (options: {
     get: Effect.fnUntraced(function*(model, key) {
       const { keyJson } = yield* encodeEntityKey(model, key)
       const row = yield* find({ spaceId: options.spaceId, model: model.name, key: keyJson }).pipe(
-        Effect.mapError(StorageUnavailable.make)
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity row is corrupt", cause }))
+        })
       )
       if (Option.isNone(row)) return Option.none()
       const value = yield* Codec.parse(row.value.value_json).pipe(
@@ -175,7 +182,7 @@ export const server = (options: {
         entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey },
         value: encoded.encodedValue
       })
-    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))),
     delete: Effect.fnUntraced(function*(model, key) {
       const encoded = yield* encodeEntityKey(model, key)
       yield* options.sql`DELETE FROM effect_local_server_entities_data
@@ -185,7 +192,7 @@ export const server = (options: {
         _tag: "Delete",
         entity: { model: model.name, modelVersion: model.version, key: encoded.encodedKey }
       })
-    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))),
     applyField: (semantics, current, operation) => semantics.apply(current, operation)
   }
 }
@@ -210,7 +217,7 @@ export const applyCanonicalChange = Effect.fnUntraced(function*(
           ${change.entity.modelVersion})
         ON CONFLICT (space_id, schema_generation, model, entity_key) DO UPDATE SET
           value_json = excluded.value_json, model_version = excluded.model_version`
-}, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+}, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
 export const entityKey = (entity: Protocol.EntityKey) => Canonical.stringify([entity.model, entity.key])
 

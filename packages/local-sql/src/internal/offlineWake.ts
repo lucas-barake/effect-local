@@ -18,7 +18,6 @@ import * as Configuration from "./configuration.js"
 import * as Dialect from "./dialect.js"
 import * as LosslessQueue from "./losslessQueue.js"
 import * as Rows from "./rows.js"
-import * as StorageUnavailable from "./storageUnavailable.js"
 import * as SqlTransaction from "./transaction.js"
 
 const NonNegativeInt = Schema.Natural
@@ -37,7 +36,7 @@ export interface Service {
   readonly registerWatch: (
     spaceId: Identity.SpaceId,
     clientId: Identity.ClientId
-  ) => Effect.Effect<void, ReplicaError.StorageUnavailable, Scope.Scope>
+  ) => Effect.Effect<void, ReplicaError.StorageUnavailable | ReplicaError.StorageCorrupt, Scope.Scope>
 }
 
 const disabled: Service = {
@@ -77,7 +76,7 @@ const CountRow = Schema.Struct({ count: Rows.integer(NonNegativeInt) })
 
 const randomToken = (crypto: Crypto.Crypto) =>
   crypto.randomUUIDv4.pipe(
-    Effect.mapError(StorageUnavailable.make)
+    Effect.catchTag("PlatformError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
   )
 
 export const make = Effect.fnUntraced(function*<R,>(
@@ -159,7 +158,7 @@ export const make = Effect.fnUntraced(function*<R,>(
   yield* Effect.acquireRelease(
     sql`INSERT INTO effect_local_server_watch_runtimes (runtime_id, expires_at)
       VALUES (${runtimeId}, ${runtimeStartedAt + presenceLeaseMillis})`.pipe(
-      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+      Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
       Effect.as(runtimeId)
     ),
     () =>
@@ -205,7 +204,7 @@ export const make = Effect.fnUntraced(function*<R,>(
     sql`UPDATE effect_local_server_offline_wake_spaces SET claim_token = NULL, claimed_until = NULL
         WHERE space_id = ${row.space_id} AND claim_token = ${row.claim_token}`.pipe(
       Effect.asVoid,
-      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+      Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
     )
   const failSpaceClaim = (row: typeof SpaceRow.Type, now: number) => {
     const retryDelay = Configuration.retryMillis(retryTiming, row.attempt_count + 1)
@@ -215,7 +214,7 @@ export const make = Effect.fnUntraced(function*<R,>(
         claim_token = NULL, claimed_until = NULL
         WHERE space_id = ${row.space_id} AND claim_token = ${row.claim_token}`.pipe(
       Effect.asVoid,
-      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+      Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
     )
   }
 
@@ -286,12 +285,12 @@ export const make = Effect.fnUntraced(function*<R,>(
     const pending = yield* Effect.forEach(recipients, (clientId) =>
       Identity.makeWakeId.pipe(
         Effect.provideService(Crypto.Crypto, crypto),
-        Effect.mapError(StorageUnavailable.make),
+        Effect.catchTag("PlatformError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
         Effect.map((wakeId) => ({ clientId, wakeId }))
       ))
     const pendingJson = yield* Codec.stringify(
       pending.map(({ clientId, wakeId }) => ({ client_id: clientId, wake_id: wakeId }))
-    ).pipe(Effect.mapError(StorageUnavailable.make))
+    )
     const generation = row.membership_generation + 1
     yield* SqlTransaction.withServerTransaction(
       sql,
@@ -348,7 +347,7 @@ export const make = Effect.fnUntraced(function*<R,>(
         return yield* Effect.void
       })
     ).pipe(
-      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+      Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
     )
   })
 
@@ -454,7 +453,7 @@ export const make = Effect.fnUntraced(function*<R,>(
         WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
           AND claim_token = ${row.claim_token}`.pipe(
       Effect.asVoid,
-      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+      Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
     )
   const failClientClaim = (row: typeof ClientRow.Type, now: number) => {
     const retryDelay = Configuration.retryMillis(retryTiming, row.attempt_count + 1)
@@ -465,7 +464,7 @@ export const make = Effect.fnUntraced(function*<R,>(
         WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
           AND claim_token = ${row.claim_token}`.pipe(
       Effect.asVoid,
-      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+      Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
     )
   }
 
@@ -477,7 +476,13 @@ export const make = Effect.fnUntraced(function*<R,>(
     })
     const now = yield* Clock.currentTimeMillis
     const presence = yield* activePresence({ spaceId: row.space_id, clientId: row.client_id, now }).pipe(
-      Effect.mapError(StorageUnavailable.make)
+      Effect.catchTags({
+        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+        SchemaError: (cause) =>
+          Effect.fail(new ReplicaError.StorageCorrupt({ message: "Offline wake presence lease is corrupt", cause })),
+        NoSuchElementError: (cause) =>
+          Effect.fail(new ReplicaError.StorageCorrupt({ message: "Offline wake presence lease is missing", cause }))
+      })
     )
     if (presence.expires_at !== null) {
       yield* releaseClientClaim(row, Math.max(now + pollIntervalMillis, presence.expires_at))
@@ -527,7 +532,7 @@ export const make = Effect.fnUntraced(function*<R,>(
     if (delivered.value.value === "NotRecipient") {
       const nextWakeId = yield* Identity.makeWakeId.pipe(
         Effect.provideService(Crypto.Crypto, crypto),
-        Effect.mapError(StorageUnavailable.make)
+        Effect.catchTag("PlatformError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
       )
       yield* SqlTransaction.withServerTransaction(
         sql,
@@ -545,13 +550,13 @@ export const make = Effect.fnUntraced(function*<R,>(
             AND high_water_sequence <= ${row.high_water_sequence}`
         })
       ).pipe(
-        Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+        Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
       )
       return
     }
     const nextWakeId = yield* Identity.makeWakeId.pipe(
       Effect.provideService(Crypto.Crypto, crypto),
-      Effect.mapError(StorageUnavailable.make)
+      Effect.catchTag("PlatformError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
     )
     yield* sql`UPDATE effect_local_server_offline_wakes SET
           notified_sequence = ${dialect.greatest(sql`notified_sequence`, sql`${row.high_water_sequence}`)},
@@ -562,7 +567,7 @@ export const make = Effect.fnUntraced(function*<R,>(
           claim_token = NULL, claimed_until = NULL
           WHERE space_id = ${row.space_id} AND client_id = ${row.client_id}
             AND claim_token = ${row.claim_token}`.pipe(
-      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+      Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
       Effect.asVoid
     )
   })
@@ -576,7 +581,7 @@ export const make = Effect.fnUntraced(function*<R,>(
       WHERE runtime.expires_at <= ${now}
       ORDER BY runtime.expires_at, runtime.runtime_id LIMIT ${options.claimBatchSize}
     )`.pipe(
-      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+      Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
     )
     yield* sql`DELETE FROM effect_local_server_watch_runtimes WHERE runtime_id IN (
       SELECT runtime.runtime_id FROM effect_local_server_watch_runtimes AS runtime
@@ -585,7 +590,7 @@ export const make = Effect.fnUntraced(function*<R,>(
           WHERE presence.runtime_id = runtime.runtime_id)
       ORDER BY runtime.expires_at, runtime.runtime_id LIMIT ${options.claimBatchSize}
     )`.pipe(
-      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+      Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
     )
     let spaceClaims = 0
     while (spaceClaims < options.claimBatchSize) {
@@ -600,7 +605,13 @@ export const make = Effect.fnUntraced(function*<R,>(
         token,
         claimedUntil: claimNow + claimLeaseMillis,
         limit
-      }).pipe(Effect.mapError(StorageUnavailable.make))
+      }).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Offline wake space row is corrupt", cause }))
+        })
+      )
       if (spaces.length === 0) break
       spaceClaims += spaces.length
       const orderedSpaces = [...spaces].sort((left, right) => left.space_id.localeCompare(right.space_id))
@@ -624,7 +635,13 @@ export const make = Effect.fnUntraced(function*<R,>(
         token,
         claimedUntil: claimNow + claimLeaseMillis,
         limit
-      }).pipe(Effect.mapError(StorageUnavailable.make))
+      }).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Offline wake row is corrupt", cause }))
+        })
+      )
       if (clients.length === 0) break
       clientClaims += clients.length
       const orderedClients = [...clients].sort((left, right) => {
@@ -665,7 +682,7 @@ export const make = Effect.fnUntraced(function*<R,>(
                 THEN excluded.next_attempt_at
                 ELSE effect_local_server_offline_wake_spaces.next_attempt_at END`
       ),
-      Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+      Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
       Effect.asVoid
     )
 
@@ -698,7 +715,13 @@ export const make = Effect.fnUntraced(function*<R,>(
           }
           return presenceInserted
         })
-      ).pipe(Effect.mapError(StorageUnavailable.make))
+      ).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Offline wake presence row is corrupt", cause }))
+        })
+      )
       if (Option.isNone(inserted)) return false
       presences.set(watcherId, { spaceId, clientId })
       return true
@@ -778,7 +801,7 @@ export const make = Effect.fnUntraced(function*<R,>(
         watcher_id: watcherId,
         space_id: presence.spaceId,
         client_id: presence.clientId
-      }))).pipe(Effect.mapError(StorageUnavailable.make))
+      })))
       const localPresence = dialect.jsonRecords(encoded, "local_presence", [
         { name: "space_id", affinity: "text" },
         { name: "client_id", affinity: "text" },
@@ -797,7 +820,7 @@ export const make = Effect.fnUntraced(function*<R,>(
           watcher_id: watcherId,
           space_id: presence.spaceId,
           client_id: presence.clientId
-        }))).pipe(Effect.mapError(StorageUnavailable.make))
+        })))
         const batchPresence = dialect.jsonRecords(batchEncoded, "local_presence", [
           { name: "space_id", affinity: "text" },
           { name: "client_id", affinity: "text" },

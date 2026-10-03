@@ -17,7 +17,6 @@ import * as SqlSchema from "effect/sql/SqlSchema"
 import type * as Statement from "effect/sql/Statement"
 import * as ConnectionLane from "./ConnectionLane.js"
 import * as Codec from "./internal/codec.js"
-import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as SqlTransaction from "./internal/transaction.js"
 import * as QueryReactivity from "./QueryReactivity.js"
 
@@ -214,11 +213,12 @@ export const layer = <D extends Definition.Any,>(
               // silently reclassifying an outage as a bad statement.
               const rows: ReadonlyArray<unknown> = yield* sql`WITH RECURSIVE ${ctes} ${user}`.pipe(
                 Effect.catchReasons("SqlError", {
-                  ConnectionError: (reason) => Effect.fail(StorageUnavailable.make(reason)),
-                  LockTimeoutError: (reason) => Effect.fail(StorageUnavailable.make(reason)),
-                  StatementTimeoutError: (reason) => Effect.fail(StorageUnavailable.make(reason)),
-                  DeadlockError: (reason) => Effect.fail(StorageUnavailable.make(reason)),
-                  SerializationError: (reason) => Effect.fail(StorageUnavailable.make(reason))
+                  ConnectionError: (reason) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: reason })),
+                  LockTimeoutError: (reason) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: reason })),
+                  StatementTimeoutError: (reason) =>
+                    Effect.fail(new ReplicaError.StorageUnavailable({ cause: reason })),
+                  DeadlockError: (reason) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: reason })),
+                  SerializationError: (reason) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: reason }))
                 }),
                 Effect.catchTag("SqlError", (error) => classifyStatementFailure(address, deduped, error))
               )
@@ -236,7 +236,12 @@ export const layer = <D extends Definition.Any,>(
       > => {
         const key = ReactivityKey.query(spaceId, query.name, payload)
         return lane.withTransaction(Effect.gen(function*() {
-          const fence = yield* findFence(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const fence = yield* findFence(undefined).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
+            NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: spaceId }))
+          }))
           if (
             fence.schema_version !== definition.schemaIdentity.version ||
             fence.schema_hash !== definition.schemaIdentity.hash ||
@@ -302,7 +307,7 @@ export const layer = <D extends Definition.Any,>(
           yield* queryReactivity.record(key, reads)
           return value
         })).pipe(
-          Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+          Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
           Effect.withSpan("QueryExecutor.execute", {
             attributes: { "query.name": query.name }
           })

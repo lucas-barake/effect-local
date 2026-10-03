@@ -5,6 +5,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
+import { flow } from "effect/Function"
 import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
@@ -15,7 +16,6 @@ import * as ClientLineage from "./internal/clientLineage.js"
 import * as Codec from "./internal/codec.js"
 import * as Dialect from "./internal/dialect.js"
 import * as Rows from "./internal/rows.js"
-import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as TerminalRejection from "./internal/TerminalRejection.js"
 import * as SqlTransaction from "./internal/transaction.js"
 import { MutationRuntime } from "./MutationRuntime.js"
@@ -422,25 +422,44 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
     })
   }
 
-  const readMeta = onLane(SqlSchema.findOne({
-    Request: Schema.Void,
-    Result: MetaRow,
-    execute: () =>
-      sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
+  const readMeta = flow(
+    SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: MetaRow,
+      execute: () =>
+        sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
         active_projection_generation,
         target_schema_version, target_schema_hash, migration_hash
         FROM effect_local_client_spaces WHERE space_id = ${options.spaceId}`
-  }))
-  const readProgress = onLane(SqlSchema.findOneOption({
-    Request: Schema.Void,
-    Result: ProgressRow,
-    execute: () =>
-      sql`SELECT source_schema_version, source_schema_hash, target_schema_version,
+    }),
+    lane.withStatement,
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+      SchemaError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
+      NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
+    })
+  )
+  const readProgress = flow(
+    SqlSchema.findOneOption({
+      Request: Schema.Void,
+      Result: ProgressRow,
+      execute: () =>
+        sql`SELECT source_schema_version, source_schema_hash, target_schema_version,
         target_schema_hash, migration_hash, generation, source_generation, source_projection_generation,
         target_projection_generation, phase,
         cursor_model, cursor_key, cursor_sequence
         FROM effect_local_client_evolution WHERE space_id = ${options.spaceId}`
-  }))
+    }),
+    lane.withStatement,
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+      SchemaError: (cause) =>
+        Effect.fail(
+          new ReplicaError.StorageCorrupt({ message: "Client schema evolution progress row is corrupt", cause })
+        )
+    })
+  )
   const countCanonicalGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
@@ -655,8 +674,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
   const registerLineage = ClientLineage.make(sql, options.spaceId)
 
   const validateBatch = Effect.fnUntraced(function*(state: typeof ProgressRow.Type) {
-    const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
-    const progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    const meta = yield* readMeta(undefined)
+    const progress = yield* readProgress(undefined)
     let expectedActiveGeneration: number = state.generation
     if (
       state.phase === "Flip" || state.phase === "Log" || state.phase === "Entities" ||
@@ -679,9 +698,9 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
     return undefined
   })
 
-  let progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+  let progress = yield* readProgress(undefined)
   if (Option.isNone(progress)) {
-    const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    const meta = yield* readMeta(undefined)
     const source = (yield* sourceDefinition(
       options.evolution,
       identityFrom(meta.schema_version, meta.schema_hash)
@@ -692,7 +711,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         yield* sql`UPDATE effect_local_client_spaces SET definition_hash = ${options.definition.hash}
             WHERE space_id = ${options.spaceId} AND schema_generation = ${meta.schema_generation}
               AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL`
-        const currentMeta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+        const currentMeta = yield* readMeta(undefined)
         if (
           currentMeta.schema_generation !== meta.schema_generation ||
           currentMeta.schema_version !== options.definition.schemaIdentity.version ||
@@ -721,7 +740,13 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         generation,
         sourceVersion: source.version,
         sourceHash: source.hash
-      }).pipe(Effect.mapError(StorageUnavailable.make))
+      }).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause }))
+        })
+      )
       if (Option.isNone(promoted)) return
       yield* sql`DELETE FROM effect_local_client_canonical_entities_data
           WHERE space_id = ${options.spaceId} AND schema_generation = ${generation}`
@@ -742,7 +767,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
             ${options.evolution.migrationHash}, ${generation}, ${meta.active_schema_generation},
             ${meta.active_projection_generation}, 0, 'Log', NULL, NULL, 0)`
     }))
-    progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    progress = yield* readProgress(undefined)
   }
   if (Option.isNone(progress)) {
     return yield* new ReplicaError.StorageCorrupt({ message: "Client schema evolution progress was not created" })
@@ -764,9 +789,9 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
   const definition = yield* sourceDefinition(options.evolution, source)
 
   while (true) {
-    const current = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    const current = yield* readProgress(undefined)
     if (Option.isNone(current)) {
-      const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+      const meta = yield* readMeta(undefined)
       if (
         meta.schema_generation === expected.generation &&
         meta.active_schema_generation === expected.generation &&
@@ -789,11 +814,15 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
 
     if (state.phase === "Log") {
       const after = state.cursor_sequence ?? 0
-      const metadata = yield* logMetadata({ after, limit: batchSize }).pipe(
-        Effect.mapError(StorageUnavailable.make)
+      const rows = yield* logMetadata({ after, limit: batchSize }).pipe(
+        Effect.flatMap((metadata) => boundedCount(metadata, batchBytes)),
+        Effect.flatMap((limit) => logBatch({ after, limit })),
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client server log row is corrupt", cause }))
+        })
       )
-      const limit = yield* boundedCount(metadata, batchBytes)
-      const rows = yield* logBatch({ after, limit }).pipe(Effect.mapError(StorageUnavailable.make))
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
@@ -814,34 +843,39 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         return undefined
       }))
     } else if (state.phase === "Entities") {
-      let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
-      if (state.cursor_model === null) {
-        metadata = yield* initialEntityMetadata({
-          generation: state.source_generation,
-          limit: batchSize
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-      } else {
-        metadata = yield* continuingEntityMetadata({
-          generation: state.source_generation,
-          model: state.cursor_model,
-          key: state.cursor_key!,
-          limit: batchSize
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-      }
-      const limit = yield* boundedCount(metadata, batchBytes)
-      let rows: ReadonlyArray<typeof EntityBatchRow.Type>
-      if (state.cursor_model === null) {
-        rows = yield* initialEntityBatch({ generation: state.source_generation, limit }).pipe(
-          Effect.mapError(StorageUnavailable.make)
-        )
-      } else {
-        rows = yield* continuingEntityBatch({
-          generation: state.source_generation,
-          model: state.cursor_model,
-          key: state.cursor_key!,
-          limit
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-      }
+      const rows = yield* Effect.gen(function*() {
+        let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
+        if (state.cursor_model === null) {
+          metadata = yield* initialEntityMetadata({
+            generation: state.source_generation,
+            limit: batchSize
+          })
+        } else {
+          metadata = yield* continuingEntityMetadata({
+            generation: state.source_generation,
+            model: state.cursor_model,
+            key: state.cursor_key!,
+            limit: batchSize
+          })
+        }
+        const limit = yield* boundedCount(metadata, batchBytes)
+        if (state.cursor_model === null) {
+          return yield* initialEntityBatch({ generation: state.source_generation, limit })
+        } else {
+          return yield* continuingEntityBatch({
+            generation: state.source_generation,
+            model: state.cursor_model,
+            key: state.cursor_key!,
+            limit
+          })
+        }
+      }).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client canonical entity row is corrupt", cause }))
+        })
+      )
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
@@ -882,11 +916,15 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         after: state.cursor_sequence ?? 0,
         limit: batchSize
       }
-      const metadata = yield* receiptMetadata(request).pipe(
-        Effect.mapError(StorageUnavailable.make)
+      const rows = yield* receiptMetadata(request).pipe(
+        Effect.flatMap((metadata) => boundedCount(metadata, batchBytes)),
+        Effect.flatMap((limit) => receiptBatch({ ...request, limit })),
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
+        })
       )
-      const limit = yield* boundedCount(metadata, batchBytes)
-      const rows = yield* receiptBatch({ ...request, limit }).pipe(Effect.mapError(StorageUnavailable.make))
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
@@ -929,11 +967,15 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         after: state.cursor_sequence ?? 0,
         limit: batchSize
       }
-      const metadata = yield* pendingMetadata(request).pipe(
-        Effect.mapError(StorageUnavailable.make)
+      const rows = yield* pendingMetadata(request).pipe(
+        Effect.flatMap((metadata) => boundedCount(metadata, batchBytes)),
+        Effect.flatMap((limit) => pendingBatch({ ...request, limit })),
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause }))
+        })
       )
-      const limit = yield* boundedCount(metadata, batchBytes)
-      const rows = yield* pendingBatch({ ...request, limit }).pipe(Effect.mapError(StorageUnavailable.make))
       yield* Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
@@ -1055,34 +1097,39 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         key: state.cursor_key,
         limit: batchSize
       }
-      let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
-      if (state.cursor_model === null || state.cursor_key === null) {
-        metadata = yield* initialRetractionMetadata({
-          generation: request.generation,
-          limit: request.limit
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-      } else {
-        metadata = yield* continuingRetractionMetadata({
-          generation: request.generation,
-          model: state.cursor_model,
-          key: state.cursor_key,
-          limit: request.limit
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-      }
-      const limit = yield* boundedCount(metadata, batchBytes)
-      let rows: ReadonlyArray<typeof RetractionBatchRow.Type>
-      if (state.cursor_model === null || state.cursor_key === null) {
-        rows = yield* initialRetractionBatch({ generation: request.generation, limit }).pipe(
-          Effect.mapError(StorageUnavailable.make)
-        )
-      } else {
-        rows = yield* continuingRetractionBatch({
-          generation: request.generation,
-          model: state.cursor_model,
-          key: state.cursor_key,
-          limit
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-      }
+      const rows = yield* Effect.gen(function*() {
+        let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
+        if (state.cursor_model === null || state.cursor_key === null) {
+          metadata = yield* initialRetractionMetadata({
+            generation: request.generation,
+            limit: request.limit
+          })
+        } else {
+          metadata = yield* continuingRetractionMetadata({
+            generation: request.generation,
+            model: state.cursor_model,
+            key: state.cursor_key,
+            limit: request.limit
+          })
+        }
+        const limit = yield* boundedCount(metadata, batchBytes)
+        if (state.cursor_model === null || state.cursor_key === null) {
+          return yield* initialRetractionBatch({ generation: request.generation, limit })
+        } else {
+          return yield* continuingRetractionBatch({
+            generation: request.generation,
+            model: state.cursor_model,
+            key: state.cursor_key,
+            limit
+          })
+        }
+      }).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client retraction row is corrupt", cause }))
+        })
+      )
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
@@ -1143,7 +1190,17 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
             WHERE space_id = ${options.spaceId} AND schema_generation = ${state.source_generation}
             ORDER BY model, entity_key LIMIT ${batchSize})`
         const remaining = yield* countCanonicalGeneration(state.source_generation).pipe(
-          Effect.mapError(StorageUnavailable.make)
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Client canonical entity count is corrupt", cause })
+              ),
+            NoSuchElementError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Client canonical entity count is missing", cause })
+              )
+          })
         )
         if (remaining.count === 0) {
           yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupVisible'
@@ -1158,7 +1215,15 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
             WHERE space_id = ${options.spaceId} AND schema_generation = ${state.source_generation}
             ORDER BY model, entity_key LIMIT ${batchSize})`
         const remaining = yield* countVisibleGeneration(state.source_generation).pipe(
-          Effect.mapError(StorageUnavailable.make)
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Client visible entity count is corrupt", cause })
+              ),
+            NoSuchElementError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client visible entity count is missing", cause }))
+          })
         )
         if (remaining.count === 0) {
           yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupRetractions'
@@ -1173,7 +1238,13 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
             WHERE space_id = ${options.spaceId} AND generation = ${state.source_generation}
             ORDER BY model, entity_key LIMIT ${batchSize})`
         const remaining = yield* countRetractionGeneration(state.source_generation).pipe(
-          Effect.mapError(StorageUnavailable.make)
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client retraction count is corrupt", cause })),
+            NoSuchElementError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client retraction count is missing", cause }))
+          })
         )
         if (remaining.count === 0) {
           yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupReceipts'
@@ -1188,7 +1259,13 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
             WHERE space_id = ${options.spaceId} AND schema_generation = ${state.source_generation}
             ORDER BY local_sequence LIMIT ${batchSize})`
         const remaining = yield* countReceiptGeneration(state.source_generation).pipe(
-          Effect.mapError(StorageUnavailable.make)
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is corrupt", cause })),
+            NoSuchElementError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is missing", cause }))
+          })
         )
         if (remaining.count === 0) {
           yield* sql`UPDATE effect_local_client_evolution SET phase = 'CleanupPending'
@@ -1203,7 +1280,17 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
             WHERE space_id = ${options.spaceId} AND schema_generation = ${state.source_generation}
             ORDER BY local_sequence LIMIT ${batchSize})`
         const remaining = yield* countPendingGeneration(state.source_generation).pipe(
-          Effect.mapError(StorageUnavailable.make)
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is corrupt", cause })
+              ),
+            NoSuchElementError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Client pending mutation count is missing", cause })
+              )
+          })
         )
         if (remaining.count === 0) {
           yield* sql`UPDATE effect_local_client_evolution SET phase = 'Finalize'
@@ -1225,7 +1312,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
     }
     if (options.afterBatch !== undefined) yield* options.afterBatch
   }
-}, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+}, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
 const ServerMetaEvolutionRow = Schema.Struct({
   definition_hash: Schema.String,
@@ -1299,14 +1386,23 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     })
   }
 
-  const readMeta = SqlSchema.findOne({
-    Request: Schema.Void,
-    Result: ServerMetaEvolutionRow,
-    execute: () =>
-      sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
+  const readMeta = flow(
+    SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: ServerMetaEvolutionRow,
+      execute: () =>
+        sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
         target_schema_version, target_schema_hash, migration_hash FROM effect_local_server_spaces
         WHERE space_id = ${options.spaceId}`
-  })
+    }),
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+      SchemaError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause })),
+      NoSuchElementError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
+    })
+  )
   const lockMeta = SqlSchema.findOne({
     Request: Schema.Void,
     Result: ServerMetaEvolutionRow,
@@ -1315,15 +1411,24 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
         target_schema_version, target_schema_hash, migration_hash FROM effect_local_server_spaces
         WHERE space_id = ${options.spaceId} ${dialect.forNoKeyUpdate}`
   })
-  const readProgress = SqlSchema.findOneOption({
-    Request: Schema.Void,
-    Result: ServerProgressRow,
-    execute: () =>
-      sql`SELECT source_schema_version, source_schema_hash, target_schema_version,
+  const readProgress = flow(
+    SqlSchema.findOneOption({
+      Request: Schema.Void,
+      Result: ServerProgressRow,
+      execute: () =>
+        sql`SELECT source_schema_version, source_schema_hash, target_schema_version,
         target_schema_hash, migration_hash, generation, source_generation, target_entity_count,
         target_entity_bytes, phase, cursor_model, cursor_key, cursor_sequence
         FROM effect_local_server_evolution WHERE space_id = ${options.spaceId}`
-  })
+    }),
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+      SchemaError: (cause) =>
+        Effect.fail(
+          new ReplicaError.StorageCorrupt({ message: "Server schema evolution progress row is corrupt", cause })
+        )
+    })
+  )
   const countEntityGeneration = SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
@@ -1489,7 +1594,13 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
         model,
         modelVersion: alias.modelVersion,
         key: alias.key
-      }).pipe(Effect.mapError(StorageUnavailable.make))
+      }).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server key lineage group row is corrupt", cause }))
+        })
+      )
       if (Option.isSome(found)) groups.add(found.value.lineage_id)
     }
     const targetKey = yield* Codec.stringifyKey(migrated.key)
@@ -1506,7 +1617,13 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
       model,
       modelVersion: migrated.modelVersion,
       key: targetKey
-    }).pipe(Effect.mapError(StorageUnavailable.make))
+    }).pipe(
+      Effect.catchTags({
+        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+        SchemaError: (cause) =>
+          Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server key lineage target row is corrupt", cause }))
+      })
+    )
     if (Option.isSome(target) && target.value.lineage_id !== lineageId) {
       return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
     }
@@ -1535,7 +1652,13 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
       model,
       modelVersion: migrated.modelVersion,
       key: targetKey
-    }).pipe(Effect.mapError(StorageUnavailable.make))
+    }).pipe(
+      Effect.catchTags({
+        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+        SchemaError: (cause) =>
+          Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server key lineage target row is corrupt", cause }))
+      })
+    )
     if (Option.isNone(stored) || stored.value.lineage_id !== lineageId) {
       return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
     }
@@ -1543,8 +1666,14 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
   })
 
   const validateBatch = Effect.fnUntraced(function*(state: typeof ServerProgressRow.Type) {
-    const meta = yield* lockMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
-    const progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    const meta = yield* lockMeta(undefined).pipe(Effect.catchTags({
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+      SchemaError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause })),
+      NoSuchElementError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
+    }))
+    const progress = yield* readProgress(undefined)
     let expectedActiveGeneration: number = state.generation
     if (
       state.phase === "Flip" || state.phase === "Log" || state.phase === "Entities"
@@ -1568,9 +1697,9 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     return undefined
   })
 
-  let progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+  let progress = yield* readProgress(undefined)
   if (Option.isNone(progress)) {
-    const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    const meta = yield* readMeta(undefined)
     const source = (yield* sourceDefinition(
       options.evolution,
       identityFrom(meta.schema_version, meta.schema_hash)
@@ -1583,7 +1712,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
           yield* sql`UPDATE effect_local_server_spaces SET definition_hash = ${options.definition.hash}
             WHERE space_id = ${options.spaceId} AND schema_generation = ${meta.schema_generation}
               AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL`
-          const currentMeta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const currentMeta = yield* readMeta(undefined)
           if (
             currentMeta.schema_generation !== meta.schema_generation ||
             currentMeta.schema_version !== options.definition.schemaIdentity.version ||
@@ -1615,7 +1744,13 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
           generation,
           sourceVersion: source.version,
           sourceHash: source.hash
-        }).pipe(Effect.mapError(StorageUnavailable.make))
+        }).pipe(
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause }))
+          })
+        )
         if (Option.isNone(promoted)) return
         yield* sql`DELETE FROM effect_local_server_entities_data
           WHERE space_id = ${options.spaceId} AND generation = ${generation}`
@@ -1629,7 +1764,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
             0, 0, 'Log', NULL, NULL, 0)`
       })
     )
-    progress = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    progress = yield* readProgress(undefined)
   }
   if (Option.isNone(progress)) {
     return yield* new ReplicaError.StorageCorrupt({ message: "Server schema evolution progress was not created" })
@@ -1651,9 +1786,9 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
   yield* sourceDefinition(options.evolution, source)
 
   while (true) {
-    const current = yield* readProgress(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+    const current = yield* readProgress(undefined)
     if (Option.isNone(current)) {
-      const meta = yield* readMeta(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+      const meta = yield* readMeta(undefined)
       if (
         meta.schema_generation === expected.generation &&
         meta.active_schema_generation === expected.generation &&
@@ -1675,11 +1810,15 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     }
     if (state.phase === "Log") {
       const after = state.cursor_sequence ?? 0
-      const metadata = yield* logMetadata({ after, limit: batchSize }).pipe(
-        Effect.mapError(StorageUnavailable.make)
+      const rows = yield* logMetadata({ after, limit: batchSize }).pipe(
+        Effect.flatMap((metadata) => boundedCount(metadata, batchBytes)),
+        Effect.flatMap((limit) => logBatch({ after, limit })),
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server log row is corrupt", cause }))
+        })
       )
-      const limit = yield* boundedCount(metadata, batchBytes)
-      const rows = yield* logBatch({ after, limit }).pipe(Effect.mapError(StorageUnavailable.make))
       yield* SqlTransaction.withServerTransaction(
         sql,
         Effect.gen(function*() {
@@ -1706,34 +1845,39 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "Entities") {
       let targetEntityCount = 0
       let targetEntityBytes = 0
-      let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
-      if (state.cursor_model === null) {
-        metadata = yield* initialEntityMetadata({
-          generation: state.source_generation,
-          limit: batchSize
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-      } else {
-        metadata = yield* continuingEntityMetadata({
-          generation: state.source_generation,
-          model: state.cursor_model,
-          key: state.cursor_key!,
-          limit: batchSize
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-      }
-      const limit = yield* boundedCount(metadata, batchBytes)
-      let rows: ReadonlyArray<typeof EntityBatchRow.Type>
-      if (state.cursor_model === null) {
-        rows = yield* initialEntityBatch({ generation: state.source_generation, limit }).pipe(
-          Effect.mapError(StorageUnavailable.make)
-        )
-      } else {
-        rows = yield* continuingEntityBatch({
-          generation: state.source_generation,
-          model: state.cursor_model,
-          key: state.cursor_key!,
-          limit
-        }).pipe(Effect.mapError(StorageUnavailable.make))
-      }
+      const rows = yield* Effect.gen(function*() {
+        let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
+        if (state.cursor_model === null) {
+          metadata = yield* initialEntityMetadata({
+            generation: state.source_generation,
+            limit: batchSize
+          })
+        } else {
+          metadata = yield* continuingEntityMetadata({
+            generation: state.source_generation,
+            model: state.cursor_model,
+            key: state.cursor_key!,
+            limit: batchSize
+          })
+        }
+        const limit = yield* boundedCount(metadata, batchBytes)
+        if (state.cursor_model === null) {
+          return yield* initialEntityBatch({ generation: state.source_generation, limit })
+        } else {
+          return yield* continuingEntityBatch({
+            generation: state.source_generation,
+            model: state.cursor_model,
+            key: state.cursor_key!,
+            limit
+          })
+        }
+      }).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity row is corrupt", cause }))
+        })
+      )
       yield* SqlTransaction.withServerTransaction(
         sql,
         Effect.gen(function*() {
@@ -1808,7 +1952,17 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
               ON snapshot.snapshot_id = entry.snapshot_id
             WHERE snapshot.space_id = ${options.spaceId}
             ORDER BY entry.snapshot_id, entry.ordinal LIMIT ${batchSize})`
-          const remaining = yield* countScopedSnapshotEntries(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const remaining = yield* countScopedSnapshotEntries(undefined).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Server scoped snapshot entry count is corrupt", cause })
+              ),
+            NoSuchElementError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Server scoped snapshot entry count is missing", cause })
+              )
+          }))
           if (remaining.count === 0) {
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupScopedSnapshots'
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
@@ -1824,7 +1978,17 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
             SELECT snapshot_id FROM effect_local_server_scoped_snapshots
             WHERE space_id = ${options.spaceId}
             ORDER BY snapshot_id LIMIT ${batchSize})`
-          const remaining = yield* countScopedSnapshots(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const remaining = yield* countScopedSnapshots(undefined).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Server scoped snapshot count is corrupt", cause })
+              ),
+            NoSuchElementError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Server scoped snapshot count is missing", cause })
+              )
+          }))
           if (remaining.count === 0) {
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupReplicationPages'
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
@@ -1842,7 +2006,17 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
               ON view.space_id = page.space_id AND view.client_id = page.client_id
             WHERE view.space_id = ${options.spaceId}
             ORDER BY page.client_id LIMIT ${batchSize})`
-          const remaining = yield* countReplicationPages(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const remaining = yield* countReplicationPages(undefined).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Server replication page count is corrupt", cause })
+              ),
+            NoSuchElementError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Server replication page count is missing", cause })
+              )
+          }))
           if (remaining.count === 0) {
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupReplicationViewEntities'
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
@@ -1863,7 +2037,17 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
             WHERE view.space_id = ${options.spaceId}
             ORDER BY entity.client_id, entity.model, entity.entity_key LIMIT ${batchSize})`
           const remaining = yield* countReplicationViewEntities(undefined).pipe(
-            Effect.mapError(StorageUnavailable.make)
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Server replication view entity count is corrupt", cause })
+                ),
+              NoSuchElementError: (cause) =>
+                Effect.fail(
+                  new ReplicaError.StorageCorrupt({ message: "Server replication view entity count is missing", cause })
+                )
+            })
           )
           if (remaining.count === 0) {
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupReplicationViews'
@@ -1880,7 +2064,17 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
             SELECT space_id, client_id FROM effect_local_server_replication_views
             WHERE space_id = ${options.spaceId}
             ORDER BY client_id LIMIT ${batchSize})`
-          const remaining = yield* countReplicationViews(undefined).pipe(Effect.mapError(StorageUnavailable.make))
+          const remaining = yield* countReplicationViews(undefined).pipe(Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Server replication view count is corrupt", cause })
+              ),
+            NoSuchElementError: (cause) =>
+              Effect.fail(
+                new ReplicaError.StorageCorrupt({ message: "Server replication view count is missing", cause })
+              )
+          }))
           if (remaining.count === 0) {
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'CleanupEntities'
               WHERE space_id = ${options.spaceId} AND generation = ${state.generation}`
@@ -1897,7 +2091,13 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
             WHERE space_id = ${options.spaceId} AND generation = ${state.source_generation}
             ORDER BY model, entity_key LIMIT ${batchSize})`
           const remaining = yield* countEntityGeneration(state.source_generation).pipe(
-            Effect.mapError(StorageUnavailable.make)
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity count is corrupt", cause })),
+              NoSuchElementError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity count is missing", cause }))
+            })
           )
           if (remaining.count === 0) {
             yield* sql`UPDATE effect_local_server_evolution SET phase = 'Finalize'
@@ -1923,4 +2123,4 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     }
     if (options.afterBatch !== undefined) yield* options.afterBatch
   }
-}, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+}, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))

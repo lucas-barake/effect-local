@@ -15,7 +15,6 @@ import * as Configuration from "./internal/configuration.js"
 import * as Dialect from "./internal/dialect.js"
 import * as ServerIndex from "./internal/serverIndex.js"
 import * as SqliteIdentifier from "./internal/sqliteIdentifier.js"
-import * as StorageUnavailable from "./internal/storageUnavailable.js"
 
 export type Catalog = "Client" | "Server"
 
@@ -232,7 +231,7 @@ const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
     if (catalog === "Client") read = readClient
     const applied = yield* access.withStatement(read(undefined)).pipe(
       Effect.catchTags({
-        SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
         SchemaError: (cause) =>
           Effect.fail(new ReplicaError.StorageCorrupt({ message: `${catalog} migration ledger is corrupt`, cause }))
       })
@@ -258,10 +257,10 @@ const runCatalogWith = Effect.fn("Migrations.runCatalog")(function*(
         ConstraintError: (_, error) => recoverConstraint(attempt, error),
         UniqueViolation: (_, error) => recoverConstraint(attempt, error),
         LockTimeoutError: (_, error) => {
-          if (attempt >= maximumAttempts) return Effect.fail(StorageUnavailable.make(error))
+          if (attempt >= maximumAttempts) return Effect.fail(new ReplicaError.StorageUnavailable({ cause: error }))
           return Effect.sleep(retryDelayMillis).pipe(Effect.andThen(run(attempt + 1)))
         }
-      }, (_, error) => Effect.fail(StorageUnavailable.make(error)))
+      }, (_, error) => Effect.fail(new ReplicaError.StorageUnavailable({ cause: error })))
     )
 
   return yield* run(1)
@@ -1073,7 +1072,7 @@ export const client = Effect.fnUntraced(function*(options: {
       execute: () => sql`PRAGMA foreign_keys`
     })(undefined)
   ).pipe(Effect.catchTags({
-    SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+    SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
     SchemaError: (cause) =>
       Effect.fail(new ReplicaError.StorageCorrupt({ message: "SQLite foreign key state is unreadable", cause })),
     NoSuchElementError: (cause) =>
@@ -1091,7 +1090,7 @@ export const client = Effect.fnUntraced(function*(options: {
         WHERE type = 'table' AND name = 'effect_local_client_meta'`
     })(undefined)
   ).pipe(Effect.catchTags({
-    SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+    SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
     SchemaError: (cause) =>
       Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client metadata catalog is unreadable", cause })),
     NoSuchElementError: (cause) =>
@@ -1105,7 +1104,7 @@ export const client = Effect.fnUntraced(function*(options: {
         execute: () => sql`SELECT client_id FROM effect_local_client_meta WHERE singleton = 1`
       })(undefined)
     ).pipe(Effect.catchTags({
-      SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
       SchemaError: (cause) =>
         Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause }))
     }))
@@ -1131,7 +1130,7 @@ export const client = Effect.fnUntraced(function*(options: {
     })(undefined)
   ).pipe(
     Effect.catchTags({
-      SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
       SchemaError: (cause) =>
         Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client replica identity is corrupt", cause })),
       NoSuchElementError: (cause) =>
@@ -1157,7 +1156,7 @@ export const client = Effect.fnUntraced(function*(options: {
         ON CONFLICT (space_id) DO NOTHING`)
   }
   return stored.client_id
-}, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+}, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
 const serverCatalogFor = (dialect: Dialect.Dialect) => {
   if (dialect.name === "pg") return serverPostgresCatalog
@@ -1175,7 +1174,7 @@ const planServer = Effect.fn("Migrations.planServer")(
     return migrations.slice(applied.length)
   },
   Effect.catchTags({
-    SqlError: (cause) => Effect.fail(StorageUnavailable.make(cause)),
+    SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
     SchemaError: (cause) =>
       Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server migration ledger is corrupt", cause }))
   })

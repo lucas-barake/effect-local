@@ -1,13 +1,12 @@
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
-import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
 import * as SqlClient from "effect/sql/SqlClient"
 import * as SqlError from "effect/sql/SqlError"
-import * as StorageUnavailable from "../src/internal/storageUnavailable.js"
 import * as Transaction from "../src/internal/transaction.js"
 
 const layerSqlite = SqliteClient.layer({ filename: ":memory:" })
@@ -30,7 +29,7 @@ describe("server transactions", () => {
     Effect.fnUntraced(function*() {
       const sql = yield* SqlClient.SqlClient
       const deadlock = new SqlError.SqlError({ reason: new SqlError.DeadlockError({ cause: "deadlock detected" }) })
-      const probe = failingOnce(StorageUnavailable.make(deadlock))
+      const probe = failingOnce(new ReplicaError.StorageUnavailable({ cause: deadlock }))
       assert.strictEqual(yield* Transaction.withServerTransaction(sql, probe.effect), "committed")
       assert.strictEqual(probe.attempts(), 2)
     }, provideSqlite)
@@ -40,7 +39,7 @@ describe("server transactions", () => {
     "does not retry a StorageUnavailable caused by anything but a transient conflict",
     Effect.fnUntraced(function*() {
       const sql = yield* SqlClient.SqlClient
-      const probe = failingOnce(StorageUnavailable.make("disk full"))
+      const probe = failingOnce(new ReplicaError.StorageUnavailable({ cause: "disk full" }))
       const outcome = yield* Transaction.withServerTransaction(sql, probe.effect).pipe(
         Effect.catch((error) => Effect.succeed(error._tag))
       )

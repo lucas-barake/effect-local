@@ -1074,4 +1074,91 @@ describe("reconciliation workflow", () => {
       assert.strictEqual(yield* Ref.get(attempts), 1)
     })
   )
+
+  it.effect(
+    "does not retry a workflow activity that fails on corrupt storage",
+    Effect.fnUntraced(function*() {
+      const attempts = yield* Ref.make(0)
+      const attempted = yield* Deferred.make<void>()
+      const databaseContext = yield* Layer.build(database())
+      const sql = Context.get(databaseContext, SqlClient.SqlClient)
+      const localContext = yield* LocalStore.layer({
+        ...clientHistory,
+        definition: Domain.definition,
+        spaceId,
+        clientId
+      }).pipe(
+        Layer.provide(layerRuntime),
+        Layer.provide(Layer.succeedContext(databaseContext)),
+        Layer.build
+      )
+      const local = Context.get(localContext, LocalStore.Store)
+      const serverContext = yield* Layer.build(layerServer)
+      const server = Context.get(serverContext, ServerStore.ServerStore)
+      const remote = SyncEngine.SyncEngine.of({
+        waitForCredentialChange: () => Effect.never,
+        transportGeneration: Effect.succeed(0),
+        waitForTransportChange: () => Effect.never,
+        discard: () => Effect.die("unexpected discard"),
+        submitBatch: () => Effect.die("unexpected submit"),
+        pull: server.pull,
+        bootstrap: server.bootstrap,
+        watch: () => Stream.never
+      })
+      const reconciliationContext = yield* Reconciler.layerOnePass({
+        definition: Domain.definition,
+        spaceId
+      }).pipe(
+        Layer.provide(Layer.succeed(LocalStore.Store, local)),
+        Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+        Layer.build
+      )
+      const reconciliation = Context.get(reconciliationContext, Reconciler.Reconciliation)
+      const countedReconciliation = Reconciler.Reconciliation.of({
+        ...reconciliation,
+        sync: Ref.update(attempts, (count) => count + 1).pipe(
+          Effect.andThen(Deferred.succeed(attempted, undefined)),
+          Effect.andThen(reconciliation.sync)
+        )
+      })
+      const engineContext = yield* Layer.build(WorkflowEngine.layerMemory)
+      const engine = Context.get(engineContext, WorkflowEngine.WorkflowEngine)
+      yield* ReconciliationWorkflow.layerRegistration({
+        definition: Domain.definition,
+        spaceId,
+        clientId,
+        retryDelay: "1 millis",
+        maximumRetryDelay: "1 millis",
+        maximumAttempts: 2
+      }).pipe(
+        Layer.provide(Layer.succeed(LocalStore.Store, local)),
+        Layer.provide(Layer.succeed(Reconciler.Reconciliation, countedReconciliation)),
+        Layer.provide(Layer.succeed(WorkflowEngine.WorkflowEngine, engine)),
+        Layer.build
+      )
+      yield* local.mutate(Domain.PutTodo, Domain.todo("corrupt-pending"))
+      yield* sql`UPDATE effect_local_client_pending_data SET digest = 'not-a-digest'`
+      const generations = yield* local.reconciliationGenerations
+      const payload = ReconciliationWorkflow.Payload.make({
+        scope: clientHistory.scope,
+        scopeGeneration,
+        schemaIdentity: `${Domain.definition.schemaIdentity.version}:${Domain.definition.schemaIdentity.hash}`,
+        spaceId,
+        clientId,
+        membershipIncarnation: local.membershipIncarnation,
+        generation: generations.requested
+      })
+      const fiber = yield* ReconciliationWorkflow.make(payload).execute(payload).pipe(
+        Effect.as({ _tag: "UnexpectedCorruptStorageWorkflowSuccess" as const }),
+        Effect.flip,
+        Effect.provideService(WorkflowEngine.WorkflowEngine, engine),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(attempted)
+      yield* TestClock.adjust("1 millis").pipe(Effect.forever, Effect.forkChild)
+      const error = yield* Fiber.join(fiber)
+      assert.strictEqual(error._tag, "StorageCorrupt")
+      assert.strictEqual(yield* Ref.get(attempts), 1)
+    })
+  )
 })

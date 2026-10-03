@@ -14,7 +14,7 @@ import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
-import { pipe } from "effect/Function"
+import { flow, pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
@@ -37,7 +37,6 @@ import * as Rows from "./internal/rows.js"
 import * as ScopedReplication from "./internal/scopedReplication.js"
 import * as ServerIndex from "./internal/serverIndex.js"
 import * as ServerMetrics from "./internal/serverMetrics.js"
-import * as StorageUnavailable from "./internal/storageUnavailable.js"
 import * as TerminalRejection from "./internal/TerminalRejection.js"
 import * as SqlTransaction from "./internal/transaction.js"
 import * as WakeVisibility from "./internal/wakeVisibility.js"
@@ -433,7 +432,13 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
             ORDER BY receipt_count DESC LIMIT 1), 0) AS receipts`
       })
       const refreshMetricDepths = readMetricDepths(undefined).pipe(
-        Effect.mapError(StorageUnavailable.make),
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space count row is corrupt", cause })),
+          NoSuchElementError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space count row is missing", cause }))
+        }),
         Effect.flatMap((depths) => metrics.initializeDepths(depths.history, depths.receipts)),
         Effect.catchCause((cause) => {
           if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
@@ -506,17 +511,24 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           return { channel, watchers }
         })
       })
-      const findReceiptByMutation = SqlSchema.findOneOption({
-        Request: Schema.Struct({ spaceId: Identity.SpaceId, mutationId: Identity.MutationId }),
-        Result: Rows.ServerReceiptRow,
-        execute: ({ spaceId, mutationId }) =>
-          sql`SELECT r.space_id, r.client_id, r.membership_incarnation, r.local_sequence,
+      const findReceiptByMutation = flow(
+        SqlSchema.findOneOption({
+          Request: Schema.Struct({ spaceId: Identity.SpaceId, mutationId: Identity.MutationId }),
+          Result: Rows.ServerReceiptRow,
+          execute: ({ spaceId, mutationId }) =>
+            sql`SELECT r.space_id, r.client_id, r.membership_incarnation, r.local_sequence,
           r.digest, r.mutation_id, r.receipt_json,
           r.digest_version, r.source_schema_version, r.source_schema_hash, r.mutation_version,
           r.mutation_name, r.rejection_origin, r.terminal_sequence, r.server_sequence
         FROM effect_local_server_receipts AS r
         WHERE r.space_id = ${spaceId} AND r.mutation_id = ${mutationId}`
-      })
+        }),
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server receipt row is corrupt", cause }))
+        })
+      )
       const findReceiptBySequence = SqlSchema.findOneOption({
         Request: Schema.Struct({
           spaceId: Identity.SpaceId,
@@ -614,16 +626,23 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           FROM effect_local_server_entities WHERE space_id = ${spaceId}
           ORDER BY entity_bytes DESC, model, entity_key LIMIT 1`
       })
-      const findSnapshot = SqlSchema.findOneOption({
-        Request: Schema.Struct({ spaceId: Identity.SpaceId, snapshotId: Identity.SnapshotId }),
-        Result: Rows.SnapshotManifestRow,
-        execute: ({ spaceId, snapshotId }) =>
-          sql`SELECT space_id, snapshot_id, definition_hash, schema_version, schema_hash,
+      const findSnapshot = flow(
+        SqlSchema.findOneOption({
+          Request: Schema.Struct({ spaceId: Identity.SpaceId, snapshotId: Identity.SnapshotId }),
+          Result: Rows.SnapshotManifestRow,
+          execute: ({ spaceId, snapshotId }) =>
+            sql`SELECT space_id, snapshot_id, definition_hash, schema_version, schema_hash,
             server_sequence, terminal_sequence,
             entity_count, content_bytes, digest
           FROM effect_local_server_snapshots
           WHERE space_id = ${spaceId} AND snapshot_id = ${snapshotId}`
-      })
+        }),
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server snapshot row is corrupt", cause }))
+        })
+      )
       const findHistoryPrune = SqlSchema.findAll({
         Request: Schema.Struct({ spaceId: Identity.SpaceId, through: Identity.ServerSequence, limit: Schema.Int }),
         Result: Rows.SequenceRow,
@@ -667,9 +686,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
             message: `Space ${spaceId} has compacted history without a published snapshot`
           })
         }
-        const stored = yield* findSnapshot({ spaceId, snapshotId: meta.snapshot_id }).pipe(
-          Effect.mapError(StorageUnavailable.make)
-        )
+        const stored = yield* findSnapshot({ spaceId, snapshotId: meta.snapshot_id })
         if (Option.isNone(stored)) {
           return yield* new ReplicaError.StorageCorrupt({
             message: `Space ${spaceId} points to missing snapshot ${meta.snapshot_id}`
@@ -739,7 +756,11 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           spaceId: envelope.spaceId,
           serverSequence: receipt.serverSequence
         }).pipe(
-          Effect.mapError(StorageUnavailable.make),
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server log row is corrupt", cause }))
+          }),
           Effect.flatMap(Option.match({
             onNone: () => Effect.succeed(undefined),
             onSome: Effect.fnUntraced(function*(row) {
@@ -957,7 +978,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           evolutionOptions = { ...evolutionOptions, batchBytes: options.schemaEvolutionBatchBytes }
         }
         return yield* SchemaEvolution.server(evolutionOptions).pipe(Effect.provideService(SqlClient.SqlClient, sql))
-      }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+      }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const bootstrapEntityFits = Effect.fnUntraced(function*(
         spaceId: Identity.SpaceId,
@@ -1094,7 +1115,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           const exactReceipt = yield* findReceiptByMutation({
             spaceId: submittedEnvelope.spaceId,
             mutationId: submittedEnvelope.mutationId
-          }).pipe(Effect.mapError(StorageUnavailable.make))
+          })
           if (Option.isSome(exactReceipt)) {
             if (exactReceipt.value.digest !== submittedEnvelope.digest) {
               return yield* new ReplicaError.MutationIdentityConflict({
@@ -1131,9 +1152,25 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               (space_id, client_id, membership_incarnation, last_local_sequence, expired_local_sequence)
               VALUES (${envelope.spaceId}, ${envelope.clientId}, ${membershipIncarnation}, 0, 0)
               ON CONFLICT (space_id, client_id, membership_incarnation) DO NOTHING`
-              const storedSpace = yield* lockSpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+              const storedSpace = yield* lockSpace(envelope.spaceId).pipe(Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause })),
+                NoSuchElementError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
+              }))
               const verifiedCounts = yield* findSpaceCounts(envelope.spaceId).pipe(
-                Effect.mapError(StorageUnavailable.make)
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                  SchemaError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({ message: "Server space count row is corrupt", cause })
+                    ),
+                  NoSuchElementError: (cause) =>
+                    Effect.fail(
+                      new ReplicaError.StorageCorrupt({ message: "Server space count row is missing", cause })
+                    )
+                })
               )
               if (
                 storedSpace.retained_history_count !== verifiedCounts.history_count ||
@@ -1148,12 +1185,18 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                 clientId: envelope.clientId,
                 membershipIncarnation
               }).pipe(
-                Effect.mapError(StorageUnavailable.make)
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                  SchemaError: (cause) =>
+                    Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server client row is corrupt", cause })),
+                  NoSuchElementError: (cause) =>
+                    Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server client row is missing", cause }))
+                })
               )
               const committedByMutation = yield* findReceiptByMutation({
                 spaceId: envelope.spaceId,
                 mutationId: envelope.mutationId
-              }).pipe(Effect.mapError(StorageUnavailable.make))
+              })
               if (Option.isSome(committedByMutation)) {
                 if (committedByMutation.value.digest !== envelope.digest) {
                   return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
@@ -1169,7 +1212,13 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                 clientId: envelope.clientId,
                 membershipIncarnation,
                 localSequence: envelope.localSequence
-              }).pipe(Effect.mapError(StorageUnavailable.make))
+              }).pipe(
+                Effect.catchTags({
+                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                  SchemaError: (cause) =>
+                    Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server receipt row is corrupt", cause }))
+                })
+              )
               if (Option.isSome(committedBySequence)) {
                 return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
               }
@@ -1266,7 +1315,13 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                         rejection: result.failure
                       })
                     }
-                    const state = yield* lockSpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+                    const state = yield* lockSpace(envelope.spaceId).pipe(Effect.catchTags({
+                      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                      SchemaError: (cause) =>
+                        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause })),
+                      NoSuchElementError: (cause) =>
+                        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
+                    }))
                     if (state.entity_count > options.maximumSnapshotEntities) {
                       return yield* new TerminalRejection.TerminalRejection({
                         origin: "Capacity",
@@ -1288,7 +1343,13 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                       })
                     }
                     const largest = yield* findLargestEntity(envelope.spaceId).pipe(
-                      Effect.mapError(StorageUnavailable.make)
+                      Effect.catchTags({
+                        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                        SchemaError: (cause) =>
+                          Effect.fail(
+                            new ReplicaError.StorageCorrupt({ message: "Server entity row is corrupt", cause })
+                          )
+                      })
                     )
                     if (Option.isSome(largest)) {
                       const row = largest.value
@@ -1415,8 +1476,11 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
             })
           )
         }).pipe(
-          Effect.catchTag("SqlError", (cause) =>
-            Effect.fail(new ReplicaError.UnknownCommitOutcome({ mutationId: submittedEnvelope.mutationId, cause }))),
+          Effect.catchTag(
+            "SqlError",
+            (cause) =>
+              Effect.fail(new ReplicaError.UnknownCommitOutcome({ mutationId: submittedEnvelope.mutationId, cause }))
+          ),
           Effect.tap((receipt) => {
             const changes = wakeChanges
             if (receipt._tag !== "Accepted" || changes === undefined) {
@@ -1484,15 +1548,13 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           const exact = yield* findReceiptByMutation({
             spaceId: submittedEnvelope.spaceId,
             mutationId: submittedEnvelope.mutationId
-          }).pipe(Effect.mapError(StorageUnavailable.make))
+          })
           if (Option.isSome(exact)) {
             if (exact.value.digest !== submittedEnvelope.digest) {
               return yield* new ReplicaError.MutationIdentityConflict({ mutationId: submittedEnvelope.mutationId })
             }
             return yield* decodeStoredReceipt(exact.value, submittedEnvelope).pipe(
-              Effect.flatMap((receipt) =>
-                SchemaEvolution.migrateReceipt(receipt, evolution)
-              ),
+              Effect.flatMap((receipt) => SchemaEvolution.migrateReceipt(receipt, evolution)),
               Effect.flatMap((receipt) => projectReceipt(receipt, callerDefinition))
             )
           }
@@ -1515,12 +1577,18 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               (space_id, client_id, membership_incarnation, last_local_sequence, expired_local_sequence)
               VALUES (${envelope.spaceId}, ${envelope.clientId}, ${membershipIncarnation}, 0, 0)
               ON CONFLICT (space_id, client_id, membership_incarnation) DO NOTHING`
-              const storedSpace = yield* lockSpace(envelope.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+              const storedSpace = yield* lockSpace(envelope.spaceId).pipe(Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause })),
+                NoSuchElementError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
+              }))
               yield* validateStoredSpace(storedSpace)
               const committed = yield* findReceiptByMutation({
                 spaceId: envelope.spaceId,
                 mutationId: envelope.mutationId
-              }).pipe(Effect.mapError(StorageUnavailable.make))
+              })
               if (Option.isSome(committed)) {
                 if (committed.value.digest !== envelope.digest) {
                   return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
@@ -1534,7 +1602,13 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                 spaceId: envelope.spaceId,
                 clientId: envelope.clientId,
                 membershipIncarnation
-              }).pipe(Effect.mapError(StorageUnavailable.make))
+              }).pipe(Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server client row is corrupt", cause })),
+                NoSuchElementError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server client row is missing", cause }))
+              }))
               if (envelope.localSequence <= client.expired_local_sequence) {
                 const manifest = yield* currentManifest(envelope.spaceId, storedSpace)
                 return yield* pipe(
@@ -1671,12 +1745,22 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           sql,
           Effect.gen(function*() {
             yield* dialect.beginSnapshotRead
-            const stored = yield* findSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
-            if (Option.isNone(stored)) return Option.none()
+            const stored = yield* findSpace(spaceId).pipe(Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause }))
+            }))
+            if (Option.isNone(stored)) {
+              return Option.none()
+            }
             const meta = stored.value
             yield* validateStoredSpace(meta)
             const rows = yield* findEntities({ spaceId, limit: options.maximumSnapshotEntities + 1 }).pipe(
-              Effect.mapError(StorageUnavailable.make)
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity row is corrupt", cause }))
+              })
             )
             const decoded = yield* decodeEntityRows(spaceId, rows)
             if (decoded.entities.length !== meta.entity_count || decoded.contentBytes !== meta.entity_bytes) {
@@ -1706,7 +1790,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               entities: decoded.entities
             })
           })
-        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const publish = Option.match({
         onNone: () => Effect.void,
@@ -1716,7 +1800,13 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           SqlTransaction.withServerTransaction(
             sql,
             Effect.gen(function*() {
-              const meta = yield* lockSpace(candidate.manifest.spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+              const meta = yield* lockSpace(candidate.manifest.spaceId).pipe(Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause })),
+                NoSuchElementError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
+              }))
               yield* validateStoredSpace(meta)
               if (
                 meta.next_server_sequence !== candidate.observedNextServer ||
@@ -1728,9 +1818,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                 meta.snapshot_sequence === candidate.manifest.sequence &&
                 meta.snapshot_terminal_sequence === candidate.manifest.terminalSequenceThrough
               if (reusable && snapshotId !== null) {
-                const stored = yield* findSnapshot({ spaceId: candidate.manifest.spaceId, snapshotId }).pipe(
-                  Effect.mapError(StorageUnavailable.make)
-                )
+                const stored = yield* findSnapshot({ spaceId: candidate.manifest.spaceId, snapshotId })
                 reusable = Option.isSome(stored) && sameSnapshotIdentity(stored.value, meta)
                 if (!reusable) {
                   yield* sql`DELETE FROM effect_local_server_snapshot_entities
@@ -1792,14 +1880,24 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                   ${dialect.offset(options.retainedSnapshots)}
                 )`
             })
-          ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+          ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
       })
 
       const pruneBatch = (spaceId: Identity.SpaceId) =>
         SqlTransaction.withServerTransaction(
           sql,
           Effect.gen(function*() {
-            const meta = yield* lockSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+            const stored = yield* lockSpace(spaceId).pipe(
+              Effect.asSome,
+              Effect.catchTags({
+                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+                SchemaError: (cause) =>
+                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause })),
+                NoSuchElementError: () => Effect.succeedNone
+              })
+            )
+            if (Option.isNone(stored)) return { history: 0, receipts: 0 }
+            const meta = stored.value
             yield* validateStoredSpace(meta)
             if (meta.snapshot_id === null) return { history: 0, receipts: 0 }
             const historyFloor = Identity.ServerSequence.make(
@@ -1818,7 +1916,11 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               spaceId: spaceId,
               through: historyFloor,
               limit: options.pruneBatchSize
-            }).pipe(Effect.mapError(StorageUnavailable.make))
+            }).pipe(Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server log row is corrupt", cause }))
+            }))
             if (history.length > 0) {
               const through = history.at(-1)!.server_sequence
               yield* sql`DELETE FROM effect_local_authoritative_log
@@ -1830,7 +1932,11 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               spaceId: spaceId,
               through: receiptFloor,
               limit: options.pruneBatchSize
-            }).pipe(Effect.mapError(StorageUnavailable.make))
+            }).pipe(Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server receipt row is corrupt", cause }))
+            }))
             if (receipts.length > 0) {
               const through = receipts.at(-1)!.terminal_sequence
               yield* sql`UPDATE effect_local_server_clients AS c SET
@@ -1856,7 +1962,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
             }
             return { history: history.length, receipts: receipts.length }
           })
-        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+        ).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
       const pruneToFloors = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
         const total = { history: 0, receipts: 0 }
@@ -1864,7 +1970,9 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           const batch = yield* pruneBatch(spaceId)
           total.history += batch.history
           total.receipts += batch.receipts
-          if (batch.history < options.pruneBatchSize && batch.receipts < options.pruneBatchSize) return total
+          if (batch.history < options.pruneBatchSize && batch.receipts < options.pruneBatchSize) {
+            return total
+          }
         }
       })
 
@@ -1877,14 +1985,18 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           meta.snapshot_sequence !== meta.next_server_sequence - 1 ||
           meta.snapshot_terminal_sequence !== meta.next_terminal_sequence - 1
         ) return false
-        const stored = yield* findSnapshot({ spaceId, snapshotId: meta.snapshot_id }).pipe(
-          Effect.mapError(StorageUnavailable.make)
-        )
+        const stored = yield* findSnapshot({ spaceId, snapshotId: meta.snapshot_id })
         return Option.isSome(stored) && sameSnapshotIdentity(stored.value, meta)
       })
 
       const publishCurrentSnapshot = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
-        const stored = yield* findSpace(spaceId).pipe(Effect.mapError(StorageUnavailable.make))
+        const stored = yield* findSpace(spaceId).pipe(
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause }))
+          })
+        )
         if (Option.isSome(stored) && (yield* snapshotCurrent(spaceId, stored.value))) return
         yield* prepareSnapshot(spaceId).pipe(Effect.flatMap(publish))
       })
@@ -1936,7 +2048,11 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         let after = ""
         while (true) {
           const spaces = yield* findSpaces({ after, limit: options.maintenanceSpaceBatchSize }).pipe(
-            Effect.mapError(StorageUnavailable.make)
+            Effect.catchTags({
+              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+              SchemaError: (cause) =>
+                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause }))
+            })
           )
           if (spaces.length === 0) return
           yield* Effect.forEach(spaces, ({ space_id }) => maintainSpace(space_id), {
@@ -2066,7 +2182,17 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           clientId: request.clientId,
           principalDigest: principalHash,
           entitiesJson: yield* Codec.stringify(identities)
-        }).pipe(Effect.mapError(StorageUnavailable.make))
+        }).pipe(Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(
+              new ReplicaError.StorageCorrupt({ message: "Server acknowledged entity count is corrupt", cause })
+            ),
+          NoSuchElementError: (cause) =>
+            Effect.fail(
+              new ReplicaError.StorageCorrupt({ message: "Server acknowledged entity count is missing", cause })
+            )
+        }))
         if (acknowledged.count > 0) return true
         for (const change of scoped) {
           if (
@@ -2313,7 +2439,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           sql`UPDATE effect_local_server_spaces SET read_auth_epoch = read_auth_epoch + 1
             WHERE space_id = ${spaceId}`.pipe(
             Effect.asVoid,
-            Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))),
+            Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))),
             Effect.withSpan("ServerStore.invalidateReadAuthorization", { attributes: { "space.id": spaceId } })
           ),
         watch: (request: Parameters<Service["watch"]>[0]) => {

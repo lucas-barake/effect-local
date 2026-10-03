@@ -311,6 +311,7 @@ const handler = (
           result.failure._tag === "ProtocolInvalid" ||
           result.failure._tag === "StaleSchema" ||
           result.failure._tag === "SpaceUnavailable" ||
+          result.failure._tag === "StorageCorrupt" ||
           result.failure._tag === "StaleReplicationScope" ||
           result.failure._tag === "UpgradeRequired" ||
           result.failure._tag === "AuthorizationDenied" ||
