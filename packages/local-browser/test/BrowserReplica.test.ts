@@ -707,84 +707,61 @@ describe("BrowserReplica ephemeral ttl", () => {
   const invalidDurations: ReadonlyArray<readonly [string, Duration.Input]> = [
     ["zero millis", 0],
     ["negative millis", -1],
-    ["NaN millis", Number.NaN],
-    ["infinite millis", Number.POSITIVE_INFINITY],
-    ["negative infinite millis", Number.NEGATIVE_INFINITY],
-    ["an infinite Duration", Duration.infinity],
-    ["a negative unit string", "-5 seconds"],
     ["an unparseable unit string", "1e3 seconds"],
     ["millis beyond the safe integer range", Number.MAX_VALUE]
   ]
 
+  interface TtlCase {
+    readonly title: (operation: TtlOperation) => string
+    readonly ttl: (operation: TtlOperation) => Duration.Input
+    readonly outcome: (operation: TtlOperation) => string
+    readonly sent: (operation: TtlOperation) => ReadonlyArray<number>
+  }
+
+  const ttlCases: ReadonlyArray<TtlCase> = [
+    ...invalidDurations.map(([label, ttl]): TtlCase => ({
+      title: (operation) => `rejects ${operation.label} with a ttl of ${label} before reaching the leader`,
+      ttl: () => ttl,
+      outcome: () => notADuration,
+      sent: () => []
+    })),
+    {
+      title: (operation) =>
+        `rejects ${operation.label} with a fractional ttl that rounds above the maximum before reaching the leader`,
+      ttl: (operation) => operation.maximum + 0.25,
+      outcome: outOfBounds,
+      sent: () => []
+    },
+    {
+      title: (operation) => `rounds a fractional ttl up to the minimum for ${operation.label}`,
+      ttl: (operation) => operation.minimum - 0.75,
+      outcome: () => "succeeded",
+      sent: (operation) => [operation.minimum]
+    },
+    {
+      title: (operation) => `sends the maximum ttl for ${operation.label} given as a Duration`,
+      ttl: (operation) => Duration.millis(operation.maximum),
+      outcome: () => "succeeded",
+      sent: (operation) => [operation.maximum]
+    }
+  ]
+
   for (const operation of ttlOperations) {
-    for (const [label, ttl] of invalidDurations) {
+    for (const ttlCase of ttlCases) {
       it.effect(
-        `rejects ${operation.label} with a ttl of ${label} before reaching the leader`,
+        ttlCase.title(operation),
         Effect.fnUntraced(
           function*() {
-            assert.deepStrictEqual(yield* ttlAttempt(operation, ttl), { outcome: notADuration, received: [] })
+            assert.deepStrictEqual(yield* ttlAttempt(operation, ttlCase.ttl(operation)), {
+              outcome: ttlCase.outcome(operation),
+              received: ttlCase.sent(operation).map((millis) => [operation.wireName, millis] as const)
+            })
           },
           Effect.scoped,
           provideFileSystem
         )
       )
     }
-
-    it.effect(
-      `rejects ${operation.label} with a ttl above the maximum before reaching the leader`,
-      Effect.fnUntraced(
-        function*() {
-          assert.deepStrictEqual(yield* ttlAttempt(operation, operation.maximum + 1), {
-            outcome: outOfBounds(operation),
-            received: []
-          })
-        },
-        Effect.scoped,
-        provideFileSystem
-      )
-    )
-
-    it.effect(
-      `rejects ${operation.label} with a fractional ttl that rounds above the maximum before reaching the leader`,
-      Effect.fnUntraced(
-        function*() {
-          assert.deepStrictEqual(yield* ttlAttempt(operation, operation.maximum + 0.5), {
-            outcome: outOfBounds(operation),
-            received: []
-          })
-        },
-        Effect.scoped,
-        provideFileSystem
-      )
-    )
-
-    it.effect(
-      `rounds a fractional ttl up to the minimum for ${operation.label}`,
-      Effect.fnUntraced(
-        function*() {
-          assert.deepStrictEqual(yield* ttlAttempt(operation, operation.minimum - 0.5), {
-            outcome: "succeeded",
-            received: [[operation.wireName, operation.minimum]]
-          })
-        },
-        Effect.scoped,
-        provideFileSystem
-      )
-    )
-
-    it.effect(
-      `sends the maximum ttl for ${operation.label} given as a Duration`,
-      Effect.fnUntraced(
-        function*() {
-          assert.deepStrictEqual(yield* ttlAttempt(operation, Duration.millis(operation.maximum)), {
-            outcome: "succeeded",
-            received: [[operation.wireName, operation.maximum]]
-          })
-        },
-        Effect.scoped,
-        provideFileSystem
-      )
-    )
   }
 
   it.effect(

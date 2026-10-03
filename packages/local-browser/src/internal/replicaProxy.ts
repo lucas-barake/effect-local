@@ -811,27 +811,27 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     return openSession(profile, sessionOptions)
   }
 
-  interface PublishInput {
-    readonly spaceId: Identity.SpaceId
-    readonly member: Protocol.EphemeralMember
-    readonly payload: unknown
-    readonly key?: unknown
-    readonly ttl: Duration.Input
-  }
-
-  const publishEvent = Effect.fnUntraced(function*(definitionArg: Ephemeral.AnyEvent, publishOptions: PublishInput) {
-    const payload = yield* encodeJson(definitionArg.payloadSchema, publishOptions.payload)
-    const ttlMillis = yield* boundedTtlMillis(publishOptions.ttl, 1, Protocol.maximumEphemeralEventTtlMillis)
-    return yield* call(client.EphemeralPublishEvent({
-      name: definitionArg.name,
-      spaceId: publishOptions.spaceId,
-      member: publishOptions.member,
-      payload,
-      ttlMillis
-    })).pipe(Effect.catchTag("WireEphemeralEncodeError", (error) => Effect.die(error)))
-  })
-
-  const publishState = Effect.fnUntraced(function*(definitionArg: Ephemeral.AnyState, publishOptions: PublishInput) {
+  const publish: EphemeralClient.Service["publish"] = Effect.fnUntraced(function*(
+    definitionArg: Ephemeral.Any,
+    publishOptions: {
+      readonly spaceId: Identity.SpaceId
+      readonly member: Protocol.EphemeralMember
+      readonly payload: unknown
+      readonly key?: unknown
+      readonly ttl: Duration.Input
+    }
+  ) {
+    if (definitionArg.kind === "event") {
+      const payload = yield* encodeJson(definitionArg.payloadSchema, publishOptions.payload)
+      const ttlMillis = yield* boundedTtlMillis(publishOptions.ttl, 1, Protocol.maximumEphemeralEventTtlMillis)
+      return yield* call(client.EphemeralPublishEvent({
+        name: definitionArg.name,
+        spaceId: publishOptions.spaceId,
+        member: publishOptions.member,
+        payload,
+        ttlMillis
+      })).pipe(Effect.catchTag("WireEphemeralEncodeError", (error) => Effect.die(error)))
+    }
     const key = yield* encodeJson(definitionArg.keySchema, publishOptions.key)
     const payload = yield* encodeJson(definitionArg.payloadSchema, publishOptions.payload)
     const ttlMillis = yield* boundedTtlMillis(publishOptions.ttl, 1, Protocol.maximumEphemeralStateTtlMillis)
@@ -844,22 +844,6 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       ttlMillis
     })).pipe(Effect.catchTag("WireEphemeralEncodeError", (error) => Effect.die(error)))
   })
-
-  function publish<D extends Ephemeral.AnyEvent,>(
-    definitionArg: D,
-    publishOptions: EphemeralClient.EventPublishOptions<D>
-  ): Effect.Effect<void, ReplicaError.ReplicaError | Ephemeral.EncodeError>
-  function publish<D extends Ephemeral.AnyState,>(
-    definitionArg: D,
-    publishOptions: EphemeralClient.StatePublishOptions<D>
-  ): Effect.Effect<void, ReplicaError.ReplicaError | Ephemeral.EncodeError>
-  function publish(
-    definitionArg: Ephemeral.Any,
-    publishOptions: PublishInput
-  ): Effect.Effect<void, ReplicaError.ReplicaError | Ephemeral.EncodeError> {
-    if (definitionArg.kind === "event") return publishEvent(definitionArg, publishOptions)
-    return publishState(definitionArg, publishOptions)
-  }
 
   const ephemeral: EphemeralClient.Service = {
     session,
