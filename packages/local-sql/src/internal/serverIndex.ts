@@ -15,7 +15,6 @@ import * as Codec from "./codec.js"
 import type * as Dialect from "./dialect.js"
 import { encodedComponents, encodedPrimitive, type SqlValue } from "./indexComponents.js"
 import * as Rows from "./rows.js"
-import * as StorageUnavailable from "./storageUnavailable.js"
 
 interface Descriptor {
   readonly model: Model.Any
@@ -257,7 +256,7 @@ export const plan = Effect.fn("ServerIndex.plan")(function*(
   }
   const pending = yield* planCatalog(all, yield* readCatalog(sql))
   return { ...pending, generation: yield* readGeneration(sql) } satisfies GenerationPlan
-}, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+}, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
 export const make = Effect.fn("ServerIndex.make")(
   function*(
@@ -578,7 +577,7 @@ export const make = Effect.fn("ServerIndex.make")(
           yield* writeRows(descriptor, rows)
         }
       }
-    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
     const encodedPartitionKey = (
       descriptor: Descriptor,
@@ -719,7 +718,7 @@ export const make = Effect.fn("ServerIndex.make")(
         }
       }
       return selected
-    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
     const resolveDescriptor = (window: Protocol.ReplicationWindow) => {
       const descriptor = byLabel.get(Canonical.stringify([window.model, window.index]))
@@ -801,7 +800,7 @@ export const make = Effect.fn("ServerIndex.make")(
         }
       }
       return selected
-    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
     const partitionsOf: Runtime["partitionsOf"] = Effect.fnUntraced(function*(
       spaceId,
@@ -842,7 +841,7 @@ export const make = Effect.fn("ServerIndex.make")(
         }
       }
       return found
-    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
     const affectedPartitions: Runtime["affectedPartitions"] = Effect.fnUntraced(function*(
       spaceId,
@@ -874,9 +873,9 @@ export const make = Effect.fn("ServerIndex.make")(
         )
       }
       return partitions
-    }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause))))
+    }, Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
 
     return { apply, membership, partitionMembership, partitionsOf, affectedPartitions }
   },
-  Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))
+  Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
 )
