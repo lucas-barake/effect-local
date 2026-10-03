@@ -78,6 +78,25 @@ const postgresText = (value: string) => `E'${Array.from(value, escapeCharacter).
 
 export const hasUnpairedSurrogate = (value: string) => value.search(unpairedSurrogate) !== -1
 
+const surrogateEscape = 0xd7ff
+const surrogateEscapeOffset = 0x100
+
+const escapableSurrogate = new RegExp(`\\ud7ff|${unpairedSurrogate.source}`, "g")
+const escapedSurrogate = /\ud7ff[\s\S]?/g
+
+const escapeSurrogates = (value: string) =>
+  value.replaceAll(
+    escapableSurrogate,
+    (character) =>
+      String.fromCharCode(surrogateEscape, character.charCodeAt(0) - surrogateEscape + surrogateEscapeOffset)
+  )
+
+const unescapeSurrogates = (value: string) =>
+  value.replaceAll(
+    escapedSurrogate,
+    (escaped) => String.fromCharCode(escaped.charCodeAt(1) - surrogateEscapeOffset + surrogateEscape)
+  )
+
 const decodeEscapedText = (value: string) => {
   let decoded = ""
   for (let index = 0; index < value.length; index++) {
@@ -90,7 +109,7 @@ const decodeEscapedText = (value: string) => {
     if (value[index] === "\u0001") decoded += "\u0000"
     else decoded += "\u0001"
   }
-  return decoded
+  return unescapeSurrogates(decoded)
 }
 
 const sqlite = (sql: SqlClient.SqlClient): Dialect => ({
@@ -103,8 +122,8 @@ const sqlite = (sql: SqlClient.SqlClient): Dialect => ({
     if (affinity === "real") return "REAL"
     return "INTEGER"
   },
-  encodeText: (value) => value,
-  decodeText: (value) => value,
+  encodeText: escapeSurrogates,
+  decodeText: unescapeSurrogates,
   lockSchema: Effect.void,
   scriptPrologue: ["BEGIN IMMEDIATE"],
   literal: quoteText,
@@ -138,10 +157,7 @@ const postgres = (sql: SqlClient.SqlClient): Dialect => ({
   tableOptions: "",
   indexColumn: postgresType,
   encodeText: (value) =>
-    value.replaceAll(unpairedSurrogate, "\ufffd").replaceAll("\u0001", "\u0001\u0002").replaceAll(
-      "\u0000",
-      "\u0001\u0001"
-    ),
+    escapeSurrogates(value).replaceAll("\u0001", "\u0001\u0002").replaceAll("\u0000", "\u0001\u0001"),
   decodeText: decodeEscapedText,
   lockSchema: sql.unsafe(schemaLockStatement).pipe(Effect.asVoid),
   scriptPrologue: ["BEGIN", schemaLockStatement],
