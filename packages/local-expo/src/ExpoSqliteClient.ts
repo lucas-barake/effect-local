@@ -276,6 +276,16 @@ export const make: (
           if (stepFailed) return discard(created)
           return finalizeStatement(created).pipe(Effect.catchTag("SqlError", (error) => Effect.die(error)))
         })
+        const columns = yield* Effect.tryPromise({
+          try: () => statement.getColumnNamesAsync(),
+          catch: (cause) =>
+            new SqlError({
+              reason: classifySqliteError(sqliteCause(cause), {
+                message: "Failed to read result columns",
+                operation: "stream"
+              })
+            })
+        }).pipe(Effect.uninterruptible)
         const result = yield* Effect.tryPromise({
           try: () => statement.executeAsync<any>(bound),
           catch: (cause) =>
@@ -286,6 +296,7 @@ export const make: (
               })
             })
         }).pipe(Effect.tapError(() => markStepFailed), Effect.uninterruptible)
+        if (columns.length === 0) return Stream.empty
         return rows(result, markStepFailed)
       }))
 

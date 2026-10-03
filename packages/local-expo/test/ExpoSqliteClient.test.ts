@@ -304,6 +304,24 @@ describe("ExpoSqliteClient", () => {
   )
 
   it.effect(
+    "executes a streamed statement without result columns exactly once",
+    Effect.fnUntraced(
+      function*() {
+        const sql = yield* client()
+        yield* sql`CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, value INTEGER)`
+        yield* sql`INSERT INTO t (value) VALUES (${0})`
+        const updated = yield* sql`UPDATE t SET value = value + 1`.stream.pipe(Stream.runCollect)
+        const inserted = yield* sql`INSERT INTO t (value) VALUES (${10})`.stream.pipe(Stream.runCollect)
+        assert.deepStrictEqual(Array.from(updated), [])
+        assert.deepStrictEqual(Array.from(inserted), [])
+        assert.deepStrictEqual(yield* sql`SELECT id, value FROM t ORDER BY id`.values, [[1, 1], [2, 10]])
+      },
+      Effect.scoped,
+      provideReactivity
+    )
+  )
+
+  it.effect(
     "applies configured result name transforms to rows and streams",
     Effect.fnUntraced(
       function*() {
