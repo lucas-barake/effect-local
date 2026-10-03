@@ -179,8 +179,8 @@ policy belongs to the application rather than this generic best-effort transport
 ## Bounds and expiry
 
 `EphemeralHub` validates every option when its Layer is built. Every option is optional: `capacity`,
-`maximumSpaces`, `maximumWatchersPerSpace`, and `maximumMembersPerSpace` default to 1024, `maximumEventKeysPerMember`
-to 64, `maximumEventKeysPerSpace` to 4096, `maximumStateKeysPerMember` to 256, `maximumStateKeysPerSpace` to 16384,
+`maximumSpaces`, `maximumWatchersPerSpace`, and `maximumMembersPerSpace` default to 1024, `maximumWatchersPerPrincipal`
+and `maximumEventKeysPerMember` to 64, `maximumEventKeysPerSpace` to 4096, `maximumStateKeysPerMember` to 256, `maximumStateKeysPerSpace` to 16384,
 `maximumBytesPerMember` to 1 MiB, `maximumBytesPerSpace` to 16 MiB, and `maximumSnapshotBytes` to the 4 MiB frame
 limit. TTL bounds default to the wire maxima. Retained state keeps its space alive until the state expires, and a space
 that no watcher, request, or retained state occupies is released after `spaceIdleTtl`, which defaults to `memberTtl`.
@@ -195,6 +195,13 @@ runs before capacity disclosure.
 `capacity` bounds the shared per-space delta history, not the number of subscribers. Excess joins fail with
 `CapacityExceeded { resource: "ephemeral watchers", limit }` and release their allowance on every stream exit. Active
 watchers are exported as `effect_local_server_ephemeral_watcher_count`.
+
+`maximumWatchersPerPrincipal` caps the joined streams one authenticated principal holds in one space, checked in the
+same admission step as the space allowance. It is keyed by the canonical principal rather than the client ID, which
+clients choose freely, so one member cannot fill the space by joining under many client IDs. Because a member exists
+only while its join stream is open, the quota also bounds the members one principal can hold. Excess joins fail with
+`CapacityExceeded { resource: "ephemeral watchers per principal", limit }`. `ServerStore` applies the same rule to sync
+watches through its own `maximumWatchersPerPrincipal`.
 
 ## Client and protocol session
 

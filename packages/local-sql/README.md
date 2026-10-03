@@ -111,7 +111,7 @@ retries, deduplicates stable mutation identities, stores terminal rejections, as
 accepted mutations, and materializes authoritative state in the same SQL transaction. Its history options set
 retained targets, hard admission caps, snapshot capacity, bootstrap page capacity, prune batches, retained snapshots,
 migration retry and mode, maintenance concurrency, and the keyset page size used to enumerate spaces. `maximumWatchersPerSpace`,
-`readAuthorizationRefreshInterval`, `maximumConcurrentReadAuthorizations`, `maximumPendingReadAuthorizations`, and
+`maximumWatchersPerPrincipal`, `readAuthorizationRefreshInterval`, `maximumConcurrentReadAuthorizations`, `maximumPendingReadAuthorizations`, and
 `readAuthorizationCacheCapacity` bound live sync streams and their policy work. Every one of them is optional and
 `ServerStore.defaults` lists the values used. `ServerStore.layerTrusted` is the explicit allow all composition.
 `SyncServer.layer` in `@lucas-barake/effect-local-rpc` builds the store for you.
@@ -130,6 +130,15 @@ Each accepted admission publishes a shared wake after its transaction commits. W
 transaction or space row write per publication. `wakeCapacity` is the optional sliding wake queue depth, while
 `maximumWatchersPerSpace` is the separate live watcher allowance. Excess streams fail with typed
 `CapacityExceeded { resource: "sync watchers", limit }`.
+
+`maximumWatchersPerPrincipal` (default 64) caps the live watchers one authenticated principal holds in one space, so a
+single member cannot take every space slot and lock other members out of live sync. The quota is keyed by the canonical
+principal, not the client ID, because clients choose their own client IDs and could rotate them to evade a per client
+cap. Every device and tab of a user shares the quota, and a principal that every caller shares, such as `null` for
+anonymous access, shares one quota across all of them. Admission checks the space and principal allowances in one step
+and releases both when the stream ends, fails, or is interrupted. Excess streams fail with typed
+`CapacityExceeded { resource: "sync watchers per principal", limit }`. Watches opened through the trusted `watch`
+method carry no principal and count only toward the space allowance.
 
 The optional `offlineWake` configuration adds a provider-neutral durable path for clients without a live Watch.
 `recipients({ spaceId })` returns authoritative member client IDs. `deliver({ wakeId, spaceId, clientId })` maps one
