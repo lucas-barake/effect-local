@@ -602,10 +602,16 @@ export const layerOnePass = (
           if (
             current._tag === "SchemaUpdateAvailable" && current.pending === pending && current.cursor === cursor &&
             current.serverSchema.version === serverSchema.version && current.serverSchema.hash === serverSchema.hash
-          ) return
+          ) {
+            yield* options.onStatusChange?.(current) ?? Effect.void
+            return
+          }
           yield* setStatus({ _tag: "SchemaUpdateAvailable", pending, cursor, serverSchema })
         } else {
-          if (current._tag === "Online" && current.pending === pending && current.cursor === cursor) return
+          if (current._tag === "Online" && current.pending === pending && current.cursor === cursor) {
+            yield* options.onStatusChange?.(current) ?? Effect.void
+            return
+          }
           yield* setStatus({ _tag: "Online", pending, cursor })
         }
       })
