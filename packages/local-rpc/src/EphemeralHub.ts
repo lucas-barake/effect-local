@@ -9,12 +9,14 @@ import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as FiberMap from "effect/FiberMap"
 import * as Layer from "effect/Layer"
 import * as Metric from "effect/Metric"
 import * as PubSub from "effect/PubSub"
 import * as RcMap from "effect/RcMap"
 import * as Schema from "effect/Schema"
+import * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
@@ -125,6 +127,7 @@ interface StateRecord {
   readonly bytes: number
   readonly entryBytes: number
   readonly token: object
+  readonly retention: Scope.Closeable
 }
 
 interface EventRecord {
@@ -218,7 +221,7 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
     ),
     spaceIdleTtlMillis: yield* positiveFiniteDurationMillis(
       "spaceIdleTtl",
-      options.spaceIdleTtl ?? Protocol.maximumEphemeralStateTtlMillis
+      options.spaceIdleTtl ?? memberTtlMillis
     )
   } satisfies ResolvedOptions
   if (resolved.memberTtlMillis < Protocol.minimumEphemeralMemberTtlMillis) {
@@ -255,12 +258,6 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
     return yield* invalidConfiguration(
       "maximumStateTtl",
       `maximumStateTtl must not exceed ${Protocol.maximumEphemeralStateTtlMillis} milliseconds`
-    )
-  }
-  if (resolved.spaceIdleTtlMillis < resolved.maximumStateTtlMillis) {
-    return yield* invalidConfiguration(
-      "spaceIdleTtl",
-      "spaceIdleTtl must be at least maximumStateTtl"
     )
   }
   return resolved
@@ -397,6 +394,7 @@ const removeState = (
       runtime.memberStateKeys.set(owner, (runtime.memberStateKeys.get(owner) ?? 1) - 1)
       cleanupOwnerAccounting(runtime, owner)
       if (cancelTimer) yield* FiberMap.remove(runtime.stateTimers, identity)
+      yield* Scope.close(current.retention, Exit.void)
       yield* publishDelta(
         runtime,
         Protocol.EphemeralStateRemoved.make({
@@ -830,7 +828,12 @@ export const layer = <R = never,>(
                   let nextEntryCount = runtime.members.size + runtime.states.size
                   if (previous === undefined) nextEntryCount += 1
                   yield* ensureSnapshotSize(resolved, nextSnapshotEntriesBytes, nextEntryCount)
-                  runtime.states.set(identity, { entry, bytes, entryBytes, token })
+                  let retention = previous?.retention
+                  if (retention === undefined) {
+                    retention = yield* Scope.make()
+                    yield* acquireSpace(request.spaceId).pipe(Scope.provide(retention))
+                  }
+                  runtime.states.set(identity, { entry, bytes, entryBytes, token, retention })
                   runtime.memberBytes.set(owner, ownerBytes)
                   let nextOwnerStateKeys = ownerStateKeys
                   if (previous === undefined) nextOwnerStateKeys += 1

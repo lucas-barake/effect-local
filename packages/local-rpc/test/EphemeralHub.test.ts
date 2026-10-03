@@ -800,6 +800,73 @@ describe("EphemeralHub", () => {
   )
 })
 
+describe("EphemeralHub space capacity", () => {
+  const layerOneSpace = layerTrusted({ maximumSpaces: 1, maximumWatchersPerSpace: 8 })
+
+  it.effect(
+    "frees the slot of a space that no member or retained state still occupies",
+    Effect.fnUntraced(function*() {
+      return yield* Effect.gen(function*() {
+        const hub = yield* EphemeralHub.EphemeralHub
+        const first = yield* startJoin(hub, joinRequest(spaceA, memberA))
+        yield* Fiber.interrupt(first.fiber)
+        yield* TestClock.adjust(Protocol.maximumEphemeralMemberTtlMillis)
+
+        const second = yield* hub.join(joinRequest(spaceB, memberB), null).pipe(
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.result
+        )
+        assert.strictEqual(
+          Result.match(second, { onSuccess: () => "joined", onFailure: (error) => error._tag }),
+          "joined"
+        )
+      }).pipe(Effect.provide(layerOneSpace))
+    })
+  )
+
+  it.effect(
+    "keeps a space with retained state after its last member leaves",
+    Effect.fnUntraced(function*() {
+      return yield* Effect.gen(function*() {
+        const hub = yield* EphemeralHub.EphemeralHub
+        const first = yield* startJoin(hub, joinRequest(spaceA, memberA))
+        yield* hub.publish(
+          Protocol.EphemeralSetStateRequest.make({
+            spaceId: spaceA,
+            member: memberA,
+            channel: "read",
+            key: "conversation-1",
+            value: 42,
+            ttlMillis: 3_600_000
+          }),
+          first.session.sessionToken,
+          null
+        )
+        yield* Fiber.interrupt(first.fiber)
+        yield* TestClock.adjust(Protocol.maximumEphemeralMemberTtlMillis)
+
+        const blocked = yield* hub.join(joinRequest(spaceB, memberB), null).pipe(Stream.runDrain, failureOf)
+        assert.strictEqual(blocked._tag, "CapacityExceeded")
+        const late = yield* startJoin(hub, joinRequest(spaceA, memberB))
+        assert.deepStrictEqual(late.snapshot.states.map((entry) => entry.value), [42])
+        yield* Fiber.interrupt(late.fiber)
+
+        yield* TestClock.adjust(3_600_000)
+        const freed = yield* hub.join(joinRequest(spaceB, memberB), null).pipe(
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.result
+        )
+        assert.strictEqual(
+          Result.match(freed, { onSuccess: () => "joined", onFailure: (error) => error._tag }),
+          "joined"
+        )
+      }).pipe(Effect.provide(layerOneSpace))
+    })
+  )
+})
+
 describe("EphemeralHub at small scheduler budgets", () => {
   it.effect(
     "ends only the subscriber that falls behind at a scheduler budget of 5 operations",
