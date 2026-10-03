@@ -133,10 +133,16 @@ const makeReconciliationRequests = (request: Effect.Effect<number, ReplicaError.
   return { run, observe }
 }
 
-const isTransientFailure = (error: ReplicaError.ReplicaError) =>
+export const isTransientFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "AuthenticatorUnavailable" ||
   error._tag === "ServerUnavailable" ||
   error._tag === "OperationTimeout"
+
+export const failureStatus = (error: ReplicaError.ReplicaError, pending: number): ReplicaStatus.ReplicaStatus => {
+  if (error._tag === "CredentialRejected") return { _tag: "NeedsAuthentication", pending }
+  if (isTransientFailure(error)) return { _tag: "Offline", pending }
+  return { _tag: "Failed", pending, message: error._tag }
+}
 
 export const makeManager = Effect.fnUntraced(function*(options: {
   readonly concurrency?: number
@@ -573,23 +579,12 @@ export const layerOnePass = (
               status,
               (current): readonly [ReplicaStatus.ReplicaStatus | undefined, ReplicaStatus.ReplicaStatus] => {
                 if (syncGeneration > observedGeneration) return [undefined, current]
-                if (error._tag === "CredentialRejected") {
-                  const next = { _tag: "NeedsAuthentication", pending } as const
-                  return [next, next]
-                }
+                const next = failureStatus(error, pending)
+                if (next._tag === "NeedsAuthentication") return [next, next]
                 if (current._tag === "NeedsAuthentication" && failedSinceSyncStarted) return [undefined, current]
-                if (preserveConnecting && (current._tag === "Connecting" || syncing) && isTransientFailure(error)) {
+                if (preserveConnecting && (current._tag === "Connecting" || syncing) && next._tag === "Offline") {
                   return [undefined, current]
                 }
-                if (
-                  error._tag === "AuthenticatorUnavailable" ||
-                  error._tag === "ServerUnavailable" ||
-                  error._tag === "OperationTimeout"
-                ) {
-                  const next = { _tag: "Offline", pending } as const
-                  return [next, next]
-                }
-                const next = { _tag: "Failed", pending, message: error._tag } as const
                 return [next, next]
               }
             ).pipe(

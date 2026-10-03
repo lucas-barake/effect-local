@@ -15,6 +15,7 @@ import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as FiberMap from "effect/FiberMap"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
@@ -153,6 +154,7 @@ interface RememberedEntry {
   synced: boolean
   retryAttempt: number
   retryVersion: number
+  backgroundFailure: ReplicaError.ReplicaError | undefined
 }
 
 type BackgroundWork =
@@ -183,6 +185,11 @@ const addressedStatus = (
   synced: boolean,
   status: ReplicaStatus.ReplicaStatus
 ): ReplicaStatus.SpaceStatus => ({ spaceId, synced, ...status })
+
+const inactiveStatus = (entry: RememberedEntry, pending: number): ReplicaStatus.ReplicaStatus => {
+  if (entry.backgroundFailure === undefined) return { _tag: "Idle", pending }
+  return Reconciler.failureStatus(entry.backgroundFailure, pending)
+}
 
 type AggregateCounts = ReplicaStatus.Aggregate["counts"]
 type AggregateCategory = keyof AggregateCounts
@@ -325,6 +332,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         Queue.shutdown
       )
       const backgroundQueued = new Set<Identity.SpaceId>()
+      const credentialWaits = yield* FiberMap.make<Identity.SpaceId, void, never>()
       const retrySchedule: Array<RetryWork> = []
       let capacityChanged = yield* Deferred.make<void>()
 
@@ -691,11 +699,49 @@ const makeLayer = <D extends Definition.Any, R,>(
         entry: RememberedEntry,
         transportGeneration: Option.Option<number>
       ) {
-        if (entries.get(entry.spaceId) !== entry || entry.leaving || entry.foreground) return
         entry.retryAttempt += 1
         entry.retryVersion += 1
         const readyAt = (yield* Clock.currentTimeMillis) + Configuration.retryMillis(retryTiming, entry.retryAttempt)
         yield* Queue.offer(retryQueue, { entry, version: entry.retryVersion, readyAt, transportGeneration })
+      })
+
+      const reportBackgroundFailure = (entry: RememberedEntry, failure: ReplicaError.ReplicaError | undefined) =>
+        Effect.suspend(() => {
+          if (entry.backgroundFailure === failure) return Effect.void
+          entry.backgroundFailure = failure
+          let contribute = Effect.void
+          if (entry.activation === "Inactive") {
+            contribute = modifyContribution(entry, (current) => inactiveStatus(entry, current.pending))
+          }
+          return FiberMap.remove(credentialWaits, entry.spaceId).pipe(
+            Effect.andThen(contribute),
+            Effect.andThen(reactivity.invalidate([ReactivityKey.status(entry.spaceId)]))
+          )
+        })
+
+      const settleBackgroundFailure = Effect.fnUntraced(function*(
+        entry: RememberedEntry,
+        failure: ReplicaError.ReplicaError,
+        transportGeneration: Option.Option<number>
+      ) {
+        if (entries.get(entry.spaceId) !== entry || entry.leaving || entry.foreground) return
+        if (Reconciler.isTransientFailure(failure)) {
+          yield* reportBackgroundFailure(entry, undefined)
+          let retryTransport = Option.none<number>()
+          if (isTransportFailure(failure)) retryTransport = transportGeneration
+          yield* scheduleBackgroundRetry(entry, retryTransport)
+          return
+        }
+        entry.retryAttempt = 0
+        entry.retryVersion += 1
+        yield* reportBackgroundFailure(entry, failure)
+        if (failure._tag !== "CredentialRejected" || failure.credentialGeneration === undefined) return
+        const resume = Effect.suspend(() => {
+          if (entries.get(entry.spaceId) !== entry || entry.backgroundFailure !== failure) return Effect.void
+          return enqueueBackground(entry)
+        })
+        const wait = remote.waitForCredentialChange(failure.credentialGeneration).pipe(Effect.andThen(resume))
+        yield* FiberMap.run(credentialWaits, entry.spaceId, wait)
       })
 
       const releaseTransportRetries = Effect.gen(function*() {
@@ -838,7 +884,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               return Effect.void
             })
           )
-          yield* updateContribution(entry, { _tag: "Idle", pending: count.count })
+          yield* updateContribution(entry, inactiveStatus(entry, count.count))
           if (enqueuePending && count.count > 0 && !entry.leaving) yield* enqueueBackground(entry)
           return true
         }))
@@ -954,6 +1000,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             entry.runtime = result.value
             entry.activation = "Active"
             entry.transition = undefined
+            if (foreground) yield* reportBackgroundFailure(entry, undefined)
             yield* Deferred.succeed(completion, undefined)
             yield* invalidateActivation(entry.spaceId)
             yield* signalCapacity
@@ -962,7 +1009,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.activation = "Inactive"
           entry.transition = undefined
           dropForegroundReservation(entry)
-          yield* modifyContribution(entry, (current) => ({ _tag: "Idle", pending: current.pending }))
+          yield* modifyContribution(entry, (current) => inactiveStatus(entry, current.pending))
           if (Exit.hasInterrupts(result)) yield* Deferred.succeed(completion, undefined)
           else yield* Deferred.done(completion, result)
           yield* invalidateActivation(entry.spaceId)
@@ -1270,7 +1317,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                 if (entry.activation === "Activating") {
                   return addressedStatus(entry.spaceId, entry.synced, { _tag: "Connecting", pending: row.count })
                 }
-                return addressedStatus(entry.spaceId, entry.synced, { _tag: "Idle", pending: row.count })
+                return addressedStatus(entry.spaceId, entry.synced, inactiveStatus(entry, row.count))
               })
             )
           })
@@ -1299,7 +1346,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           summaryStatus: { _tag: "Idle", pending: row.count },
           synced: row.replication_view_id !== null,
           retryAttempt: 0,
-          retryVersion: 0
+          retryVersion: 0,
+          backgroundFailure: undefined
         }
         if (workflow !== undefined) {
           const lease = ReconciliationWorkflow.RuntimeLease.of({
@@ -1457,6 +1505,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             Effect.tap(() =>
               removeContribution(current).pipe(
                 Effect.andThen(Effect.sync(() => entries.delete(spaceId))),
+                Effect.andThen(FiberMap.remove(credentialWaits, spaceId)),
                 Effect.andThen(publishSettlements(current))
               )
             ),
@@ -1501,7 +1550,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         const work = yield* LosslessQueue.take(backgroundQueue)
         if (work._tag === "Deactivate") {
           const result = yield* deactivate(work.entry, false, work.runtime, false).pipe(Effect.result)
-          if (Result.isFailure(result)) yield* scheduleBackgroundRetry(work.entry, Option.none())
+          if (Result.isFailure(result)) yield* settleBackgroundFailure(work.entry, result.failure, Option.none())
           return
         }
         const spaceId = work.spaceId
@@ -1524,17 +1573,16 @@ const makeLayer = <D extends Definition.Any, R,>(
             Result.isSuccess(result)
           ).pipe(Effect.result)
           if (Result.isFailure(deactivation)) {
-            yield* scheduleBackgroundRetry(entry, Option.none())
+            yield* settleBackgroundFailure(entry, deactivation.failure, Option.none())
             return
           }
         }
         if (Result.isFailure(result)) {
-          let retryTransport = Option.none<number>()
-          if (isTransportFailure(result.failure)) retryTransport = Option.some(transportGeneration)
-          yield* scheduleBackgroundRetry(entry, retryTransport)
+          yield* settleBackgroundFailure(entry, result.failure, Option.some(transportGeneration))
         } else {
           entry.retryAttempt = 0
           entry.retryVersion += 1
+          yield* reportBackgroundFailure(entry, undefined)
         }
       })
 
