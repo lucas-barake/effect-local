@@ -66,9 +66,9 @@ export const requireStringKeys = (schema: Schema.Top): void =>
 
 export function normalize<S extends Input,>(input: Valid<S>): Wire<S>
 export function normalize(input: Input): WireSchema {
-  let schema: WireSchema
-  if (Schema.isSchema(input)) schema = input
-  else schema = Schema.Struct(input)
-  requireStringKeys(schema)
-  return schema
+  let Normalized: WireSchema
+  if (Schema.isSchema(input)) Normalized = input
+  else Normalized = Schema.Struct(input)
+  requireStringKeys(Normalized)
+  return Normalized
 }

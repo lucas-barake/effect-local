@@ -849,8 +849,8 @@ const migrateMutationPart = Effect.fnUntraced(function*(options: {
     )
     let migrated: unknown = sourceValue
     if (migrate !== undefined) migrated = migrate(sourceValue)
-    const toSchema = target[part.schema]
-    const targetValue = yield* Schema.decodeUnknownEffect(Schema.toType(toSchema))(migrated).pipe(
+    const TargetSchema = target[part.schema]
+    const targetValue = yield* Schema.decodeUnknownEffect(Schema.toType(TargetSchema))(migrated).pipe(
       Effect.mapError((cause) =>
         new ReplicaError.SchemaEvolutionFailed({
           stepId: entry.id,
@@ -863,7 +863,7 @@ const migrateMutationPart = Effect.fnUntraced(function*(options: {
         })
       )
     )
-    value = yield* Schema.encodeUnknownEffect(toSchema)(targetValue).pipe(
+    value = yield* Schema.encodeUnknownEffect(TargetSchema)(targetValue).pipe(
       Effect.mapError((cause) =>
         new ReplicaError.SchemaEvolutionFailed({
           stepId: entry.id,

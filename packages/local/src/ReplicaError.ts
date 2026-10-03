@@ -1,9 +1,9 @@
 import * as Schema from "effect/Schema"
 
-const optionalDefect = Schema.optionalKey(Schema.Defect())
-const nonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
-const optionalNonNegativeInt = Schema.optionalKey(nonNegativeInt)
-const positiveInt = Schema.Int.check(Schema.isGreaterThan(0))
+const OptionalDefect = Schema.optionalKey(Schema.Defect())
+const NonNegativeInt = Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+const OptionalNonNegativeInt = Schema.optionalKey(NonNegativeInt)
+const PositiveInt = Schema.Int.check(Schema.isGreaterThan(0))
 
 export class CanonicalEncodeError extends Schema.TaggedError<CanonicalEncodeError>(
   "@lucas-barake/effect-local/CanonicalEncodeError"
@@ -15,7 +15,7 @@ export class StorageUnavailable extends Schema.TaggedError<StorageUnavailable>(
 
 export class StorageCorrupt extends Schema.TaggedError<StorageCorrupt>(
   "@lucas-barake/effect-local/StorageCorrupt"
-)("StorageCorrupt", { message: Schema.String, cause: optionalDefect }) {}
+)("StorageCorrupt", { message: Schema.String, cause: OptionalDefect }) {}
 
 /**
  * The consumer's own query statement failed: bad SQL, a missing table or column, or an unbindable
@@ -25,7 +25,7 @@ export class StorageCorrupt extends Schema.TaggedError<StorageCorrupt>(
  */
 export class QueryFailed extends Schema.TaggedError<QueryFailed>(
   "@lucas-barake/effect-local/QueryFailed"
-)("QueryFailed", { message: Schema.String, cause: optionalDefect }) {}
+)("QueryFailed", { message: Schema.String, cause: OptionalDefect }) {}
 
 export class DefinitionMismatch extends Schema.TaggedError<DefinitionMismatch>(
   "@lucas-barake/effect-local/DefinitionMismatch"
@@ -146,7 +146,7 @@ export class UnknownCommitOutcome extends Schema.TaggedError<UnknownCommitOutcom
 
 export class ProtocolInvalid extends Schema.TaggedError<ProtocolInvalid>(
   "@lucas-barake/effect-local/ProtocolInvalid"
-)("ProtocolInvalid", { message: Schema.String, cause: optionalDefect }) {}
+)("ProtocolInvalid", { message: Schema.String, cause: OptionalDefect }) {}
 
 export class UpgradeRequired extends Schema.TaggedError<UpgradeRequired>(
   "@lucas-barake/effect-local/UpgradeRequired"
@@ -169,7 +169,7 @@ export class ServerUnavailable extends Schema.TaggedError<ServerUnavailable>(
 export class CredentialRejected extends Schema.TaggedError<CredentialRejected>(
   "@lucas-barake/effect-local/CredentialRejected"
 )("CredentialRejected", {
-  credentialGeneration: optionalNonNegativeInt
+  credentialGeneration: OptionalNonNegativeInt
 }) {}
 
 export class AuthenticatorUnavailable extends Schema.TaggedError<AuthenticatorUnavailable>(
@@ -180,7 +180,7 @@ export class OperationTimeout extends Schema.TaggedError<OperationTimeout>(
   "@lucas-barake/effect-local/OperationTimeout"
 )("OperationTimeout", {
   operation: Schema.String,
-  timeoutMillis: positiveInt
+  timeoutMillis: PositiveInt
 }) {}
 
 export class AuthorizationDenied extends Schema.TaggedError<AuthorizationDenied>(
@@ -196,8 +196,8 @@ export class OwnerUnavailable extends Schema.TaggedError<OwnerUnavailable>(
 export class BuildSuperseded extends Schema.TaggedError<BuildSuperseded>(
   "@lucas-barake/effect-local/BuildSuperseded"
 )("BuildSuperseded", {
-  version: positiveInt,
-  supersedingVersion: positiveInt
+  version: PositiveInt,
+  supersedingVersion: PositiveInt
 }) {}
 
 export const StorageError = Schema.Union([StorageUnavailable, StorageCorrupt, CanonicalEncodeError])

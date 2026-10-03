@@ -19,10 +19,10 @@ export const make = <Value extends Schema.Top, Operation extends Schema.Top, E e
 }): Semantics<Value, Operation, E> => Object.freeze(options)
 
 export const register = <Value extends Schema.Top,>(schema: Value) => {
-  const operation = Schema.Struct({ _tag: Schema.Literal("Set"), value: schema })
+  const SetOperation = Schema.Struct({ _tag: Schema.Literal("Set"), value: schema })
   return make({
     schema,
-    operation,
+    operation: SetOperation,
     apply: (_current, update) =>
       Schema.decodeUnknownEffect(Schema.toType(schema))(Reflect.get(update, "value")).pipe(
         Effect.catchTag("SchemaError", (error) => Effect.die(error))
@@ -42,11 +42,11 @@ export const counter = make({
 })
 
 export const growOnlySet = <Item extends Schema.Top,>(item: Item) => {
-  const operation = Schema.Struct({ _tag: Schema.Literal("Add"), value: item })
+  const AddOperation = Schema.Struct({ _tag: Schema.Literal("Add"), value: item })
   return make({
     schema: Schema.Array(item),
-    operation,
-    apply: Effect.fnUntraced(function*(current: ReadonlyArray<Item["Type"]>, update: typeof operation.Type) {
+    operation: AddOperation,
+    apply: Effect.fnUntraced(function*(current: ReadonlyArray<Item["Type"]>, update: typeof AddOperation.Type) {
       const value = yield* Schema.decodeUnknownEffect(Schema.toType(item))(Reflect.get(update, "value")).pipe(
         Effect.catchTag("SchemaError", (error) => Effect.die(error))
       )

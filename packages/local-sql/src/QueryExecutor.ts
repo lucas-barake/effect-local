@@ -269,20 +269,20 @@ export const layer = <D extends Definition.Any,>(
             >,
             any
           >(query.handler)(context)
-          const payloadSchema = Schema.make<
+          const PayloadSchema = Schema.make<
             Schema.Codec<
               Q["payloadSchema"]["Type"],
               Q["payloadSchema"]["Encoded"]
             >
           >(query.payloadSchema.ast)
-          const successSchema = Schema.make<
+          const SuccessSchema = Schema.make<
             Schema.Codec<
               Q["successSchema"]["Type"],
               Q["successSchema"]["Encoded"]
             >
           >(query.successSchema.ast)
-          const encodedPayload = yield* Codec.encode(payloadSchema, payload)
-          const decodedPayload = yield* Codec.decode(payloadSchema, encodedPayload)
+          const encodedPayload = yield* Codec.encode(PayloadSchema, payload)
+          const decodedPayload = yield* Codec.decode(PayloadSchema, encodedPayload)
           const reads: Array<QueryReactivity.Read> = []
           yield* queryReactivity.record(key, reads)
           const result = yield* handler.execute({
@@ -297,8 +297,8 @@ export const layer = <D extends Definition.Any,>(
             ),
             payload: decodedPayload
           })
-          const encoded = yield* Codec.encode(successSchema, result)
-          const value = yield* Codec.decode(successSchema, encoded)
+          const encoded = yield* Codec.encode(SuccessSchema, result)
+          const value = yield* Codec.decode(SuccessSchema, encoded)
           yield* queryReactivity.record(key, reads)
           return value
         })).pipe(
