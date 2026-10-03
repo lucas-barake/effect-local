@@ -699,7 +699,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         entry: RememberedEntry,
         transportGeneration: Option.Option<number>
       ) {
-        if (entries.get(entry.spaceId) !== entry || entry.leaving || entry.foreground) return
         entry.retryAttempt += 1
         entry.retryVersion += 1
         const readyAt = (yield* Clock.currentTimeMillis) + Configuration.retryMillis(retryTiming, entry.retryAttempt)
@@ -724,6 +723,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         failure: ReplicaError.ReplicaError | undefined,
         transportGeneration: Option.Option<number>
       ) {
+        if (entries.get(entry.spaceId) !== entry || entry.leaving || entry.foreground) return
         if (failure !== undefined && Reconciler.isTransientFailure(failure)) {
           yield* reportBackgroundFailure(entry, undefined)
           let retryTransport = Option.none<number>()

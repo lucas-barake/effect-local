@@ -12,6 +12,7 @@ import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
@@ -568,6 +569,64 @@ describe("background sync terminal failures", () => {
 
       assert.isTrue(Option.isNone(retried))
       assert.strictEqual(attempts.count(), 3)
+    }, Effect.scoped)
+  )
+
+  it.effect.each(
+    [
+      ["layer", "ProtocolInvalid"],
+      ["layer", "CredentialRejected"],
+      ["layerWorkflow", "ProtocolInvalid"],
+      ["layerWorkflow", "CredentialRejected"]
+    ] as const
+  )(
+    "ignores a background failure that arrives after the foreground took the space over with %s and %s",
+    Effect.fnUntraced(function*([constructor, tag]) {
+      const services = yield* pendingBackgroundSpace(constructor)
+      const held = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let failure: ReplicaError.ReplicaError = protocolInvalid
+      if (tag === "CredentialRejected") failure = new ReplicaError.CredentialRejected({ credentialGeneration: 7 })
+      let pulls = 0
+      let credentialWaits = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () => {
+          credentialWaits += 1
+          return Effect.never
+        },
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          pulls += 1
+          if (pulls > 1) return emptyPage(services.crypto, request)
+          return Deferred.succeed(held, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(Effect.fail(failure)),
+            Effect.uninterruptible
+          )
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* Deferred.await(held)
+      const activation = yield* Effect.forkChild(space.activate, { startImmediately: true })
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(activation)
+      const online = awaitSpaceStatusWhere(
+        space,
+        services.reactivity,
+        (status) => status._tag === "Online" && status.pending === 0
+      ).pipe(Effect.scoped)
+      yield* VirtualTime.advanceUntil(online)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+
+      yield* space.deactivate
+
+      assert.strictEqual((yield* space.status)._tag, "Idle")
+      const aggregate = yield* replica.status
+      assert.strictEqual(aggregate.counts.idle, 1)
+      assert.strictEqual(aggregate.counts.failed, 0)
+      assert.strictEqual(aggregate.counts.needsAuthentication, 0)
+      assert.strictEqual(credentialWaits, 0)
     }, Effect.scoped)
   )
 
