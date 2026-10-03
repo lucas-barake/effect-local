@@ -939,6 +939,35 @@ describe("client schema evolution", () => {
   )
 
   it.effect(
+    "rejects an entry whose value does not match the current schema before persisting it",
+    Effect.fnUntraced(
+      function*() {
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const result = yield* v1.applyEntries([Protocol.AcceptedMutation.make({
+          sequence: Identity.ServerSequence.make(1),
+          spaceId,
+          clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+          membershipIncarnation,
+          mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000204"),
+          localSequence: Identity.LocalSequence.make(1),
+          sourceSchema: definitionV1.schemaIdentity,
+          digest: "4".repeat(64),
+          changes: [Protocol.Upsert.make({
+            entity: { model: TodoV1.name, modelVersion: TodoV1.version, key: "5" },
+            value: { id: "5", title: 5 }
+          })]
+        })]).pipe(Effect.result)
+        const error = expectFailure(result)
+        assert.strictEqual(error._tag, "SchemaEvolutionFailed")
+        assert.strictEqual((yield* v1.progress).cursor, 0)
+        assert.isTrue(Option.isNone(yield* v1.get(TodoV1, "5")))
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect(
     "rejects a later historical key that collides with promoted lineage",
     Effect.fnUntraced(
       function*() {

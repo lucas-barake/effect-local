@@ -420,6 +420,72 @@ describe("schema evolution", () => {
   )
 
   it.effect(
+    "validates source parts against the source schema when no step is crossed",
+    Effect.fnUntraced(function*() {
+      const invalidKey = expectFailure(
+        yield* Evolution.migrateModel({
+          evolution,
+          source: definitionV2.schemaIdentity,
+          model: "Todo",
+          modelVersion: Identity.SchemaVersion.make(2),
+          key: "42"
+        }).pipe(Effect.result)
+      )
+      assert.strictEqual(invalidKey._tag, "SchemaEvolutionFailed")
+      if (invalidKey._tag === "SchemaEvolutionFailed") {
+        assert.isNull(invalidKey.stepId)
+        assert.strictEqual(invalidKey.part, "Key")
+      }
+
+      const invalidValue = expectFailure(
+        yield* Evolution.migrateModel({
+          evolution,
+          source: definitionV2.schemaIdentity,
+          model: "Todo",
+          modelVersion: Identity.SchemaVersion.make(2),
+          key: 42,
+          value: { id: "42", title: "new" }
+        }).pipe(Effect.result)
+      )
+      assert.strictEqual(invalidValue._tag, "SchemaEvolutionFailed")
+      if (invalidValue._tag === "SchemaEvolutionFailed") {
+        assert.isNull(invalidValue.stepId)
+        assert.strictEqual(invalidValue.part, "Value")
+      }
+
+      const invalidPayload = expectFailure(
+        yield* Evolution.migrateMutationPayload({
+          evolution,
+          source: definitionV2.schemaIdentity,
+          mutation: "PutTodo",
+          mutationVersion: Identity.SchemaVersion.make(2),
+          value: { id: "42" }
+        }).pipe(Effect.result)
+      )
+      assert.strictEqual(invalidPayload._tag, "SchemaEvolutionFailed")
+      if (invalidPayload._tag === "SchemaEvolutionFailed") {
+        assert.isNull(invalidPayload.stepId)
+        assert.strictEqual(invalidPayload.part, "Payload")
+      }
+
+      const invalidRejection = expectFailure(
+        yield* Evolution.migrateMutationRejection({
+          evolution,
+          source: definitionV2.schemaIdentity,
+          mutation: "PutTodo",
+          mutationVersion: Identity.SchemaVersion.make(2),
+          value: { _tag: "Unknown" }
+        }).pipe(Effect.result)
+      )
+      assert.strictEqual(invalidRejection._tag, "SchemaEvolutionFailed")
+      if (invalidRejection._tag === "SchemaEvolutionFailed") {
+        assert.isNull(invalidRejection.stepId)
+        assert.strictEqual(invalidRejection.part, "Rejection")
+      }
+    })
+  )
+
+  it.effect(
     "reports invalid transform output as a typed failure with exact context",
     Effect.fnUntraced(function*() {
       const invalid = Evolution.step({

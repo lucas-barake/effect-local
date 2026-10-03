@@ -551,6 +551,34 @@ export const migrateModelTo = Effect.fnUntraced(function*(options: {
       targetHash: options.target.hash
     })
   }
+  yield* Schema.decodeUnknownEffect(sourceModel.key)(options.key).pipe(
+    Effect.mapError((cause) =>
+      new ReplicaError.SchemaEvolutionFailed({
+        stepId: null,
+        componentKind: "Model",
+        componentName: options.model,
+        part: "Key",
+        fromVersion: sourceModel.version,
+        toVersion: sourceModel.version,
+        cause
+      })
+    )
+  )
+  if (options.value !== undefined) {
+    yield* Schema.decodeUnknownEffect(sourceModel.schema)(options.value).pipe(
+      Effect.mapError((cause) =>
+        new ReplicaError.SchemaEvolutionFailed({
+          stepId: null,
+          componentKind: "Model",
+          componentName: options.model,
+          part: "Value",
+          fromVersion: sourceModel.version,
+          toVersion: sourceModel.version,
+          cause
+        })
+      )
+    )
+  }
   let key = options.key
   let value = options.value
   let version = options.modelVersion
@@ -754,6 +782,31 @@ const migrateMutationPart = Effect.fnUntraced(function*(options: {
       targetHash: options.target.hash
     })
   }
+  let sourceSchema: SchemaInput.WireSchema
+  switch (options.part) {
+    case "Payload":
+      sourceSchema = sourceMutation.payloadSchema
+      break
+    case "Success":
+      sourceSchema = sourceMutation.successSchema
+      break
+    case "Rejection":
+      sourceSchema = sourceMutation.rejectionSchema
+      break
+  }
+  yield* Schema.decodeUnknownEffect(sourceSchema)(options.value).pipe(
+    Effect.mapError((cause) =>
+      new ReplicaError.SchemaEvolutionFailed({
+        stepId: null,
+        componentKind: "Mutation",
+        componentName: options.mutation,
+        part: options.part,
+        fromVersion: sourceMutation.version,
+        toVersion: sourceMutation.version,
+        cause
+      })
+    )
+  )
   let value = options.value
   let version = options.mutationVersion
   for (const traversal of path) {
