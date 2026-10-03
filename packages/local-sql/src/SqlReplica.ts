@@ -699,6 +699,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         entry: RememberedEntry,
         transportGeneration: Option.Option<number>
       ) {
+        if (entries.get(entry.spaceId) !== entry || entry.leaving || entry.foreground) return
         entry.retryAttempt += 1
         entry.retryVersion += 1
         const readyAt = (yield* Clock.currentTimeMillis) + Configuration.retryMillis(retryTiming, entry.retryAttempt)
@@ -707,7 +708,6 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const reportBackgroundFailure = (entry: RememberedEntry, failure: ReplicaError.ReplicaError | undefined) =>
         Effect.suspend(() => {
-          if (entry.backgroundFailure === failure) return Effect.void
           entry.backgroundFailure = failure
           let contribute = Effect.void
           if (entry.activation === "Inactive") {
@@ -719,28 +719,24 @@ const makeLayer = <D extends Definition.Any, R,>(
           )
         })
 
-      const settleBackgroundFailure = Effect.fnUntraced(function*(
+      const settleBackgroundTurn = Effect.fnUntraced(function*(
         entry: RememberedEntry,
-        failure: ReplicaError.ReplicaError,
+        failure: ReplicaError.ReplicaError | undefined,
         transportGeneration: Option.Option<number>
       ) {
-        if (entries.get(entry.spaceId) !== entry || entry.leaving || entry.foreground) return
-        if (Reconciler.isTransientFailure(failure)) {
+        if (failure !== undefined && Reconciler.isTransientFailure(failure)) {
           yield* reportBackgroundFailure(entry, undefined)
           let retryTransport = Option.none<number>()
           if (isTransportFailure(failure)) retryTransport = transportGeneration
           yield* scheduleBackgroundRetry(entry, retryTransport)
           return
         }
-        entry.retryAttempt = 0
         entry.retryVersion += 1
         yield* reportBackgroundFailure(entry, failure)
-        if (failure._tag !== "CredentialRejected" || failure.credentialGeneration === undefined) return
-        const resume = Effect.suspend(() => {
-          if (entries.get(entry.spaceId) !== entry || entry.backgroundFailure !== failure) return Effect.void
-          return enqueueBackground(entry)
-        })
-        const wait = remote.waitForCredentialChange(failure.credentialGeneration).pipe(Effect.andThen(resume))
+        if (failure?._tag !== "CredentialRejected" || failure.credentialGeneration === undefined) return
+        const wait = remote.waitForCredentialChange(failure.credentialGeneration).pipe(
+          Effect.andThen(enqueueBackground(entry))
+        )
         yield* FiberMap.run(credentialWaits, entry.spaceId, wait)
       })
 
@@ -1550,7 +1546,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         const work = yield* LosslessQueue.take(backgroundQueue)
         if (work._tag === "Deactivate") {
           const result = yield* deactivate(work.entry, false, work.runtime, false).pipe(Effect.result)
-          if (Result.isFailure(result)) yield* settleBackgroundFailure(work.entry, result.failure, Option.none())
+          if (Result.isFailure(result)) yield* settleBackgroundTurn(work.entry, result.failure, Option.none())
           return
         }
         const spaceId = work.spaceId
@@ -1573,17 +1569,13 @@ const makeLayer = <D extends Definition.Any, R,>(
             Result.isSuccess(result)
           ).pipe(Effect.result)
           if (Result.isFailure(deactivation)) {
-            yield* settleBackgroundFailure(entry, deactivation.failure, Option.none())
+            yield* settleBackgroundTurn(entry, deactivation.failure, Option.none())
             return
           }
         }
-        if (Result.isFailure(result)) {
-          yield* settleBackgroundFailure(entry, result.failure, Option.some(transportGeneration))
-        } else {
-          entry.retryAttempt = 0
-          entry.retryVersion += 1
-          yield* reportBackgroundFailure(entry, undefined)
-        }
+        let failure: ReplicaError.ReplicaError | undefined
+        if (Result.isFailure(result)) failure = result.failure
+        yield* settleBackgroundTurn(entry, failure, Option.some(transportGeneration))
       })
 
       yield* Effect.forEach(

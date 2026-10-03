@@ -79,7 +79,12 @@ const emptyPage = (crypto: Crypto.Crypto, request: Parameters<Remote["pull"]>[0]
   )
 
 const makeAttempts = Effect.gen(function*() {
-  const reached = [yield* Deferred.make<void>(), yield* Deferred.make<void>(), yield* Deferred.make<void>()]
+  const reached = [
+    yield* Deferred.make<void>(),
+    yield* Deferred.make<void>(),
+    yield* Deferred.make<void>(),
+    yield* Deferred.make<void>()
+  ]
   let count = 0
   const record = Effect.suspend(() => {
     count += 1
@@ -90,11 +95,11 @@ const makeAttempts = Effect.gen(function*() {
   return {
     record,
     count: () => count,
-    reached: (attempt: 1 | 2 | 3) => Deferred.await(reached[attempt - 1])
+    reached: (attempt: 1 | 2 | 3 | 4) => Deferred.await(reached[attempt - 1])
   }
 })
 
-const pendingBackgroundSpace = Effect.fnUntraced(function*(constructor: Constructor) {
+const backgroundServices = Effect.fnUntraced(function*(constructor: Constructor) {
   const databaseContext = yield* Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
@@ -146,19 +151,87 @@ const pendingBackgroundSpace = Effect.fnUntraced(function*(constructor: Construc
     }
     return Layer.build(layerReplica).pipe(Effect.map(Context.get(Replica.Replica)))
   }
-
-  const seedScope = yield* Scope.make()
-  const seedReplica = yield* start(idleRemote).pipe(Scope.provide(seedScope))
-  const seedSpace = yield* seedReplica.space(spaceId)
-  yield* seedSpace.mutate(Domain.PutTodo, Domain.todo("pending"))
-  yield* seedSpace.deactivate
-  yield* Scope.close(seedScope, Exit.void)
-  yield* sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId}, replication_view_revision = 0`
-
   const lockNext = (statement: string) => {
     lockedStatement = statement
   }
   return { sql, crypto, reactivity, start, lockNext }
+})
+
+const pendingBackgroundSpace = Effect.fnUntraced(function*(constructor: Constructor) {
+  const services = yield* backgroundServices(constructor)
+  const seedScope = yield* Scope.make()
+  const seedReplica = yield* services.start(idleRemote).pipe(Scope.provide(seedScope))
+  const seedSpace = yield* seedReplica.space(spaceId)
+  yield* seedSpace.mutate(Domain.PutTodo, Domain.todo("pending"))
+  yield* seedSpace.deactivate
+  yield* Scope.close(seedScope, Exit.void)
+  yield* services.sql`UPDATE effect_local_client_spaces
+    SET replication_view_id = ${viewId}, replication_view_revision = 0`
+  return services
+})
+
+const pendingCountStatement = "SELECT COUNT(p.mutation_id) AS count"
+
+const awaitAggregate = Effect.fnUntraced(function*(
+  replica: Replica.Replica["Service"],
+  reactivity: Reactivity.Reactivity,
+  matches: (aggregate: ReplicaStatus.Aggregate) => boolean
+) {
+  const changes = yield* Queue.unbounded<void>()
+  yield* Effect.acquireRelease(
+    Effect.sync(() =>
+      reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+        Queue.offerUnsafe(changes, undefined)
+      })
+    ),
+    (unregister) => Effect.sync(unregister)
+  )
+  let aggregate = yield* replica.status
+  while (!matches(aggregate)) {
+    yield* Queue.take(changes)
+    aggregate = yield* replica.status
+  }
+  return aggregate
+})
+
+const awaitActivation = Effect.fnUntraced(function*(
+  space: Replica.Space,
+  reactivity: Reactivity.Reactivity,
+  activation: Replica.Activation
+) {
+  const changes = yield* Queue.unbounded<void>()
+  yield* Effect.acquireRelease(
+    Effect.sync(() =>
+      reactivity.registerUnsafe([ReactivityKey.activation(space.spaceId)], () => {
+        Queue.offerUnsafe(changes, undefined)
+      })
+    ),
+    (unregister) => Effect.sync(unregister)
+  )
+  while ((yield* space.activation) !== activation) yield* Queue.take(changes)
+})
+
+const protocolInvalid = new ReplicaError.ProtocolInvalid({ message: "rejected by the server" })
+
+const workflowRetryAfterRelease = Effect.fnUntraced(function*() {
+  const services = yield* backgroundServices("layerWorkflow")
+  const attempts = yield* makeAttempts
+  const replica = yield* services.start(SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    pull: () => {
+      if (attempts.count() === 0) {
+        return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+      }
+      return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+    }
+  }))
+  const space = yield* replica.space(spaceId)
+  yield* space.mutate(Domain.PutTodo, Domain.todo("pending"))
+  yield* attempts.reached(1)
+  yield* space.deactivate
+  yield* attempts.reached(2)
+  yield* awaitSpaceStatus(space, services.reactivity, "Failed")
+  return { services, attempts, replica, space }
 })
 
 const awaitSpaceStatusWhere = Effect.fnUntraced(function*(
@@ -361,6 +434,258 @@ describe("background sync terminal failures", () => {
       const aggregate = yield* replica.status
       assert.strictEqual(aggregate.counts.failed, 0)
       assert.strictEqual(aggregate.totalPending, 0)
+
+      yield* space.deactivate
+      assert.strictEqual((yield* space.status)._tag, "Idle")
+      assert.strictEqual((yield* replica.status).counts.idle, 1)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "notifies subscribers of the space status once the terminal failure is visible",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      yield* corruptPending(services.sql)
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => emptyPage(services.crypto, request)
+      }))
+      const space = yield* replica.space(spaceId)
+      const notified: Array<"aggregate" | "status"> = []
+      yield* Effect.acquireRelease(
+        Effect.sync(() => {
+          const aggregate = services.reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+            notified.push("aggregate")
+          })
+          const status = services.reactivity.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+            notified.push("status")
+          })
+          return () => {
+            aggregate()
+            status()
+          }
+        }),
+        (unregister) => Effect.sync(unregister)
+      )
+
+      yield* awaitSpaceStatus(space, services.reactivity, "Failed")
+
+      assert.strictEqual(notified.at(-1), "status")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "shows a terminally failed background space as connecting while it is active again",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => {
+          if (attempts.count() > 0) return Effect.never
+          return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* awaitSpaceStatus(space, services.reactivity, "Failed")
+
+      yield* space.activate
+
+      const aggregate = yield* replica.status
+      assert.strictEqual(aggregate.counts.connecting, 1)
+      assert.strictEqual(aggregate.counts.idle, 0)
+      assert.strictEqual(aggregate.counts.failed, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "keeps a terminally failed background space failed when its activation fails",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* awaitSpaceStatus(space, services.reactivity, "Failed")
+      yield* services.sql`UPDATE effect_local_client_spaces SET desired_scope_json = '{"models":["Missing"]}'`
+
+      const activation = yield* Effect.result(space.activate)
+
+      assert.strictEqual(activation._tag, "Failure")
+      const status = yield* space.status
+      assert.strictEqual(status._tag, "Failed")
+      if (status._tag === "Failed") assert.strictEqual(status.message, "ProtocolInvalid")
+      const aggregate = yield* replica.status
+      assert.strictEqual(aggregate.counts.failed, 1)
+      assert.strictEqual(aggregate.counts.idle, 0)
+      assert.strictEqual(attempts.count(), 1)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "runs another background turn when the release bookkeeping of a failed turn hits a lock timeout",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      services.lockNext(pendingCountStatement)
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* attempts.reached(1)
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.isTrue(Option.isSome(retried))
+      const status = yield* awaitSpaceStatus(space, services.reactivity, "Failed")
+      assert.strictEqual(status.pending, 1)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "drops the retry scheduled for failed release bookkeeping once a later turn fails terminally",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      services.lockNext(pendingCountStatement)
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (attempts.count() < 2) return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
+          return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* attempts.reached(3)
+      yield* awaitSpaceStatus(space, services.reactivity, "Failed")
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(4)).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.isTrue(Option.isNone(retried))
+      assert.strictEqual(attempts.count(), 3)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "keeps a background space failed after a workflow attempt on it fails and releases it",
+    Effect.fnUntraced(function*() {
+      const { services, attempts, replica, space } = yield* workflowRetryAfterRelease()
+
+      yield* VirtualTime.advanceUntil(attempts.reached(3))
+      const inactive = awaitActivation(space, services.reactivity, "Inactive").pipe(Effect.scoped)
+      yield* VirtualTime.advanceUntil(inactive)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+
+      const aggregate = yield* replica.status
+
+      assert.strictEqual(aggregate.counts.failed, 1)
+      assert.strictEqual(aggregate.counts.idle, 0)
+      const status = yield* space.status
+      assert.strictEqual(status._tag, "Failed")
+      if (status._tag === "Failed") assert.strictEqual(status.message, "ProtocolInvalid")
+      assert.strictEqual(yield* space.activation, "Inactive")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "runs another background turn when releasing a workflow attempt hits a lock timeout",
+    Effect.fnUntraced(function*() {
+      const { services, attempts, replica } = yield* workflowRetryAfterRelease()
+      services.lockNext(pendingCountStatement)
+      const failedAgain = awaitAggregate(
+        replica,
+        services.reactivity,
+        (aggregate) => attempts.count() >= 4 && aggregate.counts.failed === 1
+      ).pipe(Effect.scoped)
+
+      const settled = yield* VirtualTime.advanceUntil(failedAgain).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.isTrue(Option.isSome(settled))
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "stops waiting for a new credential when the space is activated",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      const waitInterrupted = yield* Deferred.make<void>()
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () =>
+          Effect.onInterrupt(Effect.never, () => Deferred.succeed(waitInterrupted, undefined)),
+        pull: () => {
+          if (attempts.count() > 0) return Effect.never
+          return Effect.andThen(
+            attempts.record,
+            Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
+          )
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* awaitSpaceStatus(space, services.reactivity, "NeedsAuthentication")
+
+      yield* space.activate
+
+      const interrupted = yield* Deferred.await(waitInterrupted).pipe(Effect.timeoutOption("1 minute"))
+      assert.isTrue(Option.isSome(interrupted))
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "stops waiting for a new credential when the space is left",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const waitInterrupted = yield* Deferred.make<void>()
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () =>
+          Effect.onInterrupt(Effect.never, () => Deferred.succeed(waitInterrupted, undefined)),
+        pull: () => Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* awaitSpaceStatus(space, services.reactivity, "NeedsAuthentication")
+
+      yield* replica.leave(spaceId)
+
+      const interrupted = yield* Deferred.await(waitInterrupted).pipe(Effect.timeoutOption("1 minute"))
+      assert.isTrue(Option.isSome(interrupted))
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "reports a background space as idle again when its retry after a new credential fails transiently",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      const credentialChanged = yield* Deferred.make<void>()
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () => Deferred.await(credentialChanged),
+        pull: () => {
+          if (attempts.count() > 0) {
+            return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+          }
+          return Effect.andThen(
+            attempts.record,
+            Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
+          )
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* awaitSpaceStatus(space, services.reactivity, "NeedsAuthentication")
+
+      yield* Deferred.succeed(credentialChanged, undefined)
+      yield* attempts.reached(2)
+
+      const status = yield* awaitSpaceStatus(space, services.reactivity, "Idle")
+      assert.strictEqual(status.pending, 1)
+      assert.strictEqual((yield* replica.status).counts.needsAuthentication, 0)
     }, Effect.scoped)
   )
 
