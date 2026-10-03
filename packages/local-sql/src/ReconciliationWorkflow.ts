@@ -620,11 +620,7 @@ const layerSchedulerWithConfiguration = (
             continue
           }
           yield* reconciliation.failed(error, observedGeneration)
-          if (
-            error._tag === "AuthenticatorUnavailable" ||
-            error._tag === "ServerUnavailable" ||
-            error._tag === "OperationTimeout"
-          ) {
+          if (Reconciler.isTransientFailure(error)) {
             retryAttempt += 1
             yield* Effect.logWarning("Reconciliation supervisor will retry", error)
             yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
@@ -686,11 +682,7 @@ const layerSchedulerWithConfiguration = (
             continue
           }
           yield* reconciliation.watchFailed(error)
-          if (
-            error._tag === "AuthenticatorUnavailable" ||
-            error._tag === "ServerUnavailable" ||
-            error._tag === "OperationTimeout"
-          ) {
+          if (Reconciler.isTransientFailure(error)) {
             retryAttempt += 1
             yield* Effect.logWarning("Sync watch will retry", error)
             yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))

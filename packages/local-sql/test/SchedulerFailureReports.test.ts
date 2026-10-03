@@ -166,6 +166,8 @@ const awaitStatus = (
     Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
   )
 
+const isNotOnline = (status: ReplicaStatus.SpaceStatus) => status._tag !== "Online"
+
 const replicaOptions = {
   definition: Domain.definition,
   clientId,
@@ -313,6 +315,89 @@ describe("scheduler failure reports", () => {
       )
 
       assert.isTrue(Option.isSome(drained))
+    })
+  )
+
+  it.effect.each([1, 2])(
+    "drains a pending mutation after one lock timeout with %s workflow attempts per execution",
+    Effect.fnUntraced(function*(maximumAttempts) {
+      const controls = yield* harness()
+      const space = yield* activeSpace(
+        controls,
+        SqlReplica.layerWorkflow({ ...replicaOptions, maximumAttempts }).pipe(
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(WorkflowEngine.layerMemory)
+        )
+      )
+      let claims = 0
+      const failFirstClaim = failOnce((statement) => statement.includes(claimStatement))
+      yield* controls.failWhen((statement) => {
+        if (statement.includes(claimStatement)) claims += 1
+        return failFirstClaim(statement)
+      })
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* Queue.take(controls.injected)
+      assertFailedWithStorage(
+        yield* awaitStatus(Context.get(controls.database, Reactivity.Reactivity), space, isNotOnline)
+      )
+      const onlineWithoutPending = awaitStatus(
+        Context.get(controls.database, Reactivity.Reactivity),
+        space,
+        (status) => status._tag === "Online" && status.pending === 0
+      )
+
+      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending, "10 seconds").pipe(
+        Effect.timeoutOption("10 minutes")
+      )
+
+      assert.isTrue(Option.isSome(drained))
+      assert.strictEqual(claims, 2)
+    })
+  )
+
+  it.effect.each([1, 2])(
+    "spaces every retry by the backoff while storage stays unavailable with %s workflow attempts per execution",
+    Effect.fnUntraced(function*(maximumAttempts) {
+      const controls = yield* harness()
+      const space = yield* activeSpace(
+        controls,
+        SqlReplica.layerWorkflow({ ...replicaOptions, maximumAttempts }).pipe(
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(WorkflowEngine.layerMemory)
+        )
+      )
+      yield* controls.failWhen((statement) => statement.includes(claimStatement))
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* Queue.take(controls.injected)
+
+      yield* VirtualTime.advanceUntil(Effect.never, "10 seconds").pipe(Effect.timeoutOption("10 minutes"))
+
+      const attempts = 1 + (yield* Queue.size(controls.injected))
+      assert.isAtLeast(attempts, 6)
+      assert.isAtMost(attempts, 11)
+      assertFailedWithStorage(yield* space.status)
+    })
+  )
+
+  it.effect(
+    "watches again after the watch fails on unavailable storage (workflow)",
+    Effect.fnUntraced(function*() {
+      const controls = yield* harness()
+      yield* activeSpace(
+        controls,
+        SqlReplica.layerWorkflow(replicaOptions).pipe(
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(WorkflowEngine.layerMemory)
+        )
+      )
+      yield* Queue.take(controls.watchStarts)
+      yield* controls.failWatch(new ReplicaError.StorageUnavailable({ cause: "injected" }))
+
+      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts), "10 seconds").pipe(
+        Effect.timeoutOption("10 minutes")
+      )
+
+      assert.isTrue(Option.isSome(watchedAgain))
     })
   )
 })
