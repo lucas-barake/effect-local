@@ -407,6 +407,79 @@ describe("background retries survive an abandoned foreground claim", () => {
   )
 })
 
+describe("background turns that settle after their space was left", () => {
+  it.effect(
+    "starts no credential wait when a background turn settles after its space was left",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer", singleSpace)
+      const bookkeeping = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
+      let credentialWaits = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () => {
+          credentialWaits += 1
+          return Effect.never
+        },
+        pull: () => {
+          bookkeeping.arm(2)
+          return Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
+        }
+      }))
+      yield* bookkeeping.entered
+      yield* replica.leave(spaceId)
+      assert.strictEqual((yield* replica.status).spaces, 0)
+
+      yield* bookkeeping.release
+      yield* settle("5 minutes")
+
+      assert.strictEqual(credentialWaits, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "retries a rejoined space after a new credential when a turn of its previous membership settles late",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer", singleSpace)
+      const bookkeeping = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
+      const attempts = yield* makeAttempts
+      const credentialChanged = yield* Deferred.make<void>()
+      let foreground = false
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () => Deferred.await(credentialChanged),
+        pull: () => {
+          if (foreground) return Effect.never
+          if (attempts.count() === 0) bookkeeping.arm(2)
+          if (attempts.count() < 2) {
+            return Effect.andThen(
+              attempts.record,
+              Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
+            )
+          }
+          return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+        }
+      }))
+      yield* bookkeeping.entered
+      yield* replica.leave(spaceId)
+      const rejoined = yield* replica.join(spaceId)
+      foreground = true
+      yield* rejoined.mutate(Domain.PutTodo, Domain.todo("again"))
+      foreground = false
+      yield* rejoined.deactivate
+      yield* attempts.reached(2)
+      const paused = yield* awaitSpaceStatus(rejoined, services.reactivity, "NeedsAuthentication")
+      assert.strictEqual(paused.pending, 1)
+
+      yield* bookkeeping.release
+      yield* settle("1 second")
+      yield* Deferred.succeed(credentialChanged, undefined)
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(3)).pipe(Effect.timeoutOption("5 minutes"))
+      assert.isTrue(Option.isSome(retried))
+    }, Effect.scoped)
+  )
+})
+
 describe("review 225 suspicions that did not reproduce", () => {
   it.effect(
     "keeps waiting for a new credential when leaving the space fails",

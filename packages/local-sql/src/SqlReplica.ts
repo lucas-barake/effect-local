@@ -139,6 +139,7 @@ interface ActiveRuntime {
 
 interface RememberedEntry {
   readonly spaceId: Identity.SpaceId
+  readonly membershipIncarnation: Identity.MembershipIncarnation
   handle: Replica.Space
   activation: Replica.Activation
   runtime: ActiveRuntime | undefined
@@ -332,7 +333,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         Queue.shutdown
       )
       const backgroundQueued = new Set<Identity.SpaceId>()
-      const credentialWaits = yield* FiberMap.make<Identity.SpaceId, void, never>()
+      const credentialWaits = yield* FiberMap.make<Identity.MembershipIncarnation, void, never>()
       const retrySchedule: Array<RetryWork> = []
       let capacityChanged = yield* Deferred.make<void>()
 
@@ -711,7 +712,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         Effect.suspend(() => {
           entry.backgroundGeneration += 1
           entry.backgroundFailure = undefined
-          return FiberMap.remove(credentialWaits, entry.spaceId)
+          return FiberMap.remove(credentialWaits, entry.membershipIncarnation)
         })
 
       const reportBackgroundFailure = (entry: RememberedEntry, failure: ReplicaError.ReplicaError | undefined) =>
@@ -721,7 +722,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (entry.activation === "Inactive") {
             contribute = modifyContribution(entry, (current) => inactiveStatus(entry, current.pending))
           }
-          return FiberMap.remove(credentialWaits, entry.spaceId).pipe(
+          return FiberMap.remove(credentialWaits, entry.membershipIncarnation).pipe(
             Effect.andThen(contribute),
             Effect.andThen(reactivity.invalidate([ReactivityKey.status(entry.spaceId)]))
           )
@@ -746,7 +747,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         const wait = remote.waitForCredentialChange(failure.credentialGeneration).pipe(
           Effect.andThen(enqueueBackground(entry))
         )
-        yield* FiberMap.run(credentialWaits, entry.spaceId, wait)
+        yield* FiberMap.run(credentialWaits, entry.membershipIncarnation, wait)
       })
 
       const releaseTransportRetries = Effect.gen(function*() {
@@ -1329,6 +1330,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         let handle: Replica.Space | undefined
         const entry: RememberedEntry = {
           spaceId: row.space_id,
+          membershipIncarnation: row.membership_incarnation,
           get handle() {
             if (handle === undefined) handle = makeHandle(entry)
             return handle
@@ -1504,8 +1506,11 @@ const makeLayer = <D extends Definition.Any, R,>(
             ),
             Effect.tap(() =>
               removeContribution(current).pipe(
-                Effect.andThen(Effect.sync(() => entries.delete(spaceId))),
-                Effect.andThen(FiberMap.remove(credentialWaits, spaceId)),
+                Effect.andThen(Effect.sync(() => {
+                  entries.delete(spaceId)
+                  current.backgroundGeneration += 1
+                })),
+                Effect.andThen(FiberMap.remove(credentialWaits, current.membershipIncarnation)),
                 Effect.andThen(publishSettlements(current))
               )
             ),
