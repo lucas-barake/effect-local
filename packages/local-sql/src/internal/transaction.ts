@@ -26,34 +26,23 @@ interface EncodedEntity<M extends Model.Any,> extends EncodedEntityKey<M> {
   readonly valueJson: string
 }
 
-const encodeEntityEffect = Effect.fnUntraced(function*<M extends Model.Any,>(
-  model: M,
-  key: Model.Key<M>,
-  value?: Model.Value<M>
-): Effect.fn.Return<EncodedEntityKey<M> | EncodedEntity<M>, ReplicaError.StorageCorrupt> {
-  const encodedKey = yield* Codec.encode(model.key, key)
-  const keyJson = yield* Codec.stringifyKey(encodedKey)
-  if (value === undefined) return { encodedKey, keyJson }
-  const encodedValue = yield* Codec.encode(model.schema, value)
-  return { encodedKey, keyJson, encodedValue, valueJson: yield* Codec.stringify(encodedValue) }
-})
-
-function encodeEntity<M extends Model.Any,>(
+const encodeEntityKey = Effect.fnUntraced(function*<M extends Model.Any,>(
   model: M,
   key: Model.Key<M>
-): Effect.Effect<EncodedEntityKey<M>, ReplicaError.StorageCorrupt>
-function encodeEntity<M extends Model.Any,>(
+): Effect.fn.Return<EncodedEntityKey<M>, ReplicaError.StorageCorrupt> {
+  const encodedKey = yield* Codec.encode(model.key, key)
+  return { encodedKey, keyJson: yield* Codec.stringifyKey(encodedKey) }
+})
+
+const encodeEntity = Effect.fnUntraced(function*<M extends Model.Any,>(
   model: M,
   key: Model.Key<M>,
   value: Model.Value<M>
-): Effect.Effect<EncodedEntity<M>, ReplicaError.StorageCorrupt>
-function encodeEntity<M extends Model.Any,>(
-  model: M,
-  key: Model.Key<M>,
-  value?: Model.Value<M>
-): Effect.Effect<EncodedEntityKey<M> | EncodedEntity<M>, ReplicaError.StorageCorrupt> {
-  return encodeEntityEffect(model, key, value)
-}
+): Effect.fn.Return<EncodedEntity<M>, ReplicaError.StorageCorrupt> {
+  const encodedKey = yield* encodeEntityKey(model, key)
+  const encodedValue = yield* Codec.encode(model.schema, value)
+  return { ...encodedKey, encodedValue, valueJson: yield* Codec.stringify(encodedValue) }
+})
 
 export interface Address {
   readonly spaceId: Identity.SpaceId
@@ -85,7 +74,7 @@ export const local = (
   })
   return {
     get: Effect.fnUntraced(function*(model, key) {
-      const { keyJson } = yield* encodeEntity(model, key)
+      const { keyJson } = yield* encodeEntityKey(model, key)
       const row = yield* find({ model: model.name, key: keyJson }).pipe(
         Effect.mapError(StorageUnavailable.make)
       )
@@ -119,7 +108,7 @@ export const local = (
       })
     }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     delete: Effect.fnUntraced(function*(model, key) {
-      const encoded = yield* encodeEntity(model, key)
+      const encoded = yield* encodeEntityKey(model, key)
       if (options.table === "visible") {
         yield* options.sql`DELETE FROM effect_local_client_visible_entities_data
           WHERE space_id = ${options.spaceId} AND schema_generation = ${options.schemaGeneration}
@@ -156,7 +145,7 @@ export const server = (options: {
   })
   return {
     get: Effect.fnUntraced(function*(model, key) {
-      const { keyJson } = yield* encodeEntity(model, key)
+      const { keyJson } = yield* encodeEntityKey(model, key)
       const row = yield* find({ spaceId: options.spaceId, model: model.name, key: keyJson }).pipe(
         Effect.mapError(StorageUnavailable.make)
       )
@@ -188,7 +177,7 @@ export const server = (options: {
       })
     }, Effect.catchTag("SqlError", (cause) => Effect.fail(StorageUnavailable.make(cause)))),
     delete: Effect.fnUntraced(function*(model, key) {
-      const encoded = yield* encodeEntity(model, key)
+      const encoded = yield* encodeEntityKey(model, key)
       yield* options.sql`DELETE FROM effect_local_server_entities_data
         WHERE space_id = ${options.spaceId} AND generation = ${options.generation}
           AND model = ${model.name} AND entity_key = ${encoded.keyJson}`

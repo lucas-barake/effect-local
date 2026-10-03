@@ -29,6 +29,7 @@ import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Ref from "effect/Ref"
 import * as Scheduler from "effect/Scheduler"
 import * as Schema from "effect/Schema"
+import * as SchemaGetter from "effect/SchemaGetter"
 import * as SqlClient from "effect/sql/SqlClient"
 import * as SqlError from "effect/sql/SqlError"
 import * as SqlSchema from "effect/sql/SqlSchema"
@@ -116,6 +117,20 @@ const layerMirrorTodoHandler = MirrorTodo.toLayer(Effect.fnUntraced(function*({ 
 }))
 const layerMirrorRuntime = MutationRuntime.layer(mirrorDefinition).pipe(
   Layer.provide(Layer.merge(layerMirrorPutTodoHandler, layerMirrorTodoHandler))
+)
+
+const Marker = Model.make("Marker", {
+  version: 1,
+  key: Schema.String,
+  schema: Schema.Null.pipe(Schema.decodeTo(Schema.Undefined, {
+    decode: SchemaGetter.transform(() => undefined),
+    encode: SchemaGetter.transform(() => null)
+  })).annotate({ identifier: "UndefinedFromNull" })
+})
+const PutMarker = Mutation.make("PutMarker", { version: 1, payload: { id: Schema.String } })
+const markerDefinition = Definition.make({ version: 1, models: [Marker], mutations: [PutMarker] })
+const layerMarkerRuntime = MutationRuntime.layer(markerDefinition).pipe(
+  Layer.provide(PutMarker.toLayer(({ payload, transaction }) => transaction.set(Marker, payload.id, undefined)))
 )
 
 const withServices = (layerSql: Layer.Layer<SqlClient.SqlClient, SqlError.SqlError>) =>
@@ -3511,6 +3526,54 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
     yield* Effect.addFinalizer(() => Effect.sync(cancel))
     return count
   })
+
+  it.effect("stores a model value that decodes to undefined on the client and the server", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const markerScope = Protocol.ReplicationScope.make({ models: [Marker.name] })
+      const markerLocal = (id: Identity.ClientId) =>
+        service(
+          LocalStore.Store,
+          LocalStore.layer({
+            ...clientHistory,
+            definition: markerDefinition,
+            spaceId,
+            clientId: id,
+            scope: markerScope
+          }).pipe(
+            Layer.provide(layerMarkerRuntime),
+            Layer.provide(clientDatabase())
+          )
+        )
+      const server = yield* service(
+        ServerStore.ServerStore,
+        ServerStore.layerTrusted({ ...serverHistory, definition: markerDefinition }).pipe(
+          Layer.provide(layerMarkerRuntime),
+          Layer.provide(serverDatabase())
+        )
+      )
+      const writer = yield* markerLocal(clientId)
+      const pending = yield* writer.mutate(PutMarker, { id: "marker" })
+      assert.isTrue(Option.isSome(yield* writer.get(Marker, "marker")))
+
+      const receipt = yield* server.submit(pending.envelope)
+      assert.strictEqual(receipt._tag, "Accepted")
+
+      const readerId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000003")
+      const reader = yield* markerLocal(readerId)
+      const required = yield* server.pull(Protocol.PullRequest.make({
+        ...pullRequest(null, 10, readerId, markerScope),
+        schema: markerDefinition.schemaIdentity
+      }))
+      if (!("_tag" in required)) assert.fail("expected bootstrap")
+      const page = yield* server.bootstrap(Protocol.BootstrapRequest.make({
+        ...bootstrapRequest(required.manifest, -1, 10, markerScope),
+        schema: markerDefinition.schemaIdentity
+      }))
+      yield* reader.prepareBootstrap(page.manifest)
+      assert.isTrue(yield* reader.stageBootstrapPage(page))
+      yield* reader.installBootstrap(page.manifest)
+      assert.isTrue(Option.isSome(yield* reader.get(Marker, "marker")))
+    })))
 
   it.effect("invalidates entities that pending replay creates while installing a bootstrap", () =>
     Effect.scoped(Effect.gen(function*() {
