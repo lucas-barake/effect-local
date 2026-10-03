@@ -532,7 +532,8 @@ const clientBaseline = makeMigration({
       model TEXT NOT NULL,
       model_version INTEGER NOT NULL CHECK (model_version > 0),
       entity_key TEXT NOT NULL,
-      PRIMARY KEY (space_id, schema_generation, model, entity_key)
+      PRIMARY KEY (space_id, schema_generation, model, entity_key),
+      FOREIGN KEY (space_id) REFERENCES effect_local_client_spaces(space_id) ON DELETE CASCADE
     )`,
     `CREATE TABLE effect_local_client_settlement_prune (
       space_id TEXT NOT NULL,
