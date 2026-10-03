@@ -14,6 +14,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Context from "effect/Context"
@@ -223,8 +224,7 @@ describe("test synchronization faults", () => {
     Effect.fnUntraced(function*() {
       const { faults, sync } = yield* makeSyncServices
       yield* faults.partition(spaceId)
-      const root = yield* service(
-        Replica.Replica,
+      const context = yield* Layer.build(
         SqlReplica.layer({
           ...clientHistory,
           definition,
@@ -233,28 +233,29 @@ describe("test synchronization faults", () => {
           retryDelay: "1 millis"
         }).pipe(
           Layer.provide(layerHandlers),
-          Layer.provide(database()),
+          Layer.provideMerge(database()),
           Layer.provide(Layer.succeed(SyncEngine.SyncEngine, sync))
         )
       )
+      const root = Context.get(context, Replica.Replica)
+      const reactivity = Context.get(context, Reactivity.Reactivity)
       const first = yield* root.space(spaceId)
       const second = yield* root.space(secondSpaceId)
       const firstPending = yield* first.mutate(PutTodo, { id: "shared", title: "first" })
       const secondPending = yield* second.mutate(PutTodo, { id: "shared", title: "second" })
-      const awaitReceipt = Effect.fnUntraced(function*(space: Replica.Space, mutationId: Identity.MutationId) {
-        while (true) {
-          const receipt = yield* space.receipt(PutTodo, mutationId)
-          if (Option.isSome(receipt)) return receipt.value
-          yield* Effect.yieldNow
-        }
-      })
-      const awaitStatus = Effect.fnUntraced(function*(space: Replica.Space, tag: "Offline" | "Online") {
-        while (true) {
-          const status = yield* space.status
-          if (status._tag === tag) return status
-          yield* Effect.yieldNow
-        }
-      })
+      const awaitReceipt = (space: Replica.Space, mutationId: Identity.MutationId) =>
+        reactivity.stream([ReactivityKey.receipt(space.spaceId, mutationId)], space.receipt(PutTodo, mutationId)).pipe(
+          Stream.filter(Option.isSome),
+          Stream.map((receipt) => receipt.value),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow)
+        )
+      const awaitStatus = (space: Replica.Space, tag: "Offline" | "Online") =>
+        reactivity.stream([ReactivityKey.status(space.spaceId)], space.status).pipe(
+          Stream.filter((status) => status._tag === tag),
+          Stream.runHead,
+          Effect.map(Option.getOrThrow)
+        )
 
       const secondReceipt = yield* awaitReceipt(second, secondPending.envelope.mutationId)
       assert.strictEqual(secondReceipt._tag, "Accepted")
