@@ -7,6 +7,7 @@ import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import * as Canonical from "../src/Canonical.js"
 import * as Definition from "../src/Definition.js"
+import * as Ephemeral from "../src/Ephemeral.js"
 import * as Field from "../src/Field.js"
 import * as Model from "../src/Model.js"
 import * as Mutation from "../src/Mutation.js"
@@ -20,6 +21,29 @@ const Todo = Model.make("Todo", {
 })
 const PutTodo = Mutation.make("PutTodo", { version: 1, payload: Todo.schema, success: Todo.schema })
 const ListTodos = Query.make("ListTodos", { success: Schema.Array(Todo.schema) })
+const ChatMessage = Model.make("ChatMessage", {
+  version: 1,
+  key: Schema.String,
+  schema: Schema.Struct({ id: Schema.String, chat: Schema.String, sentAt: Schema.Number }),
+  indexes: {
+    byChat: {
+      version: 1,
+      partition: [{
+        name: "chat",
+        affinity: "text",
+        schema: Schema.String,
+        extract: (value: { readonly chat: string }) => value.chat
+      }],
+      sort: [{
+        name: "sentAt",
+        affinity: "real",
+        schema: Schema.Number,
+        extract: (value: { readonly sentAt: number }) => value.sentAt
+      }]
+    }
+  }
+})
+const chatDefinition = Definition.make({ version: 1, models: [ChatMessage], mutations: [] })
 
 const collidingA = "a=U"
 const collidingB = "a@H"
@@ -137,6 +161,70 @@ describe("domain contracts", () => {
     )
     assert.throws(() => Mutation.make("$Mutation", { version: 1 }), /must not start/)
     assert.throws(() => Query.make("$Query", {}), /must not start/)
+  })
+
+  it.effect(
+    "accepts only definition names that fit the protocol name fields",
+    Effect.fnUntraced(function*() {
+      const longest = "n".repeat(256)
+      const tooLong = "n".repeat(257)
+      const component = {
+        version: 1,
+        partition: [],
+        sort: [{
+          name: "rank",
+          affinity: "real" as const,
+          schema: Schema.Number,
+          extract: (value: { readonly rank: number }) => value.rank
+        }]
+      }
+      const schema = Schema.Struct({ rank: Schema.Number })
+      const Longest = Model.make(longest, { version: 1, key: Schema.String, schema, indexes: { [longest]: component } })
+      const LongestMutation = Mutation.make(longest, { version: 1 })
+      const definition = Definition.make({ version: 1, models: [Longest], mutations: [LongestMutation] })
+      const entity = yield* Schema.decodeUnknownEffect(Protocol.EntityKey)({
+        model: Longest.name,
+        modelVersion: 1,
+        key: "a"
+      })
+      assert.strictEqual(entity.model, longest)
+      const scope = yield* Protocol.validateReplicationScope(definition, {
+        models: [],
+        windows: [{ model: Longest.name, index: longest, count: 1 }]
+      })
+      assert.strictEqual(scope.windows?.[0].index, longest)
+
+      assert.throws(() => Model.make(tooLong, { version: 1, key: Schema.String, schema }), /at most 256/)
+      assert.throws(
+        () => Model.make("Indexed", { version: 1, key: Schema.String, schema, indexes: { [tooLong]: component } }),
+        /at most 256/
+      )
+      assert.throws(() => Mutation.make(tooLong, { version: 1 }), /at most 256/)
+    })
+  )
+
+  it("rejects symbol keyed fields in wire schemas at construction", () => {
+    const tag = Symbol.for("effect-local/test/tag")
+    const symbolStruct = Schema.Struct({ id: Schema.String, [tag]: Schema.String })
+    const nested = Schema.Struct({ id: Schema.String, inner: symbolStruct })
+    const symbolRecord = Schema.Record(Schema.Symbol, Schema.String)
+    assert.throws(() => Mutation.make("SymbolPayload", { version: 1, payload: symbolStruct }), /symbol/)
+    assert.throws(() => Mutation.make("NestedPayload", { version: 1, payload: { value: nested } }), /symbol/)
+    assert.throws(() => Mutation.make("SymbolSuccess", { version: 1, success: symbolRecord }), /symbol/)
+    assert.throws(() => Model.make("SymbolModel", { version: 1, key: Schema.String, schema: nested }), /symbol/)
+    assert.throws(() => Query.make("SymbolQuery", { success: Schema.Array(symbolStruct) }), /symbol/)
+    assert.throws(() => Ephemeral.make("SymbolEvent", { kind: "event", payload: symbolStruct }), /symbol/)
+
+    type Tree = {
+      readonly label: string
+      readonly children: ReadonlyArray<Tree>
+    }
+    const Tree: Schema.Codec<Tree> = Schema.Struct({
+      label: Schema.String,
+      children: Schema.Array(Schema.suspend((): Schema.Codec<Tree> => Tree))
+    })
+    const TreeModel = Model.make("Tree", { version: 1, key: Schema.String, schema: Tree })
+    assert.strictEqual(TreeModel.schema, Tree)
   })
 
   it.effect(
@@ -310,7 +398,12 @@ describe("domain contracts", () => {
     Effect.fnUntraced(function*() {
       const decoded = yield* Schema.decodeUnknownEffect(Protocol.ReplicationScope)({ models: ["Todo", "Other"] })
       assert.deepStrictEqual(decoded, { models: ["Todo", "Other"] })
-      assert.deepStrictEqual(Protocol.normalizeReplicationScope({ models: ["Todo", "Other"] }), {
+      const definition = Definition.make({
+        version: 1,
+        models: [Todo, Model.make("Other", { version: 1, key: Schema.String, schema: Todo.schema })],
+        mutations: []
+      })
+      assert.deepStrictEqual(yield* Protocol.validateReplicationScope(definition, decoded), {
         models: ["Other", "Todo"]
       })
       const result = yield* Schema.decodeUnknownEffect(Protocol.ReplicationScope)({
@@ -337,6 +430,78 @@ describe("domain contracts", () => {
       if (Result.isFailure(result)) {
         assert.strictEqual(result.failure._tag, "ProtocolInvalid")
         assert.match(result.failure.message, /Unknown replication model: Missing/)
+      }
+    })
+  )
+
+  it.effect(
+    "normalizes empty partition overrides and empty bounds to the absent spelling",
+    Effect.fnUntraced(function*() {
+      const plain = yield* Protocol.validateReplicationScope(chatDefinition, {
+        models: [],
+        windows: [{ model: ChatMessage.name, index: "byChat", count: 1 }]
+      })
+      const emptyPartitions = yield* Protocol.validateReplicationScope(chatDefinition, {
+        models: [],
+        windows: [{ model: ChatMessage.name, index: "byChat", count: 1, partitions: [] }]
+      })
+      assert.deepStrictEqual(emptyPartitions, plain)
+      assert.strictEqual(Canonical.stringify(emptyPartitions), Canonical.stringify(plain))
+
+      const override = yield* Protocol.validateReplicationScope(chatDefinition, {
+        models: [],
+        windows: [{ model: ChatMessage.name, index: "byChat", count: 1, partitions: [{ key: ["a"], count: 2 }] }]
+      })
+      const emptyBounds = yield* Protocol.validateReplicationScope(chatDefinition, {
+        models: [],
+        windows: [{
+          model: ChatMessage.name,
+          index: "byChat",
+          count: 1,
+          partitions: [{ key: ["a"], count: 2, bounds: {} }]
+        }]
+      })
+      assert.deepStrictEqual(emptyBounds, override)
+      assert.strictEqual(Canonical.stringify(emptyBounds), Canonical.stringify(override))
+
+      assert.deepStrictEqual(yield* Protocol.validateReplicationScope(chatDefinition, emptyBounds), emptyBounds)
+      assert.deepStrictEqual(yield* Protocol.validateReplicationScope(chatDefinition, emptyPartitions), emptyPartitions)
+    })
+  )
+
+  it.effect(
+    "fails a replication scope that violates its schema as a protocol error",
+    Effect.fnUntraced(function*() {
+      const definition = Definition.make({ version: 1, models: [Todo], mutations: [PutTodo] })
+      const exit = yield* Protocol.validateReplicationScope(definition, { models: ["Todo", "Todo"] }).pipe(Effect.exit)
+      if (exit._tag !== "Failure") assert.fail("expected a duplicate model to be rejected")
+      const failure = exit.cause.reasons.find((reason) => reason._tag === "Fail")
+      if (failure?._tag !== "Fail") assert.fail("expected a typed failure instead of a defect")
+      assert.strictEqual(failure.error._tag, "ProtocolInvalid")
+    })
+  )
+
+  it.effect(
+    "rejects non-finite replication window values",
+    Effect.fnUntraced(function*() {
+      for (const value of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, Number.NaN]) {
+        const decoded = yield* Schema.decodeUnknownEffect(Protocol.ReplicationWindowPartition)({
+          key: [value],
+          bounds: { gt: value }
+        }).pipe(Effect.result)
+        assert.strictEqual(decoded._tag, "Failure")
+
+        const validated = yield* Protocol.validateReplicationScope(chatDefinition, {
+          models: [],
+          windows: [{
+            model: ChatMessage.name,
+            index: "byChat",
+            count: 1,
+            partitions: [{ key: ["a"], bounds: { gt: value } }]
+          }]
+        }).pipe(Effect.result)
+        if (validated._tag !== "Failure") assert.fail(`expected ${value} to be rejected`)
+        assert.strictEqual(validated.failure._tag, "ProtocolInvalid")
       }
     })
   )

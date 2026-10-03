@@ -1,5 +1,6 @@
 import type * as Schema from "effect/Schema"
 import * as Identity from "./Identity.js"
+import * as ComponentName from "./internal/componentName.js"
 import * as Defect from "./internal/defect.js"
 
 export type Affinity = "text" | "real" | "integer"
@@ -51,7 +52,7 @@ const validName = (kind: string, name: string): void => {
 }
 
 export const validate = (name: string, input: Any): void => {
-  validName("Index", name)
+  ComponentName.validate("Index", name)
   Identity.SchemaVersion.make(input.version)
   if (input.partition.length + input.sort.length === 0) {
     return Defect.invalid(`Index ${name} must declare at least one component`)

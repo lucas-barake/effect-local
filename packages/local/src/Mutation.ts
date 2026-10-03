@@ -4,7 +4,7 @@ import * as Layer from "effect/Layer"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
 import * as Identity from "./Identity.js"
-import * as Defect from "./internal/defect.js"
+import * as ComponentName from "./internal/componentName.js"
 import * as SchemaInput from "./internal/schemaInput.js"
 import type * as ReplicaError from "./ReplicaError.js"
 import type * as Transaction from "./Transaction.js"
@@ -77,12 +77,13 @@ export function make(name: string, options: {
   readonly success?: SchemaInput.WireSchema
   readonly rejection?: ErrorSchema
 }): Mutation<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema> {
-  if (name.length === 0) return Defect.invalid("Mutation name must be nonempty")
-  if (name.startsWith("$")) return Defect.invalid(`Mutation name must not start with $: ${name}`)
+  ComponentName.validate("Mutation", name)
   let payloadSchema: SchemaInput.WireSchema = SchemaInput.Void
   if (options.payload !== undefined) payloadSchema = SchemaInput.normalize(options.payload)
   const successSchema = options.success ?? SchemaInput.Void
   const rejectionSchema: ErrorSchema = options.rejection ?? Schema.Never
+  SchemaInput.requireStringKeys(successSchema)
+  SchemaInput.requireStringKeys(rejectionSchema)
   const handler = Context.Service<
     HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema>,
     HandlerService<string, SchemaInput.WireSchema, SchemaInput.WireSchema, ErrorSchema>
