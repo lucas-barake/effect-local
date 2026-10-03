@@ -597,7 +597,17 @@ export const layerOnePass = (
           if (reportedSyncFailures.has(error)) return Effect.void
           return reportFailure(error, false)
         })
-      const watchFailed = (error: ReplicaError.ReplicaError) => reportFailure(error, true)
+      const watchFailed = (error: ReplicaError.ReplicaError) => {
+        if (error._tag !== "AuthorizationDenied") return reportFailure(error, true)
+        return gate.withPermit(
+          local.revokeReplication.pipe(
+            Effect.matchEffect({
+              onFailure: (revokeError) => reportFailure(revokeError, false),
+              onSuccess: () => reportFailure(error, true)
+            })
+          )
+        )
+      }
       const succeeded = Effect.gen(function*() {
         if (!syncAttempted || failedSinceSyncStarted) return
         const { cursor, pending } = yield* local.progress
