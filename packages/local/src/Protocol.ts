@@ -1,4 +1,6 @@
+import * as Arr from "effect/Array"
 import * as Effect from "effect/Effect"
+import * as Order from "effect/Order"
 import * as Schema from "effect/Schema"
 import * as Struct from "effect/Struct"
 import * as Canonical from "./Canonical.js"
@@ -180,14 +182,6 @@ export type ReplicationScope = typeof ReplicationScope.Type
 export const replicationScopeDigest = (scope: ReplicationScope) =>
   Canonical.digest({ format: 1, scope }).pipe(Effect.map((value) => MutationDigest.make(value)))
 
-const comparePartitionKeys = (left: ReplicationWindowPartition, right: ReplicationWindowPartition) => {
-  const leftKey = Canonical.stringify(left.key)
-  const rightKey = Canonical.stringify(right.key)
-  if (leftKey < rightKey) return -1
-  if (leftKey > rightKey) return 1
-  return 0
-}
-
 const normalizePartition = (partition: ReplicationWindowPartition): ReplicationWindowPartition => {
   if (partition.bounds === undefined || Object.keys(partition.bounds).length > 0) return partition
   return Struct.omit(partition, ["bounds"])
@@ -196,21 +190,18 @@ const normalizePartition = (partition: ReplicationWindowPartition): ReplicationW
 const normalizeWindow = (window: ReplicationWindow): ReplicationWindow => {
   if (window.partitions === undefined) return window
   if (window.partitions.length === 0) return Struct.omit(window, ["partitions"])
-  const partitions = window.partitions.map(normalizePartition).sort(comparePartitionKeys)
+  const normalized = window.partitions.map(normalizePartition)
+  const partitions = Arr.sortWith(normalized, (partition) => Canonical.stringify(partition.key), Order.String)
   return { ...window, partitions }
 }
+
+const windowOrder = Order.Struct({ model: Order.String, index: Order.String })
 
 const normalizeReplicationScope = (scope: ReplicationScope): ReplicationScope => {
   if (scope.windows === undefined || scope.windows.length === 0) {
     return { models: [...scope.models].sort() }
   }
-  const windows = scope.windows.map(normalizeWindow).sort((left, right) => {
-    if (left.model < right.model) return -1
-    if (left.model > right.model) return 1
-    if (left.index < right.index) return -1
-    if (left.index > right.index) return 1
-    return 0
-  })
+  const windows = scope.windows.map(normalizeWindow).sort(windowOrder)
   return { models: [...scope.models].sort(), windows }
 }
 
