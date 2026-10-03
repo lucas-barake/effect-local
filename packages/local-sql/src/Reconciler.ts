@@ -56,6 +56,7 @@ export interface Options {
   readonly retryDelay?: Duration.Input
   readonly maximumRetryDelay?: Duration.Input
   readonly onStatusChange?: (status: ReplicaStatus.ReplicaStatus) => Effect.Effect<void>
+  readonly onReconciled?: Effect.Effect<void>
 }
 
 export interface ManagedSpace {
@@ -479,7 +480,7 @@ export const layerManager: Layer.Layer<Manager, ReplicaError.InvalidConfiguratio
   .effect(Manager, makeManager())
 
 export const layerOnePass = (
-  options: Pick<Options, "definition" | "spaceId" | "pageSize" | "onStatusChange">
+  options: Pick<Options, "definition" | "spaceId" | "pageSize" | "onStatusChange" | "onReconciled">
 ): Layer.Layer<Reconciliation, ReplicaError.InvalidConfiguration, LocalStore.Store | SyncEngine.SyncEngine> =>
   Layer.effect(
     Reconciliation,
@@ -761,6 +762,7 @@ export const layerOnePass = (
           yield* submitPending
           yield* catchUp
           syncing = false
+          yield* options.onReconciled ?? Effect.void
           yield* succeeded
         }).pipe(
           Effect.ensuring(Effect.sync(() => {

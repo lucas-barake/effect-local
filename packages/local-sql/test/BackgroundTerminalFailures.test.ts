@@ -214,19 +214,25 @@ const awaitActivation = Effect.fnUntraced(function*(
 
 const protocolInvalid = new ReplicaError.ProtocolInvalid({ message: "rejected by the server" })
 
-const workflowRetryAfterRelease = Effect.fnUntraced(function*() {
+const workflowRetryAfterRelease = Effect.fnUntraced(function*(workflowRetry: "fails" | "succeeds") {
   const services = yield* backgroundServices("layerWorkflow")
   const attempts = yield* makeAttempts
   const replica = yield* services.start(SyncEngine.SyncEngine.of({
     ...idleRemote,
-    pull: () => {
+    submitBatch: acceptSubmission,
+    pull: (request) => {
       if (attempts.count() === 0) {
         return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
       }
-      return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+      if (attempts.count() === 1 || workflowRetry === "fails") {
+        return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+      }
+      return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
     }
   }))
   const space = yield* replica.space(spaceId)
+  yield* services.sql`UPDATE effect_local_client_spaces
+    SET replication_view_id = ${viewId}, replication_view_revision = 0`
   yield* space.mutate(Domain.PutTodo, Domain.todo("pending"))
   yield* attempts.reached(1)
   yield* space.deactivate
@@ -412,10 +418,10 @@ describe("background sync terminal failures", () => {
     }, Effect.scoped)
   )
 
-  it.effect(
-    "recovers a terminally failed background space when it is activated after its storage is repaired",
-    Effect.fnUntraced(function*() {
-      const services = yield* pendingBackgroundSpace("layer")
+  it.effect.each(constructors)(
+    "recovers a terminally failed background space when it is activated after its storage is repaired with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* pendingBackgroundSpace(constructor)
       yield* corruptPending(services.sql)
       const attempts = yield* makeAttempts
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
@@ -631,9 +637,40 @@ describe("background sync terminal failures", () => {
   )
 
   it.effect(
+    "keeps a failed background space failed when the foreground does not reconcile it",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      services.lockNext(pendingCountStatement)
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (attempts.count() < 2) return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
+          return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* attempts.reached(3)
+      yield* awaitSpaceStatus(space, services.reactivity, "Failed")
+
+      yield* space.activate
+      yield* attempts.reached(4)
+      yield* space.deactivate
+
+      const status = yield* space.status
+      assert.strictEqual(status._tag, "Failed")
+      assert.strictEqual(status.pending, 0)
+      const aggregate = yield* replica.status
+      assert.strictEqual(aggregate.counts.failed, 1)
+      assert.strictEqual(aggregate.counts.idle, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "keeps a background space failed after a workflow attempt on it fails and releases it",
     Effect.fnUntraced(function*() {
-      const { services, attempts, replica, space } = yield* workflowRetryAfterRelease()
+      const { services, attempts, replica, space } = yield* workflowRetryAfterRelease("fails")
 
       yield* VirtualTime.advanceUntil(attempts.reached(3))
       const inactive = awaitActivation(space, services.reactivity, "Inactive").pipe(Effect.scoped)
@@ -652,9 +689,66 @@ describe("background sync terminal failures", () => {
   )
 
   it.effect(
+    "reports a failed background space as idle once a workflow attempt on it drains its mutations",
+    Effect.fnUntraced(function*() {
+      const { services, attempts, replica, space } = yield* workflowRetryAfterRelease("succeeds")
+
+      yield* VirtualTime.advanceUntil(attempts.reached(3))
+      const drained = awaitAggregate(replica, services.reactivity, (aggregate) => aggregate.totalPending === 0)
+      yield* VirtualTime.advanceUntil(Effect.scoped(drained))
+      const inactive = awaitActivation(space, services.reactivity, "Inactive").pipe(Effect.scoped)
+      yield* VirtualTime.advanceUntil(inactive)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+
+      const status = yield* space.status
+      assert.strictEqual(status._tag, "Idle")
+      assert.strictEqual(status.pending, 0)
+      const aggregate = yield* replica.status
+      assert.strictEqual(aggregate.counts.idle, 1)
+      assert.strictEqual(aggregate.counts.failed, 0)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "leaves the status to the runtime while a workflow attempt still holds a space whose background turn failed",
+    Effect.fnUntraced(function*() {
+      const services = yield* backgroundServices("layerWorkflow")
+      const attempts = yield* makeAttempts
+      const release = yield* Deferred.make<void>()
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => {
+          if (attempts.count() === 0) {
+            return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+          }
+          if (attempts.count() > 1) return Effect.andThen(attempts.record, Effect.never)
+          return attempts.record.pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
+          )
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* space.mutate(Domain.PutTodo, Domain.todo("pending"))
+      yield* attempts.reached(1)
+      yield* space.deactivate
+      yield* attempts.reached(2)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+
+      yield* Deferred.succeed(release, undefined)
+      yield* VirtualTime.advanceUntil(attempts.reached(3))
+
+      assert.strictEqual(yield* space.activation, "Active")
+      const aggregate = yield* replica.status
+      assert.strictEqual(aggregate.counts.idle, 0)
+      assert.strictEqual(aggregate.counts.offline, 1)
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "runs another background turn when releasing a workflow attempt hits a lock timeout",
     Effect.fnUntraced(function*() {
-      const { services, attempts, replica } = yield* workflowRetryAfterRelease()
+      const { services, attempts, replica } = yield* workflowRetryAfterRelease("fails")
       services.lockNext(pendingCountStatement)
       const failedAgain = awaitAggregate(
         replica,
@@ -669,7 +763,7 @@ describe("background sync terminal failures", () => {
   )
 
   it.effect(
-    "stops waiting for a new credential when the space is activated",
+    "stops waiting for a new credential once the foreground reconciles the space",
     Effect.fnUntraced(function*() {
       const services = yield* pendingBackgroundSpace("layer")
       const attempts = yield* makeAttempts
@@ -678,8 +772,9 @@ describe("background sync terminal failures", () => {
         ...idleRemote,
         waitForCredentialChange: () =>
           Effect.onInterrupt(Effect.never, () => Deferred.succeed(waitInterrupted, undefined)),
-        pull: () => {
-          if (attempts.count() > 0) return Effect.never
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (attempts.count() > 0) return emptyPage(services.crypto, request)
           return Effect.andThen(
             attempts.record,
             Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
@@ -691,7 +786,46 @@ describe("background sync terminal failures", () => {
 
       yield* space.activate
 
-      const interrupted = yield* Deferred.await(waitInterrupted).pipe(Effect.timeoutOption("1 minute"))
+      const interrupted = yield* VirtualTime.advanceUntil(Deferred.await(waitInterrupted)).pipe(
+        Effect.timeoutOption("1 minute")
+      )
+      assert.isTrue(Option.isSome(interrupted))
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "stops waiting for a new credential when a later background turn fails for another reason",
+    Effect.fnUntraced(function*() {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      const waitInterrupted = yield* Deferred.make<void>()
+      let foreground = false
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () =>
+          Effect.onInterrupt(Effect.never, () => Deferred.succeed(waitInterrupted, undefined)),
+        pull: () => {
+          if (foreground) return Effect.never
+          if (attempts.count() > 0) return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+          return Effect.andThen(
+            attempts.record,
+            Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
+          )
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* awaitSpaceStatus(space, services.reactivity, "NeedsAuthentication")
+
+      foreground = true
+      yield* space.activate
+      yield* space.deactivate
+      foreground = false
+      yield* attempts.reached(2)
+      yield* awaitSpaceStatus(space, services.reactivity, "Failed")
+
+      const interrupted = yield* VirtualTime.advanceUntil(Deferred.await(waitInterrupted)).pipe(
+        Effect.timeoutOption("1 minute")
+      )
       assert.isTrue(Option.isSome(interrupted))
     }, Effect.scoped)
   )

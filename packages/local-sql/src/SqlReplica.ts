@@ -554,7 +554,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           const layerReconciliation = Reconciler.layerOnePass({
             ...options,
             spaceId,
-            onStatusChange: (status) => updateContribution(entry, status)
+            onStatusChange: (status) => updateContribution(entry, status),
+            onReconciled: forgetBackgroundFailure(entry)
           }).pipe(
             Layer.provide(layerLocalStore)
           )
@@ -603,7 +604,8 @@ const makeLayer = <D extends Definition.Any, R,>(
             Reconciler.layerOnePass({
               ...options,
               spaceId,
-              onStatusChange: (status) => updateContribution(entry, status)
+              onStatusChange: (status) => updateContribution(entry, status),
+              onReconciled: forgetBackgroundFailure(entry)
             }).pipe(Layer.provide(layerLocalStore))
           ).pipe(
             Layer.buildWithScope(childScope),
@@ -705,6 +707,12 @@ const makeLayer = <D extends Definition.Any, R,>(
         yield* Queue.offer(retryQueue, { entry, version: entry.retryVersion, readyAt, transportGeneration })
       })
 
+      const forgetBackgroundFailure = (entry: RememberedEntry) =>
+        Effect.suspend(() => {
+          entry.backgroundFailure = undefined
+          return FiberMap.remove(credentialWaits, entry.spaceId)
+        })
+
       const reportBackgroundFailure = (entry: RememberedEntry, failure: ReplicaError.ReplicaError | undefined) =>
         Effect.suspend(() => {
           entry.backgroundFailure = failure
@@ -732,8 +740,9 @@ const makeLayer = <D extends Definition.Any, R,>(
           return
         }
         entry.retryVersion += 1
+        if (failure === undefined) return
         yield* reportBackgroundFailure(entry, failure)
-        if (failure?._tag !== "CredentialRejected" || failure.credentialGeneration === undefined) return
+        if (failure._tag !== "CredentialRejected" || failure.credentialGeneration === undefined) return
         const wait = remote.waitForCredentialChange(failure.credentialGeneration).pipe(
           Effect.andThen(enqueueBackground(entry))
         )
@@ -996,7 +1005,6 @@ const makeLayer = <D extends Definition.Any, R,>(
             entry.runtime = result.value
             entry.activation = "Active"
             entry.transition = undefined
-            if (foreground) yield* reportBackgroundFailure(entry, undefined)
             yield* Deferred.succeed(completion, undefined)
             yield* invalidateActivation(entry.spaceId)
             yield* signalCapacity
