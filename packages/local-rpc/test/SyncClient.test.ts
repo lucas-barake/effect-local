@@ -498,4 +498,52 @@ describe("SyncClient", () => {
       assert.isTrue(defect._tag === "Success")
       if (defect._tag === "Success") assert.strictEqual(defect.success, "socket defect")
     })))
+
+  it.effect("reconnects and keeps serving requests after the server sends a frame that cannot be decoded", () =>
+    Effect.scoped(Effect.gen(function*() {
+      const incoming = yield* Queue.unbounded<Frame>()
+      const pings = yield* Queue.unbounded<void>()
+      const sawProtocolError = yield* Deferred.make<void>()
+      const answered = yield* Deferred.make<void>()
+      const socket = Socket.make({
+        reader: Effect.succeed(queueReader(incoming)),
+        writer: Effect.succeed({ write: () => Queue.offer(pings, undefined), writeAll: () => Effect.void })
+      })
+      const recording = yield* RecordingClock.make
+      const context = yield* Layer.build(
+        SyncClient.layerProtocolSocket({ retryPolicy: Schedule.spaced("1 second") }).pipe(
+          Layer.provide(Layer.succeed(Socket.Socket, socket)),
+          Layer.provide(RpcSerialization.layerJson)
+        )
+      ).pipe(Effect.provideService(Clock.Clock, recording.clock))
+      const protocol = Context.get(context, RpcClient.Protocol)
+      yield* protocol.run(1, (response) => {
+        if (response._tag === "ClientProtocolError") return Deferred.succeed(sawProtocolError, undefined)
+        if (response._tag === "Exit" && response.requestId === 2) return Deferred.succeed(answered, undefined)
+        return Effect.void
+      }).pipe(Effect.forkScoped({ startImmediately: true }))
+      yield* Queue.take(pings)
+
+      yield* Queue.offer(incoming, { message: "not a json frame" })
+      yield* Deferred.await(sawProtocolError)
+      const retry = yield* recording.nextSleep((request) => request.millis === 1_000)
+      yield* recording.advanceTo(retry.deadline)
+      yield* Queue.take(pings)
+
+      yield* protocol.send(1, {
+        _tag: "Request",
+        id: 2,
+        tag: "Test",
+        payload: undefined,
+        headers: []
+      })
+      yield* Queue.offer(incoming, {
+        message: RpcSerialization.json.makeUnsafe().encode({
+          _tag: "Exit",
+          requestId: 2,
+          exit: { _tag: "Success", value: null }
+        })!
+      })
+      yield* Deferred.await(answered)
+    })))
 })

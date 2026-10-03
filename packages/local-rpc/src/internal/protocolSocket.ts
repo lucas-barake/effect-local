@@ -110,6 +110,7 @@ const makeProtocol = (
       const result = yield* Effect.result(decoded)
       if (Result.isFailure(result)) {
         yield* failCurrentSocket(new RpcClientError.RpcClientError({ reason: result.failure }))
+        yield* new Socket.SocketError({ reason: new Socket.SocketReadError({ cause: result.failure }) })
         return
       }
       const responses = result.success
