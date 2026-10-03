@@ -1,3 +1,4 @@
+import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
@@ -73,6 +74,7 @@ export interface Options {
   readonly capacity?: number
   readonly maximumSpaces?: number
   readonly maximumWatchersPerSpace?: number
+  readonly maximumWatchersPerPrincipal?: number
   readonly maximumMembersPerSpace?: number
   readonly maximumEventKeysPerMember?: number
   readonly maximumEventKeysPerSpace?: number
@@ -92,6 +94,7 @@ interface ResolvedOptions {
   readonly capacity: number
   readonly maximumSpaces: number
   readonly maximumWatchersPerSpace: number
+  readonly maximumWatchersPerPrincipal: number
   readonly maximumMembersPerSpace: number
   readonly maximumEventKeysPerMember: number
   readonly maximumEventKeysPerSpace: number
@@ -136,7 +139,7 @@ interface EventRecord {
 interface SpaceRuntime {
   readonly spaceId: Identity.SpaceId
   readonly gate: Semaphore.Semaphore
-  readonly watcherPermits: Semaphore.Semaphore
+  readonly principalWatchers: Map<string, number>
   readonly members: Map<string, MemberRecord>
   readonly states: Map<string, StateRecord>
   readonly events: Map<string, EventRecord>
@@ -147,6 +150,7 @@ interface SpaceRuntime {
   readonly stateTimers: FiberMap.FiberMap<string>
   readonly eventTimers: FiberMap.FiberMap<string>
   readonly channel: PubSub.PubSub<Protocol.EphemeralMessage>
+  watchers: number
   revision: number
   spaceBytes: number
   snapshotEntriesBytes: number
@@ -185,6 +189,7 @@ const resolveOptions = Effect.fnUntraced(function*(options: Options) {
     capacity: options.capacity ?? 1_024,
     maximumSpaces: options.maximumSpaces ?? 1_024,
     maximumWatchersPerSpace: options.maximumWatchersPerSpace ?? 1_024,
+    maximumWatchersPerPrincipal: options.maximumWatchersPerPrincipal ?? 64,
     maximumMembersPerSpace: options.maximumMembersPerSpace ?? 1_024,
     maximumEventKeysPerMember: options.maximumEventKeysPerMember ?? 64,
     maximumEventKeysPerSpace: options.maximumEventKeysPerSpace ?? 4_096,
@@ -443,7 +448,7 @@ const makeRuntime = (spaceId: Identity.SpaceId, options: ResolvedOptions) =>
       return {
         spaceId,
         gate: yield* Semaphore.make(1),
-        watcherPermits: yield* Semaphore.make(options.maximumWatchersPerSpace),
+        principalWatchers: new Map(),
         members: new Map(),
         states: new Map(),
         events: new Map(),
@@ -454,6 +459,7 @@ const makeRuntime = (spaceId: Identity.SpaceId, options: ResolvedOptions) =>
         stateTimers: yield* FiberMap.make<string>(),
         eventTimers: yield* FiberMap.make<string>(),
         channel,
+        watchers: 0,
         revision: 0,
         spaceBytes: 0,
         snapshotEntriesBytes: 0
@@ -462,14 +468,34 @@ const makeRuntime = (spaceId: Identity.SpaceId, options: ResolvedOptions) =>
     (runtime) => PubSub.shutdown(runtime.channel)
   )
 
-const acquireWatcher = (runtime: SpaceRuntime, options: ResolvedOptions) =>
+const admitWatcher = (runtime: SpaceRuntime, options: ResolvedOptions, principalKey: string) => {
+  if (runtime.watchers >= options.maximumWatchersPerSpace) {
+    return Effect.fail(capacityExceeded("ephemeral watchers", options.maximumWatchersPerSpace))
+  }
+  const held = runtime.principalWatchers.get(principalKey) ?? 0
+  if (held >= options.maximumWatchersPerPrincipal) {
+    return Effect.fail(capacityExceeded("ephemeral watchers per principal", options.maximumWatchersPerPrincipal))
+  }
+  runtime.watchers += 1
+  runtime.principalWatchers.set(principalKey, held + 1)
+  return Effect.void
+}
+
+const releaseWatcher = (runtime: SpaceRuntime, principalKey: string) =>
+  Effect.sync(() => {
+    runtime.watchers -= 1
+    const remaining = (runtime.principalWatchers.get(principalKey) ?? 0) - 1
+    if (remaining === 0) {
+      runtime.principalWatchers.delete(principalKey)
+      return
+    }
+    runtime.principalWatchers.set(principalKey, remaining)
+  })
+
+const acquireWatcher = (runtime: SpaceRuntime, options: ResolvedOptions, principalKey: string) =>
   Effect.acquireRelease(
-    Effect.gen(function*() {
-      if (!(yield* Semaphore.takeIfAvailable(runtime.watcherPermits, 1))) {
-        yield* capacityExceeded("ephemeral watchers", options.maximumWatchersPerSpace)
-      }
-    }),
-    () => Semaphore.release(runtime.watcherPermits, 1)
+    Effect.suspend(() => admitWatcher(runtime, options, principalKey)),
+    () => releaseWatcher(runtime, principalKey)
   )
 
 export const layer = <R = never,>(
@@ -511,8 +537,9 @@ export const layer = <R = never,>(
               principal
             }))
             yield* ensurePayloadSize(request)
+            const principalKey = yield* Canonical.stringifyEffect(principal)
             const runtime = yield* acquireSpace(request.spaceId)
-            yield* acquireWatcher(runtime, resolved)
+            yield* acquireWatcher(runtime, resolved, principalKey)
             yield* Effect.acquireRelease(
               Metric.modify(watcherCount, 1),
               () => Metric.modify(watcherCount, -1)

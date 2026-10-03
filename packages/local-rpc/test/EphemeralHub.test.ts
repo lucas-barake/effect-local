@@ -14,6 +14,7 @@ import * as Ref from "effect/Ref"
 import * as Result from "effect/Result"
 import * as RpcSerialization from "effect/rpc/RpcSerialization"
 import * as Scheduler from "effect/Scheduler"
+import type * as Schema from "effect/Schema"
 import * as Stream from "effect/Stream"
 import * as TestClock from "effect/testing/TestClock"
 import * as EphemeralHub from "../src/EphemeralHub.js"
@@ -73,11 +74,12 @@ const failureOf = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Ef
 const startJoin = Effect.fnUntraced(function*(
   hub: EphemeralHub.Service,
   request: Protocol.EphemeralJoinRequest,
-  onMessage: (message: Protocol.EphemeralMessage) => Effect.Effect<void> = () => Effect.void
+  onMessage: (message: Protocol.EphemeralMessage) => Effect.Effect<void> = () => Effect.void,
+  principal: Schema.Json = null
 ) {
   const session = yield* Deferred.make<Protocol.EphemeralSessionStarted>()
   const snapshot = yield* Deferred.make<Protocol.EphemeralSnapshot>()
-  const fiber = yield* hub.join(request, null).pipe(
+  const fiber = yield* hub.join(request, principal).pipe(
     Stream.tap((message) => {
       if (message._tag === "SessionStarted") return Deferred.succeed(session, message)
       let completeSnapshot = Effect.void
@@ -182,6 +184,51 @@ const expiresRosterMembersAndRetainedState = Effect.fnUntraced(function*() {
 })
 
 describe("EphemeralHub", () => {
+  it.effect(
+    "rejects a non-positive per-principal watcher quota",
+    Effect.fnUntraced(function*() {
+      const failure = yield* Layer.build(EphemeralHub.layerTrusted({
+        maximumWatchersPerPrincipal: 0
+      })).pipe(Effect.provide(NodeCrypto.layer), failureOf)
+      assert.strictEqual(failure._tag, "InvalidConfiguration")
+      if (failure._tag === "InvalidConfiguration") assert.strictEqual(failure.option, "maximumWatchersPerPrincipal")
+    })
+  )
+
+  it.effect(
+    "caps one principal's ephemeral watchers so other principals can still join",
+    Effect.fnUntraced(function*() {
+      return yield* Effect.gen(function*() {
+        const hub = yield* EphemeralHub.EphemeralHub
+        const memberD = Protocol.EphemeralMember.make({
+          clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000004"),
+          membershipIncarnation: Identity.MembershipIncarnation.make("inc_00000000-0000-4000-8000-000000000004")
+        })
+        const ignore = () => Effect.void
+        const first = yield* startJoin(hub, joinRequest(spaceA, memberA), ignore, { subject: "alice" })
+        yield* startJoin(hub, joinRequest(spaceA, memberB), ignore, { subject: "alice" })
+
+        const rejected = yield* hub.join(joinRequest(spaceA, memberC), { subject: "alice" }).pipe(
+          Stream.runHead,
+          failureOf
+        )
+        assert.deepStrictEqual(
+          rejected,
+          new ReplicaError.CapacityExceeded({ resource: "ephemeral watchers per principal", limit: 2 })
+        )
+
+        yield* startJoin(hub, joinRequest(spaceA, memberC), ignore, { subject: "bob" })
+
+        yield* Fiber.interrupt(first.fiber)
+        yield* startJoin(hub, joinRequest(spaceA, memberD), ignore, { subject: "alice" })
+      }).pipe(Effect.provide(layerTrusted({
+        ...options,
+        maximumWatchersPerSpace: 3,
+        maximumWatchersPerPrincipal: 2
+      })))
+    })
+  )
+
   it.effect(
     "rejects a member lease that cannot renew before expiry",
     Effect.fnUntraced(function*() {

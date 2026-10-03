@@ -505,6 +505,8 @@ per space allowance bounds immutable page reads and ephemeral join verification.
 `CapacityExceeded` resource `bootstrap authorizations`, `bootstrap pages`, or `ephemeral join verifications`.
 
 `ServerStore.maximumWatchersPerSpace` and `EphemeralHub.maximumWatchersPerSpace` independently cap active streams.
+Their `maximumWatchersPerPrincipal` options cap the share of those streams one authenticated principal can hold in a
+space, so one member cannot lock the others out of live sync.
 The ephemeral channel has bounded sliding history and per-subscriber revision-gap detection. Only a lagging client
 resubscribes to a fresh roster and retained-state snapshot. Join establishes a private server capability for publish
 and heartbeat, and periodic authorization revocation closes the established stream. Sync authorization successes

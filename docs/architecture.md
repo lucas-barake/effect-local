@@ -171,6 +171,11 @@ bounds shared sliding delta history. A subscriber that observes a revision gap r
 retained-state snapshot without reconnecting healthy subscribers. Excess watchers fail with typed `CapacityExceeded` resources `sync watchers` or `ephemeral
 watchers`. Interrupted, denied, and revoked streams release their watcher allowance.
 
+Both stores also cap the watchers one authenticated principal holds in a space with `maximumWatchersPerPrincipal`,
+checked in the same admission step as the space allowance. The key is the canonical principal because client IDs are
+chosen by clients and are not bound to a principal, so a per client cap could be evaded by rotating client IDs over one
+socket. Excess watchers fail with `sync watchers per principal` or `ephemeral watchers per principal`.
+
 Sync watch authorization successes share one structural `(spaceId, clientId, normalized scope, principal)` lookup and expire after
 `readAuthorizationRefreshInterval`. `maximumConcurrentReadAuthorizations` bounds policy work and
 `maximumPendingReadAuthorizations` independently bounds all live authorization callers and distinct owner lookups. It
