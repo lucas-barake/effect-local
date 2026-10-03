@@ -3,7 +3,6 @@ import * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReactivity
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
-import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
@@ -26,7 +25,7 @@ export interface Options {
   readonly locks: platform.WebLocksService
   readonly channels: platform.TabChannelService
   readonly visibility: platform.TabVisibilityService
-  readonly retryDelay: Duration.Input
+  readonly retryDelayMillis: number
   readonly gate: BuildGate.BuildGate
 }
 
@@ -254,7 +253,7 @@ export const make = Effect.fnUntraced(function*<E extends { readonly _tag: strin
     Effect.exit,
     Effect.flatMap(Exit.match({
       onSuccess: () => Effect.void,
-      onFailure: () => Effect.sleep(options.retryDelay)
+      onFailure: () => Effect.sleep(options.retryDelayMillis)
     })),
     Effect.forever,
     Effect.raceFirst(superseded),

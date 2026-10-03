@@ -22,6 +22,7 @@ import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
@@ -216,7 +217,13 @@ interface EnvironmentOptions {
   readonly kit?: testKit.MemoryPlatform
   readonly retryDelay?: BrowserReplica.Options<typeof definition>["retryDelay"]
   readonly pullGate?: Effect.Effect<void>
+  readonly layerOwnerProbe?: Layer.Layer<never, OwnerProbeError>
 }
+
+class OwnerProbeError extends Schema.TaggedError<OwnerProbeError>("test/OwnerProbeError")(
+  "OwnerProbeError",
+  {}
+) {}
 
 const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: EnvironmentOptions) {
   const fs = yield* FileSystem.FileSystem
@@ -253,7 +260,11 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
       Layer.tap(() => Ref.update(databaseOpens, (count) => count + 1))
     )
   const layerReplicaWith = (visibility: platform.TabVisibilityService, build: Build = currentBuild) => {
-    const layerOwner = Layer.merge(layerDatabaseFor(build.database), layerSync)
+    const layerOwner = Layer.mergeAll(
+      layerDatabaseFor(build.database),
+      layerSync,
+      environmentOptions.layerOwnerProbe ?? Layer.empty
+    )
     const layerVisibility = Layer.succeed(platform.TabVisibility, visibility)
     return BrowserReplica.layer(layerOwner, {
       name: environmentOptions.name ?? "tabs",
@@ -490,6 +501,106 @@ const rapidVisibilityFlips = Effect.fnUntraced(
   Effect.scoped,
   provideFileSystem
 )
+
+describe("BrowserReplica retryDelay", () => {
+  const invalidRetryDelays: ReadonlyArray<readonly [string, Duration.Input]> = [
+    ["zero millis", 0],
+    ["negative millis", -1],
+    ["NaN millis", Number.NaN],
+    ["infinite millis", Number.POSITIVE_INFINITY],
+    ["negative infinite millis", Number.NEGATIVE_INFINITY],
+    ["negative nanos", -1n],
+    ["the Infinity string", "Infinity"],
+    ["the -Infinity string", "-Infinity"],
+    ["a negative unit string", "-5 seconds"],
+    ["a zero unit string", "0 millis"],
+    ["a negative seconds tuple", [-1, 0]],
+    ["a NaN seconds tuple", [Number.NaN, 0]],
+    ["a negative duration object", { seconds: -1 }],
+    ["an infinite Duration", Duration.infinity],
+    ["an unparseable unit string", "1e3 seconds"]
+  ]
+
+  for (const [label, retryDelay] of invalidRetryDelays) {
+    it.effect(
+      `rejects ${label} with InvalidConfiguration`,
+      Effect.fnUntraced(
+        function*() {
+          const environment = yield* makeEnvironmentWith({ retryDelay })
+          const visibility = yield* testKit.makeMemoryVisibility(true)
+          const layerTab = environment.layerReplicaWith(visibility.service).pipe(
+            Layer.provideMerge(Layer.fresh(Reactivity.layer))
+          )
+          const outcome = yield* settle(
+            Layer.build(layerTab).pipe(
+              Effect.as("built"),
+              Effect.catchTag("InvalidConfiguration", (error) => Effect.succeed(error.option)),
+              Effect.scoped
+            )
+          )
+          assert.strictEqual(outcome, "retryDelay")
+        },
+        Effect.scoped,
+        provideFileSystem
+      )
+    )
+  }
+
+  it.effect(
+    "waits exactly retryDelay before rebuilding a failed owner stack",
+    Effect.fnUntraced(
+      function*() {
+        const attempts = yield* Queue.unbounded<number>()
+        const sleeps = yield* Queue.unbounded<number>()
+        const builds = yield* Ref.make(0)
+        const clock = yield* Clock.Clock
+        const recordingClock: Clock.Clock = {
+          currentTimeMillisUnsafe: () => clock.currentTimeMillisUnsafe(),
+          currentTimeMillis: clock.currentTimeMillis,
+          currentTimeNanosUnsafe: () => clock.currentTimeNanosUnsafe(),
+          currentTimeNanos: clock.currentTimeNanos,
+          monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
+          monotonicTimeNanos: clock.monotonicTimeNanos,
+          sleep: Effect.fnUntraced(function*(duration) {
+            const registered = yield* Effect.forkChild(clock.sleep(duration), { startImmediately: true })
+            yield* Queue.offer(sleeps, Duration.toMillis(duration))
+            yield* Fiber.join(registered)
+          })
+        }
+        const layerOwnerProbe = Layer.effectDiscard(
+          Clock.currentTimeMillis.pipe(
+            Effect.tap((now) => Queue.offer(attempts, now)),
+            Effect.andThen(Ref.updateAndGet(builds, (count) => count + 1)),
+            Effect.flatMap((count) => {
+              if (count === 1) return Effect.fail(new OwnerProbeError())
+              return Effect.void
+            })
+          )
+        )
+        const environment = yield* makeEnvironmentWith({ retryDelay: "7 seconds", layerOwnerProbe })
+        const visibility = yield* testKit.makeMemoryVisibility(true)
+        yield* environment.layerReplicaWith(visibility.service).pipe(
+          Layer.provideMerge(Layer.fresh(Reactivity.layer)),
+          Layer.build,
+          Effect.provideService(Clock.Clock, recordingClock),
+          Effect.forkScoped
+        )
+        const first = yield* Queue.take(attempts)
+        let requested = yield* Queue.take(sleeps)
+        while (requested !== 7_000) {
+          requested = yield* Queue.take(sleeps)
+        }
+        yield* TestClock.adjust(6_999)
+        assert.isTrue(Option.isNone(yield* Queue.poll(attempts)))
+        yield* TestClock.adjust(1)
+        const second = yield* Queue.take(attempts)
+        assert.strictEqual(second - first, 7_000)
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+})
 
 describe("BrowserReplica", () => {
   it.effect(

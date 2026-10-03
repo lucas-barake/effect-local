@@ -6,7 +6,6 @@ import { requestLogin, sessionKey, StoredSession } from "@effect-local/example-c
 import * as BrowserKeyValueStore from "@effect/platform-browser/BrowserKeyValueStore"
 import * as BrowserReplica from "@lucas-barake/effect-local-browser/BrowserReplica"
 import * as BrowserSqlite from "@lucas-barake/effect-local-browser/BrowserSqlite"
-import type * as BrowserStorageError from "@lucas-barake/effect-local-browser/BrowserStorageError"
 import * as Authentication from "@lucas-barake/effect-local-rpc/Authentication"
 import * as ReplicaAtom from "@lucas-barake/effect-local-rpc/ReplicaAtom"
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
@@ -103,14 +102,16 @@ const makeGraph = (session: LoginResponse) => {
   )
 }
 
-export type ChatClient = SharedChatClient<BrowserStorageError.BrowserStorageError>
+type ReplicaLayerError = Layer.Error<ReturnType<typeof BrowserReplica.layer>>
+
+export type ChatClient = SharedChatClient<ReplicaLayerError>
 
 const clients = new Map<UserId, ChatClient>()
 
 export const clientFor = (session: LoginResponse): ChatClient => {
   const existing = clients.get(session.userId)
   if (existing !== undefined) return existing
-  const client = makeChatClient(makeGraph(session), session.userId)
+  const client = makeChatClient<ReplicaLayerError>(makeGraph(session), session.userId)
   clients.set(session.userId, client)
   return client
 }

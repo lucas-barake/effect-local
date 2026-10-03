@@ -27,6 +27,7 @@ import type * as RpcGroup from "effect/rpc/RpcGroup"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
 import * as SubscriptionRef from "effect/SubscriptionRef"
+import { invalidConfiguration } from "./errors.js"
 import * as LosslessQueue from "./losslessQueue.js"
 import type * as replicaWire from "./replicaWire.js"
 import { decodeWith, encodeJson, type Json } from "./wireCodec.js"
@@ -46,7 +47,7 @@ export interface ProxyOptions {
   readonly consumer: string
   readonly reactivity: Reactivity.Reactivity
   readonly crypto: Crypto.Crypto
-  readonly retryDelay: Duration.Duration
+  readonly retryDelayMillis: number
   readonly awaitRouted: Effect.Effect<boolean>
   readonly superseded: Deferred.Deferred<never, ReplicaError.BuildSuperseded>
 }
@@ -213,7 +214,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     Effect.exit(effect).pipe(
       Effect.flatMap((exit) => {
         if (failureOutsideHandover(exit) === undefined) return options.awaitRouted
-        return Effect.sleep(options.retryDelay).pipe(Effect.as(true))
+        return Effect.sleep(options.retryDelayMillis).pipe(Effect.as(true))
       }),
       Effect.repeat({ while: (routed) => routed }),
       Effect.asVoid
@@ -604,10 +605,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     const sessionScope = yield* Effect.scope
     const name = options.profileNames.get(profile)
     if (name === undefined) {
-      return yield* new ReplicaError.InvalidConfiguration({
-        option: "profiles",
-        message: "Ephemeral profile is not registered with the browser replica"
-      })
+      return yield* invalidConfiguration("profiles", "Ephemeral profile is not registered with the browser replica")
     }
     const initialValue = yield* encodeJson(profile.payloadSchema, sessionOptions.value)
     const ttlMillis = Duration.toMillis(sessionOptions.ttl)
@@ -705,7 +703,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         return Deferred.failCause(opened, cause).pipe(
           Effect.flatMap((openFailed) => {
             if (openFailed) return Effect.succeed(true)
-            return Effect.sleep(options.retryDelay).pipe(Effect.as(false))
+            return Effect.sleep(options.retryDelayMillis).pipe(Effect.as(false))
           })
         )
       }),
