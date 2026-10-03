@@ -733,7 +733,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         failure: ReplicaError.ReplicaError,
         transportGeneration: Option.Option<number>
       ) {
-        if (entry.backgroundGeneration !== generation || entry.foreground) return
+        if (entry.backgroundGeneration !== generation) return
         if (Reconciler.isTransientFailure(failure)) {
           yield* reportBackgroundFailure(entry, undefined)
           let retryTransport = Option.none<number>()
@@ -935,7 +935,6 @@ const makeLayer = <D extends Definition.Any, R,>(
           }
           if (foreground && !hasForegroundRuntime(entry)) {
             entry.foreground = true
-            entry.backgroundGeneration += 1
             foregroundResidents.delete(entry.spaceId)
             foregroundResidents.set(entry.spaceId, entry)
             yield* restore(ensureForegroundCapacity(entry))
@@ -1001,6 +1000,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             entry.runtime = result.value
             entry.activation = "Active"
             entry.transition = undefined
+            if (foreground) entry.backgroundGeneration += 1
             yield* Deferred.succeed(completion, undefined)
             yield* invalidateActivation(entry.spaceId)
             yield* signalCapacity
@@ -1570,6 +1570,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           return Effect.raceFirst(sync, Deferred.await(runtime.preemption))
         }).pipe(Effect.result)
         if (activeRuntime !== undefined) {
+          if (activeRuntime.foreground) return
           const deactivation = yield* deactivate(
             entry,
             false,
