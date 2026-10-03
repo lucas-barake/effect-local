@@ -8,7 +8,6 @@ import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/sql/SqlClient"
 import * as SqlSchema from "effect/sql/SqlSchema"
 import * as Codec from "./codec.js"
-import * as StorageUnavailable from "./storageUnavailable.js"
 
 const LineageRow = Schema.Struct({ lineage_id: Schema.String })
 
@@ -54,7 +53,13 @@ export const make = (sql: SqlClient.SqlClient, spaceId: Identity.SpaceId) => {
         model,
         modelVersion: alias.modelVersion,
         key: alias.key
-      }).pipe(Effect.mapError(StorageUnavailable.make))
+      }).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client key lineage group row is corrupt", cause }))
+        })
+      )
       if (Option.isSome(found)) groups.add(found.value.lineage_id)
     }
     if (groups.size > 1) {
@@ -69,7 +74,11 @@ export const make = (sql: SqlClient.SqlClient, spaceId: Identity.SpaceId) => {
     })
     const targetKey = yield* Codec.stringifyKey(migrated.key)
     const target = yield* readTarget({ model, modelVersion: migrated.modelVersion, key: targetKey }).pipe(
-      Effect.mapError(StorageUnavailable.make)
+      Effect.catchTags({
+        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+        SchemaError: (cause) =>
+          Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client key lineage target row is corrupt", cause }))
+      })
     )
     if (Option.isSome(target) && target.value.lineage_id !== lineageId) {
       return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
@@ -101,7 +110,13 @@ export const make = (sql: SqlClient.SqlClient, spaceId: Identity.SpaceId) => {
       model,
       modelVersion: migrated.modelVersion,
       key: targetKey
-    }).pipe(Effect.mapError(StorageUnavailable.make))
+    }).pipe(
+      Effect.catchTags({
+        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+        SchemaError: (cause) =>
+          Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client key lineage target row is corrupt", cause }))
+      })
+    )
     if (Option.isNone(storedTarget) || storedTarget.value.lineage_id !== lineageId) {
       return yield* new ReplicaError.SchemaKeyCollision({ model, key: targetKey })
     }
