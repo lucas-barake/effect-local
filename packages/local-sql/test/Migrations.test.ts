@@ -640,6 +640,68 @@ describe.each(serverDatabases)("server catalog counters ($dialect)", (database) 
   )
 })
 
+describe.each(serverDatabases)("migration constraint failures ($dialect)", (database) => {
+  const provideServerDatabase = Effect.provide(database.layer())
+
+  it.effect(
+    "reports a migration that violates a constraint on its own as corrupt storage",
+    Effect.fnUntraced(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const duplicate = Migrations.makeMigration({
+        id: 1,
+        name: "duplicate-probe",
+        statements: [
+          "CREATE TABLE constraint_probe (value INTEGER NOT NULL UNIQUE)",
+          "INSERT INTO constraint_probe (value) VALUES (1)",
+          "INSERT INTO constraint_probe (value) VALUES (1)"
+        ]
+      })
+      const exit = yield* Migrations.runCatalog("Server", [duplicate]).pipe(Effect.exit)
+      const failure = expectedFailure(exit).pipe(Option.getOrThrow)
+      if (failure._tag !== "StorageCorrupt") assert.fail(`expected StorageCorrupt, got ${failure._tag}`)
+      assert.strictEqual(failure.message, "Server migration failed a permanent constraint")
+      assert.isTrue(SqlError.isSqlError(failure.cause))
+      assert.deepStrictEqual(yield* serverMigrationLedger(sql), [])
+    }, provideServerDatabase)
+  )
+
+  it.effect(
+    "accepts a constraint failure once another runner has applied the same catalog",
+    Effect.fnUntraced(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const migration = Migrations.makeMigration({
+        id: 1,
+        name: "raced-probe",
+        statements: ["CREATE TABLE raced_probe (value INTEGER NOT NULL)"]
+      })
+      let transactions = 0
+      const racedClient = new Proxy(sql, {
+        get: (target, property, receiver) => {
+          if (property !== "withTransaction") return Reflect.get(target, property, receiver)
+          return <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) => {
+            transactions += 1
+            if (transactions !== 2) return target.withTransaction(effect)
+            return Migrations.runCatalog("Server", [migration]).pipe(
+              Effect.provideService(SqlClient.SqlClient, target),
+              Effect.andThen(Effect.fail(
+                new SqlError.SqlError({
+                  reason: new SqlError.UniqueViolation({ cause: "concurrent ledger insert", constraint: "name" })
+                })
+              ))
+            )
+          }
+        }
+      })
+      yield* Migrations.runCatalog("Server", [migration]).pipe(Effect.provideService(SqlClient.SqlClient, racedClient))
+      assert.strictEqual(transactions, 2)
+      assert.deepStrictEqual(
+        yield* serverMigrationLedger(sql),
+        [{ id: migration.id, name: migration.name, checksum: migration.checksum }]
+      )
+    }, provideServerDatabase)
+  )
+})
+
 describe("client identity adoption race", () => {
   it.effect(
     "rejects an explicit identity when another opener stores a different identity before its insert",
