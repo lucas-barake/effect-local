@@ -318,6 +318,36 @@ const evolution = Evolution.make({
   })]
 })
 
+const ChargeCents = Mutation.make("Charge", {
+  version: 1,
+  payload: Schema.Number,
+  success: Schema.Number,
+  rejection: SchemaPolicyRejectedError
+})
+const ChargeDollars = Mutation.make("Charge", {
+  version: 2,
+  payload: Schema.Number,
+  success: Schema.Number,
+  rejection: SchemaPolicyRejectedError
+})
+const centsDefinition = Definition.make({ version: 1, models: [TodoV1], mutations: [ChargeCents] })
+const dollarsDefinition = Definition.make({ version: 2, models: [TodoV1], mutations: [ChargeDollars] })
+const layerDollarsHandlers = ChargeDollars.toLayer(({ payload }) => Effect.succeed(payload))
+const forwardOnlyConversionEvolution = Evolution.make({
+  current: dollarsDefinition,
+  steps: [Evolution.step({
+    id: "charge/cents-to-dollars",
+    from: centsDefinition,
+    to: dollarsDefinition,
+    mutations: [Evolution.mutation({
+      id: "charge/cents-to-dollars",
+      from: ChargeCents,
+      to: ChargeDollars,
+      success: (cents) => cents / 100
+    })]
+  })]
+})
+
 const collidingProjectionEvolution = Evolution.make({
   current: definitionV2,
   steps: [Evolution.step({
@@ -902,6 +932,35 @@ describe("client schema evolution", () => {
           Option.getOrThrow(yield* owner.get(TodoV1, "4")),
           (todo) => assert.deepStrictEqual(todo, { id: "4", title: "owned" })
         )
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect(
+    "rejects an entry whose value does not match the current schema before persisting it",
+    Effect.fnUntraced(
+      function*() {
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const result = yield* v1.applyEntries([Protocol.AcceptedMutation.make({
+          sequence: Identity.ServerSequence.make(1),
+          spaceId,
+          clientId: Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000002"),
+          membershipIncarnation,
+          mutationId: Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000204"),
+          localSequence: Identity.LocalSequence.make(1),
+          sourceSchema: definitionV1.schemaIdentity,
+          digest: "4".repeat(64),
+          changes: [Protocol.Upsert.make({
+            entity: { model: TodoV1.name, modelVersion: TodoV1.version, key: "5" },
+            value: { id: "5", title: 5 }
+          })]
+        })]).pipe(Effect.result)
+        const error = expectFailure(result)
+        assert.strictEqual(error._tag, "SchemaEvolutionFailed")
+        assert.strictEqual((yield* v1.progress).cursor, 0)
+        assert.isTrue(Option.isNone(yield* v1.get(TodoV1, "5")))
       },
       Effect.scoped,
       provideDatabase
@@ -2200,6 +2259,22 @@ describe.each(serverDatabases)("server schema evolution ($dialect)", (database) 
     Effect.fnUntraced(
       function*() {
         const result = yield* buildServer(definitionV2, layerHandlersV2, forwardOnlyEvolution, {
+          acceptedSchemaVersions: 1
+        }).pipe(Effect.result)
+        const error = expectFailure(result)
+        assert.strictEqual(error._tag, "InvalidConfiguration")
+        if (error._tag === "InvalidConfiguration") assert.strictEqual(error.option, "acceptedSchemaVersions")
+      },
+      Effect.scoped,
+      provideServerDatabase
+    )
+  )
+
+  it.effect(
+    "rejects an accepted schema window whose same-shaped transform has no reverse hook",
+    Effect.fnUntraced(
+      function*() {
+        const result = yield* buildServer(dollarsDefinition, layerDollarsHandlers, forwardOnlyConversionEvolution, {
           acceptedSchemaVersions: 1
         }).pipe(Effect.result)
         const error = expectFailure(result)

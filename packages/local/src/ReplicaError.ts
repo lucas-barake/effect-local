@@ -56,7 +56,7 @@ export class SchemaEvolutionUnsupported extends Schema.TaggedError<SchemaEvoluti
 export class SchemaEvolutionFailed extends Schema.TaggedError<SchemaEvolutionFailed>(
   "@lucas-barake/effect-local/SchemaEvolutionFailed"
 )("SchemaEvolutionFailed", {
-  stepId: Schema.String,
+  stepId: Schema.NullOr(Schema.String),
   componentKind: Schema.Literals(["Model", "Mutation"]),
   componentName: Schema.String,
   part: Schema.Literals(["Key", "Value", "Payload", "Success", "Rejection"]),

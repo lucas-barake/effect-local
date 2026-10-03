@@ -77,7 +77,169 @@ const evolution = Evolution.make({
   steps: [oneToTwo]
 })
 
+const expectFailure = <A, E,>(result: Result.Result<A, E>): E => {
+  if (Result.isFailure(result)) return result.failure
+  return assert.fail("expected Effect failure")
+}
+
+const PriceCents = Model.make("Price", {
+  version: 1,
+  key: Schema.String,
+  schema: Schema.Struct({ amount: Schema.Number })
+})
+const PriceDollars = Model.make("Price", {
+  version: 2,
+  key: Schema.String,
+  schema: Schema.Struct({ amount: Schema.Number })
+})
+const SkuV1 = Model.make("Sku", { version: 1, key: Schema.String, schema: Schema.Struct({ id: Schema.String }) })
+const SkuV2 = Model.make("Sku", { version: 2, key: Schema.String, schema: Schema.Struct({ id: Schema.String }) })
+const ChargeCents = Mutation.make("Charge", { version: 1, payload: Schema.String, success: Schema.Number })
+const ChargeDollars = Mutation.make("Charge", { version: 2, payload: Schema.String, success: Schema.Number })
+const centsDefinition = Definition.make({ version: 1, models: [PriceCents, SkuV1], mutations: [ChargeCents] })
+const dollarsDefinition = Definition.make({ version: 2, models: [PriceDollars, SkuV2], mutations: [ChargeDollars] })
+const centsToDollars = (reversible: boolean) => {
+  if (reversible) {
+    return Evolution.step({
+      id: "price/cents-to-dollars",
+      from: centsDefinition,
+      to: dollarsDefinition,
+      models: [
+        Evolution.model({
+          id: "price/cents-to-dollars",
+          from: PriceCents,
+          to: PriceDollars,
+          value: ({ value }) => ({ amount: value.amount / 100 }),
+          downgradeValue: ({ value }) => ({ amount: value.amount * 100 })
+        }),
+        Evolution.model({
+          id: "sku/prefix",
+          from: SkuV1,
+          to: SkuV2,
+          key: (key) => `sku:${key}`,
+          downgradeKey: (key) => key.slice(4)
+        })
+      ],
+      mutations: [Evolution.mutation({
+        id: "charge/cents-to-dollars",
+        from: ChargeCents,
+        to: ChargeDollars,
+        success: (cents) => cents / 100,
+        downgradeSuccess: (dollars) => dollars * 100
+      })]
+    })
+  }
+  return Evolution.step({
+    id: "price/cents-to-dollars",
+    from: centsDefinition,
+    to: dollarsDefinition,
+    models: [
+      Evolution.model({
+        id: "price/cents-to-dollars",
+        from: PriceCents,
+        to: PriceDollars,
+        value: ({ value }) => ({ amount: value.amount / 100 })
+      }),
+      Evolution.model({ id: "sku/prefix", from: SkuV1, to: SkuV2, key: (key) => `sku:${key}` })
+    ],
+    mutations: [Evolution.mutation({
+      id: "charge/cents-to-dollars",
+      from: ChargeCents,
+      to: ChargeDollars,
+      success: (cents) => cents / 100
+    })]
+  })
+}
+
 describe("schema evolution", () => {
+  it.effect(
+    "refuses to project a transformed part back without its reverse hook even when the schemas match",
+    Effect.fnUntraced(function*() {
+      const forwardOnly = Evolution.make({ current: dollarsDefinition, steps: [centsToDollars(false)] })
+      const forward = yield* Evolution.migrateModel({
+        evolution: forwardOnly,
+        source: centsDefinition.schemaIdentity,
+        model: "Price",
+        modelVersion: Identity.SchemaVersion.make(1),
+        key: "coffee",
+        value: { amount: 100 }
+      })
+      assert.deepStrictEqual(forward.value, { amount: 1 })
+
+      const price = yield* Evolution.migrateModelTo({
+        evolution: forwardOnly,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        model: "Price",
+        modelVersion: Identity.SchemaVersion.make(2),
+        key: "coffee",
+        value: { amount: 1 }
+      }).pipe(Effect.result)
+      assert.strictEqual(expectFailure(price)._tag, "SchemaEvolutionUnsupported")
+
+      const sku = yield* Evolution.migrateModelTo({
+        evolution: forwardOnly,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        model: "Sku",
+        modelVersion: Identity.SchemaVersion.make(2),
+        key: "sku:coffee"
+      }).pipe(Effect.result)
+      assert.strictEqual(expectFailure(sku)._tag, "SchemaEvolutionUnsupported")
+
+      const charge = yield* Evolution.migrateMutationSuccessTo({
+        evolution: forwardOnly,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        mutation: "Charge",
+        mutationVersion: Identity.SchemaVersion.make(2),
+        value: 1
+      }).pipe(Effect.result)
+      assert.strictEqual(expectFailure(charge)._tag, "SchemaEvolutionUnsupported")
+
+      const admission = yield* Evolution.validateDowngradeTarget(forwardOnly, centsDefinition.schemaIdentity).pipe(
+        Effect.result
+      )
+      assert.strictEqual(expectFailure(admission)._tag, "SchemaEvolutionUnsupported")
+    })
+  )
+
+  it.effect(
+    "projects a transformed part back through its explicit reverse hook",
+    Effect.fnUntraced(function*() {
+      const reversible = Evolution.make({ current: dollarsDefinition, steps: [centsToDollars(true)] })
+      yield* Evolution.validateDowngradeTarget(reversible, centsDefinition.schemaIdentity)
+      const price = yield* Evolution.migrateModelTo({
+        evolution: reversible,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        model: "Price",
+        modelVersion: Identity.SchemaVersion.make(2),
+        key: "coffee",
+        value: { amount: 1 }
+      })
+      assert.deepStrictEqual(price.value, { amount: 100 })
+      const sku = yield* Evolution.migrateModelTo({
+        evolution: reversible,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        model: "Sku",
+        modelVersion: Identity.SchemaVersion.make(2),
+        key: "sku:coffee"
+      })
+      assert.strictEqual(sku.key, "coffee")
+      const charge = yield* Evolution.migrateMutationSuccessTo({
+        evolution: reversible,
+        source: dollarsDefinition.schemaIdentity,
+        target: centsDefinition.schemaIdentity,
+        mutation: "Charge",
+        mutationVersion: Identity.SchemaVersion.make(2),
+        value: 1
+      })
+      assert.strictEqual(charge.value, 100)
+    })
+  )
+
   it("uses an order independent schema identity and excludes queries from it", () => {
     const First = Mutation.make("First", { version: 1 })
     const Second = Mutation.make("Second", { version: 1 })
@@ -98,6 +260,51 @@ describe("schema evolution", () => {
     })
     assert.deepStrictEqual(left.schemaIdentity, withQuery.schemaIdentity)
     assert.notStrictEqual(left.hash, withQuery.hash)
+  })
+
+  it("keeps the current definition for its schema identity and rejects conflicting same-identity definitions", () => {
+    const TodoV2Indexed = Model.make("Todo", {
+      version: 2,
+      key: Schema.Number,
+      schema: TodoV2.schema,
+      indexes: {
+        byTitle: {
+          version: 1,
+          partition: [],
+          sort: [{
+            name: "title",
+            affinity: "text",
+            schema: Schema.String,
+            extract: (todo: { readonly title: string }) => todo.title
+          }]
+        }
+      }
+    })
+    const indexed = Definition.make({ version: 2, models: [TodoV2Indexed], mutations: [PutTodoV2] })
+    assert.deepStrictEqual(indexed.schemaIdentity, definitionV2.schemaIdentity)
+    assert.notStrictEqual(indexed.indexLayoutHash, definitionV2.indexLayoutHash)
+    assert.throws(
+      () => Evolution.make({ current: indexed, steps: [oneToTwo] }),
+      /Conflicting definition for schema identity/
+    )
+
+    const withQuery = Definition.make({
+      version: 2,
+      models: [TodoV2],
+      mutations: [PutTodoV2],
+      queries: [Query.make("ListTodos", { success: Schema.Array(TodoV2.schema), error: Missing })]
+    })
+    assert.deepStrictEqual(withQuery.schemaIdentity, definitionV2.schemaIdentity)
+    assert.notStrictEqual(withQuery.hash, definitionV2.hash)
+    assert.throws(
+      () => Evolution.make({ current: withQuery, steps: [oneToTwo] }),
+      /Conflicting definition for schema identity/
+    )
+
+    const equivalent = Definition.make({ version: 2, models: [TodoV2], mutations: [PutTodoV2] })
+    const configured = Evolution.make({ current: equivalent, steps: [oneToTwo] })
+    const identity = equivalent.schemaIdentity
+    assert.strictEqual(configured.definitionByIdentity.get(`${identity.version}:${identity.hash}`), equivalent)
   })
 
   it("requires complete contiguous forward definitions and exact component migrations", () => {
@@ -209,6 +416,72 @@ describe("schema evolution", () => {
       })
       assert.deepStrictEqual(rejection.schemaIdentity, definitionV1.schemaIdentity)
       assert.deepStrictEqual(rejection.value, { _tag: "Missing" })
+    })
+  )
+
+  it.effect(
+    "validates source parts against the source schema when no step is crossed",
+    Effect.fnUntraced(function*() {
+      const invalidKey = expectFailure(
+        yield* Evolution.migrateModel({
+          evolution,
+          source: definitionV2.schemaIdentity,
+          model: "Todo",
+          modelVersion: Identity.SchemaVersion.make(2),
+          key: "42"
+        }).pipe(Effect.result)
+      )
+      assert.strictEqual(invalidKey._tag, "SchemaEvolutionFailed")
+      if (invalidKey._tag === "SchemaEvolutionFailed") {
+        assert.isNull(invalidKey.stepId)
+        assert.strictEqual(invalidKey.part, "Key")
+      }
+
+      const invalidValue = expectFailure(
+        yield* Evolution.migrateModel({
+          evolution,
+          source: definitionV2.schemaIdentity,
+          model: "Todo",
+          modelVersion: Identity.SchemaVersion.make(2),
+          key: 42,
+          value: { id: "42", title: "new" }
+        }).pipe(Effect.result)
+      )
+      assert.strictEqual(invalidValue._tag, "SchemaEvolutionFailed")
+      if (invalidValue._tag === "SchemaEvolutionFailed") {
+        assert.isNull(invalidValue.stepId)
+        assert.strictEqual(invalidValue.part, "Value")
+      }
+
+      const invalidPayload = expectFailure(
+        yield* Evolution.migrateMutationPayload({
+          evolution,
+          source: definitionV2.schemaIdentity,
+          mutation: "PutTodo",
+          mutationVersion: Identity.SchemaVersion.make(2),
+          value: { id: "42" }
+        }).pipe(Effect.result)
+      )
+      assert.strictEqual(invalidPayload._tag, "SchemaEvolutionFailed")
+      if (invalidPayload._tag === "SchemaEvolutionFailed") {
+        assert.isNull(invalidPayload.stepId)
+        assert.strictEqual(invalidPayload.part, "Payload")
+      }
+
+      const invalidRejection = expectFailure(
+        yield* Evolution.migrateMutationRejection({
+          evolution,
+          source: definitionV2.schemaIdentity,
+          mutation: "PutTodo",
+          mutationVersion: Identity.SchemaVersion.make(2),
+          value: { _tag: "Unknown" }
+        }).pipe(Effect.result)
+      )
+      assert.strictEqual(invalidRejection._tag, "SchemaEvolutionFailed")
+      if (invalidRejection._tag === "SchemaEvolutionFailed") {
+        assert.isNull(invalidRejection.stepId)
+        assert.strictEqual(invalidRejection.part, "Rejection")
+      }
     })
   )
 
