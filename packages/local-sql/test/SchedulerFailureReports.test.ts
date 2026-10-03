@@ -29,6 +29,7 @@ import * as SqlReplica from "../src/SqlReplica.js"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import { gateStatements } from "./fixtures/SqlGate.js"
+import * as VirtualTime from "./fixtures/VirtualTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-0000000000e1")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-0000000000e1")
@@ -56,6 +57,7 @@ const layerClientDatabase = Layer.mergeAll(
 
 const completeStatement = "SET completed_generation"
 const countStatement = "SELECT COUNT(*) AS count FROM effect_local_client_pending_data"
+const claimStatement = "AND attempt_count >= "
 
 type PullMode = "Pass" | "Hold" | "Interrupt"
 
@@ -72,7 +74,7 @@ const harness = Effect.fnUntraced(function*() {
       if (Array.isArray(source) && failStatement(source.join("?"))) {
         return Queue.offer(injected, undefined).pipe(
           Effect.andThen(
-            Effect.fail(new SqlError.SqlError({ reason: new SqlError.UnknownError({ cause: "injected" }) }))
+            Effect.fail(new SqlError.SqlError({ reason: new SqlError.LockTimeoutError({ cause: "injected" }) }))
           )
         )
       }
@@ -87,6 +89,7 @@ const harness = Effect.fnUntraced(function*() {
   let pullMode: PullMode = "Pass"
   const heldPulls = yield* Queue.unbounded<void>()
   const transportWaits = yield* Queue.unbounded<void>()
+  const watchStarts = yield* Queue.unbounded<void>()
   const remote = SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
     transportGeneration: Effect.succeed(0),
@@ -103,13 +106,20 @@ const harness = Effect.fnUntraced(function*() {
         return server.pull(request)
       }),
     bootstrap: server.bootstrap,
-    watch: () => Stream.fromEffect(Deferred.await(watchFailure).pipe(Effect.flatMap(Effect.fail)))
+    watch: () =>
+      Stream.fromEffect(
+        Queue.offer(watchStarts, undefined).pipe(
+          Effect.andThen(Deferred.await(watchFailure)),
+          Effect.flatMap(Effect.fail)
+        )
+      )
   })
   return {
     database: Context.add(database, SqlClient.SqlClient, gate.sql),
     layerRemote: Layer.succeed(SyncEngine.SyncEngine, remote),
     heldPulls,
     transportWaits,
+    watchStarts,
     injected,
     paused: gate.pauses,
     failWatch: (error: ReplicaError.ReplicaError) => Deferred.succeed(watchFailure, error),
@@ -190,7 +200,7 @@ const statusAfterNextTurnStarts = Effect.fnUntraced(function*(
 ) {
   yield* controls.setPullMode("Hold")
   yield* space.mutate(Domain.PutTodo, Domain.todo("next"))
-  yield* Queue.take(controls.heldPulls)
+  yield* VirtualTime.advanceUntil(Queue.take(controls.heldPulls), "1 minute")
   return yield* space.status
 })
 
@@ -234,6 +244,77 @@ describe("scheduler failure reports", () => {
       assertFailedWithStorage(yield* statusAfterNextTurnStarts(controls, space))
     })
   )
+
+  it.effect(
+    "drains a pending mutation after one lock timeout during a foreground sync (Manager)",
+    Effect.fnUntraced(function*() {
+      const controls = yield* harness()
+      const space = yield* activeSpace(
+        controls,
+        SqlReplica.layer(replicaOptions).pipe(Layer.provide(Domain.layerHandlers))
+      )
+      yield* controls.failWhen(failOnce((statement) => statement.includes(claimStatement)))
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* Queue.take(controls.injected)
+
+      const onlineWithoutPending = awaitStatus(
+        Context.get(controls.database, Reactivity.Reactivity),
+        space,
+        (status) => status._tag === "Online" && status.pending === 0
+      )
+
+      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending, "10 seconds").pipe(
+        Effect.timeoutOption("10 minutes")
+      )
+
+      assert.isTrue(Option.isSome(drained))
+    })
+  )
+
+  it.effect(
+    "watches again after the watch fails on unavailable storage (Manager)",
+    Effect.fnUntraced(function*() {
+      const controls = yield* harness()
+      yield* activeSpace(controls, SqlReplica.layer(replicaOptions).pipe(Layer.provide(Domain.layerHandlers)))
+      yield* Queue.take(controls.watchStarts)
+      yield* controls.failWatch(new ReplicaError.StorageUnavailable({ cause: "injected" }))
+
+      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts), "10 seconds").pipe(
+        Effect.timeoutOption("10 minutes")
+      )
+
+      assert.isTrue(Option.isSome(watchedAgain))
+    })
+  )
+
+  it.effect(
+    "drains a pending mutation after one lock timeout during a foreground sync (workflow)",
+    Effect.fnUntraced(function*() {
+      const controls = yield* harness()
+      const space = yield* activeSpace(
+        controls,
+        SqlReplica.layerWorkflow(replicaOptions).pipe(
+          Layer.provide(Domain.layerHandlers),
+          Layer.provide(WorkflowEngine.layerMemory)
+        )
+      )
+      yield* controls.failWhen(failOnce((statement) => statement.includes(claimStatement)))
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* Queue.take(controls.injected)
+
+      const onlineWithoutPending = awaitStatus(
+        Context.get(controls.database, Reactivity.Reactivity),
+        space,
+        (status) => status._tag === "Online" && status.pending === 0
+      )
+
+      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending, "10 seconds").pipe(
+        Effect.timeoutOption("10 minutes")
+      )
+
+      assert.isTrue(Option.isSome(drained))
+    })
+  )
 })
 
 const inMemory = Effect.fnUntraced(function*(controls: Effect.Success<ReturnType<typeof harness>>) {
@@ -268,7 +349,8 @@ const inMemory = Effect.fnUntraced(function*(controls: Effect.Success<ReturnType
   assert.strictEqual(initial._tag, "Online")
   return {
     reconciler: Context.get(context, Reconciler.Reconciler),
-    local: Context.get(context, LocalStore.Store)
+    local: Context.get(context, LocalStore.Store),
+    statuses
   }
 })
 
@@ -286,8 +368,50 @@ describe("in-memory scheduler failure reports", () => {
       yield* controls.setPullMode("Hold")
       yield* local.mutate(Domain.PutTodo, Domain.todo("next"))
       yield* reconciler.schedule
-      yield* Queue.take(controls.heldPulls)
+      yield* VirtualTime.advanceUntil(Queue.take(controls.heldPulls), "1 minute")
       assertFailedWithStorage(yield* reconciler.status)
+    })
+  )
+
+  it.effect(
+    "drains a pending mutation after one lock timeout during a sync",
+    Effect.fnUntraced(function*() {
+      const controls = yield* harness()
+      const { local, reconciler, statuses } = yield* inMemory(controls)
+      yield* controls.failWhen(failOnce((statement) => statement.includes(claimStatement)))
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* reconciler.schedule
+      yield* Queue.take(controls.injected)
+      let reported = yield* Queue.take(statuses)
+      while (reported._tag !== "Failed") reported = yield* Queue.take(statuses)
+      assertFailedWithStorage(reported)
+      const awaitDrained = Effect.gen(function*() {
+        let status = yield* Queue.take(statuses)
+        while (status._tag !== "Online" || status.pending !== 0) status = yield* Queue.take(statuses)
+        return status
+      })
+
+      const drained = yield* VirtualTime.advanceUntil(awaitDrained, "10 seconds").pipe(
+        Effect.timeoutOption("10 minutes")
+      )
+
+      assert.isTrue(Option.isSome(drained))
+    })
+  )
+
+  it.effect(
+    "watches again after the watch fails on unavailable storage",
+    Effect.fnUntraced(function*() {
+      const controls = yield* harness()
+      yield* inMemory(controls)
+      yield* Queue.take(controls.watchStarts)
+      yield* controls.failWatch(new ReplicaError.StorageUnavailable({ cause: "injected" }))
+
+      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts), "10 seconds").pipe(
+        Effect.timeoutOption("10 minutes")
+      )
+
+      assert.isTrue(Option.isSome(watchedAgain))
     })
   )
 

@@ -133,14 +133,17 @@ const makeReconciliationRequests = (request: Effect.Effect<number, ReplicaError.
   return { run, observe }
 }
 
-export const isTransientFailure = (error: ReplicaError.ReplicaError) =>
+const isConnectivityFailure = (error: ReplicaError.ReplicaError) =>
   error._tag === "AuthenticatorUnavailable" ||
   error._tag === "ServerUnavailable" ||
   error._tag === "OperationTimeout"
 
+export const isTransientFailure = (error: ReplicaError.ReplicaError) =>
+  isConnectivityFailure(error) || error._tag === "StorageUnavailable"
+
 export const failureStatus = (error: ReplicaError.ReplicaError, pending: number): ReplicaStatus.ReplicaStatus => {
   if (error._tag === "CredentialRejected") return { _tag: "NeedsAuthentication", pending }
-  if (isTransientFailure(error)) return { _tag: "Offline", pending }
+  if (isConnectivityFailure(error)) return { _tag: "Offline", pending }
   return { _tag: "Failed", pending, message: error._tag }
 }
 

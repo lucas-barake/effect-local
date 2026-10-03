@@ -18,6 +18,7 @@ import * as Queue from "effect/Queue"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Scope from "effect/Scope"
 import * as SqlClient from "effect/sql/SqlClient"
+import * as SqlError from "effect/sql/SqlError"
 import * as Stream from "effect/Stream"
 import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
 import * as SqlReplica from "../src/SqlReplica.js"
@@ -101,6 +102,18 @@ const pendingBackgroundSpace = Effect.fnUntraced(function*(constructor: Construc
     WorkflowEngine.layerMemory
   ).pipe(Layer.build)
   const sql = Context.get(databaseContext, SqlClient.SqlClient)
+  let lockedStatement: string | undefined
+  const lockingSql = new Proxy(sql, {
+    apply: (target, thisArg, args: Parameters<typeof sql>) => {
+      const source: unknown = args[0]
+      if (lockedStatement === undefined || !Array.isArray(source) || !source.join("?").includes(lockedStatement)) {
+        return Reflect.apply(target, thisArg, args)
+      }
+      lockedStatement = undefined
+      const reason = new SqlError.LockTimeoutError({ cause: "injected lock timeout" })
+      return Effect.fail(new SqlError.SqlError({ reason }))
+    }
+  })
   const crypto = Context.get(databaseContext, Crypto.Crypto)
   const reactivity = Context.get(databaseContext, Reactivity.Reactivity)
   const options = {
@@ -120,11 +133,12 @@ const pendingBackgroundSpace = Effect.fnUntraced(function*(constructor: Construc
     retryDelay: "1 second",
     maximumRetryDelay: "1 second"
   } satisfies SqlReplica.Options<typeof Domain.definition>
+  const lockingContext = Context.add(databaseContext, SqlClient.SqlClient, lockingSql)
   const start = (remote: Remote) => {
     const layerServices = Layer.mergeAll(
       Domain.layerHandlers,
       Layer.succeed(SyncEngine.SyncEngine, remote),
-      Layer.succeedContext(databaseContext)
+      Layer.succeedContext(lockingContext)
     )
     let layerReplica = SqlReplica.layer(options).pipe(Layer.provide(layerServices))
     if (constructor === "layerWorkflow") {
@@ -141,13 +155,16 @@ const pendingBackgroundSpace = Effect.fnUntraced(function*(constructor: Construc
   yield* Scope.close(seedScope, Exit.void)
   yield* sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId}, replication_view_revision = 0`
 
-  return { sql, crypto, reactivity, start }
+  const lockNext = (statement: string) => {
+    lockedStatement = statement
+  }
+  return { sql, crypto, reactivity, start, lockNext }
 })
 
-const awaitSpaceStatus = Effect.fnUntraced(function*(
+const awaitSpaceStatusWhere = Effect.fnUntraced(function*(
   space: Replica.Space,
   reactivity: Reactivity.Reactivity,
-  tag: ReplicaStatus.ReplicaStatus["_tag"]
+  matches: (status: ReplicaStatus.SpaceStatus) => boolean
 ) {
   const changes = yield* Queue.unbounded<void>()
   yield* Effect.acquireRelease(
@@ -159,12 +176,18 @@ const awaitSpaceStatus = Effect.fnUntraced(function*(
     (unregister) => Effect.sync(unregister)
   )
   let status = yield* space.status
-  while (status._tag !== tag) {
+  while (!matches(status)) {
     yield* Queue.take(changes)
     status = yield* space.status
   }
   return status
 })
+
+const awaitSpaceStatus = (
+  space: Replica.Space,
+  reactivity: Reactivity.Reactivity,
+  tag: ReplicaStatus.ReplicaStatus["_tag"]
+) => awaitSpaceStatusWhere(space, reactivity, (status) => status._tag === tag)
 
 const corruptPending = (sql: SqlClient.SqlClient) =>
   sql`UPDATE effect_local_client_pending_data SET digest = 'x' || digest`
@@ -251,6 +274,34 @@ describe("background sync terminal failures", () => {
       const aggregate = yield* replica.status
       assert.strictEqual(aggregate.counts.failed, 0)
       assert.strictEqual(aggregate.totalPending, 1)
+    }, Effect.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "drains a background space after one lock timeout on its storage with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* pendingBackgroundSpace(constructor)
+      const attempts = yield* makeAttempts
+      services.lockNext("SELECT desired_scope_json FROM effect_local_client_spaces WHERE space_id")
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => Effect.andThen(attempts.record, emptyPage(services.crypto, request))
+      }))
+      const space = yield* replica.space(spaceId)
+
+      const idleWithoutPending = awaitSpaceStatusWhere(
+        space,
+        services.reactivity,
+        (status) => status._tag === "Idle" && status.pending === 0
+      ).pipe(Effect.scoped)
+
+      const drained = yield* VirtualTime.advanceUntil(idleWithoutPending).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.isTrue(Option.isSome(drained))
+      const aggregate = yield* replica.status
+      assert.strictEqual(aggregate.counts.failed, 0)
+      assert.strictEqual(aggregate.totalPending, 0)
     }, Effect.scoped)
   )
 
