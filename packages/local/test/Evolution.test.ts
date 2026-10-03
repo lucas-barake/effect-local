@@ -262,6 +262,51 @@ describe("schema evolution", () => {
     assert.notStrictEqual(left.hash, withQuery.hash)
   })
 
+  it("keeps the current definition for its schema identity and rejects conflicting same-identity definitions", () => {
+    const TodoV2Indexed = Model.make("Todo", {
+      version: 2,
+      key: Schema.Number,
+      schema: TodoV2.schema,
+      indexes: {
+        byTitle: {
+          version: 1,
+          partition: [],
+          sort: [{
+            name: "title",
+            affinity: "text",
+            schema: Schema.String,
+            extract: (todo: { readonly title: string }) => todo.title
+          }]
+        }
+      }
+    })
+    const indexed = Definition.make({ version: 2, models: [TodoV2Indexed], mutations: [PutTodoV2] })
+    assert.deepStrictEqual(indexed.schemaIdentity, definitionV2.schemaIdentity)
+    assert.notStrictEqual(indexed.indexLayoutHash, definitionV2.indexLayoutHash)
+    assert.throws(
+      () => Evolution.make({ current: indexed, steps: [oneToTwo] }),
+      /Conflicting definition for schema identity/
+    )
+
+    const withQuery = Definition.make({
+      version: 2,
+      models: [TodoV2],
+      mutations: [PutTodoV2],
+      queries: [Query.make("ListTodos", { success: Schema.Array(TodoV2.schema), error: Missing })]
+    })
+    assert.deepStrictEqual(withQuery.schemaIdentity, definitionV2.schemaIdentity)
+    assert.notStrictEqual(withQuery.hash, definitionV2.hash)
+    assert.throws(
+      () => Evolution.make({ current: withQuery, steps: [oneToTwo] }),
+      /Conflicting definition for schema identity/
+    )
+
+    const equivalent = Definition.make({ version: 2, models: [TodoV2], mutations: [PutTodoV2] })
+    const configured = Evolution.make({ current: equivalent, steps: [oneToTwo] })
+    const identity = equivalent.schemaIdentity
+    assert.strictEqual(configured.definitionByIdentity.get(`${identity.version}:${identity.hash}`), equivalent)
+  })
+
   it("requires complete contiguous forward definitions and exact component migrations", () => {
     assert.throws(
       () => Evolution.step({ id: "missing-components", from: definitionV1, to: definitionV2 }),

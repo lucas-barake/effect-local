@@ -380,10 +380,13 @@ export const make = (options: {
   const addDefinition = (definition: Definition.Any): void => {
     const key = identityKey(definition.schemaIdentity)
     const existing = definitionByIdentity.get(key)
-    if (existing !== undefined && existing.version !== definition.version) {
+    if (existing === undefined) {
+      definitionByIdentity.set(key, definition)
+      return
+    }
+    if (existing.hash !== definition.hash || existing.indexLayoutHash !== definition.indexLayoutHash) {
       return Defect.invalid(`Conflicting definition for schema identity: ${key}`)
     }
-    definitionByIdentity.set(key, definition)
   }
   addDefinition(options.current)
   for (const entry of steps) {
