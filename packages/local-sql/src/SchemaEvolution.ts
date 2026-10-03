@@ -1278,7 +1278,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
   yield* Effect.annotateCurrentSpan("space.id", options.spaceId)
   const sql = yield* SqlClient.SqlClient
   const dialect = yield* Dialect.make(sql)
-  const withTransaction = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
+  const withTransaction = <A, E extends SqlTransaction.ServerTransactionFailure, R,>(effect: Effect.Effect<A, E, R>) =>
     SqlTransaction.withServerTransaction(sql, effect)
   if (!sameIdentity(options.definition.schemaIdentity, options.evolution.current.schemaIdentity)) {
     return yield* new ReplicaError.InvalidConfiguration({

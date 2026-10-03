@@ -8,7 +8,6 @@ import type * as Transaction from "@lucas-barake/effect-local/Transaction"
 import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
-import * as Predicate from "effect/Predicate"
 import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/sql/SqlClient"
 import * as SqlError from "effect/sql/SqlError"
@@ -217,27 +216,32 @@ export const entityKey = (entity: Protocol.EntityKey) => Canonical.stringify([en
 
 const maximumTransactionAttempts = 8
 
+export type ServerTransactionFailure = ReplicaError.ReplicaError | SqlError.SqlError | Schema.SchemaError
+
 const isTransientConflict = (error: SqlError.SqlError) =>
   error.reason._tag === "DeadlockError" || error.reason._tag === "SerializationError"
 
-const transientConflict = (error: unknown) => {
-  if (SqlError.isSqlError(error)) return isTransientConflict(error)
-  if (!Predicate.isTagged(error, "StorageUnavailable") || !Predicate.hasProperty(error, "cause")) return false
+const transientConflict = (error: ReplicaError.StorageUnavailable | SqlError.SqlError) => {
+  if (error._tag === "SqlError") return isTransientConflict(error)
   return SqlError.isSqlError(error.cause) && isTransientConflict(error.cause)
 }
 
-export const withServerTransaction = <A, E extends { readonly _tag: string }, R,>(
+export function withServerTransaction<A, E extends ServerTransactionFailure, R,>(
   sql: SqlClient.SqlClient,
   effect: Effect.Effect<A, E, R>
-): Effect.Effect<A, E | SqlError.SqlError, R> => {
-  const attempt = (remaining: number): Effect.Effect<A, E | SqlError.SqlError, R> =>
+): Effect.Effect<A, E | SqlError.SqlError, R>
+export function withServerTransaction<R,>(
+  sql: SqlClient.SqlClient,
+  effect: Effect.Effect<unknown, ServerTransactionFailure, R>
+): Effect.Effect<unknown, ServerTransactionFailure, R> {
+  const attempt = (remaining: number): Effect.Effect<unknown, ServerTransactionFailure, R> =>
     Effect.suspend(() => {
       let committing = false
       const markCommitting = Effect.sync(() => {
         committing = true
       })
       return sql.withTransaction(Effect.tap(effect, markCommitting)).pipe(
-        Effect.catchCause((cause) => {
+        Effect.catchCause((cause): Effect.Effect<never, ServerTransactionFailure> => {
           const commitErrors = cause.reasons.filter(Cause.isDieReason).map((reason) => reason.defect).filter(
             SqlError.isSqlError
           )
@@ -255,7 +259,7 @@ export const withServerTransaction = <A, E extends { readonly _tag: string }, R,
             })
           )
         }),
-        Effect.catch((error) => {
+        Effect.catchTag(["SqlError", "StorageUnavailable"], (error) => {
           if (remaining > 1 && transientConflict(error)) return attempt(remaining - 1)
           return Effect.fail(error)
         })
