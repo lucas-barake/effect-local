@@ -1124,6 +1124,55 @@ describe("background sync terminal failures", () => {
   )
 
   it.effect(
+    "ignores a failed release of a workflow attempt once the foreground took the space over",
+    Effect.fnUntraced(function*() {
+      const services = yield* backgroundServices("layerWorkflow")
+      const attempts = yield* makeAttempts
+      const release = yield* services.holdRelease()
+      let pulls = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          pulls += 1
+          if (attempts.count() === 0) {
+            return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+          }
+          if (attempts.count() === 1) return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+          if (attempts.count() > 2) return emptyPage(services.crypto, request)
+          release.arm()
+          return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* services.sql`UPDATE effect_local_client_spaces
+        SET replication_view_id = ${viewId}, replication_view_revision = 0`
+      yield* space.mutate(Domain.PutTodo, Domain.todo("pending"))
+      yield* attempts.reached(1)
+      yield* space.deactivate
+      yield* attempts.reached(2)
+      yield* VirtualTime.advanceUntil(release.entered)
+      yield* space.activate
+      const online = awaitSpaceStatusWhere(
+        space,
+        services.reactivity,
+        (status) => status._tag === "Online" && status.pending === 0
+      ).pipe(Effect.scoped)
+      yield* VirtualTime.advanceUntil(online)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+      const pullsBefore = pulls
+
+      services.lockNext(pendingCountStatement)
+      yield* release.release
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.strictEqual(pulls, pullsBefore)
+      assert.strictEqual(yield* space.activation, "Active")
+      assert.strictEqual((yield* space.status)._tag, "Online")
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "runs another background turn when releasing a workflow attempt hits a lock timeout",
     Effect.fnUntraced(function*() {
       const { services, attempts, replica } = yield* workflowRetryAfterRelease("fails")
