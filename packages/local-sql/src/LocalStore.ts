@@ -16,7 +16,7 @@ import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
-import { constFalse, pipe } from "effect/Function"
+import { constFalse, flow, pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
@@ -768,14 +768,23 @@ export const layer = (
         execute: () =>
           sql`SELECT COUNT(*) AS count FROM effect_local_client_quarantine WHERE space_id = ${options.spaceId}`
       })
-      const countReceipts = SqlSchema.findOne({
-        Request: Schema.Void,
-        Result: Rows.CountRow,
-        execute: () =>
-          sql`SELECT COUNT(*) AS count FROM effect_local_client_receipts_data
+      const countReceipts = flow(
+        SqlSchema.findOne({
+          Request: Schema.Void,
+          Result: Rows.CountRow,
+          execute: () =>
+            sql`SELECT COUNT(*) AS count FROM effect_local_client_receipts_data
           WHERE space_id = ${options.spaceId} AND schema_generation = (
             SELECT active_schema_generation FROM effect_local_client_spaces WHERE space_id = ${options.spaceId})`
-      })
+        }),
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is corrupt", cause })),
+          NoSuchElementError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is missing", cause }))
+        })
+      )
       const PrunableReceiptRow = Schema.Struct({
         mutation_id: Identity.MutationId,
         settled_sequence: Schema.NullOr(Identity.SettlementSequence),
@@ -833,15 +842,24 @@ export const layer = (
           ORDER BY r.settled_sequence ASC
           LIMIT ${limit}`
       })
-      const findScopedBootstrap = SqlSchema.findOneOption({
-        Request: Schema.Void,
-        Result: Rows.ClientScopedBootstrapRow,
-        execute: () =>
-          sql`SELECT snapshot_id, space_id, client_id, definition_hash, schema_version, schema_hash,
+      const findScopedBootstrap = flow(
+        SqlSchema.findOneOption({
+          Request: Schema.Void,
+          Result: Rows.ClientScopedBootstrapRow,
+          execute: () =>
+            sql`SELECT snapshot_id, space_id, client_id, definition_hash, schema_version, schema_hash,
             scope_digest, scope_generation, view_id, view_revision, server_sequence, terminal_sequence,
             entry_count, content_bytes, digest, next_ordinal, received_bytes, rolling_digest
           FROM effect_local_client_scoped_bootstrap WHERE space_id = ${options.spaceId}`
-      })
+        }),
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(
+              new ReplicaError.StorageCorrupt({ message: "Client scoped bootstrap row is corrupt", cause })
+            )
+        })
+      )
       const findScopedBootstrapEntries = SqlSchema.findAll({
         Request: Schema.Void,
         Result: Rows.ScopedSnapshotEntryRow,
@@ -2345,13 +2363,7 @@ export const layer = (
       )
 
       const pruneReceipts = Effect.fnUntraced(function*(target: number) {
-        const count = yield* countReceipts(undefined).pipe(Effect.catchTags({
-          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-          SchemaError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is corrupt", cause })),
-          NoSuchElementError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is missing", cause }))
-        }))
+        const count = yield* countReceipts(undefined)
         const excess = Math.max(0, count.count - target)
         if (excess === 0) return []
         const state = yield* findSettlementState(undefined).pipe(Effect.catchTags({
@@ -2360,41 +2372,30 @@ export const layer = (
             Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
           NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
         }))
-        const rows = Array.from(
-          yield* findPrunableUnsettled(excess).pipe(
-            Effect.catchTags({
-              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-              SchemaError: (cause) =>
-                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
+        const rows = yield* Effect.gen(function*() {
+          const prunable = Array.from(yield* findPrunableUnsettled(excess))
+          if (prunable.length < excess) {
+            const acknowledged = yield* findPrunableAcknowledged({
+              limit: excess - prunable.length,
+              floor: state.settlement_floor
             })
-          )
+            prunable.push(...acknowledged)
+          }
+          if (prunable.length < excess) {
+            const unacknowledged = yield* findPrunableUnacknowledged({
+              limit: excess - prunable.length,
+              floor: state.settlement_floor
+            })
+            prunable.push(...unacknowledged)
+          }
+          return prunable
+        }).pipe(
+          Effect.catchTags({
+            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+            SchemaError: (cause) =>
+              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
+          })
         )
-        if (rows.length < excess) {
-          const acknowledged = yield* findPrunableAcknowledged({
-            limit: excess - rows.length,
-            floor: state.settlement_floor
-          }).pipe(
-            Effect.catchTags({
-              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-              SchemaError: (cause) =>
-                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
-            })
-          )
-          rows.push(...acknowledged)
-        }
-        if (rows.length < excess) {
-          const unacknowledged = yield* findPrunableUnacknowledged({
-            limit: excess - rows.length,
-            floor: state.settlement_floor
-          }).pipe(
-            Effect.catchTags({
-              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-              SchemaError: (cause) =>
-                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
-            })
-          )
-          rows.push(...unacknowledged)
-        }
         for (let offset = 0; offset < rows.length; offset += 500) {
           const mutationIds = rows.slice(offset, offset + 500).map((row) => row.mutation_id)
           yield* sql`INSERT INTO effect_local_client_retired_mutations (space_id, mutation_id, local_sequence)
@@ -2556,13 +2557,7 @@ export const layer = (
           })
         }
         const pruned = yield* pruneReceipts(options.retainedReceipts)
-        const receiptCount = yield* countReceipts(undefined).pipe(Effect.catchTags({
-          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-          SchemaError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is corrupt", cause })),
-          NoSuchElementError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is missing", cause }))
-        }))
+        const receiptCount = yield* countReceipts(undefined)
         if (receiptCount.count >= options.maximumReceipts) {
           return yield* new ReplicaError.CapacityExceeded({
             resource: "client receipts",
@@ -3014,13 +3009,7 @@ export const layer = (
                 })
               }
               const pruned = yield* pruneReceipts(options.retainedReceipts)
-              const receiptCount = yield* countReceipts(undefined).pipe(Effect.catchTags({
-                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-                SchemaError: (cause) =>
-                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is corrupt", cause })),
-                NoSuchElementError: (cause) =>
-                  Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt count is missing", cause }))
-              }))
+              const receiptCount = yield* countReceipts(undefined)
               if (receiptCount.count >= options.maximumReceipts) {
                 return yield* new ReplicaError.CapacityExceeded({
                   resource: "client receipts",
@@ -3186,15 +3175,7 @@ export const layer = (
         yield* Effect.annotateCurrentSpan({ "snapshot.id": manifest.snapshotId })
         yield* validateManifest(manifest)
         return yield* lane.withTransaction(Effect.gen(function*() {
-          const current = yield* findScopedBootstrap(undefined).pipe(
-            Effect.catchTags({
-              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.StorageCorrupt({ message: "Client scoped bootstrap row is corrupt", cause })
-                )
-            })
-          )
+          const current = yield* findScopedBootstrap(undefined)
           if (Option.isSome(current) && bootstrapMatches(current.value, manifest)) {
             return current.value.next_ordinal - 1
           }
@@ -3228,15 +3209,7 @@ export const layer = (
           })
         }
         return yield* lane.withTransaction(Effect.gen(function*() {
-          const found = yield* findScopedBootstrap(undefined).pipe(
-            Effect.catchTags({
-              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-              SchemaError: (cause) =>
-                Effect.fail(
-                  new ReplicaError.StorageCorrupt({ message: "Client scoped bootstrap row is corrupt", cause })
-                )
-            })
-          )
+          const found = yield* findScopedBootstrap(undefined)
           if (Option.isNone(found) || !bootstrapMatches(found.value, page.manifest)) {
             return yield* new ReplicaError.ProtocolInvalid({
               message: `Bootstrap page does not match durable snapshot ${page.manifest.snapshotId}`
@@ -3356,15 +3329,7 @@ export const layer = (
         let prunedReceiptIds: ReadonlyArray<Identity.MutationId> = []
         yield* pipe(
           Effect.gen(function*() {
-            const found = yield* findScopedBootstrap(undefined).pipe(
-              Effect.catchTags({
-                SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-                SchemaError: (cause) =>
-                  Effect.fail(
-                    new ReplicaError.StorageCorrupt({ message: "Client scoped bootstrap row is corrupt", cause })
-                  )
-              })
-            )
+            const found = yield* findScopedBootstrap(undefined)
             if (Option.isNone(found) || !bootstrapMatches(found.value, manifest)) {
               return yield* new ReplicaError.ProtocolInvalid({
                 message: `Snapshot ${manifest.snapshotId} is not staged for installation`

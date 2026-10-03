@@ -5,6 +5,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
+import { flow } from "effect/Function"
 import * as Option from "effect/Option"
 import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
@@ -421,25 +422,44 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
     })
   }
 
-  const readMeta = onLane(SqlSchema.findOne({
-    Request: Schema.Void,
-    Result: MetaRow,
-    execute: () =>
-      sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
+  const readMeta = flow(
+    SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: MetaRow,
+      execute: () =>
+        sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
         active_projection_generation,
         target_schema_version, target_schema_hash, migration_hash
         FROM effect_local_client_spaces WHERE space_id = ${options.spaceId}`
-  }))
-  const readProgress = onLane(SqlSchema.findOneOption({
-    Request: Schema.Void,
-    Result: ProgressRow,
-    execute: () =>
-      sql`SELECT source_schema_version, source_schema_hash, target_schema_version,
+    }),
+    lane.withStatement,
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+      SchemaError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
+      NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
+    })
+  )
+  const readProgress = flow(
+    SqlSchema.findOneOption({
+      Request: Schema.Void,
+      Result: ProgressRow,
+      execute: () =>
+        sql`SELECT source_schema_version, source_schema_hash, target_schema_version,
         target_schema_hash, migration_hash, generation, source_generation, source_projection_generation,
         target_projection_generation, phase,
         cursor_model, cursor_key, cursor_sequence
         FROM effect_local_client_evolution WHERE space_id = ${options.spaceId}`
-  }))
+    }),
+    lane.withStatement,
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+      SchemaError: (cause) =>
+        Effect.fail(
+          new ReplicaError.StorageCorrupt({ message: "Client schema evolution progress row is corrupt", cause })
+        )
+    })
+  )
   const countCanonicalGeneration = onLane(SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
@@ -654,21 +674,8 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
   const registerLineage = ClientLineage.make(sql, options.spaceId)
 
   const validateBatch = Effect.fnUntraced(function*(state: typeof ProgressRow.Type) {
-    const meta = yield* readMeta(undefined).pipe(Effect.catchTags({
-      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-      SchemaError: (cause) =>
-        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
-      NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
-    }))
-    const progress = yield* readProgress(undefined).pipe(
-      Effect.catchTags({
-        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-        SchemaError: (cause) =>
-          Effect.fail(
-            new ReplicaError.StorageCorrupt({ message: "Client schema evolution progress row is corrupt", cause })
-          )
-      })
-    )
+    const meta = yield* readMeta(undefined)
+    const progress = yield* readProgress(undefined)
     let expectedActiveGeneration: number = state.generation
     if (
       state.phase === "Flip" || state.phase === "Log" || state.phase === "Entities" ||
@@ -691,22 +698,9 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
     return undefined
   })
 
-  let progress = yield* readProgress(undefined).pipe(
-    Effect.catchTags({
-      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-      SchemaError: (cause) =>
-        Effect.fail(
-          new ReplicaError.StorageCorrupt({ message: "Client schema evolution progress row is corrupt", cause })
-        )
-    })
-  )
+  let progress = yield* readProgress(undefined)
   if (Option.isNone(progress)) {
-    const meta = yield* readMeta(undefined).pipe(Effect.catchTags({
-      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-      SchemaError: (cause) =>
-        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
-      NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
-    }))
+    const meta = yield* readMeta(undefined)
     const source = (yield* sourceDefinition(
       options.evolution,
       identityFrom(meta.schema_version, meta.schema_hash)
@@ -717,12 +711,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         yield* sql`UPDATE effect_local_client_spaces SET definition_hash = ${options.definition.hash}
             WHERE space_id = ${options.spaceId} AND schema_generation = ${meta.schema_generation}
               AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL`
-        const currentMeta = yield* readMeta(undefined).pipe(Effect.catchTags({
-          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-          SchemaError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
-          NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
-        }))
+        const currentMeta = yield* readMeta(undefined)
         if (
           currentMeta.schema_generation !== meta.schema_generation ||
           currentMeta.schema_version !== options.definition.schemaIdentity.version ||
@@ -778,15 +767,7 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
             ${options.evolution.migrationHash}, ${generation}, ${meta.active_schema_generation},
             ${meta.active_projection_generation}, 0, 'Log', NULL, NULL, 0)`
     }))
-    progress = yield* readProgress(undefined).pipe(
-      Effect.catchTags({
-        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-        SchemaError: (cause) =>
-          Effect.fail(
-            new ReplicaError.StorageCorrupt({ message: "Client schema evolution progress row is corrupt", cause })
-          )
-      })
-    )
+    progress = yield* readProgress(undefined)
   }
   if (Option.isNone(progress)) {
     return yield* new ReplicaError.StorageCorrupt({ message: "Client schema evolution progress was not created" })
@@ -808,22 +789,9 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
   const definition = yield* sourceDefinition(options.evolution, source)
 
   while (true) {
-    const current = yield* readProgress(undefined).pipe(
-      Effect.catchTags({
-        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-        SchemaError: (cause) =>
-          Effect.fail(
-            new ReplicaError.StorageCorrupt({ message: "Client schema evolution progress row is corrupt", cause })
-          )
-      })
-    )
+    const current = yield* readProgress(undefined)
     if (Option.isNone(current)) {
-      const meta = yield* readMeta(undefined).pipe(Effect.catchTags({
-        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-        SchemaError: (cause) =>
-          Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client membership row is corrupt", cause })),
-        NoSuchElementError: () => Effect.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
-      }))
+      const meta = yield* readMeta(undefined)
       if (
         meta.schema_generation === expected.generation &&
         meta.active_schema_generation === expected.generation &&
@@ -846,15 +814,9 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
 
     if (state.phase === "Log") {
       const after = state.cursor_sequence ?? 0
-      const metadata = yield* logMetadata({ after, limit: batchSize }).pipe(
-        Effect.catchTags({
-          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-          SchemaError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client server log row is corrupt", cause }))
-        })
-      )
-      const limit = yield* boundedCount(metadata, batchBytes)
-      const rows = yield* logBatch({ after, limit }).pipe(
+      const rows = yield* logMetadata({ after, limit: batchSize }).pipe(
+        Effect.flatMap((metadata) => boundedCount(metadata, batchBytes)),
+        Effect.flatMap((limit) => logBatch({ after, limit })),
         Effect.catchTags({
           SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
           SchemaError: (cause) =>
@@ -881,56 +843,39 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         return undefined
       }))
     } else if (state.phase === "Entities") {
-      let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
-      if (state.cursor_model === null) {
-        metadata = yield* initialEntityMetadata({
-          generation: state.source_generation,
-          limit: batchSize
-        }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client canonical entity row is corrupt", cause }))
+      const rows = yield* Effect.gen(function*() {
+        let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
+        if (state.cursor_model === null) {
+          metadata = yield* initialEntityMetadata({
+            generation: state.source_generation,
+            limit: batchSize
           })
-        )
-      } else {
-        metadata = yield* continuingEntityMetadata({
-          generation: state.source_generation,
-          model: state.cursor_model,
-          key: state.cursor_key!,
-          limit: batchSize
-        }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client canonical entity row is corrupt", cause }))
+        } else {
+          metadata = yield* continuingEntityMetadata({
+            generation: state.source_generation,
+            model: state.cursor_model,
+            key: state.cursor_key!,
+            limit: batchSize
           })
-        )
-      }
-      const limit = yield* boundedCount(metadata, batchBytes)
-      let rows: ReadonlyArray<typeof EntityBatchRow.Type>
-      if (state.cursor_model === null) {
-        rows = yield* initialEntityBatch({ generation: state.source_generation, limit }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client canonical entity row is corrupt", cause }))
+        }
+        const limit = yield* boundedCount(metadata, batchBytes)
+        if (state.cursor_model === null) {
+          return yield* initialEntityBatch({ generation: state.source_generation, limit })
+        } else {
+          return yield* continuingEntityBatch({
+            generation: state.source_generation,
+            model: state.cursor_model,
+            key: state.cursor_key!,
+            limit
           })
-        )
-      } else {
-        rows = yield* continuingEntityBatch({
-          generation: state.source_generation,
-          model: state.cursor_model,
-          key: state.cursor_key!,
-          limit
-        }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client canonical entity row is corrupt", cause }))
-          })
-        )
-      }
+        }
+      }).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client canonical entity row is corrupt", cause }))
+        })
+      )
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
@@ -971,15 +916,9 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         after: state.cursor_sequence ?? 0,
         limit: batchSize
       }
-      const metadata = yield* receiptMetadata(request).pipe(
-        Effect.catchTags({
-          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-          SchemaError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client receipt row is corrupt", cause }))
-        })
-      )
-      const limit = yield* boundedCount(metadata, batchBytes)
-      const rows = yield* receiptBatch({ ...request, limit }).pipe(
+      const rows = yield* receiptMetadata(request).pipe(
+        Effect.flatMap((metadata) => boundedCount(metadata, batchBytes)),
+        Effect.flatMap((limit) => receiptBatch({ ...request, limit })),
         Effect.catchTags({
           SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
           SchemaError: (cause) =>
@@ -1028,15 +967,9 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         after: state.cursor_sequence ?? 0,
         limit: batchSize
       }
-      const metadata = yield* pendingMetadata(request).pipe(
-        Effect.catchTags({
-          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-          SchemaError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client pending mutation row is corrupt", cause }))
-        })
-      )
-      const limit = yield* boundedCount(metadata, batchBytes)
-      const rows = yield* pendingBatch({ ...request, limit }).pipe(
+      const rows = yield* pendingMetadata(request).pipe(
+        Effect.flatMap((metadata) => boundedCount(metadata, batchBytes)),
+        Effect.flatMap((limit) => pendingBatch({ ...request, limit })),
         Effect.catchTags({
           SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
           SchemaError: (cause) =>
@@ -1164,56 +1097,39 @@ export const client = Effect.fn("SchemaEvolution.client")(function*(options: Cli
         key: state.cursor_key,
         limit: batchSize
       }
-      let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
-      if (state.cursor_model === null || state.cursor_key === null) {
-        metadata = yield* initialRetractionMetadata({
-          generation: request.generation,
-          limit: request.limit
-        }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client retraction row is corrupt", cause }))
+      const rows = yield* Effect.gen(function*() {
+        let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
+        if (state.cursor_model === null || state.cursor_key === null) {
+          metadata = yield* initialRetractionMetadata({
+            generation: request.generation,
+            limit: request.limit
           })
-        )
-      } else {
-        metadata = yield* continuingRetractionMetadata({
-          generation: request.generation,
-          model: state.cursor_model,
-          key: state.cursor_key,
-          limit: request.limit
-        }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client retraction row is corrupt", cause }))
+        } else {
+          metadata = yield* continuingRetractionMetadata({
+            generation: request.generation,
+            model: state.cursor_model,
+            key: state.cursor_key,
+            limit: request.limit
           })
-        )
-      }
-      const limit = yield* boundedCount(metadata, batchBytes)
-      let rows: ReadonlyArray<typeof RetractionBatchRow.Type>
-      if (state.cursor_model === null || state.cursor_key === null) {
-        rows = yield* initialRetractionBatch({ generation: request.generation, limit }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client retraction row is corrupt", cause }))
+        }
+        const limit = yield* boundedCount(metadata, batchBytes)
+        if (state.cursor_model === null || state.cursor_key === null) {
+          return yield* initialRetractionBatch({ generation: request.generation, limit })
+        } else {
+          return yield* continuingRetractionBatch({
+            generation: request.generation,
+            model: state.cursor_model,
+            key: state.cursor_key,
+            limit
           })
-        )
-      } else {
-        rows = yield* continuingRetractionBatch({
-          generation: request.generation,
-          model: state.cursor_model,
-          key: state.cursor_key,
-          limit
-        }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client retraction row is corrupt", cause }))
-          })
-        )
-      }
+        }
+      }).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Client retraction row is corrupt", cause }))
+        })
+      )
       yield* withTransaction(Effect.gen(function*() {
         yield* validateBatch(state)
         for (const row of rows) {
@@ -1470,14 +1386,23 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     })
   }
 
-  const readMeta = SqlSchema.findOne({
-    Request: Schema.Void,
-    Result: ServerMetaEvolutionRow,
-    execute: () =>
-      sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
+  const readMeta = flow(
+    SqlSchema.findOne({
+      Request: Schema.Void,
+      Result: ServerMetaEvolutionRow,
+      execute: () =>
+        sql`SELECT definition_hash, schema_version, schema_hash, schema_generation, active_schema_generation,
         target_schema_version, target_schema_hash, migration_hash FROM effect_local_server_spaces
         WHERE space_id = ${options.spaceId}`
-  })
+    }),
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+      SchemaError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause })),
+      NoSuchElementError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
+    })
+  )
   const lockMeta = SqlSchema.findOne({
     Request: Schema.Void,
     Result: ServerMetaEvolutionRow,
@@ -1486,15 +1411,24 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
         target_schema_version, target_schema_hash, migration_hash FROM effect_local_server_spaces
         WHERE space_id = ${options.spaceId} ${dialect.forNoKeyUpdate}`
   })
-  const readProgress = SqlSchema.findOneOption({
-    Request: Schema.Void,
-    Result: ServerProgressRow,
-    execute: () =>
-      sql`SELECT source_schema_version, source_schema_hash, target_schema_version,
+  const readProgress = flow(
+    SqlSchema.findOneOption({
+      Request: Schema.Void,
+      Result: ServerProgressRow,
+      execute: () =>
+        sql`SELECT source_schema_version, source_schema_hash, target_schema_version,
         target_schema_hash, migration_hash, generation, source_generation, target_entity_count,
         target_entity_bytes, phase, cursor_model, cursor_key, cursor_sequence
         FROM effect_local_server_evolution WHERE space_id = ${options.spaceId}`
-  })
+    }),
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+      SchemaError: (cause) =>
+        Effect.fail(
+          new ReplicaError.StorageCorrupt({ message: "Server schema evolution progress row is corrupt", cause })
+        )
+    })
+  )
   const countEntityGeneration = SqlSchema.findOne({
     Request: NonNegativeInt,
     Result: CountRow,
@@ -1739,15 +1673,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
       NoSuchElementError: (cause) =>
         Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
     }))
-    const progress = yield* readProgress(undefined).pipe(
-      Effect.catchTags({
-        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-        SchemaError: (cause) =>
-          Effect.fail(
-            new ReplicaError.StorageCorrupt({ message: "Server schema evolution progress row is corrupt", cause })
-          )
-      })
-    )
+    const progress = yield* readProgress(undefined)
     let expectedActiveGeneration: number = state.generation
     if (
       state.phase === "Flip" || state.phase === "Log" || state.phase === "Entities"
@@ -1771,23 +1697,9 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     return undefined
   })
 
-  let progress = yield* readProgress(undefined).pipe(
-    Effect.catchTags({
-      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-      SchemaError: (cause) =>
-        Effect.fail(
-          new ReplicaError.StorageCorrupt({ message: "Server schema evolution progress row is corrupt", cause })
-        )
-    })
-  )
+  let progress = yield* readProgress(undefined)
   if (Option.isNone(progress)) {
-    const meta = yield* readMeta(undefined).pipe(Effect.catchTags({
-      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-      SchemaError: (cause) =>
-        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause })),
-      NoSuchElementError: (cause) =>
-        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
-    }))
+    const meta = yield* readMeta(undefined)
     const source = (yield* sourceDefinition(
       options.evolution,
       identityFrom(meta.schema_version, meta.schema_hash)
@@ -1800,13 +1712,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
           yield* sql`UPDATE effect_local_server_spaces SET definition_hash = ${options.definition.hash}
             WHERE space_id = ${options.spaceId} AND schema_generation = ${meta.schema_generation}
               AND target_schema_version IS NULL AND target_schema_hash IS NULL AND migration_hash IS NULL`
-          const currentMeta = yield* readMeta(undefined).pipe(Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause })),
-            NoSuchElementError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
-          }))
+          const currentMeta = yield* readMeta(undefined)
           if (
             currentMeta.schema_generation !== meta.schema_generation ||
             currentMeta.schema_version !== options.definition.schemaIdentity.version ||
@@ -1858,15 +1764,7 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
             0, 0, 'Log', NULL, NULL, 0)`
       })
     )
-    progress = yield* readProgress(undefined).pipe(
-      Effect.catchTags({
-        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-        SchemaError: (cause) =>
-          Effect.fail(
-            new ReplicaError.StorageCorrupt({ message: "Server schema evolution progress row is corrupt", cause })
-          )
-      })
-    )
+    progress = yield* readProgress(undefined)
   }
   if (Option.isNone(progress)) {
     return yield* new ReplicaError.StorageCorrupt({ message: "Server schema evolution progress was not created" })
@@ -1888,23 +1786,9 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
   yield* sourceDefinition(options.evolution, source)
 
   while (true) {
-    const current = yield* readProgress(undefined).pipe(
-      Effect.catchTags({
-        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-        SchemaError: (cause) =>
-          Effect.fail(
-            new ReplicaError.StorageCorrupt({ message: "Server schema evolution progress row is corrupt", cause })
-          )
-      })
-    )
+    const current = yield* readProgress(undefined)
     if (Option.isNone(current)) {
-      const meta = yield* readMeta(undefined).pipe(Effect.catchTags({
-        SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-        SchemaError: (cause) =>
-          Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is corrupt", cause })),
-        NoSuchElementError: (cause) =>
-          Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
-      }))
+      const meta = yield* readMeta(undefined)
       if (
         meta.schema_generation === expected.generation &&
         meta.active_schema_generation === expected.generation &&
@@ -1926,15 +1810,9 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     }
     if (state.phase === "Log") {
       const after = state.cursor_sequence ?? 0
-      const metadata = yield* logMetadata({ after, limit: batchSize }).pipe(
-        Effect.catchTags({
-          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-          SchemaError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server log row is corrupt", cause }))
-        })
-      )
-      const limit = yield* boundedCount(metadata, batchBytes)
-      const rows = yield* logBatch({ after, limit }).pipe(
+      const rows = yield* logMetadata({ after, limit: batchSize }).pipe(
+        Effect.flatMap((metadata) => boundedCount(metadata, batchBytes)),
+        Effect.flatMap((limit) => logBatch({ after, limit })),
         Effect.catchTags({
           SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
           SchemaError: (cause) =>
@@ -1967,56 +1845,39 @@ export const server = Effect.fn("SchemaEvolution.server")(function*(options: Ser
     } else if (state.phase === "Entities") {
       let targetEntityCount = 0
       let targetEntityBytes = 0
-      let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
-      if (state.cursor_model === null) {
-        metadata = yield* initialEntityMetadata({
-          generation: state.source_generation,
-          limit: batchSize
-        }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity row is corrupt", cause }))
+      const rows = yield* Effect.gen(function*() {
+        let metadata: ReadonlyArray<typeof EntityBytesRow.Type>
+        if (state.cursor_model === null) {
+          metadata = yield* initialEntityMetadata({
+            generation: state.source_generation,
+            limit: batchSize
           })
-        )
-      } else {
-        metadata = yield* continuingEntityMetadata({
-          generation: state.source_generation,
-          model: state.cursor_model,
-          key: state.cursor_key!,
-          limit: batchSize
-        }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity row is corrupt", cause }))
+        } else {
+          metadata = yield* continuingEntityMetadata({
+            generation: state.source_generation,
+            model: state.cursor_model,
+            key: state.cursor_key!,
+            limit: batchSize
           })
-        )
-      }
-      const limit = yield* boundedCount(metadata, batchBytes)
-      let rows: ReadonlyArray<typeof EntityBatchRow.Type>
-      if (state.cursor_model === null) {
-        rows = yield* initialEntityBatch({ generation: state.source_generation, limit }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity row is corrupt", cause }))
+        }
+        const limit = yield* boundedCount(metadata, batchBytes)
+        if (state.cursor_model === null) {
+          return yield* initialEntityBatch({ generation: state.source_generation, limit })
+        } else {
+          return yield* continuingEntityBatch({
+            generation: state.source_generation,
+            model: state.cursor_model,
+            key: state.cursor_key!,
+            limit
           })
-        )
-      } else {
-        rows = yield* continuingEntityBatch({
-          generation: state.source_generation,
-          model: state.cursor_model,
-          key: state.cursor_key!,
-          limit
-        }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity row is corrupt", cause }))
-          })
-        )
-      }
+        }
+      }).pipe(
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server entity row is corrupt", cause }))
+        })
+      )
       yield* SqlTransaction.withServerTransaction(
         sql,
         Effect.gen(function*() {

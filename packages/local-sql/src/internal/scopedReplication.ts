@@ -5,7 +5,7 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Crypto from "effect/Crypto"
 import * as Effect from "effect/Effect"
-import { pipe } from "effect/Function"
+import { flow, pipe } from "effect/Function"
 import * as Option from "effect/Option"
 import * as Schema from "effect/Schema"
 import type * as SqlClient from "effect/sql/SqlClient"
@@ -135,20 +135,27 @@ export const make = (options: Options) => {
         )
       ORDER BY entity.model, entity.entity_key`
   })
-  const findView = SqlSchema.findOneOption({
-    Request: Schema.Struct({
-      spaceId: Identity.SpaceId,
-      clientId: Identity.ClientId,
-      membershipIncarnation: Identity.MembershipIncarnation
-    }),
-    Result: Rows.ReplicationViewRow,
-    execute: ({ clientId, membershipIncarnation, spaceId }) =>
-      sql`SELECT space_id, client_id, principal_digest, view_id, view_revision, scope_generation,
+  const findView = flow(
+    SqlSchema.findOneOption({
+      Request: Schema.Struct({
+        spaceId: Identity.SpaceId,
+        clientId: Identity.ClientId,
+        membershipIncarnation: Identity.MembershipIncarnation
+      }),
+      Result: Rows.ReplicationViewRow,
+      execute: ({ clientId, membershipIncarnation, spaceId }) =>
+        sql`SELECT space_id, client_id, principal_digest, view_id, view_revision, scope_generation,
         scope_json, scope_digest, definition_hash, index_layout_hash, schema_version, schema_hash,
         server_sequence, delivered_sequence, read_auth_epoch
       FROM effect_local_server_replication_views
       WHERE space_id = ${spaceId} AND client_id = ${clientId} AND membership_incarnation = ${membershipIncarnation}`
-  })
+    }),
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+      SchemaError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server replication view row is corrupt", cause }))
+    })
+  )
   const findViewEntities = SqlSchema.findAll({
     Request: Schema.Struct({
       spaceId: Identity.SpaceId,
@@ -185,13 +192,20 @@ export const make = (options: Options) => {
   const snapshotColumns = sql`snapshot_id, space_id, client_id, membership_incarnation, principal_digest,
     definition_hash, index_layout_hash, schema_version, schema_hash, scope_json, scope_digest, scope_generation,
     view_id, view_revision, server_sequence, terminal_sequence, entry_count, content_bytes, digest`
-  const findSnapshot = SqlSchema.findOneOption({
-    Request: Identity.SnapshotId,
-    Result: Rows.ScopedSnapshotManifestRow,
-    execute: (snapshotId) =>
-      sql`SELECT ${snapshotColumns}
+  const findSnapshot = flow(
+    SqlSchema.findOneOption({
+      Request: Identity.SnapshotId,
+      Result: Rows.ScopedSnapshotManifestRow,
+      execute: (snapshotId) =>
+        sql`SELECT ${snapshotColumns}
       FROM effect_local_server_scoped_snapshots WHERE snapshot_id = ${snapshotId}`
-  })
+    }),
+    Effect.catchTags({
+      SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+      SchemaError: (cause) =>
+        Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server scoped snapshot row is corrupt", cause }))
+    })
+  )
   const findClientSnapshot = SqlSchema.findOneOption({
     Request: Schema.Struct({ spaceId: Identity.SpaceId, clientId: Identity.ClientId }),
     Result: Rows.ScopedSnapshotManifestRow,
@@ -552,13 +566,7 @@ export const make = (options: Options) => {
         NoSuchElementError: (cause) =>
           Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server space row is missing", cause }))
       }))
-      const previous = yield* findView(request).pipe(
-        Effect.catchTags({
-          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-          SchemaError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server replication view row is corrupt", cause }))
-        })
-      )
+      const previous = yield* findView(request)
       if (Option.isSome(previous) && request.scopeGeneration < previous.value.scope_generation) {
         return yield* new ReplicaError.StaleReplicationScope({
           expected: previous.value.scope_generation,
@@ -1164,11 +1172,7 @@ export const make = (options: Options) => {
         const schemaIsCurrent = WindowSchema.isCurrent(request.schema, options.definition.schemaIdentity)
         const normalizedDigest = yield* scopeDigest(normalized)
         const principalHash = yield* principalDigest(principal)
-        const stored = yield* findView(request).pipe(Effect.catchTags({
-          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-          SchemaError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server replication view row is corrupt", cause }))
-        }))
+        const stored = yield* findView(request)
         if (Option.isSome(stored) && request.scopeGeneration < stored.value.scope_generation) {
           return yield* new ReplicaError.StaleReplicationScope({
             expected: stored.value.scope_generation,
@@ -1286,11 +1290,6 @@ export const make = (options: Options) => {
           return yield* bootstrapRequired({ ...request, scope: normalized }, principal, principalHash)
         }
         const currentView = yield* findView(request).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server replication view row is corrupt", cause }))
-          }),
           Effect.flatMap(Option.match({
             onNone: () => Effect.fail(new ReplicaError.StorageCorrupt({ message: "Replication view disappeared" })),
             onSome: Effect.succeed
@@ -1387,11 +1386,7 @@ export const make = (options: Options) => {
         yield* WindowSchema.validate(normalized, request.schema, options.definition.schemaIdentity)
         const normalizedDigest = yield* scopeDigest(normalized)
         const principalHash = yield* principalDigest(principal)
-        let stored = yield* findSnapshot(request.snapshotId).pipe(Effect.catchTags({
-          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-          SchemaError: (cause) =>
-            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server scoped snapshot row is corrupt", cause }))
-        }))
+        let stored = yield* findSnapshot(request.snapshotId)
         let afterOrdinal = request.afterOrdinal
         if (
           Option.isNone(stored) || stored.value.space_id !== request.spaceId ||
@@ -1405,11 +1400,7 @@ export const make = (options: Options) => {
           stored.value.view_id !== request.cursor.viewId || stored.value.view_revision !== request.cursor.revision
         ) {
           const manifest = yield* createSnapshot({ ...request, scope: normalized }, principal, principalHash)
-          stored = yield* findSnapshot(manifest.snapshotId).pipe(Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server scoped snapshot row is corrupt", cause }))
-          }))
+          stored = yield* findSnapshot(manifest.snapshotId)
           afterOrdinal = -1
         }
         if (Option.isNone(stored)) {
@@ -1522,11 +1513,7 @@ export const make = (options: Options) => {
         }
         if (!valid) {
           const manifest = yield* createSnapshot({ ...request, scope: normalized }, principal, principalHash)
-          const replacement = yield* findSnapshot(manifest.snapshotId).pipe(Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server scoped snapshot row is corrupt", cause }))
-          }))
+          const replacement = yield* findSnapshot(manifest.snapshotId)
           if (Option.isNone(replacement)) {
             return yield* new ReplicaError.StorageCorrupt({ message: "Replacement scoped snapshot disappeared" })
           }

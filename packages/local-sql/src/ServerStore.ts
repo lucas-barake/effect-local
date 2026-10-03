@@ -14,7 +14,7 @@ import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
-import { pipe } from "effect/Function"
+import { flow, pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as PubSub from "effect/PubSub"
@@ -511,17 +511,24 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           return { channel, watchers }
         })
       })
-      const findReceiptByMutation = SqlSchema.findOneOption({
-        Request: Schema.Struct({ spaceId: Identity.SpaceId, mutationId: Identity.MutationId }),
-        Result: Rows.ServerReceiptRow,
-        execute: ({ spaceId, mutationId }) =>
-          sql`SELECT r.space_id, r.client_id, r.membership_incarnation, r.local_sequence,
+      const findReceiptByMutation = flow(
+        SqlSchema.findOneOption({
+          Request: Schema.Struct({ spaceId: Identity.SpaceId, mutationId: Identity.MutationId }),
+          Result: Rows.ServerReceiptRow,
+          execute: ({ spaceId, mutationId }) =>
+            sql`SELECT r.space_id, r.client_id, r.membership_incarnation, r.local_sequence,
           r.digest, r.mutation_id, r.receipt_json,
           r.digest_version, r.source_schema_version, r.source_schema_hash, r.mutation_version,
           r.mutation_name, r.rejection_origin, r.terminal_sequence, r.server_sequence
         FROM effect_local_server_receipts AS r
         WHERE r.space_id = ${spaceId} AND r.mutation_id = ${mutationId}`
-      })
+        }),
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server receipt row is corrupt", cause }))
+        })
+      )
       const findReceiptBySequence = SqlSchema.findOneOption({
         Request: Schema.Struct({
           spaceId: Identity.SpaceId,
@@ -619,16 +626,23 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           FROM effect_local_server_entities WHERE space_id = ${spaceId}
           ORDER BY entity_bytes DESC, model, entity_key LIMIT 1`
       })
-      const findSnapshot = SqlSchema.findOneOption({
-        Request: Schema.Struct({ spaceId: Identity.SpaceId, snapshotId: Identity.SnapshotId }),
-        Result: Rows.SnapshotManifestRow,
-        execute: ({ spaceId, snapshotId }) =>
-          sql`SELECT space_id, snapshot_id, definition_hash, schema_version, schema_hash,
+      const findSnapshot = flow(
+        SqlSchema.findOneOption({
+          Request: Schema.Struct({ spaceId: Identity.SpaceId, snapshotId: Identity.SnapshotId }),
+          Result: Rows.SnapshotManifestRow,
+          execute: ({ spaceId, snapshotId }) =>
+            sql`SELECT space_id, snapshot_id, definition_hash, schema_version, schema_hash,
             server_sequence, terminal_sequence,
             entity_count, content_bytes, digest
           FROM effect_local_server_snapshots
           WHERE space_id = ${spaceId} AND snapshot_id = ${snapshotId}`
-      })
+        }),
+        Effect.catchTags({
+          SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
+          SchemaError: (cause) =>
+            Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server snapshot row is corrupt", cause }))
+        })
+      )
       const findHistoryPrune = SqlSchema.findAll({
         Request: Schema.Struct({ spaceId: Identity.SpaceId, through: Identity.ServerSequence, limit: Schema.Int }),
         Result: Rows.SequenceRow,
@@ -672,13 +686,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
             message: `Space ${spaceId} has compacted history without a published snapshot`
           })
         }
-        const stored = yield* findSnapshot({ spaceId, snapshotId: meta.snapshot_id }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server snapshot row is corrupt", cause }))
-          })
-        )
+        const stored = yield* findSnapshot({ spaceId, snapshotId: meta.snapshot_id })
         if (Option.isNone(stored)) {
           return yield* new ReplicaError.StorageCorrupt({
             message: `Space ${spaceId} points to missing snapshot ${meta.snapshot_id}`
@@ -1107,11 +1115,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           const exactReceipt = yield* findReceiptByMutation({
             spaceId: submittedEnvelope.spaceId,
             mutationId: submittedEnvelope.mutationId
-          }).pipe(Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server receipt row is corrupt", cause }))
-          }))
+          })
           if (Option.isSome(exactReceipt)) {
             if (exactReceipt.value.digest !== submittedEnvelope.digest) {
               return yield* new ReplicaError.MutationIdentityConflict({
@@ -1192,13 +1196,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               const committedByMutation = yield* findReceiptByMutation({
                 spaceId: envelope.spaceId,
                 mutationId: envelope.mutationId
-              }).pipe(
-                Effect.catchTags({
-                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-                  SchemaError: (cause) =>
-                    Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server receipt row is corrupt", cause }))
-                })
-              )
+              })
               if (Option.isSome(committedByMutation)) {
                 if (committedByMutation.value.digest !== envelope.digest) {
                   return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
@@ -1550,13 +1548,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           const exact = yield* findReceiptByMutation({
             spaceId: submittedEnvelope.spaceId,
             mutationId: submittedEnvelope.mutationId
-          }).pipe(
-            Effect.catchTags({
-              SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-              SchemaError: (cause) =>
-                Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server receipt row is corrupt", cause }))
-            })
-          )
+          })
           if (Option.isSome(exact)) {
             if (exact.value.digest !== submittedEnvelope.digest) {
               return yield* new ReplicaError.MutationIdentityConflict({ mutationId: submittedEnvelope.mutationId })
@@ -1596,13 +1588,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               const committed = yield* findReceiptByMutation({
                 spaceId: envelope.spaceId,
                 mutationId: envelope.mutationId
-              }).pipe(
-                Effect.catchTags({
-                  SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-                  SchemaError: (cause) =>
-                    Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server receipt row is corrupt", cause }))
-                })
-              )
+              })
               if (Option.isSome(committed)) {
                 if (committed.value.digest !== envelope.digest) {
                   return yield* new ReplicaError.MutationIdentityConflict({ mutationId: envelope.mutationId })
@@ -1832,13 +1818,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                 meta.snapshot_sequence === candidate.manifest.sequence &&
                 meta.snapshot_terminal_sequence === candidate.manifest.terminalSequenceThrough
               if (reusable && snapshotId !== null) {
-                const stored = yield* findSnapshot({ spaceId: candidate.manifest.spaceId, snapshotId }).pipe(
-                  Effect.catchTags({
-                    SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-                    SchemaError: (cause) =>
-                      Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server snapshot row is corrupt", cause }))
-                  })
-                )
+                const stored = yield* findSnapshot({ spaceId: candidate.manifest.spaceId, snapshotId })
                 reusable = Option.isSome(stored) && sameSnapshotIdentity(stored.value, meta)
                 if (!reusable) {
                   yield* sql`DELETE FROM effect_local_server_snapshot_entities
@@ -2005,13 +1985,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           meta.snapshot_sequence !== meta.next_server_sequence - 1 ||
           meta.snapshot_terminal_sequence !== meta.next_terminal_sequence - 1
         ) return false
-        const stored = yield* findSnapshot({ spaceId, snapshotId: meta.snapshot_id }).pipe(
-          Effect.catchTags({
-            SqlError: (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })),
-            SchemaError: (cause) =>
-              Effect.fail(new ReplicaError.StorageCorrupt({ message: "Server snapshot row is corrupt", cause }))
-          })
-        )
+        const stored = yield* findSnapshot({ spaceId, snapshotId: meta.snapshot_id })
         return Option.isSome(stored) && sameSnapshotIdentity(stored.value, meta)
       })
 
