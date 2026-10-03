@@ -547,7 +547,7 @@ describe("BrowserReplica retryDelay", () => {
   }
 
   it.effect(
-    "sleeps for retryDelay before rebuilding a failed owner stack",
+    "waits exactly retryDelay before rebuilding a failed owner stack",
     Effect.fnUntraced(
       function*() {
         const attempts = yield* Queue.unbounded<number>()
@@ -561,10 +561,11 @@ describe("BrowserReplica retryDelay", () => {
           currentTimeNanos: clock.currentTimeNanos,
           monotonicTimeNanosUnsafe: () => clock.monotonicTimeNanosUnsafe(),
           monotonicTimeNanos: clock.monotonicTimeNanos,
-          sleep: (duration) => {
-            Queue.offerUnsafe(sleeps, Duration.toMillis(duration))
-            return clock.sleep(duration)
-          }
+          sleep: Effect.fnUntraced(function*(duration) {
+            const registered = yield* Effect.forkChild(clock.sleep(duration), { startImmediately: true })
+            yield* Queue.offer(sleeps, Duration.toMillis(duration))
+            yield* Fiber.join(registered)
+          })
         }
         const layerOwnerProbe = Layer.effectDiscard(
           Clock.currentTimeMillis.pipe(
@@ -576,7 +577,7 @@ describe("BrowserReplica retryDelay", () => {
             })
           )
         )
-        const environment = yield* makeEnvironmentWith({ retryDelay: "1 hour", layerOwnerProbe })
+        const environment = yield* makeEnvironmentWith({ retryDelay: "7 seconds", layerOwnerProbe })
         const visibility = yield* testKit.makeMemoryVisibility(true)
         yield* environment.layerReplicaWith(visibility.service).pipe(
           Layer.provideMerge(Layer.fresh(Reactivity.layer)),
@@ -586,16 +587,14 @@ describe("BrowserReplica retryDelay", () => {
         )
         const first = yield* Queue.take(attempts)
         let requested = yield* Queue.take(sleeps)
-        while (requested !== 3_600_000) {
+        while (requested !== 7_000) {
           requested = yield* Queue.take(sleeps)
         }
+        yield* TestClock.adjust(6_999)
         assert.isTrue(Option.isNone(yield* Queue.poll(attempts)))
-        yield* TestClock.adjust("1 hour").pipe(
-          Effect.forever,
-          Effect.forkScoped
-        )
+        yield* TestClock.adjust(1)
         const second = yield* Queue.take(attempts)
-        assert.isAtLeast(second - first, 3_600_000)
+        assert.strictEqual(second - first, 7_000)
       },
       Effect.scoped,
       provideFileSystem
