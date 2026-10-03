@@ -1,7 +1,9 @@
 import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as SqlClient from "effect/sql/SqlClient"
 import * as SqlError from "effect/sql/SqlError"
 import * as StorageUnavailable from "../src/internal/storageUnavailable.js"
@@ -43,6 +45,25 @@ describe("server transactions", () => {
       )
       assert.strictEqual(outcome, "StorageUnavailable")
       assert.strictEqual(probe.attempts(), 1)
+    }, provideSqlite)
+  )
+
+  it.effect(
+    "keeps a SqlError defect raised before COMMIT a defect",
+    Effect.fnUntraced(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const defect = new SqlError.SqlError({ reason: new SqlError.UnknownError({ cause: "body defect" }) })
+      const exit = yield* Transaction.withServerTransaction(sql, Effect.die(defect)).pipe(Effect.exit)
+      assert.isTrue(Exit.isFailure(exit) && Cause.hasDies(exit.cause) && !Cause.hasFails(exit.cause))
+    }, provideSqlite)
+  )
+
+  it.effect(
+    "keeps an interrupted transaction body interrupted",
+    Effect.fnUntraced(function*() {
+      const sql = yield* SqlClient.SqlClient
+      const exit = yield* Transaction.withServerTransaction(sql, Effect.interrupt).pipe(Effect.exit)
+      assert.isTrue(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause))
     }, provideSqlite)
   )
 })

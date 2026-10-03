@@ -348,6 +348,22 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
       BEGIN SELECT RAISE(ABORT, 'pruning refused'); END`)
     return sql.unsafe(`DROP TRIGGER refuse_pruning`).pipe(Effect.asVoid)
   })
+  const failCommitAfterReceipt = Effect.fnUntraced(function*(sql: SqlClient.SqlClient) {
+    yield* sql.unsafe("CREATE TABLE commit_probe_parent (id BIGINT PRIMARY KEY)")
+    yield* sql.unsafe(`CREATE TABLE commit_probe_child (parent_id BIGINT
+      REFERENCES commit_probe_parent (id) DEFERRABLE INITIALLY DEFERRED)`)
+    if (database.dialect === "pg") {
+      yield* sql.unsafe(`CREATE FUNCTION orphan_commit_probe() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN INSERT INTO commit_probe_child VALUES (1); RETURN NEW; END $$`)
+      yield* sql.unsafe(`CREATE TRIGGER orphan_commit_probe AFTER INSERT ON effect_local_server_receipts
+        FOR EACH ROW EXECUTE FUNCTION orphan_commit_probe()`)
+      return sql.unsafe("DROP TRIGGER orphan_commit_probe ON effect_local_server_receipts").pipe(Effect.asVoid)
+    }
+    yield* sql.unsafe("PRAGMA foreign_keys = ON")
+    yield* sql.unsafe(`CREATE TRIGGER orphan_commit_probe AFTER INSERT ON effect_local_server_receipts
+      BEGIN INSERT INTO commit_probe_child VALUES (1); END`)
+    return sql.unsafe("DROP TRIGGER orphan_commit_probe").pipe(Effect.asVoid)
+  })
 
   it.effect(
     "does not scale SQL writes or transactions with watcher fanout",
@@ -3097,6 +3113,50 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
           terminalSequence: Identity.TerminalSequence.make(1)
         })
         assert.deepStrictEqual(yield* server.submit(submitted), receipt)
+      },
+      Effect.provide(NodeCrypto.layer),
+      Effect.scoped
+    ))
+  )
+
+  it.effect(
+    "reports an unknown commit outcome when COMMIT fails after the receipt is written",
+    pipe(Effect.fnUntraced(
+      function*() {
+        const sql = yield* database.client
+        const layerSql = Layer.succeed(SqlClient.SqlClient, sql)
+        const server = yield* service(
+          ServerStore.ServerStore,
+          ServerStore.layerTrusted({ ...serverHistory, definition: Domain.definition }).pipe(
+            Layer.provide(layerRuntime),
+            Layer.provide(withServices(layerSql))
+          )
+        )
+        const removeProbe = yield* failCommitAfterReceipt(sql)
+        const submitted = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("deferred-violation"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000032")
+        )
+        const discarded = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("deferred-discard"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000033")
+        )
+
+        const submitFailure = yield* expectedFailure(server.submit(submitted))
+        const discardFailure = yield* expectedFailure(
+          server.discard({ envelope: discarded, schema: Domain.definition.schemaIdentity }, null)
+        )
+        assert.strictEqual(submitFailure._tag, "UnknownCommitOutcome")
+        assert.strictEqual(discardFailure._tag, "UnknownCommitOutcome")
+
+        yield* removeProbe
+        const retried = yield* server.submit(submitted)
+        assert.strictEqual(retried._tag, "Accepted")
+        if (retried._tag === "Accepted") assert.strictEqual(retried.serverSequence, 1)
       },
       Effect.provide(NodeCrypto.layer),
       Effect.scoped
