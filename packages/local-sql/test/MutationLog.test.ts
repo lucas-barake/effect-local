@@ -3061,6 +3061,49 @@ describe.each(serverDatabases)("server reconciled mutation log ($dialect)", (dat
   )
 
   it.effect(
+    "counts the terminal sequence when bounding a rejection that fills the receipt limit",
+    pipe(Effect.fnUntraced(
+      function*() {
+        const submitted = yield* envelope(
+          Domain.PutTodo.name,
+          Domain.todo("limit-sized-authorization"),
+          1,
+          Identity.MutationId.make("mut_00000000-0000-4000-8000-000000000031")
+        )
+        const unpadded = Protocol.RejectedReceipt.make({
+          spaceId,
+          clientId,
+          membershipIncarnation: submitted.membershipIncarnation,
+          mutationId: submitted.mutationId,
+          localSequence: submitted.localSequence,
+          name: submitted.name,
+          sourceSchema: submitted.sourceSchema,
+          mutationVersion: submitted.mutationVersion,
+          origin: "Authorization",
+          rejection: { _tag: "TestAuthorizationError", reason: "" }
+        })
+        const reason = "x".repeat(Protocol.maximumReceiptBytes - (yield* Protocol.encodedBytesEffect(unpadded)))
+        const server = yield* service(
+          ServerStore.ServerStore,
+          serverLayer(() => Effect.fail(new TestAuthorizationError({ reason })))
+        )
+        const receipt = yield* server.submit(submitted)
+
+        assert.isAtMost(yield* Protocol.encodedBytesEffect(receipt), Protocol.maximumReceiptBytes)
+        assert.deepStrictEqual(receipt, {
+          ...unpadded,
+          origin: "Capacity",
+          rejection: { _tag: "CapacityExceeded", resource: "receipt bytes", limit: Protocol.maximumReceiptBytes },
+          terminalSequence: Identity.TerminalSequence.make(1)
+        })
+        assert.deepStrictEqual(yield* server.submit(submitted), receipt)
+      },
+      Effect.provide(NodeCrypto.layer),
+      Effect.scoped
+    ))
+  )
+
+  it.effect(
     "assigns dense authoritative log sequences",
     pipe(Effect.fnUntraced(
       function*() {

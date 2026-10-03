@@ -764,7 +764,8 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
         envelope: Protocol.MutationEnvelope,
         mutation: MutationRuntime.CurrentMutationView,
         rejection: Schema.Json,
-        origin: Protocol.RejectionOrigin
+        origin: Protocol.RejectionOrigin,
+        terminalSequence: Identity.TerminalSequence
       ) {
         const receipt = Protocol.RejectedReceipt.make({
           spaceId: envelope.spaceId,
@@ -776,6 +777,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           sourceSchema: options.definition.schemaIdentity,
           mutationVersion: mutation.mutationVersion,
           origin,
+          terminalSequence,
           rejection
         })
         if ((yield* Protocol.encodedBytesEffect(receipt)) <= Protocol.maximumReceiptBytes) return receipt
@@ -789,6 +791,7 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
           sourceSchema: options.definition.schemaIdentity,
           mutationVersion: mutation.mutationVersion,
           origin: "Capacity",
+          terminalSequence,
           rejection: receiptCapacityRejection
         })
       })
@@ -1232,10 +1235,13 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
               )
               let receipt: Protocol.AcceptedReceipt | Protocol.RejectedReceipt
               if (Result.isFailure(authorization)) {
-                receipt = {
-                  ...(yield* rejectedReceipt(envelope, mutation, { ...authorization.failure }, "Authorization")),
-                  terminalSequence: Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
-                }
+                receipt = yield* rejectedReceipt(
+                  envelope,
+                  mutation,
+                  { ...authorization.failure },
+                  "Authorization",
+                  Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
+                )
               } else {
                 const changes: Array<Protocol.EntityChange> = []
                 const mutationName = mutation.name
@@ -1351,15 +1357,13 @@ export const layer = <R = never,>(configured: Options<R>): Layer.Layer<
                   Effect.catchTag("TerminalRejection", (terminal) => Effect.succeed(Result.fail(terminal)))
                 )
                 if (Result.isFailure(executed)) {
-                  receipt = {
-                    ...(yield* rejectedReceipt(
-                      envelope,
-                      mutation,
-                      executed.failure.rejection,
-                      executed.failure.origin
-                    )),
-                    terminalSequence: Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
-                  }
+                  receipt = yield* rejectedReceipt(
+                    envelope,
+                    mutation,
+                    executed.failure.rejection,
+                    executed.failure.origin,
+                    Identity.TerminalSequence.make(storedSpace.next_terminal_sequence)
+                  )
                 } else {
                   const { entry, entryBytes, entryJson } = executed.success
                   yield* sql`UPDATE effect_local_server_spaces SET
