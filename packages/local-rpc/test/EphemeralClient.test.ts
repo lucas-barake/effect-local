@@ -6,6 +6,7 @@ import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Equal from "effect/Equal"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
@@ -868,6 +869,66 @@ describe("EphemeralClient projection work", () => {
         yield* Fiber.interrupt(sentinelConsumer)
       })
       yield* program.pipe(Effect.provide(harness.layerClient))
+    })
+  )
+
+  it.effect(
+    "rejoins with the member value the server accepted last when updates overlap",
+    Effect.fnUntraced(function*() {
+      const joinValues = yield* Queue.unbounded<typeof Schema.Json.Type>()
+      const accepted = yield* Ref.make<typeof Schema.Json.Type>(null)
+      const graceReceived = yield* Deferred.make<void>()
+      const firstQueue = yield* Deferred.make<Queue.Queue<Protocol.EphemeralJoinMessage, Cause.Done>>()
+      const joins = yield* Ref.make(0)
+      const fakeClient = {
+        JoinEphemeral: Effect.fnUntraced(function*(
+          request: typeof Protocol.VersionedEphemeralJoinRequest.Type
+        ) {
+          const join = yield* Ref.updateAndGet(joins, (count) => count + 1)
+          yield* Queue.offer(joinValues, request.value)
+          const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage, Cause.Done>()
+          yield* Queue.offer(messages, sessionStarted(spaceId, member))
+          yield* Queue.offer(
+            messages,
+            snapshot(spaceId, join, {
+              members: [{ member, value: request.value, expiresAtMillis: 60_000 }]
+            })
+          )
+          if (join === 1) yield* Deferred.succeed(firstQueue, messages)
+          return messages
+        }),
+        HeartbeatEphemeral: () => Effect.succeed(null),
+        PublishEphemeral: Effect.fnUntraced(function*(
+          request: typeof Protocol.VersionedEphemeralPublishRequest.Type
+        ) {
+          if (request.request._tag !== "UpdateMember") return null
+          yield* Ref.set(accepted, request.request.value)
+          if (Equal.equals(request.request.value, { displayName: "Grace" })) {
+            yield* Deferred.succeed(graceReceived, undefined)
+            yield* Effect.sleep("1 second")
+          }
+          return null
+        })
+      }
+      const layerClient = layerFromFakeClient(fakeClient)
+      const program = Effect.gen(function*() {
+        const client = yield* EphemeralClient.EphemeralClient
+        const opened = yield* client.session(Profile, sessionOptions)
+        assert.deepStrictEqual(yield* Queue.take(joinValues), { displayName: "Ada" })
+        const grace = yield* opened.updateMember({ displayName: "Grace" }).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* Deferred.await(graceReceived)
+        const hopper = yield* opened.updateMember({ displayName: "Hopper" }).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* TestClock.adjust("1 second")
+        yield* Fiber.join(grace)
+        yield* Fiber.join(hopper)
+        yield* Queue.end(yield* Deferred.await(firstQueue))
+        assert.deepStrictEqual(yield* Queue.take(joinValues), yield* Ref.get(accepted))
+      })
+      yield* program.pipe(Effect.provide(layerClient), Effect.scoped)
     })
   )
 

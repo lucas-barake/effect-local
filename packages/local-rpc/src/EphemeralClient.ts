@@ -24,6 +24,7 @@ import type * as RpcMiddleware from "effect/rpc/RpcMiddleware"
 import * as Schedule from "effect/Schedule"
 import * as Schema from "effect/Schema"
 import * as Scope from "effect/Scope"
+import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import type * as Authentication from "./Authentication.js"
 import { positiveFiniteDurationMillis, positiveSafeInteger, reconnectPolicy } from "./internal/configuration.js"
@@ -200,6 +201,7 @@ interface SessionRuntime {
   readonly events: PubSub.PubSub<EventDelivery>
   readonly ready: Deferred.Deferred<void, ReplicaError.ReplicaError>
   readonly failure: Deferred.Deferred<never, ReplicaError.ReplicaError>
+  readonly memberUpdates: Semaphore.Semaphore
   readonly recordMemberValue: (value: typeof Schema.Json.Type) => void
 }
 
@@ -517,6 +519,7 @@ export const layerFromSession = (
 
       const joinAttempt = (
         request: Protocol.EphemeralJoinRequest,
+        memberUpdates: Semaphore.Semaphore,
         memberValue: () => typeof Schema.Json.Type,
         version: Protocol.ProtocolVersion,
         synchronized: Deferred.Deferred<void>
@@ -524,6 +527,13 @@ export const layerFromSession = (
         Stream.unwrap(Effect.gen(function*() {
           const owner = {}
           const started = yield* Deferred.make<Protocol.EphemeralSessionStarted>()
+          const holding = yield* Deferred.make<void>()
+          yield* Deferred.succeed(holding, undefined).pipe(
+            Effect.andThen(Deferred.await(started)),
+            Semaphore.withPermit(memberUpdates),
+            Effect.forkScoped({ startImmediately: true })
+          )
+          yield* Deferred.await(holding)
           const queue = yield* client.JoinEphemeral(
             { ...request, value: memberValue(), protocolVersion: version },
             { asQueue: true }
@@ -599,6 +609,7 @@ export const layerFromSession = (
 
       const joinWire = (
         request: Protocol.EphemeralJoinRequest,
+        memberUpdates: Semaphore.Semaphore,
         memberValue: () => typeof Schema.Json.Type
       ) =>
         ProtocolSessionRetry.runStream(
@@ -619,7 +630,7 @@ export const layerFromSession = (
                 })
               )
               return LosslessQueue.mergeEffect(
-                joinAttempt(request, memberValue, version, synchronized),
+                joinAttempt(request, memberUpdates, memberValue, version, synchronized),
                 handshakeDeadline
               )
             }))
@@ -643,6 +654,7 @@ export const layerFromSession = (
           let eventSequence = 0
           let unknownPresented = false
           let memberValue = identity.request.value
+          const memberUpdates = yield* Semaphore.make(1)
           const consume = (message: Protocol.EphemeralMessage) => {
             if (message._tag === "Event") {
               eventSequence = eventSequence + 1
@@ -674,7 +686,7 @@ export const layerFromSession = (
             while (true) {
               let joined = false
               const transportGeneration = yield* transport.generation
-              const attempt = yield* joinWire(identity.request, () => memberValue).pipe(
+              const attempt = yield* joinWire(identity.request, memberUpdates, () => memberValue).pipe(
                 Stream.runForEach((message) => {
                   joined = true
                   return consume(message)
@@ -721,6 +733,7 @@ export const layerFromSession = (
             events,
             ready,
             failure,
+            memberUpdates,
             recordMemberValue: (value) => {
               memberValue = value
             }
@@ -820,7 +833,10 @@ export const layerFromSession = (
                 spaceId: target.spaceId,
                 member: target.member,
                 value: encoded
-              })).pipe(Effect.andThen(Effect.sync(() => runtime.recordMemberValue(encoded))))
+              })).pipe(
+                Effect.andThen(Effect.sync(() => runtime.recordMemberValue(encoded))),
+                Semaphore.withPermit(runtime.memberUpdates)
+              )
             )
           )
         return {
