@@ -1,6 +1,8 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as Cause from "effect/Cause"
 import * as Chunk from "effect/Chunk"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as HashMap from "effect/HashMap"
 import * as HashSet from "effect/HashSet"
 import * as Result from "effect/Result"
@@ -162,6 +164,33 @@ describe("domain contracts", () => {
     assert.throws(() => Mutation.make("$Mutation", { version: 1 }), /must not start/)
     assert.throws(() => Query.make("$Query", {}), /must not start/)
   })
+
+  it("rejects an invalid definition by throwing a TypeError that states the reason", () => {
+    assert.throws(() => Query.make("$Query", {}), TypeError, /^Query name must not start with \$: \$Query$/)
+    assert.throws(
+      () => Mutation.make("", { version: 1 }),
+      TypeError,
+      /^Mutation name must be nonempty and at most 256 characters$/
+    )
+    assert.throws(() => Ephemeral.make("", { kind: "event" }), TypeError, /^Ephemeral name must be nonempty$/)
+    assert.throws(
+      () => Definition.make({ version: 1, models: [Todo, Todo], mutations: [PutTodo] }),
+      TypeError,
+      /^Duplicate model name: Todo$/
+    )
+  })
+
+  it.effect(
+    "turns an invalid definition built inside an Effect into a TypeError defect",
+    Effect.fnUntraced(function*() {
+      const exit = yield* Effect.sync(() => Query.make("$Query", {})).pipe(Effect.exit)
+      if (Exit.isSuccess(exit)) assert.fail("expected the invalid query name to be a defect")
+      assert.isFalse(Cause.hasFails(exit.cause))
+      const defect = Cause.squash(exit.cause)
+      assert.instanceOf(defect, TypeError)
+      assert.propertyVal(defect, "message", "Query name must not start with $: $Query")
+    })
+  )
 
   it.effect(
     "accepts only definition names that fit the protocol name fields",
