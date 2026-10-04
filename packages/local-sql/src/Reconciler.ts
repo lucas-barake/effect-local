@@ -136,13 +136,59 @@ const makeReconciliationRequests = (request: Effect.Effect<number, ReplicaError.
 
 type FailureClass = "Unreachable" | "Retryable" | "NeedsCredential" | "Terminal"
 
-const failureClasses: { readonly [Tag in ReplicaError.ReplicaError["_tag"]]: FailureClass } = {
+const capacityClasses: { readonly [Resource in ReplicaError.CapacityResource]: "Retryable" | "Terminal" } = {
+  "read authorizations": "Retryable",
+  "sync watchers": "Retryable",
+  "sync watchers per principal": "Retryable",
+  "server receipts": "Retryable",
+  "server history": "Retryable",
+  "bootstrap authorizations": "Retryable",
+  "bootstrap pages": "Retryable",
+  "ephemeral join verifications": "Retryable",
+  "ephemeral watchers": "Retryable",
+  "ephemeral watchers per principal": "Retryable",
+  "ephemeral spaces": "Retryable",
+  "ephemeral members": "Retryable",
+  "ephemeral bytes per space": "Retryable",
+  "ephemeral event keys per space": "Retryable",
+  "ephemeral state keys per space": "Retryable",
+  "ephemeral events": "Retryable",
+  "pending mutations": "Retryable",
+  "client receipts": "Terminal",
+  "bootstrap entries": "Terminal",
+  "bootstrap bytes": "Terminal",
+  "bootstrap page bytes": "Terminal",
+  "bootstrap entity bytes": "Terminal",
+  "snapshot entities": "Terminal",
+  "snapshot bytes": "Terminal",
+  "scoped snapshot bytes": "Terminal",
+  "replication page bytes": "Terminal",
+  "mutation bytes": "Terminal",
+  "receipt bytes": "Terminal",
+  "mutation submission attempts": "Terminal",
+  "schema evolution row bytes": "Terminal",
+  "schema generations": "Terminal",
+  "replication scope generations": "Terminal",
+  "projection generation": "Terminal",
+  "reconciliation generations": "Terminal",
+  "local sequence": "Terminal",
+  "terminal sequence": "Terminal",
+  "server sequence": "Terminal",
+  "ephemeral payload bytes": "Terminal",
+  "ephemeral snapshot bytes": "Terminal",
+  "ephemeral bytes per member": "Terminal",
+  "ephemeral event keys per member": "Terminal",
+  "ephemeral state keys per member": "Terminal"
+}
+
+const failureClasses: {
+  readonly [Tag in Exclude<ReplicaError.ReplicaError["_tag"], "CapacityExceeded">]: FailureClass
+} = {
   ServerUnavailable: "Unreachable",
   OperationTimeout: "Unreachable",
   AuthenticatorUnavailable: "Unreachable",
   StorageUnavailable: "Retryable",
   UnknownCommitOutcome: "Retryable",
-  CapacityExceeded: "Retryable",
   OwnerUnavailable: "Retryable",
   CredentialRejected: "NeedsCredential",
   StorageCorrupt: "Terminal",
@@ -175,7 +221,10 @@ const failureClasses: { readonly [Tag in ReplicaError.ReplicaError["_tag"]]: Fai
   BuildSuperseded: "Terminal"
 }
 
-const failureClass = (error: ReplicaError.ReplicaError): FailureClass => failureClasses[error._tag]
+const failureClass = (error: ReplicaError.ReplicaError): FailureClass => {
+  if (error._tag === "CapacityExceeded") return capacityClasses[error.resource]
+  return failureClasses[error._tag]
+}
 
 export const isTransientFailure = (error: ReplicaError.ReplicaError) => {
   const classified = failureClass(error)

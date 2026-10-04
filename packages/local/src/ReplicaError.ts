@@ -132,9 +132,55 @@ export class SnapshotUnavailable extends Schema.TaggedError<SnapshotUnavailable>
   "@lucas-barake/effect-local/SnapshotUnavailable"
 )("SnapshotUnavailable", { snapshotId: Schema.String }) {}
 
+export const CapacityResource = Schema.Literals([
+  "read authorizations",
+  "sync watchers",
+  "sync watchers per principal",
+  "server receipts",
+  "server history",
+  "bootstrap authorizations",
+  "bootstrap pages",
+  "ephemeral join verifications",
+  "ephemeral watchers",
+  "ephemeral watchers per principal",
+  "ephemeral spaces",
+  "ephemeral members",
+  "ephemeral bytes per space",
+  "ephemeral event keys per space",
+  "ephemeral state keys per space",
+  "ephemeral events",
+  "pending mutations",
+  "client receipts",
+  "bootstrap entries",
+  "bootstrap bytes",
+  "bootstrap page bytes",
+  "bootstrap entity bytes",
+  "snapshot entities",
+  "snapshot bytes",
+  "scoped snapshot bytes",
+  "replication page bytes",
+  "mutation bytes",
+  "receipt bytes",
+  "mutation submission attempts",
+  "schema evolution row bytes",
+  "schema generations",
+  "replication scope generations",
+  "projection generation",
+  "reconciliation generations",
+  "local sequence",
+  "terminal sequence",
+  "server sequence",
+  "ephemeral payload bytes",
+  "ephemeral snapshot bytes",
+  "ephemeral bytes per member",
+  "ephemeral event keys per member",
+  "ephemeral state keys per member"
+])
+export type CapacityResource = typeof CapacityResource.Type
+
 export class CapacityExceeded extends Schema.TaggedError<CapacityExceeded>(
   "@lucas-barake/effect-local/CapacityExceeded"
-)("CapacityExceeded", { resource: Schema.String, limit: Schema.Number }) {}
+)("CapacityExceeded", { resource: CapacityResource, limit: Schema.Number }) {}
 
 export class InvalidConfiguration extends Schema.TaggedError<InvalidConfiguration>(
   "@lucas-barake/effect-local/InvalidConfiguration"

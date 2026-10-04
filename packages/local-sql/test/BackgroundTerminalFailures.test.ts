@@ -7,14 +7,18 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Arr from "effect/Array"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
+import * as Order from "effect/Order"
 import * as Queue from "effect/Queue"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Scope from "effect/Scope"
@@ -80,6 +84,31 @@ const emptyPage = (crypto: Crypto.Crypto, request: Parameters<Remote["pull"]>[0]
     Effect.provideService(Crypto.Crypto, crypto)
   )
 
+const oversizedSnapshot = (crypto: Crypto.Crypto, request: Parameters<Remote["pull"]>[0]) =>
+  Protocol.replicationScopeDigest(request.scope).pipe(
+    Effect.map((scopeDigest) =>
+      Protocol.BootstrapRequired.make({
+        manifest: {
+          spaceId: request.spaceId,
+          clientId: request.clientId,
+          definitionHash: Domain.definition.hash,
+          schema: Domain.definition.schemaIdentity,
+          scopeDigest,
+          scopeGeneration: request.scopeGeneration,
+          cursor: Protocol.ReplicationCursor.make({ viewId, revision: Identity.ReplicationViewRevision.make(1) }),
+          snapshotId: Identity.SnapshotId.make("snp_00000000-0000-4000-8000-000000000801"),
+          sequence: Identity.ServerSequence.make(1),
+          terminalSequenceThrough: Identity.TerminalSequence.make(0),
+          entityCount: 10_001,
+          contentBytes: 1,
+          digest: Protocol.initialSnapshotDigest
+        },
+        serverSchema: Domain.definition.schemaIdentity
+      })
+    ),
+    Effect.provideService(Crypto.Crypto, crypto)
+  )
+
 const makeAttempts = Effect.gen(function*() {
   const reached = [
     yield* Deferred.make<void>(),
@@ -101,7 +130,10 @@ const makeAttempts = Effect.gen(function*() {
   }
 })
 
-const backgroundServices = Effect.fnUntraced(function*(constructor: Constructor) {
+const backgroundServices = Effect.fnUntraced(function*(
+  constructor: Constructor,
+  maximumRetryDelay: Duration.Input = "1 second"
+) {
   const databaseContext = yield* Layer.mergeAll(
     SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
     NodeCrypto.layer,
@@ -138,7 +170,7 @@ const backgroundServices = Effect.fnUntraced(function*(constructor: Constructor)
     maximumBootstrapPageBytes: 4 * 1024 * 1024,
     migration: { retryDelay: "1 millis", maximumAttempts: 8 },
     retryDelay: "1 second",
-    maximumRetryDelay: "1 second"
+    maximumRetryDelay
   } satisfies SqlReplica.Options<typeof Domain.definition>
   let heldRelease:
     | { remaining: number; readonly entered: Deferred.Deferred<void>; readonly release: Deferred.Deferred<void> }
@@ -191,8 +223,11 @@ const backgroundServices = Effect.fnUntraced(function*(constructor: Constructor)
   return { sql, crypto, reactivity, start, lockNext, holdRelease }
 })
 
-const pendingBackgroundSpace = Effect.fnUntraced(function*(constructor: Constructor) {
-  const services = yield* backgroundServices(constructor)
+const pendingBackgroundSpace = Effect.fnUntraced(function*(
+  constructor: Constructor,
+  maximumRetryDelay: Duration.Input = "1 second"
+) {
+  const services = yield* backgroundServices(constructor, maximumRetryDelay)
   const seedScope = yield* Scope.make()
   const seedReplica = yield* services.start(idleRemote).pipe(Scope.provide(seedScope))
   const seedSpace = yield* seedReplica.space(spaceId)
@@ -282,6 +317,26 @@ const retryingTags: ReadonlyArray<FailureTag> = [
   "CapacityExceeded",
   "OwnerUnavailable"
 ]
+
+const temporaryCapacity = new Set<ReplicaError.CapacityResource>([
+  "read authorizations",
+  "sync watchers",
+  "sync watchers per principal",
+  "server receipts",
+  "server history",
+  "bootstrap authorizations",
+  "bootstrap pages",
+  "ephemeral join verifications",
+  "ephemeral watchers",
+  "ephemeral watchers per principal",
+  "ephemeral spaces",
+  "ephemeral members",
+  "ephemeral bytes per space",
+  "ephemeral event keys per space",
+  "ephemeral state keys per space",
+  "ephemeral events",
+  "pending mutations"
+])
 
 const stoppingTags = Struct.keys(failures).filter((tag) => !retryingTags.includes(tag))
 
@@ -447,6 +502,131 @@ describe("background sync terminal failures", () => {
         if (status._tag === "Failed") assert.strictEqual(status.message, tag)
       }
     }, Effect.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "stops a background space whose server snapshot exceeds the bootstrap limit with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* pendingBackgroundSpace(constructor)
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: (request) => Effect.andThen(attempts.record, oversizedSnapshot(services.crypto, request))
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* attempts.reached(1)
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.strictEqual(attempts.count(), 1)
+      assert.isTrue(Option.isNone(retried))
+      const status = yield* awaitSpaceStatus(space, services.reactivity, "Failed")
+      if (status._tag === "Failed") assert.strictEqual(status.message, "CapacityExceeded")
+    }, Effect.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "stops a foreground space whose server snapshot exceeds the bootstrap limit with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* backgroundServices(constructor)
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: (request) => Effect.andThen(attempts.record, oversizedSnapshot(services.crypto, request))
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* space.activate
+      yield* attempts.reached(1)
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.strictEqual(attempts.count(), 1)
+      assert.isTrue(Option.isNone(retried))
+      const status = yield* awaitSpaceStatus(space, services.reactivity, "Failed")
+      if (status._tag === "Failed") assert.strictEqual(status.message, "CapacityExceeded")
+    }, Effect.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "retries and drains a background space after the server was briefly at capacity with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* pendingBackgroundSpace(constructor)
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (attempts.count() > 0) return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
+          return Effect.andThen(attempts.record, Effect.fail(failures.CapacityExceeded))
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      const idleWithoutPending = awaitSpaceStatusWhere(
+        space,
+        services.reactivity,
+        (status) => status._tag === "Idle" && status.pending === 0
+      ).pipe(Effect.scoped)
+
+      const drained = yield* VirtualTime.advanceUntil(idleWithoutPending).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.isTrue(Option.isSome(drained))
+    }, Effect.scoped)
+  )
+
+  it.effect.each(ReplicaError.CapacityResource.literals)(
+    "retries a background space at capacity for %s only when the capacity can free up on its own",
+    Effect.fnUntraced(function*(resource) {
+      const services = yield* pendingBackgroundSpace("layer")
+      const attempts = yield* makeAttempts
+      const failure = new ReplicaError.CapacityExceeded({ resource, limit: 1 })
+      yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => Effect.andThen(attempts.record, Effect.fail(failure))
+      }))
+      yield* attempts.reached(1)
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.strictEqual(Option.isSome(retried), temporaryCapacity.has(resource))
+    }, Effect.scoped)
+  )
+
+  it.effect.each(
+    [
+      ["layer", "background"],
+      ["layerWorkflow", "background"],
+      ["layer", "foreground"],
+      ["layerWorkflow", "foreground"]
+    ] as const
+  )(
+    "backs off a retryable failure as slowly as an unreachable server with %s in the %s",
+    Effect.fnUntraced(function*([constructor, mode]) {
+      const attemptTimes = Effect.fnUntraced(function*(failure: ReplicaError.ReplicaError) {
+        const services = yield* pendingBackgroundSpace(constructor, "1 minute")
+        const times: Array<number> = []
+        const replica = yield* services.start(SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          pull: () =>
+            Clock.currentTimeMillis.pipe(
+              Effect.tap((now) => Effect.sync(() => times.push(now))),
+              Effect.andThen(Effect.fail(failure))
+            )
+        }))
+        if (mode === "foreground") yield* (yield* replica.space(spaceId)).activate
+        yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("2 minutes"))
+        return times.map((time) => time - times[0])
+      }, Effect.scoped)
+
+      const retryable = yield* attemptTimes(failures.UnknownCommitOutcome)
+      const unreachable = yield* attemptTimes(failures.ServerUnavailable)
+
+      assert.deepStrictEqual(retryable, unreachable)
+      assert.isAtMost(retryable.length, 8)
+      assert.isAtLeast(retryable.length, 5)
+      const gaps = retryable.slice(1).map((time, index) => time - retryable[index])
+      assert.deepStrictEqual(gaps, Arr.sort(gaps, Order.Number))
+      assert.isAbove(gaps[gaps.length - 1], gaps[0])
+    })
   )
 
   it.effect.each(schedulerCases(retryingTags))(
