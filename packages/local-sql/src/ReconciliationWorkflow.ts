@@ -703,7 +703,18 @@ const layerSchedulerWithConfiguration = (
           return
         }
       })
-      const watchFiber = yield* Effect.forkScoped(Effect.provideService(watch, ConnectionLane.Priority, "Background"))
+      const watchFiber = yield* watch.pipe(
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+          const died = Errors.reconciliationDied("Sync watch died", cause)
+          return Effect.logError("Sync watch died", cause).pipe(
+            Effect.annotateLogs({ "space.id": options.spaceId }),
+            Effect.andThen(reconciliation.watchFailed(died))
+          )
+        }),
+        Effect.provideService(ConnectionLane.Priority, "Background"),
+        Effect.forkScoped
+      )
       yield* requestAndNotify
       yield* Effect.addFinalizer(() => {
         return Fiber.interruptAll([supervisorFiber, watchFiber]).pipe(

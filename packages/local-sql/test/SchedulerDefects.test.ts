@@ -11,6 +11,7 @@ import type * as Layer from "effect/Layer"
 import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
 import * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
@@ -273,23 +274,26 @@ describe("background turns that die", () => {
 
 const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
 
-const foregroundSpaces = Effect.fnUntraced(function*(
-  services: BackgroundReplica.Services,
-  remote: BackgroundReplica.Remote,
-  layerLogs: Layer.Layer<never>
-) {
-  const replica = yield* services.start(remote).pipe(Effect.provide(layerLogs))
-  const space = yield* replica.space(spaceId)
-  const other = yield* replica.space(otherSpaceId)
-  yield* services.sql`UPDATE effect_local_client_spaces
-    SET replication_view_id = ${viewId}, replication_view_revision = 0`
-  yield* space.activate
-  yield* other.activate
-  const online = yield* eventually(services, space, isOnlineDrained)
-  const otherOnline = yield* eventually(services, other, isOnlineDrained)
-  assert.isTrue(Option.isSome(online) && Option.isSome(otherOnline), "both spaces came online")
-  return { replica, space, other }
-})
+const foregroundSpaces = Effect.fnUntraced(
+  function*(
+    services: BackgroundReplica.Services,
+    remote: BackgroundReplica.Remote,
+    _layerLogs: Layer.Layer<never>
+  ) {
+    const replica = yield* services.start(remote)
+    const space = yield* replica.space(spaceId)
+    const other = yield* replica.space(otherSpaceId)
+    yield* services.sql`UPDATE effect_local_client_spaces
+      SET replication_view_id = ${viewId}, replication_view_revision = 0`
+    yield* space.activate
+    yield* other.activate
+    const online = yield* eventually(services, space, isOnlineDrained)
+    const otherOnline = yield* eventually(services, other, isOnlineDrained)
+    assert.isTrue(Option.isSome(online) && Option.isSome(otherOnline), "both spaces came online")
+    return { replica, space, other }
+  },
+  (effect, _services, _remote, layerLogs) => Effect.provide(effect, layerLogs)
+)
 
 describe("foreground sync that dies", () => {
   it.effect.each(constructors)(
@@ -324,6 +328,43 @@ describe("foreground sync that dies", () => {
 
       undecodable = false
       yield* space.mutate(Domain.PutTodo, Domain.todo("second"))
+
+      const drained = yield* eventually(services, space, isOnlineDrained)
+
+      assert.isTrue(Option.isSome(drained))
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "reports a foreground space whose watch died as failed and still drains its next mutation with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      const watchDies = yield* Deferred.make<void>()
+      const { other, space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => emptyPage(services.crypto, request),
+          watch: (request) => {
+            if (request.spaceId !== spaceId) return Stream.never
+            return Deferred.await(watchDies).pipe(Effect.andThen(Effect.die("undecodable wake")), Stream.fromEffect)
+          }
+        }),
+        logs.layerLogs
+      )
+      yield* Deferred.succeed(watchDies, undefined)
+
+      const failed = yield* eventually(services, space, isFailed)
+      yield* other.mutate(Domain.PutTodo, Domain.todo("other"))
+      const otherDrained = yield* eventually(services, other, isOnlineDrained)
+
+      assert.strictEqual(failureMessage(failed), "ProtocolInvalid")
+      assert.deepStrictEqual(logs.defects(), ["undecodable wake"])
+      assert.isTrue(Option.isSome(otherDrained))
+
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
 
       const drained = yield* eventually(services, space, isOnlineDrained)
 

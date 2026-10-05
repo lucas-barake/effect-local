@@ -546,7 +546,17 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       yield* FiberMap.run(
         watches,
         managedKey(space.spaceId, space.generation),
-        watch().pipe(Effect.provideService(ConnectionLane.Priority, "Background"))
+        watch().pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+            const died = Errors.reconciliationDied("Sync watch died", cause)
+            return Effect.logError("Sync watch died", cause).pipe(
+              Effect.annotateLogs({ "space.id": space.spaceId }),
+              Effect.andThen(state.reconciliation.watchFailed(died))
+            )
+          }),
+          Effect.provideService(ConnectionLane.Priority, "Background")
+        )
       )
       return yield* enqueue(state)
     },
