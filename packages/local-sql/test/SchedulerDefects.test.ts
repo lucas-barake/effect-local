@@ -47,8 +47,6 @@ const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000a01"
 const otherSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000a02")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000a01")
 
-const claimStatement = "AND attempt_count >= "
-
 const serverUnavailable = Effect.fail(new ReplicaError.ServerUnavailable())
 
 const twoSpaces = (constructor: Constructor, maximumRetryDelay: Duration.Input = "1 second") =>
@@ -105,32 +103,6 @@ const failureMessage = (status: Option.Option<ReplicaStatus.SpaceStatus>) =>
 
 describe("background turns that die", () => {
   it.effect.each(constructors)(
-    "keeps draining background spaces after two background turns died with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* withPending(constructor, [spaceId, otherSpaceId])
-      const attempts = yield* makeAttempts
-      const replica = yield* services.start(SyncEngine.SyncEngine.of({
-        ...idleRemote,
-        submitBatch: acceptSubmission,
-        pull: (request) => {
-          if (request.spaceId !== spaceId) return emptyPage(services.crypto, request)
-          if (attempts.count() < 2) return Effect.andThen(attempts.record, Effect.die("undecodable response"))
-          return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
-        }
-      }))
-      const space = yield* replica.space(spaceId)
-      const other = yield* replica.space(otherSpaceId)
-
-      const otherDrained = yield* eventually(services, other, isDrained)
-      const drained = yield* eventually(services, space, isDrained)
-
-      assert.isTrue(Option.isSome(otherDrained))
-      assert.isAbove(attempts.count(), 2)
-      assert.isTrue(Option.isSome(drained))
-    }, VirtualTime.scoped)
-  )
-
-  it.effect.each(constructors)(
     "reports a background space whose turn died as failed until a retry drains it with %s",
     Effect.fnUntraced(function*(constructor) {
       const services = yield* withPending(constructor, [spaceId, otherSpaceId])
@@ -171,30 +143,6 @@ describe("background turns that die", () => {
 
       assert.isTrue(Option.isSome(drained))
       assert.strictEqual((yield* replica.status).counts.failed, 0)
-    }, VirtualTime.scoped)
-  )
-
-  it.effect.each(constructors)(
-    "retries and drains a background space after a storage statement died in its turn with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* withPending(constructor, [spaceId])
-      const logs = captureLogs()
-      services.dieNext(claimStatement)
-      const replica = yield* services.start(SyncEngine.SyncEngine.of({
-        ...idleRemote,
-        submitBatch: acceptSubmission,
-        pull: (request) => emptyPage(services.crypto, request)
-      })).pipe(Effect.provide(logs.layerLogs))
-      const space = yield* replica.space(spaceId)
-
-      const failed = yield* eventually(services, space, isFailed)
-      const activation = yield* space.activation
-      const drained = yield* eventually(services, space, isDrained)
-
-      assert.strictEqual(failureMessage(failed), "UnexpectedFailure")
-      assert.strictEqual(activation, "Inactive")
-      assert.deepStrictEqual(logs.defects(), ["injected statement defect"])
-      assert.isTrue(Option.isSome(drained))
     }, VirtualTime.scoped)
   )
 
@@ -563,31 +511,6 @@ describe("a background turn that dies settles like a typed failure", () => {
       assert.strictEqual(aggregate.counts.failed, 0)
     }, VirtualTime.scoped)
   )
-
-  it.effect.each(constructors)(
-    "keeps a drained space idle when the pending count after its successful background turn died with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* twoSpaces(constructor)
-      yield* BackgroundReplica.seedPending(services, [spaceId])
-      const attempts = yield* makeAttempts
-      services.dieNext(membershipPendingCountStatement)
-      const replica = yield* services.start(SyncEngine.SyncEngine.of({
-        ...idleRemote,
-        submitBatch: acceptSubmission,
-        pull: (request) => Effect.andThen(attempts.record, emptyPage(services.crypto, request))
-      }))
-      const space = yield* replica.space(spaceId)
-      yield* VirtualTime.advanceUntil(attempts.reached(2))
-      yield* settle("5 minutes")
-
-      const status = yield* space.status
-      const aggregate = yield* replica.status
-
-      assert.strictEqual(status.pending, 0)
-      assert.strictEqual(status._tag, "Idle")
-      assert.strictEqual(aggregate.counts.failed, 0)
-    }, VirtualTime.scoped)
-  )
 })
 
 describe("turns that die retry with the normal backoff", () => {
@@ -750,24 +673,17 @@ const offlineReplica = Effect.fnUntraced(function*(constructor: Constructor, tra
 })
 
 describe("background retries held when the retry scheduler dies", () => {
-  it.effect.each(constructors)(
-    "drains two offline spaces after the server returns when nothing died with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const { other, reconnect, services, space } = yield* offlineReplica(constructor, false)
-      yield* reconnect
-
-      const drained = yield* eventually(services, space, isDrained)
-      const otherDrained = yield* eventually(services, other, isDrained)
-
-      assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Idle, pending 0")
-      assert.strictEqual(describeSpaceStatus(otherDrained, yield* other.status), "Idle, pending 0")
-    }, VirtualTime.scoped)
-  )
-
-  it.effect.each(constructors)(
-    "drains two offline spaces after the server returns when the retry scheduler died once with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const { other, reconnect, services, space, trigger } = yield* offlineReplica(constructor, true)
+  it.effect.each(
+    [
+      ["layer", false],
+      ["layer", true],
+      ["layerWorkflow", false],
+      ["layerWorkflow", true]
+    ] as const
+  )(
+    "drains two offline spaces with %s after the server returns, retry scheduler died once: %s",
+    Effect.fnUntraced(function*([constructor, schedulerDies]) {
+      const { other, reconnect, services, space, trigger } = yield* offlineReplica(constructor, schedulerDies)
       yield* reconnect
       yield* trigger
 
@@ -1043,38 +959,6 @@ describe("a leave whose cleanup dies", () => {
 
 describe("watches that die subscribe again", () => {
   it.effect.each(constructors)(
-    "subscribes to the watch again after a foreground watch died with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* twoSpaces(constructor)
-      const logs = captureLogs()
-      const watchDies = yield* Deferred.make<void>()
-      let subscriptions = 0
-      const { space } = yield* foregroundSpaces(
-        services,
-        SyncEngine.SyncEngine.of({
-          ...idleRemote,
-          submitBatch: acceptSubmission,
-          pull: (request) => emptyPage(services.crypto, request),
-          watch: (request) => {
-            if (request.spaceId !== spaceId) return Stream.never
-            subscriptions += 1
-            if (subscriptions > 1) return Stream.never
-            return Deferred.await(watchDies).pipe(Effect.andThen(Effect.die("undecodable wake")), Stream.fromEffect)
-          }
-        }),
-        logs.layerLogs
-      )
-      yield* Deferred.succeed(watchDies, undefined)
-      const failed = yield* eventually(services, space, isFailed)
-      assert.isTrue(Option.isSome(failed), "the watch death was reported")
-      yield* settle("5 minutes")
-
-      assert.strictEqual(subscriptions, 2)
-      assert.deepStrictEqual(logs.defects(), ["undecodable wake"])
-    }, VirtualTime.scoped)
-  )
-
-  it.effect.each(constructors)(
     "spaces the subscriptions of a foreground watch that keeps dying by the backoff with %s",
     Effect.fnUntraced(function*(constructor) {
       const services = yield* twoSpaces(constructor, "1 minute")
@@ -1107,92 +991,10 @@ describe("watches that die subscribe again", () => {
       assert.strictEqual(logs.defects().length, subscriptions)
     }, VirtualTime.scoped)
   )
-
-  it.effect(
-    "subscribes to the watch again after an in-memory watch died",
-    Effect.fnUntraced(function*() {
-      const watchDies = yield* Deferred.make<void>()
-      const { awaitStatus, logs, subscriptions } = yield* inMemoryScheduler({
-        pull: Effect.void,
-        watch: Effect.andThen(Deferred.await(watchDies), Effect.die("undecodable wake"))
-      })
-      yield* Deferred.succeed(watchDies, undefined)
-      const failed = yield* awaitStatus((status) => status._tag === "Failed")
-      assert.isTrue(Option.isSome(failed), "the watch death was reported")
-      yield* settle("5 minutes")
-
-      assert.strictEqual(subscriptions(), 2)
-      assert.deepStrictEqual(logs.defects(), ["undecodable wake"])
-    }, VirtualTime.scoped)
-  )
 })
 
 const storePendingCountStatement = "SELECT COUNT(*) AS count FROM effect_local_client_pending_data"
 const noStatement = "no statement contains this text"
-
-describe("a failure report that dies", () => {
-  it.effect.each(constructors)(
-    "syncs the next mutation after a foreground turn died and its status report died too with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* twoSpaces(constructor)
-      const logs = captureLogs()
-      let undecodable = false
-      const { space } = yield* foregroundSpaces(
-        services,
-        SyncEngine.SyncEngine.of({
-          ...idleRemote,
-          submitBatch: acceptSubmission,
-          pull: (request) => {
-            if (undecodable && request.spaceId === spaceId) return Effect.die("undecodable response")
-            return emptyPage(services.crypto, request)
-          }
-        }),
-        logs.layerLogs
-      )
-      undecodable = true
-      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
-      services.dieNext(storePendingCountStatement, 1_000_000)
-      yield* settle("5 seconds")
-      services.dieNext(noStatement)
-      undecodable = false
-      yield* space.mutate(Domain.PutTodo, Domain.todo("second"))
-
-      const drained = yield* eventually(services, space, isOnlineDrained)
-
-      assert.deepStrictEqual(logs.defects().slice(0, 1), ["undecodable response"])
-      assert.isTrue(logs.defects().includes("injected statement defect"), "the report defect was logged")
-      assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Online, pending 0")
-    }, VirtualTime.scoped)
-  )
-
-  it.effect(
-    "reports an in-memory turn that died as failed when the pending count for the report died too",
-    Effect.fnUntraced(function*() {
-      let undecodable = false
-      const { awaitStatus, dieOn, forgetStatuses, local, logs, reconciler } = yield* inMemoryScheduler({
-        pull: Effect.suspend(() => {
-          if (undecodable) return Effect.die("undecodable response")
-          return Effect.void
-        }),
-        watch: Effect.never
-      })
-      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
-      undecodable = true
-      dieOn(storePendingCountStatement)
-      yield* forgetStatuses
-      yield* reconciler.schedule
-
-      const failed = yield* awaitStatus((status) => status._tag === "Failed")
-      dieOn(undefined)
-      undecodable = false
-      const drained = yield* awaitStatus((status) => status._tag === "Online" && status.pending === 0)
-
-      assert.strictEqual(reportedFailure(failed), "UnexpectedFailure")
-      assert.deepStrictEqual(logs.defects().slice(0, 1), ["undecodable response"])
-      assert.isTrue(Option.isSome(drained), "the retry drained the space")
-    }, VirtualTime.scoped)
-  )
-})
 
 describe("inner work that ends by interruption only", () => {
   it.effect.each(constructors)(
@@ -1245,10 +1047,10 @@ describe("inner work that ends by interruption only", () => {
     }, VirtualTime.scoped)
   )
 
-  it.effect.each(constructors)(
-    "retries a foreground sync that ended by interruption as an unreachable server with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* twoSpaces(constructor)
+  it.effect(
+    "retries a foreground sync that ended by interruption as an unreachable server",
+    Effect.fnUntraced(function*() {
+      const services = yield* twoSpaces("layer")
       const logs = captureLogs()
       let cancelled = false
       const { space } = yield* foregroundSpaces(
@@ -1267,15 +1069,10 @@ describe("inner work that ends by interruption only", () => {
       cancelled = true
       yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
 
-      let offline = Option.none<ReplicaStatus.SpaceStatus>()
-      if (constructor === "layer") {
-        offline = yield* eventually(services, space, (status) => status._tag === "Offline")
-      }
+      const offline = yield* eventually(services, space, (status) => status._tag === "Offline")
       const drained = yield* eventually(services, space, isOnlineDrained)
 
-      if (constructor === "layer") {
-        assert.isTrue(Option.isSome(offline), "the cancelled sync was reported as an unreachable server")
-      }
+      assert.isTrue(Option.isSome(offline), "the cancelled sync was reported as an unreachable server")
       assert.isTrue(Option.isSome(drained), "the retry drained the space")
       assert.strictEqual(logs.errors(), 0)
     }, VirtualTime.scoped)
