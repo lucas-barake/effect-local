@@ -203,4 +203,21 @@ describe("Invalidation.notify", () => {
       assert.deepStrictEqual(logs.errors(), [])
     })
   )
+
+  it.effect(
+    "logs the defect once and ends with the interruption when the Reactivity service ends with both",
+    Effect.fnUntraced(function*() {
+      const logs = captureLogs()
+      const base = yield* Reactivity.make
+      const reactivity: Reactivity.Reactivity = {
+        ...base,
+        invalidate: () => Effect.ensuring(Effect.interrupt, Effect.die("subscriber died"))
+      }
+
+      const exit = yield* Invalidation.notify(reactivity, ["key"]).pipe(Effect.exit, Effect.provide(logs.layerLogs))
+
+      assert.isTrue(Exit.hasInterrupts(exit), "the notification ended with the interruption")
+      assert.deepStrictEqual(logs.errors(), [{ message: "Reactivity subscriber died", key: "key", defect: true }])
+    })
+  )
 })
