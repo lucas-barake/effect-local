@@ -861,19 +861,43 @@ Both sides default to `Protocol.supportedProtocolVersions`, which is `[1]`. Each
 An accepted old client continues syncing. Its space status changes to `SchemaUpdateAvailable`, which includes the
 server schema identity so the application can show a reload prompt without treating the replica as failed.
 
+`space.status` is a single read. To follow the status, derive an atom from `graph.status(spaceId)`, which reruns the
+read whenever the replica invalidates that space's status key:
+
 ```ts
+import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Option from "effect/Option"
+import * as AsyncResult from "effect/reactivity/AsyncResult"
+import * as Atom from "effect/reactivity/Atom"
+
+const availableVersion = (status: ReplicaStatus.SpaceStatus) => {
+  if (status._tag === "SchemaUpdateAvailable") return Option.some(status.serverSchema.version)
+  return Option.none()
+}
+
+export const availableUpdateAtom = Atom.make((get) => {
+  const status = get(graph.status(spaceId))
+  if (!AsyncResult.isSuccess(status)) return Option.none()
+  return availableVersion(status.value)
+})
+```
+
+A component that reads `availableUpdateAtom` renders the prompt while it holds a version. Code that does not use the
+atom graph subscribes through the same key with Effect's `Reactivity`. The stream emits the current status, then
+reruns the read on each invalidation:
+
+```ts
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as Effect from "effect/Effect"
+import * as Reactivity from "effect/reactivity/Reactivity"
+import * as Stream from "effect/Stream"
 
-export const promptForReload = Replica.Replica.use((replica) =>
-  Effect.gen(function*() {
-    const space = yield* replica.space(spaceId)
-    const status = yield* space.status
-
-    if (status._tag === "SchemaUpdateAvailable") {
-      yield* showReloadPrompt({ serverVersion: status.serverSchema.version })
-    }
-  })
+export const availableUpdates = Replica.Replica.use((replica) => replica.space(spaceId)).pipe(
+  Effect.map((space) => Reactivity.stream(space.status, [ReactivityKey.status(spaceId)])),
+  Stream.unwrap,
+  Stream.map(availableVersion),
+  Stream.changes
 )
 ```
 
