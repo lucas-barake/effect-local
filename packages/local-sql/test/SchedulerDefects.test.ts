@@ -1,17 +1,29 @@
+import { NodeCrypto } from "@effect/platform-node"
+import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Cause from "effect/Cause"
+import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
-import type * as Layer from "effect/Layer"
+import * as Layer from "effect/Layer"
 import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
+import * as Queue from "effect/Queue"
+import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
+import * as ConnectionLane from "../src/ConnectionLane.js"
+import * as LocalStore from "../src/LocalStore.js"
+import * as MutationRuntime from "../src/MutationRuntime.js"
+import * as QueryReactivity from "../src/QueryReactivity.js"
+import * as Reconciler from "../src/Reconciler.js"
+import * as ServerStore from "../src/ServerStore.js"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
@@ -367,6 +379,143 @@ describe("foreground sync that dies", () => {
       yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
 
       const drained = yield* eventually(services, space, isOnlineDrained)
+
+      assert.isTrue(Option.isSome(drained))
+    }, VirtualTime.scoped)
+  )
+})
+
+const migration = { retryDelay: "1 millis", maximumAttempts: 8 } as const
+const scope = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
+const layerRuntime = MutationRuntime.layer(Domain.definition).pipe(Layer.provide(Domain.layerHandlers))
+const layerServer = ServerStore.layerTrusted({ definition: Domain.definition, migration }).pipe(
+  Layer.provide(layerRuntime),
+  Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
+  Layer.provide(NodeCrypto.layer)
+)
+const layerClientDatabase = Layer.mergeAll(
+  ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))),
+  NodeCrypto.layer,
+  Reactivity.layer,
+  QueryReactivity.layer
+)
+
+const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
+  readonly pull: Effect.Effect<void>
+  readonly watch: Effect.Effect<void>
+}) {
+  const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
+  const logs = captureLogs()
+  const statuses = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
+  const remote = SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    submitBatch: (request) => server.admitBatch(request, null),
+    pull: (request) => Effect.andThen(faults.pull, server.pull(request)),
+    bootstrap: server.bootstrap,
+    watch: () => Stream.fromEffect(faults.watch).pipe(Stream.drain)
+  })
+  const context = yield* Layer.build(
+    Reconciler.layer({
+      definition: Domain.definition,
+      spaceId,
+      retryDelay: "1 second",
+      maximumRetryDelay: "1 second",
+      onStatusChange: (status) => Queue.offer(statuses, status).pipe(Effect.asVoid)
+    }).pipe(
+      Layer.provideMerge(
+        LocalStore.layer({
+          definition: Domain.definition,
+          spaceId,
+          clientId,
+          scope,
+          retainedReceipts: 256,
+          maximumReceipts: 10_000,
+          retainedHistoryEntries: 256,
+          maximumBootstrapEntities: 10_000,
+          maximumBootstrapBytes: 64 * 1024 * 1024,
+          maximumBootstrapPageBytes: 4 * 1024 * 1024,
+          migration
+        }).pipe(Layer.provide(layerRuntime), Layer.provide(layerClientDatabase))
+      ),
+      Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+      Layer.provide(logs.layerLogs)
+    )
+  )
+  const awaitStatus = (matches: (status: ReplicaStatus.ReplicaStatus) => boolean) =>
+    Queue.take(statuses).pipe(
+      Effect.repeat({ until: matches }),
+      VirtualTime.advanceUntil,
+      Effect.timeoutOption("5 minutes")
+    )
+  const online = yield* awaitStatus((status) => status._tag === "Online")
+  assert.isTrue(Option.isSome(online), "the space came online")
+  return {
+    reconciler: Context.get(context, Reconciler.Reconciler),
+    local: Context.get(context, LocalStore.Store),
+    awaitStatus,
+    logs
+  }
+})
+
+const reportedFailure = (status: Option.Option<ReplicaStatus.ReplicaStatus>) =>
+  status.pipe(
+    Option.flatMap((current) => {
+      if (current._tag !== "Failed") return Option.none()
+      return Option.some(current.message)
+    }),
+    Option.getOrElse(() => "the space never reported a failure")
+  )
+
+describe("in-memory scheduler loops that die", () => {
+  it.effect(
+    "reports a sync that died as failed and drains the next scheduled sync",
+    Effect.fnUntraced(function*() {
+      let undecodable = false
+      const { awaitStatus, local, logs, reconciler } = yield* inMemoryScheduler({
+        pull: Effect.suspend(() => {
+          if (undecodable) return Effect.die("undecodable response")
+          return Effect.void
+        }),
+        watch: Effect.never
+      })
+      undecodable = true
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* reconciler.schedule
+
+      const failed = yield* awaitStatus((status) => status._tag === "Failed")
+
+      assert.strictEqual(reportedFailure(failed), "ProtocolInvalid")
+      assert.deepStrictEqual(logs.defects(), ["undecodable response"])
+
+      undecodable = false
+      yield* local.mutate(Domain.PutTodo, Domain.todo("second"))
+      yield* reconciler.schedule
+
+      const drained = yield* awaitStatus((status) => status._tag === "Online" && status.pending === 0)
+
+      assert.isTrue(Option.isSome(drained))
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "reports a watch that died as failed and still drains the next scheduled sync",
+    Effect.fnUntraced(function*() {
+      const watchDies = yield* Deferred.make<void>()
+      const { awaitStatus, local, logs, reconciler } = yield* inMemoryScheduler({
+        pull: Effect.void,
+        watch: Effect.andThen(Deferred.await(watchDies), Effect.die("undecodable wake"))
+      })
+      yield* Deferred.succeed(watchDies, undefined)
+
+      const failed = yield* awaitStatus((status) => status._tag === "Failed")
+
+      assert.strictEqual(reportedFailure(failed), "ProtocolInvalid")
+      assert.deepStrictEqual(logs.defects(), ["undecodable wake"])
+
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* reconciler.schedule
+
+      const drained = yield* awaitStatus((status) => status._tag === "Online" && status.pending === 0)
 
       assert.isTrue(Option.isSome(drained))
     }, VirtualTime.scoped)

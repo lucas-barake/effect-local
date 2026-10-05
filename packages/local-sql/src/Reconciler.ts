@@ -1003,6 +1003,16 @@ export const layerInMemoryScheduler = (
       const worker = Effect.andThen(LosslessQueue.take(wake), awaitAuthenticationChange).pipe(
         Effect.andThen(remote.transportGeneration),
         Effect.flatMap(turn),
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+          return Effect.logError("Reconciliation turn died", cause).pipe(
+            Effect.annotateLogs({ "space.id": options.spaceId }),
+            Effect.andThen(reconciliation.generation),
+            Effect.flatMap((generation) =>
+              reconciliation.failed(Errors.reconciliationDied("Reconciliation turn died", cause), generation)
+            )
+          )
+        }),
         Effect.forever()
       )
       const workerFiber = yield* Effect.forkScoped(Effect.provideService(worker, ConnectionLane.Priority, "Background"))
@@ -1059,6 +1069,14 @@ export const layerInMemoryScheduler = (
           )
         })
       const watchFiber = yield* watch().pipe(
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+          const died = Errors.reconciliationDied("Sync watch died", cause)
+          return Effect.logError("Sync watch died", cause).pipe(
+            Effect.annotateLogs({ "space.id": options.spaceId }),
+            Effect.andThen(reconciliation.watchFailed(died))
+          )
+        }),
         Effect.provideService(ConnectionLane.Priority, "Background"),
         Effect.forkScoped
       )
