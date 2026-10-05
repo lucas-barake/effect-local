@@ -408,13 +408,26 @@ export const makeManager = Effect.fnUntraced(function*(options: {
 
   const readmit = (space: ManagedState): Effect.Effect<void> =>
     enqueue(space).pipe(
+      Effect.catchCause((cause) => {
+        if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
+        const failure = Errors.iterationFailure("Reconciliation readmission died", cause)
+        return Errors.logDefect("Reconciliation readmission died", cause).pipe(
+          Effect.annotateLogs({ "space.id": space.spaceId }),
+          Effect.andThen(Effect.fail(failure))
+        )
+      }),
       Effect.catch(Effect.fnUntraced(function*(error) {
         const transportGeneration = yield* remote.transportGeneration
         const observedGeneration = yield* space.reconciliation.generation
         yield* handleFailure(space, error, transportGeneration, observedGeneration).pipe(
           Effect.catch(() => Effect.void)
         )
-      }))
+      })),
+      Effect.catchCause((cause) =>
+        Errors.logDefect("Reconciliation failure handling died", cause).pipe(
+          Effect.annotateLogs({ "space.id": space.spaceId })
+        )
+      )
     )
 
   const runTurn = Effect.fnUntraced(function*(space: ManagedState, epoch: number) {

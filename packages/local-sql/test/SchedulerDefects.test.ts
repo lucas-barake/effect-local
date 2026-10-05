@@ -494,7 +494,7 @@ describe("in-memory scheduler loops that die", () => {
 
 const membershipPendingCountStatement = "SELECT COUNT(p.mutation_id) AS count"
 
-const settle = (duration: "5 seconds" | "5 minutes" | "10 minutes") =>
+const settle = (duration: "5 seconds" | "30 seconds" | "1 minute" | "5 minutes" | "10 minutes") =>
   VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption(duration))
 
 describe("a background turn that dies settles like a typed failure", () => {
@@ -1445,6 +1445,47 @@ describe("a leave whose notification died after the membership row was deleted",
       assert.isTrue(Exit.isSuccess(activation), "the joined space could be activated")
       assert.isTrue(Exit.isSuccess(leftAgain), "the space could be left again")
       assert.strictEqual(aggregate.spaces, listed.length)
+    }, VirtualTime.scoped)
+  )
+})
+
+const requestReconciliationStatement = "SET requested_generation = "
+
+describe("steps of a managed space that run outside its turn", () => {
+  it.effect.each(["die", "typed failure"] as const)(
+    "syncs again on its own after the readmission that follows a retry backoff ended with a %s",
+    Effect.fnUntraced(function*(kind) {
+      const services = yield* twoSpaces("layer")
+      const logs = captureLogs()
+      let unavailable = false
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (unavailable && request.spaceId === spaceId) {
+              return Effect.fail(new ReplicaError.StorageUnavailable({ cause: "injected" }))
+            }
+            return emptyPage(services.crypto, request)
+          }
+        }),
+        logs.layerLogs
+      )
+      unavailable = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      const failed = yield* eventually(services, space, isFailed)
+      assert.isTrue(Option.isSome(failed), "the turn failed and a retry was scheduled")
+      if (kind === "die") services.dieNext(requestReconciliationStatement, 3)
+      else services.lockNext(requestReconciliationStatement, 3)
+      yield* settle("30 seconds")
+      services.dieNext(noStatement)
+      services.lockNext(noStatement)
+      unavailable = false
+
+      const drained = yield* eventually(services, space, isOnlineDrained)
+
+      assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Online, pending 0")
     }, VirtualTime.scoped)
   )
 })
