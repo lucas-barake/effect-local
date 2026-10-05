@@ -45,6 +45,7 @@ export interface Options<D extends Definition.Any,> {
   readonly profiles?: Readonly<Record<string, Ephemeral.AnyMember>> | undefined
   readonly requestPersistence?: boolean | undefined
   readonly retryDelay?: Duration.Input | undefined
+  readonly eventCapacity?: number | undefined
   readonly sharding?: Partial<ShardingConfig.ShardingConfig["Service"]> | undefined
 }
 
@@ -117,8 +118,9 @@ export const layer = <D extends Definition.Any, E extends Tagged, R,>(
       "retryDelay",
       options.retryDelay ?? Duration.seconds(1)
     )
+    const eventCapacity = yield* configuration.positiveSafeInteger("eventCapacity", options.eventCapacity ?? 1_024)
     const scheduler = yield* TabScheduler.make
-    return yield* build(layerOwner, options, retryDelayMillis).pipe(
+    return yield* build(layerOwner, options, retryDelayMillis, eventCapacity).pipe(
       Effect.provideService(Scheduler.Scheduler, scheduler)
     )
   }))
@@ -126,7 +128,8 @@ export const layer = <D extends Definition.Any, E extends Tagged, R,>(
 const build = Effect.fnUntraced(function*<D extends Definition.Any, E extends Tagged, R,>(
   layerOwner: Layer.Layer<SqlClient.SqlClient | SyncEngine.SyncEngine | EphemeralClient.EphemeralClient, E, R>,
   options: Options<D>,
-  retryDelayMillis: number
+  retryDelayMillis: number,
+  eventCapacity: number
 ) {
   const reactivity = yield* Reactivity.Reactivity
   const handlers = Context.pick(
@@ -214,6 +217,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, E extends Ta
     reactivity,
     crypto,
     retryDelayMillis,
+    eventCapacity,
     awaitRouted: cluster.awaitRouted,
     superseded: gate.superseded
   })
