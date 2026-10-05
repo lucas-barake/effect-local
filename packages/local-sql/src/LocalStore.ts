@@ -4157,13 +4157,7 @@ export const layer = (
             const entities = committed.created.flatMap((created) =>
               created.pendingMutation.changes.map((change) => change.entity)
             )
-            yield* invalidate(entities, [], true).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logError("Committed local mutations were not announced", cause).pipe(
-                  Effect.annotateLogs({ "space.id": options.spaceId })
-                )
-              )
-            )
+            yield* invalidate(entities, [], true)
           }
           yield* scheduled
           return committed.applied

@@ -32,20 +32,22 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000f4
 interface Outcome {
   readonly kind: string
   readonly outcome: Effect.Effect<void, ReplicaError.ReplicaError>
-  readonly operation: "succeeded" | "interrupted" | "failed"
-  readonly logged: number
+  readonly message: string
 }
 
 const outcomes: ReadonlyArray<Outcome> = [
-  { kind: "a defect", outcome: Effect.die("subscriber died"), operation: "succeeded", logged: 1 },
-  { kind: "an interruption", outcome: Effect.interrupt, operation: "interrupted", logged: 0 },
+  { kind: "a defect", outcome: Effect.die("subscriber died"), message: "Reactivity subscriber died" },
+  { kind: "an interruption", outcome: Effect.interrupt, message: "Reactivity notification was interrupted" },
   {
     kind: "an interruption and a defect",
     outcome: Effect.ensuring(Effect.interrupt, Effect.die("subscriber died")),
-    operation: "interrupted",
-    logged: 1
+    message: "Reactivity subscriber died"
   },
-  { kind: "a failure", outcome: Effect.fail(new ReplicaError.ServerUnavailable()), operation: "failed", logged: 0 }
+  {
+    kind: "a failure",
+    outcome: Effect.fail(new ReplicaError.ServerUnavailable()),
+    message: "Reactivity notification failed"
+  }
 ]
 
 const withConstructor = (constructor: Constructor) => (outcome: Outcome) => Object.assign({ constructor }, outcome)
@@ -110,7 +112,7 @@ const installView = (services: BackgroundReplica.Services) =>
 
 describe("a notification that a Reactivity service ends with", () => {
   it.effect.each(rows)(
-    "$kind leaves the space joined and its join $operation with $constructor",
+    "$kind leaves the space joined and its join succeeded with $constructor",
     Effect.fnUntraced(function*(row) {
       const errors = captureErrors()
       const services = yield* twoSpaces(row.constructor)
@@ -122,16 +124,16 @@ describe("a notification that a Reactivity service ends with", () => {
       const listed = yield* replica.spaces
       const aggregate = yield* replica.status
 
-      assert.strictEqual(describeExit(joined), row.operation, "the join")
+      assert.strictEqual(describeExit(joined), "succeeded", "the join")
       assert.strictEqual(describeExit(again), "succeeded", "a second join")
       assert.strictEqual(listed.length, 3)
       assert.strictEqual(aggregate.spaces, 3)
-      assert.strictEqual(errors.messages().length, row.logged)
+      assert.deepStrictEqual(errors.messages(), [row.message])
     }, VirtualTime.scoped)
   )
 
   it.effect.each(rows)(
-    "$kind leaves the space left, its leave $operation, and a second leave complete with $constructor",
+    "$kind leaves the space left, its leave succeeded, and a second leave complete with $constructor",
     Effect.fnUntraced(function*(row) {
       const errors = captureErrors()
       const services = yield* twoSpaces(row.constructor)
@@ -144,17 +146,17 @@ describe("a notification that a Reactivity service ends with", () => {
       const aggregate = yield* replica.status
       const stored = yield* services.sql`SELECT space_id FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
 
-      assert.strictEqual(describeExit(left), row.operation, "the leave")
+      assert.strictEqual(describeExit(left), "succeeded", "the leave")
       assert.strictEqual(describeExit(again), "succeeded", "a second leave")
       assert.strictEqual(stored.length, 0, "the membership row was deleted")
       assert.strictEqual(listed.length, 1)
       assert.strictEqual(aggregate.spaces, 1)
-      assert.strictEqual(errors.messages().length, row.logged)
+      assert.deepStrictEqual(errors.messages(), [row.message])
     }, VirtualTime.scoped)
   )
 
   it.effect.each(rows)(
-    "$kind leaves the space active and its activation $operation with $constructor",
+    "$kind leaves the space active and its activation succeeded with $constructor",
     Effect.fnUntraced(function*(row) {
       const errors = captureErrors()
       const services = yield* twoSpaces(row.constructor)
@@ -168,16 +170,16 @@ describe("a notification that a Reactivity service ends with", () => {
       const again = yield* within(space.activate)
       const drained = yield* eventually(services, space, isOnlineDrained)
 
-      assert.strictEqual(describeExit(activated), row.operation, "the activation")
+      assert.strictEqual(describeExit(activated), "succeeded", "the activation")
       assert.strictEqual(activation, "Active")
       assert.strictEqual(describeExit(again), "succeeded", "a second activation")
       assert.isTrue(Option.isSome(drained), "the space came online")
-      assert.strictEqual(errors.messages().length, row.logged * 2)
+      assert.deepStrictEqual(errors.messages(), [row.message, row.message])
     }, VirtualTime.scoped)
   )
 
   it.effect.each(rows)(
-    "$kind leaves the space inactive, its deactivation $operation, and a later activation complete with $constructor",
+    "$kind leaves the space inactive, its deactivation succeeded, and a later activation complete with $constructor",
     Effect.fnUntraced(function*(row) {
       const errors = captureErrors()
       const services = yield* twoSpaces(row.constructor)
@@ -194,11 +196,11 @@ describe("a notification that a Reactivity service ends with", () => {
       services.endInvalidationsWith(ReactivityKey.activation(spaceId), Effect.void)
       const reactivated = yield* within(space.activate)
 
-      assert.strictEqual(describeExit(deactivated), row.operation, "the deactivation")
+      assert.strictEqual(describeExit(deactivated), "succeeded", "the deactivation")
       assert.strictEqual(activation, "Inactive")
       assert.strictEqual(aggregate.counts.idle, 2)
       assert.strictEqual(describeExit(reactivated), "succeeded", "a later activation")
-      assert.strictEqual(errors.messages().length, row.logged * 2)
+      assert.deepStrictEqual(errors.messages(), [row.message, row.message])
     }, VirtualTime.scoped)
   )
 
@@ -222,6 +224,7 @@ describe("a notification that a Reactivity service ends with", () => {
       assert.strictEqual(describeExit(next), "succeeded", "the next mutation")
       assert.isTrue(Option.isSome(drained), "both mutations synced")
       assert.isAbove(errors.messages().length, 0, "the outcome of the notification was logged")
+      assert.deepStrictEqual(Array.from(new Set(errors.messages())), [row.message])
     }, VirtualTime.scoped)
   )
 
@@ -243,7 +246,7 @@ describe("a notification that a Reactivity service ends with", () => {
       const activated = yield* within(Fiber.join(first))
 
       assert.strictEqual(describeExit(waited), "succeeded", "the activation that waited")
-      assert.strictEqual(describeExit(activated), "interrupted", "the first activation")
+      assert.strictEqual(describeExit(activated), "succeeded", "the first activation")
       assert.strictEqual(yield* space.activation, "Active")
     }, VirtualTime.scoped)
   )
@@ -264,7 +267,7 @@ describe("a notification that a Reactivity service ends with", () => {
       const joined = yield* within(Fiber.join(first))
 
       assert.strictEqual(describeExit(waited), "succeeded", "the join that waited")
-      assert.strictEqual(describeExit(joined), "interrupted", "the first join")
+      assert.strictEqual(describeExit(joined), "succeeded", "the first join")
     }, VirtualTime.scoped)
   )
 })

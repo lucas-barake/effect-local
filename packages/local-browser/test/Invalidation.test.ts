@@ -150,21 +150,39 @@ describe("Invalidation.notify", () => {
   )
 
   it.effect(
-    "ends with the interruption and logs nothing when the Reactivity service interrupts the notification",
+    "completes and logs the cause with its key when the Reactivity service ends a notification without a defect",
     Effect.fnUntraced(function*() {
       const logs = captureLogs()
       const base = yield* Reactivity.make
-      const reactivity: Reactivity.Reactivity = { ...base, invalidate: () => Effect.interrupt }
+      const notified: Array<string> = []
+      base.registerUnsafe(["after"], () => {
+        notified.push("after")
+      })
+      const reactivity: Reactivity.Reactivity = {
+        ...base,
+        invalidate: (keys) => {
+          if (Array.isArray(keys) && keys.includes("interrupted")) return Effect.interrupt
+          return base.invalidate(keys)
+        }
+      }
 
-      const exit = yield* Invalidation.notify(reactivity, ["key"]).pipe(Effect.exit, Effect.provide(logs.layerLogs))
+      const exit = yield* Invalidation.notify(reactivity, ["interrupted", "after"]).pipe(
+        Effect.exit,
+        Effect.provide(logs.layerLogs)
+      )
 
-      assert.isTrue(Exit.hasInterrupts(exit), "the notification ended with the interruption")
-      assert.deepStrictEqual(logs.errors(), [])
+      assert.isTrue(Exit.isSuccess(exit), "the notification completed")
+      assert.deepStrictEqual(notified, ["after"])
+      assert.deepStrictEqual(logs.errors(), [{
+        message: "Reactivity notification was interrupted",
+        key: "interrupted",
+        defect: false
+      }])
     })
   )
 
   it.effect(
-    "logs the defect once and ends with the interruption when the Reactivity service ends with both",
+    "completes and logs the defect once when the Reactivity service ends with a defect and an interruption",
     Effect.fnUntraced(function*() {
       const logs = captureLogs()
       const base = yield* Reactivity.make
@@ -175,7 +193,7 @@ describe("Invalidation.notify", () => {
 
       const exit = yield* Invalidation.notify(reactivity, ["key"]).pipe(Effect.exit, Effect.provide(logs.layerLogs))
 
-      assert.isTrue(Exit.hasInterrupts(exit), "the notification ended with the interruption")
+      assert.isTrue(Exit.isSuccess(exit), "the notification completed")
       assert.deepStrictEqual(logs.errors(), [{ message: "Reactivity subscriber died", key: "key", defect: true }])
     })
   )

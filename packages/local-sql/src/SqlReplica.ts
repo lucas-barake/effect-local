@@ -369,19 +369,6 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (fiber.getRef(CallerFiber) === fiber.id) return Invalidation.notify(reactivity, keys)
           return flush(keys)
         })
-      const collectOutcomes = () => {
-        let first: Exit.Exit<void> = Exit.void
-        return {
-          run: (notification: Effect.Effect<void>) =>
-            notification.pipe(
-              Effect.exit,
-              Effect.map((exit) => {
-                if (Exit.isSuccess(first)) first = exit
-              })
-            ),
-          raise: Effect.suspend(() => first)
-        }
-      }
       const addContribution = (entry: RememberedEntry) =>
         Ref.update(aggregate, (current) => {
           const category = statusCategory(entry.summaryStatus)
@@ -918,17 +905,16 @@ const makeLayer = <D extends Definition.Any, R,>(
             return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
           }
           const completion = Completion.make<void, ReplicaError.ReplicaError>()
-          const announced = collectOutcomes()
           entry.activation = "Deactivating"
           entry.transition = completion
           dropForegroundReservation(entry)
-          yield* announced.run(invalidateActivation(entry.spaceId))
+          yield* invalidateActivation(entry.spaceId)
           const shutdown = Scope.close(runtime.scope, Exit.void)
           const result = yield* runtime.operationGate.withPermits(operationPermits)(shutdown).pipe(Effect.exit)
           entry.runtime = undefined
           entry.activation = "Inactive"
           entry.transition = undefined
-          yield* announced.run(invalidateActivation(entry.spaceId))
+          yield* invalidateActivation(entry.spaceId)
           yield* Completion.settle(completion, result)
           if (Exit.isFailure(result)) {
             yield* result
@@ -962,8 +948,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             changed = yield* applyContribution(entry, () => inactiveStatus(entry, count.count))
           }
           if (enqueuePending && count.count > 0) yield* enqueueBackground(entry)
-          yield* announced.run(announceContribution(changed))
-          yield* announced.raise
+          yield* announceContribution(changed)
           return true
         }))
 
@@ -1043,17 +1028,12 @@ const makeLayer = <D extends Definition.Any, R,>(
           }
           if (foreground && !entry.foreground) return yield* transition(entry, foreground)
           const completion = Completion.make<void, ReplicaError.ReplicaError>()
-          const announced = collectOutcomes()
           const generation = ++nextGeneration
           entry.activation = "Activating"
           entry.transition = completion
           entry.runtime = undefined
-          const connecting = yield* applyContribution(entry, (current) => ({
-            _tag: "Connecting",
-            pending: current.pending
-          }))
-          yield* announced.run(announceContribution(connecting))
-          yield* announced.run(invalidateActivation(entry.spaceId))
+          yield* modifyContribution(entry, (current) => ({ _tag: "Connecting", pending: current.pending }))
+          yield* invalidateActivation(entry.spaceId)
           const startRuntime = restore(initialize(entry, generation, foreground))
           let start = startRuntime
           if (retiring !== undefined) {
@@ -1089,10 +1069,9 @@ const makeLayer = <D extends Definition.Any, R,>(
             entry.activation = "Active"
             entry.transition = undefined
             if (foreground) entry.backgroundGeneration += 1
-            yield* announced.run(invalidateActivation(entry.spaceId))
+            yield* invalidateActivation(entry.spaceId)
             yield* Completion.settle(completion, Exit.void)
             yield* signalCapacity
-            yield* announced.raise
             return result.value
           }
           entry.activation = "Inactive"
@@ -1100,8 +1079,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           dropForegroundReservation(entry)
           const changed = yield* applyContribution(entry, (current) => inactiveStatus(entry, current.pending))
           if (retiring !== undefined) yield* enqueueBackground(entry)
-          yield* announced.run(announceContribution(changed))
-          yield* announced.run(invalidateActivation(entry.spaceId))
+          yield* announceContribution(changed)
+          yield* invalidateActivation(entry.spaceId)
           if (Exit.hasInterrupts(result)) yield* Completion.settle(completion, Exit.void)
           else yield* Completion.settle(completion, Exit.asVoid(result))
           yield* signalCapacity
