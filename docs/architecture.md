@@ -77,7 +77,9 @@ application data authority.
     caller's `Reactivity.withBatch` and run when the batch ends. Notifications raised on any other fiber, including
     one forked from those calls, a commit's, a leave's, and a background turn's, are delivered immediately.
     Delivery is interruptible, so a custom `Reactivity` whose `invalidate` never returns cannot hold back a
-    deactivation, a leave, the interruption of a join, or the replica's shutdown. Each waiter of an operation is
+    deactivation, a leave, the interruption of a join, or the replica's shutdown. When a delivery is cut short by
+    the cancellation of the fiber that was notifying, the cancellation is not logged, and the keys that were not
+    delivered are delivered by a fiber the replica owns. The key that was being delivered can be notified twice. Each waiter of an operation is
     resumed on its own, so a completion callback that throws is logged and does not keep the other waiters from
     resuming.
 
