@@ -338,7 +338,7 @@ const layerServer = ServerStore.layerTrusted({ definition: Domain.definition, mi
 )
 const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
   readonly pull: Effect.Effect<void, ReplicaError.ReplicaError>
-  readonly watch: Effect.Effect<void>
+  readonly watch: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly waitForCredentialChange?: Effect.Effect<void>
   readonly waitForTransportChange?: Effect.Effect<void>
   readonly transportGeneration?: Effect.Effect<number>
@@ -1581,6 +1581,77 @@ describe("steps of a managed space that run outside its turn", () => {
       assert.strictEqual(reportedFailure(failed), "UnexpectedFailure")
       assert.deepStrictEqual(logs.defects(), ["generation died"])
       assert.isTrue(Option.isSome(drained))
+    }, VirtualTime.scoped)
+  )
+})
+
+const storageUnavailable = Effect.fail(new ReplicaError.StorageUnavailable({ cause: "injected" }))
+
+describe("a watch whose recovery dies", () => {
+  it.effect.each(constructors)(
+    "subscribes again and delivers a later wake after the sync requests that follow a failed watch died twice with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      const watchFails = yield* Deferred.make<void>()
+      const wakes = yield* Deferred.make<void>()
+      let subscriptions = 0
+      let pulls = 0
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (request.spaceId === spaceId) pulls += 1
+            return emptyPage(services.crypto, request)
+          },
+          watch: (request) => {
+            if (request.spaceId !== spaceId) return Stream.never
+            subscriptions += 1
+            if (subscriptions === 1) {
+              return Deferred.await(watchFails).pipe(Effect.andThen(storageUnavailable), Stream.fromEffect)
+            }
+            if (subscriptions > 2) return Stream.never
+            const wake = Effect.as(Deferred.await(wakes), Protocol.Wake.make({ spaceId }))
+            return Stream.concat(Stream.fromEffect(wake), Stream.never)
+          }
+        }),
+        logs.layerLogs
+      )
+      services.dieNext(requestReconciliationStatement, 2)
+      yield* Deferred.succeed(watchFails, undefined)
+      yield* settle("1 minute")
+      services.dieNext(noStatement)
+      const pulledBeforeWake = pulls
+      yield* Deferred.succeed(wakes, undefined)
+
+      const recovered = yield* eventually(services, space, isOnlineDrained)
+
+      assert.strictEqual(subscriptions, 2)
+      assert.isAbove(pulls, pulledBeforeWake)
+      assert.isTrue(Option.isSome(recovered), "the space reported online after the wake was synced")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "subscribes again after the sync requests that follow a failed in-memory watch died",
+    Effect.fnUntraced(function*() {
+      const watchFails = yield* Deferred.make<void>()
+      const { awaitStatus, dieOn, subscriptions } = yield* inMemoryScheduler({
+        pull: Effect.void,
+        watch: Effect.andThen(Deferred.await(watchFails), storageUnavailable)
+      })
+      dieOn(requestReconciliationStatement)
+      yield* Deferred.succeed(watchFails, undefined)
+      yield* settle("1 minute")
+      const resubscribed = subscriptions()
+      dieOn(undefined)
+
+      const recovered = yield* awaitStatus((status) => status._tag === "Online")
+
+      assert.strictEqual(resubscribed, 2)
+      assert.isTrue(Option.isSome(recovered), "the space reported online once storage healed")
     }, VirtualTime.scoped)
   )
 })
