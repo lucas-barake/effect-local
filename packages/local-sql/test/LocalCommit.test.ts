@@ -7,6 +7,7 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -222,6 +223,28 @@ describe("local commit", () => {
       assert.strictEqual(pendingRounds, 2, "the queued mutations shared one round")
       assert.deepStrictEqual(committed.map((pending) => pending.envelope.localSequence), [2, 3, 4, 5])
       assert.strictEqual(yield* local.pendingCount, 5)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "announces a committed mutation whose commit callback died and returns the defect",
+    Effect.fnUntraced(function*() {
+      const base = Context.get(yield* Layer.build(Reactivity.layer), Reactivity.Reactivity)
+      let entity = 0
+      let pending = 0
+      base.registerUnsafe([ReactivityKey.entity(spaceId, Domain.Todo.name, "first")], () => {
+        entity += 1
+      })
+      base.registerUnsafe([ReactivityKey.pending(spaceId)], () => {
+        pending += 1
+      })
+      const { local } = yield* localStore(Layer.succeed(Reactivity.Reactivity, base), () => Effect.die("callback died"))
+
+      const mutated = yield* local.mutate(Domain.PutTodo, Domain.todo("first")).pipe(Effect.exit)
+
+      assert.isTrue(Exit.isFailure(mutated) && Cause.hasDies(mutated.cause), "the caller received the defect")
+      assert.strictEqual(yield* local.pendingCount, 1)
+      assert.deepStrictEqual({ entity, pending }, { entity: 1, pending: 1 })
     }, Effect.scoped)
   )
 

@@ -4142,21 +4142,30 @@ export const layer = (
             return { applied, created, pending: pendingAfter }
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
           if (committed.created.length > 0) yield* updatePendingMetric(committed.created.length)
+          let scheduled: Exit.Exit<void> = Exit.void
           if (committed.pending !== undefined && options.onMutationsCommitted !== undefined) {
-            yield* options.onMutationsCommitted(committed.pending).pipe(
+            scheduled = yield* options.onMutationsCommitted(committed.pending).pipe(
               Effect.catch((error) =>
                 Effect.logWarning("Committed local mutations could not schedule reconciliation").pipe(
                   Effect.annotateLogs({ error: error._tag, "space.id": options.spaceId })
                 )
-              )
+              ),
+              Effect.exit
             )
           }
           if (committed.created.length > 0) {
             const entities = committed.created.flatMap((created) =>
               created.pendingMutation.changes.map((change) => change.entity)
             )
-            yield* invalidate(entities, [], true)
+            yield* invalidate(entities, [], true).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logError("Committed local mutations were not announced", cause).pipe(
+                  Effect.annotateLogs({ "space.id": options.spaceId })
+                )
+              )
+            )
           }
+          yield* scheduled
           return committed.applied
         })).pipe(
           Effect.withSpan("LocalStore.commitMutations", {
