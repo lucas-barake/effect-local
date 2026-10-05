@@ -103,6 +103,11 @@ const RequestFrame = Schema.Struct({
 })
 const isRequestFrame = Schema.is(RequestFrame)
 const isPingFrame = Schema.is(Schema.Struct({ _tag: Schema.Literal("Ping") }))
+const InterruptFrame = Schema.Struct({
+  _tag: Schema.Literal("Interrupt"),
+  requestId: Schema.Union([Schema.String, Schema.Number])
+})
+const isInterruptFrame = Schema.is(InterruptFrame)
 
 const layerCredentialStatic = Authentication.layerCredentialProviderStatic(Redacted.make("secret"))
 
@@ -120,6 +125,7 @@ const connect = Effect.fnUntraced(function*(
 ) {
   const incoming = yield* Queue.unbounded<string | Uint8Array>()
   const outgoing = yield* Queue.unbounded<unknown>()
+  const interrupted = yield* Queue.unbounded<RequestId>()
   const parser = RpcSerialization.json.makeUnsafe()
   const decoder = new TextDecoder()
   const deliver = (frame: unknown) => {
@@ -130,6 +136,7 @@ const connect = Effect.fnUntraced(function*(
   }
   const answer = (frame: unknown) => {
     if (isPingFrame(frame)) return deliver({ _tag: "Pong" })
+    if (isInterruptFrame(frame)) return Queue.offer(interrupted, frame.requestId)
     if (!isRequestFrame(frame)) return Effect.void
     const reply = script.get(frame.tag)
     if (reply !== undefined) return Effect.forEach(reply(frame.id), deliver, { discard: true })
@@ -170,7 +177,8 @@ const connect = Effect.fnUntraced(function*(
   yield* Effect.yieldNow
   return {
     engine: Context.get(context, SyncEngine.SyncEngine),
-    ephemeral: Context.get(context, EphemeralClient.EphemeralClient)
+    ephemeral: Context.get(context, EphemeralClient.EphemeralClient),
+    interrupted
   }
 })
 
@@ -201,6 +209,8 @@ const pullRequest = {
   cursor: null,
   limit: 1
 }
+
+const watchRequest = { spaceId, clientId, schema: definition.schemaIdentity, scope, scopeGeneration, cursor }
 
 const openSession = (clients: Clients) =>
   clients.ephemeral.session(Presence, { spaceId, member, value: { status: "here" }, ttl: "1 minute" })
@@ -281,9 +291,7 @@ const calls: ReadonlyArray<Call> = [
     transportFailure: "ProtocolInvalid: The Watch RPC failed",
     prelude: [],
     streamed: true,
-    run: (clients) =>
-      clients.engine.watch({ spaceId, clientId, schema: definition.schemaIdentity, scope, scopeGeneration, cursor })
-        .pipe(Stream.runDrain, exitOutcome)
+    run: (clients) => clients.engine.watch(watchRequest).pipe(Stream.runDrain, exitOutcome)
   },
   {
     rpc: "JoinEphemeral",
@@ -373,14 +381,10 @@ describe("a server reply that this client cannot decode", () => {
         layerCredentialStatic
       )
       const wakes = yield* Queue.unbounded<Protocol.Wake>()
-      const ended = yield* clients.engine.watch({
-        spaceId,
-        clientId,
-        schema: definition.schemaIdentity,
-        scope,
-        scopeGeneration,
-        cursor
-      }).pipe(Stream.runForEach((wake) => Queue.offer(wakes, wake)), exitOutcome)
+      const ended = yield* clients.engine.watch(watchRequest).pipe(
+        Stream.runForEach((wake) => Queue.offer(wakes, wake)),
+        exitOutcome
+      )
       assert.deepStrictEqual(yield* Queue.clear(wakes), [{ spaceId }])
       assert.strictEqual(ended, "ProtocolInvalid: The Watch RPC response could not be decoded [cause: SchemaError]")
     }, Effect.scoped)
@@ -399,6 +403,44 @@ describe("a server reply that this client cannot decode", () => {
         ended,
         "ProtocolInvalid: The JoinEphemeral RPC response could not be decoded [cause: SchemaError]"
       )
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "keeps answering other calls after a watch received a wake it cannot decode",
+    Effect.fnUntraced(function*() {
+      const clients = yield* connect(
+        new Map([
+          ["Watch", unknownChunkReply],
+          ["Pull", failWith({ _tag: "SpaceNotJoined", spaceId })]
+        ]),
+        layerCredentialStatic
+      )
+      const watched = yield* clients.engine.watch(watchRequest).pipe(Stream.runDrain, exitOutcome)
+      assert.strictEqual(watched, "ProtocolInvalid: The Watch RPC response could not be decoded [cause: SchemaError]")
+      assert.strictEqual(yield* exitOutcome(clients.engine.pull(pullRequest)), "SpaceNotJoined")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "tells the server to stop a watch whose wake it could not decode",
+    Effect.fnUntraced(function*() {
+      const watches: Array<RequestId> = []
+      const clients = yield* connect(
+        new Map([
+          ["Watch", (requestId) => {
+            watches.push(requestId)
+            return unknownChunkReply(requestId)
+          }],
+          ["Pull", failWith({ _tag: "SpaceNotJoined", spaceId })]
+        ]),
+        layerCredentialStatic
+      )
+      yield* clients.engine.watch(watchRequest).pipe(Stream.runDrain, Effect.exit)
+      yield* clients.engine.pull(pullRequest).pipe(Effect.exit)
+      yield* clients.engine.pull(pullRequest).pipe(Effect.exit)
+      assert.strictEqual(watches.length, 1)
+      assert.deepStrictEqual(yield* Queue.clear(clients.interrupted), watches)
     }, Effect.scoped)
   )
 
