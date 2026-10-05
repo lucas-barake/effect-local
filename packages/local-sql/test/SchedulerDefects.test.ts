@@ -1283,3 +1283,66 @@ describe("inner work that ends by interruption only", () => {
     }, VirtualTime.scoped)
   )
 })
+
+describe("a watch that recovered", () => {
+  it.effect.each(
+    [
+      ["layer", "died"],
+      ["layer", "failed on unavailable storage"],
+      ["layerWorkflow", "died"],
+      ["layerWorkflow", "failed on unavailable storage"]
+    ] as const
+  )(
+    "reports the space online again with %s after its watch %s once and the next watch stayed open",
+    Effect.fnUntraced(function*([constructor, ending]) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      const watchEnds = yield* Deferred.make<void>()
+      let ended: Effect.Effect<never, ReplicaError.ReplicaError> = Effect.die("undecodable wake")
+      if (ending !== "died") ended = Effect.fail(new ReplicaError.StorageUnavailable({ cause: "injected" }))
+      let subscriptions = 0
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => emptyPage(services.crypto, request),
+          watch: (request) => {
+            if (request.spaceId !== spaceId) return Stream.never
+            subscriptions += 1
+            if (subscriptions > 1) return Stream.never
+            return Deferred.await(watchEnds).pipe(Effect.andThen(ended), Stream.fromEffect)
+          }
+        }),
+        logs.layerLogs
+      )
+      yield* Deferred.succeed(watchEnds, undefined)
+      const failed = yield* eventually(services, space, isFailed)
+
+      const recovered = yield* eventually(services, space, isOnlineDrained)
+
+      assert.isTrue(Option.isSome(failed), "the watch failure was reported")
+      assert.strictEqual(subscriptions, 2)
+      assert.isTrue(Option.isSome(recovered), "the space reported online again without another trigger")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "reports the space online again after an in-memory watch died once and the next watch stayed open",
+    Effect.fnUntraced(function*() {
+      const watchDies = yield* Deferred.make<void>()
+      const { awaitStatus, subscriptions } = yield* inMemoryScheduler({
+        pull: Effect.void,
+        watch: Effect.andThen(Deferred.await(watchDies), Effect.die("undecodable wake"))
+      })
+      yield* Deferred.succeed(watchDies, undefined)
+
+      const failed = yield* awaitStatus((status) => status._tag === "Failed")
+      const recovered = yield* awaitStatus((status) => status._tag === "Online")
+
+      assert.isTrue(Option.isSome(failed), "the watch death was reported")
+      assert.strictEqual(subscriptions(), 2)
+      assert.isTrue(Option.isSome(recovered), "the space reported online again without another trigger")
+    }, VirtualTime.scoped)
+  )
+})

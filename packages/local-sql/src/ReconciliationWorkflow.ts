@@ -511,6 +511,9 @@ const layerSchedulerWithConfiguration = (
       >(Option.none())
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
+      const resyncAfterWatchFailure = requestAndNotify.pipe(
+        Effect.catch((error) => reconciliation.watchFailed(error))
+      )
       const authenticationPause = yield* pipe(
         Option.none(),
         Ref.make<Option.Option<Deferred.Deferred<void>>>
@@ -716,7 +719,7 @@ const layerSchedulerWithConfiguration = (
           if (Reconciler.isTransientFailure(error)) {
             yield* Effect.logWarning("Sync watch will retry", error)
             yield* Effect.sleep(yield* watchBackoff.closed)
-            yield* notify
+            yield* resyncAfterWatchFailure
             continue
           }
           yield* Effect.logWarning("Sync watch stopped", error)
@@ -726,18 +729,14 @@ const layerSchedulerWithConfiguration = (
       const superviseWatch = (): Effect.Effect<void, never, Scope.Scope> =>
         watch.pipe(
           Effect.catchCause((cause) => {
-            let reported = Effect.void
-            if (Errors.causeKind(cause) === "Defect") {
-              const died = Errors.unexpectedFailure("Sync watch died", cause)
-              reported = Effect.logError("Sync watch died", cause).pipe(
-                Effect.annotateLogs({ "space.id": options.spaceId }),
-                Effect.andThen(reconciliation.watchFailed(died))
-              )
-            }
-            return reported.pipe(
-              Effect.andThen(watchBackoff.closed),
-              Effect.flatMap(Effect.sleep),
-              Effect.andThen(notify),
+            const resubscribed = watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep))
+            if (Errors.causeKind(cause) !== "Defect") return Effect.andThen(resubscribed, superviseWatch())
+            const died = Errors.unexpectedFailure("Sync watch died", cause)
+            return Effect.logError("Sync watch died", cause).pipe(
+              Effect.annotateLogs({ "space.id": options.spaceId }),
+              Effect.andThen(reconciliation.watchFailed(died)),
+              Effect.andThen(resubscribed),
+              Effect.andThen(resyncAfterWatchFailure),
               Effect.andThen(superviseWatch())
             )
           })
