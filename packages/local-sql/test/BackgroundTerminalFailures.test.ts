@@ -131,7 +131,6 @@ const failures: { readonly [Tag in FailureTag]: Extract<ReplicaError.ReplicaErro
   CursorGap: new ReplicaError.CursorGap({ expected: 2, actual: 1 }),
   SettlementReplayTruncated: new ReplicaError.SettlementReplayTruncated({ requested: 1, oldestAvailable: 2 }),
   StaleReplicationScope: new ReplicaError.StaleReplicationScope({ expected: 2, actual: 1 }),
-  SnapshotUnavailable: new ReplicaError.SnapshotUnavailable({ snapshotId: "snapshot" }),
   CapacityExceeded: new ReplicaError.CapacityExceeded({ resource: "read authorizations", limit: 1 }),
   InvalidConfiguration: new ReplicaError.InvalidConfiguration({ option: "option", message: "injected" }),
   UnknownCommitOutcome: new ReplicaError.UnknownCommitOutcome({ mutationId: "mutation", cause: "injected" }),

@@ -128,10 +128,6 @@ export class StaleReplicationScope extends Schema.TaggedError<StaleReplicationSc
   "@lucas-barake/effect-local/StaleReplicationScope"
 )("StaleReplicationScope", { expected: Schema.Number, actual: Schema.Number }) {}
 
-export class SnapshotUnavailable extends Schema.TaggedError<SnapshotUnavailable>(
-  "@lucas-barake/effect-local/SnapshotUnavailable"
-)("SnapshotUnavailable", { snapshotId: Schema.String }) {}
-
 export const CapacityResource = Schema.Literals([
   "read authorizations",
   "sync watchers",
@@ -275,7 +271,6 @@ export const ReplicaError = Schema.Union([
   CursorGap,
   SettlementReplayTruncated,
   StaleReplicationScope,
-  SnapshotUnavailable,
   CapacityExceeded,
   InvalidConfiguration,
   UnknownCommitOutcome,
