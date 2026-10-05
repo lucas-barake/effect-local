@@ -1,4 +1,5 @@
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Clock from "effect/Clock"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
@@ -80,3 +81,23 @@ export const retryMillis = (timing: RetryTiming, attempt: number) =>
     timing.maximumRetryDelayMillis,
     timing.retryDelayMillis * 2 ** Math.min(attempt - 1, 52)
   )
+
+export const makeWatchBackoff = (timing: RetryTiming) => {
+  let attempt = 0
+  let openedAt = 0
+  let lastDelay = 0
+  const opened = Effect.map(Clock.currentTimeMillis, (now) => {
+    openedAt = now
+  })
+  const closed = Effect.map(Clock.currentTimeMillis, (now) => {
+    if (now - openedAt > lastDelay) attempt = 0
+    attempt += 1
+    lastDelay = retryMillis(timing, attempt)
+    return lastDelay
+  })
+  const reset = Effect.sync(() => {
+    attempt = 0
+    lastDelay = 0
+  })
+  return { opened, closed, reset }
+}

@@ -6,9 +6,11 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
@@ -94,6 +96,8 @@ const harness = Effect.fnUntraced(function*() {
   const heldPulls = yield* Queue.unbounded<void>()
   const transportWaits = yield* Queue.unbounded<void>()
   const watchStarts = yield* Queue.unbounded<void>()
+  const watchTimes: Array<number> = []
+  let watchWakes = false
   const watchFailed = Effect.flip(Deferred.await(watchFailure))
   const watchOutcome = Effect.raceFirst(watchFailed, Deferred.await(watchEnd))
   const remote = SyncEngine.SyncEngine.of({
@@ -121,12 +125,16 @@ const harness = Effect.fnUntraced(function*() {
         return server.pull(request)
       }),
     bootstrap: server.bootstrap,
-    watch: () =>
-      Stream.fromEffect(
-        Queue.offer(watchStarts, undefined).pipe(
-          Effect.andThen(watchOutcome)
-        )
-      ).pipe(Stream.drain)
+    watch: (request) => {
+      const started = Clock.currentTimeMillis.pipe(
+        Effect.tap((now) => Effect.sync(() => watchTimes.push(now))),
+        Effect.andThen(Queue.offer(watchStarts, undefined))
+      )
+      const outcome = Stream.fromEffect(Effect.andThen(started, watchOutcome)).pipe(Stream.drain)
+      if (!watchWakes) return outcome
+      const wake = Protocol.Wake.make({ spaceId: request.spaceId })
+      return Stream.concat(Stream.succeed(wake), outcome)
+    }
   })
   return {
     database: Context.add(database, SqlClient.SqlClient, gate.sql),
@@ -134,6 +142,10 @@ const harness = Effect.fnUntraced(function*() {
     heldPulls,
     transportWaits,
     watchStarts,
+    watchTimes,
+    wakeOnWatch: Effect.sync(() => {
+      watchWakes = true
+    }),
     injected,
     paused: gate.pauses,
     failWatch: (error: ReplicaError.ReplicaError) => Deferred.succeed(watchFailure, error),
@@ -516,13 +528,16 @@ describe("scheduler failure reports", () => {
   )
 })
 
-const inMemory = Effect.fnUntraced(function*(controls: Effect.Success<ReturnType<typeof harness>>) {
+const inMemory = Effect.fnUntraced(function*(
+  controls: Effect.Success<ReturnType<typeof harness>>,
+  retryDelay: Duration.Input = "1 minute"
+) {
   const statuses = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
   const context = yield* Layer.build(
     Reconciler.layer({
       definition: Domain.definition,
       spaceId,
-      retryDelay: "1 minute",
+      retryDelay,
       maximumRetryDelay: "1 minute",
       onStatusChange: (status) => Queue.offer(statuses, status).pipe(Effect.asVoid)
     }).pipe(
@@ -643,6 +658,29 @@ describe("in-memory scheduler failure reports", () => {
 
       assert.isTrue(Option.isSome(drained))
     })
+  )
+
+  it.effect.each(
+    [
+      new ReplicaError.StorageUnavailable({ cause: "injected" }),
+      new ReplicaError.ServerUnavailable()
+    ]
+  )(
+    "grows the delay between watch subscriptions when every watch wakes once and then fails",
+    Effect.fnUntraced(function*(failure) {
+      const controls = yield* harness()
+      yield* inMemory(controls, "1 second")
+      yield* Queue.take(controls.watchStarts)
+      yield* controls.wakeOnWatch
+      yield* controls.failWatch(failure)
+
+      yield* VirtualTime.advanceUntil(Effect.never, "1 second").pipe(Effect.timeoutOption("10 minutes"))
+
+      const times = controls.watchTimes
+      const gaps = times.slice(1).map((time, index) => (time - times[index]) / 1000)
+      assert.deepStrictEqual(gaps, [1, 2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60, 60, 60])
+    }),
+    60_000
   )
 
   it.effect(

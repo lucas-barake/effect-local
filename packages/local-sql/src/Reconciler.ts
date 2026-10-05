@@ -482,7 +482,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
         dirtyEpoch: 0
       }
       spaces.set(space.spaceId, state)
-      let watchAttempt = 0
+      const watchBackoff = Configuration.makeWatchBackoff(retryTiming)
       const watch = (): Effect.Effect<void> =>
         Effect.suspend(() => {
           const authenticationGate = state.authenticationGate
@@ -490,7 +490,8 @@ export const makeManager = Effect.fnUntraced(function*(options: {
             return Deferred.await(authenticationGate).pipe(Effect.andThen(watch()))
           }
           const watchEpoch = state.authenticationEpoch
-          return remote.transportGeneration.pipe(Effect.flatMap((transportGeneration) =>
+          const subscribed = Effect.andThen(watchBackoff.opened, remote.transportGeneration)
+          return subscribed.pipe(Effect.flatMap((transportGeneration) =>
             Stream.unwrap(Effect.map(space.local.replicationState, (replication) =>
               remote.watch({
                 spaceId: space.spaceId,
@@ -500,16 +501,9 @@ export const makeManager = Effect.fnUntraced(function*(options: {
                 scopeGeneration: replication.scopeGeneration,
                 cursor: replication.cursor
               }))).pipe(
-                Stream.runForEach(() => {
-                  watchAttempt = 0
-                  return enqueue(state)
-                }),
+                Stream.runForEach(() => enqueue(state)),
                 Effect.matchEffect({
-                  onSuccess: () => {
-                    watchAttempt += 1
-                    const delay = Configuration.retryMillis(retryTiming, watchAttempt)
-                    return Effect.sleep(delay).pipe(Effect.andThen(watch()))
-                  },
+                  onSuccess: () => watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep), Effect.andThen(watch())),
                   onFailure: Effect.fnUntraced(function*(error) {
                     if (watchEpoch !== state.authenticationEpoch) return yield* watch()
                     const activeAuthenticationGate = state.authenticationGate
@@ -525,11 +519,10 @@ export const makeManager = Effect.fnUntraced(function*(options: {
                       yield* Deferred.await(admission.gate)
                       return yield* watch()
                     } else if (isTransientFailure(error)) {
-                      policy = Effect.suspend(() => {
-                        watchAttempt += 1
-                        const delay = Configuration.retryMillis(retryTiming, watchAttempt)
-                        return backoff(remote, delay, error, transportGeneration).pipe(Effect.andThen(watch()))
-                      })
+                      policy = watchBackoff.closed.pipe(
+                        Effect.flatMap((delay) => backoff(remote, delay, error, transportGeneration)),
+                        Effect.andThen(watch())
+                      )
                     } else {
                       policy = Effect.void
                     }
@@ -992,11 +985,12 @@ export const layerInMemoryScheduler = (
         Effect.forever()
       )
       const workerFiber = yield* Effect.forkScoped(Effect.provideService(worker, ConnectionLane.Priority, "Background"))
-      let watchAttempt = 0
+      const watchBackoff = Configuration.makeWatchBackoff(retryTiming)
       const watch = (): Effect.Effect<void, never, Scope.Scope> =>
         Effect.suspend(() => {
           const watchEpoch = authenticationEpoch
           return awaitAuthenticationChange.pipe(
+            Effect.andThen(watchBackoff.opened),
             Effect.andThen(remote.transportGeneration),
             Effect.flatMap((transportGeneration) =>
               Stream.unwrap(local.replicationState.pipe(
@@ -1011,10 +1005,7 @@ export const layerInMemoryScheduler = (
                   })
                 )
               )).pipe(
-                Stream.runForEach(() => {
-                  watchAttempt = 0
-                  return requestAndNotify
-                }),
+                Stream.runForEach(() => requestAndNotify),
                 Effect.matchEffect({
                   onFailure: Effect.fnUntraced(function*(error) {
                     if (watchEpoch !== authenticationEpoch) return yield* watch()
@@ -1024,7 +1015,7 @@ export const layerInMemoryScheduler = (
                       yield* reconciliation.watchFailed(error)
                       yield* startCredentialWait(error.credentialGeneration, admission)
                       yield* Deferred.await(admission.gate)
-                      watchAttempt = 0
+                      yield* watchBackoff.reset
                       return yield* watch()
                     }
                     const pause = yield* Ref.get(authenticationPause)
@@ -1033,19 +1024,14 @@ export const layerInMemoryScheduler = (
                       return yield* watch()
                     }
                     if (!isTransientFailure(error)) return yield* reconciliation.watchFailed(error)
-                    watchAttempt += 1
-                    const delay = Configuration.retryMillis(retryTiming, watchAttempt)
+                    const delay = yield* watchBackoff.closed
                     return yield* reconciliation.watchFailed(error).pipe(
                       Effect.andThen(Effect.logWarning("Sync watch ended", error)),
                       Effect.andThen(backoff(remote, delay, error, transportGeneration)),
                       Effect.andThen(watch())
                     )
                   }),
-                  onSuccess: () => {
-                    watchAttempt += 1
-                    const delay = Configuration.retryMillis(retryTiming, watchAttempt)
-                    return Effect.sleep(delay).pipe(Effect.andThen(watch()))
-                  }
+                  onSuccess: () => watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep), Effect.andThen(watch()))
                 })
               )
             )

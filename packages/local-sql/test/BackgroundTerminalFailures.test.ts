@@ -12,7 +12,7 @@ import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
-import type * as Duration from "effect/Duration"
+import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
@@ -627,6 +627,75 @@ describe("background sync terminal failures", () => {
       assert.deepStrictEqual(gaps, Arr.sort(gaps, Order.Number))
       assert.isAbove(gaps[gaps.length - 1], gaps[0])
     })
+  )
+
+  it.effect.each(schedulerCases(retryingTags))(
+    "grows the delay between watch subscriptions when every watch wakes once and then fails with %s on %s",
+    Effect.fnUntraced(function*([tag, constructor]) {
+      const services = yield* backgroundServices(constructor, "1 minute")
+      const subscribedAt: Array<number> = []
+      let pulls = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        watch: (request) =>
+          Stream.fromEffect(
+            Effect.map(Clock.currentTimeMillis, (now) => {
+              subscribedAt.push(now)
+              return Protocol.Wake.make({ spaceId: request.spaceId })
+            })
+          ).pipe(Stream.concat(Stream.fail(failures[tag]))),
+        pull: (request) => {
+          pulls += 1
+          return emptyPage(services.crypto, request)
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* space.activate
+
+      yield* VirtualTime.advanceUntil(Effect.never, "1 second").pipe(Effect.timeoutOption("10 minutes"))
+
+      const gaps = subscribedAt.slice(1).map((time, index) => (time - subscribedAt[index]) / 1000)
+      assert.deepStrictEqual(gaps, [1, 2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60, 60, 60])
+      assert.isAtMost(pulls, 2 * subscribedAt.length + 2)
+    }, Effect.scoped),
+    60_000
+  )
+
+  it.effect.each(constructors)(
+    "reconnects a watch quickly when it fails after it stayed open for hours with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* backgroundServices(constructor, "1 minute")
+      const subscribedAt: Array<number> = []
+      const wake = (request: Parameters<Remote["watch"]>[0]) =>
+        Stream.fromEffect(
+          Effect.map(Clock.currentTimeMillis, (now) => {
+            subscribedAt.push(now)
+            return Protocol.Wake.make({ spaceId: request.spaceId })
+          })
+        )
+      const unavailable = Stream.fail(failures.StorageUnavailable)
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        watch: (request) => {
+          if (subscribedAt.length < 5) return Stream.concat(wake(request), unavailable)
+          if (subscribedAt.length > 5) return Stream.concat(wake(request), Stream.never)
+          const open = Stream.fromEffect(Effect.sleep("3 hours")).pipe(Stream.drain)
+          return wake(request).pipe(Stream.concat(open), Stream.concat(unavailable))
+        },
+        pull: (request) => emptyPage(services.crypto, request)
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* space.activate
+
+      yield* VirtualTime.advanceUntil(Effect.never, "1 second").pipe(Effect.timeoutOption("4 hours"))
+
+      assert.strictEqual(subscribedAt.length, 7)
+      const healthyFor = Duration.toMillis(Duration.hours(3))
+      assert.strictEqual(subscribedAt[6] - subscribedAt[5], healthyFor + 1000)
+    }, Effect.scoped),
+    60_000
   )
 
   it.effect.each(schedulerCases(retryingTags))(
@@ -1400,9 +1469,9 @@ describe("background sync terminal failures", () => {
     }, Effect.scoped)
   )
 
-  it.effect(
-    "stops waiting for a new credential when a later background turn fails for another reason",
-    Effect.fnUntraced(function*() {
+  it.effect.each(["ProtocolInvalid", "ServerUnavailable"] as const)(
+    "stops waiting for a new credential when a later background turn fails with %s",
+    Effect.fnUntraced(function*(tag) {
       const services = yield* pendingBackgroundSpace("layer")
       const attempts = yield* makeAttempts
       const waitInterrupted = yield* Deferred.make<void>()
@@ -1413,7 +1482,7 @@ describe("background sync terminal failures", () => {
           Effect.onInterrupt(Effect.never, () => Deferred.succeed(waitInterrupted, undefined)),
         pull: () => {
           if (foreground) return Effect.never
-          if (attempts.count() > 0) return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
+          if (attempts.count() > 0) return Effect.andThen(attempts.record, Effect.fail(failures[tag]))
           return Effect.andThen(
             attempts.record,
             Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
@@ -1428,7 +1497,6 @@ describe("background sync terminal failures", () => {
       yield* space.deactivate
       foreground = false
       yield* attempts.reached(2)
-      yield* awaitSpaceStatus(space, services.reactivity, "Failed")
 
       const interrupted = yield* VirtualTime.advanceUntil(Deferred.await(waitInterrupted)).pipe(
         Effect.timeoutOption("1 minute")

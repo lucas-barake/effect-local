@@ -630,9 +630,10 @@ const layerSchedulerWithConfiguration = (
         Effect.provideService(supervise, ConnectionLane.Priority, "Background")
       )
       const watch = Effect.gen(function*() {
-        let retryAttempt = 0
+        const watchBackoff = Configuration.makeWatchBackoff(configuration)
         while (true) {
           yield* awaitAuthenticationChange
+          yield* watchBackoff.opened
           const watchEpoch = authenticationEpoch
           const result = yield* Stream.unwrap(Effect.map(local.replicationState, (state) =>
             remote.watch({
@@ -643,16 +644,12 @@ const layerSchedulerWithConfiguration = (
               scopeGeneration: state.scopeGeneration,
               cursor: state.cursor
             }))).pipe(
-              Stream.runForEach(() => {
-                retryAttempt = 0
-                return requestAndNotify
-              }),
+              Stream.runForEach(() => requestAndNotify),
               Effect.andThen(requestAndNotify),
               Effect.result
             )
           if (Result.isSuccess(result)) {
-            retryAttempt += 1
-            yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
+            yield* Effect.sleep(yield* watchBackoff.closed)
             continue
           }
           const error = result.failure
@@ -672,14 +669,13 @@ const layerSchedulerWithConfiguration = (
             yield* reconciliation.watchFailed(error)
             yield* startCredentialWait(error.credentialGeneration, admission)
             yield* Deferred.await(admission.gate)
-            retryAttempt = 0
+            yield* watchBackoff.reset
             continue
           }
           yield* reconciliation.watchFailed(error)
           if (Reconciler.isTransientFailure(error)) {
-            retryAttempt += 1
             yield* Effect.logWarning("Sync watch will retry", error)
-            yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
+            yield* Effect.sleep(yield* watchBackoff.closed)
             yield* notify
             continue
           }
