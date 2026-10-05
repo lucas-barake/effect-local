@@ -74,7 +74,8 @@ const captureLogs = () => {
       if (entry.logLevel !== "Error" || !Cause.hasDies(entry.cause)) return []
       return [Cause.squash(entry.cause)]
     })
-  return { layerLogs: Logger.layer([logger]), defects }
+  const errors = () => entries.filter((entry) => entry.logLevel === "Error").length
+  return { layerLogs: Logger.layer([logger]), defects, errors }
 }
 
 const eventually = (
@@ -1160,6 +1161,125 @@ describe("a failure report that dies", () => {
       assert.strictEqual(reportedFailure(failed), "UnexpectedFailure")
       assert.deepStrictEqual(logs.defects().slice(0, 1), ["undecodable response"])
       assert.isTrue(Option.isSome(drained), "the retry drained the space")
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("inner work that ends by interruption only", () => {
+  it.effect.each(constructors)(
+    "subscribes again without reporting a failure after a foreground watch ended by interruption with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      const watchEnds = yield* Deferred.make<void>()
+      let subscriptions = 0
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => emptyPage(services.crypto, request),
+          watch: (request) => {
+            if (request.spaceId !== spaceId) return Stream.never
+            subscriptions += 1
+            if (subscriptions > 1) return Stream.never
+            return Deferred.await(watchEnds).pipe(Effect.andThen(Effect.interrupt), Stream.fromEffect)
+          }
+        }),
+        logs.layerLogs
+      )
+      yield* Deferred.succeed(watchEnds, undefined)
+      yield* settle("5 minutes")
+
+      assert.strictEqual(subscriptions, 2)
+      assert.strictEqual(logs.errors(), 0)
+      const status = yield* space.status
+      assert.strictEqual(status._tag, "Online")
+      assert.strictEqual(status.pending, 0)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "subscribes again without reporting a failure after an in-memory watch ended by interruption",
+    Effect.fnUntraced(function*() {
+      const watchEnds = yield* Deferred.make<void>()
+      const { logs, reconciler, subscriptions } = yield* inMemoryScheduler({
+        pull: Effect.void,
+        watch: Effect.andThen(Deferred.await(watchEnds), Effect.interrupt)
+      })
+      yield* Deferred.succeed(watchEnds, undefined)
+      yield* settle("5 minutes")
+
+      assert.strictEqual(subscriptions(), 2)
+      assert.strictEqual(logs.errors(), 0)
+      assert.strictEqual((yield* reconciler.status)._tag, "Online")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "retries a foreground sync that ended by interruption as an unreachable server with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      let cancelled = false
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (!cancelled || request.spaceId !== spaceId) return emptyPage(services.crypto, request)
+            cancelled = false
+            return Effect.interrupt
+          }
+        }),
+        logs.layerLogs
+      )
+      cancelled = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+
+      let offline = Option.none<ReplicaStatus.SpaceStatus>()
+      if (constructor === "layer") {
+        offline = yield* eventually(services, space, (status) => status._tag === "Offline")
+      }
+      const drained = yield* eventually(services, space, isOnlineDrained)
+
+      if (constructor === "layer") {
+        assert.isTrue(Option.isSome(offline), "the cancelled sync was reported as an unreachable server")
+      }
+      assert.isTrue(Option.isSome(drained), "the retry drained the space")
+      assert.strictEqual(logs.errors(), 0)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "logs no error when the replica scope closes while a foreground workflow turn is in flight",
+    Effect.fnUntraced(function*() {
+      const services = yield* twoSpaces("layerWorkflow")
+      const logs = captureLogs()
+      const pulling = yield* Deferred.make<void>()
+      const replicaScope = yield* Scope.make()
+      let hangs = false
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (request.spaceId !== spaceId || !hangs) return emptyPage(services.crypto, request)
+            return Effect.andThen(Deferred.succeed(pulling, undefined), Effect.never)
+          }
+        }),
+        logs.layerLogs
+      ).pipe(Scope.provide(replicaScope))
+      hangs = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* VirtualTime.advanceUntil(Deferred.await(pulling))
+
+      yield* Scope.close(replicaScope, Exit.void)
+      yield* settle("5 minutes")
+
+      assert.strictEqual(logs.errors(), 0)
     }, VirtualTime.scoped)
   )
 })

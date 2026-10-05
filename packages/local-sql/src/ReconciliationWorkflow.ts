@@ -598,15 +598,15 @@ const layerSchedulerWithConfiguration = (
           }
         }).pipe(
           Effect.catchCause((cause) => {
-            if (Cause.hasFails(cause)) return Effect.failCause(cause)
-            const died = Errors.unexpectedFailure("Reconciliation supervisor turn died", cause)
-            return Effect.logError("Reconciliation supervisor turn died", cause).pipe(
+            if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
+            const failure = Errors.iterationFailure("Reconciliation supervisor turn died", cause)
+            return Errors.logDefect("Reconciliation supervisor turn died", cause).pipe(
               Effect.annotateLogs({ "space.id": options.spaceId }),
               Effect.andThen(reconciliation.generation),
               Effect.map((generation) => {
                 observedGeneration = generation
               }),
-              Effect.andThen(Effect.fail(died))
+              Effect.andThen(Effect.fail(failure))
             )
           }),
           Effect.result
@@ -649,6 +649,7 @@ const layerSchedulerWithConfiguration = (
         while (!stopped) {
           stopped = yield* superviseTurn.pipe(
             Effect.catchCause((cause) => {
+              if (Errors.causeKind(cause) !== "Defect") return Effect.succeed(false)
               return Effect.logError("Reconciliation failure handling died", cause).pipe(
                 Effect.annotateLogs({ "space.id": options.spaceId }),
                 Effect.andThen(reconciliation.generation),
@@ -725,10 +726,15 @@ const layerSchedulerWithConfiguration = (
       const superviseWatch = (): Effect.Effect<void, never, Scope.Scope> =>
         watch.pipe(
           Effect.catchCause((cause) => {
-            const died = Errors.unexpectedFailure("Sync watch died", cause)
-            return Effect.logError("Sync watch died", cause).pipe(
-              Effect.annotateLogs({ "space.id": options.spaceId }),
-              Effect.andThen(reconciliation.watchFailed(died)),
+            let reported = Effect.void
+            if (Errors.causeKind(cause) === "Defect") {
+              const died = Errors.unexpectedFailure("Sync watch died", cause)
+              reported = Effect.logError("Sync watch died", cause).pipe(
+                Effect.annotateLogs({ "space.id": options.spaceId }),
+                Effect.andThen(reconciliation.watchFailed(died))
+              )
+            }
+            return reported.pipe(
               Effect.andThen(watchBackoff.closed),
               Effect.flatMap(Effect.sleep),
               Effect.andThen(notify),
