@@ -753,6 +753,12 @@ const makeLayer = <D extends Definition.Any, R,>(
             return Effect.andThen(stopWait, published)
           }
           const wait = remote.waitForCredentialChange(failure.credentialGeneration).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logError("Background credential wait died", cause).pipe(
+                Effect.annotateLogs({ "space.id": entry.spaceId }),
+                Effect.andThen(Effect.sleep(retryTiming.maximumRetryDelayMillis))
+              )
+            ),
             Effect.andThen(enqueueBackground(entry))
           )
           return FiberMap.run(credentialWaits, entry.membershipIncarnation, wait).pipe(Effect.andThen(published))

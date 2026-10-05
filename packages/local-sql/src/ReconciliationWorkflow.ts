@@ -548,6 +548,12 @@ const layerSchedulerWithConfiguration = (
           if (owned) yield* Deferred.succeed(admission.gate, undefined)
         }).pipe(Effect.uninterruptible)
         return remote.waitForCredentialChange(generation).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("Credential wait died", cause).pipe(
+              Effect.annotateLogs({ "space.id": options.spaceId }),
+              Effect.andThen(Effect.sleep(configuration.maximumRetryDelayMillis))
+            )
+          ),
           Effect.andThen(finishWait),
           Effect.catchCause((cause) => {
             if (Cause.hasInterruptsOnly(cause)) return Effect.void

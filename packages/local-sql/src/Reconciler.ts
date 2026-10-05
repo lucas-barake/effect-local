@@ -334,6 +334,12 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       authenticationWaiters,
       key,
       remote.waitForCredentialChange(admission.generation).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logError("Credential wait died", cause).pipe(
+            Effect.annotateLogs({ "space.id": space.spaceId }),
+            Effect.andThen(Effect.sleep(space.maximumRetryDelayMillis))
+          )
+        ),
         Effect.andThen(finishWait),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
@@ -945,6 +951,12 @@ export const layerInMemoryScheduler = (
           if (owned) yield* Deferred.succeed(admission.gate, undefined)
         }).pipe(Effect.uninterruptible)
         yield* remote.waitForCredentialChange(generation).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("Credential wait died", cause).pipe(
+              Effect.annotateLogs({ "space.id": options.spaceId }),
+              Effect.andThen(Effect.sleep(retryTiming.maximumRetryDelayMillis))
+            )
+          ),
           Effect.andThen(finishWait),
           Effect.catchCause((cause) => {
             if (Cause.hasInterruptsOnly(cause)) return Effect.void

@@ -19,6 +19,7 @@ import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Scope from "effect/Scope"
+import * as SqlClient from "effect/sql/SqlClient"
 import * as Stream from "effect/Stream"
 import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as LocalStore from "../src/LocalStore.js"
@@ -333,26 +334,45 @@ const layerServer = ServerStore.layerTrusted({ definition: Domain.definition, mi
   Layer.provide(SqliteClient.layer({ filename: ":memory:", disableWAL: true })),
   Layer.provide(NodeCrypto.layer)
 )
-const layerClientDatabase = Layer.mergeAll(
-  ConnectionLane.makeLayer().pipe(Layer.provideMerge(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))),
-  NodeCrypto.layer,
-  Reactivity.layer,
-  QueryReactivity.layer
-)
-
 const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
-  readonly pull: Effect.Effect<void>
+  readonly pull: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly watch: Effect.Effect<void>
+  readonly waitForCredentialChange?: Effect.Effect<void>
 }) {
   const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
+  const database = yield* Layer.build(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
+  const sql = Context.get(database, SqlClient.SqlClient)
+  let dying: string | undefined
+  const dyingSql = new Proxy(sql, {
+    apply: (target, thisArg, args: Parameters<typeof sql>) => {
+      const source: unknown = args[0]
+      if (dying !== undefined && Array.isArray(source) && source.join("?").includes(dying)) {
+        return Effect.die("injected statement defect")
+      }
+      return Reflect.apply(target, thisArg, args)
+    }
+  })
+  const layerDyingSql = Layer.succeedContext(Context.add(database, SqlClient.SqlClient, dyingSql))
+  const layerClientDatabase = Layer.mergeAll(
+    ConnectionLane.makeLayer().pipe(Layer.provideMerge(layerDyingSql)),
+    NodeCrypto.layer,
+    Reactivity.layer,
+    QueryReactivity.layer
+  )
   const logs = captureLogs()
   const statuses = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
+  let subscriptions = 0
   const remote = SyncEngine.SyncEngine.of({
     ...idleRemote,
+    waitForCredentialChange: () => faults.waitForCredentialChange ?? Effect.never,
     submitBatch: (request) => server.admitBatch(request, null),
     pull: (request) => Effect.andThen(faults.pull, server.pull(request)),
     bootstrap: server.bootstrap,
-    watch: () => Stream.fromEffect(faults.watch).pipe(Stream.drain)
+    watch: () => {
+      subscriptions += 1
+      if (subscriptions > 1) return Stream.never
+      return Stream.fromEffect(faults.watch).pipe(Stream.drain)
+    }
   })
   const context = yield* Layer.build(
     Reconciler.layer({
@@ -389,11 +409,17 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
     )
   const online = yield* awaitStatus((status) => status._tag === "Online")
   assert.isTrue(Option.isSome(online), "the space came online")
+  const reconciler = Context.get(context, Reconciler.Reconciler)
   return {
-    reconciler: Context.get(context, Reconciler.Reconciler),
+    reconciler,
     local: Context.get(context, LocalStore.Store),
     awaitStatus,
-    logs
+    forgetStatuses: Queue.clear(statuses),
+    logs,
+    subscriptions: () => subscriptions,
+    dieOn: (statement: string | undefined) => {
+      dying = statement
+    }
   }
 })
 
@@ -799,6 +825,109 @@ describe("background turns that end with a defect and an interrupt in one cause"
       yield* Fiber.interrupt(cycle)
 
       assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Idle, pending 0")
+    }, VirtualTime.scoped)
+  )
+})
+
+const credentialRejected = Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 7 }))
+
+const needsAuthentication = (status: ReplicaStatus.ReplicaStatus) => status._tag === "NeedsAuthentication"
+
+describe("credential waits that die", () => {
+  it.effect.each(constructors)(
+    "logs a background credential wait that died and retries the space after the retry delay with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* withPending(constructor, [spaceId])
+      const logs = captureLogs()
+      let rejected = true
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForCredentialChange: () => Effect.die("credential wait died"),
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (rejected) return credentialRejected
+          return emptyPage(services.crypto, request)
+        }
+      })).pipe(Effect.provide(logs.layerLogs))
+      const space = yield* replica.space(spaceId)
+      const paused = yield* eventually(services, space, needsAuthentication)
+      assert.isTrue(Option.isSome(paused), "the space asked for a new credential")
+      yield* settle("5 seconds")
+      const waits = logs.defects()
+      rejected = false
+
+      const drained = yield* eventually(services, space, isDrained)
+
+      assert.isAbove(waits.length, 0)
+      assert.isAtMost(waits.length, 6)
+      assert.deepStrictEqual(Array.from(new Set(waits)), ["credential wait died"])
+      assert.isTrue(Option.isSome(drained), "the space drained once its credential was accepted")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "logs a foreground credential wait that died and retries the space after the retry delay with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      let rejected = false
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          waitForCredentialChange: () => Effect.die("credential wait died"),
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (rejected && request.spaceId === spaceId) return credentialRejected
+            return emptyPage(services.crypto, request)
+          }
+        }),
+        logs.layerLogs
+      )
+      rejected = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      const paused = yield* eventually(services, space, needsAuthentication)
+      assert.isTrue(Option.isSome(paused), "the space asked for a new credential")
+      yield* settle("5 seconds")
+      const waits = logs.defects()
+      rejected = false
+
+      const drained = yield* eventually(services, space, isOnlineDrained)
+
+      assert.isAbove(waits.length, 0)
+      assert.isAtMost(waits.length, 6)
+      assert.deepStrictEqual(Array.from(new Set(waits)), ["credential wait died"])
+      assert.isTrue(Option.isSome(drained), "the space drained once its credential was accepted")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "logs an in-memory credential wait that died and retries after the retry delay",
+    Effect.fnUntraced(function*() {
+      let rejected = false
+      const { awaitStatus, local, logs, reconciler } = yield* inMemoryScheduler({
+        pull: Effect.suspend(() => {
+          if (rejected) return credentialRejected
+          return Effect.void
+        }),
+        watch: Effect.never,
+        waitForCredentialChange: Effect.die("credential wait died")
+      })
+      rejected = true
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* reconciler.schedule
+      const paused = yield* awaitStatus(needsAuthentication)
+      assert.isTrue(Option.isSome(paused), "the space asked for a new credential")
+      yield* settle("5 seconds")
+      const waits = logs.defects()
+      rejected = false
+
+      const drained = yield* awaitStatus((status) => status._tag === "Online" && status.pending === 0)
+
+      assert.isAbove(waits.length, 0)
+      assert.isAtMost(waits.length, 6)
+      assert.deepStrictEqual(Array.from(new Set(waits)), ["credential wait died"])
+      assert.isTrue(Option.isSome(drained), "the space drained once its credential was accepted")
     }, VirtualTime.scoped)
   )
 })
