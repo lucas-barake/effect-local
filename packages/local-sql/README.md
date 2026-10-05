@@ -24,9 +24,14 @@ or `QueryExecutor.layer` directly provides one `ConnectionLane.makeLayer()` per 
 
 `Replica.Space.status` reports a `SpaceStatus`. A remembered space that is not active is `Idle`, with its pending
 count: before its first activation, after deactivation or eviction, and between background syncs. `Idle` says nothing
-about the transport. An activated space is `Connecting` until its first sync attempt resolves. It becomes `Online`
-once a sync completes, and `Offline` only after an attempt failed or the transport reports that it cannot connect.
-Later syncs keep the last outcome until they resolve. Every status carries `synced`, which is `true` once the space
+about the transport. The exception is an inactive space whose last background sync ended in a failure that does not
+retry. It reports `Failed`, or `NeedsAuthentication` for a rejected credential, until a reconciliation of that space
+succeeds. An activated space is `Connecting` until its first sync attempt resolves. It becomes `Online` once a sync
+completes, or `SchemaUpdateAvailable` when the server reports a different schema identity. It becomes `Offline` only after a sync or
+its watch failed because the server could not be reached: `ServerUnavailable`, `OperationTimeout`, or
+`AuthenticatorUnavailable`. A watch failure of that kind while a sync is still running does not change the status.
+`CredentialRejected` reports `NeedsAuthentication` and every other failure reports `Failed` with the failure tag as
+its `message`. Later syncs keep the last outcome until they resolve. Every status carries `synced`, which is `true` once the space
 has an installed replication view, meaning a bootstrap completed at least once, and `false` before that. It is read
 from durable storage, so a synced space stays `synced` after an offline reload. It returns to `false` only when the
 view is cleared: after leaving and rejoining the space, after the server revokes read access, or after a schema
@@ -34,9 +39,25 @@ migration that requires a fresh bootstrap. A scope change keeps the installed vi
 it. An app can show an empty state when `synced` is `true` and a loading state while it is `false`.
 
 `Replica.status` summarizes every remembered space. `counts` holds one count per category, idle included, and
-`totalPending` sums every space. `state` is computed from the active spaces only: `Idle` when none is active, `Failed`
-or `NeedsAuthentication` when any active space is, `Online` or `Offline` when every active space is, `Connecting` when
-any active space is still connecting, and `Degraded` otherwise.
+`totalPending` sums every space. `SchemaUpdateAvailable` counts as online. `state` is computed from the spaces that
+are not `Idle`: `Idle` when there is none, `Failed` when any of them is, otherwise `NeedsAuthentication` when any of
+them is, `Online` or `Offline` when every one of them is, `Connecting` when any of them is still connecting, and
+`Degraded` otherwise.
+
+Reconciliation classifies every `ReplicaError` once, in `Reconciler.ts`. `ServerUnavailable`, `OperationTimeout`, and
+`AuthenticatorUnavailable` retry and report `Offline`. `StorageUnavailable`, `UnknownCommitOutcome`,
+`OwnerUnavailable`, and the `CapacityExceeded` resources that load can clear retry and report `Failed`.
+`CredentialRejected` reports `NeedsAuthentication` and waits for a new credential generation. Everything else stops and
+reports `Failed`. Retries start at `retryDelay` (1 second) and double up to `maximumRetryDelay` (1 minute). The
+background scheduler that drains inactive spaces follows the same classes: it retries the first two with the same
+delays, stops on the rest, and remembers that failure in the space status until a reconciliation succeeds. A watch
+that closes is reopened after the same delays, which reset once a watch has stayed open longer than the previous
+delay. See [synchronization](https://github.com/lucas-barake/effect-local/blob/main/docs/sync.md#websocket-rpc) for
+the per tag and per resource table.
+
+Storage failures are reported by tag. A SQL or platform error is `StorageUnavailable`. A row that cannot be decoded, or
+a required row that is missing, is `StorageCorrupt`. A store or query operation that finds no membership row for its
+space fails with `SpaceUnavailable`.
 
 `SqlReplica.layerWorkflow` uses the same store, query executor, and idempotent reconciliation pass with finite Effect
 Workflow generations. Local SQLite stores canonical entities, visible entities, pending mutations, bounded terminal
@@ -74,9 +95,12 @@ const layerReplica = SqlReplica.layerWorkflow({
 )
 ```
 
-Only `definition` is required. `SqlReplica.defaults` lists the rest: 16 active spaces with 4 reserved
-for foreground work, 256 retained receipts under a cap of 10000, 256 retained history entries, bootstrap bounds of
-100000 entities, 64 MiB, and 4 MiB pages. `defaultScope` defaults to every model in the definition. A caller-minted
+Only `definition` is required. `SqlReplica.defaults` lists the active space, receipt, history, bootstrap, and migration
+defaults: 16 active spaces with 4 reserved for foreground work, 256 retained receipts under a cap of 10000, 256
+retained history entries, bootstrap bounds of 100000 entities, 64 MiB, and 4 MiB pages, and migration retries of 8
+attempts 100 milliseconds apart. The other options default inline: `maximumPendingMutations` 10000,
+`retainedMutationIds` 100000, `pageSize` 256, `reconciliationConcurrency` 8 with `foregroundReconciliationConcurrency`
+1, `retryDelay` 1 second, and `maximumRetryDelay` 1 minute. `defaultScope` defaults to every model in the definition. A caller-minted
 `mutationId` stays idempotent while its receipt is retained, and after that for the next `retainedMutationIds` (100000)
 mutations of the space, where reusing it fails with `MutationIdentityConflict` instead of running the handler again.
 
@@ -179,7 +203,7 @@ const layerStore = ServerStore.layer({
 ```
 
 Maintenance publishes an immutable snapshot and logical floors before bounded physical deletion. A space compacts
-itself: a write that takes its history or receipts past the midpoint between the retained target and the hard cap
+itself: a write that brings its history or receipts to the midpoint between the retained target and the hard cap
 starts one background compaction of that space, so admission only reaches the cap, where it fails before handler
 execution, if compaction cannot keep up. `ServerStore.layerMaintenance` adds a sweep over every space as an Effect
 Cluster singleton, so it runs on one runner at a time. It sweeps once when it starts and then every `interval` (one
@@ -237,7 +261,8 @@ on SQLite. JSON columns stay `TEXT`, compared byte for byte. Every `TEXT` column
 cursors, and window membership follow UTF-8 byte order exactly like SQLite `BINARY`, whatever the database locale.
 PostgreSQL `TEXT` cannot hold U+0000, so text index components are stored with an order preserving escape (U+0001
 becomes U+0001 U+0002 and U+0000 becomes U+0001 U+0001). Queries decode it, so entity values containing control
-characters behave as on SQLite.
+characters behave as on SQLite. On both dialects an unpaired surrogate, and U+D7FF itself, is stored as U+D7FF
+followed by an offset code unit, so text index columns keep such strings losslessly.
 
 SQLite serializes every write transaction. On PostgreSQL the same guarantees come from explicit locks, so several
 runners can share one database:

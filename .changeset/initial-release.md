@@ -27,10 +27,11 @@ share one `assertionSecret`, because each process otherwise generates its own ra
 another runner signed.
 In the browser, `BrowserReplica.layer` turns every tab of an origin into a runner of one cluster, hosts the replica on
 the leader tab that owns SQLite, fails over when that tab closes, and `ReplicaAtom.make` exposes it as an Atom graph.
-Tabs from different deploys never share a cluster: the newest build takes the database over and every tab of an older
-build fails with a typed `BuildSuperseded` error that the app can turn into a reload prompt.
-On React Native, `ExpoReplica.layer` runs the same replica over `expo-sqlite`, `expo-crypto`, and React Native's
-WebSocket, in Expo Go or a native build.
+Tabs from different deploys never share a cluster. The build with the higher definition version takes the database
+over. Between builds of the same version the build of the tab that started last wins. Every tab of the losing build
+fails with a typed `BuildSuperseded` error that the app can turn into a reload prompt.
+On React Native, `ExpoReplica.layer` runs the same replica over `expo-sqlite` and `expo-crypto`, in Expo Go or a native
+build, and `ReactNativeSocket.layerWebSocketConstructor` supplies React Native's WebSocket to the sync client.
 Server storage migrates its own schema by default. Where the database role may not run DDL,
 `Migrations.renderServer` reads the database and returns the exact SQL a DBA applies, and
 `migration: { mode: "verify" }` refuses to serve with `StorageMigrationPending` until the schema is current.
