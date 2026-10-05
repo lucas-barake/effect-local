@@ -68,17 +68,18 @@ application data authority.
    new finite Workflow.
 10. Effect `Reactivity` invalidates affected models, pending inspection, receipts, and status after the SQL transaction
     commits. Every invalidation is delivered one key at a time, after the state it announces is applied and before
-    the operation's waiters resume. A subscriber that throws is logged at error level with its key and never fails
-    the operation that notified it. Subscribers registered after it on the same key miss that one notification,
-    because Effect `Reactivity` stops iterating a key's handlers at the first throw. A notification that a custom
-    `Reactivity` ends with an interruption or a failure never skips bookkeeping or strands a waiter. The operation
-    finishes its state changes and then ends with that cause, and a commit logs it and returns the committed
-    mutation. Notifications raised on the fiber that called `join`, `activate`, `deactivate`, `setScope`, or an
-    operation that activates a space join that caller's `Reactivity.withBatch` and run when the batch ends.
-    Notifications raised on a fiber the library owns, including a commit's, a leave's, and a background turn's, are
-    delivered immediately. Delivery is interruptible, so a custom `Reactivity` whose `invalidate` never returns
-    cannot hold back a deactivation, a leave, or the replica's shutdown. Each waiter of an operation is resumed on
-    its own, so a completion callback that throws is logged and does not keep the other waiters from resuming.
+    the operation's waiters resume. A notification is not part of an operation's contract. A subscriber that
+    throws, or a custom `Reactivity` that fails or interrupts a notification, is logged at error level with the key,
+    and the operation that took effect succeeds. Interrupting the caller's own fiber still interrupts the
+    operation. Subscribers registered after a subscriber that throws on the same key miss that one notification,
+    because Effect `Reactivity` stops iterating a key's handlers at the first throw. Notifications raised on the
+    fiber that called `join`, `activate`, `deactivate`, `setScope`, or an operation that activates a space join that
+    caller's `Reactivity.withBatch` and run when the batch ends. Notifications raised on any other fiber, including
+    one forked from those calls, a commit's, a leave's, and a background turn's, are delivered immediately.
+    Delivery is interruptible, so a custom `Reactivity` whose `invalidate` never returns cannot hold back a
+    deactivation, a leave, the interruption of a join, or the replica's shutdown. Each waiter of an operation is
+    resumed on its own, so a completion callback that throws is logged and does not keep the other waiters from
+    resuming.
 
 The local commit and server settlement contracts are separate. `mutate` returns after the optimistic SQLite commit and
 never widens its error channel with a later server outcome. Durable pending inspection exposes the decoded payload,
