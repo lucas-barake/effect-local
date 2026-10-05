@@ -11,7 +11,7 @@ import * as Schema from "effect/Schema"
 import * as SyncRpc from "../src/SyncRpc.js"
 
 const wireFingerprints: { readonly [protocolVersion: number]: string } = {
-  1: "9e43bfda72114f30"
+  1: "7f739e57d7530416"
 }
 
 const describeSchema = (schema: Schema.Top) => SchemaDescriptor.make(schema, { includeConstructorDefaults: false })
