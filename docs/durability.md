@@ -67,15 +67,26 @@ snapshot and never runs the handler. The client retains that pending envelope an
 atomically installs the named or a newer covering snapshot, or until its durable cursor already covers the snapshot
 sequence and therefore contains any accepted outcome.
 
-SQL errors after a submit begins are exposed as `UnknownCommitOutcome`. The client keeps the pending envelope and
-retries its stable identity. A later exact receipt resolves whether the original transaction committed.
+SQL errors after a submit begins are exposed as `UnknownCommitOutcome`. The client keeps the pending envelope.
+Reconciliation classifies the failure as retryable, so it resubmits the same stable identity after its backoff and
+reports `Failed` until a sync succeeds. A later exact receipt resolves whether the original transaction committed.
 
 ## Validation
 
 Every durable JSON column is parsed and Schema decoded before use. The definition hash prevents a database from being
 opened with a different domain. The local database validates its singleton client identity while membership rows
-define the joined spaces. Envelopes have a canonical SHA 256 digest that binds the membership incarnation. Unknown mutation names, malformed payloads, cursor gaps, identity conflicts, and capacity violations are
-typed failures.
+define the joined spaces. Envelopes have a canonical SHA 256 digest that binds the membership incarnation. Unknown
+mutation names, malformed payloads, cursor gaps, identity conflicts, and capacity violations are typed failures.
+
+Storage failures are reported by what went wrong. A SQL or platform error is `StorageUnavailable`, which reconciliation
+retries. A row that cannot be decoded, or a row the store requires and cannot find, is `StorageCorrupt`, which is
+terminal. A client store or query operation that finds no membership row for its space fails with `SpaceUnavailable`,
+the same error a stale `Replica.Space` handle returns.
+
+Canonical encoding sorts object keys and gives `Map`, `Set`, `HashMap`, and `HashSet` values a tagged encoding whose
+members are sorted by their own encoding, so two equal collections produce one digest whatever their insertion order.
+A `Chunk` keeps its element order under its own tag. Dates, bigints, byte arrays, and other values without a JSON form
+encode as prefixed strings that no plain string can forge.
 
 Client and server storage schemas advance through a package owned ordered migration catalog. Each stored descriptor includes
 its id, name, and checksum. Migration acquires a database writer mutex before catalog reads, validates the complete

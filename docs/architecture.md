@@ -110,8 +110,9 @@ watermark returns `Expired` bound to a published snapshot fence and never execut
 
 Public capabilities are `Context.Service` values. Implementations are scoped Layers. SQL transactions and errors stay
 in Effects. Callers select either the lightweight in memory reconciliation Layer or the finite Workflow Layer. The
-Workflow payload contains only definition, space, client, membership incarnation, and generation identity. Activities call the same
-idempotent reconciliation operation as the in memory scheduler.
+Workflow payload contains only the schema identity, space, client, membership incarnation, replication scope and scope
+generation, and reconciliation generation. Activities call the same idempotent reconciliation operation as the in
+memory scheduler.
 
 The server front door is an authenticated WebSocket RPC facade. It routes every operation by space to one Effect
 Cluster entity, `EffectLocal/Space`, so an active space costs one resident entity. The entity runs SubmitBatch and Discard
@@ -142,8 +143,9 @@ fails the calls addressed to it, Cluster resends them to the next leader, and ca
 mutations from running twice. Cluster fibers dispatch through a private `MessageChannel`, because hidden tabs throttle
 timers and the leader is often hidden.
 
-The browser graph defaults to Effect's shared `Atom.runtime`. The replica Layer and `factory.withReactivity` therefore
-share one application memo map and memoized `Reactivity` service. Every atom and invalidation key includes its space.
+The Atom graph defaults to Effect's shared `Atom.runtime`. The replica Layer and the graph's atoms therefore share one
+application memo map and one memoized `Reactivity` service, on which the graph registers its invalidation keys. Every
+atom and invalidation key includes its space.
 Entity keys invalidate exact records. Query dependencies invalidate once per space and model.
 
 ## Capacity
@@ -189,7 +191,9 @@ the stream fails with `AuthorizationDenied`. The configured interval is therefor
 when policy work hangs or the client stops pulling. Pull and Bootstrap perform uncached one shot authorization checks.
 
 Capacity failures use the Schema tagged `CapacityExceeded { resource, limit }` error across SQL, ephemera, and RPC
-boundaries. Full Cluster mailboxes map to `ServerUnavailable` because the request did not enter its domain handler.
+boundaries. `resource` is the closed union `ReplicaError.CapacityResource`, so reconciliation can decide per resource
+whether a limit is worth retrying. Full Cluster mailboxes map to `ServerUnavailable` because the request did not enter
+its domain handler.
 
 Operational metrics report admission outcome and rejection class, history and receipt depth beside their limits, sync
 and ephemeral watcher populations, wake fanout duration, durable bootstrap installs, maintenance outcomes and prune

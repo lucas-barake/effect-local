@@ -26,9 +26,10 @@ envelopes whose encoded size stays within `Protocol.maximumBatchBytes`, so N pen
 SQLite transaction and records its receipts in one transaction with a savepoint per receipt, so a receipt that fails
 validation rolls back alone and the receipts before it stay recorded. The next batch is sent only after the previous
 batch's receipts are durable. SQLite commits requested generation changes with local mutations and records
-completed generations idempotently. The in memory composition has one dispatcher, one keyed watch per joined space,
-and one keyed turn per active space. A blocked or retrying turn cannot prevent another key from starting, and all keys
-share the same RPC protocol and physical WebSocket.
+completed generations idempotently. The in memory composition has one dispatcher with one keyed watch and one keyed
+turn per foreground active space. A joined space that is not foreground active has no watch. Its pending work drains
+through short background sync passes. A blocked or retrying turn cannot prevent another key from starting, and all
+keys share the same RPC protocol and physical WebSocket.
 
 Each Workflow is finite, coalesces requests made while it ran, and has bounded exponential retry attempts. Its
 identity includes the membership incarnation, so leave and rejoin cannot resume stale execution identity. This bounds
@@ -147,8 +148,27 @@ Authentication and authorization failures remain distinct:
 | `OperationTimeout`         | Session acquisition or an RPC exceeded its configured bound     | `Offline`. Retry with capped exponential backoff |
 | `ServerUnavailable`        | The RPC transport or server is unavailable                      | `Offline`. Retry with capped exponential backoff |
 
-Other terminal protocol, schema, capacity, and storage failures report `Failed`. Ephemeral operations expose the same
-typed failures directly, but ephemera is outside reconciliation and does not change replica status.
+Reconciliation classifies every `ReplicaError` once, in `Reconciler.ts`, and both reconcilers and the background
+scheduler read that one classification:
+
+| Class            | Failures                                                                                            | Status                | Policy                           |
+| ---------------- | --------------------------------------------------------------------------------------------------- | --------------------- | -------------------------------- |
+| Unreachable      | `ServerUnavailable`, `OperationTimeout`, `AuthenticatorUnavailable`                                 | `Offline`             | Retry with backoff               |
+| Retryable        | `StorageUnavailable`, `UnknownCommitOutcome`, `OwnerUnavailable`, retryable `CapacityExceeded`      | `Failed`              | Retry with backoff               |
+| Needs credential | `CredentialRejected`                                                                                | `NeedsAuthentication` | Wait for a new generation        |
+| Terminal         | Every other tag, including `StorageCorrupt`, `AuthorizationDenied`, and terminal `CapacityExceeded` | `Failed`              | Stop until new work is requested |
+
+`CapacityExceeded.resource` is the closed union `ReplicaError.CapacityResource`, and each resource has its own class.
+Limits that load can clear retry: `read authorizations`, `sync watchers`, `sync watchers per principal`,
+`server receipts`, `server history`, `bootstrap authorizations`, `bootstrap pages`, `pending mutations`, and the
+ephemeral join, watcher, space, member, per space byte and key, and event resources. The rest are terminal: client
+receipts, bootstrap and snapshot sizes, page, mutation, receipt, and schema evolution row bytes, submission attempts,
+schema, scope, projection, and reconciliation generations, the sequence ceilings, and the ephemeral payload, snapshot,
+and per member limits. A `Failed` status carries the failure tag as its `message`. A
+`CredentialRejected` that carries no credential generation cannot be waited on and stops like a terminal failure.
+
+Ephemeral operations expose the same typed failures directly, but ephemera is outside reconciliation and does not
+change replica status.
 
 The space entity is the single live owner and relay for a space. Its operations are deliberately volatile. A live wire
 wake contains only the space ID. Entity changes wake a connected client only when they are currently in scope and
@@ -165,8 +185,8 @@ rejection is a receipt, so later envelopes in the batch are still admitted. Any 
 happens at the first envelope the call fails with that error. When it happens later the call returns the receipts
 admitted so far, and the client's next batch starts at the failed envelope and receives the error there. The receipts
 of one response are bounded by `Protocol.maximumBatchBytes`. An admitted envelope whose receipt would exceed that bound
-is left out of the response and returned by exact resubmission. The entity also stops starting admissions once a batch
-has run for `maximumSubmitBatchDuration`, default 1 second, so a slow database or authorization hook shortens the
+is left out of the response and returned by exact resubmission. The store also stops starting admissions once a batch
+has run for its `maximumSubmitBatchDuration`, default 1 second, so a slow database or authorization hook shortens the
 response instead of letting one call outlive the client's `rpcTimeout`. An interrupted or lost batch leaves a committed
 prefix that exact resubmission returns without executing anything twice.
 
@@ -187,14 +207,27 @@ ephemeral streams reconnect to the current space owner.
 
 `SyncRpc.layerJson` is the WebSocket serializer. WebSocket messages are already framed, so it keeps no cumulative
 buffer. It rejects an inbound UTF-8 frame before JSON parsing and rejects an outbound frame after encoding when it
-exceeds the configurable bound. It also replaces RPC defects and infrastructure causes with opaque wire values.
+exceeds the configurable bound. The default bound is `SyncRpc.maximumFrameBytes`, which is
+`Protocol.maximumRpcFrameBytes`: the 4 MiB `Protocol.maximumBatchBytes` plus 64 KiB. It also replaces RPC defects and
+infrastructure causes with opaque wire values.
 
-Application ingress remains responsible for TLS, allowed Origins, socket limits, and HTTP server configuration. The
-installed high level `NodeHttpServer` creates `ws` with its 100 MiB default and does not expose `maxPayload`.
-Production servers must enforce a limit no larger than `SyncRpc.maximumFrameBytes` in a reverse proxy or construct a
-lower level `WebSocketServer({ noServer: true, maxPayload })` through `NodeHttpServer.makeUpgradeHandler`. The
-serializer bound protects parsing and application allocation after the native socket has assembled a message. It does
-not replace an ingress payload limit.
+Application ingress remains responsible for TLS, allowed Origins, socket limits, and HTTP server configuration.
+`NodeHttpServer` creates its `ws` server with the 100 MiB `ws` default unless told otherwise. Its `websocket` option
+forwards to the `ws` `WebSocketServer`, so a production server sets the limit there or in a reverse proxy:
+
+```ts
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer"
+import * as SyncRpc from "@lucas-barake/effect-local-rpc/SyncRpc"
+import * as Http from "node:http"
+
+const layerHttpServer = NodeHttpServer.layer(() => Http.createServer(), {
+  port: 4100,
+  websocket: { maxPayload: SyncRpc.maximumFrameBytes }
+})
+```
+
+The serializer bound protects parsing and application allocation after the native socket has assembled a message. It
+does not replace an ingress payload limit.
 
 ## Reconnect and retry
 
@@ -214,25 +247,39 @@ and returns `OperationTimeout` with the operation name and configured `timeoutMi
 idle indefinitely. Socket ping and reconnect behavior detect a dead connection without treating healthy inactivity as
 an RPC timeout.
 
-The in memory and Workflow reconcilers start transient retries at `retryDelay`, defaulting to 1 second, then double
-the delay up to `maximumRetryDelay`, defaulting to 1 minute. A successful reconciliation resets the attempt count.
-`maximumRetryDelay` must be greater than or equal to `retryDelay`. Workflow also uses `maximumAttempts` to bound one
-durable execution. Its supervisor can start another finite execution after a transient failure.
+The in memory and Workflow reconcilers start retries of the unreachable and retryable classes at `retryDelay`,
+defaulting to 1 second, then double the delay up to `maximumRetryDelay`, defaulting to 1 minute. A successful
+reconciliation resets the attempt count. `maximumRetryDelay` must be greater than or equal to `retryDelay`, and an
+invalid value fails Layer construction with `InvalidConfiguration`. In the in memory reconciler and the background
+scheduler, a wait that follows `ServerUnavailable` or `OperationTimeout` also ends as soon as the socket reconnects.
+Workflow also uses `maximumAttempts`, default 8, to bound one durable execution. Its supervisor can start another finite execution after a transient failure.
 
-`SyncClient.layerProtocolSocket` passes `retryPolicy` and `retryTransientErrors` to Effect's socket protocol. This
-socket reconnect schedule is independent from reconciliation backoff. With `retryTransientErrors: true`, socket open
-errors stay internal while the policy continues. If a finite `retryPolicy` exhausts, that protocol instance stops
-opening the socket. Outstanding RPCs remain bounded by their configured timeout, but restarting socket acquisition
-requires rebuilding the protocol Layer.
+The background scheduler that drains inactive spaces uses the same classes and the same delays. A terminal failure
+stops its retries for that space. The failure is remembered and shown by `space.status` as `Failed`, or as
+`NeedsAuthentication` for a rejected credential, instead of `Idle`, and it counts in `Replica.status`. A rejected
+credential that carries its generation is retried when the provider publishes a new one. The next successful
+reconciliation of the space clears the remembered failure.
+
+`SyncClient.layerProtocolSocket` implements the socket protocol itself and takes `retryPolicy` and
+`retryTransientErrors`. The default `retryPolicy` doubles from 250 milliseconds up to 2 seconds between attempts, with
+jitter between half and the whole delay. The schedule starts over once a connection has received a frame. With
+`retryTransientErrors: true`, a socket open error stays internal while no RPC is in flight. A socket open error with
+an RPC in flight, and any other socket error, fails the RPCs of that connection with `ServerUnavailable`, and new RPCs
+keep failing with it until the socket reconnects. If a finite `retryPolicy` exhausts, that protocol instance stops opening the socket and every later RPC
+fails with `ServerUnavailable`. Restarting socket acquisition requires rebuilding the protocol Layer.
 
 An interrupted socket may fail an active request even when the server committed it. The client retains the pending
 mutation and retries exactly. Retained server receipts deduplicate by mutation identity and client sequence. After a
 receipt expires, the durable watermark prevents reexecution and directs the client to its covering snapshot. The
 accepted log or verified snapshot, not an acknowledgement, changes client canonical state.
 
-When a watch ends, its finalizer requests another reconciliation generation. The transport may reconnect
-independently. The durable view cursor, scope generation, global mutation watermark, pending queue, retractions, and
-reconciliation generation counters contain everything required to resume.
+When a watch ends, the reconciler reopens it. The server sends one wake when a watch opens, so the reopened watch
+requests another reconciliation generation. The delay before reopening starts at `retryDelay` and doubles up to
+`maximumRetryDelay` while watches keep closing early. It returns to `retryDelay` once a watch has stayed open longer
+than the previous delay. An unreachable or retryable failure reopens the watch after that delay. A terminal failure
+stops the watch and is reported in the space status, and a rejected credential waits for a new generation. The
+transport may reconnect independently. The durable view cursor, scope generation, global mutation watermark, pending
+queue, retractions, and reconciliation generation counters contain everything required to resume.
 
 ## Schema deployment
 
