@@ -8,6 +8,7 @@ import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
@@ -330,6 +331,7 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
   const logs = captureLogs()
   const statuses = yield* Queue.unbounded<ReplicaStatus.ReplicaStatus>()
   let subscriptions = 0
+  const watchTimes = yield* Queue.unbounded<number>()
   const remote = SyncEngine.SyncEngine.of({
     ...idleRemote,
     waitForCredentialChange: () => faults.waitForCredentialChange ?? Effect.never,
@@ -341,7 +343,8 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
     watch: () => {
       subscriptions += 1
       if (subscriptions > 1 && faults.everyWatch !== true) return Stream.never
-      return Stream.fromEffect(faults.watch).pipe(Stream.drain)
+      const subscribed = Clock.currentTimeMillis.pipe(Effect.flatMap((now) => Queue.offer(watchTimes, now)))
+      return Stream.fromEffect(Effect.andThen(subscribed, faults.watch)).pipe(Stream.drain)
     }
   })
   const context = yield* Layer.build(
@@ -349,7 +352,7 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
       definition: Domain.definition,
       spaceId,
       retryDelay: "1 second",
-      maximumRetryDelay: "1 second",
+      maximumRetryDelay: "1 minute",
       onStatusChange: (status) => Queue.offer(statuses, status).pipe(Effect.asVoid)
     }).pipe(
       Layer.provideMerge(
@@ -387,6 +390,7 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
     forgetStatuses: Queue.clear(statuses),
     logs,
     subscriptions: () => subscriptions,
+    watchTimes,
     dieOn: (statement: string | undefined) => {
       dying = statement
     },
@@ -788,7 +792,8 @@ describe("credential waits that die", () => {
   it.effect.each(constructors)(
     "waits again without sending the rejected credential after a background credential wait died with %s",
     Effect.fnUntraced(function*(constructor) {
-      const services = yield* withPending(constructor, [spaceId])
+      const services = yield* twoSpaces(constructor, "1 minute")
+      yield* BackgroundReplica.seedPending(services, [spaceId])
       const logs = captureLogs()
       const provider = makeCredentialProvider()
       let rejected = true
@@ -824,7 +829,7 @@ describe("credential waits that die", () => {
   it.effect.each(constructors)(
     "waits again without sending the rejected credential after a foreground credential wait died with %s",
     Effect.fnUntraced(function*(constructor) {
-      const services = yield* twoSpaces(constructor)
+      const services = yield* twoSpaces(constructor, "1 minute")
       const logs = captureLogs()
       const provider = makeCredentialProvider()
       let rejected = false
@@ -1555,6 +1560,9 @@ describe("a failure report whose pending count could not be read", () => {
   )
 })
 
+const secondsBetween = (times: ReadonlyArray<number>) =>
+  times.slice(1).map((time, index) => (time - times[index]) / 1000)
+
 const failureWithDefect = Cause.combine(
   Cause.fail(new ReplicaError.StorageUnavailable({ cause: "injected" })),
   Cause.die("finalizer died")
@@ -1717,15 +1725,17 @@ describe("backoffs that keep dying or ending", () => {
   )
 
   it.effect(
-    "spaces the retries of an in-memory sync by the backoff while its transport wait keeps dying",
+    "doubles the gap between the retries of an in-memory sync while its transport wait keeps dying",
     Effect.fnUntraced(function*() {
+      const pullTimes = yield* Queue.unbounded<number>()
       let offline = false
-      let pulls = 0
       const { local, reconciler } = yield* inMemoryScheduler({
         pull: Effect.suspend(() => {
           if (!offline) return Effect.void
-          pulls += 1
-          return serverUnavailable
+          return Clock.currentTimeMillis.pipe(
+            Effect.flatMap((now) => Queue.offer(pullTimes, now)),
+            Effect.andThen(serverUnavailable)
+          )
         }),
         watch: Effect.never,
         waitForTransportChange: Effect.die("transport wait died")
@@ -1734,10 +1744,9 @@ describe("backoffs that keep dying or ending", () => {
       yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
       yield* reconciler.schedule
 
-      yield* settle("10 minutes")
+      const times = yield* VirtualTime.advanceUntil(Queue.takeN(pullTimes, 9))
 
-      assert.isAtLeast(pulls, 100)
-      assert.isAtMost(pulls, 700)
+      assert.deepStrictEqual(secondsBetween(times), [1, 2, 4, 8, 16, 32, 60, 60])
     }, VirtualTime.scoped)
   )
 
@@ -1776,20 +1785,19 @@ describe("backoffs that keep dying or ending", () => {
   )
 
   it.effect.each(["died", "ended by interruption"] as const)(
-    "spaces the subscriptions of an in-memory watch that keeps having %s by the backoff",
+    "doubles the gap between the subscriptions of an in-memory watch that keeps having %s",
     Effect.fnUntraced(function*(ending) {
       let ended: Effect.Effect<never> = Effect.die("undecodable wake")
       if (ending !== "died") ended = Effect.interrupt
-      const { subscriptions } = yield* inMemoryScheduler({
+      const { watchTimes } = yield* inMemoryScheduler({
         pull: Effect.void,
         watch: ended,
         everyWatch: true
       })
 
-      yield* settle("10 minutes")
+      const times = yield* VirtualTime.advanceUntil(Queue.takeN(watchTimes, 9))
 
-      assert.isAtLeast(subscriptions(), 100)
-      assert.isAtMost(subscriptions(), 700)
+      assert.deepStrictEqual(secondsBetween(times), [1, 2, 4, 8, 16, 32, 60, 60])
     }, VirtualTime.scoped)
   )
 })
@@ -1815,7 +1823,7 @@ describe("a credential wait that ends by interruption", () => {
       yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
       yield* reconciler.schedule
       const paused = yield* awaitStatus(needsAuthentication)
-      yield* settle("5 seconds")
+      yield* settle("5 minutes")
 
       assert.isTrue(Option.isSome(paused), "the space asked for a new credential")
       assert.isAbove(waits, 1)
