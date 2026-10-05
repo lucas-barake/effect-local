@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
@@ -27,6 +28,8 @@ const otherSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000a01")
 
 const claimStatement = "AND attempt_count >= "
+
+const serverUnavailable = Effect.fail(new ReplicaError.ServerUnavailable())
 
 const twoSpaces = (constructor: Constructor) =>
   BackgroundReplica.services({
@@ -213,6 +216,54 @@ describe("background turns that die", () => {
       assert.isTrue(Option.isNone(retried))
       assert.strictEqual(attempts.count(), 1)
       assert.deepStrictEqual(logs.defects(), [])
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "keeps retrying other background spaces after the retry scheduler died with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* withPending(constructor, [spaceId, otherSpaceId])
+      const attempts = yield* makeAttempts
+      const logs = captureLogs()
+      const releaseOther = yield* Deferred.make<void>()
+      let transportWaitDies = true
+      let otherPulls = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForTransportChange: () => {
+          if (transportWaitDies) return Effect.die("transport wait died")
+          return Effect.never
+        },
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (request.spaceId === spaceId) {
+            if (attempts.count() === 0) return Effect.andThen(attempts.record, serverUnavailable)
+            return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
+          }
+          otherPulls += 1
+          if (otherPulls === 1) return Effect.andThen(Deferred.await(releaseOther), serverUnavailable)
+          return emptyPage(services.crypto, request)
+        }
+      })).pipe(Effect.provide(logs.layerLogs))
+      const space = yield* replica.space(spaceId)
+      const other = yield* replica.space(otherSpaceId)
+      yield* VirtualTime.advanceUntil(attempts.reached(1))
+
+      const failed = yield* eventually(services, space, isFailed)
+      transportWaitDies = false
+      yield* Deferred.succeed(releaseOther, undefined)
+      const otherDrained = yield* eventually(services, other, isDrained)
+
+      assert.isTrue(Option.isSome(otherDrained), "the other space retried and drained")
+      assert.strictEqual(failureMessage(failed), "ProtocolInvalid")
+      assert.deepStrictEqual(logs.defects(), ["transport wait died"])
+
+      yield* space.activate
+      yield* space.deactivate
+
+      const drained = yield* eventually(services, space, isDrained)
+
+      assert.isTrue(Option.isSome(drained))
     }, VirtualTime.scoped)
   )
 })

@@ -829,6 +829,21 @@ const makeLayer = <D extends Definition.Any, R,>(
         )
       })
 
+      const abandonRetries = Effect.fnUntraced(function*(cause: Cause.Cause<never>) {
+        yield* Effect.logError("Background retry scheduling died", cause)
+        for (const work of retrySchedule.splice(0)) {
+          yield* settleBackgroundTurn(
+            work.entry,
+            work.version,
+            new ReplicaError.ProtocolInvalid({
+              message: "Background retry scheduling died",
+              cause: Cause.squash(cause)
+            }),
+            Option.none()
+          )
+        }
+      })
+
       const deactivate = (
         entry: RememberedEntry,
         explicit: boolean,
@@ -1668,6 +1683,10 @@ const makeLayer = <D extends Definition.Any, R,>(
         { discard: true }
       )
       yield* retrySchedulerTurn.pipe(
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+          return abandonRetries(cause)
+        }),
         Effect.forever,
         Effect.provideService(ConnectionLane.Priority, "Background"),
         Effect.forkScoped({ startImmediately: true })
