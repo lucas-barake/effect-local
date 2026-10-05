@@ -89,12 +89,6 @@ const makeProtocol = (
       requestClientMap.clear()
       return broadcast({ _tag: "ClientProtocolError", error })
     }
-    const interruptRequest = (requestId: string | number) =>
-      Effect.suspend(() => {
-        const encoded = parser.encode({ _tag: "Interrupt", requestId })
-        if (encoded === undefined) return Effect.void
-        return writer.write(encoded)
-      })
     const processFrame = Effect.fnUntraced(function*(message: Uint8Array | string) {
       const decoded = Effect.try({
         try: () => parser.decode(message),
@@ -135,7 +129,11 @@ const makeProtocol = (
             if (clientId !== undefined) {
               if (response._tag === "Chunk") {
                 return writeResponse(clientId, response).pipe(
-                  Effect.catchDefect(() => interruptRequest(response.requestId))
+                  Effect.catchDefect(() => {
+                    const encoded = parser.encode({ _tag: "Interrupt", requestId: response.requestId })
+                    if (encoded === undefined) return Effect.void
+                    return writer.write(encoded)
+                  })
                 )
               }
               requestClientMap.delete(response.requestId)
