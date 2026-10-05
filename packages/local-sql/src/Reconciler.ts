@@ -212,7 +212,6 @@ const failureClasses: {
   CursorGap: "Terminal",
   SettlementReplayTruncated: "Terminal",
   StaleReplicationScope: "Terminal",
-  SnapshotUnavailable: "Terminal",
   InvalidConfiguration: "Terminal",
   ProtocolInvalid: "Terminal",
   UpgradeRequired: "Terminal",
