@@ -12,9 +12,10 @@ The client and server are composed almost entirely from library Layers:
 `SyncClient.layerWebSocket` for the socket, serialization, protocol session,
 credential middleware, sync engine, and ephemeral client in one call;
 `Authentication.layerCredentialProviderStatic` for the bearer token;
-`BrowserSqlite.layerWorker` for the OPFS worker lifecycle; and
-`PrincipalAssertion.layerJson` on the server. The application code that remains
-is the domain, the authorization policy, and the UI.
+`BrowserSqlite.layerWorker` for the OPFS worker lifecycle; and `SyncServer.layer`
+on the server, which builds the store, the ephemeral hub, and the signed
+principal assertions. The application code that remains is the domain, the
+authorization policy, and the UI.
 
 ## Quickstart
 
@@ -73,18 +74,19 @@ shared/   @effect-local/example-chat-shared
           session.ts  — the login request and the stored session schema
 server/   @effect-local/example-chat-server
           server.ts   — makeServerLayer({ port, databaseFile }): /login route,
-                        authenticator, per-mutation authorization, ServerStore,
-                        EphemeralHub, PrincipalAssertion.layerJson, SyncServer
-                        over WebSocket
+                        authenticator, per-mutation authorization, and
+                        SyncServer.layer over WebSocket, which builds the
+                        ServerStore, the ephemeral hub, and HMAC-signed
+                        principal assertions
           main.ts     — thin entrypoint reading CHAT_PORT / CHAT_DB
 client/   Vite + React app
-          replica.ts  — per-session graph: MultiTab + BrowserReplica over
+          replica.ts  — per-session graph: BrowserReplica.layer over
                         BrowserSqlite.layerWorker and SyncClient.layerWebSocket;
                         the stored session is an Atom.kvs over localStorage and
                         login goes through HttpClient
           chat.tsx    — conversation view: message window pagination, ticks,
                         typing publisher, failed-message overlay
-          sqlite.worker.ts — OpfsWorker.run over the worker's own port
+          sqlite.worker.ts — BrowserSqliteWorker.run over the worker's own port
 mobile/   Expo SDK 57 app
           runtime.ts  — per-session graph: ExpoReplica over expo-sqlite,
                         expo-crypto, and React Native's WebSocket; the session
@@ -120,12 +122,13 @@ test/     domain.test.ts — tick-state derivation matrix, branded id invariants
 - **Ephemeral typing and presence.** Typing is keyed ephemeral state with a
   TTL, published while the draft is non-empty through `graph.publishEphemeral`
   and cleared on send through `graph.removeEphemeral`; presence is an
-  ephemeral member profile. Ephemeral identity is minted once per page load
-  with `Identity.makeClientId` and is deliberately decoupled from the
-  replica's multi-tab client id.
-- **Multi-tab out of the box.** `MultiTab.layer` elects one leader tab per
-  user; followers proxy the replica over `BroadcastChannel`. Reload or open
-  another tab and everything keeps working.
+  ephemeral member profile. The ephemeral member is `graph.member`, which the
+  graph mints from the layer's `Crypto` when an ephemeral atom first needs it.
+  It is separate from the replica's durable client id.
+- **Multi-tab out of the box.** `BrowserReplica.layer` makes the tabs of one
+  user a cluster. One leader tab hosts the replica and the other tabs reach it
+  over `BroadcastChannel`. Reload or open another tab and everything keeps
+  working.
 - **Deploys with tabs still open.** When a tab from a newer deploy opens, it
   takes the replica over and every tab of the older build shows "This app was
   updated in another tab" with a Reload button, driven by the typed
@@ -171,9 +174,9 @@ WebSocket constructor.
   should cursor on a server-assigned per-conversation sequence instead.
 - **Ephemeral identity is client-asserted.** Durable mutations are bound to
   the authenticated principal server-side, but the ephemeral hub's authorize
-  hook receives `{ spaceId, member, principal }` — not the published value —
-  so a valid token holder can publish presence/typing claiming another user's
-  id. Binding that needs a library-level change (the hub authorization input
+  hook receives the space, member, and principal, plus the operation, channel,
+  and key for a publish — not the published value — so a valid token holder
+  can publish presence/typing claiming another user's id. Binding that needs a library-level change (the hub authorization input
   would have to carry the value).
 - Hardening deliberately left out of this demo (worth doing before copying it
   anywhere real): the WebSocket upgrade performs no `Origin` check, and the
