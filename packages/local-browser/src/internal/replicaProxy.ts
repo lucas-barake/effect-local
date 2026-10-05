@@ -3,6 +3,7 @@ import type * as QueryReactivity from "@lucas-barake/effect-local-sql/QueryReact
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import type * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Invalidation from "@lucas-barake/effect-local/Invalidation"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
@@ -232,6 +233,8 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
   let invalidationsLive = false
   const mintMutationId = Identity.makeMutationId.pipe(Effect.provideService(Crypto.Crypto, options.crypto))
 
+  const notify = (keys: ReadonlyArray<string>) => Invalidation.notify(options.reactivity, keys)
+
   const fullRefreshKeys = (): Array<string> => {
     const keys: Array<string> = [ReactivityKey.spaces, ReactivityKey.aggregateStatus]
     for (const spaceId of known) keys.push(ReactivityKey.membership(spaceId))
@@ -273,16 +276,16 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     Stream.runForEach((frame) => {
       if (frame._tag === "Keys") {
         forgetInvalidatedMemberships(frame.keys)
-        return options.reactivity.invalidate(frame.keys)
+        return notify(frame.keys)
       }
       if (frame._tag === "Overflow") {
         dropMemberships()
-        return options.reactivity.invalidate(fullRefreshKeys())
+        return notify(fullRefreshKeys())
       }
       invalidationsLive = true
       if (resubscribing) {
         dropMemberships()
-        return options.reactivity.invalidate(fullRefreshKeys())
+        return notify(fullRefreshKeys())
       }
       resubscribing = true
       return Deferred.succeed(subscribed, undefined)
@@ -295,7 +298,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
   yield* supersededSignal.pipe(
     Effect.andThen(Effect.suspend(() => {
       forgetMemberships()
-      return options.reactivity.invalidate(fullRefreshKeys())
+      return notify(fullRefreshKeys())
     })),
     Effect.forkIn(proxyScope)
   )
@@ -584,7 +587,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         Effect.suspend(() => {
           acquisitions += 1
           if (acquisitions === 1) return Deferred.succeed(acquired, undefined)
-          return options.reactivity.invalidate([key])
+          return notify([key])
         })
       ),
       resubscribeAfterHandover,

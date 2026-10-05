@@ -985,6 +985,41 @@ describe("BrowserReplica", () => {
   )
 
   it.effect(
+    "keeps notifying the subscribers of a follower tab after one of them threw",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        yield* environment.openTab
+        const follower = yield* environment.openTab
+        const space = yield* settle(follower.replica.space(spaceId))
+        yield* settle(space.activate)
+        const reactivity = Context.get(follower.context, Reactivity.Reactivity)
+        let throws = 0
+        let notified = 0
+        reactivity.registerUnsafe([ReactivityKey.pending(spaceId)], () => {
+          throws += 1
+          decodeURIComponent("%")
+        })
+        reactivity.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+          notified += 1
+        })
+
+        yield* settle(space.mutate(PutTodo, { id: "1", title: "first" }))
+        const throwsAfterFirst = throws
+        const notifiedAfterFirst = notified
+        yield* settle(space.mutate(PutTodo, { id: "2", title: "second" }))
+
+        assert.isAbove(throwsAfterFirst, 0, "the subscriber threw while the first mutation was announced")
+        assert.isAbove(notifiedAfterFirst, 0, "the status subscriber was notified of the first mutation")
+        assert.isAbove(throws, throwsAfterFirst, "the second mutation reached the subscriber that throws")
+        assert.isAbove(notified, notifiedAfterFirst, "the status subscriber was notified of the second mutation")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
     "serves a follower tab's mutations and queries from the leader tab's replica",
     Effect.fnUntraced(
       function*() {
