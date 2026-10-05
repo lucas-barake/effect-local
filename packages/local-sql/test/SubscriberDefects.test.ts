@@ -23,6 +23,7 @@ import {
   constructors,
   emptyPage,
   idleRemote,
+  makeAttempts,
   viewId
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
@@ -143,6 +144,20 @@ const healthyRemote = (services: BackgroundReplica.Services, isOffline: () => bo
       return acceptSubmission(request)
     },
     pull: (request) => emptyPage(services.crypto, request)
+  })
+
+const hangingThenDrain = (
+  services: BackgroundReplica.Services,
+  attempts: { readonly record: Effect.Effect<void>; readonly count: () => number }
+) =>
+  SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    submitBatch: acceptSubmission,
+    pull: (request) => {
+      if (request.spaceId !== spaceId) return emptyPage(services.crypto, request)
+      if (attempts.count() === 0) return Effect.andThen(attempts.record, Effect.never)
+      return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
+    }
   })
 
 const installView = (services: BackgroundReplica.Services) =>
@@ -932,6 +947,107 @@ describe("a notification that is still being delivered", () => {
       assert.isTrue(delivering, "the notification of the first join was still being delivered")
       assert.strictEqual(describeExit(waited), "succeeded", "the join that waited")
       assert.strictEqual(describeSettled(joined), "succeeded", "the first join")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "does not hold back the background retry of a space whose foreground takeover failed to build with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      yield* BackgroundReplica.seedPending(services, [spaceId])
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(hangingThenDrain(services, attempts))
+      const space = yield* replica.space(spaceId)
+      yield* VirtualTime.advanceUntil(attempts.reached(1))
+      const delivery = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
+      delivery.arm(2)
+      services.lockNext("SELECT desired_scope_json")
+      const activating = yield* space.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(delivery.entered)
+
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
+      const delivering = activating.pollUnsafe() === undefined
+      yield* delivery.release
+      const activated = yield* Fiber.join(activating)
+
+      assert.isTrue(delivering, "the notification of the failed takeover was still being delivered")
+      assert.isTrue(Option.isSome(retried), "the background turn of the retired runtime ran again")
+      assert.strictEqual(describeSettled(activated), "failed", "the foreground activation")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "announces the pending count of a commit that outlived its caller while the space was still closing",
+    Effect.fnUntraced(function*() {
+      const warnings: Array<string> = []
+      const logger = Logger.make<unknown, void>((entry) => {
+        let message: unknown = entry.message
+        if (Array.isArray(message)) message = message[0]
+        if (entry.logLevel === "Warn") warnings.push(String(message))
+      })
+      const result = yield* Effect.gen(function*() {
+        const services = yield* twoSpaces("layer")
+        const { replica, space } = yield* onlineSpace(services, () => false)
+        const committing = yield* services.holdStatement("INSERT INTO effect_local_client_pending_data", true)
+        const mutating = yield* space.mutate(Domain.PutTodo, firstTodo).pipe(
+          Effect.forkChild({ startImmediately: true })
+        )
+        yield* VirtualTime.advanceUntil(committing.entered)
+        yield* Fiber.interrupt(mutating)
+        const deactivating = yield* space.deactivate.pipe(Effect.forkChild({ startImmediately: true }))
+        yield* settle("1 second")
+        const delivery = yield* services.holdInvalidation(ReactivityKey.aggregateStatus)
+        delivery.arm(1)
+        yield* committing.release
+        yield* VirtualTime.advanceUntil(delivery.entered)
+        const activation = yield* space.activation
+        const aggregate = yield* replica.status
+        yield* delivery.release
+        const deactivated = yield* within(Fiber.join(deactivating))
+        yield* settle("5 minutes")
+        return { activation, aggregate, deactivated, status: yield* space.status }
+      }).pipe(Effect.provide(Logger.layer([logger])))
+
+      assert.deepStrictEqual(warnings, ["Committed local mutations could not schedule reconciliation"])
+      assert.strictEqual(result.activation, "Deactivating")
+      assert.strictEqual(result.aggregate.totalPending, 1)
+      assert.strictEqual(describeExit(result.deactivated), "succeeded", "the deactivation")
+      assert.strictEqual(describeStatus(result.status), "Idle, pending 0")
+    }, VirtualTime.scoped)
+  )
+})
+
+const takeoverRows = constructors.flatMap((constructor) => [
+  { constructor, name: "the activation", key: ReactivityKey.activation(spaceId) },
+  { constructor, name: "the aggregate status", key: ReactivityKey.aggregateStatus }
+])
+
+describe("a subscriber that throws on every notification while a foreground takeover fails to build", () => {
+  it.effect.each(takeoverRows)(
+    "does not lose the background retry of the retired runtime when it subscribes to $name with $constructor",
+    Effect.fnUntraced(function*(row) {
+      const services = yield* twoSpaces(row.constructor)
+      yield* BackgroundReplica.seedPending(services, [spaceId])
+      const attempts = yield* makeAttempts
+      const replica = yield* services.start(hangingThenDrain(services, attempts))
+      const space = yield* replica.space(spaceId)
+      yield* VirtualTime.advanceUntil(attempts.reached(1))
+      let throws = 0
+      services.reactivity.registerUnsafe([row.key], () => {
+        throws += 1
+        decodeURIComponent("%")
+      })
+      services.lockNext("SELECT desired_scope_json")
+
+      const activated = yield* within(space.activate)
+      const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
+      yield* settle("5 minutes")
+      const status = yield* space.status
+
+      assert.isAbove(throws, 0, "the subscriber threw")
+      assert.strictEqual(describeExit(activated), "failed", "the foreground activation")
+      assert.isTrue(Option.isSome(retried), "the background turn of the retired runtime ran again")
+      assert.strictEqual(describeStatus(status), "Idle, pending 0")
     }, VirtualTime.scoped)
   )
 })

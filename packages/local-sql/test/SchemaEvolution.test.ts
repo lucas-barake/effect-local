@@ -1878,6 +1878,51 @@ describe("client schema evolution", () => {
   )
 
   it.effect(
+    "syncs again after a discard whose aggregate status subscriber throws on every notification",
+    Effect.fnUntraced(
+      function*() {
+        const reactivity = yield* Reactivity.Reactivity
+        let throws = 0
+        const cancel = reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+          throws += 1
+          decodeURIComponent("%")
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(cancel))
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const original = yield* v1.mutate(PutTodoV1, { id: "71", title: "original" })
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 0 })
+        const live = serverSync(server)
+        const discarded = yield* Deferred.make<void>()
+        const pulledAfterDiscard = yield* Deferred.make<void>()
+        const observed = SyncEngine.SyncEngine.of({
+          ...live,
+          discard: (request) => Effect.tap(live.discard(request), () => Deferred.succeed(discarded, undefined)),
+          pull: (request) =>
+            Deferred.isDone(discarded).pipe(
+              Effect.flatMap((done) => {
+                if (done) return Deferred.succeed(pulledAfterDiscard, undefined)
+                return Effect.void
+              }),
+              Effect.andThen(live.pull(request))
+            )
+        })
+        const replica = yield* buildReplica(definitionV2, layerHandlersV2, observed, evolution)
+
+        const receipt = yield* replica.discardQuarantined(original.envelope.mutationId)
+        const throwsWhenDiscarded = throws
+        yield* Deferred.await(pulledAfterDiscard)
+
+        assert.strictEqual(receipt._tag, "Rejected")
+        assert.isAbove(throwsWhenDiscarded, 0, "the subscriber threw during the discard")
+        assert.deepStrictEqual(yield* replica.quarantine, [])
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect(
     "resolves a quarantined mutation discarded twice concurrently with one server discard",
     Effect.fnUntraced(
       function*() {

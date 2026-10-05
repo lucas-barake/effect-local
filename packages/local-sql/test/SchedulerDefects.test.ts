@@ -1913,15 +1913,20 @@ describe("a sync request after a watch failure that fails", () => {
   )
 })
 
-describe("a status subscriber that throws while a failure is reported", () => {
-  it.effect.each(constructors)(
-    "still retries and drains a foreground space with %s",
-    Effect.fnUntraced(function*(constructor) {
+const failureReportSubscribers = constructors.flatMap((constructor) => [
+  { constructor, name: "space status", key: ReactivityKey.status(spaceId) },
+  { constructor, name: "aggregate status", key: ReactivityKey.aggregateStatus }
+])
+
+describe("a subscriber that throws while a failure is reported", () => {
+  it.effect.each(failureReportSubscribers)(
+    "still retries and drains a foreground space when it subscribes to the $name with $constructor",
+    Effect.fnUntraced(function*({ constructor, key }) {
       const services = yield* twoSpaces(constructor)
       const logs = captureLogs()
       let throwing = false
       let unavailable = false
-      services.reactivity.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+      services.reactivity.registerUnsafe([key], () => {
         if (throwing) decodeURIComponent("%")
       })
       const { space } = yield* foregroundSpaces(

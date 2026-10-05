@@ -8,7 +8,7 @@ import * as Layer from "effect/Layer"
 import * as Logger from "effect/Logger"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as References from "effect/References"
-import * as Invalidation from "../src/Invalidation.js"
+import * as Invalidation from "../src/internal/invalidation.js"
 
 const captureLogs = () => {
   const errors: Array<{ readonly message: unknown; readonly key: unknown; readonly defect: boolean }> = []
