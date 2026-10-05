@@ -90,6 +90,19 @@ describe("SchemaDescriptor", () => {
     assert.notStrictEqual(patternA, patternB)
   })
 
+  it("describes every Schema.Defect variant as its own built-in transformation", () => {
+    const variants = [
+      Schema.Defect(),
+      Schema.Defect({ includeStack: true }),
+      Schema.Defect({ excludeCause: true }),
+      Schema.Defect({ includeStack: true, excludeCause: true })
+    ]
+    const hashes = variants.map((schema) => Canonical.hash(SchemaDescriptor.make(schema)))
+    assert.strictEqual(new Set(hashes).size, variants.length)
+    const json = SchemaDescriptor.make(Schema.Json)
+    assert.notInclude(hashes, Canonical.hash(json))
+  })
+
   it("still rejects a filter that carries no stable identity", () => {
     const Even = Schema.Number.check(Schema.makeFilter((value: number) => value % 2 === 0))
     assert.throws(() => SchemaDescriptor.make(Even), /Opaque schema checks/)
