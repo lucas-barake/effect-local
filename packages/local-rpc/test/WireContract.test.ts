@@ -106,7 +106,7 @@ describe("sync wire contract", () => {
       actual,
       pinned,
       `A schema that crosses the sync wire changed while Protocol.currentProtocolVersion is still ${version}. ` +
-        `Peers that negotiated version ${version} cannot decode the new shape, and RpcClient reports that as a defect. ` +
+        `Peers that negotiated version ${version} cannot decode the new shape, and their calls fail with ProtocolInvalid. ` +
         "If the change is unintended, revert it. If it is intended, bump currentProtocolVersion in " +
         `packages/local/src/Protocol.ts and pin { [the new version]: "${actual}" } in wireFingerprints in ` +
         "packages/local-rpc/test/WireContract.test.ts."

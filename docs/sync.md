@@ -167,9 +167,9 @@ schema, scope, projection, and reconciliation generations, the sequence ceilings
 and per member limits. A `Failed` status carries the failure tag as its `message`. A
 `CredentialRejected` that carries no credential generation cannot be waited on and stops like a terminal failure.
 
-`UnexpectedFailure` reports a defect inside the replica's own sync machinery, such as a storage client that died or a
-server response the client could not decode. It carries the defect as `cause`, is logged at error level with its full
-cause, and retries with the same backoff. An inactive space keeps it in `space.status` while its retry is pending, so
+`UnexpectedFailure` reports a defect inside the replica's own sync machinery, such as a storage client that died. It
+carries the defect as `cause`, is logged at error level with its full cause, and retries with the same backoff. A
+server response the client could not decode is not one of these. It is `ProtocolInvalid` and terminal. An inactive space keeps it in `space.status` while its retry is pending, so
 the failure stays visible until a sync succeeds.
 
 Ephemeral operations expose the same typed failures directly, but ephemera is outside reconciliation and does not
@@ -241,6 +241,9 @@ ephemeral operation must carry that selected version. There is no implicit proto
 operation rejected after reconnect clears the cached selection, negotiates against the new peer, and retries once. No
 shared version returns typed `UpgradeRequired`. Reconciliation treats it as terminal. Transport loss and
 `ServerUnavailable` remain retryable. A malformed frame remains `ProtocolInvalid`. It is not used as a version signal.
+A well formed reply whose success, error, or streamed value does not match the client's schema for that RPC is also
+`ProtocolInvalid`. It names the RPC, carries the `SchemaError` as `cause`, and fails only that call. The socket stays
+open, and for a stream the client sends the server an interrupt for it.
 
 Clients and servers support protocol version 1 by default. Pending mutations are submitted with `SubmitBatch`, which
 carries up to `Protocol.maximumSubmitBatchEntries` envelopes of one space. A remote defect is a server failure. Every

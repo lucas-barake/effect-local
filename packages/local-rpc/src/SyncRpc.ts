@@ -7,7 +7,7 @@ import * as Rpc from "effect/rpc/Rpc"
 import {
   type FromGroup as RpcClientFromGroup,
   make as makeClient,
-  type Protocol as RpcClientProtocol
+  Protocol as RpcClientProtocol
 } from "effect/rpc/RpcClient"
 import type { RpcClientError } from "effect/rpc/RpcClientError"
 import * as RpcGroup from "effect/rpc/RpcGroup"
@@ -18,6 +18,7 @@ import * as SchemaGetter from "effect/SchemaGetter"
 import type * as Scope from "effect/Scope"
 import * as Authentication from "./Authentication.js"
 import { invalidConfiguration } from "./internal/errors.js"
+import { markingCodecFor } from "./internal/responseDecoding.js"
 
 export const maximumFrameBytes = Protocol.maximumRpcFrameBytes
 
@@ -201,4 +202,9 @@ export const makeRpcClient: Effect.Effect<
   Client,
   never,
   RpcClientProtocol | RpcMiddleware.ForClient<Authentication.Authentication> | Scope.Scope
-> = makeClient(Rpcs)
+> = makeClient(Rpcs).pipe(
+  Effect.updateService(RpcClientProtocol, (protocol) => ({
+    ...protocol,
+    codecFor: markingCodecFor(protocol.codecFor)
+  }))
+)

@@ -127,7 +127,16 @@ const makeProtocol = (
           if (response._tag === "Chunk" || response._tag === "Exit") {
             const clientId = requestClientMap.get(response.requestId)
             if (clientId !== undefined) {
-              if (response._tag === "Exit") requestClientMap.delete(response.requestId)
+              if (response._tag === "Chunk") {
+                return writeResponse(clientId, response).pipe(
+                  Effect.catchDefect(() => {
+                    const encoded = parser.encode({ _tag: "Interrupt", requestId: response.requestId })
+                    if (encoded === undefined) return Effect.void
+                    return writer.write(encoded)
+                  })
+                )
+              }
+              requestClientMap.delete(response.requestId)
               return writeResponse(clientId, response)
             }
           }
