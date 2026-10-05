@@ -1655,3 +1655,75 @@ describe("a watch whose recovery dies", () => {
     }, VirtualTime.scoped)
   )
 })
+
+describe("a failure report whose pending count could not be read", () => {
+  it.effect.each(
+    [
+      ["layer", "died"],
+      ["layer", "failed"],
+      ["layerWorkflow", "died"],
+      ["layerWorkflow", "failed"]
+    ] as const
+  )(
+    "keeps the last known pending count with %s when the count read for the report %s",
+    Effect.fnUntraced(function*([constructor, ending]) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      let undecodable = false
+      const { replica, space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (undecodable && request.spaceId === spaceId) return Effect.die("undecodable response")
+            return emptyPage(services.crypto, request)
+          }
+        }),
+        logs.layerLogs
+      )
+      undecodable = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      if (ending === "died") services.dieNext(storePendingCountStatement, 1_000_000)
+      else services.lockNext(storePendingCountStatement, 1_000_000)
+      yield* settle("5 seconds")
+      const whileUnreadable = yield* replica.status
+      services.dieNext(noStatement)
+      services.lockNext(noStatement)
+      const stored = yield* services.sql<{ readonly pending: number }>`SELECT COUNT(mutation_id) AS pending
+        FROM effect_local_client_pending_data WHERE space_id = ${spaceId}`
+      const status = yield* space.status
+
+      assert.strictEqual(stored[0].pending, 1)
+      assert.strictEqual(whileUnreadable.totalPending, stored[0].pending)
+      assert.strictEqual(whileUnreadable.counts.failed, 1)
+      assert.strictEqual(status._tag, "Failed")
+      assert.strictEqual(status.pending, 1)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "keeps the pending count the in-memory scheduler last published when the count read for the report died",
+    Effect.fnUntraced(function*() {
+      let undecodable = false
+      const { awaitStatus, dieOn, forgetStatuses, local, reconciler } = yield* inMemoryScheduler({
+        pull: Effect.suspend(() => {
+          if (undecodable) return Effect.die("undecodable response")
+          return Effect.void
+        }),
+        watch: Effect.never
+      })
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      undecodable = true
+      yield* reconciler.schedule
+      const counted = yield* awaitStatus((status) => status._tag === "Failed")
+      dieOn(storePendingCountStatement)
+      yield* forgetStatuses
+
+      const uncounted = yield* awaitStatus((status) => status._tag === "Failed")
+
+      assert.strictEqual(Option.getOrThrow(counted).pending, 1)
+      assert.strictEqual(Option.getOrThrow(uncounted).pending, 1)
+    }, VirtualTime.scoped)
+  )
+})

@@ -422,6 +422,14 @@ const makeLayer = <D extends Definition.Any, R,>(
         entry: RememberedEntry,
         next: ReplicaStatus.ReplicaStatus
       ) => modifyContribution(entry, () => next)
+      const publishRuntimeStatus = (
+        entry: RememberedEntry,
+        next: ReplicaStatus.ReplicaStatus,
+        pendingCounted: boolean
+      ) => {
+        if (pendingCounted) return updateContribution(entry, next)
+        return modifyContribution(entry, (current) => ({ ...next, pending: current.pending }))
+      }
       const updatePendingContribution = (entry: RememberedEntry, pending: number) =>
         modifyContribution(entry, (current) => ({ ...current, pending }))
       const readMemberships = SqlSchema.findAll({
@@ -559,7 +567,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           const layerReconciliation = Reconciler.layerOnePass({
             ...options,
             spaceId,
-            onStatusChange: (status) => updateContribution(entry, status),
+            onStatusChange: (status, pendingCounted) => publishRuntimeStatus(entry, status, pendingCounted),
             onReconciled: forgetBackgroundFailure(entry)
           }).pipe(
             Layer.provide(layerLocalStore)
@@ -610,7 +618,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             Reconciler.layerOnePass({
               ...options,
               spaceId,
-              onStatusChange: (status) => updateContribution(entry, status),
+              onStatusChange: (status, pendingCounted) => publishRuntimeStatus(entry, status, pendingCounted),
               onReconciled: forgetBackgroundFailure(entry)
             }).pipe(Layer.provide(layerLocalStore))
           ).pipe(

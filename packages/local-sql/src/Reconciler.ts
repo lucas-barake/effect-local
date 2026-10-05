@@ -56,7 +56,7 @@ export interface Options {
   readonly pageSize?: number
   readonly retryDelay?: Duration.Input
   readonly maximumRetryDelay?: Duration.Input
-  readonly onStatusChange?: (status: ReplicaStatus.ReplicaStatus) => Effect.Effect<void>
+  readonly onStatusChange?: (status: ReplicaStatus.ReplicaStatus, pendingCounted: boolean) => Effect.Effect<void>
   readonly onReconciled?: Effect.Effect<void>
 }
 
@@ -660,7 +660,7 @@ export const layerOnePass = (
       const setStatus = (value: ReplicaStatus.ReplicaStatus) =>
         Ref.set(status, value).pipe(
           Effect.andThen(local.invalidateStatus),
-          Effect.andThen(options.onStatusChange?.(value) ?? Effect.void)
+          Effect.andThen(options.onStatusChange?.(value, true) ?? Effect.void)
         )
       const reportFailure = (
         error: ReplicaError.ReplicaError,
@@ -668,19 +668,25 @@ export const layerOnePass = (
         observedGeneration: number
       ) =>
         local.pendingCount.pipe(
-          Effect.catch(() => Effect.succeed(0)),
+          Effect.map(Option.some),
+          Effect.catch((countError) =>
+            Effect.logWarning("Pending count for a failure report failed", countError).pipe(
+              Effect.annotateLogs({ "space.id": options.spaceId }),
+              Effect.as(Option.none<number>())
+            )
+          ),
           Effect.catchCause((cause) =>
             Errors.logDefect("Pending count for a failure report died", cause).pipe(
               Effect.annotateLogs({ "space.id": options.spaceId }),
-              Effect.as(0)
+              Effect.as(Option.none<number>())
             )
           ),
-          Effect.flatMap((pending) =>
+          Effect.flatMap((counted) =>
             Ref.modify(
               status,
               (current): readonly [ReplicaStatus.ReplicaStatus | undefined, ReplicaStatus.ReplicaStatus] => {
                 if (syncGeneration > observedGeneration) return [undefined, current]
-                const next = failureStatus(error, pending)
+                const next = failureStatus(error, Option.getOrElse(counted, () => current.pending))
                 if (next._tag === "NeedsAuthentication") return [next, next]
                 if (current._tag === "NeedsAuthentication" && failedSinceSyncStarted) return [undefined, current]
                 if (preserveConnecting && (current._tag === "Connecting" || syncing) && next._tag === "Offline") {
@@ -693,7 +699,7 @@ export const layerOnePass = (
                 if (next === undefined) return Effect.void
                 failedSinceSyncStarted = true
                 return local.invalidateStatus.pipe(
-                  Effect.andThen(options.onStatusChange?.(next) ?? Effect.void)
+                  Effect.andThen(options.onStatusChange?.(next, Option.isSome(counted)) ?? Effect.void)
                 )
               })
             )
@@ -723,13 +729,13 @@ export const layerOnePass = (
             current._tag === "SchemaUpdateAvailable" && current.pending === pending && current.cursor === cursor &&
             current.serverSchema.version === serverSchema.version && current.serverSchema.hash === serverSchema.hash
           ) {
-            yield* options.onStatusChange?.(current) ?? Effect.void
+            yield* options.onStatusChange?.(current, true) ?? Effect.void
             return
           }
           yield* setStatus({ _tag: "SchemaUpdateAvailable", pending, cursor, serverSchema })
         } else {
           if (current._tag === "Online" && current.pending === pending && current.cursor === cursor) {
-            yield* options.onStatusChange?.(current) ?? Effect.void
+            yield* options.onStatusChange?.(current, true) ?? Effect.void
             return
           }
           yield* setStatus({ _tag: "Online", pending, cursor })
