@@ -9,6 +9,7 @@ import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Cause from "effect/Cause"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
@@ -47,7 +48,7 @@ const claimStatement = "AND attempt_count >= "
 
 const serverUnavailable = Effect.fail(new ReplicaError.ServerUnavailable())
 
-const twoSpaces = (constructor: Constructor) =>
+const twoSpaces = (constructor: Constructor, maximumRetryDelay: Duration.Input = "1 second") =>
   BackgroundReplica.services({
     constructor,
     clientId,
@@ -55,7 +56,7 @@ const twoSpaces = (constructor: Constructor) =>
     maximumActiveSpaces: 4,
     foregroundActiveSpaces: 2,
     retryDelay: "1 second",
-    maximumRetryDelay: "1 second"
+    maximumRetryDelay
   })
 
 const withPending = (constructor: Constructor, seeded: ReadonlyArray<Identity.SpaceId>) =>
@@ -510,7 +511,7 @@ describe("in-memory scheduler loops that die", () => {
 
 const membershipPendingCountStatement = "SELECT COUNT(p.mutation_id) AS count"
 
-const settle = (duration: "5 seconds" | "5 minutes") =>
+const settle = (duration: "5 seconds" | "5 minutes" | "10 minutes") =>
   VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption(duration))
 
 describe("a background turn that dies settles like a typed failure", () => {
@@ -600,6 +601,127 @@ describe("a background turn that dies settles like a typed failure", () => {
       assert.strictEqual(status.pending, 0)
       assert.strictEqual(status._tag, "Idle")
       assert.strictEqual(aggregate.counts.failed, 0)
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("turns that die retry with the normal backoff", () => {
+  it.effect.each(constructors)(
+    "drains a mutation admitted while a foreground sync was running that then died with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      const syncing = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let dies = false
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (request.spaceId !== spaceId || !dies) return emptyPage(services.crypto, request)
+            dies = false
+            return Deferred.succeed(syncing, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(Effect.die("undecodable response"))
+            )
+          }
+        }),
+        logs.layerLogs
+      )
+      dies = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* VirtualTime.advanceUntil(Deferred.await(syncing))
+      yield* space.mutate(Domain.PutTodo, Domain.todo("second"))
+      yield* Deferred.succeed(release, undefined)
+
+      const drained = yield* eventually(services, space, isOnlineDrained)
+
+      assert.deepStrictEqual(logs.defects(), ["undecodable response"])
+      assert.isTrue(Option.isSome(drained), "both mutations drained without another trigger")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "spaces the retries of a foreground sync that keeps dying by the backoff with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor, "1 minute")
+      const logs = captureLogs()
+      let pulls = 0
+      let dies = false
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (request.spaceId !== spaceId || !dies) return emptyPage(services.crypto, request)
+            pulls += 1
+            return Effect.die("undecodable response")
+          }
+        }),
+        logs.layerLogs
+      )
+      dies = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+
+      yield* settle("10 minutes")
+
+      assert.isAtLeast(pulls, 6)
+      assert.isAtMost(pulls, 20)
+      assert.strictEqual(logs.defects().length, pulls)
+      assert.strictEqual((yield* space.status)._tag, "Failed")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "spaces the retries of a background sync that keeps dying by the backoff with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor, "1 minute")
+      yield* BackgroundReplica.seedPending(services, [spaceId])
+      const logs = captureLogs()
+      let pulls = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => {
+          pulls += 1
+          return Effect.die("undecodable response")
+        }
+      })).pipe(Effect.provide(logs.layerLogs))
+      const space = yield* replica.space(spaceId)
+
+      yield* settle("10 minutes")
+
+      assert.isAtLeast(pulls, 6)
+      assert.isAtMost(pulls, 20)
+      assert.strictEqual(logs.defects().length, pulls)
+      assert.strictEqual((yield* space.status)._tag, "Failed")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "retries a sync that died in the in-memory scheduler without another trigger",
+    Effect.fnUntraced(function*() {
+      let undecodable = false
+      const { awaitStatus, local, logs, reconciler } = yield* inMemoryScheduler({
+        pull: Effect.suspend(() => {
+          if (!undecodable) return Effect.void
+          undecodable = false
+          return Effect.die("undecodable response")
+        }),
+        watch: Effect.never
+      })
+      undecodable = true
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* reconciler.schedule
+
+      const failed = yield* awaitStatus((status) => status._tag === "Failed")
+      const drained = yield* awaitStatus((status) => status._tag === "Online" && status.pending === 0)
+
+      assert.strictEqual(reportedFailure(failed), "UnexpectedFailure")
+      assert.deepStrictEqual(logs.defects(), ["undecodable response"])
+      assert.isTrue(Option.isSome(drained))
     }, VirtualTime.scoped)
   )
 })

@@ -433,20 +433,26 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       yield* Queue.offer(queue, { spaceId: current.spaceId, generation: current.generation })
     }).pipe(Effect.uninterruptible)
     yield* turn.pipe(
-      Effect.catch((error) =>
-        handleFailure(space, error, transportGeneration, observedGeneration).pipe(Effect.catch(() => Effect.void))
-      ),
       Effect.catchCause((cause) => {
-        if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-        space.halted = true
+        if (Cause.hasFails(cause)) return Effect.failCause(cause)
+        const died = Errors.unexpectedFailure("Reconciliation turn died", cause)
         return Effect.logError("Reconciliation turn died", cause).pipe(
           Effect.annotateLogs({ "space.id": space.spaceId }),
           Effect.andThen(space.reconciliation.generation),
-          Effect.flatMap((generation) =>
-            space.reconciliation.failed(Errors.unexpectedFailure("Reconciliation turn died", cause), generation)
-          )
+          Effect.map((generation) => {
+            observedGeneration = generation
+          }),
+          Effect.andThen(Effect.fail(died))
         )
       }),
+      Effect.catch((error) =>
+        handleFailure(space, error, transportGeneration, observedGeneration).pipe(Effect.catch(() => Effect.void))
+      ),
+      Effect.catchCause((cause) =>
+        Effect.logError("Reconciliation failure handling died", cause).pipe(
+          Effect.annotateLogs({ "space.id": space.spaceId })
+        )
+      ),
       Effect.ensuring(finishTurn)
     )
   })
@@ -976,6 +982,18 @@ export const layerInMemoryScheduler = (
           yield* reconciliation.succeeded
           retryAttempt = 0
         }).pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasFails(cause)) return Effect.failCause(cause)
+            const died = Errors.unexpectedFailure("Reconciliation turn died", cause)
+            return Effect.logError("Reconciliation turn died", cause).pipe(
+              Effect.annotateLogs({ "space.id": options.spaceId }),
+              Effect.andThen(reconciliation.generation),
+              Effect.map((generation) => {
+                observedGeneration = generation
+              }),
+              Effect.andThen(Effect.fail(died))
+            )
+          }),
           Effect.catch(Effect.fnUntraced(function*(error) {
             if (error._tag === "CredentialRejected") {
               if (error.credentialGeneration === undefined) {
@@ -1006,11 +1024,14 @@ export const layerInMemoryScheduler = (
         Effect.flatMap(turn),
         Effect.catchCause((cause) => {
           if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-          return Effect.logError("Reconciliation turn died", cause).pipe(
+          return Effect.logError("Reconciliation failure handling died", cause).pipe(
             Effect.annotateLogs({ "space.id": options.spaceId }),
             Effect.andThen(reconciliation.generation),
             Effect.flatMap((generation) =>
-              reconciliation.failed(Errors.unexpectedFailure("Reconciliation turn died", cause), generation)
+              reconciliation.failed(
+                Errors.unexpectedFailure("Reconciliation failure handling died", cause),
+                generation
+              )
             )
           )
         }),

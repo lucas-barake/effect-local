@@ -590,7 +590,21 @@ const layerSchedulerWithConfiguration = (
             yield* workflow.execute(payload).pipe(Effect.ensuring(clearExecution))
             retryAttempt = 0
           }
-        }).pipe(Effect.result)
+        }).pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasFails(cause)) return Effect.failCause(cause)
+            const died = Errors.unexpectedFailure("Reconciliation supervisor turn died", cause)
+            return Effect.logError("Reconciliation supervisor turn died", cause).pipe(
+              Effect.annotateLogs({ "space.id": options.spaceId }),
+              Effect.andThen(reconciliation.generation),
+              Effect.map((generation) => {
+                observedGeneration = generation
+              }),
+              Effect.andThen(Effect.fail(died))
+            )
+          }),
+          Effect.result
+        )
         if (Result.isSuccess(result)) return false
         const error = result.failure
         if (error._tag === "CredentialRejected") {
@@ -630,12 +644,12 @@ const layerSchedulerWithConfiguration = (
           stopped = yield* superviseTurn.pipe(
             Effect.catchCause((cause) => {
               if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-              return Effect.logError("Reconciliation supervisor turn died", cause).pipe(
+              return Effect.logError("Reconciliation failure handling died", cause).pipe(
                 Effect.annotateLogs({ "space.id": options.spaceId }),
                 Effect.andThen(reconciliation.generation),
                 Effect.flatMap((generation) =>
                   reconciliation.failed(
-                    Errors.unexpectedFailure("Reconciliation supervisor turn died", cause),
+                    Errors.unexpectedFailure("Reconciliation failure handling died", cause),
                     generation
                   )
                 ),
