@@ -191,6 +191,7 @@ const failureClasses: {
   StorageUnavailable: "Retryable",
   UnknownCommitOutcome: "Retryable",
   OwnerUnavailable: "Retryable",
+  UnexpectedFailure: "Retryable",
   CredentialRejected: "NeedsCredential",
   StorageCorrupt: "Terminal",
   CanonicalEncodeError: "Terminal",
@@ -442,7 +443,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
           Effect.annotateLogs({ "space.id": space.spaceId }),
           Effect.andThen(space.reconciliation.generation),
           Effect.flatMap((generation) =>
-            space.reconciliation.failed(Errors.reconciliationDied("Reconciliation turn died", cause), generation)
+            space.reconciliation.failed(Errors.unexpectedFailure("Reconciliation turn died", cause), generation)
           )
         )
       }),
@@ -549,7 +550,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
         watch().pipe(
           Effect.catchCause((cause) => {
             if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-            const died = Errors.reconciliationDied("Sync watch died", cause)
+            const died = Errors.unexpectedFailure("Sync watch died", cause)
             return Effect.logError("Sync watch died", cause).pipe(
               Effect.annotateLogs({ "space.id": space.spaceId }),
               Effect.andThen(state.reconciliation.watchFailed(died))
@@ -1009,7 +1010,7 @@ export const layerInMemoryScheduler = (
             Effect.annotateLogs({ "space.id": options.spaceId }),
             Effect.andThen(reconciliation.generation),
             Effect.flatMap((generation) =>
-              reconciliation.failed(Errors.reconciliationDied("Reconciliation turn died", cause), generation)
+              reconciliation.failed(Errors.unexpectedFailure("Reconciliation turn died", cause), generation)
             )
           )
         }),
@@ -1071,7 +1072,7 @@ export const layerInMemoryScheduler = (
       const watchFiber = yield* watch().pipe(
         Effect.catchCause((cause) => {
           if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-          const died = Errors.reconciliationDied("Sync watch died", cause)
+          const died = Errors.unexpectedFailure("Sync watch died", cause)
           return Effect.logError("Sync watch died", cause).pipe(
             Effect.annotateLogs({ "space.id": options.spaceId }),
             Effect.andThen(reconciliation.watchFailed(died))

@@ -735,6 +735,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           const stopWait = FiberMap.remove(credentialWaits, entry.membershipIncarnation)
           if (Reconciler.isTransientFailure(failure)) {
             entry.backgroundFailure = undefined
+            if (failure._tag === "UnexpectedFailure") entry.backgroundFailure = failure
             entry.retryAttempt += 1
             entry.backgroundGeneration += 1
             let retryTransport = Option.none<number>()
@@ -836,7 +837,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           yield* settleBackgroundTurn(
             work.entry,
             work.version,
-            Errors.reconciliationDied("Background retry scheduling died", cause),
+            Errors.unexpectedFailure("Background retry scheduling died", cause),
             Option.none()
           )
         }
@@ -1646,7 +1647,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         return yield* settleBackgroundTurn(
           entry,
           entry.backgroundGeneration,
-          Errors.reconciliationDied("Background sync turn died", cause),
+          Errors.unexpectedFailure("Background sync turn died", cause),
           Option.none()
         )
       })

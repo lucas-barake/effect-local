@@ -499,7 +499,7 @@ the bounded session or RPC operation that expired. Session acquisition, unary RP
 10 second timeouts and accept `Duration.Input`. Established watch streams may remain idle.
 
 Reconciliation classifies every failure once. `ServerUnavailable`, `OperationTimeout`, and `AuthenticatorUnavailable`
-retry and report `Offline`. `StorageUnavailable`, `UnknownCommitOutcome`, `OwnerUnavailable`, and the `CapacityExceeded`
+retry and report `Offline`. `StorageUnavailable`, `UnknownCommitOutcome`, `OwnerUnavailable`, `UnexpectedFailure`, and the `CapacityExceeded`
 resources that load can clear, such as `server history` or `sync watchers`, retry and report `Failed` until a sync
 succeeds. `CredentialRejected` reports `NeedsAuthentication` and waits for a new credential generation. Every other
 failure stops retrying and reports `Failed`. Retries use capped exponential backoff from `retryDelay`, default 1

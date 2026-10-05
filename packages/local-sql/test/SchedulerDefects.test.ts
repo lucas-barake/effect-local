@@ -104,51 +104,44 @@ describe("background turns that die", () => {
     Effect.fnUntraced(function*(constructor) {
       const services = yield* withPending(constructor, [spaceId, otherSpaceId])
       const attempts = yield* makeAttempts
-      let undecodable = true
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
         submitBatch: acceptSubmission,
         pull: (request) => {
           if (request.spaceId !== spaceId) return emptyPage(services.crypto, request)
-          if (undecodable) return Effect.andThen(attempts.record, Effect.die("undecodable response"))
+          if (attempts.count() < 2) return Effect.andThen(attempts.record, Effect.die("undecodable response"))
           return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
         }
       }))
       const space = yield* replica.space(spaceId)
       const other = yield* replica.space(otherSpaceId)
-      yield* VirtualTime.advanceUntil(attempts.reached(1))
-      const otherDrained = yield* eventually(services, other, isDrained)
-      yield* space.activate
-      yield* VirtualTime.advanceUntil(attempts.reached(2))
-      yield* space.deactivate
-      yield* VirtualTime.advanceUntil(attempts.reached(3))
-      yield* space.activate
-      yield* VirtualTime.advanceUntil(attempts.reached(4))
-      undecodable = false
-      yield* space.deactivate
 
+      const otherDrained = yield* eventually(services, other, isDrained)
       const drained = yield* eventually(services, space, isDrained)
 
       assert.isTrue(Option.isSome(otherDrained))
-      assert.isAbove(attempts.count(), 4)
+      assert.isAbove(attempts.count(), 2)
       assert.isTrue(Option.isSome(drained))
     }, VirtualTime.scoped)
   )
 
   it.effect.each(constructors)(
-    "reports a background space whose turn died as failed until its next turn drains it with %s",
+    "reports a background space whose turn died as failed until a retry drains it with %s",
     Effect.fnUntraced(function*(constructor) {
       const services = yield* withPending(constructor, [spaceId, otherSpaceId])
       const attempts = yield* makeAttempts
       const logs = captureLogs()
-      let undecodable = true
+      const healed = yield* Deferred.make<void>()
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
         submitBatch: acceptSubmission,
         pull: (request) => {
           if (request.spaceId !== spaceId) return emptyPage(services.crypto, request)
-          if (undecodable) return Effect.andThen(attempts.record, Effect.die("undecodable response"))
-          return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
+          if (attempts.count() === 0) return Effect.andThen(attempts.record, Effect.die("undecodable response"))
+          return attempts.record.pipe(
+            Effect.andThen(Deferred.await(healed)),
+            Effect.andThen(emptyPage(services.crypto, request))
+          )
         }
       })).pipe(Effect.provide(logs.layerLogs))
       const space = yield* replica.space(spaceId)
@@ -158,7 +151,7 @@ describe("background turns that die", () => {
       const failed = yield* eventually(services, space, isFailed)
       const otherDrained = yield* eventually(services, other, isDrained)
 
-      assert.strictEqual(failureMessage(failed), "ProtocolInvalid")
+      assert.strictEqual(failureMessage(failed), "UnexpectedFailure")
       assert.strictEqual(Option.getOrThrow(failed).pending, 1)
       assert.strictEqual(yield* space.activation, "Inactive")
       assert.isTrue(Option.isSome(otherDrained))
@@ -167,10 +160,7 @@ describe("background turns that die", () => {
       assert.strictEqual(aggregate.counts.failed, 1)
       assert.deepStrictEqual(logs.defects(), ["undecodable response"])
 
-      yield* space.activate
-      yield* VirtualTime.advanceUntil(attempts.reached(2))
-      undecodable = false
-      yield* space.deactivate
+      yield* Deferred.succeed(healed, undefined)
 
       const drained = yield* eventually(services, space, isDrained)
 
@@ -180,7 +170,7 @@ describe("background turns that die", () => {
   )
 
   it.effect.each(constructors)(
-    "reports a background space as failed after a storage statement died in its turn with %s",
+    "retries and drains a background space after a storage statement died in its turn with %s",
     Effect.fnUntraced(function*(constructor) {
       const services = yield* withPending(constructor, [spaceId])
       const logs = captureLogs()
@@ -193,16 +183,12 @@ describe("background turns that die", () => {
       const space = yield* replica.space(spaceId)
 
       const failed = yield* eventually(services, space, isFailed)
-
-      assert.strictEqual(failureMessage(failed), "ProtocolInvalid")
-      assert.strictEqual(yield* space.activation, "Inactive")
-      assert.deepStrictEqual(logs.defects(), ["injected statement defect"])
-
-      yield* space.activate
-      yield* space.deactivate
-
+      const activation = yield* space.activation
       const drained = yield* eventually(services, space, isDrained)
 
+      assert.strictEqual(failureMessage(failed), "UnexpectedFailure")
+      assert.strictEqual(activation, "Inactive")
+      assert.deepStrictEqual(logs.defects(), ["injected statement defect"])
       assert.isTrue(Option.isSome(drained))
     }, VirtualTime.scoped)
   )
@@ -271,7 +257,7 @@ describe("background turns that die", () => {
       const otherDrained = yield* eventually(services, other, isDrained)
 
       assert.isTrue(Option.isSome(otherDrained), "the other space retried and drained")
-      assert.strictEqual(failureMessage(failed), "ProtocolInvalid")
+      assert.strictEqual(failureMessage(failed), "UnexpectedFailure")
       assert.deepStrictEqual(logs.defects(), ["transport wait died"])
 
       yield* space.activate
@@ -333,7 +319,7 @@ describe("foreground sync that dies", () => {
       yield* other.mutate(Domain.PutTodo, Domain.todo("other"))
       const otherDrained = yield* eventually(services, other, isOnlineDrained)
 
-      assert.strictEqual(failureMessage(failed), "ProtocolInvalid")
+      assert.strictEqual(failureMessage(failed), "UnexpectedFailure")
       assert.strictEqual(Option.getOrThrow(failed).pending, 1)
       assert.deepStrictEqual(logs.defects(), ["undecodable response"])
       assert.isTrue(Option.isSome(otherDrained))
@@ -372,7 +358,7 @@ describe("foreground sync that dies", () => {
       yield* other.mutate(Domain.PutTodo, Domain.todo("other"))
       const otherDrained = yield* eventually(services, other, isOnlineDrained)
 
-      assert.strictEqual(failureMessage(failed), "ProtocolInvalid")
+      assert.strictEqual(failureMessage(failed), "UnexpectedFailure")
       assert.deepStrictEqual(logs.defects(), ["undecodable wake"])
       assert.isTrue(Option.isSome(otherDrained))
 
@@ -484,7 +470,7 @@ describe("in-memory scheduler loops that die", () => {
 
       const failed = yield* awaitStatus((status) => status._tag === "Failed")
 
-      assert.strictEqual(reportedFailure(failed), "ProtocolInvalid")
+      assert.strictEqual(reportedFailure(failed), "UnexpectedFailure")
       assert.deepStrictEqual(logs.defects(), ["undecodable response"])
 
       undecodable = false
@@ -509,7 +495,7 @@ describe("in-memory scheduler loops that die", () => {
 
       const failed = yield* awaitStatus((status) => status._tag === "Failed")
 
-      assert.strictEqual(reportedFailure(failed), "ProtocolInvalid")
+      assert.strictEqual(reportedFailure(failed), "UnexpectedFailure")
       assert.deepStrictEqual(logs.defects(), ["undecodable wake"])
 
       yield* local.mutate(Domain.PutTodo, Domain.todo("first"))

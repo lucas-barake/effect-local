@@ -635,7 +635,7 @@ const layerSchedulerWithConfiguration = (
                 Effect.andThen(reconciliation.generation),
                 Effect.flatMap((generation) =>
                   reconciliation.failed(
-                    Errors.reconciliationDied("Reconciliation supervisor turn died", cause),
+                    Errors.unexpectedFailure("Reconciliation supervisor turn died", cause),
                     generation
                   )
                 ),
@@ -706,7 +706,7 @@ const layerSchedulerWithConfiguration = (
       const watchFiber = yield* watch.pipe(
         Effect.catchCause((cause) => {
           if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-          const died = Errors.reconciliationDied("Sync watch died", cause)
+          const died = Errors.unexpectedFailure("Sync watch died", cause)
           return Effect.logError("Sync watch died", cause).pipe(
             Effect.annotateLogs({ "space.id": options.spaceId }),
             Effect.andThen(reconciliation.watchFailed(died))

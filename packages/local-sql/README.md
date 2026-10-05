@@ -46,7 +46,7 @@ them is, `Online` or `Offline` when every one of them is, `Connecting` when any 
 
 Reconciliation classifies every `ReplicaError` once, in `Reconciler.ts`. `ServerUnavailable`, `OperationTimeout`, and
 `AuthenticatorUnavailable` retry and report `Offline`. `StorageUnavailable`, `UnknownCommitOutcome`,
-`OwnerUnavailable`, and the `CapacityExceeded` resources that load can clear retry and report `Failed`.
+`OwnerUnavailable`, `UnexpectedFailure`, and the `CapacityExceeded` resources that load can clear retry and report `Failed`.
 `CredentialRejected` reports `NeedsAuthentication` and waits for a new credential generation. Everything else stops and
 reports `Failed`. Retries start at `retryDelay` (1 second) and double up to `maximumRetryDelay` (1 minute). The
 background scheduler that drains inactive spaces follows the same classes: it retries the first two with the same

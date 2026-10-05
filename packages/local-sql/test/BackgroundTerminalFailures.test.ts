@@ -143,7 +143,8 @@ const failures: { readonly [Tag in FailureTag]: Extract<ReplicaError.ReplicaErro
   OperationTimeout: new ReplicaError.OperationTimeout({ operation: "pull", timeoutMillis: 1 }),
   AuthorizationDenied: new ReplicaError.AuthorizationDenied({ reason: null }),
   OwnerUnavailable: new ReplicaError.OwnerUnavailable({ reason: "transport" }),
-  BuildSuperseded: new ReplicaError.BuildSuperseded({ version: 1, supersedingVersion: 2 })
+  BuildSuperseded: new ReplicaError.BuildSuperseded({ version: 1, supersedingVersion: 2 }),
+  UnexpectedFailure: new ReplicaError.UnexpectedFailure({ message: "injected", cause: "injected" })
 }
 
 const retryingTags: ReadonlyArray<FailureTag> = [
@@ -153,7 +154,8 @@ const retryingTags: ReadonlyArray<FailureTag> = [
   "StorageUnavailable",
   "UnknownCommitOutcome",
   "CapacityExceeded",
-  "OwnerUnavailable"
+  "OwnerUnavailable",
+  "UnexpectedFailure"
 ]
 
 const temporaryCapacity = new Set<ReplicaError.CapacityResource>([
@@ -528,7 +530,9 @@ describe("background sync terminal failures", () => {
 
       assert.isTrue(Option.isSome(retried))
       const aggregate = yield* replica.status
-      assert.strictEqual(aggregate.counts.failed, 0)
+      let reportedFailed = 0
+      if (tag === "UnexpectedFailure") reportedFailed = 1
+      assert.strictEqual(aggregate.counts.failed, reportedFailed)
       assert.strictEqual(aggregate.totalPending, 1)
     }, VirtualTime.scoped)
   )
