@@ -18,6 +18,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef"
 import * as Authentication from "./Authentication.js"
 import * as EphemeralClient from "./EphemeralClient.js"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
+import { findDecodeDefect } from "./internal/decodeDefect.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
 import * as ProtocolSocket from "./internal/protocolSocket.js"
@@ -83,7 +84,14 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
           ),
           Effect.catchCause((cause) => {
             if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
-            return Effect.failCause(cause)
+            const undecodable = findDecodeDefect(cause)
+            if (undecodable === undefined) return Effect.failCause(cause)
+            return Effect.fail(
+              new ReplicaError.ProtocolInvalid({
+                message: "The SubmitBatch RPC response could not be decoded",
+                cause: undecodable
+              })
+            )
           }),
           Effect.timeoutOrElse({
             duration: rpcTimeoutMillis,
@@ -157,7 +165,14 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
               ),
               Effect.catchCause((cause) => {
                 if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
-                return Effect.failCause(cause)
+                const undecodable = findDecodeDefect(cause)
+                if (undecodable === undefined) return Effect.failCause(cause)
+                return Effect.fail(
+                  new ReplicaError.ProtocolInvalid({
+                    message: "The Discard RPC response could not be decoded",
+                    cause: undecodable
+                  })
+                )
               }),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
@@ -224,7 +239,14 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
               ),
               Effect.catchCause((cause) => {
                 if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
-                return Effect.failCause(cause)
+                const undecodable = findDecodeDefect(cause)
+                if (undecodable === undefined) return Effect.failCause(cause)
+                return Effect.fail(
+                  new ReplicaError.ProtocolInvalid({
+                    message: "The Pull RPC response could not be decoded",
+                    cause: undecodable
+                  })
+                )
               }),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
@@ -293,7 +315,14 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
               ),
               Effect.catchCause((cause) => {
                 if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
-                return Effect.failCause(cause)
+                const undecodable = findDecodeDefect(cause)
+                if (undecodable === undefined) return Effect.failCause(cause)
+                return Effect.fail(
+                  new ReplicaError.ProtocolInvalid({
+                    message: "The Bootstrap RPC response could not be decoded",
+                    cause: undecodable
+                  })
+                )
               }),
               Effect.timeoutOrElse({
                 duration: rpcTimeoutMillis,
@@ -379,7 +408,14 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                     ),
                     Stream.catchCause((cause) => {
                       if (Cause.hasInterruptsOnly(cause)) return Stream.fail(new ReplicaError.ServerUnavailable())
-                      return Stream.failCause(cause)
+                      const undecodable = findDecodeDefect(cause)
+                      if (undecodable === undefined) return Stream.failCause(cause)
+                      return Stream.fail(
+                        new ReplicaError.ProtocolInvalid({
+                          message: "The Watch RPC response could not be decoded",
+                          cause: undecodable
+                        })
+                      )
                     })
                   )
                 })

@@ -12,6 +12,7 @@ import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
 import type * as Authentication from "./Authentication.js"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
+import { findDecodeDefect } from "./internal/decodeDefect.js"
 import { invalidConfiguration } from "./internal/errors.js"
 import * as SyncRpc from "./SyncRpc.js"
 
@@ -99,7 +100,14 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
           ),
           Effect.catchCause((cause) => {
             if (Cause.hasInterruptsOnly(cause)) return Effect.fail(new ReplicaError.ServerUnavailable())
-            return Effect.failCause(cause)
+            const undecodable = findDecodeDefect(cause)
+            if (undecodable === undefined) return Effect.failCause(cause)
+            return Effect.fail(
+              new ReplicaError.ProtocolInvalid({
+                message: "The Negotiate RPC response could not be decoded",
+                cause: undecodable
+              })
+            )
           }),
           Effect.withSpan("ProtocolSession.negotiate")
         )
