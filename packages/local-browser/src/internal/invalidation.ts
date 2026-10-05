@@ -6,7 +6,7 @@ export const notify = (reactivity: Reactivity.Reactivity, keys: Iterable<string>
   Effect.forEach(
     new Set(keys),
     (key) =>
-      reactivity.withBatch(reactivity.invalidate([key])).pipe(
+      reactivity.invalidate([key]).pipe(
         Effect.catchCause((cause) => {
           if (!Cause.hasDies(cause)) return Effect.failCause(cause)
           return Effect.logError("Reactivity subscriber died", cause).pipe(

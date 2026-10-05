@@ -149,3 +149,21 @@ describe("a subscriber of an entity that throws on every notification", () => {
     }, Effect.scoped)
   )
 })
+
+describe("a replica activated inside a batch of the caller", () => {
+  it.effect(
+    "announces the first sync of its space after the batch ended",
+    Effect.fnUntraced(function*() {
+      const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
+      const client = yield* openClient(
+        remoteOf(server),
+        Identity.ClientId.make("cli_00000000-0000-4000-8000-0000000000b3")
+      )
+
+      yield* client.reactivity.withBatch(client.space.activate)
+      const synced = yield* awaitStatus(client.reactivity, client.space, (status) => status.synced)
+
+      assert.isTrue(synced.synced)
+    }, Effect.scoped)
+  )
+})

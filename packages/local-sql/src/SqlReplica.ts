@@ -357,6 +357,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const defaultScopeDigest = yield* Protocol.replicationScopeDigest(normalizedDefaultScope)
 
       const notify = (keys: ReadonlyArray<string>) => Invalidation.notify(reactivity, keys)
+      const flush = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys)
       const addContribution = (entry: RememberedEntry) =>
         Ref.update(aggregate, (current) => {
           const category = statusCategory(entry.summaryStatus)
@@ -418,14 +419,19 @@ const makeLayer = <D extends Definition.Any, R,>(
         entry: RememberedEntry,
         next: ReplicaStatus.ReplicaStatus
       ) => modifyContribution(entry, () => next)
+      const publishContribution = (changed: boolean) => {
+        if (changed) return flush([ReactivityKey.aggregateStatus])
+        return Effect.void
+      }
       const publishRuntimeStatus = (
         entry: RememberedEntry,
         next: ReplicaStatus.ReplicaStatus,
         pendingCounted: boolean
-      ) => {
-        if (pendingCounted) return updateContribution(entry, next)
-        return modifyContribution(entry, (current) => ({ ...next, pending: current.pending }))
-      }
+      ) =>
+        applyContribution(entry, (current) => {
+          if (pendingCounted) return next
+          return { ...next, pending: current.pending }
+        }).pipe(Effect.flatMap(publishContribution), Effect.uninterruptible)
       const applyPendingContribution = (entry: RememberedEntry, pending: number) =>
         applyContribution(entry, (current) => ({ ...current, pending }))
       const readMemberships = SqlSchema.findAll({
@@ -499,7 +505,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         Effect.suspend(() => {
           if (entry.synced === installed) return Effect.void
           entry.synced = installed
-          return notify([ReactivityKey.status(entry.spaceId)])
+          return flush([ReactivityKey.status(entry.spaceId)])
         })
 
       const publishSettlements = (entry: RememberedEntry) =>
@@ -551,7 +557,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               Effect.flatMap((changed) =>
                 Deferred.await(reconcilerReady).pipe(
                   Effect.flatMap((ready) => ready.schedule),
-                  Effect.ensuring(announceContribution(changed))
+                  Effect.ensuring(publishContribution(changed))
                 )
               )
             )

@@ -1633,7 +1633,7 @@ export const layer = (
         }
         return Array.from(new Set(keys))
       })
-      const notify = (keys: ReadonlyArray<string>) => Invalidation.notify(reactivity, keys)
+      const notify = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys)
       const invalidate = (
         entities: ReadonlyArray<Protocol.EntityKey>,
         receiptIds: ReadonlyArray<Identity.MutationId> = [],
