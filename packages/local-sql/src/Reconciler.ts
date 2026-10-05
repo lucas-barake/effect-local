@@ -19,6 +19,7 @@ import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
+import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import { backoff } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
@@ -434,6 +435,17 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       Effect.catch((error) =>
         handleFailure(space, error, transportGeneration, observedGeneration).pipe(Effect.catch(() => Effect.void))
       ),
+      Effect.catchCause((cause) => {
+        if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+        space.halted = true
+        return Effect.logError("Reconciliation turn died", cause).pipe(
+          Effect.annotateLogs({ "space.id": space.spaceId }),
+          Effect.andThen(space.reconciliation.generation),
+          Effect.flatMap((generation) =>
+            space.reconciliation.failed(Errors.reconciliationDied("Reconciliation turn died", cause), generation)
+          )
+        )
+      }),
       Effect.ensuring(finishTurn)
     )
   })

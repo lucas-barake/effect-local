@@ -33,6 +33,7 @@ import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
 import * as ConnectionLane from "./ConnectionLane.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
+import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
@@ -835,10 +836,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           yield* settleBackgroundTurn(
             work.entry,
             work.version,
-            new ReplicaError.ProtocolInvalid({
-              message: "Background retry scheduling died",
-              cause: Cause.squash(cause)
-            }),
+            Errors.reconciliationDied("Background retry scheduling died", cause),
             Option.none()
           )
         }
@@ -1648,7 +1646,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         return yield* settleBackgroundTurn(
           entry,
           entry.backgroundGeneration,
-          new ReplicaError.ProtocolInvalid({ message: "Background sync turn died", cause: Cause.squash(cause) }),
+          Errors.reconciliationDied("Background sync turn died", cause),
           Option.none()
         )
       })

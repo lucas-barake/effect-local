@@ -24,6 +24,7 @@ import * as Workflow from "effect/workflow/Workflow"
 import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
 import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
+import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Reconciler from "./Reconciler.js"
@@ -557,72 +558,91 @@ const layerSchedulerWithConfiguration = (
         )
       }
 
-      const supervise = Effect.gen(function*() {
-        let retryAttempt = 0
-        let readmit = false
-        while (true) {
-          if (!readmit) yield* LosslessQueue.take(wake)
-          yield* awaitAuthenticationChange
-          let observedGeneration = yield* reconciliation.generation
-          const requestFirst = readmit
-          readmit = false
-          const result = yield* Effect.gen(function*() {
-            if (requestFirst) yield* local.requestReconciliation
-            while (true) {
-              yield* awaitAuthenticationChange
-              observedGeneration = yield* reconciliation.generation
-              const generations = yield* local.reconciliationGenerations
-              if (generations.completed >= generations.requested) return
-              const state = yield* local.replicationState
-              const payload = Payload.make({
-                schemaIdentity: schemaIdentityKey(options.definition),
-                spaceId: options.spaceId,
-                clientId: options.clientId,
-                membershipIncarnation: local.membershipIncarnation,
-                scope: state.scope,
-                scopeGeneration: state.scopeGeneration,
-                generation: generations.requested
-              })
-              const workflow = make(payload)
-              const activeExecutionId = yield* workflow.executionId(payload)
-              yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
-              const clearExecution = Ref.set(activeExecution, Option.none())
-              yield* workflow.execute(payload).pipe(Effect.ensuring(clearExecution))
-              retryAttempt = 0
-            }
-          }).pipe(Effect.result)
-          if (Result.isSuccess(result)) continue
-          const error = result.failure
-          if (error._tag === "CredentialRejected") {
-            if (error.credentialGeneration === undefined) {
-              yield* reconciliation.failed(error, observedGeneration)
-              yield* Effect.logWarning("Rejected credential did not include its generation")
-              return
-            }
-            const admission = yield* admitCredentialPause
-            yield* reconciliation.failed(error, observedGeneration)
-            yield* startCredentialWait(error.credentialGeneration, admission)
-            yield* Deferred.await(admission.gate)
+      let retryAttempt = 0
+      let readmit = false
+      const superviseTurn = Effect.gen(function*() {
+        if (!readmit) yield* LosslessQueue.take(wake)
+        yield* awaitAuthenticationChange
+        let observedGeneration = yield* reconciliation.generation
+        const requestFirst = readmit
+        readmit = false
+        const result = yield* Effect.gen(function*() {
+          if (requestFirst) yield* local.requestReconciliation
+          while (true) {
+            yield* awaitAuthenticationChange
+            observedGeneration = yield* reconciliation.generation
+            const generations = yield* local.reconciliationGenerations
+            if (generations.completed >= generations.requested) return
+            const state = yield* local.replicationState
+            const payload = Payload.make({
+              schemaIdentity: schemaIdentityKey(options.definition),
+              spaceId: options.spaceId,
+              clientId: options.clientId,
+              membershipIncarnation: local.membershipIncarnation,
+              scope: state.scope,
+              scopeGeneration: state.scopeGeneration,
+              generation: generations.requested
+            })
+            const workflow = make(payload)
+            const activeExecutionId = yield* workflow.executionId(payload)
+            yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
+            const clearExecution = Ref.set(activeExecution, Option.none())
+            yield* workflow.execute(payload).pipe(Effect.ensuring(clearExecution))
             retryAttempt = 0
-            readmit = true
-            continue
           }
-          const pause = yield* Ref.get(authenticationPause)
-          if (Option.isSome(pause)) {
-            yield* Deferred.await(pause.value)
-            readmit = true
-            continue
+        }).pipe(Effect.result)
+        if (Result.isSuccess(result)) return false
+        const error = result.failure
+        if (error._tag === "CredentialRejected") {
+          if (error.credentialGeneration === undefined) {
+            yield* reconciliation.failed(error, observedGeneration)
+            yield* Effect.logWarning("Rejected credential did not include its generation")
+            return true
           }
+          const admission = yield* admitCredentialPause
           yield* reconciliation.failed(error, observedGeneration)
-          if (Reconciler.isTransientFailure(error)) {
-            retryAttempt += 1
-            yield* Effect.logWarning("Reconciliation supervisor will retry", error)
-            yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
-            readmit = true
-            continue
-          }
-          yield* Effect.logWarning("Reconciliation supervisor stopped", error)
-          continue
+          yield* startCredentialWait(error.credentialGeneration, admission)
+          yield* Deferred.await(admission.gate)
+          retryAttempt = 0
+          readmit = true
+          return false
+        }
+        const pause = yield* Ref.get(authenticationPause)
+        if (Option.isSome(pause)) {
+          yield* Deferred.await(pause.value)
+          readmit = true
+          return false
+        }
+        yield* reconciliation.failed(error, observedGeneration)
+        if (Reconciler.isTransientFailure(error)) {
+          retryAttempt += 1
+          yield* Effect.logWarning("Reconciliation supervisor will retry", error)
+          yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
+          readmit = true
+          return false
+        }
+        yield* Effect.logWarning("Reconciliation supervisor stopped", error)
+        return false
+      })
+      const supervise = Effect.gen(function*() {
+        let stopped = false
+        while (!stopped) {
+          stopped = yield* superviseTurn.pipe(
+            Effect.catchCause((cause) => {
+              if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+              return Effect.logError("Reconciliation supervisor turn died", cause).pipe(
+                Effect.annotateLogs({ "space.id": options.spaceId }),
+                Effect.andThen(reconciliation.generation),
+                Effect.flatMap((generation) =>
+                  reconciliation.failed(
+                    Errors.reconciliationDied("Reconciliation supervisor turn died", cause),
+                    generation
+                  )
+                ),
+                Effect.as(false)
+              )
+            })
+          )
         }
       })
 

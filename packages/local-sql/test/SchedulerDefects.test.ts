@@ -7,10 +7,12 @@ import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import type * as Layer from "effect/Layer"
 import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
 import * as Scope from "effect/Scope"
 import * as SyncEngine from "../src/SyncEngine.js"
+import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
   acceptSubmission,
@@ -19,7 +21,8 @@ import {
   constructors,
   emptyPage,
   idleRemote,
-  makeAttempts
+  makeAttempts,
+  viewId
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
@@ -262,6 +265,67 @@ describe("background turns that die", () => {
       yield* space.deactivate
 
       const drained = yield* eventually(services, space, isDrained)
+
+      assert.isTrue(Option.isSome(drained))
+    }, VirtualTime.scoped)
+  )
+})
+
+const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
+
+const foregroundSpaces = Effect.fnUntraced(function*(
+  services: BackgroundReplica.Services,
+  remote: BackgroundReplica.Remote,
+  layerLogs: Layer.Layer<never>
+) {
+  const replica = yield* services.start(remote).pipe(Effect.provide(layerLogs))
+  const space = yield* replica.space(spaceId)
+  const other = yield* replica.space(otherSpaceId)
+  yield* services.sql`UPDATE effect_local_client_spaces
+    SET replication_view_id = ${viewId}, replication_view_revision = 0`
+  yield* space.activate
+  yield* other.activate
+  const online = yield* eventually(services, space, isOnlineDrained)
+  const otherOnline = yield* eventually(services, other, isOnlineDrained)
+  assert.isTrue(Option.isSome(online) && Option.isSome(otherOnline), "both spaces came online")
+  return { replica, space, other }
+})
+
+describe("foreground sync that dies", () => {
+  it.effect.each(constructors)(
+    "reports a foreground space whose sync died as failed and drains it after the next mutation with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      let undecodable = false
+      const { other, space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (request.spaceId === spaceId && undecodable) return Effect.die("undecodable response")
+            return emptyPage(services.crypto, request)
+          }
+        }),
+        logs.layerLogs
+      )
+      undecodable = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+
+      const failed = yield* eventually(services, space, isFailed)
+      yield* other.mutate(Domain.PutTodo, Domain.todo("other"))
+      const otherDrained = yield* eventually(services, other, isOnlineDrained)
+
+      assert.strictEqual(failureMessage(failed), "ProtocolInvalid")
+      assert.strictEqual(Option.getOrThrow(failed).pending, 1)
+      assert.deepStrictEqual(logs.defects(), ["undecodable response"])
+      assert.isTrue(Option.isSome(otherDrained))
+
+      undecodable = false
+      yield* space.mutate(Domain.PutTodo, Domain.todo("second"))
+
+      const drained = yield* eventually(services, space, isOnlineDrained)
 
       assert.isTrue(Option.isSome(drained))
     }, VirtualTime.scoped)
