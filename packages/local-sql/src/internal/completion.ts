@@ -42,4 +42,4 @@ export const settle = <A, E extends { readonly _tag: string },>(
         ),
       { discard: true }
     )
-  })
+  }).pipe(Effect.uninterruptible)
