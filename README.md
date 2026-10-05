@@ -54,13 +54,14 @@ invariants and failure model.
 
 ## Packages
 
-| Package                              | Purpose                                                           |
-| ------------------------------------ | ----------------------------------------------------------------- |
-| `@lucas-barake/effect-local`         | Models, mutations, queries, field semantics, protocol, and errors |
-| `@lucas-barake/effect-local-sql`     | SQLite state, server log, and Workflow reconciliation             |
-| `@lucas-barake/effect-local-rpc`     | WebSocket RPC, Cluster space routing, and bounded ephemera        |
-| `@lucas-barake/effect-local-browser` | Browser SQLite, the multi-tab replica cluster, and the Atom graph |
-| `@lucas-barake/effect-local-test`    | Production shaped test layers and deterministic network faults    |
+| Package                              | Purpose                                                            |
+| ------------------------------------ | ------------------------------------------------------------------ |
+| `@lucas-barake/effect-local`         | Models, mutations, queries, field semantics, protocol, and errors  |
+| `@lucas-barake/effect-local-sql`     | SQLite state, server log, and Workflow reconciliation              |
+| `@lucas-barake/effect-local-rpc`     | WebSocket RPC, Cluster space routing, ephemera, and the Atom graph |
+| `@lucas-barake/effect-local-browser` | Browser SQLite and the multi-tab replica cluster                   |
+| `@lucas-barake/effect-local-expo`    | React Native replica over `expo-sqlite` and `expo-crypto`          |
+| `@lucas-barake/effect-local-test`    | Production shaped test layers and deterministic network faults     |
 
 All packages are ESM. Public modules are available as subpaths such as
 `@lucas-barake/effect-local/Mutation`. Paths under `internal/*` are private.
@@ -190,7 +191,8 @@ that opens its own `WITH` fails with `QueryFailed`. Rows come back raw (`Array<u
 plain SQL: `LIMIT`/`OFFSET`, or keyset predicates such as `("count", "id") > (?, ?)` carried in the query payload.
 
 A failing statement surfaces as `QueryFailed` in the typed error channel; transient engine failures (busy, locked,
-connection) stay `StorageUnavailable`, so bad SQL is never mistaken for a storage outage. The CTEs are a convenience
+connection) stay `StorageUnavailable`, so bad SQL is never mistaken for a storage outage. When the statement fails
+because a stored entity value of a declared model is not valid JSON, the failure is `StorageCorrupt`. The CTEs are a convenience
 projection over the fenced generations, not an enforcement boundary: query handlers are trusted in-process
 application code and can name base tables directly, but everything under `effect_local_` is private storage whose
 layout changes without notice.
@@ -257,7 +259,10 @@ const program = Replica.Replica.use((replica) =>
 ).pipe(Effect.provide(layerReplica), Effect.scoped)
 ```
 
-Every other option has a default listed in `SqlReplica.defaults`, and `defaultScope` defaults to every model.
+Only `definition` is required, and `defaultScope` defaults to every model. `SqlReplica.defaults` lists the active
+space, receipt, history, bootstrap, and migration defaults. The remaining options default inline: 10,000 pending
+mutations, 100,000 retained mutation ids, a `pageSize` of 256, a `reconciliationConcurrency` of 8 with 1 reserved for
+foreground work, and the retry delays described below.
 
 Call `replica.join(spaceId)` to remember membership, `replica.leave(spaceId)` to evict that space, and `replica.spaces`
 to list remembered handles. A remembered space starts inactive. `space.activate` opens its local runtime and watch,
@@ -279,8 +284,10 @@ The explicit Workflow composition persists only reconciliation execution control
 SQLite tables used by the in memory composition.
 
 `space.mutate` still completes at the local optimistic commit. Pass `{ mutationId }` as its third argument to make a
-retry idempotent: the same id and payload return the recorded mutation, and a different payload fails with
-`MutationIdentityConflict`, even after the receipt was pruned, for the next `retainedMutationIds` mutations. It never waits for the server and its error channel
+retry idempotent: while the mutation is pending or its receipt is retained, the same id and payload return the recorded
+mutation and a different payload fails with `MutationIdentityConflict`. After the receipt is pruned, reusing the id
+fails with `MutationIdentityConflict` whatever the payload, for the next `retainedMutationIds` mutations, so the
+handler never runs twice. It never waits for the server and its error channel
 contains only failures from that local run. Use `space.pending` to inspect every in flight mutation, including its
 decoded payload, submission state, and attempt count. Use `space.pendingFor(PutTask)` when the mutation specific type
 matters. `space.settlements()` is a durable Stream of `{ sequence, settlement }` values, where each settlement holds
@@ -396,8 +403,10 @@ a policy-only revocation is eventually retracted even when no mutation changes t
 Every pull re-evaluates `authorizeRead` for each entity the client currently holds, so a revocation retracts on the
 next pull even when the entity itself never changed. The reverse direction is not free under incremental pulls: a
 policy flip that newly grants an entity untouched since the client's watermark stays invisible until something changes
-it. When authorization depends on external state, call `ServerStore.invalidateReadAuthorization(spaceId)` after that
-state changes; the next pull of each affected client re-derives its complete view.
+it. When authorization depends on external state, call the `invalidateReadAuthorization(spaceId)` method of the
+`ServerStore.ServerStore` service after that state changes, for example
+`ServerStore.ServerStore.use((store) => store.invalidateReadAuthorization(spaceId))`. The next pull of each affected
+client re-derives its complete view.
 
 ## Server and WebSocket RPC
 
@@ -408,7 +417,7 @@ The dense space sequence remains the mutation basis. A separate dense view curso
 client.
 
 Maintenance prepares the global recovery snapshot used to expire old mutation and receipt evidence, then reclaims
-bounded prefixes. A write that takes a space past the midpoint between its retained target and hard cap starts one
+bounded prefixes. A write that brings a space's history or receipts to the midpoint between the retained target and the hard cap starts one
 background compaction of that space, and `ServerStore.layerMaintenance` sweeps every space from an Effect Cluster
 singleton, once at start and then hourly by default. Admission returns `CapacityExceeded` before handler execution only
 when compaction cannot keep up with the hard cap. A fresh or invalid client view receives `BootstrapRequired` and
@@ -464,12 +473,13 @@ import * as Config from "effect/Config"
 const layerDatabase = PgClient.layerConfig({ url: Config.Redacted("DATABASE_URL") })
 ```
 
-`Migrations.server` picks the PostgreSQL catalog from the client's dialect and fails with `InvalidConfiguration` for
-any other dialect. When the server may not run DDL, `Migrations.renderServer` writes the pending schema as a script for
-a DBA and `store: { migration: { mode: "verify" } }` refuses to serve until it is applied. See
-[migrations applied by a DBA](packages/local-sql/README.md#migrations-applied-by-a-dba). Pass the client without `transformResultNames` or `transformQueryNames`, because server rows are
-decoded by their snake case column names. See the
-[`effect-local-sql` guide](packages/local-sql/README.md#postgresql-server-storage) for the storage and locking details.
+`Migrations.server` picks the SQLite or PostgreSQL catalog from the client's dialect and fails with
+`InvalidConfiguration` for any other dialect. When the server may not run DDL, `Migrations.renderServer` writes the
+pending schema as a script for a DBA and `store: { migration: { mode: "verify" } }` refuses to serve until it is
+applied. See [migrations applied by a DBA](packages/local-sql/README.md#migrations-applied-by-a-dba). Pass the client
+without `transformResultNames` or `transformQueryNames`, because server rows are decoded by their snake case column
+names. See the [`effect-local-sql` guide](packages/local-sql/README.md#postgresql-server-storage) for the storage and
+locking details.
 
 `ServerStore.layer` requires `authorizeAccess`, `authorizeMutation`, and `authorizeRead`. Access authorization runs
 before retry receipt lookup. Mutation admission rejection consumes the client's local sequence and persists an exact
@@ -486,17 +496,27 @@ generation resumes synchronization through the same replica and WebSocket.
 `CredentialRejected` is a credential problem. `AuthenticatorUnavailable` is a verifier outage and remains retryable.
 `AuthorizationDenied` means an authenticated principal lacks permission and is terminal. `OperationTimeout` identifies
 the bounded session or RPC operation that expired. Session acquisition, unary RPCs, and stream acquisition default to
-10 second timeouts and accept `Duration.Input`. Established watch streams may remain idle. Transient reconciliation
-failures use capped exponential backoff from `retryDelay`, default 1 second, through `maximumRetryDelay`, default 1
-minute. See [synchronization](docs/sync.md) and the
+10 second timeouts and accept `Duration.Input`. Established watch streams may remain idle.
+
+Reconciliation classifies every failure once. `ServerUnavailable`, `OperationTimeout`, and `AuthenticatorUnavailable`
+retry and report `Offline`. `StorageUnavailable`, `UnknownCommitOutcome`, `OwnerUnavailable`, and the `CapacityExceeded`
+resources that load can clear, such as `server history` or `sync watchers`, retry and report `Failed` until a sync
+succeeds. `CredentialRejected` reports `NeedsAuthentication` and waits for a new credential generation. Every other
+failure stops retrying and reports `Failed`. Retries use capped exponential backoff from `retryDelay`, default 1
+second, through `maximumRetryDelay`, default 1 minute. When a background sync of an inactive space ends in a failure
+that does not retry, the space keeps
+that failure in its `space.status` and stops retrying. The next successful reconciliation of the space clears it.
+See [synchronization](docs/sync.md#reconnect-and-retry) and the
 [`effect-local-rpc` guide](packages/local-rpc/README.md) for the provider contract and socket retry policy.
 
 The authenticated server facade sends all operations to the Cluster entity for the requested space. Cluster supplies
 the unique live owner and cross runner stream routing. SQL stores the authoritative accepted log and terminal
 receipts. The application chooses Effect's runner storage, message storage, runner transport, and deployment Layers.
 It also remains responsible for its HTTP server, WebSocket path, TLS, Origin policy, credential verification, and
-tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. A
-reverse proxy or lower level WebSocket upgrade handler must enforce the same native ingress payload limit.
+tenant authorization. Provide `SyncRpc.layerJson` on both sides. It bounds complete JSON frames to
+`SyncRpc.maximumFrameBytes`, which is 4 MiB plus 64 KiB, and sanitizes them. The native socket must enforce the same
+ingress limit before a message is assembled. `NodeHttpServer.layer` forwards `websocket: { maxPayload }` to `ws`, whose
+own default is 100 MiB. A reverse proxy can enforce the limit instead.
 
 Each space is one entity. It serializes SubmitBatch and Discard behind one admission permit and serves Pull, Bootstrap,
 Watch, and ephemeral operations concurrently, so a paused Bootstrap page or a full join population cannot block

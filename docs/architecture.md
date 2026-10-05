@@ -110,8 +110,9 @@ watermark returns `Expired` bound to a published snapshot fence and never execut
 
 Public capabilities are `Context.Service` values. Implementations are scoped Layers. SQL transactions and errors stay
 in Effects. Callers select either the lightweight in memory reconciliation Layer or the finite Workflow Layer. The
-Workflow payload contains only definition, space, client, membership incarnation, and generation identity. Activities call the same
-idempotent reconciliation operation as the in memory scheduler.
+Workflow payload contains only the schema identity, space, client, membership incarnation, replication scope and scope
+generation, and reconciliation generation. Activities call the same idempotent reconciliation operation as the in
+memory scheduler.
 
 The server front door is an authenticated WebSocket RPC facade. It routes every operation by space to one Effect
 Cluster entity, `EffectLocal/Space`, so an active space costs one resident entity. The entity runs SubmitBatch and Discard
@@ -142,8 +143,9 @@ fails the calls addressed to it, Cluster resends them to the next leader, and ca
 mutations from running twice. Cluster fibers dispatch through a private `MessageChannel`, because hidden tabs throttle
 timers and the leader is often hidden.
 
-The browser graph defaults to Effect's shared `Atom.runtime`. The replica Layer and `factory.withReactivity` therefore
-share one application memo map and memoized `Reactivity` service. Every atom and invalidation key includes its space.
+The Atom graph defaults to Effect's shared `Atom.runtime`. The replica Layer and the graph's atoms therefore share one
+application memo map and one memoized `Reactivity` service, on which the graph registers its invalidation keys. Every
+atom and invalidation key includes its space.
 Entity keys invalidate exact records. Query dependencies invalidate once per space and model.
 
 ## Capacity
@@ -156,14 +158,15 @@ accepted evidence, staged entities, staged bytes, and incoming page bytes. The i
 dispatcher with independent watches and turns. Workflow generations coalesce durable requests. Streams and
 publications carry only notifications.
 
-`SpaceEntity.HandlerOptions` requires positive finite `admissionMailboxCapacity`, `readMailboxCapacity`,
-`watchMailboxCapacity`, `ephemeralJoinMailboxCapacity`, and `ephemeralCommandMailboxCapacity` values. It also requires
-`maximumConcurrentBootstrapAuthorizations`, `maximumConcurrentBootstrapPagesPerSpace`,
-`maximumConcurrentEphemeralJoinVerificationsPerSpace`, and `maximumConcurrentEphemeralRequestsPerSpace`. Join
-mailboxes bound active watchers plus pending verification. Join verification and command work use separate per space
-allowances. Bootstrap assertion verification and preparation share one fail fast Layer wide allowance. Published page
-reads use a separate per space allowance. Saturation reports `CapacityExceeded` with resource
-`bootstrap authorizations`, `bootstrap pages`, or `ephemeral join verifications`.
+Every `SpaceEntity.HandlerOptions` field is optional. One `mailboxCapacity` (a positive safe integer or `"unbounded"`)
+bounds the active requests of a space entity, open `Watch` and `JoinEphemeral` streams included. When it is omitted,
+Cluster's `ShardingConfig.entityMailboxCapacity` applies. `maximumConcurrentBootstrapAuthorizations` (64),
+`maximumConcurrentBootstrapPagesPerSpace` (4), `maximumConcurrentEphemeralJoinVerificationsPerSpace` (64), and
+`maximumConcurrentEphemeralRequestsPerSpace` (64) default to the values shown and must be positive safe integers. Join
+verification and ephemeral publish and heartbeat work use separate per space allowances. Bootstrap assertion
+verification and preparation share one fail fast Layer wide allowance. Published page reads use a separate per space
+allowance. Saturation reports `CapacityExceeded` with resource `bootstrap authorizations`, `bootstrap pages`, or
+`ephemeral join verifications`.
 
 `ServerStore.maximumWatchersPerSpace` is the active sync watcher allowance. `EphemeralHub.maximumWatchersPerSpace` is a
 separate joined-stream allowance. `ServerStore.wakeCapacity` is the sliding sync hint depth. `EphemeralHub.capacity`
@@ -188,7 +191,9 @@ the stream fails with `AuthorizationDenied`. The configured interval is therefor
 when policy work hangs or the client stops pulling. Pull and Bootstrap perform uncached one shot authorization checks.
 
 Capacity failures use the Schema tagged `CapacityExceeded { resource, limit }` error across SQL, ephemera, and RPC
-boundaries. Full Cluster mailboxes map to `ServerUnavailable` because the request did not enter its domain handler.
+boundaries. `resource` is the closed union `ReplicaError.CapacityResource`, so reconciliation can decide per resource
+whether a limit is worth retrying. Full Cluster mailboxes map to `ServerUnavailable` because the request did not enter
+its domain handler.
 
 Operational metrics report admission outcome and rejection class, history and receipt depth beside their limits, sync
 and ephemeral watcher populations, wake fanout duration, durable bootstrap installs, maintenance outcomes and prune

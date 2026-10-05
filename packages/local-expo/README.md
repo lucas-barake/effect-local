@@ -3,8 +3,9 @@
 Effect Local replicas on React Native, backed by Expo modules.
 
 `ExpoReplica.layer` builds the same `SqlReplica` the browser and Node use, over an on-device SQLite database opened
-with `expo-sqlite`, Effect's `Crypto` served by `expo-crypto`, and React Native's WebSocket. It runs in Expo Go and in
-development or release builds, because both native modules ship with the Expo SDK.
+with `expo-sqlite` and Effect's `Crypto` served by `expo-crypto`. It does not include a socket. The sync engine stays a
+requirement, and `ReactNativeSocket.layerWebSocketConstructor` gives it React Native's WebSocket. It runs in Expo Go
+and in development or release builds, because both native modules ship with the Expo SDK.
 
 ```sh
 npx expo install expo-sqlite expo-crypto
@@ -49,7 +50,8 @@ ephemeral member from the `Crypto` the layer exposes, so an app needs no global 
 - `ReactNativeSocket.layerWebSocketConstructor` provides `Socket.WebSocketConstructor` from React Native's WebSocket.
   It forwards handshake headers and delays a close requested while the socket is still connecting until the socket
   opens, because Android ignores that close and would keep the late connection open.
-- `ExpoReplica.layer` composes the three with `SqlReplica.layer`.
+- `ExpoReplica.layer` composes `ExpoSqliteClient.layer` and `ExpoCrypto.layer` with `SqlReplica.layer`. It requires
+  the domain handlers, `Reactivity`, and a `SyncEngine`, and it exposes `Replica`, `QueryReactivity`, and `Crypto`.
 
 ## expo-sqlite behavior
 

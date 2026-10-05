@@ -1,6 +1,7 @@
 # @lucas-barake/effect-local-browser
 
-Browser replicas that every open tab shares, and the Effect Atom graph over them.
+Browser replicas that every open tab shares. `ReplicaAtom.make` from `@lucas-barake/effect-local-rpc` turns one into
+an Effect Atom graph.
 
 `BrowserReplica.layer` turns the tabs of one origin into an Effect Cluster. Every tab is a runner that talks to the
 others over `BroadcastChannel`, and Web Locks decide which tab is alive and which one leads. The leader tab opens the
@@ -37,12 +38,15 @@ const graph = ReplicaAtom.make(layerReplica)
 The first argument provides the database and the sync engine. Only the leader tab builds it, once per leadership
 term, the same way `HttpRouter.serve` builds the app Layer it is given, and whatever it requires, such as the WebSocket
 constructor and the credential provider above, becomes a requirement of the replica Layer.
-`BrowserReplica.layerPlatformBrowser` provides the Web Locks, `BroadcastChannel`, `localStorage`, and WebCrypto
-adapters. Tests provide in-memory versions instead to run several tabs in one process.
+`BrowserReplica.layerPlatformBrowser` provides the Web Locks, `BroadcastChannel`, page visibility, `localStorage`, and
+WebCrypto adapters. Tests provide in-memory versions instead to run several tabs in one process.
 
-`name` scopes the cluster, its locks, and the durable client id, so two replicas on one origin need different names.
-Everything else is optional. `replica` forwards `SqlReplica` options, `sharding` overrides the tab cluster's
-`ShardingConfig`, and `retryDelay` (1 second) paces leader election retries.
+`name` and `definition` are required. `name` scopes the cluster, its locks, and the durable client id, so two replicas
+on one origin need different names. Everything else is optional. `replica` forwards `SqlReplica` options, `sharding`
+overrides the tab cluster's `ShardingConfig`, and `retryDelay` (1 second) paces leader election retries and each
+tab's resubscription of its live streams and ephemeral sessions after a failure. The layer validates `retryDelay` when it builds and fails with
+`InvalidConfiguration` unless it is a positive finite duration. Its error type is
+`BrowserStorageError | InvalidConfiguration`.
 `BrowserSqlite.layerWorker` spawns and owns a dedicated SQLite WASM worker that is terminated when the Layer's scope
 closes, and `BrowserSqlite.layerMessagePort` adapts an application-owned worker port instead.
 
@@ -84,7 +88,8 @@ When two builds meet, the newest one owns the database:
 
 The coordination between builds uses only a presence lock per tab, named
 `@lucas-barake/effect-local-browser:<name>:presence:<sequence>:<version>:<fingerprint>:<host>`, the shared leader lock,
-and a channel on which arriving tabs post a wake-up. Those names are the one contract every library version must keep.
+and a channel on which arriving tabs post a wake-up. `<name>` is the `name` option passed through
+`encodeURIComponent`, so a name that contains `:` cannot shift the fields. Those names are the one contract every library version must keep.
 A future version may append fields to the presence name, and older tabs still read the first four.
 
 Every tab of the losing build is superseded for the rest of its life, even after the winning tabs close, because the
@@ -177,7 +182,8 @@ A malformed remote value fails only the projection atom for that definition with
 shared session and every other projection stay live, and refreshing the failed state projection re-reads the current
 session view. Peers running an incompatible schema for one channel therefore surface as an isolated decode failure on
 that projection, never as a runtime defect. TTL inputs everywhere accept `Duration.Input`; only the serialized RPC
-protocol uses integer `ttlMillis` fields.
+protocol uses integer `ttlMillis` fields. Each tab checks a `ttl` against the wire bounds before it sends the request
+to the leader, so an out of range value fails in the calling tab with `InvalidConfiguration`.
 
 The scoped client keeps the private server session capability out of atom state, schedules heartbeats from the
 accepted lease, and rejoins with a replacement snapshot when its subscriber misses a revision. Disposing the registry
@@ -191,7 +197,8 @@ component can publish or clear state without reaching for the `EphemeralClient` 
 
 The remaining graph families expose `entity`, `query`, `mutation`, `pending`, `receipt`, `settlements`, `scope`,
 `setScope`, `activation`, `activate`, `deactivate`, `status`, `spaces`, `join`, `leave`, and the constant-size
-`aggregateStatus`. Effect `Reactivity` refreshes only mounted reads whose exact space, entity, or index range changed.
+`aggregateStatus`. Effect `Reactivity` keys every read by space. An `entity` read and a `query.get` read refresh only
+when their exact entity changes, and a `query.sql` read refreshes when any entity of a model it declared changes.
 Leaving a space invalidates retained atoms for that address.
 
 Profiles passed to `ephemeral` sessions must be registered in `BrowserReplica.layer`'s `profiles` option, and

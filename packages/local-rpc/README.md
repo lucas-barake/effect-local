@@ -181,17 +181,19 @@ policy belongs to the application rather than this generic best-effort transport
 `EphemeralHub` validates every option when its Layer is built. Every option is optional: `capacity`,
 `maximumSpaces`, `maximumWatchersPerSpace`, and `maximumMembersPerSpace` default to 1024, `maximumWatchersPerPrincipal`
 and `maximumEventKeysPerMember` to 64, `maximumEventKeysPerSpace` to 4096, `maximumStateKeysPerMember` to 256, `maximumStateKeysPerSpace` to 16384,
-`maximumBytesPerMember` to 1 MiB, `maximumBytesPerSpace` to 16 MiB, and `maximumSnapshotBytes` to the 4 MiB frame
-limit. TTL bounds default to the wire maxima. Retained state keeps its space alive until the state expires, and a space
+`maximumBytesPerMember` to 1 MiB, `maximumBytesPerSpace` to 16 MiB, and `maximumSnapshotBytes` to 4 MiB, which is
+`Protocol.maximumBatchBytes` and also its upper bound. TTL bounds default to the wire maxima. Retained state keeps its space alive until the state expires, and a space
 that no watcher, request, or retained state occupies is released after `spaceIdleTtl`, which defaults to `memberTtl`.
 
 The wire contract also caps each encoded join or publish payload at 16 KiB, channel and key strings at 256 characters,
-member and event TTLs at 60 seconds, and state TTLs at seven days. The server takes the smaller of the requested TTL
-and its configured maximum. Member values and retained state count toward per-member and per-space byte limits. Event,
+member and event TTLs at 60 seconds, and state TTLs at seven days. `EphemeralClient` checks a `ttl` against those wire
+bounds before it sends, and fails with `InvalidConfiguration` when the value is outside them. The server takes the
+smaller of the requested TTL and its configured maximum. Member values and retained state count toward per-member and per-space byte limits. Event,
 state, member, watcher, and active-space counts have independent limits. Capacity rejection is typed and authorization
 runs before capacity disclosure.
 
-`maximumSnapshotBytes` bounds the complete roster and retained-state snapshot below the shared RPC frame limit.
+`maximumSnapshotBytes` bounds the complete roster and retained-state snapshot below the shared RPC frame limit,
+`SyncRpc.maximumFrameBytes`, which is 4 MiB plus 64 KiB.
 `capacity` bounds the shared per-space delta history, not the number of subscribers. Excess joins fail with
 `CapacityExceeded { resource: "ephemeral watchers", limit }` and release their allowance on every stream exit. Active
 watchers are exported as `effect_local_server_ephemeral_watcher_count`.
@@ -233,8 +235,9 @@ export const layerClientRpc = Layer.merge(
 ```
 
 The actual heartbeat interval is no longer than half the server-accepted member lease. Roster and state streams always
-resume at the latest view, so a slow subscriber skips intermediate views. Event streams buffer up to `eventCapacity`
-events per session, default 1,024, and a subscriber that falls further behind fails with `CapacityExceeded`. Negotiation selects the highest shared
+resume at the latest view, so a slow subscriber skips intermediate views. The client keeps one view per session, the
+latest. Event streams buffer up to `eventCapacity` events per session, default 1,024, and a subscriber that falls
+further behind fails with `CapacityExceeded { resource: "ephemeral events", limit }`. Negotiation selects the highest shared
 version. A peer rejection causes one renegotiation and retry. No common version returns terminal `UpgradeRequired`.
 
 `ProtocolSession` and `SyncServer` default to `Protocol.supportedProtocolVersions`, which is `[1]`. `SyncEngine.submitBatch`
@@ -272,7 +275,8 @@ the first connection. `Authentication.layerCredentialProvider`
 takes a `SubscriptionRef` of credentials when the application rotates tokens; `awaitChange` resolves with the first
 credential whose generation differs from the rejected one.
 
-`SyncClient.layerProtocolSocket` exposes Effect's socket retry options:
+`SyncClient.layerProtocolSocket` is the library's socket protocol. It takes `retryPolicy` and `retryTransientErrors`.
+Without a `retryPolicy` it reconnects with a jittered delay that doubles from 250 milliseconds up to 2 seconds:
 
 ```ts
 import * as SyncClient from "@lucas-barake/effect-local-rpc/SyncClient"
@@ -297,9 +301,12 @@ entity verifies it before any authorization callback runs, so browser payloads n
 authority.
 
 `CredentialRejected` pauses the rejected credential generation until `awaitChange` returns a new one.
-`AuthenticatorUnavailable` is retryable. `AuthorizationDenied` is terminal.
+`AuthenticatorUnavailable` is retryable. `AuthorizationDenied` is terminal. The
+[synchronization notes](https://github.com/lucas-barake/effect-local/blob/main/docs/sync.md#websocket-rpc) list how
+reconciliation treats every other failure.
 
-Use `SyncRpc.layerJson` on both sides. It bounds and sanitizes complete JSON frames. Production ingress must enforce
-the same native frame limit with a reverse proxy or lower-level WebSocket upgrade handler.
+Use `SyncRpc.layerJson` on both sides. It bounds complete JSON frames to `SyncRpc.maximumFrameBytes`, 4 MiB plus
+64 KiB, and sanitizes them. Production ingress must enforce the same native frame limit. On Node pass
+`websocket: { maxPayload: SyncRpc.maximumFrameBytes }` to `NodeHttpServer.layer`, or enforce it in a reverse proxy.
 
 See the [repository guide](https://github.com/lucas-barake/effect-local#readme).
