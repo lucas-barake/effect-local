@@ -989,3 +989,24 @@ describe("retry backoffs that die", () => {
     }, VirtualTime.scoped)
   )
 })
+
+describe("a leave whose cleanup dies", () => {
+  it.effect.each(constructors)(
+    "lets a space be joined and left again after its leave cleanup died with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(idleRemote)
+      services.dieNext("DELETE FROM effect_local_client_spaces")
+      const left = yield* replica.leave(spaceId).pipe(Effect.exit)
+      assert.isTrue(Exit.isFailure(left) && Cause.hasDies(left.cause), "the leave died")
+
+      const rejoined = yield* replica.join(spaceId).pipe(Effect.exit)
+      const leftAgain = yield* replica.leave(spaceId).pipe(Effect.exit)
+      const remembered = yield* replica.space(spaceId).pipe(Effect.exit)
+
+      assert.isTrue(Exit.isSuccess(rejoined), "joining again succeeded")
+      assert.isTrue(Exit.isSuccess(leftAgain), "leaving again succeeded")
+      assert.isTrue(Exit.isFailure(remembered), "the space is no longer joined")
+    }, VirtualTime.scoped)
+  )
+})

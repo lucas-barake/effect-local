@@ -1560,7 +1560,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               ])
             ),
             Effect.asVoid,
-            Effect.tapError(() =>
+            Effect.tapCause(() =>
               Effect.suspend(() => {
                 current.leaving = false
                 current.leaveCompletion = undefined
