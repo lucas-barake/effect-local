@@ -358,6 +358,19 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const flush = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys)
       const notify = (keys: ReadonlyArray<string>) => Invalidation.notify(reactivity, keys)
+      const collectOutcomes = () => {
+        let first: Exit.Exit<void> = Exit.void
+        return {
+          run: (notification: Effect.Effect<void>) =>
+            notification.pipe(
+              Effect.exit,
+              Effect.map((exit) => {
+                if (Exit.isSuccess(first)) first = exit
+              })
+            ),
+          raise: Effect.suspend(() => first)
+        }
+      }
       const addContribution = (entry: RememberedEntry) =>
         Ref.update(aggregate, (current) => {
           const category = statusCategory(entry.summaryStatus)
@@ -894,16 +907,17 @@ const makeLayer = <D extends Definition.Any, R,>(
             return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
           }
           const completion = Completion.make<void, ReplicaError.ReplicaError>()
+          const announced = collectOutcomes()
           entry.activation = "Deactivating"
           entry.transition = completion
           dropForegroundReservation(entry)
-          yield* invalidateActivation(entry.spaceId)
+          yield* announced.run(invalidateActivation(entry.spaceId))
           const shutdown = Scope.close(runtime.scope, Exit.void)
           const result = yield* runtime.operationGate.withPermits(operationPermits)(shutdown).pipe(Effect.exit)
           entry.runtime = undefined
           entry.activation = "Inactive"
           entry.transition = undefined
-          yield* invalidateActivation(entry.spaceId)
+          yield* announced.run(invalidateActivation(entry.spaceId))
           yield* Completion.settle(completion, result)
           yield* signalCapacity
           if (Exit.isFailure(result)) {
@@ -935,7 +949,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           )
           const changed = yield* applyContribution(entry, () => inactiveStatus(entry, count.count))
           if (enqueuePending && count.count > 0) yield* enqueueBackground(entry)
-          yield* announceContribution(changed)
+          yield* announced.run(announceContribution(changed))
+          yield* announced.raise
           return true
         }))
 
@@ -1015,12 +1030,17 @@ const makeLayer = <D extends Definition.Any, R,>(
           }
           if (foreground && !entry.foreground) return yield* transition(entry, foreground)
           const completion = Completion.make<void, ReplicaError.ReplicaError>()
+          const announced = collectOutcomes()
           const generation = ++nextGeneration
           entry.activation = "Activating"
           entry.transition = completion
           entry.runtime = undefined
-          yield* modifyContribution(entry, (current) => ({ _tag: "Connecting", pending: current.pending }))
-          yield* invalidateActivation(entry.spaceId)
+          const connecting = yield* applyContribution(entry, (current) => ({
+            _tag: "Connecting",
+            pending: current.pending
+          }))
+          yield* announced.run(announceContribution(connecting))
+          yield* announced.run(invalidateActivation(entry.spaceId))
           const startRuntime = restore(initialize(entry, generation, foreground))
           let start = startRuntime
           if (retiring !== undefined) {
@@ -1056,9 +1076,10 @@ const makeLayer = <D extends Definition.Any, R,>(
             entry.activation = "Active"
             entry.transition = undefined
             if (foreground) entry.backgroundGeneration += 1
-            yield* invalidateActivation(entry.spaceId)
+            yield* announced.run(invalidateActivation(entry.spaceId))
             yield* Completion.settle(completion, Exit.void)
             yield* signalCapacity
+            yield* announced.raise
             return result.value
           }
           entry.activation = "Inactive"
@@ -1066,8 +1087,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           dropForegroundReservation(entry)
           const changed = yield* applyContribution(entry, (current) => inactiveStatus(entry, current.pending))
           if (retiring !== undefined) yield* enqueueBackground(entry)
-          yield* announceContribution(changed)
-          yield* invalidateActivation(entry.spaceId)
+          yield* announced.run(announceContribution(changed))
+          yield* announced.run(invalidateActivation(entry.spaceId))
           if (Exit.hasInterrupts(result)) yield* Completion.settle(completion, Exit.void)
           else yield* Completion.settle(completion, Exit.asVoid(result))
           yield* signalCapacity
@@ -1513,8 +1534,13 @@ const makeLayer = <D extends Definition.Any, R,>(
             }
             entries.set(spaceId, result.value)
             yield* addContribution(result.value)
-            yield* notify([ReactivityKey.aggregateStatus, ReactivityKey.membership(spaceId), ReactivityKey.spaces])
+            const announced = yield* notify([
+              ReactivityKey.aggregateStatus,
+              ReactivityKey.membership(spaceId),
+              ReactivityKey.spaces
+            ]).pipe(Effect.exit)
             yield* Completion.settle(completion, Exit.void)
+            yield* announced
             return result.value.handle
           })
         )
@@ -1570,12 +1596,11 @@ const makeLayer = <D extends Definition.Any, R,>(
                 return enqueueBackground(current)
               })
             ),
-            Effect.exit,
-            Effect.tap((exit) => {
-              if (Exit.isFailure(exit)) return Effect.void
-              return notify([ReactivityKey.aggregateStatus, ReactivityKey.membership(spaceId), ReactivityKey.spaces])
-            }),
-            Effect.flatMap((exit) => Completion.settle(completion, exit))
+            Effect.andThen(
+              notify([ReactivityKey.aggregateStatus, ReactivityKey.membership(spaceId), ReactivityKey.spaces])
+            ),
+            Effect.onExit((exit) => Completion.settle(completion, exit)),
+            Effect.exit
           )
           yield* Effect.forkIn(cleanup, parentScope, { startImmediately: true })
           return yield* restore(Completion.wait(completion))

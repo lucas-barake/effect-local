@@ -4,6 +4,7 @@ import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
@@ -182,10 +183,15 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
       readonly release: Deferred.Deferred<void>
     }
     | undefined
+  let invalidationOutcome:
+    | { readonly key: string; readonly outcome: Effect.Effect<void, ReplicaError.ReplicaError> }
+    | undefined
   const gatedReactivity = new Proxy(reactivity, {
     get: (target, property, receiver) => {
       if (property !== "invalidate") return Reflect.get(target, property, receiver)
       return (keys: Parameters<typeof reactivity.invalidate>[0]) => {
+        const replaced = invalidationOutcome
+        if (replaced !== undefined && Array.isArray(keys) && keys.includes(replaced.key)) return replaced.outcome
         const held = heldInvalidation
         if (held === undefined || !Array.isArray(keys) || !keys.includes(held.key)) {
           return target.invalidate(keys)
@@ -236,8 +242,22 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     }
     return { arm, entered: Deferred.await(entered), release: Deferred.succeed(release, undefined) }
   })
+  const endInvalidationsWith = (key: string, outcome: Effect.Effect<void, ReplicaError.ReplicaError>) => {
+    invalidationOutcome = { key, outcome }
+  }
   const lockRemaining = () => locked?.remaining ?? 0
-  return { sql, crypto, reactivity, start, lockNext, lockRemaining, dieNext, holdStatement, holdInvalidation }
+  return {
+    sql,
+    crypto,
+    reactivity,
+    start,
+    lockNext,
+    lockRemaining,
+    dieNext,
+    holdStatement,
+    holdInvalidation,
+    endInvalidationsWith
+  }
 })
 
 export type Services = Effect.Success<ReturnType<typeof services>>
