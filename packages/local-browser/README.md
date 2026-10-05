@@ -108,10 +108,13 @@ status atoms are refreshed when it is superseded, so the app can show a reload p
 ```ts
 import * as Option from "effect/Option"
 import * as AsyncResult from "effect/reactivity/AsyncResult"
+import * as Atom from "effect/reactivity/Atom"
 
-const status = registry.get(graph.status(spaceId))
-const superseded = AsyncResult.isFailure(status) &&
-  Option.exists(AsyncResult.error(status), (error) => error._tag === "BuildSuperseded")
+export const supersededAtom = Atom.make((get) => {
+  const status = get(graph.status(spaceId))
+  return AsyncResult.isFailure(status) &&
+    Option.exists(AsyncResult.error(status), (error) => error._tag === "BuildSuperseded")
+})
 ```
 
 A reload is the only recovery. A mutation that was in flight when its tab was superseded may still have been recorded
