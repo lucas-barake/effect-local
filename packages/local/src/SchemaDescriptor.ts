@@ -249,6 +249,13 @@ interface BuiltInTransformation {
 
 let builtInTransformations: ReadonlyArray<BuiltInTransformation> | undefined
 
+const defectVariants: ReadonlyArray<readonly [string, Schema.ErrorOptions]> = [
+  ["Defect", {}],
+  ["Defect(includeStack)", { includeStack: true }],
+  ["Defect(excludeCause)", { excludeCause: true }],
+  ["Defect(includeStack,excludeCause)", { includeStack: true, excludeCause: true }]
+]
+
 const getBuiltInTransformations = (): ReadonlyArray<BuiltInTransformation> => {
   if (builtInTransformations !== undefined) return builtInTransformations
   const result = new Map<SchemaAST.Link["transformation"], string>()
@@ -298,6 +305,9 @@ const getBuiltInTransformations = (): ReadonlyArray<BuiltInTransformation> => {
     ) {
       visit(value.ast, name, new WeakSet())
     }
+  }
+  for (const [name, options] of defectVariants) {
+    visit(Schema.Defect(options).ast, name, new WeakSet())
   }
   builtInTransformations = Array.from(result, ([transformation, identity]) => ({
     transformation,

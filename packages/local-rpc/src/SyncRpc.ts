@@ -26,7 +26,7 @@ const RemoteDefect = Schema.Struct({
 }).pipe(Schema.decodeTo(Schema.Unknown, {
   decode: SchemaGetter.transform(() => ({ _tag: "RemoteDefect" })),
   encode: SchemaGetter.transform(() => ({ _tag: "RemoteDefect" as const }))
-}))
+})).annotate({ identifier: "@lucas-barake/effect-local-rpc/RemoteDefect" })
 
 const opaqueDefect = { _tag: "RemoteDefect" } as const
 const opaqueCause = { name: "Error", message: "Remote internal error" } as const
