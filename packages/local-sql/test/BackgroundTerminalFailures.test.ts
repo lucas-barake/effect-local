@@ -5,7 +5,6 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
-import * as Arr from "effect/Array"
 import * as Clock from "effect/Clock"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
@@ -13,7 +12,6 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
-import * as Order from "effect/Order"
 import * as Queue from "effect/Queue"
 import type * as Reactivity from "effect/reactivity/Reactivity"
 import type * as SqlClient from "effect/sql/SqlClient"
@@ -34,7 +32,7 @@ import {
   type Remote,
   viewId
 } from "./fixtures/BackgroundReplica.js"
-import * as VirtualTime from "./fixtures/VirtualTime.js"
+import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000801")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000801")
@@ -296,7 +294,7 @@ describe("background sync terminal failures", () => {
       assert.strictEqual(aggregate.counts.failed, 1)
       assert.strictEqual(aggregate.counts.idle, 0)
       assert.strictEqual(aggregate.totalPending, 1)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(stoppingTags)(
@@ -322,7 +320,7 @@ describe("background sync terminal failures", () => {
         assert.strictEqual(status._tag, "Failed")
         if (status._tag === "Failed") assert.strictEqual(status.message, tag)
       }
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(constructors)(
@@ -343,7 +341,7 @@ describe("background sync terminal failures", () => {
       assert.isTrue(Option.isNone(retried))
       const status = yield* awaitSpaceStatus(space, services.reactivity, "Failed")
       if (status._tag === "Failed") assert.strictEqual(status.message, "CapacityExceeded")
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(constructors)(
@@ -365,7 +363,7 @@ describe("background sync terminal failures", () => {
       assert.isTrue(Option.isNone(retried))
       const status = yield* awaitSpaceStatus(space, services.reactivity, "Failed")
       if (status._tag === "Failed") assert.strictEqual(status.message, "CapacityExceeded")
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(constructors)(
@@ -391,7 +389,7 @@ describe("background sync terminal failures", () => {
       const drained = yield* VirtualTime.advanceUntil(idleWithoutPending).pipe(Effect.timeoutOption("1 minute"))
 
       assert.isTrue(Option.isSome(drained))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(ReplicaError.CapacityResource.literals)(
@@ -409,7 +407,7 @@ describe("background sync terminal failures", () => {
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("1 minute"))
 
       assert.strictEqual(Option.isSome(retried), temporaryCapacity.has(resource))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(
@@ -442,12 +440,9 @@ describe("background sync terminal failures", () => {
       const unreachable = yield* attemptTimes(failures.ServerUnavailable)
 
       assert.deepStrictEqual(retryable, unreachable)
-      assert.isAtMost(retryable.length, 8)
-      assert.isAtLeast(retryable.length, 5)
       const gaps = retryable.slice(1).map((time, index) => time - retryable[index])
-      assert.deepStrictEqual(gaps, Arr.sort(gaps, Order.Number))
-      assert.isAbove(gaps[gaps.length - 1], gaps[0])
-    })
+      assert.deepStrictEqual(gaps.filter((gap) => gap > 0), [1000, 2000, 4000, 8000, 16_000, 32_000])
+    }, VirtualTime.provide)
   )
 
   it.effect.each(schedulerCases(foregroundRetryingTags))(
@@ -474,12 +469,12 @@ describe("background sync terminal failures", () => {
       const space = yield* replica.space(spaceId)
       yield* space.activate
 
-      yield* VirtualTime.advanceUntil(Effect.never, "1 second").pipe(Effect.timeoutOption("10 minutes"))
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("10 minutes"))
 
       const gaps = subscribedAt.slice(1).map((time, index) => (time - subscribedAt[index]) / 1000)
       assert.deepStrictEqual(gaps, [1, 2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60, 60, 60])
       assert.isAtMost(pulls, 2 * subscribedAt.length + 2)
-    }, Effect.scoped),
+    }, VirtualTime.scoped),
     60_000
   )
 
@@ -510,12 +505,12 @@ describe("background sync terminal failures", () => {
       const space = yield* replica.space(spaceId)
       yield* space.activate
 
-      yield* VirtualTime.advanceUntil(Effect.never, "1 second").pipe(Effect.timeoutOption("4 hours"))
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("4 hours"))
 
       assert.strictEqual(subscribedAt.length, 7)
       const healthyFor = Duration.toMillis(Duration.hours(3))
       assert.strictEqual(subscribedAt[6] - subscribedAt[5], healthyFor + 1000)
-    }, Effect.scoped),
+    }, VirtualTime.scoped),
     60_000
   )
 
@@ -536,7 +531,7 @@ describe("background sync terminal failures", () => {
       const aggregate = yield* replica.status
       assert.strictEqual(aggregate.counts.failed, 0)
       assert.strictEqual(aggregate.totalPending, 1)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(schedulerCases(foregroundStoppingTags))(
@@ -556,7 +551,7 @@ describe("background sync terminal failures", () => {
 
       assert.strictEqual(attempts.count(), 1)
       assert.isTrue(Option.isNone(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(schedulerCases(foregroundRetryingTags))(
@@ -575,7 +570,7 @@ describe("background sync terminal failures", () => {
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(3)).pipe(Effect.timeoutOption("1 minute"))
 
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(constructors)(
@@ -603,7 +598,7 @@ describe("background sync terminal failures", () => {
       const aggregate = yield* replica.status
       assert.strictEqual(aggregate.counts.failed, 0)
       assert.strictEqual(aggregate.totalPending, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(constructors)(
@@ -636,7 +631,7 @@ describe("background sync terminal failures", () => {
 
       assert.strictEqual(submissions, 2)
       assert.isTrue(Option.isSome(drained))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(constructors)(
@@ -660,7 +655,7 @@ describe("background sync terminal failures", () => {
 
       assert.isTrue(Option.isSome(retried))
       assert.strictEqual((yield* replica.status).counts.failed, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -684,7 +679,7 @@ describe("background sync terminal failures", () => {
       assert.isTrue(Option.isSome(stopped))
       assert.isTrue(Option.isNone(retried))
       assert.strictEqual(attempts.count(), 1)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -717,7 +712,7 @@ describe("background sync terminal failures", () => {
       assert.isTrue(Option.isNone(retried))
       const status = yield* awaitSpaceStatus(space, services.reactivity, "Failed")
       if (status._tag === "Failed") assert.strictEqual(status.message, "StorageCorrupt")
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(constructors)(
@@ -747,7 +742,7 @@ describe("background sync terminal failures", () => {
       yield* space.deactivate
       assert.strictEqual((yield* space.status)._tag, "Idle")
       assert.strictEqual((yield* replica.status).counts.idle, 1)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -781,7 +776,7 @@ describe("background sync terminal failures", () => {
       yield* awaitSpaceStatus(space, services.reactivity, "Failed")
 
       assert.strictEqual(notified.at(-1), "status")
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -805,7 +800,7 @@ describe("background sync terminal failures", () => {
       assert.strictEqual(aggregate.counts.connecting, 1)
       assert.strictEqual(aggregate.counts.idle, 0)
       assert.strictEqual(aggregate.counts.failed, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -831,7 +826,7 @@ describe("background sync terminal failures", () => {
       assert.strictEqual(aggregate.counts.failed, 1)
       assert.strictEqual(aggregate.counts.idle, 0)
       assert.strictEqual(attempts.count(), 1)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -852,7 +847,7 @@ describe("background sync terminal failures", () => {
       assert.isTrue(Option.isSome(retried))
       const status = yield* awaitSpaceStatus(space, services.reactivity, "Failed")
       assert.strictEqual(status.pending, 1)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -877,7 +872,7 @@ describe("background sync terminal failures", () => {
 
       assert.isTrue(Option.isNone(retried))
       assert.strictEqual(attempts.count(), 3)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(
@@ -935,7 +930,7 @@ describe("background sync terminal failures", () => {
       assert.strictEqual(aggregate.counts.failed, 0)
       assert.strictEqual(aggregate.counts.needsAuthentication, 0)
       assert.strictEqual(credentialWaits, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -966,7 +961,7 @@ describe("background sync terminal failures", () => {
       const aggregate = yield* replica.status
       assert.strictEqual(aggregate.counts.failed, 1)
       assert.strictEqual(aggregate.counts.idle, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(
@@ -1021,7 +1016,7 @@ describe("background sync terminal failures", () => {
       assert.strictEqual(aggregate.counts.failed, 0)
       assert.strictEqual(aggregate.counts.needsAuthentication, 0)
       assert.strictEqual(credentialWaits, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1049,7 +1044,7 @@ describe("background sync terminal failures", () => {
       assert.isTrue(Option.isNone(retried))
       assert.strictEqual(attempts.count(), 2)
       assert.strictEqual(yield* space.activation, "Active")
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1091,7 +1086,7 @@ describe("background sync terminal failures", () => {
       const aggregate = yield* replica.status
       assert.strictEqual(aggregate.counts.idle, 1)
       assert.strictEqual(aggregate.counts.failed, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1112,7 +1107,7 @@ describe("background sync terminal failures", () => {
       assert.strictEqual(status._tag, "Failed")
       if (status._tag === "Failed") assert.strictEqual(status.message, "ProtocolInvalid")
       assert.strictEqual(yield* space.activation, "Inactive")
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1133,7 +1128,7 @@ describe("background sync terminal failures", () => {
       const aggregate = yield* replica.status
       assert.strictEqual(aggregate.counts.idle, 1)
       assert.strictEqual(aggregate.counts.failed, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1169,7 +1164,7 @@ describe("background sync terminal failures", () => {
       const aggregate = yield* replica.status
       assert.strictEqual(aggregate.counts.idle, 0)
       assert.strictEqual(aggregate.counts.offline, 1)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1208,7 +1203,7 @@ describe("background sync terminal failures", () => {
       assert.strictEqual(sinceRelease[0], 0)
       assert.isTrue(sinceRelease.includes(2000))
       assert.deepStrictEqual(sinceRelease.filter((elapsed) => elapsed > 0 && elapsed < 2000), [])
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1257,7 +1252,7 @@ describe("background sync terminal failures", () => {
       assert.strictEqual(pulls, pullsBefore)
       assert.strictEqual(yield* space.activation, "Active")
       assert.strictEqual((yield* space.status)._tag, "Online")
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1274,7 +1269,7 @@ describe("background sync terminal failures", () => {
       const settled = yield* VirtualTime.advanceUntil(failedAgain).pipe(Effect.timeoutOption("1 minute"))
 
       assert.isTrue(Option.isSome(settled))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1305,7 +1300,7 @@ describe("background sync terminal failures", () => {
         Effect.timeoutOption("1 minute")
       )
       assert.isTrue(Option.isSome(interrupted))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(["ProtocolInvalid", "ServerUnavailable"] as const)(
@@ -1341,7 +1336,7 @@ describe("background sync terminal failures", () => {
         Effect.timeoutOption("1 minute")
       )
       assert.isTrue(Option.isSome(interrupted))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1379,7 +1374,7 @@ describe("background sync terminal failures", () => {
       assert.strictEqual(yield* space.activation, "Active")
       assert.strictEqual(credentialWaits, 1)
       assert.strictEqual(attempts.count(), 3)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1410,7 +1405,7 @@ describe("background sync terminal failures", () => {
 
       assert.strictEqual(credentialWaits, 0)
       assert.strictEqual((yield* replica.status).spaces, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1431,7 +1426,7 @@ describe("background sync terminal failures", () => {
 
       const interrupted = yield* Deferred.await(waitInterrupted).pipe(Effect.timeoutOption("1 minute"))
       assert.isTrue(Option.isSome(interrupted))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1462,7 +1457,7 @@ describe("background sync terminal failures", () => {
       const status = yield* awaitSpaceStatus(space, services.reactivity, "Idle")
       assert.strictEqual(status.pending, 1)
       assert.strictEqual((yield* replica.status).counts.needsAuthentication, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1503,6 +1498,6 @@ describe("background sync terminal failures", () => {
       const settled = yield* awaitSpaceStatus(space, services.reactivity, "Idle")
       assert.strictEqual(settled.pending, 0)
       assert.strictEqual((yield* replica.status).counts.needsAuthentication, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 })

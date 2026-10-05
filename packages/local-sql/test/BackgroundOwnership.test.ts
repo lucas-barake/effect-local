@@ -21,7 +21,7 @@ import {
   idleRemote,
   makeAttempts
 } from "./fixtures/BackgroundReplica.js"
-import * as VirtualTime from "./fixtures/VirtualTime.js"
+import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000901")
 const otherSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000902")
@@ -218,7 +218,7 @@ describe("background retries survive an abandoned foreground claim", () => {
       assert.strictEqual(yield* space.activation, "Inactive")
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(["layer", "layerWorkflow"] as const)(
@@ -243,7 +243,7 @@ describe("background retries survive an abandoned foreground claim", () => {
       assert.strictEqual(yield* space.activation, "Inactive")
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(["layer", "layerWorkflow"] as const)(
@@ -271,7 +271,7 @@ describe("background retries survive an abandoned foreground claim", () => {
 
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(["layer", "layerWorkflow"] as const)(
@@ -295,7 +295,7 @@ describe("background retries survive an abandoned foreground claim", () => {
 
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 })
 
@@ -325,7 +325,7 @@ describe("background turns that settle after their space was left", () => {
       yield* settle("5 minutes")
 
       assert.strictEqual(credentialWaits, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -368,7 +368,7 @@ describe("background turns that settle after their space was left", () => {
 
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(3)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 })
 
@@ -409,7 +409,7 @@ describe("work that comes due during a leave that later fails", () => {
       assert.strictEqual(left._tag, "Failure")
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -437,7 +437,7 @@ describe("work that comes due during a leave that later fails", () => {
       assert.strictEqual(left._tag, "Failure")
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 })
 
@@ -473,7 +473,7 @@ describe("review 225 suspicions that did not reproduce", () => {
       yield* Deferred.succeed(credentialChanged, undefined)
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(["layer", "layerWorkflow"] as const)(
@@ -504,7 +504,7 @@ describe("review 225 suspicions that did not reproduce", () => {
       assert.strictEqual(aggregate.spaces, 1)
       assert.strictEqual(aggregate.counts.idle, 1)
       assert.strictEqual(aggregate.totalPending, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -535,7 +535,7 @@ describe("review 225 suspicions that did not reproduce", () => {
         needsAuthentication: 0,
         failed: 0
       })
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -556,7 +556,7 @@ describe("review 225 suspicions that did not reproduce", () => {
       yield* Scope.close(replicaScope, Exit.void)
 
       assert.isTrue(yield* Deferred.isDone(waitInterrupted))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -582,7 +582,7 @@ describe("review 225 suspicions that did not reproduce", () => {
       assert.strictEqual(aggregate.spaces, 1)
       assert.strictEqual(aggregate.counts.failed, 1)
       assert.strictEqual(attempts.count(), 1)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -617,7 +617,7 @@ describe("review 225 suspicions that did not reproduce", () => {
       assert.strictEqual(status._tag, "Failed")
       assert.strictEqual(aggregate.counts.failed, 1)
       assert.strictEqual(aggregate.totalPending, status.pending)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -661,7 +661,7 @@ describe("review 225 suspicions that did not reproduce", () => {
       assert.strictEqual(status.pending, 0)
       assert.isAbove(pullTimes.length, pullsBefore)
       assert.isAtLeast(pullTimes[pullsBefore] - failedAt, 40_000)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -684,7 +684,7 @@ describe("review 225 suspicions that did not reproduce", () => {
 
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(["layer", "layerWorkflow"] as const)(
@@ -705,7 +705,7 @@ describe("review 225 suspicions that did not reproduce", () => {
 
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(["layer", "layerWorkflow"] as const)(
@@ -729,7 +729,7 @@ describe("review 225 suspicions that did not reproduce", () => {
 
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -772,7 +772,7 @@ describe("review 225 suspicions that did not reproduce", () => {
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(3)).pipe(Effect.timeoutOption("5 minutes"))
       yield* bookkeeping.release
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 })
 
@@ -832,7 +832,7 @@ describe("a background turn rejected by a leave that later fails", () => {
         { tag: status._tag, message, pending: status.pending, failed: aggregate.counts.failed },
         { tag: "Idle", message: "", pending: 0, failed: 0 }
       )
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -874,7 +874,7 @@ describe("a background turn rejected by a leave that later fails", () => {
         { tag: status._tag, message, pending: status.pending, synced: attempts.count() > 0 },
         { tag: "Idle", message: "", pending: 1, synced: true }
       )
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 })
 
@@ -917,7 +917,7 @@ describe("background outcomes that must not outlive the work that replaced them"
         { tag: status._tag, message, pending: status.pending },
         { tag: "Idle", message: "", pending: 1 }
       )
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -943,7 +943,7 @@ describe("background outcomes that must not outlive the work that replaced them"
 
       assert.strictEqual(run.attempts.count(), 1)
       assert.strictEqual((yield* run.space.status)._tag, "Failed")
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 })
 
@@ -968,7 +968,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       assert.strictEqual(aggregate.counts.needsAuthentication, 0)
       assert.strictEqual(aggregate.counts.failed, 0)
       assert.strictEqual(aggregate.totalPending, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -988,7 +988,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       const aggregate = yield* run.replica.status
       assert.strictEqual(aggregate.counts.failed, 0)
       assert.strictEqual(aggregate.counts.idle, 2)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1013,7 +1013,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       yield* run.credential.change
       yield* settle("5 seconds")
       assert.strictEqual(run.attempts.count(), before + 1)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(["released after the turn", "released while the turn holds the runtime"] as const)(
@@ -1072,7 +1072,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       const status = yield* space.status
       assert.strictEqual(status._tag, "Idle")
       assert.strictEqual(status.pending, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1081,7 +1081,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       const run = yield* turnTakenDuringLeave()
       assert.strictEqual(run.duringLeave, 1)
       assert.isTrue(Option.isSome(run.retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(["completes", "fails"] as const)(
@@ -1133,7 +1133,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       yield* credential.change
       yield* settle("5 seconds")
       assert.strictEqual(attempts.count(), before + 1)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1168,7 +1168,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       yield* credential.change
       yield* settle("5 seconds")
       assert.strictEqual(attempts.count(), before + 1)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(["layer", "layerWorkflow"] as const)(
@@ -1212,7 +1212,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       assert.strictEqual(aggregate.totalPending, 1)
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(3)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect(
@@ -1248,7 +1248,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       assert.strictEqual(aggregate.spaces, 1)
       assert.strictEqual(aggregate.counts.online, 1)
       assert.strictEqual(aggregate.totalPending, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(operations)(
@@ -1270,7 +1270,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       assert.strictEqual(yield* space.activation, "Inactive")
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(operations)(
@@ -1295,7 +1295,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
 
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(operations)(
@@ -1318,7 +1318,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       assert.strictEqual(attempts.count(), 1)
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(operations)(
@@ -1338,7 +1338,7 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
       const status = yield* space.status
       assert.strictEqual(status._tag, "Online")
       assert.strictEqual(status.pending, 0)
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 
   it.effect.each(["no leave", "leave completes"] as const)(
@@ -1395,6 +1395,6 @@ describe("review 225 round 2 suspicions that did not reproduce", () => {
         { tag: status._tag, pending: status.pending, failed: aggregate.counts.failed, online: aggregate.counts.online },
         { tag: "Idle", pending: 0, failed: 0, online: 0 }
       )
-    }, Effect.scoped)
+    }, VirtualTime.scoped)
   )
 })

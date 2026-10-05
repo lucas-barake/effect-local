@@ -30,8 +30,8 @@ import * as ServerStore from "../src/ServerStore.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
+import * as VirtualTime from "./fixtures/DeterministicTime.js"
 import { gateStatements } from "./fixtures/SqlGate.js"
-import * as VirtualTime from "./fixtures/VirtualTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-0000000000e1")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-0000000000e1")
@@ -252,7 +252,7 @@ const statusAfterNextTurnStarts = Effect.fnUntraced(function*(
 ) {
   yield* controls.setPullMode("Hold")
   yield* space.mutate(Domain.PutTodo, Domain.todo("next"))
-  yield* VirtualTime.advanceUntil(Queue.take(controls.heldPulls), "1 minute")
+  yield* VirtualTime.advanceUntil(Queue.take(controls.heldPulls))
   return yield* space.status
 })
 
@@ -275,7 +275,7 @@ describe("scheduler failure reports", () => {
       yield* Queue.take(controls.injected)
 
       assertFailedWithStorage(yield* statusAfterNextTurnStarts(controls, space))
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect(
@@ -294,7 +294,7 @@ describe("scheduler failure reports", () => {
       yield* Queue.take(controls.injected)
 
       assertFailedWithStorage(yield* statusAfterNextTurnStarts(controls, space))
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect(
@@ -315,12 +315,12 @@ describe("scheduler failure reports", () => {
         (status) => status._tag === "Online" && status.pending === 0
       )
 
-      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending, "10 seconds").pipe(
+      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending).pipe(
         Effect.timeoutOption("10 minutes")
       )
 
       assert.isTrue(Option.isSome(drained))
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect(
@@ -331,12 +331,12 @@ describe("scheduler failure reports", () => {
       yield* Queue.take(controls.watchStarts)
       yield* controls.failWatch(new ReplicaError.StorageUnavailable({ cause: "injected" }))
 
-      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts), "10 seconds").pipe(
+      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts)).pipe(
         Effect.timeoutOption("10 minutes")
       )
 
       assert.isTrue(Option.isSome(watchedAgain))
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect(
@@ -360,12 +360,12 @@ describe("scheduler failure reports", () => {
         (status) => status._tag === "Online" && status.pending === 0
       )
 
-      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending, "10 seconds").pipe(
+      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending).pipe(
         Effect.timeoutOption("10 minutes")
       )
 
       assert.isTrue(Option.isSome(drained))
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect.each([1, 2])(
@@ -396,13 +396,13 @@ describe("scheduler failure reports", () => {
         (status) => status._tag === "Online" && status.pending === 0
       )
 
-      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending, "10 seconds").pipe(
+      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending).pipe(
         Effect.timeoutOption("10 minutes")
       )
 
       assert.isTrue(Option.isSome(drained))
       assert.strictEqual(claims, 2)
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect.each([1, 2])(
@@ -420,13 +420,13 @@ describe("scheduler failure reports", () => {
       yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
       yield* Queue.take(controls.injected)
 
-      yield* VirtualTime.advanceUntil(Effect.never, "10 seconds").pipe(Effect.timeoutOption("10 minutes"))
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("10 minutes"))
 
       const attempts = 1 + (yield* Queue.size(controls.injected))
       assert.isAtLeast(attempts, 6)
       assert.isAtMost(attempts, 11)
       assertFailedWithStorage(yield* space.status)
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect(
@@ -443,12 +443,12 @@ describe("scheduler failure reports", () => {
       yield* Queue.take(controls.watchStarts)
       yield* controls.failWatch(new ReplicaError.StorageUnavailable({ cause: "injected" }))
 
-      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts), "10 seconds").pipe(
+      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts)).pipe(
         Effect.timeoutOption("10 minutes")
       )
 
       assert.isTrue(Option.isSome(watchedAgain))
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect.each(
@@ -466,7 +466,7 @@ describe("scheduler failure reports", () => {
       yield* controls.failWhen(failEach([claimStatement, admissionStatement]))
       yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
       yield* Queue.take(controls.injected)
-      yield* VirtualTime.advanceUntil(Queue.take(controls.injected), "10 seconds")
+      yield* VirtualTime.advanceUntil(Queue.take(controls.injected))
       if (trigger === "after another mutation") yield* space.mutate(Domain.PutTodo, Domain.todo("second"))
       const onlineWithoutPending = awaitStatus(
         Context.get(controls.database, Reactivity.Reactivity),
@@ -474,12 +474,12 @@ describe("scheduler failure reports", () => {
         (status) => status._tag === "Online" && status.pending === 0
       )
 
-      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending, "10 seconds").pipe(
+      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending).pipe(
         Effect.timeoutOption("10 minutes")
       )
 
       assert.isTrue(Option.isSome(drained))
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect.each(["layer", "layerWorkflow"] as const)(
@@ -500,12 +500,12 @@ describe("scheduler failure reports", () => {
         (status) => status._tag === "Online" && status.pending === 0
       )
 
-      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending, "10 seconds").pipe(
+      const drained = yield* VirtualTime.advanceUntil(onlineWithoutPending).pipe(
         Effect.timeoutOption("10 minutes")
       )
 
       assert.isTrue(Option.isSome(drained))
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect(
@@ -519,12 +519,12 @@ describe("scheduler failure reports", () => {
       yield* Queue.take(controls.injected)
       yield* Queue.clear(controls.watchStarts)
 
-      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts), "10 seconds").pipe(
+      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts)).pipe(
         Effect.timeoutOption("10 minutes")
       )
 
       assert.isTrue(Option.isSome(watchedAgain))
-    })
+    }, VirtualTime.provide)
   )
 })
 
@@ -582,9 +582,9 @@ describe("in-memory scheduler failure reports", () => {
       yield* controls.setPullMode("Hold")
       yield* local.mutate(Domain.PutTodo, Domain.todo("next"))
       yield* reconciler.schedule
-      yield* VirtualTime.advanceUntil(Queue.take(controls.heldPulls), "1 minute")
+      yield* VirtualTime.advanceUntil(Queue.take(controls.heldPulls))
       assertFailedWithStorage(yield* reconciler.status)
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect(
@@ -605,12 +605,12 @@ describe("in-memory scheduler failure reports", () => {
         return status
       })
 
-      const drained = yield* VirtualTime.advanceUntil(awaitDrained, "10 seconds").pipe(
+      const drained = yield* VirtualTime.advanceUntil(awaitDrained).pipe(
         Effect.timeoutOption("10 minutes")
       )
 
       assert.isTrue(Option.isSome(drained))
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect(
@@ -621,12 +621,12 @@ describe("in-memory scheduler failure reports", () => {
       yield* Queue.take(controls.watchStarts)
       yield* controls.failWatch(new ReplicaError.StorageUnavailable({ cause: "injected" }))
 
-      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts), "10 seconds").pipe(
+      const watchedAgain = yield* VirtualTime.advanceUntil(Queue.take(controls.watchStarts)).pipe(
         Effect.timeoutOption("10 minutes")
       )
 
       assert.isTrue(Option.isSome(watchedAgain))
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect.each(
@@ -652,12 +652,12 @@ describe("in-memory scheduler failure reports", () => {
         return status
       })
 
-      const drained = yield* VirtualTime.advanceUntil(awaitDrained, "10 seconds").pipe(
+      const drained = yield* VirtualTime.advanceUntil(awaitDrained).pipe(
         Effect.timeoutOption("10 minutes")
       )
 
       assert.isTrue(Option.isSome(drained))
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect.each(
@@ -674,12 +674,12 @@ describe("in-memory scheduler failure reports", () => {
       yield* controls.wakeOnWatch
       yield* controls.failWatch(failure)
 
-      yield* VirtualTime.advanceUntil(Effect.never, "1 second").pipe(Effect.timeoutOption("10 minutes"))
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("10 minutes"))
 
       const times = controls.watchTimes
       const gaps = times.slice(1).map((time, index) => (time - times[index]) / 1000)
       assert.deepStrictEqual(gaps, [1, 2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60, 60, 60])
-    }),
+    }, VirtualTime.provide),
     60_000
   )
 
@@ -694,7 +694,7 @@ describe("in-memory scheduler failure reports", () => {
       yield* Queue.take(controls.transportWaits)
 
       assert.strictEqual((yield* reconciler.status)._tag, "Offline")
-    })
+    }, VirtualTime.provide)
   )
 
   it.effect(
@@ -710,6 +710,6 @@ describe("in-memory scheduler failure reports", () => {
 
       yield* Fiber.join(later)
       assert.strictEqual((yield* reconciler.status)._tag, "NeedsAuthentication")
-    })
+    }, VirtualTime.provide)
   )
 })
