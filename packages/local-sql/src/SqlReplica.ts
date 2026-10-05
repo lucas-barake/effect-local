@@ -1582,9 +1582,13 @@ const makeLayer = <D extends Definition.Any, R,>(
               Effect.suspend(() => {
                 current.leaving = false
                 current.leaveCompletion = undefined
-                if (!current.dueWhileLeaving) return Effect.void
+                let republished = Effect.void
+                if (current.activation === "Inactive") {
+                  republished = modifyContribution(current, (summary) => inactiveStatus(current, summary.pending))
+                }
+                if (!current.dueWhileLeaving) return republished
                 current.dueWhileLeaving = false
-                return enqueueBackground(current)
+                return Effect.andThen(republished, enqueueBackground(current))
               })
             ),
             Effect.andThen(
