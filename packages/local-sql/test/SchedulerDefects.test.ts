@@ -839,18 +839,32 @@ const credentialRejected = Effect.fail(new ReplicaError.CredentialRejected({ cre
 
 const needsAuthentication = (status: ReplicaStatus.ReplicaStatus) => status._tag === "NeedsAuthentication"
 
+const makeCredentialProvider = () => {
+  const state = { waits: 0, healsAfter: Number.POSITIVE_INFINITY }
+  const waitForChange = () =>
+    Effect.suspend(() => {
+      state.waits += 1
+      if (state.waits > state.healsAfter) return Effect.void
+      return Effect.die("credential wait died")
+    })
+  return { state, waitForChange }
+}
+
 describe("credential waits that die", () => {
   it.effect.each(constructors)(
-    "logs a background credential wait that died and retries the space after the retry delay with %s",
+    "waits again without sending the rejected credential after a background credential wait died with %s",
     Effect.fnUntraced(function*(constructor) {
       const services = yield* withPending(constructor, [spaceId])
       const logs = captureLogs()
+      const provider = makeCredentialProvider()
       let rejected = true
+      let pulls = 0
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
-        waitForCredentialChange: () => Effect.die("credential wait died"),
+        waitForCredentialChange: provider.waitForChange,
         submitBatch: acceptSubmission,
         pull: (request) => {
+          pulls += 1
           if (rejected) return credentialRejected
           return emptyPage(services.crypto, request)
         }
@@ -858,34 +872,39 @@ describe("credential waits that die", () => {
       const space = yield* replica.space(spaceId)
       const paused = yield* eventually(services, space, needsAuthentication)
       assert.isTrue(Option.isSome(paused), "the space asked for a new credential")
-      yield* settle("5 seconds")
-      const waits = logs.defects()
+      yield* settle("5 minutes")
+      const sent = pulls
+      const waited = provider.state.waits
       rejected = false
+      provider.state.healsAfter = provider.state.waits
 
       const drained = yield* eventually(services, space, isDrained)
 
-      assert.isAbove(waits.length, 0)
-      assert.isAtMost(waits.length, 6)
-      assert.deepStrictEqual(Array.from(new Set(waits)), ["credential wait died"])
-      assert.isTrue(Option.isSome(drained), "the space drained once its credential was accepted")
+      assert.strictEqual(sent, 1)
+      assert.isAbove(waited, 1)
+      assert.deepStrictEqual(logs.defects(), ["credential wait died"])
+      assert.isTrue(Option.isSome(drained), "the space drained once the provider reported a change")
     }, VirtualTime.scoped)
   )
 
   it.effect.each(constructors)(
-    "logs a foreground credential wait that died and retries the space after the retry delay with %s",
+    "waits again without sending the rejected credential after a foreground credential wait died with %s",
     Effect.fnUntraced(function*(constructor) {
       const services = yield* twoSpaces(constructor)
       const logs = captureLogs()
+      const provider = makeCredentialProvider()
       let rejected = false
+      let rejections = 0
       const { space } = yield* foregroundSpaces(
         services,
         SyncEngine.SyncEngine.of({
           ...idleRemote,
-          waitForCredentialChange: () => Effect.die("credential wait died"),
+          waitForCredentialChange: provider.waitForChange,
           submitBatch: acceptSubmission,
           pull: (request) => {
-            if (rejected && request.spaceId === spaceId) return credentialRejected
-            return emptyPage(services.crypto, request)
+            if (!rejected || request.spaceId !== spaceId) return emptyPage(services.crypto, request)
+            rejections += 1
+            return credentialRejected
           }
         }),
         logs.layerLogs
@@ -894,46 +913,53 @@ describe("credential waits that die", () => {
       yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
       const paused = yield* eventually(services, space, needsAuthentication)
       assert.isTrue(Option.isSome(paused), "the space asked for a new credential")
-      yield* settle("5 seconds")
-      const waits = logs.defects()
+      yield* settle("5 minutes")
+      const sent = rejections
+      const waited = provider.state.waits
       rejected = false
+      provider.state.healsAfter = provider.state.waits
 
       const drained = yield* eventually(services, space, isOnlineDrained)
 
-      assert.isAbove(waits.length, 0)
-      assert.isAtMost(waits.length, 6)
-      assert.deepStrictEqual(Array.from(new Set(waits)), ["credential wait died"])
-      assert.isTrue(Option.isSome(drained), "the space drained once its credential was accepted")
+      assert.strictEqual(sent, 1)
+      assert.isAbove(waited, 1)
+      assert.deepStrictEqual(logs.defects(), ["credential wait died"])
+      assert.isTrue(Option.isSome(drained), "the space drained once the provider reported a change")
     }, VirtualTime.scoped)
   )
 
   it.effect(
-    "logs an in-memory credential wait that died and retries after the retry delay",
+    "waits again without sending the rejected credential after an in-memory credential wait died",
     Effect.fnUntraced(function*() {
+      const provider = makeCredentialProvider()
       let rejected = false
+      let rejections = 0
       const { awaitStatus, local, logs, reconciler } = yield* inMemoryScheduler({
         pull: Effect.suspend(() => {
-          if (rejected) return credentialRejected
-          return Effect.void
+          if (!rejected) return Effect.void
+          rejections += 1
+          return credentialRejected
         }),
         watch: Effect.never,
-        waitForCredentialChange: Effect.die("credential wait died")
+        waitForCredentialChange: provider.waitForChange()
       })
       rejected = true
       yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
       yield* reconciler.schedule
       const paused = yield* awaitStatus(needsAuthentication)
       assert.isTrue(Option.isSome(paused), "the space asked for a new credential")
-      yield* settle("5 seconds")
-      const waits = logs.defects()
+      yield* settle("5 minutes")
+      const sent = rejections
+      const waited = provider.state.waits
       rejected = false
+      provider.state.healsAfter = provider.state.waits
 
       const drained = yield* awaitStatus((status) => status._tag === "Online" && status.pending === 0)
 
-      assert.isAbove(waits.length, 0)
-      assert.isAtMost(waits.length, 6)
-      assert.deepStrictEqual(Array.from(new Set(waits)), ["credential wait died"])
-      assert.isTrue(Option.isSome(drained), "the space drained once its credential was accepted")
+      assert.strictEqual(sent, 1)
+      assert.isAbove(waited, 1)
+      assert.deepStrictEqual(logs.defects(), ["credential wait died"])
+      assert.isTrue(Option.isSome(drained), "the space drained once the provider reported a change")
     }, VirtualTime.scoped)
   )
 })

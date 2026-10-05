@@ -21,7 +21,7 @@ import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
-import { backoff } from "./internal/transport.js"
+import { backoff, credentialChange } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as SyncEngine from "./SyncEngine.js"
 
@@ -333,13 +333,8 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     yield* FiberMap.run(
       authenticationWaiters,
       key,
-      remote.waitForCredentialChange(admission.generation).pipe(
-        Effect.catchCause((cause) =>
-          Effect.logError("Credential wait died", cause).pipe(
-            Effect.annotateLogs({ "space.id": space.spaceId }),
-            Effect.andThen(Effect.sleep(space.maximumRetryDelayMillis))
-          )
-        ),
+      credentialChange(remote, admission.generation, space.maximumRetryDelayMillis).pipe(
+        Effect.annotateLogs({ "space.id": space.spaceId }),
         Effect.andThen(finishWait),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
@@ -987,13 +982,8 @@ export const layerInMemoryScheduler = (
           })
           if (owned) yield* Deferred.succeed(admission.gate, undefined)
         }).pipe(Effect.uninterruptible)
-        yield* remote.waitForCredentialChange(generation).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logError("Credential wait died", cause).pipe(
-              Effect.annotateLogs({ "space.id": options.spaceId }),
-              Effect.andThen(Effect.sleep(retryTiming.maximumRetryDelayMillis))
-            )
-          ),
+        yield* credentialChange(remote, generation, retryTiming.maximumRetryDelayMillis).pipe(
+          Effect.annotateLogs({ "space.id": options.spaceId }),
           Effect.andThen(finishWait),
           Effect.catchCause((cause) => {
             if (Cause.hasInterruptsOnly(cause)) return Effect.void

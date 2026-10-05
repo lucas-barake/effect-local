@@ -38,7 +38,7 @@ import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as SqliteIdentifier from "./internal/sqliteIdentifier.js"
-import { isTransportFailure } from "./internal/transport.js"
+import { credentialChange, isTransportFailure } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
@@ -752,13 +752,12 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (failure._tag !== "CredentialRejected" || failure.credentialGeneration === undefined) {
             return Effect.andThen(stopWait, published)
           }
-          const wait = remote.waitForCredentialChange(failure.credentialGeneration).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logError("Background credential wait died", cause).pipe(
-                Effect.annotateLogs({ "space.id": entry.spaceId }),
-                Effect.andThen(Effect.sleep(retryTiming.maximumRetryDelayMillis))
-              )
-            ),
+          const wait = credentialChange(
+            remote,
+            failure.credentialGeneration,
+            retryTiming.maximumRetryDelayMillis
+          ).pipe(
+            Effect.annotateLogs({ "space.id": entry.spaceId }),
             Effect.andThen(enqueueBackground(entry))
           )
           return FiberMap.run(credentialWaits, entry.membershipIncarnation, wait).pipe(Effect.andThen(published))
