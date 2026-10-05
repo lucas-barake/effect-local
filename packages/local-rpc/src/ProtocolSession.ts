@@ -12,8 +12,8 @@ import * as Schema from "effect/Schema"
 import * as Semaphore from "effect/Semaphore"
 import type * as Authentication from "./Authentication.js"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
-import { findDecodeDefect } from "./internal/decodeDefect.js"
 import { invalidConfiguration } from "./internal/errors.js"
+import { findDecodeDefect } from "./internal/responseDecoding.js"
 import * as SyncRpc from "./SyncRpc.js"
 
 type Client = Effect.Success<typeof SyncRpc.makeRpcClient>

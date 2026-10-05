@@ -119,13 +119,39 @@ const layerCredentialDying = Layer.succeed(
   })
 )
 
+const localSchemaError = Effect.gen(function*() {
+  const decoded = yield* Effect.result(Schema.decodeUnknownEffect(Schema.Number)("not a number"))
+  if (Result.isFailure(decoded)) return decoded.failure
+  return yield* Effect.die("a string decoded as a number")
+})
+
+const layerCredentialDyingAt = (acquisition: number, defect: Schema.SchemaError) =>
+  Layer.sync(Authentication.CredentialProvider, () => {
+    let acquired = 0
+    return Authentication.CredentialProvider.of({
+      acquire: Effect.suspend(() => {
+        acquired += 1
+        if (acquired === acquisition) return Effect.die(defect)
+        return Effect.succeed({ generation: 0, bearer: Redacted.make("secret") })
+      }),
+      awaitChange: () => Effect.never
+    })
+  })
+
+interface WriteDefect {
+  readonly tag: string
+  readonly defect: Schema.SchemaError
+}
+
 const connect = Effect.fnUntraced(function*(
   script: ReadonlyMap<string, Reply>,
-  layerCredential: Layer.Layer<Authentication.CredentialProvider>
+  layerCredential: Layer.Layer<Authentication.CredentialProvider>,
+  writeDefect?: WriteDefect
 ) {
   const incoming = yield* Queue.unbounded<string | Uint8Array>()
   const outgoing = yield* Queue.unbounded<unknown>()
   const interrupted = yield* Queue.unbounded<RequestId>()
+  const written: Array<string> = []
   const parser = RpcSerialization.json.makeUnsafe()
   const decoder = new TextDecoder()
   const deliver = (frame: unknown) => {
@@ -154,7 +180,13 @@ const connect = Effect.fnUntraced(function*(
         if (typeof chunk !== "string" && !(chunk instanceof Uint8Array)) return Effect.void
         let text = chunk
         if (typeof text !== "string") text = decoder.decode(text)
-        return Queue.offerAll(outgoing, parser.decode(text))
+        const frames = parser.decode(text)
+        for (const frame of frames) {
+          if (!isRequestFrame(frame)) continue
+          if (frame.tag === writeDefect?.tag) return Effect.die(writeDefect.defect)
+          written.push(frame.tag)
+        }
+        return Queue.offerAll(outgoing, frames)
       },
       writeAll: () => Effect.void
     })
@@ -178,7 +210,8 @@ const connect = Effect.fnUntraced(function*(
   return {
     engine: Context.get(context, SyncEngine.SyncEngine),
     ephemeral: Context.get(context, EphemeralClient.EphemeralClient),
-    interrupted
+    interrupted,
+    written
   }
 })
 
@@ -220,6 +253,7 @@ interface Call {
   readonly transportFailure: string
   readonly prelude: ReadonlyArray<readonly [string, Reply]>
   readonly streamed: boolean
+  readonly acquisition: number
   readonly run: (clients: Clients) => Effect.Effect<string>
 }
 
@@ -232,6 +266,7 @@ const calls: ReadonlyArray<Call> = [
     transportFailure: "ProtocolInvalid: The protocol negotiation failed",
     prelude: [],
     streamed: false,
+    acquisition: 1,
     run: (clients) => exitOutcome(clients.engine.pull(pullRequest))
   },
   {
@@ -239,6 +274,7 @@ const calls: ReadonlyArray<Call> = [
     transportFailure: "ProtocolInvalid: The SubmitBatch RPC failed",
     prelude: [],
     streamed: false,
+    acquisition: 2,
     run: (clients) =>
       envelope.pipe(
         Effect.flatMap((submitted) =>
@@ -252,6 +288,7 @@ const calls: ReadonlyArray<Call> = [
     transportFailure: "ProtocolInvalid: The Discard RPC failed",
     prelude: [],
     streamed: false,
+    acquisition: 2,
     run: (clients) =>
       envelope.pipe(
         Effect.flatMap((discarded) =>
@@ -265,6 +302,7 @@ const calls: ReadonlyArray<Call> = [
     transportFailure: "ProtocolInvalid: The Pull RPC failed",
     prelude: [],
     streamed: false,
+    acquisition: 2,
     run: (clients) => exitOutcome(clients.engine.pull(pullRequest))
   },
   {
@@ -272,6 +310,7 @@ const calls: ReadonlyArray<Call> = [
     transportFailure: "ProtocolInvalid: The Bootstrap RPC failed",
     prelude: [],
     streamed: false,
+    acquisition: 2,
     run: (clients) =>
       exitOutcome(clients.engine.bootstrap({
         spaceId,
@@ -291,6 +330,7 @@ const calls: ReadonlyArray<Call> = [
     transportFailure: "ProtocolInvalid: The Watch RPC failed",
     prelude: [],
     streamed: true,
+    acquisition: 2,
     run: (clients) => clients.engine.watch(watchRequest).pipe(Stream.runDrain, exitOutcome)
   },
   {
@@ -298,6 +338,7 @@ const calls: ReadonlyArray<Call> = [
     transportFailure: "ProtocolInvalid: The JoinEphemeral RPC failed",
     prelude: [],
     streamed: true,
+    acquisition: 2,
     run: (clients) => openSession(clients).pipe(Effect.scoped, exitOutcome)
   },
   {
@@ -305,6 +346,7 @@ const calls: ReadonlyArray<Call> = [
     transportFailure: "ProtocolInvalid: The PublishEphemeral RPC failed",
     prelude: [["JoinEphemeral", joined]],
     streamed: false,
+    acquisition: 3,
     run: (clients) =>
       openSession(clients).pipe(
         Effect.andThen(
@@ -319,6 +361,7 @@ const calls: ReadonlyArray<Call> = [
     transportFailure: "ProtocolInvalid: The JoinEphemeral RPC failed",
     prelude: [["JoinEphemeral", joined]],
     streamed: false,
+    acquisition: 3,
     run: Effect.fnUntraced(
       function*(clients: Clients) {
         const session = yield* openSession(clients)
@@ -361,6 +404,26 @@ describe("a server reply that this client cannot decode", () => {
       Effect.fnUntraced(function*() {
         const clients = yield* connect(replies(call, unknownErrorReply), layerCredentialStatic)
         assert.strictEqual(yield* call.run(clients), undecodable)
+      }, Effect.scoped)
+    )
+
+    it.effect(
+      `leaves ${call.rpc} dying when the credential provider dies with a SchemaError before the request is written`,
+      Effect.fnUntraced(function*() {
+        const defect = yield* localSchemaError
+        const clients = yield* connect(new Map(call.prelude), layerCredentialDyingAt(call.acquisition, defect))
+        assert.strictEqual(yield* call.run(clients), "defect: SchemaError")
+        assert.notInclude(clients.written, call.rpc)
+      }, Effect.scoped)
+    )
+
+    it.effect(
+      `leaves ${call.rpc} dying when the socket write of its request dies with a SchemaError`,
+      Effect.fnUntraced(function*() {
+        const defect = yield* localSchemaError
+        const clients = yield* connect(new Map(call.prelude), layerCredentialStatic, { tag: call.rpc, defect })
+        assert.strictEqual(yield* call.run(clients), "defect: SchemaError")
+        assert.notInclude(clients.written, call.rpc)
       }, Effect.scoped)
     )
 
