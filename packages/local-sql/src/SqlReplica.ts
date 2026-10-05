@@ -957,7 +957,10 @@ const makeLayer = <D extends Definition.Any, R,>(
               return Effect.void
             })
           )
-          const changed = yield* applyContribution(entry, () => inactiveStatus(entry, count.count))
+          let changed = false
+          if (entry.activation === "Inactive") {
+            changed = yield* applyContribution(entry, () => inactiveStatus(entry, count.count))
+          }
           if (enqueuePending && count.count > 0) yield* enqueueBackground(entry)
           yield* announced.run(announceContribution(changed))
           yield* announced.raise

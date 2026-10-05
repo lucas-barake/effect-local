@@ -474,3 +474,28 @@ describe("a waiter whose completion callback throws", () => {
     }, VirtualTime.scoped)
   )
 })
+
+describe("a space reactivated while its deactivation was still being announced", () => {
+  it.effect.each(constructors)(
+    "stays counted online with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const { replica, space } = yield* onlineSpace(services)
+      const delivery = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
+      delivery.arm(2)
+      const deactivating = yield* space.deactivate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(delivery.entered)
+      yield* space.activate
+      assert.isTrue(Option.isSome(yield* eventually(services, space, isOnlineDrained)), "the space came back online")
+      yield* delivery.release
+      const deactivated = yield* VirtualTime.advanceUntil(Fiber.join(deactivating))
+      yield* settle
+      const aggregate = yield* replica.status
+
+      assert.isTrue(Exit.isSuccess(deactivated), "the deactivation")
+      assert.strictEqual(yield* space.activation, "Active")
+      assert.strictEqual(aggregate.counts.online, 1)
+      assert.strictEqual(aggregate.counts.idle, 1)
+    }, VirtualTime.scoped)
+  )
+})
