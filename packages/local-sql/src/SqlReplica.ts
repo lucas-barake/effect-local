@@ -8,6 +8,7 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import type * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
@@ -32,11 +33,12 @@ import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
 import * as ConnectionLane from "./ConnectionLane.js"
 import * as Codec from "./internal/codec.js"
 import * as Configuration from "./internal/configuration.js"
+import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as SqliteIdentifier from "./internal/sqliteIdentifier.js"
-import { isTransportFailure } from "./internal/transport.js"
+import { credentialChange, isTransportFailure } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
@@ -378,7 +380,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             current.totalPending - entry.summaryStatus.pending,
             { ...current.counts, [category]: current.counts[category] - 1 }
           )
-        })
+        }, false)
       const modifyContribution = (
         entry: RememberedEntry,
         update: (current: ReplicaStatus.ReplicaStatus) => ReplicaStatus.ReplicaStatus
@@ -420,6 +422,14 @@ const makeLayer = <D extends Definition.Any, R,>(
         entry: RememberedEntry,
         next: ReplicaStatus.ReplicaStatus
       ) => modifyContribution(entry, () => next)
+      const publishRuntimeStatus = (
+        entry: RememberedEntry,
+        next: ReplicaStatus.ReplicaStatus,
+        pendingCounted: boolean
+      ) => {
+        if (pendingCounted) return updateContribution(entry, next)
+        return modifyContribution(entry, (current) => ({ ...next, pending: current.pending }))
+      }
       const updatePendingContribution = (entry: RememberedEntry, pending: number) =>
         modifyContribution(entry, (current) => ({ ...current, pending }))
       const readMemberships = SqlSchema.findAll({
@@ -557,7 +567,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           const layerReconciliation = Reconciler.layerOnePass({
             ...options,
             spaceId,
-            onStatusChange: (status) => updateContribution(entry, status),
+            onStatusChange: (status, pendingCounted) => publishRuntimeStatus(entry, status, pendingCounted),
             onReconciled: forgetBackgroundFailure(entry)
           }).pipe(
             Layer.provide(layerLocalStore)
@@ -584,6 +594,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               Layer.provide(
                 Layer.succeed(ReconciliationWorkflow.Registration, entry.workflowRegistration)
               ),
+              Layer.provide(Layer.succeed(ReconciliationWorkflow.RegistrationScope, parentScope)),
               Layer.buildWithScope(childScope),
               Effect.provide(workflowContext),
               Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
@@ -607,7 +618,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             Reconciler.layerOnePass({
               ...options,
               spaceId,
-              onStatusChange: (status) => updateContribution(entry, status),
+              onStatusChange: (status, pendingCounted) => publishRuntimeStatus(entry, status, pendingCounted),
               onReconciled: forgetBackgroundFailure(entry)
             }).pipe(Layer.provide(layerLocalStore))
           ).pipe(
@@ -729,10 +740,12 @@ const makeLayer = <D extends Definition.Any, R,>(
       ) =>
         Effect.suspend(() => {
           if (entry.backgroundGeneration !== generation) return Effect.void
+          if (entry.runtime !== undefined && entry.runtime.foreground) return Effect.void
           const published = publishBackgroundFailure(entry)
           const stopWait = FiberMap.remove(credentialWaits, entry.membershipIncarnation)
           if (Reconciler.isTransientFailure(failure)) {
             entry.backgroundFailure = undefined
+            if (failure._tag === "UnexpectedFailure") entry.backgroundFailure = failure
             entry.retryAttempt += 1
             entry.backgroundGeneration += 1
             let retryTransport = Option.none<number>()
@@ -749,7 +762,12 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (failure._tag !== "CredentialRejected" || failure.credentialGeneration === undefined) {
             return Effect.andThen(stopWait, published)
           }
-          const wait = remote.waitForCredentialChange(failure.credentialGeneration).pipe(
+          const wait = credentialChange(
+            remote,
+            failure.credentialGeneration,
+            retryTiming.maximumRetryDelayMillis
+          ).pipe(
+            Effect.annotateLogs({ "space.id": entry.spaceId }),
             Effect.andThen(enqueueBackground(entry))
           )
           return FiberMap.run(credentialWaits, entry.membershipIncarnation, wait).pipe(Effect.andThen(published))
@@ -828,6 +846,15 @@ const makeLayer = <D extends Definition.Any, R,>(
         )
       })
 
+      const rearmRetries = (cause: Cause.Cause<never>) =>
+        Errors.logDefect("Background retry scheduling died", cause).pipe(
+          Effect.map(() => {
+            for (let index = 0; index < retrySchedule.length; index++) {
+              retrySchedule[index] = { ...retrySchedule[index], transportGeneration: Option.none() }
+            }
+          })
+        )
+
       const deactivate = (
         entry: RememberedEntry,
         explicit: boolean,
@@ -895,7 +922,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                   })
                 )
             }),
-            Effect.tapError(() => {
+            Effect.tapCause(() => {
               if (enqueuePending) return enqueueBackground(entry)
               return Effect.void
             })
@@ -1525,24 +1552,21 @@ const makeLayer = <D extends Definition.Any, R,>(
                 Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
               )
             ),
-            Effect.tap(() =>
-              removeContribution(current).pipe(
-                Effect.andThen(Effect.sync(() => {
-                  entries.delete(spaceId)
-                  current.backgroundGeneration += 1
-                })),
-                Effect.andThen(FiberMap.remove(credentialWaits, current.membershipIncarnation)),
-                Effect.andThen(publishSettlements(current))
+            Effect.tap(() => {
+              entries.delete(spaceId)
+              current.backgroundGeneration += 1
+              const announced = Effect.ensuring(
+                invalidateAggregate,
+                reactivity.invalidate([ReactivityKey.membership(spaceId), ReactivityKey.spaces])
               )
-            ),
-            Effect.tap(() =>
-              reactivity.invalidate([
-                ReactivityKey.membership(spaceId),
-                ReactivityKey.spaces
-              ])
-            ),
+              return removeContribution(current).pipe(
+                Effect.andThen(FiberMap.remove(credentialWaits, current.membershipIncarnation)),
+                Effect.andThen(publishSettlements(current)),
+                Effect.andThen(announced)
+              )
+            }),
             Effect.asVoid,
-            Effect.tapError(() =>
+            Effect.tapCause(() =>
               Effect.suspend(() => {
                 current.leaving = false
                 current.leaveCompletion = undefined
@@ -1575,25 +1599,22 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const status = Ref.get(aggregate)
 
-      const backgroundTurn = Effect.gen(function*() {
-        const work = yield* LosslessQueue.take(backgroundQueue)
+      const runBackgroundWork = Effect.fnUntraced(function*(
+        work: BackgroundWork,
+        entry: RememberedEntry,
+        generation: number
+      ) {
         if (work._tag === "Deactivate") {
-          const generation = work.entry.backgroundGeneration
-          const result = yield* deactivate(work.entry, false, work.runtime, false).pipe(Effect.result)
+          const result = yield* deactivate(entry, false, work.runtime, false).pipe(Effect.result)
           if (Result.isFailure(result)) {
-            yield* settleBackgroundTurn(work.entry, generation, result.failure, Option.none())
+            yield* settleBackgroundTurn(entry, generation, result.failure, Option.none())
           }
           return
         }
-        const spaceId = work.spaceId
-        backgroundQueued.delete(spaceId)
-        const entry = entries.get(spaceId)
-        if (entry === undefined) return
         if (entry.leaving) {
           entry.dueWhileLeaving = true
           return
         }
-        const generation = entry.backgroundGeneration
         let activeRuntime: ActiveRuntime | undefined
         const transportGeneration = yield* remote.transportGeneration
         const result = yield* withLease(entry, false, (runtime) => {
@@ -1603,7 +1624,6 @@ const makeLayer = <D extends Definition.Any, R,>(
           return Effect.raceFirst(sync, Deferred.await(runtime.preemption))
         }).pipe(Effect.result)
         if (activeRuntime !== undefined) {
-          if (activeRuntime.foreground) return
           const deactivation = yield* deactivate(
             entry,
             false,
@@ -1620,6 +1640,56 @@ const makeLayer = <D extends Definition.Any, R,>(
         }
       })
 
+      const settleDiedTurn = Effect.fnUntraced(function*(
+        entry: RememberedEntry,
+        generation: number,
+        cause: Cause.Cause<never>
+      ) {
+        yield* Errors.logDefect("Background scheduler turn died", cause).pipe(
+          Effect.annotateLogs({ "space.id": entry.spaceId })
+        )
+        const stranded = entry.runtime
+        if (stranded !== undefined) {
+          const closed = yield* deactivate(entry, false, stranded, false).pipe(Effect.exit)
+          if (Exit.isFailure(closed)) {
+            yield* Effect.logError("Background runtime did not close after its turn died", closed.cause).pipe(
+              Effect.annotateLogs({ "space.id": entry.spaceId })
+            )
+          }
+        }
+        yield* settleBackgroundTurn(
+          entry,
+          generation,
+          Errors.iterationFailure("Background scheduler turn died", cause),
+          Option.none()
+        )
+      })
+
+      const backgroundTurn = Effect.gen(function*() {
+        const work = yield* LosslessQueue.take(backgroundQueue)
+        let entry: RememberedEntry | undefined
+        if (work._tag === "Deactivate") {
+          entry = work.entry
+        } else {
+          backgroundQueued.delete(work.spaceId)
+          entry = entries.get(work.spaceId)
+        }
+        if (entry === undefined) return
+        const claimed = entry
+        const generation = claimed.backgroundGeneration
+        yield* runBackgroundWork(work, claimed, generation).pipe(
+          Effect.catchCause((cause) =>
+            settleDiedTurn(claimed, generation, cause).pipe(
+              Effect.catchCause((settleCause) =>
+                Errors.logDefect("Background turn settlement died", settleCause).pipe(
+                  Effect.annotateLogs({ "space.id": claimed.spaceId })
+                )
+              )
+            )
+          )
+        )
+      })
+
       yield* Effect.forEach(
         Array.from({ length: backgroundConcurrency }),
         () =>
@@ -1631,6 +1701,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         { discard: true }
       )
       yield* retrySchedulerTurn.pipe(
+        Effect.catchCause(rearmRetries),
         Effect.forever,
         Effect.provideService(ConnectionLane.Priority, "Background"),
         Effect.forkScoped({ startImmediately: true })

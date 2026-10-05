@@ -242,6 +242,10 @@ export class BuildSuperseded extends Schema.TaggedError<BuildSuperseded>(
   supersedingVersion: PositiveInt
 }) {}
 
+export class UnexpectedFailure extends Schema.TaggedError<UnexpectedFailure>(
+  "@lucas-barake/effect-local/UnexpectedFailure"
+)("UnexpectedFailure", { message: Schema.String, cause: Schema.Defect() }) {}
+
 export const StorageError = Schema.Union([StorageUnavailable, StorageCorrupt, CanonicalEncodeError])
 export type StorageError = typeof StorageError.Type
 
@@ -283,6 +287,7 @@ export const ReplicaError = Schema.Union([
   OperationTimeout,
   AuthorizationDenied,
   OwnerUnavailable,
-  BuildSuperseded
+  BuildSuperseded,
+  UnexpectedFailure
 ])
 export type ReplicaError = typeof ReplicaError.Type

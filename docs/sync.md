@@ -151,12 +151,12 @@ Authentication and authorization failures remain distinct:
 Reconciliation classifies every `ReplicaError` once, in `Reconciler.ts`, and both reconcilers and the background
 scheduler read that one classification:
 
-| Class            | Failures                                                                                            | Status                | Policy                           |
-| ---------------- | --------------------------------------------------------------------------------------------------- | --------------------- | -------------------------------- |
-| Unreachable      | `ServerUnavailable`, `OperationTimeout`, `AuthenticatorUnavailable`                                 | `Offline`             | Retry with backoff               |
-| Retryable        | `StorageUnavailable`, `UnknownCommitOutcome`, `OwnerUnavailable`, retryable `CapacityExceeded`      | `Failed`              | Retry with backoff               |
-| Needs credential | `CredentialRejected`                                                                                | `NeedsAuthentication` | Wait for a new generation        |
-| Terminal         | Every other tag, including `StorageCorrupt`, `AuthorizationDenied`, and terminal `CapacityExceeded` | `Failed`              | Stop until new work is requested |
+| Class            | Failures                                                                                                            | Status                | Policy                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------- | --------------------- | -------------------------------- |
+| Unreachable      | `ServerUnavailable`, `OperationTimeout`, `AuthenticatorUnavailable`                                                 | `Offline`             | Retry with backoff               |
+| Retryable        | `StorageUnavailable`, `UnknownCommitOutcome`, `OwnerUnavailable`, `UnexpectedFailure`, retryable `CapacityExceeded` | `Failed`              | Retry with backoff               |
+| Needs credential | `CredentialRejected`                                                                                                | `NeedsAuthentication` | Wait for a new generation        |
+| Terminal         | Every other tag, including `StorageCorrupt`, `AuthorizationDenied`, and terminal `CapacityExceeded`                 | `Failed`              | Stop until new work is requested |
 
 `CapacityExceeded.resource` is the closed union `ReplicaError.CapacityResource`, and each resource has its own class.
 Limits that load can clear retry: `read authorizations`, `sync watchers`, `sync watchers per principal`,
@@ -166,6 +166,11 @@ receipts, bootstrap and snapshot sizes, page, mutation, receipt, and schema evol
 schema, scope, projection, and reconciliation generations, the sequence ceilings, and the ephemeral payload, snapshot,
 and per member limits. A `Failed` status carries the failure tag as its `message`. A
 `CredentialRejected` that carries no credential generation cannot be waited on and stops like a terminal failure.
+
+`UnexpectedFailure` reports a defect inside the replica's own sync machinery, such as a storage client that died or a
+server response the client could not decode. It carries the defect as `cause`, is logged at error level with its full
+cause, and retries with the same backoff. An inactive space keeps it in `space.status` while its retry is pending, so
+the failure stays visible until a sync succeeds.
 
 Ephemeral operations expose the same typed failures directly, but ephemera is outside reconciliation and does not
 change replica status.
