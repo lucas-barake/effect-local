@@ -78,6 +78,8 @@ describe("sync wire contract", () => {
       Rpc.make("Call", { ...base, payload: { ...payload, extra: Schema.optionalKey(Schema.String) } }),
       Rpc.make("Call", { ...base, success: Schema.NullOr(Schema.Number) }),
       Rpc.make("Call", { ...base, stream: true }),
+      Rpc.make("Call", { ...base, stream: true, success: Schema.String }),
+      Rpc.make("Call", { ...base, stream: true, error: FailedWithRequiredKey }),
       Rpc.make("Call", { ...base, defect: Schema.Defect({ includeStack: true }) }),
       Rpc.make("Call", { ...base, error: FailedWithWiderLiteral }),
       Rpc.make("Call", { ...base, error: FailedWithRequiredKey }),
