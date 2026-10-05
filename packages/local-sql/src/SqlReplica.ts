@@ -363,10 +363,12 @@ const makeLayer = <D extends Definition.Any, R,>(
       const defaultScopeJson = yield* Codec.stringify(normalizedDefaultScope)
       const defaultScopeDigest = yield* Protocol.replicationScopeDigest(normalizedDefaultScope)
 
-      const flush = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys)
+      const handOff = (keys: ReadonlyArray<string>) =>
+        Invalidation.flush(reactivity, keys, () => Effect.void).pipe(Effect.forkIn(parentScope), Effect.asVoid)
+      const flush = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys, handOff)
       const notify = (keys: ReadonlyArray<string>) =>
         Effect.withFiber((fiber) => {
-          if (fiber.getRef(CallerFiber) === fiber.id) return Invalidation.notify(reactivity, keys)
+          if (fiber.getRef(CallerFiber) === fiber.id) return Invalidation.notify(reactivity, keys, handOff)
           return flush(keys)
         })
       const addContribution = (entry: RememberedEntry) =>
@@ -561,6 +563,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           clientId,
           scope: replicationScope,
           spaceId,
+          handOffInvalidation: handOff,
           onSettlementsRecorded: publishSettlements(entry),
           onReplicationView: (installed) => recordReplicationView(entry, installed),
           onMutationsCommitted: (pending) =>

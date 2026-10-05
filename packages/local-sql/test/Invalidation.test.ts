@@ -25,6 +25,8 @@ const captureLogs = () => {
   return { layerLogs: Logger.layer([logger]), errors: () => errors }
 }
 
+const dropped = () => Effect.void
+
 const provideReactivity = Effect.provide(Reactivity.layer)
 
 describe("Invalidation.notify", () => {
@@ -47,7 +49,7 @@ describe("Invalidation.notify", () => {
         reactivity.registerUnsafe(["third"], () => {
           notified.push("third")
         })
-        return yield* Invalidation.notify(reactivity, ["first", "second", "third"]).pipe(Effect.exit)
+        return yield* Invalidation.notify(reactivity, ["first", "second", "third"], dropped).pipe(Effect.exit)
       }).pipe(Effect.provide(Layer.merge(Reactivity.layer, logs.layerLogs)))
 
       assert.isTrue(Exit.isSuccess(exit), "the notification completed")
@@ -65,8 +67,8 @@ describe("Invalidation.notify", () => {
         notifications += 1
       })
 
-      const insideBatch = yield* Invalidation.notify(reactivity, ["key"]).pipe(
-        Effect.andThen(Invalidation.notify(reactivity, ["key"])),
+      const insideBatch = yield* Invalidation.notify(reactivity, ["key"], dropped).pipe(
+        Effect.andThen(Invalidation.notify(reactivity, ["key"], dropped)),
         Effect.andThen(reactivity.invalidate(["key"])),
         Effect.map(() => notifications),
         reactivity.withBatch
@@ -87,7 +89,7 @@ describe("Invalidation.notify", () => {
           decodeURIComponent("%")
         })
         let notified: Exit.Exit<void> | undefined
-        const batch = yield* Invalidation.notify(reactivity, ["key"]).pipe(
+        const batch = yield* Invalidation.notify(reactivity, ["key"], dropped).pipe(
           Effect.exit,
           Effect.map((exit) => {
             notified = exit
@@ -113,7 +115,7 @@ describe("Invalidation.notify", () => {
         notifications += 1
       })
 
-      const insideBatch = yield* Invalidation.flush(reactivity, ["key"]).pipe(
+      const insideBatch = yield* Invalidation.flush(reactivity, ["key"], dropped).pipe(
         Effect.map(() => notifications),
         reactivity.withBatch
       )
@@ -136,7 +138,7 @@ describe("Invalidation.notify", () => {
         reactivity.registerUnsafe(["second"], () => {
           notified.push("second")
         })
-        return yield* Invalidation.flush(reactivity, ["first", "second", "second"]).pipe(Effect.exit)
+        return yield* Invalidation.flush(reactivity, ["first", "second", "second"], dropped).pipe(Effect.exit)
       }).pipe(Effect.provide(Layer.merge(Reactivity.layer, logs.layerLogs)))
 
       assert.isTrue(Exit.isSuccess(exit), "the notification completed")
@@ -154,14 +156,14 @@ describe("Invalidation.notify", () => {
         notifications += 1
       })
 
-      yield* Invalidation.notify(reactivity, ["key", "key"])
+      yield* Invalidation.notify(reactivity, ["key", "key"], dropped)
 
       assert.strictEqual(notifications, 1)
     }, provideReactivity)
   )
 
   it.effect(
-    "stops when the caller is interrupted while a notification is being delivered",
+    "hands the keys it did not deliver to the library when the caller is interrupted during a delivery",
     Effect.fnUntraced(function*() {
       const base = yield* Reactivity.make
       const reached = yield* Deferred.make<void>()
@@ -178,7 +180,12 @@ describe("Invalidation.notify", () => {
           notified.push(key)
         })
       }
-      const notifying = yield* Invalidation.notify(reactivity, ["first", "second", "third"]).pipe(
+      const handedOff: Array<ReadonlyArray<string>> = []
+      const handOff = (keys: ReadonlyArray<string>) =>
+        Effect.sync(() => {
+          handedOff.push(keys)
+        })
+      const notifying = yield* Invalidation.notify(reactivity, ["first", "second", "third"], handOff).pipe(
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(reached)
@@ -187,6 +194,7 @@ describe("Invalidation.notify", () => {
 
       assert.isTrue(Exit.hasInterrupts(exit), "the notification ended with the interruption")
       assert.deepStrictEqual(notified, ["first"])
+      assert.deepStrictEqual(handedOff, [["second", "third"]])
     })
   )
 
@@ -209,7 +217,12 @@ describe("Invalidation.notify", () => {
           notified.push(key)
         })
       }
-      const notifying = yield* Invalidation.notify(reactivity, ["first", "second"]).pipe(
+      const handedOff: Array<ReadonlyArray<string>> = []
+      const handOff = (keys: ReadonlyArray<string>) =>
+        Effect.sync(() => {
+          handedOff.push(keys)
+        })
+      const notifying = yield* Invalidation.notify(reactivity, ["first", "second"], handOff).pipe(
         Effect.uninterruptible,
         Effect.provide(logs.layerLogs),
         Effect.forkChild({ startImmediately: true })
@@ -220,6 +233,7 @@ describe("Invalidation.notify", () => {
 
       assert.isTrue(Exit.hasInterrupts(exit), "the caller was interrupted")
       assert.deepStrictEqual(notified, ["second"])
+      assert.deepStrictEqual(handedOff, [["first"]])
       assert.deepStrictEqual(logs.errors(), [])
     })
   )
@@ -241,7 +255,7 @@ describe("Invalidation.notify", () => {
         }
       }
 
-      const exit = yield* Invalidation.notify(reactivity, ["interrupted", "after"]).pipe(
+      const exit = yield* Invalidation.notify(reactivity, ["interrupted", "after"], dropped).pipe(
         Effect.exit,
         Effect.provide(logs.layerLogs)
       )
@@ -266,7 +280,10 @@ describe("Invalidation.notify", () => {
         invalidate: () => Effect.ensuring(Effect.interrupt, Effect.die("subscriber died"))
       }
 
-      const exit = yield* Invalidation.notify(reactivity, ["key"]).pipe(Effect.exit, Effect.provide(logs.layerLogs))
+      const exit = yield* Invalidation.notify(reactivity, ["key"], dropped).pipe(
+        Effect.exit,
+        Effect.provide(logs.layerLogs)
+      )
 
       assert.isTrue(Exit.isSuccess(exit), "the notification completed")
       assert.deepStrictEqual(logs.errors(), [{ message: "Reactivity subscriber died", key: "key", defect: true }])

@@ -67,6 +67,7 @@ export interface Options {
   readonly maximumSettlementSnapshotBytes?: number
   readonly retainedMutationIds?: number
   readonly migration: Migrations.Options
+  readonly handOffInvalidation?: (keys: ReadonlyArray<string>) => Effect.Effect<void>
   readonly onSettlementsRecorded?: Effect.Effect<void>
   readonly onReplicationView?: (installed: boolean) => Effect.Effect<void>
   readonly onMutationsCommitted?: (pending: number) => Effect.Effect<void, ReplicaError.ReplicaError>
@@ -1633,7 +1634,10 @@ export const layer = (
         }
         return Array.from(new Set(keys))
       })
-      const notify = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys)
+      const invalidationScope = yield* Effect.scope
+      const handOffInvalidation = options.handOffInvalidation ?? ((keys: ReadonlyArray<string>) =>
+        Invalidation.flush(reactivity, keys, () => Effect.void).pipe(Effect.forkIn(invalidationScope), Effect.asVoid))
+      const notify = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys, handOffInvalidation)
       const invalidate = (
         entities: ReadonlyArray<Protocol.EntityKey>,
         receiptIds: ReadonlyArray<Identity.MutationId> = [],

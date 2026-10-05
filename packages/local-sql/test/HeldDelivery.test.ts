@@ -169,6 +169,14 @@ describe("a membership subscriber of a join that never returns", () => {
     Effect.fnUntraced(function*(constructor) {
       const services = yield* twoSpaces(constructor)
       const replica = yield* services.start(idleRemote)
+      let listedAnnouncements = 0
+      let membershipAnnouncements = 0
+      services.reactivity.registerUnsafe([ReactivityKey.spaces], () => {
+        listedAnnouncements += 1
+      })
+      services.reactivity.registerUnsafe([ReactivityKey.membership(thirdSpaceId)], () => {
+        membershipAnnouncements += 1
+      })
       const delivery = yield* services.holdInvalidation(ReactivityKey.membership(thirdSpaceId))
       delivery.arm(1)
       const inserting = yield* services.holdStatement("INSERT INTO effect_local_client_spaces", true)
@@ -187,6 +195,8 @@ describe("a membership subscriber of a join that never returns", () => {
       assert.isTrue(interrupted, "the join was interrupted while its notification was being delivered")
       assert.isTrue(waited !== undefined && Exit.isSuccess(waited), "the join that waited completed")
       assert.strictEqual(listed.length, 3, "the space was joined")
+      assert.strictEqual(listedAnnouncements, 1, "the key the caller did not reach was delivered by the library")
+      assert.isAbove(membershipAnnouncements, 0, "the key that was being delivered was delivered")
     }, VirtualTime.scoped)
   )
 })
