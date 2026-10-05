@@ -1,0 +1,377 @@
+import { assert, describe, it } from "@effect/vitest"
+import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
+import type * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
+import * as Logger from "effect/Logger"
+import * as Option from "effect/Option"
+import * as SyncEngine from "../src/SyncEngine.js"
+import * as Domain from "./Domain.js"
+import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
+import {
+  acceptSubmission,
+  awaitSpaceStatusWhere,
+  type Constructor,
+  constructors,
+  emptyPage,
+  idleRemote,
+  viewId
+} from "./fixtures/BackgroundReplica.js"
+import * as VirtualTime from "./fixtures/DeterministicTime.js"
+
+const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000f01")
+const otherSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000f02")
+const thirdSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000f03")
+const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000f01")
+
+const twoSpaces = (constructor: Constructor) =>
+  BackgroundReplica.services({
+    constructor,
+    clientId,
+    initialSpaces: [spaceId, otherSpaceId],
+    maximumActiveSpaces: 4,
+    foregroundActiveSpaces: 2,
+    retryDelay: "1 second",
+    maximumRetryDelay: "1 minute"
+  })
+
+const eventually = (
+  services: BackgroundReplica.Services,
+  space: Replica.Space,
+  matches: (status: ReplicaStatus.SpaceStatus) => boolean
+) =>
+  awaitSpaceStatusWhere(space, services.reactivity, matches).pipe(
+    Effect.scoped,
+    VirtualTime.advanceUntil,
+    Effect.timeoutOption("5 minutes")
+  )
+
+const firstTodo = Domain.todo("first")
+
+const settle = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 second"))
+
+const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
+
+const healthyRemote = (services: BackgroundReplica.Services) =>
+  SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    submitBatch: acceptSubmission,
+    pull: (request) => emptyPage(services.crypto, request)
+  })
+
+const installView = (services: BackgroundReplica.Services) =>
+  services.sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId}, replication_view_revision = 0`
+
+const onlineSpace = Effect.fnUntraced(function*(services: BackgroundReplica.Services) {
+  const replica = yield* services.start(healthyRemote(services))
+  yield* installView(services)
+  const space = yield* replica.space(spaceId)
+  yield* space.activate
+  assert.isTrue(Option.isSome(yield* eventually(services, space, isOnlineDrained)), "the space came online")
+  return { replica, space }
+})
+
+const count = (services: BackgroundReplica.Services, key: string) => {
+  let delivered = 0
+  services.reactivity.registerUnsafe([key], () => {
+    delivered += 1
+  })
+  return () => delivered
+}
+
+const captureErrors = () => {
+  const messages: Array<string> = []
+  const logger = Logger.make<unknown, void>((entry) => {
+    if (entry.logLevel !== "Error") return
+    let message: unknown = entry.message
+    if (Array.isArray(message)) message = message[0]
+    messages.push(String(message))
+  })
+  return { layerLogs: Logger.layer([logger]), messages: () => messages }
+}
+
+const throwingObserver = () => {
+  let completed = 0
+  const observe = () => {
+    completed += 1
+    decodeURIComponent("%")
+  }
+  return { observe, completed: () => completed }
+}
+
+describe("the subscribers of an operation when its caller resumes", () => {
+  it.effect.each(constructors)(
+    "were notified of the leave of an active space with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const { replica } = yield* onlineSpace(services)
+      const listed = count(services, ReactivityKey.spaces)
+      const membership = count(services, ReactivityKey.membership(spaceId))
+      const aggregate = count(services, ReactivityKey.aggregateStatus)
+      const removal = yield* services.holdStatement("DELETE FROM effect_local_client_spaces", true)
+      const leaving = yield* replica.leave(spaceId).pipe(
+        Effect.map(() => ({ listed: listed(), membership: membership(), aggregate: aggregate() > 0 })),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* VirtualTime.advanceUntil(removal.entered)
+      yield* removal.release
+      const observed = yield* VirtualTime.advanceUntil(Fiber.join(leaving))
+
+      assert.deepStrictEqual(observed, { listed: 1, membership: 1, aggregate: true })
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "were notified of the leave of an inactive space with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(idleRemote)
+      const listed = count(services, ReactivityKey.spaces)
+      const membership = count(services, ReactivityKey.membership(spaceId))
+      const removal = yield* services.holdStatement("DELETE FROM effect_local_client_spaces", true)
+      const leaving = yield* replica.leave(spaceId).pipe(
+        Effect.map(() => ({ listed: listed(), membership: membership() })),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* VirtualTime.advanceUntil(removal.entered)
+      yield* removal.release
+      const observed = yield* VirtualTime.advanceUntil(Fiber.join(leaving))
+
+      assert.deepStrictEqual(observed, { listed: 1, membership: 1 })
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "were notified of the join that a second join waited for with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(idleRemote)
+      const membership = count(services, ReactivityKey.membership(thirdSpaceId))
+      const inserting = yield* services.holdStatement("INSERT INTO effect_local_client_spaces", true)
+      const joining = yield* replica.join(thirdSpaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(inserting.entered)
+      const waiting = yield* replica.join(thirdSpaceId).pipe(
+        Effect.map(() => membership()),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* inserting.release
+      const observed = yield* VirtualTime.advanceUntil(Fiber.join(waiting))
+      yield* Fiber.join(joining)
+
+      assert.strictEqual(observed, 1)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "were notified of the activation that a second activation waited for with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(healthyRemote(services))
+      yield* installView(services)
+      const space = yield* replica.space(spaceId)
+      const activation = count(services, ReactivityKey.activation(spaceId))
+      const building = yield* services.holdStatement("SELECT desired_scope_json", true)
+      const activating = yield* space.activate.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(building.entered)
+      const waiting = yield* space.activate.pipe(
+        Effect.map(() => activation()),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* building.release
+      const observed = yield* VirtualTime.advanceUntil(Fiber.join(waiting))
+      yield* Fiber.join(activating)
+
+      assert.strictEqual(observed, 2)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "were notified of the failed activation that a second activation waited for with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(healthyRemote(services))
+      yield* installView(services)
+      const space = yield* replica.space(spaceId)
+      const activation = count(services, ReactivityKey.activation(spaceId))
+      const aggregate = count(services, ReactivityKey.aggregateStatus)
+      const building = yield* services.holdStatement("SELECT desired_scope_json")
+      const activating = yield* space.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(building.entered)
+      const waiting = yield* space.activate.pipe(
+        Effect.exit,
+        Effect.map(() => ({ activation: activation(), aggregate: aggregate() })),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* building.release
+      const observed = yield* VirtualTime.advanceUntil(Fiber.join(waiting))
+      const failed = yield* Fiber.join(activating)
+
+      assert.isTrue(Exit.isFailure(failed), "the first activation failed to build")
+      assert.deepStrictEqual(observed, { activation: 2, aggregate: 2 })
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "were notified of the deactivation that an activation waited for with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const { space } = yield* onlineSpace(services)
+      const activation = count(services, ReactivityKey.activation(spaceId))
+      const closing = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
+      closing.arm(1)
+      const deactivating = yield* space.deactivate.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(closing.entered)
+      const activationWhenResumed = 0
+      const waiting = yield* space.deactivate.pipe(
+        Effect.map(() => activation()),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* closing.release
+      const observed = yield* VirtualTime.advanceUntil(Fiber.join(waiting))
+      yield* Fiber.join(deactivating)
+
+      assert.strictEqual(observed - activationWhenResumed, 2)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "were notified of the commit when its mutation returns with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const { space } = yield* onlineSpace(services)
+      const pending = count(services, ReactivityKey.pending(spaceId))
+      const aggregate = count(services, ReactivityKey.aggregateStatus)
+
+      const observed = yield* space.mutate(Domain.PutTodo, Domain.todo("first")).pipe(
+        Effect.map(() => ({ pending: pending(), aggregate: aggregate() }))
+      )
+
+      assert.deepStrictEqual(observed, { pending: 1, aggregate: 1 })
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("a caller whose completion callback throws", () => {
+  it.effect.each(constructors)(
+    "does not keep the subscribers of the space list from learning of its leave with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const errors = captureErrors()
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(idleRemote)
+      const listed = count(services, ReactivityKey.spaces)
+      const membership = count(services, ReactivityKey.membership(spaceId))
+      const aggregate = count(services, ReactivityKey.aggregateStatus)
+      const removal = yield* services.holdStatement("DELETE FROM effect_local_client_spaces", true)
+      const callback = throwingObserver()
+      const leaving = yield* replica.leave(spaceId).pipe(
+        Effect.provide(errors.layerLogs),
+        Effect.forkChild({ startImmediately: true })
+      )
+      leaving.addObserver(callback.observe)
+      yield* VirtualTime.advanceUntil(removal.entered)
+      yield* removal.release
+      yield* settle
+      const remaining = yield* replica.spaces
+
+      assert.strictEqual(callback.completed(), 1, "the leave completed and its callback threw")
+      assert.strictEqual(remaining.length, 1, "the space was left")
+      assert.deepStrictEqual(
+        { listed: listed(), membership: membership(), aggregate: aggregate() },
+        { listed: 1, membership: 1, aggregate: 1 }
+      )
+      assert.deepStrictEqual(errors.messages(), ["Completion callback died"])
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "does not fail the join it waited for or keep its subscribers from learning of it with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const errors = captureErrors()
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(idleRemote)
+      const listed = count(services, ReactivityKey.spaces)
+      const membership = count(services, ReactivityKey.membership(thirdSpaceId))
+      const inserting = yield* services.holdStatement("INSERT INTO effect_local_client_spaces", true)
+      const first = yield* replica.join(thirdSpaceId).pipe(
+        Effect.exit,
+        Effect.provide(errors.layerLogs),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* VirtualTime.advanceUntil(inserting.entered)
+      const callback = throwingObserver()
+      const waiting = yield* replica.join(thirdSpaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      waiting.addObserver(callback.observe)
+      yield* inserting.release
+      const joined = yield* VirtualTime.advanceUntil(Fiber.join(first))
+      const spaces = yield* replica.spaces
+
+      assert.strictEqual(callback.completed(), 1, "the join that waited completed and its callback threw")
+      assert.isTrue(Exit.isSuccess(joined), "the first join")
+      assert.strictEqual(spaces.length, 3, "the space was joined")
+      assert.deepStrictEqual({ listed: listed(), membership: membership() }, { listed: 1, membership: 1 })
+      assert.deepStrictEqual(errors.messages(), ["Completion callback died"])
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "does not fail the activation it waited for with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const errors = captureErrors()
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(healthyRemote(services))
+      yield* installView(services)
+      const space = yield* replica.space(spaceId)
+      const building = yield* services.holdStatement("SELECT desired_scope_json", true)
+      const first = yield* space.activate.pipe(
+        Effect.exit,
+        Effect.provide(errors.layerLogs),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* VirtualTime.advanceUntil(building.entered)
+      const callback = throwingObserver()
+      const waiting = yield* space.activate.pipe(Effect.forkChild({ startImmediately: true }))
+      waiting.addObserver(callback.observe)
+      yield* building.release
+      const activated = yield* VirtualTime.advanceUntil(Fiber.join(first))
+
+      assert.strictEqual(callback.completed(), 1, "the activation that waited completed and its callback threw")
+      assert.isTrue(Exit.isSuccess(activated), "the first activation")
+      assert.strictEqual(yield* space.activation, "Active")
+      assert.deepStrictEqual(errors.messages(), ["Completion callback died"])
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "does not stop later mutations from committing when it waited for a mutation with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const errors = captureErrors()
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(healthyRemote(services)).pipe(Effect.provide(errors.layerLogs))
+      yield* installView(services)
+      const space = yield* replica.space(spaceId)
+      yield* space.activate
+      assert.isTrue(Option.isSome(yield* eventually(services, space, isOnlineDrained)), "the space came online")
+      const callback = throwingObserver()
+      const mutating = yield* space.mutate(Domain.PutTodo, firstTodo).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      mutating.addObserver(callback.observe)
+      yield* settle
+
+      const second = yield* space.mutate(Domain.PutTodo, Domain.todo("second")).pipe(
+        Effect.exit,
+        Effect.timeoutOption("5 minutes"),
+        VirtualTime.advanceUntil
+      )
+      const drained = yield* eventually(services, space, isOnlineDrained)
+
+      assert.strictEqual(callback.completed(), 1, "the mutation completed and its callback threw")
+      assert.isTrue(Option.isSome(second) && Exit.isSuccess(second.value), "the next mutation committed")
+      assert.isTrue(Option.isSome(drained), "both mutations synced")
+      assert.deepStrictEqual(errors.messages(), ["Completion callback died"])
+    }, VirtualTime.scoped)
+  )
+})

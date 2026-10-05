@@ -32,6 +32,7 @@ import * as Stream from "effect/Stream"
 import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
 import * as ConnectionLane from "./ConnectionLane.js"
 import * as Codec from "./internal/codec.js"
+import * as Completion from "./internal/completion.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as Invalidation from "./internal/invalidation.js"
@@ -488,10 +489,10 @@ const makeLayer = <D extends Definition.Any, R,>(
         return yield* decodeScope(row.value.desired_scope_json)
       })
 
-      const signalCapacity = Effect.sync(() => {
+      const signalCapacity = Effect.suspend(() => {
         const previous = capacityChanged
         capacityChanged = Deferred.makeUnsafe<void>()
-        Deferred.doneUnsafe(previous, Exit.void)
+        return Completion.supervise(Deferred.done(previous, Exit.void))
       })
 
       const recordReplicationView = (entry: RememberedEntry, installed: boolean) =>
@@ -505,8 +506,8 @@ const makeLayer = <D extends Definition.Any, R,>(
         Effect.suspend(() => {
           const recorded = entry.settlementsRecorded
           entry.settlementsRecorded = Deferred.makeUnsafe<void>()
-          return Deferred.succeed(recorded, undefined)
-        }).pipe(Effect.asVoid)
+          return Completion.supervise(Deferred.succeed(recorded, undefined))
+        })
 
       const invalidateActivation = (spaceId: Identity.SpaceId) =>
         notify([
@@ -896,9 +897,9 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.runtime = undefined
           entry.activation = "Inactive"
           entry.transition = undefined
-          yield* Deferred.done(completion, result)
-          yield* signalCapacity
           yield* invalidateActivation(entry.spaceId)
+          yield* Completion.supervise(Deferred.done(completion, result))
+          yield* signalCapacity
           if (Exit.isFailure(result)) {
             yield* result
             return false
@@ -1049,21 +1050,21 @@ const makeLayer = <D extends Definition.Any, R,>(
             entry.activation = "Active"
             entry.transition = undefined
             if (foreground) entry.backgroundGeneration += 1
-            yield* Deferred.succeed(completion, undefined)
-            yield* signalCapacity
             yield* invalidateActivation(entry.spaceId)
+            yield* Completion.supervise(Deferred.succeed(completion, undefined))
+            yield* signalCapacity
             return result.value
           }
           entry.activation = "Inactive"
           entry.transition = undefined
           dropForegroundReservation(entry)
           const changed = yield* applyContribution(entry, (current) => inactiveStatus(entry, current.pending))
-          if (Exit.hasInterrupts(result)) yield* Deferred.succeed(completion, undefined)
-          else yield* Deferred.done(completion, result)
-          yield* signalCapacity
           if (retiring !== undefined) yield* enqueueBackground(entry)
           yield* announceContribution(changed)
           yield* invalidateActivation(entry.spaceId)
+          if (Exit.hasInterrupts(result)) yield* Completion.supervise(Deferred.succeed(completion, undefined))
+          else yield* Completion.supervise(Deferred.done(completion, result))
+          yield* signalCapacity
           return yield* result
         }))
 
@@ -1501,13 +1502,13 @@ const makeLayer = <D extends Definition.Any, R,>(
             ).pipe(Effect.exit)
             if (joining.get(spaceId) === completion) joining.delete(spaceId)
             if (Exit.isFailure(result)) {
-              yield* Deferred.succeed(completion, undefined)
+              yield* Completion.supervise(Deferred.succeed(completion, undefined))
               return yield* Effect.failCause(result.cause)
             }
             entries.set(spaceId, result.value)
             yield* addContribution(result.value)
-            yield* Deferred.succeed(completion, undefined)
             yield* notify([ReactivityKey.aggregateStatus, ReactivityKey.membership(spaceId), ReactivityKey.spaces])
+            yield* Completion.supervise(Deferred.succeed(completion, undefined))
             return result.value.handle
           })
         )
@@ -1564,11 +1565,11 @@ const makeLayer = <D extends Definition.Any, R,>(
               })
             ),
             Effect.exit,
-            Effect.tap((exit) => Deferred.done(completion, exit)),
-            Effect.flatMap((exit) => {
+            Effect.tap((exit) => {
               if (Exit.isFailure(exit)) return Effect.void
               return notify([ReactivityKey.aggregateStatus, ReactivityKey.membership(spaceId), ReactivityKey.spaces])
-            })
+            }),
+            Effect.flatMap((exit) => Completion.supervise(Deferred.done(completion, exit)))
           )
           yield* Effect.forkIn(cleanup, parentScope, { startImmediately: true })
           return yield* restore(Deferred.await(completion))

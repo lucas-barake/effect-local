@@ -704,65 +704,6 @@ describe("a subscriber that throws on every notification", () => {
 
 describe("a notification that is still being delivered", () => {
   it.effect.each(constructors)(
-    "does not hold back an activation that waited for the capacity of an activation that succeeded with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* spaces(constructor, [spaceId, otherSpaceId], 1)
-      const replica = yield* services.start(healthyRemote(services, () => false))
-      yield* installView(services)
-      const space = yield* replica.space(spaceId)
-      const other = yield* replica.space(otherSpaceId)
-      const building = yield* services.holdStatement("SELECT desired_scope_json", true)
-      const first = yield* space.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
-      yield* VirtualTime.advanceUntil(building.entered)
-      const second = yield* other.activate.pipe(Effect.forkChild({ startImmediately: true }))
-      const delivery = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
-      delivery.arm(3)
-      yield* building.release
-      yield* VirtualTime.advanceUntil(delivery.entered)
-
-      const waiting = yield* within(Fiber.join(second))
-      const delivering = first.pollUnsafe() === undefined
-      yield* delivery.release
-      const activated = yield* Fiber.join(first)
-
-      assert.isTrue(delivering, "the notification of the first activation was still being delivered")
-      assert.strictEqual(describeExit(waiting), "succeeded", "the activation that waited")
-      assert.isTrue(Exit.isSuccess(activated), "the first activation")
-    }, VirtualTime.scoped)
-  )
-
-  it.effect.each(constructors.flatMap((constructor) => [
-    { constructor, name: "the activation", key: ReactivityKey.activation(spaceId), nth: 1 },
-    { constructor, name: "the aggregate status", key: ReactivityKey.aggregateStatus, nth: 2 }
-  ]))(
-    "of $name does not hold back an activation that waited for the capacity of an activation that failed with $constructor",
-    Effect.fnUntraced(function*(row) {
-      const services = yield* spaces(row.constructor, [spaceId, otherSpaceId], 1)
-      const replica = yield* services.start(healthyRemote(services, () => false))
-      yield* installView(services)
-      const space = yield* replica.space(spaceId)
-      const other = yield* replica.space(otherSpaceId)
-      const building = yield* services.holdStatement("SELECT desired_scope_json")
-      const first = yield* space.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
-      yield* VirtualTime.advanceUntil(building.entered)
-      const second = yield* other.activate.pipe(Effect.forkChild({ startImmediately: true }))
-      const delivery = yield* services.holdInvalidation(row.key)
-      delivery.arm(row.nth)
-      yield* building.release
-      yield* VirtualTime.advanceUntil(delivery.entered)
-
-      const waiting = yield* within(Fiber.join(second))
-      const delivering = first.pollUnsafe() === undefined
-      yield* delivery.release
-      const activated = yield* Fiber.join(first)
-
-      assert.isTrue(delivering, "the notification of the failed activation was still being delivered")
-      assert.strictEqual(describeExit(waiting), "succeeded", "the activation that waited")
-      assert.strictEqual(describeSettled(activated), "failed", "the first activation")
-    }, VirtualTime.scoped)
-  )
-
-  it.effect.each(constructors)(
     "does not hold back the background sync of a space that was deactivated with a pending mutation with %s",
     Effect.fnUntraced(function*(constructor) {
       const services = yield* twoSpaces(constructor)
@@ -786,62 +727,6 @@ describe("a notification that is still being delivered", () => {
       assert.isTrue(delivering, "the notification of the deactivation was still being delivered")
       assert.strictEqual(describeStatus(status), "Idle, pending 0")
       assert.isTrue(Exit.isSuccess(deactivated), "the deactivation")
-    }, VirtualTime.scoped)
-  )
-
-  it.effect.each(constructors)(
-    "does not hold back a second join of the space that was joined with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* twoSpaces(constructor)
-      const replica = yield* services.start(idleRemote)
-      const delivery = yield* services.holdInvalidation(ReactivityKey.membership(thirdSpaceId))
-      delivery.arm(1)
-      const joining = yield* replica.join(thirdSpaceId).pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
-      yield* VirtualTime.advanceUntil(delivery.entered)
-
-      const again = yield* within(replica.join(thirdSpaceId))
-      const found = yield* replica.space(thirdSpaceId).pipe(Effect.exit)
-      const aggregate = yield* replica.status
-      const delivering = joining.pollUnsafe() === undefined
-      yield* delivery.release
-      const joined = yield* Fiber.join(joining)
-
-      assert.isTrue(delivering, "the notification of the join was still being delivered")
-      assert.strictEqual(describeExit(again), "succeeded", "the second join")
-      assert.isTrue(Exit.isSuccess(found), "the space was joined")
-      assert.strictEqual(aggregate.spaces, 3)
-      assert.isTrue(Exit.isSuccess(joined), "the first join")
-    }, VirtualTime.scoped)
-  )
-
-  it.effect.each(constructors)(
-    "does not hold back the leave or a join that waited for it with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* twoSpaces(constructor)
-      const replica = yield* services.start(idleRemote)
-      let delivered = 0
-      services.reactivity.registerUnsafe([ReactivityKey.membership(spaceId)], () => {
-        delivered += 1
-      })
-      const removal = yield* services.holdStatement("DELETE FROM effect_local_client_spaces", true)
-      const leaving = yield* replica.leave(spaceId).pipe(Effect.forkChild({ startImmediately: true }))
-      yield* VirtualTime.advanceUntil(removal.entered)
-      const joining = yield* replica.join(spaceId).pipe(Effect.forkChild({ startImmediately: true }))
-      const delivery = yield* services.holdInvalidation(ReactivityKey.membership(spaceId))
-      delivery.arm(2)
-      yield* removal.release
-      yield* VirtualTime.advanceUntil(delivery.entered)
-
-      const left = yield* within(Fiber.join(leaving))
-      const joined = yield* within(Fiber.join(joining))
-      const deliveredWhileHeld = delivered
-      yield* delivery.release
-      yield* settle("1 second")
-
-      assert.strictEqual(describeExit(left), "succeeded", "the leave")
-      assert.strictEqual(describeExit(joined), "succeeded", "the join that waited")
-      assert.strictEqual(deliveredWhileHeld, 1, "only the join had been announced")
-      assert.strictEqual(delivered, 2, "the leave was announced once its notification was delivered")
     }, VirtualTime.scoped)
   )
 
@@ -896,57 +781,6 @@ describe("a notification that is still being delivered", () => {
 
       assert.strictEqual(aggregate.counts.offline, 1)
       assert.strictEqual(describeExit(mutated), "succeeded", "the mutation")
-    }, VirtualTime.scoped)
-  )
-
-  it.effect.each(constructors)(
-    "does not hold back an activation that waited for the deactivation with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* twoSpaces(constructor)
-      const { space } = yield* onlineSpace(services, () => false)
-      const closing = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
-      closing.arm(1)
-      const deactivating = yield* space.deactivate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
-      yield* VirtualTime.advanceUntil(closing.entered)
-      const activating = yield* space.activate.pipe(Effect.forkChild({ startImmediately: true }))
-      const delivery = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
-      delivery.arm(3)
-      yield* closing.release
-      yield* VirtualTime.advanceUntil(delivery.entered)
-
-      const activated = yield* within(Fiber.join(activating))
-      const delivering = deactivating.pollUnsafe() === undefined
-      yield* delivery.release
-      const deactivated = yield* Fiber.join(deactivating)
-
-      assert.isTrue(delivering, "the notification of the deactivation was still being delivered")
-      assert.strictEqual(describeExit(activated), "succeeded", "the activation that waited")
-      assert.strictEqual(describeSettled(deactivated), "succeeded", "the deactivation")
-    }, VirtualTime.scoped)
-  )
-
-  it.effect.each(constructors)(
-    "does not hold back a join that waited for the join of the same space with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* twoSpaces(constructor)
-      const replica = yield* services.start(idleRemote)
-      const inserting = yield* services.holdStatement("INSERT INTO effect_local_client_spaces", true)
-      const joining = yield* replica.join(thirdSpaceId).pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
-      yield* VirtualTime.advanceUntil(inserting.entered)
-      const waiting = yield* replica.join(thirdSpaceId).pipe(Effect.forkChild({ startImmediately: true }))
-      const delivery = yield* services.holdInvalidation(ReactivityKey.membership(thirdSpaceId))
-      delivery.arm(1)
-      yield* inserting.release
-      yield* VirtualTime.advanceUntil(delivery.entered)
-
-      const waited = yield* within(Fiber.join(waiting))
-      const delivering = joining.pollUnsafe() === undefined
-      yield* delivery.release
-      const joined = yield* Fiber.join(joining)
-
-      assert.isTrue(delivering, "the notification of the first join was still being delivered")
-      assert.strictEqual(describeExit(waited), "succeeded", "the join that waited")
-      assert.strictEqual(describeSettled(joined), "succeeded", "the first join")
     }, VirtualTime.scoped)
   )
 

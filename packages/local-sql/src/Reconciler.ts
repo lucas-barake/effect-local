@@ -18,6 +18,7 @@ import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
 import * as ConnectionLane from "./ConnectionLane.js"
+import * as Completion from "./internal/completion.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
@@ -124,7 +125,7 @@ const makeReconciliationRequests = (request: Effect.Effect<number, ReplicaError.
     return request.pipe(
       Effect.onExit((exit) => {
         if (exit._tag === "Failure" && pending === own) pending = undefined
-        return Deferred.succeed(own, exit._tag === "Success")
+        return Completion.supervise(Deferred.succeed(own, exit._tag === "Success"))
       }),
       Effect.asVoid
     )
@@ -327,7 +328,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       if (current !== space || current.authenticationGate !== gate) return
       current.authenticationGate = undefined
       current.retryAttempt = 0
-      yield* Deferred.succeed(gate, undefined)
+      yield* Completion.supervise(Deferred.succeed(gate, undefined))
       yield* readmit(current)
     }).pipe(Effect.uninterruptible)
     yield* FiberMap.run(
@@ -957,7 +958,7 @@ export const layerInMemoryScheduler = (
             }
             return [false, current] as const
           })
-          if (owned) yield* Deferred.succeed(admission.gate, undefined)
+          if (owned) yield* Completion.supervise(Deferred.succeed(admission.gate, undefined))
         }).pipe(Effect.uninterruptible)
         yield* credentialChange(remote, generation, retryTiming.maximumRetryDelayMillis).pipe(
           Effect.annotateLogs({ "space.id": options.spaceId }),

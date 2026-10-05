@@ -32,6 +32,7 @@ import * as ConnectionLane from "./ConnectionLane.js"
 import * as ClientLineage from "./internal/clientLineage.js"
 import * as ClientMetrics from "./internal/clientMetrics.js"
 import * as Codec from "./internal/codec.js"
+import * as Completion from "./internal/completion.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Invalidation from "./internal/invalidation.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
@@ -4081,7 +4082,7 @@ export const layer = (
           return Effect.andThen(Deferred.await(reached), effect)
         })
       const settleRequest = (request: QueuedMutation, effect: Effect.Effect<void>) =>
-        Effect.ensuring(effect, Effect.sync(() => releaseCommits(request.ticket)))
+        Effect.ensuring(effect, Effect.sync(() => releaseCommits(request.ticket)).pipe(Completion.supervise))
 
       const abandon = (request: QueuedMutation) => {
         const unavailable = Cause.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
@@ -4241,12 +4242,14 @@ export const layer = (
                       return Option.some(Cause.squash(cause))
                     }
                   }),
-                  settle: Deferred.done(result, Exit.map(exit, (value) => value.pendingMutation)).pipe(Effect.asVoid)
+                  settle: Deferred.done(result, Exit.map(exit, (value) => value.pendingMutation)).pipe(
+                    Completion.supervise
+                  )
                 }))
               )
             )
           ),
-          fail: (cause) => Deferred.failCause(result, cause).pipe(Effect.asVoid)
+          fail: (cause) => Completion.supervise(Deferred.failCause(result, cause))
         }
         if (!Queue.offerUnsafe(commitQueue, request)) {
           return yield* new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId })
