@@ -562,19 +562,23 @@ export const makeManager = Effect.fnUntraced(function*(options: {
               )
           ))
         })
-      yield* FiberMap.run(
-        watches,
-        managedKey(space.spaceId, space.generation),
+      const superviseWatch = (): Effect.Effect<void> =>
         watch().pipe(
           Effect.catchCause((cause) => {
             const died = Errors.unexpectedFailure("Sync watch died", cause)
             return Effect.logError("Sync watch died", cause).pipe(
               Effect.annotateLogs({ "space.id": space.spaceId }),
-              Effect.andThen(state.reconciliation.watchFailed(died))
+              Effect.andThen(state.reconciliation.watchFailed(died)),
+              Effect.andThen(watchBackoff.closed),
+              Effect.flatMap(Effect.sleep),
+              Effect.andThen(superviseWatch())
             )
-          }),
-          Effect.provideService(ConnectionLane.Priority, "Background")
+          })
         )
+      yield* FiberMap.run(
+        watches,
+        managedKey(space.spaceId, space.generation),
+        superviseWatch().pipe(Effect.provideService(ConnectionLane.Priority, "Background"))
       )
       return yield* enqueue(state)
     },
@@ -1114,14 +1118,20 @@ export const layerInMemoryScheduler = (
             )
           )
         })
-      const watchFiber = yield* watch().pipe(
-        Effect.catchCause((cause) => {
-          const died = Errors.unexpectedFailure("Sync watch died", cause)
-          return Effect.logError("Sync watch died", cause).pipe(
-            Effect.annotateLogs({ "space.id": options.spaceId }),
-            Effect.andThen(reconciliation.watchFailed(died))
-          )
-        }),
+      const superviseWatch = (): Effect.Effect<void, never, Scope.Scope> =>
+        watch().pipe(
+          Effect.catchCause((cause) => {
+            const died = Errors.unexpectedFailure("Sync watch died", cause)
+            return Effect.logError("Sync watch died", cause).pipe(
+              Effect.annotateLogs({ "space.id": options.spaceId }),
+              Effect.andThen(reconciliation.watchFailed(died)),
+              Effect.andThen(watchBackoff.closed),
+              Effect.flatMap(Effect.sleep),
+              Effect.andThen(superviseWatch())
+            )
+          })
+        )
+      const watchFiber = yield* superviseWatch().pipe(
         Effect.provideService(ConnectionLane.Priority, "Background"),
         Effect.forkScoped
       )

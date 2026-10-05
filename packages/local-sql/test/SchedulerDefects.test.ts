@@ -1010,3 +1010,89 @@ describe("a leave whose cleanup dies", () => {
     }, VirtualTime.scoped)
   )
 })
+
+describe("watches that die subscribe again", () => {
+  it.effect.each(constructors)(
+    "subscribes to the watch again after a foreground watch died with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      const watchDies = yield* Deferred.make<void>()
+      let subscriptions = 0
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => emptyPage(services.crypto, request),
+          watch: (request) => {
+            if (request.spaceId !== spaceId) return Stream.never
+            subscriptions += 1
+            if (subscriptions > 1) return Stream.never
+            return Deferred.await(watchDies).pipe(Effect.andThen(Effect.die("undecodable wake")), Stream.fromEffect)
+          }
+        }),
+        logs.layerLogs
+      )
+      yield* Deferred.succeed(watchDies, undefined)
+      const failed = yield* eventually(services, space, isFailed)
+      assert.isTrue(Option.isSome(failed), "the watch death was reported")
+      yield* settle("5 minutes")
+
+      assert.strictEqual(subscriptions, 2)
+      assert.deepStrictEqual(logs.defects(), ["undecodable wake"])
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "spaces the subscriptions of a foreground watch that keeps dying by the backoff with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor, "1 minute")
+      const logs = captureLogs()
+      let dies = false
+      let subscriptions = 0
+      const firstWatchEnds = yield* Deferred.make<void>()
+      yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => emptyPage(services.crypto, request),
+          watch: (request) => {
+            if (request.spaceId !== spaceId) return Stream.never
+            if (!dies) return Stream.fromEffect(Deferred.await(firstWatchEnds)).pipe(Stream.drain)
+            subscriptions += 1
+            return Stream.die("undecodable wake")
+          }
+        }),
+        logs.layerLogs
+      )
+      dies = true
+      yield* Deferred.succeed(firstWatchEnds, undefined)
+
+      yield* settle("10 minutes")
+
+      assert.isAtLeast(subscriptions, 6)
+      assert.isAtMost(subscriptions, 20)
+      assert.strictEqual(logs.defects().length, subscriptions)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "subscribes to the watch again after an in-memory watch died",
+    Effect.fnUntraced(function*() {
+      const watchDies = yield* Deferred.make<void>()
+      const { awaitStatus, logs, subscriptions } = yield* inMemoryScheduler({
+        pull: Effect.void,
+        watch: Effect.andThen(Deferred.await(watchDies), Effect.die("undecodable wake"))
+      })
+      yield* Deferred.succeed(watchDies, undefined)
+      const failed = yield* awaitStatus((status) => status._tag === "Failed")
+      assert.isTrue(Option.isSome(failed), "the watch death was reported")
+      yield* settle("5 minutes")
+
+      assert.strictEqual(subscriptions(), 2)
+      assert.deepStrictEqual(logs.defects(), ["undecodable wake"])
+    }, VirtualTime.scoped)
+  )
+})

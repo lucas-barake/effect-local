@@ -668,8 +668,8 @@ const layerSchedulerWithConfiguration = (
       const supervisorFiber = yield* Effect.forkScoped(
         Effect.provideService(supervise, ConnectionLane.Priority, "Background")
       )
+      const watchBackoff = Configuration.makeWatchBackoff(configuration)
       const watch = Effect.gen(function*() {
-        const watchBackoff = Configuration.makeWatchBackoff(configuration)
         while (true) {
           yield* awaitAuthenticationChange
           yield* watchBackoff.opened
@@ -722,14 +722,21 @@ const layerSchedulerWithConfiguration = (
           return
         }
       })
-      const watchFiber = yield* watch.pipe(
-        Effect.catchCause((cause) => {
-          const died = Errors.unexpectedFailure("Sync watch died", cause)
-          return Effect.logError("Sync watch died", cause).pipe(
-            Effect.annotateLogs({ "space.id": options.spaceId }),
-            Effect.andThen(reconciliation.watchFailed(died))
-          )
-        }),
+      const superviseWatch = (): Effect.Effect<void, never, Scope.Scope> =>
+        watch.pipe(
+          Effect.catchCause((cause) => {
+            const died = Errors.unexpectedFailure("Sync watch died", cause)
+            return Effect.logError("Sync watch died", cause).pipe(
+              Effect.annotateLogs({ "space.id": options.spaceId }),
+              Effect.andThen(reconciliation.watchFailed(died)),
+              Effect.andThen(watchBackoff.closed),
+              Effect.flatMap(Effect.sleep),
+              Effect.andThen(notify),
+              Effect.andThen(superviseWatch())
+            )
+          })
+        )
+      const watchFiber = yield* superviseWatch().pipe(
         Effect.provideService(ConnectionLane.Priority, "Background"),
         Effect.forkScoped
       )
