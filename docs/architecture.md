@@ -67,7 +67,10 @@ application data authority.
 9. Successful reconciliation advances the completed generation idempotently. A newer requested generation starts a
    new finite Workflow.
 10. Effect `Reactivity` invalidates affected models, pending inspection, receipts, and status after the SQL transaction
-    commits.
+    commits. Every invalidation goes through `Invalidation.notify`, one key at a time and after the state it announces
+    is applied. A subscriber that throws is logged at error level with its key and never fails the operation that
+    notified it. Subscribers registered after it on the same key miss that one notification, because Effect
+    `Reactivity` stops iterating a key's handlers at the first throw.
 
 The local commit and server settlement contracts are separate. `mutate` returns after the optimistic SQLite commit and
 never widens its error channel with a later server outcome. Durable pending inspection exposes the decoded payload,

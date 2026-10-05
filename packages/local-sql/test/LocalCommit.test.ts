@@ -215,9 +215,11 @@ describe("local commit", () => {
       const committed = yield* Effect.forEach(queued, Fiber.join)
 
       const queuedKeys = ids.map((id) => ReactivityKey.entity(spaceId, Domain.Todo.name, id))
-      const rounds = probe.invalidations.filter((keys) => queuedKeys.some((key) => keys.includes(key)))
-      assert.strictEqual(rounds.length, 1)
-      assert.isTrue(queuedKeys.every((key) => rounds[0].includes(key)))
+      const announced = probe.invalidations.flat()
+      const timesAnnounced = (key: string) => announced.filter((candidate) => candidate === key).length
+      assert.deepStrictEqual(queuedKeys.map(timesAnnounced), [1, 1, 1, 1])
+      const pendingRounds = timesAnnounced(ReactivityKey.pending(spaceId))
+      assert.strictEqual(pendingRounds, 2, "the queued mutations shared one round")
       assert.deepStrictEqual(committed.map((pending) => pending.envelope.localSequence), [2, 3, 4, 5])
       assert.strictEqual(yield* local.pendingCount, 5)
     }, Effect.scoped)

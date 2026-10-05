@@ -2,6 +2,7 @@ import * as Canonical from "@lucas-barake/effect-local/Canonical"
 import type * as Definition from "@lucas-barake/effect-local/Definition"
 import * as Evolution from "@lucas-barake/effect-local/Evolution"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Invalidation from "@lucas-barake/effect-local/Invalidation"
 import type * as Model from "@lucas-barake/effect-local/Model"
 import type * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
@@ -1631,13 +1632,14 @@ export const layer = (
         }
         return Array.from(new Set(keys))
       })
+      const notify = (keys: ReadonlyArray<string>) => Invalidation.notify(reactivity, keys)
       const invalidate = (
         entities: ReadonlyArray<Protocol.EntityKey>,
         receiptIds: ReadonlyArray<Identity.MutationId> = [],
         pendingChanged = false
       ) =>
         prepareInvalidation(entities, receiptIds, pendingChanged).pipe(
-          Effect.flatMap(reactivity.invalidate)
+          Effect.flatMap(notify)
         )
 
       const deferredEntities = new Map<string, Protocol.EntityKey>()
@@ -1664,7 +1666,7 @@ export const layer = (
           return yield* Effect.succeed(Option.none<{
             readonly entities: ReadonlyArray<Protocol.EntityKey>
             readonly receiptIds: ReadonlyArray<Identity.MutationId>
-            readonly keys: ReadonlyArray<unknown>
+            readonly keys: ReadonlyArray<string>
           }>())
         }
         const keys = yield* prepareInvalidation(entities, receiptIds, deferredPendingChanged)
@@ -1674,11 +1676,11 @@ export const layer = (
         prepared: Option.Option<{
           readonly entities: ReadonlyArray<Protocol.EntityKey>
           readonly receiptIds: ReadonlyArray<Identity.MutationId>
-          readonly keys: ReadonlyArray<unknown>
+          readonly keys: ReadonlyArray<string>
         }>
       ) {
         if (Option.isNone(prepared)) return yield* Effect.void
-        yield* reactivity.withBatch(reactivity.invalidate(prepared.value.keys))
+        yield* notify(prepared.value.keys)
         for (const entity of prepared.value.entities) {
           deferredEntities.delete(SqlTransaction.entityKey(entity))
         }
@@ -2735,14 +2737,13 @@ export const layer = (
           Effect.tapError(() => {
             if (Option.isNone(page)) return Effect.void
             return projectSettlements(page, []).pipe(
-              Effect.flatMap((entities) => invalidate(entities)),
-              reactivity.withBatch
+              Effect.flatMap((entities) => invalidate(entities))
             )
           })
         )
         const settled = Array.from(touched.values())
         const entities = yield* projectSettlements(page, settled)
-        let invalidationKeys: ReadonlyArray<unknown> = []
+        let invalidationKeys: ReadonlyArray<string> = []
         if (
           Option.isSome(page) || entities.length > 0 || prunedReceiptIds.length > 0 || settlements.length > 0
         ) {
@@ -2764,10 +2765,7 @@ export const layer = (
             ReactivityKey.status(options.spaceId)
           ]
         }
-        if (keys.length > 0) {
-          const uniqueKeys = Array.from(new Set(keys))
-          yield* reactivity.withBatch(reactivity.invalidate(uniqueKeys))
-        }
+        yield* notify(keys)
         return deletedSettlements
       })
       const settleReceiptsInGate = prepareSettlementsInGate.pipe(
@@ -3568,9 +3566,7 @@ export const layer = (
           yield* recordBootstrapInstallMetric
           const entities = yield* rebuildProjection
           const deletedSettlements = yield* deleteSettledPending(settlements)
-          yield* reactivity.withBatch(
-            invalidate(entities, prunedReceiptIds, pendingChanged || deletedSettlements.length > 0)
-          )
+          yield* invalidate(entities, prunedReceiptIds, pendingChanged || deletedSettlements.length > 0)
           return deletedSettlements
         }).pipe(Effect.ensuring(reportReplicationView(true)))
       }, Effect.uninterruptible)
@@ -4016,7 +4012,7 @@ export const layer = (
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
           yield* updatePendingMetric(result.pendingDelta)
           const entities = result.pendingMutation.changes.map((change) => change.entity)
-          yield* reactivity.withBatch(invalidate(entities, [], true))
+          yield* invalidate(entities, [], true)
           return result.pendingMutation
         })).pipe(Effect.withSpan("LocalStore.ensureQuarantineResubmission", {
           attributes: { "mutation.id": mutationId, "mutation.name": mutation.name }
@@ -4144,13 +4140,7 @@ export const layer = (
             }
             return { applied, created, pending: pendingAfter }
           })).pipe(Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause }))))
-          if (committed.created.length > 0) {
-            yield* updatePendingMetric(committed.created.length)
-            const entities = committed.created.flatMap((created) =>
-              created.pendingMutation.changes.map((change) => change.entity)
-            )
-            yield* reactivity.withBatch(invalidate(entities, [], true))
-          }
+          if (committed.created.length > 0) yield* updatePendingMetric(committed.created.length)
           if (committed.pending !== undefined && options.onMutationsCommitted !== undefined) {
             yield* options.onMutationsCommitted(committed.pending).pipe(
               Effect.catch((error) =>
@@ -4159,6 +4149,12 @@ export const layer = (
                 )
               )
             )
+          }
+          if (committed.created.length > 0) {
+            const entities = committed.created.flatMap((created) =>
+              created.pendingMutation.changes.map((change) => change.entity)
+            )
+            yield* invalidate(entities, [], true)
           }
           return committed.applied
         })).pipe(
@@ -4536,7 +4532,7 @@ export const layer = (
         prepareBootstrap,
         stageBootstrapPage,
         installBootstrap,
-        invalidateStatus: reactivity.invalidate([ReactivityKey.status(options.spaceId)])
+        invalidateStatus: notify([ReactivityKey.status(options.spaceId)])
       }
       yield* reportReplicationView(initializedMeta.replication_view_id !== null)
       return Store.of(service)

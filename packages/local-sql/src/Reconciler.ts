@@ -616,8 +616,8 @@ export const layerOnePass = (
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
       const setStatus = (value: ReplicaStatus.ReplicaStatus) =>
         Ref.set(status, value).pipe(
-          Effect.andThen(local.invalidateStatus),
-          Effect.andThen(options.onStatusChange?.(value, true) ?? Effect.void)
+          Effect.andThen(options.onStatusChange?.(value, true) ?? Effect.void),
+          Effect.andThen(local.invalidateStatus)
         )
       const reportFailure = (
         error: ReplicaError.ReplicaError,
@@ -649,13 +649,9 @@ export const layerOnePass = (
               Effect.flatMap((next) => {
                 if (next === undefined) return Effect.void
                 failedSinceSyncStarted = true
-                return local.invalidateStatus.pipe(
-                  Effect.andThen(options.onStatusChange?.(next, Option.isSome(counted)) ?? Effect.void),
-                  Effect.catchCause((cause) =>
-                    Errors.logDefect("Failure status notification died", cause).pipe(
-                      Effect.annotateLogs({ "space.id": options.spaceId })
-                    )
-                  )
+                return Effect.andThen(
+                  options.onStatusChange?.(next, Option.isSome(counted)) ?? Effect.void,
+                  local.invalidateStatus
                 )
               })
             )

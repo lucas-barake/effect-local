@@ -1272,7 +1272,7 @@ describe("a runtime close whose pending count failed", () => {
   )
 })
 
-describe("a leave whose notification died after the membership row was deleted", () => {
+describe("a leave whose subscriber threw after the membership row was deleted", () => {
   it.effect.each(constructors)(
     "leaves a space that can be joined, activated and left again with %s",
     Effect.fnUntraced(function*(constructor) {
@@ -1300,7 +1300,7 @@ describe("a leave whose notification died after the membership row was deleted",
       const listed = yield* replica.spaces
       unregister()
 
-      assert.isTrue(Exit.isFailure(left) && Cause.hasDies(left.cause), "the caller received the subscriber defect")
+      assert.isTrue(Exit.isSuccess(left), "the leave completed")
       assert.strictEqual(rows.length, 0, "the membership row was deleted")
       assert.strictEqual(announced, 1, "the change of the space list was announced")
       assert.strictEqual(afterLeave.spaces, 1)
@@ -1941,7 +1941,7 @@ describe("a status subscriber that throws while a failure is reported", () => {
       unavailable = true
       yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
       yield* settle("5 seconds")
-      const notified = logs.errorMessages().filter((message) => message === "Failure status notification died")
+      const notified = logs.errorMessages().filter((message) => message === "Reactivity subscriber died")
       throwing = false
       yield* settle("5 minutes")
       const status = yield* space.status
@@ -2106,6 +2106,7 @@ describe("a subscriber that throws while a died background turn is published", (
       })).pipe(Effect.provide(logs.layerLogs))
       const third = yield* replica.space(thirdSpaceId)
       yield* settle("5 minutes")
+      const reported = logs.errorMessages().filter((message) => message === "Reactivity subscriber died")
       const settlements = logs.errorMessages().filter((message) => message === "Background turn settlement died")
       yield* services.sql`UPDATE effect_local_client_spaces
         SET replication_view_id = ${viewId}, replication_view_revision = 0`
@@ -2116,7 +2117,8 @@ describe("a subscriber that throws while a died background turn is published", (
       const drained = yield* eventually(services, third, isDrained)
 
       assert.strictEqual(throws, 2, "the subscriber threw while each died turn was published")
-      assert.strictEqual(settlements.length, 2)
+      assert.strictEqual(reported.length, 2)
+      assert.strictEqual(settlements.length, 0)
       assert.isTrue(Option.isSome(drained), "a worker drained the third space")
     }, VirtualTime.scoped)
   )
