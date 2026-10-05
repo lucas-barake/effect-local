@@ -147,14 +147,14 @@ interface RememberedEntry {
   handle: Replica.Space
   activation: Replica.Activation
   runtime: ActiveRuntime | undefined
-  transition: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
+  transition: Completion.Completion<void, ReplicaError.ReplicaError> | undefined
   foreground: boolean
   foregroundDemand: number
-  settlementsRecorded: Deferred.Deferred<void>
+  settlementsRecorded: Completion.Completion<void>
   leases: number
   leaving: boolean
   dueWhileLeaving: boolean
-  leaveCompletion: Deferred.Deferred<void, ReplicaError.ReplicaError> | undefined
+  leaveCompletion: Completion.Completion<void, ReplicaError.ReplicaError> | undefined
   workflowRegistration: ReconciliationWorkflow.RegistrationService | undefined
   summaryStatus: ReplicaStatus.ReplicaStatus
   synced: boolean
@@ -258,7 +258,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         lane
       )
       const entries = new Map<Identity.SpaceId, RememberedEntry>()
-      const joining = new Map<Identity.SpaceId, Deferred.Deferred<void>>()
+      const joining = new Map<Identity.SpaceId, Completion.Completion<void>>()
       const foregroundResidents = new Map<Identity.SpaceId, RememberedEntry>()
       const foregroundAdmitted = new Set<Identity.SpaceId>()
       const dropForegroundReservation = (entry: RememberedEntry) => {
@@ -341,7 +341,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const leaveRejections = new WeakSet<ReplicaError.ReplicaError>()
       const credentialWaits = yield* FiberMap.make<Identity.MembershipIncarnation, void, never>()
       const retrySchedule: Array<RetryWork> = []
-      let capacityChanged = yield* Deferred.make<void>()
+      let capacityChanged = Completion.make<void>()
 
       const clientId = yield* Migrations.client({
         definition: options.definition,
@@ -356,8 +356,8 @@ const makeLayer = <D extends Definition.Any, R,>(
       const defaultScopeJson = yield* Codec.stringify(normalizedDefaultScope)
       const defaultScopeDigest = yield* Protocol.replicationScopeDigest(normalizedDefaultScope)
 
-      const notify = (keys: ReadonlyArray<string>) => Invalidation.notify(reactivity, keys)
       const flush = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys)
+      const notify = (keys: ReadonlyArray<string>) => Invalidation.notify(reactivity, keys)
       const addContribution = (entry: RememberedEntry) =>
         Ref.update(aggregate, (current) => {
           const category = statusCategory(entry.summaryStatus)
@@ -497,8 +497,8 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const signalCapacity = Effect.suspend(() => {
         const previous = capacityChanged
-        capacityChanged = Deferred.makeUnsafe<void>()
-        return Completion.supervise(Deferred.done(previous, Exit.void))
+        capacityChanged = Completion.make<void>()
+        return Completion.settle(previous, Exit.void)
       })
 
       const recordReplicationView = (entry: RememberedEntry, installed: boolean) =>
@@ -511,8 +511,8 @@ const makeLayer = <D extends Definition.Any, R,>(
       const publishSettlements = (entry: RememberedEntry) =>
         Effect.suspend(() => {
           const recorded = entry.settlementsRecorded
-          entry.settlementsRecorded = Deferred.makeUnsafe<void>()
-          return Completion.supervise(Deferred.succeed(recorded, undefined))
+          entry.settlementsRecorded = Completion.make<void>()
+          return Completion.settle(recorded, Exit.void)
         })
 
       const invalidateActivation = (spaceId: Identity.SpaceId) =>
@@ -874,7 +874,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (entry.activation === "Inactive") return false
           if (entry.activation === "Activating" || entry.activation === "Deactivating") {
             const pending = entry.transition
-            if (pending !== undefined) yield* restore(Deferred.await(pending))
+            if (pending !== undefined) yield* restore(Completion.wait(pending))
             return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
           }
           const runtime = entry.runtime
@@ -890,10 +890,10 @@ const makeLayer = <D extends Definition.Any, R,>(
             if (!explicit) return false
             const changed = capacityChanged
             yield* Deferred.succeed(runtime.preemption, undefined)
-            yield* restore(Deferred.await(changed))
+            yield* restore(Completion.wait(changed))
             return yield* deactivate(entry, explicit, expectedRuntime, enqueuePending)
           }
-          const completion = Deferred.makeUnsafe<void, ReplicaError.ReplicaError>()
+          const completion = Completion.make<void, ReplicaError.ReplicaError>()
           entry.activation = "Deactivating"
           entry.transition = completion
           dropForegroundReservation(entry)
@@ -904,7 +904,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.activation = "Inactive"
           entry.transition = undefined
           yield* invalidateActivation(entry.spaceId)
-          yield* Completion.supervise(Deferred.done(completion, result))
+          yield* Completion.settle(completion, result)
           yield* signalCapacity
           if (Exit.isFailure(result)) {
             yield* result
@@ -962,7 +962,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             return deactivate(victim, false).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
           }
           const changed = capacityChanged
-          return Deferred.await(changed).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
+          return Completion.wait(changed).pipe(Effect.andThen(ensureForegroundCapacity(entry)))
         })
 
       const releaseForegroundReservation = (entry: RememberedEntry) =>
@@ -1004,17 +1004,17 @@ const makeLayer = <D extends Definition.Any, R,>(
             if (entry.leases > 0) {
               const changed = capacityChanged
               yield* Deferred.succeed(entry.runtime.preemption, undefined)
-              yield* restore(Deferred.await(changed))
+              yield* restore(Completion.wait(changed))
               return yield* transition(entry, foreground)
             }
             retiring = entry.runtime
           } else if (entry.activation === "Activating" || entry.activation === "Deactivating") {
             const pending = entry.transition
-            if (pending !== undefined) yield* restore(Deferred.await(pending))
+            if (pending !== undefined) yield* restore(Completion.wait(pending))
             return yield* transition(entry, foreground)
           }
           if (foreground && !entry.foreground) return yield* transition(entry, foreground)
-          const completion = Deferred.makeUnsafe<void, ReplicaError.ReplicaError>()
+          const completion = Completion.make<void, ReplicaError.ReplicaError>()
           const generation = ++nextGeneration
           entry.activation = "Activating"
           entry.transition = completion
@@ -1057,7 +1057,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             entry.transition = undefined
             if (foreground) entry.backgroundGeneration += 1
             yield* invalidateActivation(entry.spaceId)
-            yield* Completion.supervise(Deferred.succeed(completion, undefined))
+            yield* Completion.settle(completion, Exit.void)
             yield* signalCapacity
             return result.value
           }
@@ -1068,8 +1068,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (retiring !== undefined) yield* enqueueBackground(entry)
           yield* announceContribution(changed)
           yield* invalidateActivation(entry.spaceId)
-          if (Exit.hasInterrupts(result)) yield* Completion.supervise(Deferred.succeed(completion, undefined))
-          else yield* Completion.supervise(Deferred.done(completion, result))
+          if (Exit.hasInterrupts(result)) yield* Completion.settle(completion, Exit.void)
+          else yield* Completion.settle(completion, Exit.asVoid(result))
           yield* signalCapacity
           return yield* result
         }))
@@ -1183,7 +1183,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                     if (settled.length > 0) {
                       return [settled, Option.some<number>(settled[settled.length - 1].sequence)] as const
                     }
-                    yield* Deferred.await(recorded)
+                    yield* Completion.wait(recorded)
                   }
                 })
               )
@@ -1389,7 +1389,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           transition: undefined,
           foreground: false,
           foregroundDemand: 0,
-          settlementsRecorded: Deferred.makeUnsafe<void>(),
+          settlementsRecorded: Completion.make<void>(),
           leases: 0,
           leaving: false,
           dueWhileLeaving: false,
@@ -1468,15 +1468,15 @@ const makeLayer = <D extends Definition.Any, R,>(
             const current = entries.get(spaceId)
             if (current !== undefined && !current.leaving) return current.handle
             if (current?.leaveCompletion !== undefined) {
-              yield* restore(Deferred.await(current.leaveCompletion))
+              yield* restore(Completion.wait(current.leaveCompletion))
               return yield* join(spaceId)
             }
             const activeJoin = joining.get(spaceId)
             if (activeJoin !== undefined) {
-              yield* restore(Deferred.await(activeJoin))
+              yield* restore(Completion.wait(activeJoin))
               return yield* join(spaceId)
             }
-            const completion = yield* Deferred.make<void>()
+            const completion = Completion.make<void>()
             joining.set(spaceId, completion)
             const result = yield* restore(
               lane.withTransaction(insertMembership(spaceId)).pipe(
@@ -1508,13 +1508,13 @@ const makeLayer = <D extends Definition.Any, R,>(
             ).pipe(Effect.exit)
             if (joining.get(spaceId) === completion) joining.delete(spaceId)
             if (Exit.isFailure(result)) {
-              yield* Completion.supervise(Deferred.succeed(completion, undefined))
+              yield* Completion.settle(completion, Exit.void)
               return yield* Effect.failCause(result.cause)
             }
             entries.set(spaceId, result.value)
             yield* addContribution(result.value)
             yield* notify([ReactivityKey.aggregateStatus, ReactivityKey.membership(spaceId), ReactivityKey.spaces])
-            yield* Completion.supervise(Deferred.succeed(completion, undefined))
+            yield* Completion.settle(completion, Exit.void)
             return result.value.handle
           })
         )
@@ -1523,12 +1523,12 @@ const makeLayer = <D extends Definition.Any, R,>(
         Effect.uninterruptibleMask(Effect.fnUntraced(function*(restore) {
           const activeJoin = joining.get(spaceId)
           if (activeJoin !== undefined) {
-            yield* restore(Deferred.await(activeJoin))
+            yield* restore(Completion.wait(activeJoin))
             return yield* leave(spaceId)
           }
           const current = entries.get(spaceId)
           if (current?.leaveCompletion !== undefined) {
-            return yield* restore(Deferred.await(current.leaveCompletion))
+            return yield* restore(Completion.wait(current.leaveCompletion))
           }
           if (current === undefined) {
             return yield* restore(
@@ -1540,7 +1540,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               )
             )
           }
-          const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
+          const completion = Completion.make<void, ReplicaError.ReplicaError>()
           current.leaving = true
           current.leaveCompletion = completion
           const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
@@ -1575,10 +1575,10 @@ const makeLayer = <D extends Definition.Any, R,>(
               if (Exit.isFailure(exit)) return Effect.void
               return notify([ReactivityKey.aggregateStatus, ReactivityKey.membership(spaceId), ReactivityKey.spaces])
             }),
-            Effect.flatMap((exit) => Completion.supervise(Deferred.done(completion, exit)))
+            Effect.flatMap((exit) => Completion.settle(completion, exit))
           )
           yield* Effect.forkIn(cleanup, parentScope, { startImmediately: true })
-          return yield* restore(Deferred.await(completion))
+          return yield* restore(Completion.wait(completion))
         }))
 
       const space = (spaceId: Identity.SpaceId) =>

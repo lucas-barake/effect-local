@@ -4082,7 +4082,7 @@ export const layer = (
           return Effect.andThen(Deferred.await(reached), effect)
         })
       const settleRequest = (request: QueuedMutation, effect: Effect.Effect<void>) =>
-        Effect.ensuring(effect, Effect.sync(() => releaseCommits(request.ticket)).pipe(Completion.supervise))
+        Effect.ensuring(effect, Effect.sync(() => releaseCommits(request.ticket)))
 
       const abandon = (request: QueuedMutation) => {
         const unavailable = Cause.fail(new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId }))
@@ -4206,7 +4206,7 @@ export const layer = (
           "client.id": options.clientId
         })
         yield* MutationDescriptor.validate(options.definition, mutation)
-        const result = yield* Deferred.make<
+        const result = Completion.make<
           Protocol.PendingMutation,
           ReplicaError.ReplicaError | Mutation.Rejection<M>
         >()
@@ -4242,20 +4242,18 @@ export const layer = (
                       return Option.some(Cause.squash(cause))
                     }
                   }),
-                  settle: Deferred.done(result, Exit.map(exit, (value) => value.pendingMutation)).pipe(
-                    Completion.supervise
-                  )
+                  settle: Completion.settle(result, Exit.map(exit, (value) => value.pendingMutation))
                 }))
               )
             )
           ),
-          fail: (cause) => Completion.supervise(Deferred.failCause(result, cause))
+          fail: (cause) => Completion.settle(result, Exit.failCause(cause))
         }
         if (!Queue.offerUnsafe(commitQueue, request)) {
           return yield* new ReplicaError.SpaceUnavailable({ spaceId: options.spaceId })
         }
         admittedCommits += 1
-        return yield* Deferred.await(result).pipe(
+        return yield* Completion.wait(result).pipe(
           Effect.onInterrupt(() =>
             Effect.sync(() => {
               request.withdrawn = true

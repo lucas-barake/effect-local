@@ -8,6 +8,7 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as FiberMap from "effect/FiberMap"
 import * as Layer from "effect/Layer"
@@ -111,21 +112,21 @@ interface Work {
 const managedKey = (spaceId: Identity.SpaceId, generation: number) => `${spaceId}:${generation}`
 
 const makeReconciliationRequests = (request: Effect.Effect<number, ReplicaError.ReplicaError>) => {
-  let pending: Deferred.Deferred<boolean> | undefined
+  let pending: Completion.Completion<boolean> | undefined
   const run: Effect.Effect<void, ReplicaError.ReplicaError> = Effect.suspend(() => {
     const shared = pending
     if (shared !== undefined) {
-      return Deferred.await(shared).pipe(Effect.flatMap((written) => {
+      return Completion.wait(shared).pipe(Effect.flatMap((written) => {
         if (written) return Effect.void
         return run
       }))
     }
-    const own = Deferred.makeUnsafe<boolean>()
+    const own = Completion.make<boolean>()
     pending = own
     return request.pipe(
       Effect.onExit((exit) => {
         if (exit._tag === "Failure" && pending === own) pending = undefined
-        return Completion.supervise(Deferred.succeed(own, exit._tag === "Success"))
+        return Completion.settle(own, Exit.succeed(exit._tag === "Success"))
       }),
       Effect.asVoid
     )
@@ -328,7 +329,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       if (current !== space || current.authenticationGate !== gate) return
       current.authenticationGate = undefined
       current.retryAttempt = 0
-      yield* Completion.supervise(Deferred.succeed(gate, undefined))
+      yield* Deferred.succeed(gate, undefined)
       yield* readmit(current)
     }).pipe(Effect.uninterruptible)
     yield* FiberMap.run(
@@ -958,7 +959,7 @@ export const layerInMemoryScheduler = (
             }
             return [false, current] as const
           })
-          if (owned) yield* Completion.supervise(Deferred.succeed(admission.gate, undefined))
+          if (owned) yield* Deferred.succeed(admission.gate, undefined)
         }).pipe(Effect.uninterruptible)
         yield* credentialChange(remote, generation, retryTiming.maximumRetryDelayMillis).pipe(
           Effect.annotateLogs({ "space.id": options.spaceId }),

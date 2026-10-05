@@ -23,7 +23,6 @@ import * as DurableClock from "effect/workflow/DurableClock"
 import * as Workflow from "effect/workflow/Workflow"
 import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
 import * as ConnectionLane from "./ConnectionLane.js"
-import * as Completion from "./internal/completion.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
@@ -553,7 +552,7 @@ const layerSchedulerWithConfiguration = (
             }
             return [false, current] as const
           })
-          if (owned) yield* Completion.supervise(Deferred.succeed(admission.gate, undefined))
+          if (owned) yield* Deferred.succeed(admission.gate, undefined)
         }).pipe(Effect.uninterruptible)
         return credentialChange(remote, generation, configuration.maximumRetryDelayMillis).pipe(
           Effect.annotateLogs({ "space.id": options.spaceId }),

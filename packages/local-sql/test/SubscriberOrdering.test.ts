@@ -375,3 +375,102 @@ describe("a caller whose completion callback throws", () => {
     }, VirtualTime.scoped)
   )
 })
+
+const outcome = <A, E extends { readonly _tag: string },>(fiber: Fiber.Fiber<A, E>) => {
+  const exit = fiber.pollUnsafe()
+  if (exit === undefined) return "never completed"
+  if (Exit.isSuccess(exit)) return "succeeded"
+  return "failed"
+}
+
+const allSucceeded = { first: "succeeded", throwing: "succeeded", later: "succeeded" }
+
+describe("a waiter whose completion callback throws", () => {
+  it.effect.each(constructors)(
+    "does not strand a later caller that waited for the same activation with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(healthyRemote(services))
+      yield* installView(services)
+      const space = yield* replica.space(spaceId)
+      const building = yield* services.holdStatement("SELECT desired_scope_json", true)
+      const first = yield* space.activate.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(building.entered)
+      const throwing = yield* space.activate.pipe(Effect.forkChild({ startImmediately: true }))
+      throwing.addObserver(throwingObserver().observe)
+      const later = yield* space.activate.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* building.release
+      yield* settle
+
+      assert.deepStrictEqual(
+        { first: outcome(first), throwing: outcome(throwing), later: outcome(later) },
+        allSucceeded
+      )
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "does not strand a later caller that waited for the same join with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(idleRemote)
+      const inserting = yield* services.holdStatement("INSERT INTO effect_local_client_spaces", true)
+      const first = yield* replica.join(thirdSpaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(inserting.entered)
+      const throwing = yield* replica.join(thirdSpaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      throwing.addObserver(throwingObserver().observe)
+      const later = yield* replica.join(thirdSpaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* inserting.release
+      yield* settle
+
+      assert.deepStrictEqual(
+        { first: outcome(first), throwing: outcome(throwing), later: outcome(later) },
+        allSucceeded
+      )
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "does not strand a later caller of the same leave with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(idleRemote)
+      const removal = yield* services.holdStatement("DELETE FROM effect_local_client_spaces", true)
+      const first = yield* replica.leave(spaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(removal.entered)
+      const throwing = yield* replica.leave(spaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      throwing.addObserver(throwingObserver().observe)
+      const later = yield* replica.leave(spaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* removal.release
+      yield* settle
+
+      assert.deepStrictEqual(
+        { first: outcome(first), throwing: outcome(throwing), later: outcome(later) },
+        allSucceeded
+      )
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "does not strand a later activation that waited for the same deactivation with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const { space } = yield* onlineSpace(services)
+      const closing = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
+      closing.arm(1)
+      const first = yield* space.deactivate.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(closing.entered)
+      const throwing = yield* space.deactivate.pipe(Effect.forkChild({ startImmediately: true }))
+      throwing.addObserver(throwingObserver().observe)
+      const later = yield* space.activate.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* closing.release
+      yield* settle
+
+      assert.deepStrictEqual(
+        { first: outcome(first), throwing: outcome(throwing), later: outcome(later) },
+        allSucceeded
+      )
+      assert.strictEqual(yield* space.activation, "Active")
+    }, VirtualTime.scoped)
+  )
+})
