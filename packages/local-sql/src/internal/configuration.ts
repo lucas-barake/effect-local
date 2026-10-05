@@ -84,13 +84,14 @@ export const retryMillis = (timing: RetryTiming, attempt: number) =>
 
 export const makeWatchBackoff = (timing: RetryTiming) => {
   let attempt = 0
-  let openedAt = 0
+  let openedAt = Option.none<number>()
   let lastDelay = 0
   const opened = Effect.map(Clock.currentTimeMillis, (now) => {
-    openedAt = now
+    openedAt = Option.some(now)
   })
   const closed = Effect.map(Clock.currentTimeMillis, (now) => {
-    if (now - openedAt > lastDelay) attempt = 0
+    if (Option.isSome(openedAt) && now - openedAt.value > lastDelay) attempt = 0
+    openedAt = Option.none()
     attempt += 1
     lastDelay = retryMillis(timing, attempt)
     return lastDelay

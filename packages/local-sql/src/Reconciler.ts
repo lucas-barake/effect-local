@@ -925,9 +925,11 @@ export const layerInMemoryScheduler = (
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
       const requests = makeReconciliationRequests(local.requestReconciliation)
       const requestAndNotify = requests.run.pipe(Effect.andThen(notify))
-      const resyncAfterWatchFailure = requestAndNotify.pipe(
-        Effect.catch((error) => reconciliation.watchFailed(error))
-      )
+      let resyncRequested = false
+      const resyncAfterWatchFailure = Effect.suspend(() => {
+        resyncRequested = true
+        return notify
+      })
       const authenticationPause = yield* Ref.make<Option.Option<Deferred.Deferred<void>>>(Option.none())
       let authenticationEpoch = 0
       const awaitAuthenticationChange = Ref.get(authenticationPause).pipe(
@@ -992,6 +994,10 @@ export const layerInMemoryScheduler = (
       const turn = Effect.gen(function*() {
         turnTransportGeneration = yield* remote.transportGeneration
         observedGeneration = yield* reconciliation.generation
+        if (resyncRequested) {
+          yield* requests.run
+          resyncRequested = false
+        }
         yield* requests.observe
         const generations = yield* local.reconciliationGenerations
         if (generations.completed >= generations.requested) return

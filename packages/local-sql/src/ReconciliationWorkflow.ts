@@ -513,9 +513,11 @@ const layerSchedulerWithConfiguration = (
       >(Option.none())
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
-      const resyncAfterWatchFailure = requestAndNotify.pipe(
-        Effect.catch((error) => reconciliation.watchFailed(error))
-      )
+      let resyncRequested = false
+      const resyncAfterWatchFailure = Effect.suspend(() => {
+        resyncRequested = true
+        return notify
+      })
       const authenticationPause = yield* pipe(
         Option.none(),
         Ref.make<Option.Option<Deferred.Deferred<void>>>
@@ -570,8 +572,9 @@ const layerSchedulerWithConfiguration = (
         if (!readmit) yield* LosslessQueue.take(wake)
         yield* awaitAuthenticationChange
         let observedGeneration = yield* reconciliation.generation
-        const requestFirst = readmit
+        const requestFirst = readmit || resyncRequested
         readmit = false
+        resyncRequested = false
         const result = yield* Effect.gen(function*() {
           if (requestFirst) yield* local.requestReconciliation
           while (true) {

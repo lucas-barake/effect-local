@@ -23,7 +23,9 @@ import * as Scope from "effect/Scope"
 import * as SqlClient from "effect/sql/SqlClient"
 import * as SqlError from "effect/sql/SqlError"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
 import * as ConnectionLane from "../src/ConnectionLane.js"
+import * as Configuration from "../src/internal/configuration.js"
 import * as LocalStore from "../src/LocalStore.js"
 import * as MutationRuntime from "../src/MutationRuntime.js"
 import * as QueryReactivity from "../src/QueryReactivity.js"
@@ -1467,11 +1469,10 @@ describe("a watch whose recovery dies", () => {
       const whileDying = subscriptions()
       dieOn(undefined)
       yield* forgetStatuses
-      yield* settle("1 minute")
 
       const recovered = yield* awaitStatus((status) => status._tag === "Online")
 
-      assert.strictEqual(whileDying, 1)
+      assert.strictEqual(whileDying, 2, "the watch reopened while the sync request kept dying")
       assert.strictEqual(subscriptions(), 2)
       assert.isTrue(Option.isSome(recovered), "the space reported online once storage healed")
     }, VirtualTime.scoped)
@@ -1896,8 +1897,10 @@ describe("a sync request after a watch failure that fails", () => {
         (status) => status._tag === "Failed" && status.message === "StorageUnavailable"
       )
       services.lockNext(noStatement)
+      const recovered = yield* eventually(services, space, isOnlineDrained)
 
       assert.isTrue(Option.isSome(reported), "the failed sync request was reported")
+      assert.isTrue(Option.isSome(recovered), "the space reported online on its own once storage healed")
     }, VirtualTime.scoped)
   )
 })
@@ -2108,5 +2111,59 @@ describe("a subscriber that throws while a died background turn is published", (
       assert.strictEqual(settlements.length, 2)
       assert.isTrue(Option.isSome(drained), "a worker drained the third space")
     }, VirtualTime.scoped)
+  )
+})
+
+describe("a sync request that keeps dying after a watch failure", () => {
+  it.effect.each(constructors)(
+    "subscribes to the watch again and backs off while the request keeps dying with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* threeSpaces(constructor)
+      const logs = captureLogs()
+      const watchFails = yield* Deferred.make<void>()
+      let subscriptions = 0
+      yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => emptyPage(services.crypto, request),
+          watch: (request) => {
+            if (request.spaceId !== spaceId) return Stream.never
+            subscriptions += 1
+            if (subscriptions > 1) return Stream.never
+            return Deferred.await(watchFails).pipe(Effect.andThen(storageUnavailable), Stream.fromEffect)
+          }
+        }),
+        logs.layerLogs
+      )
+      services.dieNext(requestReconciliationStatement, 1_000_000)
+      yield* Deferred.succeed(watchFails, undefined)
+
+      yield* settle("10 minutes")
+
+      assert.strictEqual(subscriptions, 2, "the watch reopened while the sync request kept dying")
+      assert.isAbove(logs.errors(), 5)
+      assert.isBelow(logs.errors(), 30, "the retry of the dying request was backed off")
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("the watch backoff", () => {
+  it.effect(
+    "keeps growing while the watch has not opened again",
+    Effect.fnUntraced(function*() {
+      const backoff = Configuration.makeWatchBackoff({ retryDelayMillis: 1000, maximumRetryDelayMillis: 60_000 })
+      yield* backoff.opened
+      yield* TestClock.adjust("10 seconds")
+      const afterStayingOpen = yield* backoff.closed
+      yield* TestClock.adjust("10 seconds")
+      const withoutReopening = yield* backoff.closed
+      yield* backoff.opened
+      yield* TestClock.adjust("10 seconds")
+      const afterReopening = yield* backoff.closed
+
+      assert.deepStrictEqual([afterStayingOpen, withoutReopening, afterReopening], [1000, 2000, 1000])
+    })
   )
 })
