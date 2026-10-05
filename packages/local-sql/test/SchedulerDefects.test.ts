@@ -2063,3 +2063,50 @@ describe("background work claimed after the foreground took the space over", () 
     }, VirtualTime.scoped)
   )
 })
+
+describe("a subscriber that throws while a died background turn is published", () => {
+  it.effect.each(constructors)(
+    "keeps the background workers running with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* threeSpaces(constructor)
+      yield* BackgroundReplica.seedPending(services, [spaceId, otherSpaceId])
+      const logs = captureLogs()
+      let pullDies = 2
+      let untilThrow = 0
+      let throws = 0
+      services.reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+        if (untilThrow === 0) return
+        untilThrow -= 1
+        if (untilThrow > 0) return
+        throws += 1
+        decodeURIComponent("%")
+      })
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (request.spaceId !== thirdSpaceId && pullDies > 0) {
+            pullDies -= 1
+            untilThrow = 2
+            return Effect.die("undecodable response")
+          }
+          return emptyPage(services.crypto, request)
+        }
+      })).pipe(Effect.provide(logs.layerLogs))
+      const third = yield* replica.space(thirdSpaceId)
+      yield* settle("5 minutes")
+      const settlements = logs.errorMessages().filter((message) => message === "Background turn settlement died")
+      yield* services.sql`UPDATE effect_local_client_spaces
+        SET replication_view_id = ${viewId}, replication_view_revision = 0`
+      yield* third.activate
+      yield* third.mutate(Domain.PutTodo, Domain.todo("third"))
+      yield* third.deactivate
+
+      const drained = yield* eventually(services, third, isDrained)
+
+      assert.strictEqual(throws, 2, "the subscriber threw while each died turn was published")
+      assert.strictEqual(settlements.length, 2)
+      assert.isTrue(Option.isSome(drained), "a worker drained the third space")
+    }, VirtualTime.scoped)
+  )
+})

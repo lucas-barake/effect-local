@@ -1678,7 +1678,15 @@ const makeLayer = <D extends Definition.Any, R,>(
         const claimed = entry
         const generation = claimed.backgroundGeneration
         yield* runBackgroundWork(work, claimed, generation).pipe(
-          Effect.catchCause((cause) => settleDiedTurn(claimed, generation, cause))
+          Effect.catchCause((cause) =>
+            settleDiedTurn(claimed, generation, cause).pipe(
+              Effect.catchCause((settleCause) =>
+                Errors.logDefect("Background turn settlement died", settleCause).pipe(
+                  Effect.annotateLogs({ "space.id": claimed.spaceId })
+                )
+              )
+            )
+          )
         )
       })
 
