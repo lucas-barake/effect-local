@@ -31,6 +31,7 @@ import { boundedTtlMillis } from "./configuration.js"
 import { invalidConfiguration } from "./errors.js"
 import * as LosslessQueue from "./losslessQueue.js"
 import type * as replicaWire from "./replicaWire.js"
+import * as SequencedPubSub from "./sequencedPubSub.js"
 import { decodeWith, encodeJson, type Json } from "./wireCodec.js"
 
 type TransportError =
@@ -49,6 +50,7 @@ export interface ProxyOptions {
   readonly reactivity: Reactivity.Reactivity
   readonly crypto: Crypto.Crypto
   readonly retryDelayMillis: number
+  readonly eventCapacity: number
   readonly awaitRouted: Effect.Effect<boolean>
   readonly superseded: Deferred.Deferred<never, ReplicaError.BuildSuperseded>
 }
@@ -637,8 +639,11 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         ).pipe(Effect.tap((created) => Effect.sync(() => states.set(stateName, created))))
       })
     const events = yield* Effect.acquireRelease(
-      PubSub.unbounded<Extract<replicaWire.EphemeralSessionFrame, { readonly _tag: "Event" }>>(),
-      PubSub.shutdown
+      SequencedPubSub.sliding<Extract<replicaWire.EphemeralSessionFrame, { readonly _tag: "Event" }>>(
+        "ephemeral events",
+        options.eventCapacity
+      ),
+      SequencedPubSub.shutdown
     )
     const opened = yield* Deferred.make<void, ReplicaError.ReplicaError | Ephemeral.EncodeError>()
 
@@ -670,7 +675,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         )
       }
       if (frame._tag === "Members") return SubscriptionRef.set(members, Option.some(frame.entries))
-      if (frame._tag === "Event") return PubSub.publish(events, frame).pipe(Effect.asVoid)
+      if (frame._tag === "Event") return SequencedPubSub.publish(events, frame)
       return stateRef(frame.name).pipe(
         Effect.flatMap((ref) => SubscriptionRef.set(ref, Option.some(frame.entries)))
       )
@@ -727,7 +732,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       EphemeralClient.EventEnvelope<Ephemeral.AnyEvent>,
       Ephemeral.DecodeError | ReplicaError.ReplicaError
     > {
-      return Stream.fromPubSub(events).pipe(
+      return Stream.unwrap(SequencedPubSub.subscribe(events)).pipe(
         Stream.filter((frame) => frame.name === definitionArg.name),
         Stream.mapEffect((frame) =>
           decodeWith(definitionArg.payloadSchema, frame.payload).pipe(

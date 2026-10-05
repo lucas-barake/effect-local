@@ -18,6 +18,13 @@ export const positiveFiniteDurationMillis = (
     }
   })
 
+export const positiveSafeInteger = Effect.fnUntraced(function*(option: string, value: number) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    return yield* invalidConfiguration(option, `${option} must be a positive safe integer`)
+  }
+  return value
+})
+
 export const boundedTtlMillis = Effect.fnUntraced(function*(
   input: Duration.Input,
   minimum: number,

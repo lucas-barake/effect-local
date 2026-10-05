@@ -1,10 +1,9 @@
-import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Effect from "effect/Effect"
 import * as PubSub from "effect/PubSub"
 import * as Scheduler from "effect/Scheduler"
 import type * as Scope from "effect/Scope"
 import * as Stream from "effect/Stream"
-import { capacityExceeded } from "./errors.js"
 
 interface Delivery<A,> {
   readonly sequence: number
@@ -40,7 +39,11 @@ export const subscribe = <A,>(
         Stream.mapAccumEffect(
           () => firstExpected,
           (expected, delivery) => {
-            if (delivery.sequence > expected) return Effect.fail(capacityExceeded(self.resource, self.capacity))
+            if (delivery.sequence > expected) {
+              return Effect.fail(
+                new ReplicaError.CapacityExceeded({ resource: self.resource, limit: self.capacity })
+              )
+            }
             return Effect.succeed([delivery.sequence + 1, [delivery.value]] as const)
           }
         )

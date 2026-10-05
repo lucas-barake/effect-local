@@ -47,6 +47,12 @@ overrides the tab cluster's `ShardingConfig`, and `retryDelay` (1 second) paces 
 tab's resubscription of its live streams and ephemeral sessions after a failure. The layer validates `retryDelay` when it builds and fails with
 `InvalidConfiguration` unless it is a positive finite duration. Its error type is
 `BrowserStorageError | InvalidConfiguration`.
+`eventCapacity` (1,024) bounds the ephemeral events each tab buffers per session, the same contract as
+`EphemeralClient`'s option of that name. A subscriber of `session.events` that falls more than `eventCapacity` events
+behind fails with `CapacityExceeded` for the `"ephemeral events"` resource instead of growing the tab's memory, and
+events that arrive before a subscription exists are not delivered to it. The layer fails with `InvalidConfiguration`
+unless `eventCapacity` is a positive safe integer. The leader tab's own `EphemeralClient` Layer applies its
+`eventCapacity` separately to what it forwards to each tab.
 `BrowserSqlite.layerWorker` spawns and owns a dedicated SQLite WASM worker that is terminated when the Layer's scope
 closes, and `BrowserSqlite.layerMessagePort` adapts an application-owned worker port instead.
 

@@ -216,6 +216,7 @@ interface EnvironmentOptions {
   readonly name?: string
   readonly kit?: testKit.MemoryPlatform
   readonly retryDelay?: BrowserReplica.Options<typeof definition>["retryDelay"]
+  readonly eventCapacity?: BrowserReplica.Options<typeof definition>["eventCapacity"]
   readonly pullGate?: Effect.Effect<void>
   readonly layerOwnerProbe?: Layer.Layer<never, OwnerProbeError>
 }
@@ -274,6 +275,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
       ephemerals: build.ephemerals,
       requestPersistence: false,
       retryDelay: environmentOptions.retryDelay ?? "100 millis",
+      eventCapacity: environmentOptions.eventCapacity,
       sharding: environmentOptions.sharding
     }).pipe(
       Layer.provide(layerHandlersWith(environmentOptions.runIndex ?? firstRunIndex)),
@@ -778,6 +780,173 @@ describe("BrowserReplica ephemeral ttl", () => {
       provideFileSystem
     )
   )
+})
+
+const layerEphemeralReactions = (source: Queue.Dequeue<string>) => {
+  function events<D extends Ephemeral.AnyEvent,>(
+    eventMember: Protocol.EphemeralMember
+  ): Stream.Stream<EphemeralClient.EventEnvelope<D>>
+  function events(
+    eventMember: Protocol.EphemeralMember
+  ): Stream.Stream<EphemeralClient.EventEnvelope<typeof Reaction>> {
+    return Stream.fromQueue(source).pipe(Stream.map((emoji) => ({ member: eventMember, payload: { emoji } })))
+  }
+  return Layer.succeed(EphemeralClient.EphemeralClient, {
+    session: (_profile, options) =>
+      Effect.succeed({
+        spaceId: options.spaceId,
+        member: options.member,
+        events: () => events(options.member),
+        state: () => Stream.never,
+        members: Stream.never,
+        updateMember: () => Effect.void
+      }),
+    publish: () => Effect.void,
+    clear: () => Effect.void,
+    remove: () => Effect.void
+  })
+}
+
+const openFollowerReactions = Effect.fnUntraced(function*(eventCapacity: number | undefined) {
+  const source = yield* Queue.unbounded<string>()
+  const environment = yield* makeEnvironmentWith({ layerEphemeral: layerEphemeralReactions(source), eventCapacity })
+  yield* environment.openTabWith(true)
+  const follower = yield* environment.openTabWith(false)
+  const session = yield* settle(openStatusSession(follower.context).pipe(Scope.provide(yield* Effect.scope)))
+  const subscribe = Effect.fnUntraced(function*(gate: Effect.Effect<void>) {
+    const seen = yield* Queue.unbounded<string>()
+    const fiber = yield* session.events(Reaction).pipe(
+      Stream.runForEach((envelope) => Queue.offer(seen, envelope.payload.emoji).pipe(Effect.andThen(gate))),
+      Effect.as("ended"),
+      Effect.catchTag("CapacityExceeded", (error) => Effect.succeed(`${error.resource} ${error.limit}`)),
+      Effect.forkChild
+    )
+    yield* settle(Effect.void)
+    return { seen, fiber }
+  })
+  const react = (emoji: string) => Queue.offer(source, emoji)
+  return { subscribe, react }
+})
+
+describe("BrowserReplica ephemeral event buffer", () => {
+  it.effect(
+    "fails a follower subscriber that stopped reading while more events than the capacity arrived",
+    Effect.fnUntraced(
+      function*() {
+        const follower = yield* openFollowerReactions(4)
+        const resume = yield* Deferred.make<void>()
+        const reading = yield* follower.subscribe(Effect.void)
+        const stalled = yield* follower.subscribe(Deferred.await(resume))
+        for (let index = 0; index < 12; index++) {
+          yield* follower.react(`${index}`)
+          assert.strictEqual(yield* Queue.take(reading.seen), `${index}`)
+        }
+        assert.strictEqual(yield* Queue.take(stalled.seen), "0")
+        yield* settle(Deferred.succeed(resume, undefined))
+        assert.isAtMost(yield* Queue.size(stalled.seen), 4)
+        const outcome = stalled.fiber.pollUnsafe()
+        assert.isDefined(outcome, "the stalled subscriber was never told that its buffer overflowed")
+        if (outcome !== undefined) assert.strictEqual(yield* outcome, "ephemeral events 4")
+        assert.isUndefined(reading.fiber.pollUnsafe())
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "delivers every event in order to a follower subscriber that keeps reading past the capacity",
+    Effect.fnUntraced(
+      function*() {
+        const follower = yield* openFollowerReactions(4)
+        const reading = yield* follower.subscribe(Effect.void)
+        for (let index = 0; index < 12; index++) {
+          yield* follower.react(`${index}`)
+          assert.strictEqual(yield* Queue.take(reading.seen), `${index}`)
+        }
+        assert.isUndefined(reading.fiber.pollUnsafe())
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "neither delivers nor counts events that reached the follower before a subscription existed",
+    Effect.fnUntraced(
+      function*() {
+        const follower = yield* openFollowerReactions(4)
+        const witness = yield* follower.subscribe(Effect.void)
+        for (let index = 0; index < 6; index++) {
+          yield* follower.react(`early ${index}`)
+          assert.strictEqual(yield* Queue.take(witness.seen), `early ${index}`)
+        }
+        const late = yield* follower.subscribe(Effect.void)
+        yield* follower.react("late")
+        assert.strictEqual(yield* Queue.take(late.seen), "late")
+        assert.strictEqual(yield* Queue.size(late.seen), 0)
+        assert.isUndefined(late.fiber.pollUnsafe())
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "bounds a follower subscriber at 1024 buffered events when no capacity is configured",
+    Effect.fnUntraced(
+      function*() {
+        const follower = yield* openFollowerReactions(undefined)
+        const resume = yield* Deferred.make<void>()
+        const reading = yield* follower.subscribe(Effect.void)
+        const stalled = yield* follower.subscribe(Deferred.await(resume))
+        for (let index = 0; index < 1_040; index++) {
+          yield* follower.react(`${index}`)
+          assert.strictEqual(yield* Queue.take(reading.seen), `${index}`)
+        }
+        yield* settle(Deferred.succeed(resume, undefined))
+        const outcome = stalled.fiber.pollUnsafe()
+        assert.isDefined(outcome, "the stalled subscriber was never told that its buffer overflowed")
+        if (outcome !== undefined) assert.strictEqual(yield* outcome, "ephemeral events 1024")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  const invalidCapacities: ReadonlyArray<readonly [string, number]> = [
+    ["zero", 0],
+    ["a negative integer", -1],
+    ["a fraction", 1.5],
+    ["NaN", Number.NaN],
+    ["infinity", Number.POSITIVE_INFINITY],
+    ["an unsafe integer", Number.MAX_SAFE_INTEGER + 1]
+  ]
+
+  for (const [label, eventCapacity] of invalidCapacities) {
+    it.effect(
+      `rejects ${label} as the event capacity with InvalidConfiguration`,
+      Effect.fnUntraced(
+        function*() {
+          const environment = yield* makeEnvironmentWith({ eventCapacity })
+          const visibility = yield* testKit.makeMemoryVisibility(true)
+          const layerTab = environment.layerReplicaWith(visibility.service).pipe(
+            Layer.provideMerge(Layer.fresh(Reactivity.layer))
+          )
+          const outcome = yield* settle(
+            Layer.build(layerTab).pipe(
+              Effect.as("built"),
+              Effect.catchTag("InvalidConfiguration", (error) => Effect.succeed(error.option)),
+              Effect.scoped
+            )
+          )
+          assert.strictEqual(outcome, "eventCapacity")
+        },
+        Effect.scoped,
+        provideFileSystem
+      )
+    )
+  }
 })
 
 describe("BrowserReplica", () => {
