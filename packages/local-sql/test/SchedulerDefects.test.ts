@@ -341,6 +341,7 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
   readonly watch: Effect.Effect<void>
   readonly waitForCredentialChange?: Effect.Effect<void>
   readonly waitForTransportChange?: Effect.Effect<void>
+  readonly transportGeneration?: Effect.Effect<number>
 }) {
   const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
   const database = yield* Layer.build(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
@@ -369,6 +370,7 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
     ...idleRemote,
     waitForCredentialChange: () => faults.waitForCredentialChange ?? Effect.never,
     waitForTransportChange: () => faults.waitForTransportChange ?? Effect.never,
+    transportGeneration: faults.transportGeneration ?? Effect.succeed(0),
     submitBatch: (request) => server.admitBatch(request, null),
     pull: (request) => Effect.andThen(faults.pull, server.pull(request)),
     bootstrap: server.bootstrap,
@@ -1486,6 +1488,64 @@ describe("steps of a managed space that run outside its turn", () => {
       const drained = yield* eventually(services, space, isOnlineDrained)
 
       assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Online, pending 0")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "syncs the next mutation after the transport generation read at the start of a turn died",
+    Effect.fnUntraced(function*() {
+      const services = yield* twoSpaces("layer")
+      const logs = captureLogs()
+      let dies = false
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          transportGeneration: Effect.suspend(() => {
+            if (dies) return Effect.die("generation died")
+            return Effect.succeed(0)
+          }),
+          submitBatch: acceptSubmission,
+          pull: (request) => emptyPage(services.crypto, request)
+        }),
+        logs.layerLogs
+      )
+      dies = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      const failed = yield* eventually(services, space, isFailed)
+      dies = false
+      yield* space.mutate(Domain.PutTodo, Domain.todo("second"))
+
+      const drained = yield* eventually(services, space, isOnlineDrained)
+
+      assert.strictEqual(failureMessage(failed), "UnexpectedFailure")
+      assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Online, pending 0")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "retries an in-memory turn whose transport generation read died",
+    Effect.fnUntraced(function*() {
+      let dies = false
+      const { awaitStatus, local, logs, reconciler } = yield* inMemoryScheduler({
+        pull: Effect.void,
+        watch: Effect.never,
+        transportGeneration: Effect.suspend(() => {
+          if (!dies) return Effect.succeed(0)
+          dies = false
+          return Effect.die("generation died")
+        })
+      })
+      dies = true
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* reconciler.schedule
+
+      const failed = yield* awaitStatus((status) => status._tag === "Failed")
+      const drained = yield* awaitStatus((status) => status._tag === "Online" && status.pending === 0)
+
+      assert.strictEqual(reportedFailure(failed), "UnexpectedFailure")
+      assert.deepStrictEqual(logs.defects(), ["generation died"])
+      assert.isTrue(Option.isSome(drained))
     }, VirtualTime.scoped)
   )
 })

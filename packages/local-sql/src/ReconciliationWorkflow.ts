@@ -572,10 +572,11 @@ const layerSchedulerWithConfiguration = (
       const superviseTurn = Effect.gen(function*() {
         if (!readmit) yield* LosslessQueue.take(wake)
         yield* awaitAuthenticationChange
-        let observedGeneration = yield* reconciliation.generation
+        let observedGeneration = 0
         const requestFirst = readmit
         readmit = false
         const result = yield* Effect.gen(function*() {
+          observedGeneration = yield* reconciliation.generation
           if (requestFirst) yield* local.requestReconciliation
           while (true) {
             yield* awaitAuthenticationChange
