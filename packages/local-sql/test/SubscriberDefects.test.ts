@@ -161,12 +161,6 @@ const hangingThenDrain = (
     }
   })
 
-const activationIs = (space: Replica.Space, expected: Replica.Activation) =>
-  space.activation.pipe(
-    Effect.map((activation) => activation === expected),
-    Effect.catch(() => Effect.succeed(false))
-  )
-
 const recordAnnouncements = Effect.fnUntraced(function*(services: BackgroundReplica.Services) {
   const clock = yield* Clock.Clock
   const announced: Array<{ readonly key: "aggregate" | "status"; readonly at: number }> = []
@@ -810,10 +804,10 @@ describe("a notification that is still being delivered", () => {
       const replica = yield* services.start(hangingThenDrain(services, attempts))
       const space = yield* replica.space(spaceId)
       yield* VirtualTime.advanceUntil(attempts.reached(1))
-      const caller: { fiber: number | undefined } = { fiber: undefined }
+      const caller: { fiber: number | undefined; announced: number } = { fiber: undefined, announced: 0 }
       const delivery = yield* services.holdInvalidationWhen(ReactivityKey.activation(spaceId), (fiber) => {
-        if (fiber !== caller.fiber) return Effect.succeed(false)
-        return activationIs(space, "Inactive")
+        if (fiber === caller.fiber) caller.announced += 1
+        return Effect.succeed(caller.announced === 2)
       })
       services.lockNext("SELECT desired_scope_json")
       const activating = yield* space.activate.pipe(Effect.exit, Effect.forkChild)
