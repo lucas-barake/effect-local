@@ -1923,6 +1923,74 @@ describe("client schema evolution", () => {
   )
 
   it.effect(
+    "announces the aggregate status when a resubmission staged its replacement and the server discard failed",
+    Effect.fnUntraced(
+      function*() {
+        const reactivity = yield* Reactivity.Reactivity
+        const v1 = yield* buildStore(definitionV1, layerHandlersV1)
+        const original = yield* v1.mutate(PutTodoV1, { id: "73", title: "original" })
+        yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
+        const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 0 })
+        const live = serverSync(server)
+        let offline = false
+        const remote = SyncEngine.SyncEngine.of({
+          ...live,
+          submitBatch: (request) => {
+            if (offline) return Effect.never
+            return live.submitBatch(request)
+          },
+          pull: (request) => {
+            if (offline) return Effect.never
+            return live.pull(request)
+          },
+          discard: (request) => {
+            if (offline) return Effect.fail(new ReplicaError.ServerUnavailable())
+            return live.discard(request)
+          }
+        })
+        const context = yield* SqlReplica.layer({
+          ...clientHistory,
+          definition: definitionV2,
+          clientId,
+          initialSpaces: [spaceId],
+          schemaEvolutionBatchSize: 1,
+          evolution
+        }).pipe(
+          Layer.provide(layerHandlersV2),
+          Layer.provide(Layer.succeed(SyncEngine.SyncEngine, remote)),
+          Layer.build
+        )
+        const replica = Context.get(context, Replica.Replica)
+        const space = yield* replica.space(spaceId)
+        yield* space.activate
+        yield* reactivity.stream([ReactivityKey.status(spaceId)], space.status).pipe(
+          Stream.filter((status) => status._tag === "Online"),
+          Stream.runHead
+        )
+        const before = (yield* replica.status).totalPending
+        let announced = 0
+        const cancel = reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+          announced += 1
+        })
+        yield* Effect.addFinalizer(() => Effect.sync(cancel))
+        offline = true
+        const replacement = { id: 73, title: "replacement", done: false }
+
+        const outcome = yield* space.resubmitQuarantined(original.envelope.mutationId, PutTodoV2, replacement).pipe(
+          Effect.exit
+        )
+        const after = (yield* replica.status).totalPending
+
+        assert.isTrue(Exit.isFailure(outcome), "the resubmission failed at the server discard")
+        assert.deepStrictEqual({ before, after }, { before: 0, after: 1 })
+        assert.strictEqual(announced, 1, "the aggregate status was announced once")
+      },
+      Effect.scoped,
+      provideDatabase
+    )
+  )
+
+  it.effect(
     "resolves a quarantined mutation discarded twice concurrently with one server discard",
     Effect.fnUntraced(
       function*() {

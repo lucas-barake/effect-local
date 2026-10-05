@@ -929,7 +929,6 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.transition = undefined
           yield* announced.run(invalidateActivation(entry.spaceId))
           yield* Completion.settle(completion, result)
-          yield* signalCapacity
           if (Exit.isFailure(result)) {
             yield* result
             return false
