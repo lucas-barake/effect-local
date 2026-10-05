@@ -191,6 +191,40 @@ describe("Invalidation.notify", () => {
   )
 
   it.effect(
+    "does not log the cancellation of its caller as an interrupted notification inside an uninterruptible region",
+    Effect.fnUntraced(function*() {
+      const logs = captureLogs()
+      const base = yield* Reactivity.make
+      const reached = yield* Deferred.make<void>()
+      const reactivity: Reactivity.Reactivity = {
+        ...base,
+        invalidate: (keys) => {
+          if (!Array.isArray(keys) || !keys.includes("first")) return base.invalidate(keys)
+          return Deferred.succeed(reached, undefined).pipe(Effect.andThen(Effect.interruptible(Effect.never)))
+        }
+      }
+      const notified: Array<string> = []
+      for (const key of ["first", "second"]) {
+        reactivity.registerUnsafe([key], () => {
+          notified.push(key)
+        })
+      }
+      const notifying = yield* Invalidation.notify(reactivity, ["first", "second"]).pipe(
+        Effect.uninterruptible,
+        Effect.provide(logs.layerLogs),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(reached)
+
+      const exit = yield* Fiber.interrupt(notifying).pipe(Effect.andThen(Fiber.await(notifying)))
+
+      assert.isTrue(Exit.hasInterrupts(exit), "the caller was interrupted")
+      assert.deepStrictEqual(notified, ["second"])
+      assert.deepStrictEqual(logs.errors(), [])
+    })
+  )
+
+  it.effect(
     "completes and logs the cause with its key when the Reactivity service ends a notification without a defect",
     Effect.fnUntraced(function*() {
       const logs = captureLogs()
