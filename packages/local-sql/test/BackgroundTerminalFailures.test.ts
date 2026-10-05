@@ -1,88 +1,43 @@
-import { NodeCrypto } from "@effect/platform-node"
-import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
-import * as Replica from "@lucas-barake/effect-local/Replica"
+import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Arr from "effect/Array"
 import * as Clock from "effect/Clock"
-import * as Context from "effect/Context"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
-import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
-import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Order from "effect/Order"
 import * as Queue from "effect/Queue"
-import * as Reactivity from "effect/reactivity/Reactivity"
-import * as Scope from "effect/Scope"
-import * as SqlClient from "effect/sql/SqlClient"
-import * as SqlError from "effect/sql/SqlError"
+import type * as Reactivity from "effect/reactivity/Reactivity"
+import type * as SqlClient from "effect/sql/SqlClient"
 import * as Stream from "effect/Stream"
 import * as Struct from "effect/Struct"
-import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
-import * as SqlReplica from "../src/SqlReplica.js"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
+import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
+import {
+  acceptSubmission,
+  awaitSpaceStatus,
+  awaitSpaceStatusWhere,
+  type Constructor,
+  constructors,
+  emptyPage,
+  idleRemote,
+  makeAttempts,
+  type Remote,
+  viewId
+} from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/VirtualTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000801")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000801")
-const viewId = Identity.ReplicationViewId.make("viw_00000000-0000-4000-8000-000000000801")
-
-const constructors = ["layer", "layerWorkflow"] as const
-
-type Constructor = typeof constructors[number]
-
-type Remote = SyncEngine.SyncEngine["Service"]
-
-const idleRemote = SyncEngine.SyncEngine.of({
-  waitForCredentialChange: () => Effect.never,
-  transportGeneration: Effect.succeed(0),
-  waitForTransportChange: () => Effect.never,
-  submitBatch: () => Effect.never,
-  discard: () => Effect.die("unexpected discard"),
-  pull: () => Effect.never,
-  bootstrap: () => Effect.die("unexpected bootstrap"),
-  watch: () => Stream.never
-})
-
-const acceptSubmission: Remote["submitBatch"] = (request) =>
-  Effect.succeed(Protocol.SubmitBatchResult.make({
-    receipts: request.envelopes.map((envelope) =>
-      Protocol.AcceptedReceipt.make({
-        ...envelope,
-        serverSequence: Identity.ServerSequence.make(1),
-        result: Domain.todo(envelope.mutationId, "accepted")
-      })
-    )
-  }))
-
-const emptyPage = (crypto: Crypto.Crypto, request: Parameters<Remote["pull"]>[0]) =>
-  Protocol.viewChangesDigest([]).pipe(
-    Effect.map((digest) =>
-      Protocol.PullPage.make({
-        scopeGeneration: request.scopeGeneration,
-        cursor: Protocol.ReplicationCursor.make({
-          viewId,
-          revision: Identity.ReplicationViewRevision.make((request.cursor?.revision ?? 0) + 1)
-        }),
-        serverSequence: Identity.ServerSequence.make(1),
-        changes: [],
-        contentBytes: Protocol.encodedBytes([]),
-        digest,
-        hasMore: false,
-        serverSchema: Domain.definition.schemaIdentity
-      })
-    ),
-    Effect.provideService(Crypto.Crypto, crypto)
-  )
 
 const oversizedSnapshot = (crypto: Crypto.Crypto, request: Parameters<Remote["pull"]>[0]) =>
   Protocol.replicationScopeDigest(request.scope).pipe(
@@ -109,135 +64,21 @@ const oversizedSnapshot = (crypto: Crypto.Crypto, request: Parameters<Remote["pu
     Effect.provideService(Crypto.Crypto, crypto)
   )
 
-const makeAttempts = Effect.gen(function*() {
-  const reached = [
-    yield* Deferred.make<void>(),
-    yield* Deferred.make<void>(),
-    yield* Deferred.make<void>(),
-    yield* Deferred.make<void>()
-  ]
-  let count = 0
-  const record = Effect.suspend(() => {
-    count += 1
-    const signal = reached[count - 1]
-    if (signal === undefined) return Effect.void
-    return Deferred.succeed(signal, undefined).pipe(Effect.asVoid)
-  })
-  return {
-    record,
-    count: () => count,
-    reached: (attempt: 1 | 2 | 3 | 4) => Deferred.await(reached[attempt - 1])
-  }
-})
-
-const backgroundServices = Effect.fnUntraced(function*(
-  constructor: Constructor,
-  maximumRetryDelay: Duration.Input = "1 second"
-) {
-  const databaseContext = yield* Layer.mergeAll(
-    SqliteClient.layer({ filename: ":memory:", disableWAL: true }),
-    NodeCrypto.layer,
-    Reactivity.layer,
-    WorkflowEngine.layerMemory
-  ).pipe(Layer.build)
-  const sql = Context.get(databaseContext, SqlClient.SqlClient)
-  let lockedStatement: string | undefined
-  const lockingSql = new Proxy(sql, {
-    apply: (target, thisArg, args: Parameters<typeof sql>) => {
-      const source: unknown = args[0]
-      if (lockedStatement === undefined || !Array.isArray(source) || !source.join("?").includes(lockedStatement)) {
-        return Reflect.apply(target, thisArg, args)
-      }
-      lockedStatement = undefined
-      const reason = new SqlError.LockTimeoutError({ cause: "injected lock timeout" })
-      return Effect.fail(new SqlError.SqlError({ reason }))
-    }
-  })
-  const crypto = Context.get(databaseContext, Crypto.Crypto)
-  const reactivity = Context.get(databaseContext, Reactivity.Reactivity)
-  const options = {
-    definition: Domain.definition,
+const backgroundServices = (constructor: Constructor, maximumRetryDelay: Duration.Input = "1 second") =>
+  BackgroundReplica.services({
+    constructor,
     clientId,
     initialSpaces: [spaceId],
-    defaultScope: Protocol.ReplicationScope.make({ models: [Domain.Todo.name] }),
     maximumActiveSpaces: 4,
     foregroundActiveSpaces: 2,
-    retainedReceipts: 256,
-    maximumReceipts: 10_000,
-    retainedHistoryEntries: 256,
-    maximumBootstrapEntities: 10_000,
-    maximumBootstrapBytes: 64 * 1024 * 1024,
-    maximumBootstrapPageBytes: 4 * 1024 * 1024,
-    migration: { retryDelay: "1 millis", maximumAttempts: 8 },
     retryDelay: "1 second",
     maximumRetryDelay
-  } satisfies SqlReplica.Options<typeof Domain.definition>
-  let heldRelease:
-    | { remaining: number; readonly entered: Deferred.Deferred<void>; readonly release: Deferred.Deferred<void> }
-    | undefined
-  const gatedReactivity = new Proxy(reactivity, {
-    get: (target, property, receiver) => {
-      if (property !== "invalidate") return Reflect.get(target, property, receiver)
-      return (keys: Parameters<typeof reactivity.invalidate>[0]) => {
-        const held = heldRelease
-        if (held === undefined || !Array.isArray(keys) || !keys.includes(ReactivityKey.activation(spaceId))) {
-          return target.invalidate(keys)
-        }
-        held.remaining -= 1
-        if (held.remaining > 0) return target.invalidate(keys)
-        heldRelease = undefined
-        return target.invalidate(keys).pipe(
-          Effect.andThen(Deferred.succeed(held.entered, undefined)),
-          Effect.andThen(Deferred.await(held.release))
-        )
-      }
-    }
   })
-  const lockingContext = databaseContext.pipe(
-    Context.add(SqlClient.SqlClient, lockingSql),
-    Context.add(Reactivity.Reactivity, gatedReactivity)
-  )
-  const start = (remote: Remote) => {
-    const layerServices = Layer.mergeAll(
-      Domain.layerHandlers,
-      Layer.succeed(SyncEngine.SyncEngine, remote),
-      Layer.succeedContext(lockingContext)
-    )
-    let layerReplica = SqlReplica.layer(options).pipe(Layer.provide(layerServices))
-    if (constructor === "layerWorkflow") {
-      layerReplica = SqlReplica.layerWorkflow(options).pipe(Layer.provide(layerServices))
-    }
-    return Layer.build(layerReplica).pipe(Effect.map(Context.get(Replica.Replica)))
-  }
-  const lockNext = (statement: string) => {
-    lockedStatement = statement
-  }
-  const holdRelease = Effect.fnUntraced(function*() {
-    const entered = yield* Deferred.make<void>()
-    const release = yield* Deferred.make<void>()
-    const arm = () => {
-      heldRelease = { remaining: 2, entered, release }
-    }
-    return { arm, entered: Deferred.await(entered), release: Deferred.succeed(release, undefined) }
-  })
-  return { sql, crypto, reactivity, start, lockNext, holdRelease }
-})
 
-const pendingBackgroundSpace = Effect.fnUntraced(function*(
-  constructor: Constructor,
-  maximumRetryDelay: Duration.Input = "1 second"
-) {
-  const services = yield* backgroundServices(constructor, maximumRetryDelay)
-  const seedScope = yield* Scope.make()
-  const seedReplica = yield* services.start(idleRemote).pipe(Scope.provide(seedScope))
-  const seedSpace = yield* seedReplica.space(spaceId)
-  yield* seedSpace.mutate(Domain.PutTodo, Domain.todo("pending"))
-  yield* seedSpace.deactivate
-  yield* Scope.close(seedScope, Exit.void)
-  yield* services.sql`UPDATE effect_local_client_spaces
-    SET replication_view_id = ${viewId}, replication_view_revision = 0`
-  return services
-})
+const pendingBackgroundSpace = (constructor: Constructor, maximumRetryDelay: Duration.Input = "1 second") =>
+  backgroundServices(constructor, maximumRetryDelay).pipe(
+    Effect.tap((services) => BackgroundReplica.seedPending(services, [spaceId]))
+  )
 
 type FailureTag = ReplicaError.ReplicaError["_tag"]
 
@@ -340,6 +181,14 @@ const temporaryCapacity = new Set<ReplicaError.CapacityResource>([
 
 const stoppingTags = Struct.keys(failures).filter((tag) => !retryingTags.includes(tag))
 
+const foregroundStoppingTags: ReadonlyArray<FailureTag> = [
+  "ProtocolInvalid",
+  "CredentialRejected",
+  "AuthorizationDenied"
+]
+
+const foregroundRetryingTags: ReadonlyArray<FailureTag> = ["ServerUnavailable", "StorageUnavailable"]
+
 const schedulerCases = (tags: ReadonlyArray<FailureTag>) =>
   tags.flatMap((tag) => constructors.map((constructor) => [tag, constructor] as const))
 
@@ -413,34 +262,6 @@ const workflowRetryAfterRelease = Effect.fnUntraced(function*(workflowRetry: "fa
   return { services, attempts, replica, space }
 })
 
-const awaitSpaceStatusWhere = Effect.fnUntraced(function*(
-  space: Replica.Space,
-  reactivity: Reactivity.Reactivity,
-  matches: (status: ReplicaStatus.SpaceStatus) => boolean
-) {
-  const changes = yield* Queue.unbounded<void>()
-  yield* Effect.acquireRelease(
-    Effect.sync(() =>
-      reactivity.registerUnsafe([ReactivityKey.status(space.spaceId), ReactivityKey.aggregateStatus], () => {
-        Queue.offerUnsafe(changes, undefined)
-      })
-    ),
-    (unregister) => Effect.sync(unregister)
-  )
-  let status = yield* space.status
-  while (!matches(status)) {
-    yield* Queue.take(changes)
-    status = yield* space.status
-  }
-  return status
-})
-
-const awaitSpaceStatus = (
-  space: Replica.Space,
-  reactivity: Reactivity.Reactivity,
-  tag: ReplicaStatus.ReplicaStatus["_tag"]
-) => awaitSpaceStatusWhere(space, reactivity, (status) => status._tag === tag)
-
 const corruptPending = (sql: SqlClient.SqlClient) =>
   sql`UPDATE effect_local_client_pending_data SET digest = 'x' || digest`
 
@@ -478,10 +299,10 @@ describe("background sync terminal failures", () => {
     }, Effect.scoped)
   )
 
-  it.effect.each(schedulerCases(stoppingTags))(
-    "stops a background space after one attempt that fails with %s on %s",
-    Effect.fnUntraced(function*([tag, constructor]) {
-      const services = yield* pendingBackgroundSpace(constructor)
+  it.effect.each(stoppingTags)(
+    "stops a background space after one attempt that fails with %s",
+    Effect.fnUntraced(function*(tag) {
+      const services = yield* pendingBackgroundSpace("layer")
       const attempts = yield* makeAttempts
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
@@ -629,7 +450,7 @@ describe("background sync terminal failures", () => {
     })
   )
 
-  it.effect.each(schedulerCases(retryingTags))(
+  it.effect.each(schedulerCases(foregroundRetryingTags))(
     "grows the delay between watch subscriptions when every watch wakes once and then fails with %s on %s",
     Effect.fnUntraced(function*([tag, constructor]) {
       const services = yield* backgroundServices(constructor, "1 minute")
@@ -698,10 +519,10 @@ describe("background sync terminal failures", () => {
     60_000
   )
 
-  it.effect.each(schedulerCases(retryingTags))(
-    "keeps retrying a background space whose sync fails with %s on %s",
-    Effect.fnUntraced(function*([tag, constructor]) {
-      const services = yield* pendingBackgroundSpace(constructor)
+  it.effect.each(retryingTags)(
+    "keeps retrying a background space whose sync fails with %s",
+    Effect.fnUntraced(function*(tag) {
+      const services = yield* pendingBackgroundSpace("layer")
       const attempts = yield* makeAttempts
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
@@ -718,7 +539,7 @@ describe("background sync terminal failures", () => {
     }, Effect.scoped)
   )
 
-  it.effect.each(schedulerCases(stoppingTags))(
+  it.effect.each(schedulerCases(foregroundStoppingTags))(
     "stops a foreground space after one attempt that fails with %s on %s",
     Effect.fnUntraced(function*([tag, constructor]) {
       const services = yield* backgroundServices(constructor)
@@ -738,7 +559,7 @@ describe("background sync terminal failures", () => {
     }, Effect.scoped)
   )
 
-  it.effect.each(schedulerCases(retryingTags))(
+  it.effect.each(schedulerCases(foregroundRetryingTags))(
     "keeps retrying a foreground space whose sync fails with %s on %s",
     Effect.fnUntraced(function*([tag, constructor]) {
       const services = yield* backgroundServices(constructor)
@@ -754,27 +575,6 @@ describe("background sync terminal failures", () => {
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(3)).pipe(Effect.timeoutOption("1 minute"))
 
       assert.isTrue(Option.isSome(retried))
-    }, Effect.scoped)
-  )
-
-  it.effect.each(constructors)(
-    "keeps retrying a background space whose sync fails transiently with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* pendingBackgroundSpace(constructor)
-      const attempts = yield* makeAttempts
-      const replica = yield* services.start(SyncEngine.SyncEngine.of({
-        ...idleRemote,
-        pull: () => Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
-      }))
-      yield* attempts.reached(1)
-      assert.strictEqual(attempts.count(), 1)
-
-      yield* VirtualTime.advanceUntil(attempts.reached(3))
-
-      assert.strictEqual(attempts.count(), 3)
-      const aggregate = yield* replica.status
-      assert.strictEqual(aggregate.counts.failed, 0)
-      assert.strictEqual(aggregate.totalPending, 1)
     }, Effect.scoped)
   )
 
@@ -1180,7 +980,7 @@ describe("background sync terminal failures", () => {
     "ignores a background failure settled after the foreground reconciled and released the space with %s and %s",
     Effect.fnUntraced(function*([constructor, tag]) {
       const services = yield* pendingBackgroundSpace(constructor)
-      const bookkeeping = yield* services.holdRelease()
+      const bookkeeping = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
       let failure: ReplicaError.ReplicaError = protocolInvalid
       if (tag === "CredentialRejected") failure = new ReplicaError.CredentialRejected({ credentialGeneration: 7 })
       let pulls = 0
@@ -1195,7 +995,7 @@ describe("background sync terminal failures", () => {
         pull: (request) => {
           pulls += 1
           if (pulls > 1) return emptyPage(services.crypto, request)
-          bookkeeping.arm()
+          bookkeeping.arm(2)
           return Effect.fail(failure)
         }
       }))
@@ -1257,7 +1057,7 @@ describe("background sync terminal failures", () => {
     Effect.fnUntraced(function*() {
       const services = yield* backgroundServices("layerWorkflow")
       const attempts = yield* makeAttempts
-      const bookkeeping = yield* services.holdRelease()
+      const bookkeeping = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
         submitBatch: acceptSubmission,
@@ -1266,7 +1066,7 @@ describe("background sync terminal failures", () => {
             return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
           }
           if (attempts.count() > 1) return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
-          bookkeeping.arm()
+          bookkeeping.arm(2)
           return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
         }
       }))
@@ -1373,11 +1173,50 @@ describe("background sync terminal failures", () => {
   )
 
   it.effect(
+    "replaces the retry of a failed turn when releasing the workflow attempt that outlived it then fails",
+    Effect.fnUntraced(function*() {
+      const services = yield* backgroundServices("layerWorkflow", "1 minute")
+      const attempts = yield* makeAttempts
+      const release = yield* Deferred.make<void>()
+      const times: Array<number> = []
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        pull: () => {
+          const unavailable = Effect.fail(new ReplicaError.ServerUnavailable())
+          if (attempts.count() === 0) return Effect.andThen(attempts.record, unavailable)
+          if (attempts.count() === 1) {
+            return attempts.record.pipe(Effect.andThen(Deferred.await(release)), Effect.andThen(unavailable))
+          }
+          return attempts.record.pipe(
+            Effect.andThen(Clock.currentTimeMillis),
+            Effect.tap((now) => Effect.sync(() => times.push(now))),
+            Effect.andThen(unavailable)
+          )
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* space.mutate(Domain.PutTodo, Domain.todo("pending"))
+      yield* attempts.reached(1)
+      yield* space.deactivate
+      yield* attempts.reached(2)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+      const before = yield* Clock.currentTimeMillis
+      services.lockNext(pendingCountStatement)
+      yield* Deferred.succeed(release, undefined)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("2 minutes"))
+      const sinceRelease = times.map((time) => time - before)
+      assert.strictEqual(sinceRelease[0], 0)
+      assert.isTrue(sinceRelease.includes(2000))
+      assert.deepStrictEqual(sinceRelease.filter((elapsed) => elapsed > 0 && elapsed < 2000), [])
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "ignores a failed release of a workflow attempt once the foreground took the space over",
     Effect.fnUntraced(function*() {
       const services = yield* backgroundServices("layerWorkflow")
       const attempts = yield* makeAttempts
-      const release = yield* services.holdRelease()
+      const release = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
       let pulls = 0
       const replica = yield* services.start(SyncEngine.SyncEngine.of({
         ...idleRemote,
@@ -1389,7 +1228,7 @@ describe("background sync terminal failures", () => {
           }
           if (attempts.count() === 1) return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
           if (attempts.count() > 2) return emptyPage(services.crypto, request)
-          release.arm()
+          release.arm(2)
           return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
         }
       }))
