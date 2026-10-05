@@ -2167,3 +2167,113 @@ describe("the watch backoff", () => {
     })
   )
 })
+
+const managedSpace = Effect.fnUntraced(function*(readmission: {
+  readonly onFirstFailure: Effect.Effect<void>
+  readonly transportGeneration: Effect.Effect<number>
+  readonly request: Effect.Effect<void, ReplicaError.ReplicaError>
+}) {
+  const waits: Array<number> = []
+  const synced = yield* Queue.unbounded<void>()
+  let requested = 0
+  let completed = 0
+  let syncs = 0
+  const remote = SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    transportGeneration: readmission.transportGeneration,
+    waitForTransportChange: (generation) => {
+      waits.push(generation)
+      return Effect.never
+    }
+  })
+  const manager = yield* Reconciler.makeManager({ concurrency: 1 }).pipe(
+    Effect.provideService(SyncEngine.SyncEngine, remote)
+  )
+  yield* manager.register({
+    spaceId,
+    generation: 1,
+    definition: Domain.definition,
+    local: {
+      requestReconciliation: Effect.suspend(() => {
+        let admitted = readmission.request
+        if (requested === 0) admitted = Effect.void
+        return Effect.map(admitted, () => {
+          requested += 1
+          return requested
+        })
+      }),
+      reconciliationGenerations: Effect.sync(() => ({ requested, completed })),
+      completeReconciliation: (generation) =>
+        Effect.sync(() => {
+          completed = generation
+        }),
+      replicationState: Effect.never
+    },
+    reconciliation: {
+      sync: Effect.suspend(() => {
+        syncs += 1
+        if (syncs > 1) return Queue.offer(synced, undefined).pipe(Effect.asVoid)
+        return Effect.andThen(readmission.onFirstFailure, storageUnavailable)
+      }),
+      generation: Effect.succeed(0),
+      failed: () => Effect.void,
+      watchFailed: () => Effect.void,
+      succeeded: Effect.void,
+      status: Effect.succeed({ _tag: "Connecting", pending: 0 })
+    }
+  })
+  return { waits, synced }
+})
+
+describe("the transport generation a managed readmission reads", () => {
+  it.effect(
+    "is the generation the retry of a readmission that could not reach the server waits on",
+    Effect.fnUntraced(function*() {
+      let generation = 1
+      let unreachable = false
+      const { waits } = yield* managedSpace({
+        onFirstFailure: Effect.sync(() => {
+          generation = 7
+          unreachable = true
+        }),
+        transportGeneration: Effect.sync(() => generation),
+        request: Effect.suspend(() => {
+          if (unreachable) return serverUnavailable
+          return Effect.void
+        })
+      })
+
+      yield* settle("5 seconds")
+
+      assert.deepStrictEqual(Array.from(new Set(waits)), [7])
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "retries the space when the read died and the readmission could not reach the server either",
+    Effect.fnUntraced(function*() {
+      let dies = false
+      let unreachable = false
+      const { synced } = yield* managedSpace({
+        onFirstFailure: Effect.sync(() => {
+          dies = true
+          unreachable = true
+        }),
+        transportGeneration: Effect.suspend(() => {
+          if (!dies) return Effect.succeed(1)
+          dies = false
+          return Effect.die("generation died")
+        }),
+        request: Effect.suspend(() => {
+          if (!unreachable) return Effect.void
+          unreachable = false
+          return serverUnavailable
+        })
+      })
+
+      const retried = yield* VirtualTime.advanceUntil(Queue.take(synced)).pipe(Effect.timeoutOption("5 minutes"))
+
+      assert.isTrue(Option.isSome(retried), "the space synced again after both failures")
+    }, VirtualTime.scoped)
+  )
+})
