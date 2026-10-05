@@ -913,9 +913,10 @@ const makeLayer = <D extends Definition.Any, R,>(
                   })
                 )
             }),
-            Effect.tapError(() => {
-              if (enqueuePending) return enqueueBackground(entry)
-              return Effect.void
+            Effect.tapCause(() => {
+              const published = modifyContribution(entry, (current) => inactiveStatus(entry, current.pending))
+              if (!enqueuePending) return published
+              return Effect.andThen(published, enqueueBackground(entry))
             })
           )
           yield* updateContribution(entry, inactiveStatus(entry, count.count))

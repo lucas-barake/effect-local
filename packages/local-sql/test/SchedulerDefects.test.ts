@@ -1346,3 +1346,70 @@ describe("a watch that recovered", () => {
     }, VirtualTime.scoped)
   )
 })
+
+describe("a runtime close whose pending count failed", () => {
+  it.effect.each(constructors)(
+    "reports the replica idle after the release that followed a successful background turn died with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* withPending(constructor, [spaceId])
+      services.dieNext(membershipPendingCountStatement)
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => emptyPage(services.crypto, request)
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* settle("5 minutes")
+
+      const status = yield* space.status
+      const aggregate = yield* replica.status
+
+      assert.strictEqual(status._tag, "Idle")
+      assert.strictEqual(status.pending, 0)
+      assert.strictEqual(yield* space.activation, "Inactive")
+      assert.deepStrictEqual(
+        { state: aggregate.state, idle: aggregate.counts.idle, online: aggregate.counts.online },
+        { state: "Idle", idle: 2, online: 0 }
+      )
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(["die", "typed failure"] as const)(
+    "drains the pending mutation of a foreground space after its leave ended with a %s while closing the runtime",
+    Effect.fnUntraced(function*(kind) {
+      const services = yield* twoSpaces("layer")
+      const logs = captureLogs()
+      let offline = false
+      const { replica, space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: (request) => {
+            if (offline) return serverUnavailable
+            return acceptSubmission(request)
+          },
+          pull: (request) => emptyPage(services.crypto, request)
+        }),
+        logs.layerLogs
+      )
+      offline = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      const parked = yield* eventually(services, space, (status) => status._tag === "Offline" && status.pending === 1)
+      assert.isTrue(Option.isSome(parked), "the mutation stayed pending while the server was unreachable")
+      if (kind === "die") services.dieNext(membershipPendingCountStatement)
+      else services.lockNext(membershipPendingCountStatement)
+
+      const left = yield* replica.leave(spaceId).pipe(Effect.exit)
+      assert.isTrue(Exit.isFailure(left), "the leave did not complete")
+      offline = false
+      yield* settle("5 minutes")
+
+      const status = yield* space.status
+      const aggregate = yield* replica.status
+
+      assert.strictEqual(status._tag, "Idle")
+      assert.strictEqual(status.pending, 0)
+      assert.strictEqual(aggregate.totalPending, 0)
+    }, VirtualTime.scoped)
+  )
+})
