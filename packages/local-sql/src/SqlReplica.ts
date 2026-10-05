@@ -128,6 +128,12 @@ type BaseRequirements<D extends Definition.Any,> =
 
 const operationPermits = Number.MAX_SAFE_INTEGER
 
+const CallerFiber = Context.Reference<boolean>("@lucas-barake/effect-local-sql/SqlReplica/CallerFiber", {
+  defaultValue: () => false
+})
+
+const onCallerFiber = Effect.provideService(CallerFiber, true)
+
 interface ActiveRuntime {
   readonly foreground: boolean
   readonly scope: Scope.Closeable
@@ -357,7 +363,11 @@ const makeLayer = <D extends Definition.Any, R,>(
       const defaultScopeDigest = yield* Protocol.replicationScopeDigest(normalizedDefaultScope)
 
       const flush = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys)
-      const notify = (keys: ReadonlyArray<string>) => Invalidation.notify(reactivity, keys)
+      const notify = (keys: ReadonlyArray<string>) =>
+        Effect.withFiber((fiber) => {
+          if (fiber.getRef(CallerFiber)) return Invalidation.notify(reactivity, keys)
+          return flush(keys)
+        })
       const collectOutcomes = () => {
         let first: Exit.Exit<void> = Exit.void
         return {
@@ -1159,7 +1169,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         withLease(entry, true, (runtime) => {
           const operation = checkRuntime(entry, runtime).pipe(Effect.andThen(use(runtime)))
           return runtime.operationGate.withPermit(operation)
-        })
+        }).pipe(onCallerFiber)
 
       const withResidentRuntime = <A, E extends { readonly _tag: string },>(
         entry: RememberedEntry,
@@ -1260,7 +1270,8 @@ const makeLayer = <D extends Definition.Any, R,>(
               Effect.flatMap(() => deactivate(entry, true)),
               Effect.andThen(activate(entry, true)),
               Effect.flatMap((runtime) => runtime.reconciler.notify),
-              Effect.andThen(notify([ReactivityKey.scope(entry.spaceId)]))
+              Effect.andThen(notify([ReactivityKey.scope(entry.spaceId)])),
+              onCallerFiber
             ),
           activation: Effect.suspend(() => {
             if (entries.get(entry.spaceId) !== entry || entry.leaving) {
@@ -1268,8 +1279,8 @@ const makeLayer = <D extends Definition.Any, R,>(
             }
             return Effect.succeed(entry.activation)
           }),
-          activate: activate(entry, true).pipe(Effect.asVoid),
-          deactivate: deactivate(entry, true).pipe(Effect.asVoid),
+          activate: activate(entry, true).pipe(Effect.asVoid, onCallerFiber),
+          deactivate: deactivate(entry, true).pipe(Effect.asVoid, onCallerFiber),
           mutate: (mutation, payload, mutateOptions) =>
             withActive(entry, (runtime) => runtime.local.mutate(mutation, payload, mutateOptions)),
           get: (model, key) => withActive(entry, (runtime) => runtime.local.get(model, key)),
@@ -1756,7 +1767,13 @@ const makeLayer = <D extends Definition.Any, R,>(
         if (entry !== undefined && row.count > 0) yield* enqueueBackground(entry)
       }
 
-      return Replica.Replica.of({ join, leave, spaces, space, status })
+      return Replica.Replica.of({
+        join: (spaceId) => onCallerFiber(join(spaceId)),
+        leave,
+        spaces,
+        space,
+        status
+      })
     })
   ).pipe(Layer.provideMerge(layerQueryReactivity))
 }

@@ -5,6 +5,7 @@ import type * as Replica from "@lucas-barake/effect-local/Replica"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as SyncEngine from "../src/SyncEngine.js"
@@ -159,6 +160,47 @@ describe("notifications raised inside a batch of the caller", () => {
 
       assert.isAbove(pending(), 0, "the pending mutations were announced")
       assert.isAbove(aggregate(), 0, "the aggregate status was announced")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "are delivered for a leave that its caller abandoned with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(idleRemote)
+      const listed = count(services, ReactivityKey.spaces)
+      const removal = yield* services.holdStatement("DELETE FROM effect_local_client_spaces", true)
+      const leaving = yield* replica.leave(spaceId).pipe(
+        services.reactivity.withBatch,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* VirtualTime.advanceUntil(removal.entered)
+      yield* Fiber.interrupt(leaving)
+      yield* removal.release
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 second"))
+      const remaining = yield* replica.spaces
+
+      assert.strictEqual(remaining.length, 1, "the space was left")
+      assert.strictEqual(listed(), 1, "the space list was announced")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "include the replication view status of the runtime, which is delivered before the batch ends with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(healthyRemote(services))
+      yield* installView(services)
+      const space = yield* replica.space(spaceId)
+      const status = count(services, ReactivityKey.status(spaceId))
+
+      const insideBatch = yield* space.activate.pipe(
+        Effect.map(() => status()),
+        services.reactivity.withBatch,
+        VirtualTime.advanceUntil
+      )
+
+      assert.strictEqual(insideBatch, 1)
     }, VirtualTime.scoped)
   )
 })
