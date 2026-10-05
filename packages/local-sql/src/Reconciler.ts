@@ -368,6 +368,12 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       retries,
       key,
       backoff(remote, delay, failure, transportGeneration).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logError("Retry backoff died", cause).pipe(
+            Effect.annotateLogs({ "space.id": space.spaceId }),
+            Effect.andThen(Effect.sleep(delay))
+          )
+        ),
         Effect.andThen(finishRetry),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
@@ -971,7 +977,15 @@ export const layerInMemoryScheduler = (
         Effect.suspend(() => {
           retryAttempt += 1
           const delay = Configuration.retryMillis(retryTiming, retryAttempt)
-          return backoff(remote, delay, error, transportGeneration).pipe(Effect.andThen(notify))
+          return backoff(remote, delay, error, transportGeneration).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logError("Retry backoff died", cause).pipe(
+                Effect.annotateLogs({ "space.id": options.spaceId }),
+                Effect.andThen(Effect.sleep(delay))
+              )
+            ),
+            Effect.andThen(notify)
+          )
         })
       const turn = Effect.fnUntraced(function*(transportGeneration: number) {
         let observedGeneration = yield* reconciliation.generation

@@ -338,6 +338,7 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
   readonly pull: Effect.Effect<void, ReplicaError.ReplicaError>
   readonly watch: Effect.Effect<void>
   readonly waitForCredentialChange?: Effect.Effect<void>
+  readonly waitForTransportChange?: Effect.Effect<void>
 }) {
   const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
   const database = yield* Layer.build(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
@@ -365,6 +366,7 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
   const remote = SyncEngine.SyncEngine.of({
     ...idleRemote,
     waitForCredentialChange: () => faults.waitForCredentialChange ?? Effect.never,
+    waitForTransportChange: () => faults.waitForTransportChange ?? Effect.never,
     submitBatch: (request) => server.admitBatch(request, null),
     pull: (request) => Effect.andThen(faults.pull, server.pull(request)),
     bootstrap: server.bootstrap,
@@ -928,6 +930,62 @@ describe("credential waits that die", () => {
       assert.isAtMost(waits.length, 6)
       assert.deepStrictEqual(Array.from(new Set(waits)), ["credential wait died"])
       assert.isTrue(Option.isSome(drained), "the space drained once its credential was accepted")
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("retry backoffs that die", () => {
+  it.effect(
+    "retries a foreground sync after its retry backoff died in the transport wait",
+    Effect.fnUntraced(function*() {
+      const services = yield* twoSpaces("layer")
+      const logs = captureLogs()
+      let offline = false
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          waitForTransportChange: () => Effect.die("transport wait died"),
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (!offline || request.spaceId !== spaceId) return emptyPage(services.crypto, request)
+            offline = false
+            return serverUnavailable
+          }
+        }),
+        logs.layerLogs
+      )
+      offline = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+
+      const drained = yield* eventually(services, space, isOnlineDrained)
+
+      assert.deepStrictEqual(logs.defects(), ["transport wait died"])
+      assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Online, pending 0")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "retries an in-memory sync after its retry backoff died in the transport wait",
+    Effect.fnUntraced(function*() {
+      let offline = false
+      const { awaitStatus, local, logs, reconciler } = yield* inMemoryScheduler({
+        pull: Effect.suspend(() => {
+          if (!offline) return Effect.void
+          offline = false
+          return serverUnavailable
+        }),
+        watch: Effect.never,
+        waitForTransportChange: Effect.die("transport wait died")
+      })
+      offline = true
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* reconciler.schedule
+
+      const drained = yield* awaitStatus((status) => status._tag === "Online" && status.pending === 0)
+
+      assert.deepStrictEqual(logs.defects(), ["transport wait died"])
+      assert.isTrue(Option.isSome(drained))
     }, VirtualTime.scoped)
   )
 })
