@@ -12,6 +12,7 @@ import * as Deferred from "effect/Deferred"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
+import * as Fiber from "effect/Fiber"
 import * as Layer from "effect/Layer"
 import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
@@ -767,6 +768,37 @@ describe("background retries held when the retry scheduler dies", () => {
       assert.isAtLeast(pulls, 6)
       assert.isAtMost(pulls, 20)
       assert.isAtMost(logs.defects().length, pulls)
+    }, VirtualTime.scoped)
+  )
+})
+
+const defectWithInterrupt = Cause.combine(Cause.die("undecodable response"), Cause.interrupt())
+
+describe("background turns that end with a defect and an interrupt in one cause", () => {
+  it.effect.each(constructors)(
+    "keeps draining background spaces after two turns ended with a defect and an interrupt with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* withPending(constructor, [spaceId, otherSpaceId])
+      let mixed = true
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (mixed) return Effect.failCause(defectWithInterrupt)
+          return emptyPage(services.crypto, request)
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* settle("5 seconds")
+      mixed = false
+      const cycle = yield* Effect.forkChild(Effect.andThen(space.activate, space.deactivate), {
+        startImmediately: true
+      })
+
+      const drained = yield* eventually(services, space, (status) => status._tag === "Idle" && status.pending === 0)
+      yield* Fiber.interrupt(cycle)
+
+      assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Idle, pending 0")
     }, VirtualTime.scoped)
   )
 })

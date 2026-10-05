@@ -1698,10 +1698,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         const claimed = entry
         const generation = claimed.backgroundGeneration
         yield* runBackgroundWork(work, claimed, generation).pipe(
-          Effect.catchCause((cause) => {
-            if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-            return settleDiedTurn(claimed, generation, cause)
-          })
+          Effect.catchCause((cause) => settleDiedTurn(claimed, generation, cause))
         )
       })
 

@@ -643,7 +643,6 @@ const layerSchedulerWithConfiguration = (
         while (!stopped) {
           stopped = yield* superviseTurn.pipe(
             Effect.catchCause((cause) => {
-              if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
               return Effect.logError("Reconciliation failure handling died", cause).pipe(
                 Effect.annotateLogs({ "space.id": options.spaceId }),
                 Effect.andThen(reconciliation.generation),
@@ -719,7 +718,6 @@ const layerSchedulerWithConfiguration = (
       })
       const watchFiber = yield* watch.pipe(
         Effect.catchCause((cause) => {
-          if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
           const died = Errors.unexpectedFailure("Sync watch died", cause)
           return Effect.logError("Sync watch died", cause).pipe(
             Effect.annotateLogs({ "space.id": options.spaceId }),
