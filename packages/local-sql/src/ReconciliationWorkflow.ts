@@ -306,17 +306,7 @@ const handler = (
           const generation = observedGeneration ?? (yield* runtime.reconciliation.generation)
           yield* runtime.reconciliation.failed(result.failure, generation)
         }))
-        if (
-          result.failure._tag === "CredentialRejected" ||
-          result.failure._tag === "ProtocolInvalid" ||
-          result.failure._tag === "StaleSchema" ||
-          result.failure._tag === "SpaceUnavailable" ||
-          result.failure._tag === "StorageCorrupt" ||
-          result.failure._tag === "StaleReplicationScope" ||
-          result.failure._tag === "UpgradeRequired" ||
-          result.failure._tag === "AuthorizationDenied" ||
-          attempt >= configuration.maximumAttempts
-        ) {
+        if (!Reconciler.isTransientFailure(result.failure) || attempt >= configuration.maximumAttempts) {
           yield* result.failure
           return
         }
@@ -569,11 +559,15 @@ const layerSchedulerWithConfiguration = (
 
       const supervise = Effect.gen(function*() {
         let retryAttempt = 0
+        let readmit = false
         while (true) {
-          yield* LosslessQueue.take(wake)
+          if (!readmit) yield* LosslessQueue.take(wake)
           yield* awaitAuthenticationChange
           let observedGeneration = yield* reconciliation.generation
+          const requestFirst = readmit
+          readmit = false
           const result = yield* Effect.gen(function*() {
+            if (requestFirst) yield* local.requestReconciliation
             while (true) {
               yield* awaitAuthenticationChange
               observedGeneration = yield* reconciliation.generation
@@ -610,25 +604,21 @@ const layerSchedulerWithConfiguration = (
             yield* startCredentialWait(error.credentialGeneration, admission)
             yield* Deferred.await(admission.gate)
             retryAttempt = 0
-            yield* requestAndNotify
+            readmit = true
             continue
           }
           const pause = yield* Ref.get(authenticationPause)
           if (Option.isSome(pause)) {
             yield* Deferred.await(pause.value)
-            yield* requestAndNotify
+            readmit = true
             continue
           }
           yield* reconciliation.failed(error, observedGeneration)
-          if (
-            error._tag === "AuthenticatorUnavailable" ||
-            error._tag === "ServerUnavailable" ||
-            error._tag === "OperationTimeout"
-          ) {
+          if (Reconciler.isTransientFailure(error)) {
             retryAttempt += 1
             yield* Effect.logWarning("Reconciliation supervisor will retry", error)
             yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
-            yield* requestAndNotify
+            readmit = true
             continue
           }
           yield* Effect.logWarning("Reconciliation supervisor stopped", error)
@@ -640,9 +630,10 @@ const layerSchedulerWithConfiguration = (
         Effect.provideService(supervise, ConnectionLane.Priority, "Background")
       )
       const watch = Effect.gen(function*() {
-        let retryAttempt = 0
+        const watchBackoff = Configuration.makeWatchBackoff(configuration)
         while (true) {
           yield* awaitAuthenticationChange
+          yield* watchBackoff.opened
           const watchEpoch = authenticationEpoch
           const result = yield* Stream.unwrap(Effect.map(local.replicationState, (state) =>
             remote.watch({
@@ -653,16 +644,12 @@ const layerSchedulerWithConfiguration = (
               scopeGeneration: state.scopeGeneration,
               cursor: state.cursor
             }))).pipe(
-              Stream.runForEach(() => {
-                retryAttempt = 0
-                return requestAndNotify
-              }),
+              Stream.runForEach(() => requestAndNotify),
+              Effect.andThen(requestAndNotify),
               Effect.result
             )
           if (Result.isSuccess(result)) {
-            retryAttempt += 1
-            yield* requestAndNotify
-            yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
+            yield* Effect.sleep(yield* watchBackoff.closed)
             continue
           }
           const error = result.failure
@@ -682,18 +669,13 @@ const layerSchedulerWithConfiguration = (
             yield* reconciliation.watchFailed(error)
             yield* startCredentialWait(error.credentialGeneration, admission)
             yield* Deferred.await(admission.gate)
-            retryAttempt = 0
+            yield* watchBackoff.reset
             continue
           }
           yield* reconciliation.watchFailed(error)
-          if (
-            error._tag === "AuthenticatorUnavailable" ||
-            error._tag === "ServerUnavailable" ||
-            error._tag === "OperationTimeout"
-          ) {
-            retryAttempt += 1
+          if (Reconciler.isTransientFailure(error)) {
             yield* Effect.logWarning("Sync watch will retry", error)
-            yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
+            yield* Effect.sleep(yield* watchBackoff.closed)
             yield* notify
             continue
           }

@@ -12,13 +12,16 @@ interface Delivery<A,> {
 }
 
 export interface SequencedPubSub<A,> {
-  readonly resource: string
+  readonly resource: ReplicaError.CapacityResource
   readonly capacity: number
   readonly pubsub: PubSub.PubSub<Delivery<A>>
   published: number
 }
 
-export const sliding = <A,>(resource: string, capacity: number): Effect.Effect<SequencedPubSub<A>> =>
+export const sliding = <A,>(
+  resource: ReplicaError.CapacityResource,
+  capacity: number
+): Effect.Effect<SequencedPubSub<A>> =>
   Effect.map(PubSub.sliding<Delivery<A>>(capacity), (pubsub) => ({ resource, capacity, pubsub, published: 0 }))
 
 export const publish = <A,>(self: SequencedPubSub<A>, value: A): Effect.Effect<void> =>

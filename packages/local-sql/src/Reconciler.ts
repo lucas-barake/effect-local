@@ -56,6 +56,7 @@ export interface Options {
   readonly retryDelay?: Duration.Input
   readonly maximumRetryDelay?: Duration.Input
   readonly onStatusChange?: (status: ReplicaStatus.ReplicaStatus) => Effect.Effect<void>
+  readonly onReconciled?: Effect.Effect<void>
 }
 
 export interface ManagedSpace {
@@ -133,10 +134,109 @@ const makeReconciliationRequests = (request: Effect.Effect<number, ReplicaError.
   return { run, observe }
 }
 
-const isTransientFailure = (error: ReplicaError.ReplicaError) =>
-  error._tag === "AuthenticatorUnavailable" ||
-  error._tag === "ServerUnavailable" ||
-  error._tag === "OperationTimeout"
+type FailureClass = "Unreachable" | "Retryable" | "NeedsCredential" | "Terminal"
+
+const capacityClasses: { readonly [Resource in ReplicaError.CapacityResource]: "Retryable" | "Terminal" } = {
+  "read authorizations": "Retryable",
+  "sync watchers": "Retryable",
+  "sync watchers per principal": "Retryable",
+  "server receipts": "Retryable",
+  "server history": "Retryable",
+  "bootstrap authorizations": "Retryable",
+  "bootstrap pages": "Retryable",
+  "ephemeral join verifications": "Retryable",
+  "ephemeral watchers": "Retryable",
+  "ephemeral watchers per principal": "Retryable",
+  "ephemeral spaces": "Retryable",
+  "ephemeral members": "Retryable",
+  "ephemeral bytes per space": "Retryable",
+  "ephemeral event keys per space": "Retryable",
+  "ephemeral state keys per space": "Retryable",
+  "ephemeral events": "Retryable",
+  "pending mutations": "Retryable",
+  "client receipts": "Terminal",
+  "bootstrap entries": "Terminal",
+  "bootstrap bytes": "Terminal",
+  "bootstrap page bytes": "Terminal",
+  "bootstrap entity bytes": "Terminal",
+  "snapshot entities": "Terminal",
+  "snapshot bytes": "Terminal",
+  "scoped snapshot bytes": "Terminal",
+  "replication page bytes": "Terminal",
+  "mutation bytes": "Terminal",
+  "receipt bytes": "Terminal",
+  "mutation submission attempts": "Terminal",
+  "schema evolution row bytes": "Terminal",
+  "schema generations": "Terminal",
+  "replication scope generations": "Terminal",
+  "projection generation": "Terminal",
+  "reconciliation generations": "Terminal",
+  "local sequence": "Terminal",
+  "terminal sequence": "Terminal",
+  "server sequence": "Terminal",
+  "ephemeral payload bytes": "Terminal",
+  "ephemeral snapshot bytes": "Terminal",
+  "ephemeral bytes per member": "Terminal",
+  "ephemeral event keys per member": "Terminal",
+  "ephemeral state keys per member": "Terminal"
+}
+
+const failureClasses: {
+  readonly [Tag in Exclude<ReplicaError.ReplicaError["_tag"], "CapacityExceeded">]: FailureClass
+} = {
+  ServerUnavailable: "Unreachable",
+  OperationTimeout: "Unreachable",
+  AuthenticatorUnavailable: "Unreachable",
+  StorageUnavailable: "Retryable",
+  UnknownCommitOutcome: "Retryable",
+  OwnerUnavailable: "Retryable",
+  CredentialRejected: "NeedsCredential",
+  StorageCorrupt: "Terminal",
+  CanonicalEncodeError: "Terminal",
+  DefinitionMismatch: "Terminal",
+  StaleSchema: "Terminal",
+  SchemaGenerationConflict: "Terminal",
+  SchemaEvolutionUnsupported: "Terminal",
+  SchemaEvolutionFailed: "Terminal",
+  StorageMigrationMismatch: "Terminal",
+  StorageMigrationPending: "Terminal",
+  SchemaKeyCollision: "Terminal",
+  PendingMutationEvolutionRejected: "Terminal",
+  ReplicaIdentityMismatch: "Terminal",
+  SpaceNotJoined: "Terminal",
+  SpaceUnavailable: "Terminal",
+  EphemeralSessionUnavailable: "Terminal",
+  MutationIdentityConflict: "Terminal",
+  QuarantineResubmissionConflict: "Terminal",
+  OutOfOrderMutation: "Terminal",
+  CursorGap: "Terminal",
+  SettlementReplayTruncated: "Terminal",
+  StaleReplicationScope: "Terminal",
+  SnapshotUnavailable: "Terminal",
+  InvalidConfiguration: "Terminal",
+  ProtocolInvalid: "Terminal",
+  UpgradeRequired: "Terminal",
+  ProtocolVersionRejected: "Terminal",
+  AuthorizationDenied: "Terminal",
+  BuildSuperseded: "Terminal"
+}
+
+const failureClass = (error: ReplicaError.ReplicaError): FailureClass => {
+  if (error._tag === "CapacityExceeded") return capacityClasses[error.resource]
+  return failureClasses[error._tag]
+}
+
+export const isTransientFailure = (error: ReplicaError.ReplicaError) => {
+  const classified = failureClass(error)
+  return classified === "Unreachable" || classified === "Retryable"
+}
+
+export const failureStatus = (error: ReplicaError.ReplicaError, pending: number): ReplicaStatus.ReplicaStatus => {
+  const classified = failureClass(error)
+  if (classified === "NeedsCredential") return { _tag: "NeedsAuthentication", pending }
+  if (classified === "Unreachable") return { _tag: "Offline", pending }
+  return { _tag: "Failed", pending, message: error._tag }
+}
 
 export const makeManager = Effect.fnUntraced(function*(options: {
   readonly concurrency?: number
@@ -227,51 +327,13 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       current.authenticationGate = undefined
       current.retryAttempt = 0
       yield* Deferred.succeed(gate, undefined)
-      yield* enqueue(current)
+      yield* readmit(current)
     }).pipe(Effect.uninterruptible)
     yield* FiberMap.run(
       authenticationWaiters,
       key,
       remote.waitForCredentialChange(admission.generation).pipe(
         Effect.andThen(finishWait),
-        Effect.catchTags({
-          StorageUnavailable: (error) => Effect.die(error),
-          StorageCorrupt: (error) => Effect.die(error),
-          CanonicalEncodeError: (error) => Effect.die(error),
-          SpaceNotJoined: (error) => Effect.die(error),
-          DefinitionMismatch: (error) => Effect.die(error),
-          StaleSchema: (error) => Effect.die(error),
-          SchemaGenerationConflict: (error) => Effect.die(error),
-          SchemaEvolutionUnsupported: (error) => Effect.die(error),
-          SchemaEvolutionFailed: (error) => Effect.die(error),
-          StorageMigrationMismatch: (error) => Effect.die(error),
-          StorageMigrationPending: (error) => Effect.die(error),
-          SchemaKeyCollision: (error) => Effect.die(error),
-          PendingMutationEvolutionRejected: (error) => Effect.die(error),
-          ReplicaIdentityMismatch: (error) => Effect.die(error),
-          SpaceUnavailable: (error) => Effect.die(error),
-          EphemeralSessionUnavailable: (error) => Effect.die(error),
-          MutationIdentityConflict: (error) => Effect.die(error),
-          QuarantineResubmissionConflict: (error) => Effect.die(error),
-          OutOfOrderMutation: (error) => Effect.die(error),
-          CursorGap: (error) => Effect.die(error),
-          SettlementReplayTruncated: (error) => Effect.die(error),
-          StaleReplicationScope: (error) => Effect.die(error),
-          SnapshotUnavailable: (error) => Effect.die(error),
-          CapacityExceeded: (error) => Effect.die(error),
-          InvalidConfiguration: (error) => Effect.die(error),
-          UnknownCommitOutcome: (error) => Effect.die(error),
-          ProtocolInvalid: (error) => Effect.die(error),
-          UpgradeRequired: (error) => Effect.die(error),
-          ProtocolVersionRejected: (error) => Effect.die(error),
-          ServerUnavailable: (error) => Effect.die(error),
-          CredentialRejected: (error) => Effect.die(error),
-          AuthenticatorUnavailable: (error) => Effect.die(error),
-          OperationTimeout: (error) => Effect.die(error),
-          AuthorizationDenied: (error) => Effect.die(error),
-          OwnerUnavailable: (error) => Effect.die(error),
-          BuildSuperseded: (error) => Effect.die(error)
-        }),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
           return Effect.failCause(cause)
@@ -293,51 +355,13 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       const current = spaces.get(space.spaceId)
       if (current !== space) return
       current.retrying = false
-      yield* enqueue(current)
+      yield* readmit(current)
     }).pipe(Effect.uninterruptible)
     yield* FiberMap.run(
       retries,
       key,
       backoff(remote, delay, failure, transportGeneration).pipe(
         Effect.andThen(finishRetry),
-        Effect.catchTags({
-          StorageUnavailable: (error) => Effect.die(error),
-          StorageCorrupt: (error) => Effect.die(error),
-          CanonicalEncodeError: (error) => Effect.die(error),
-          SpaceNotJoined: (error) => Effect.die(error),
-          DefinitionMismatch: (error) => Effect.die(error),
-          StaleSchema: (error) => Effect.die(error),
-          SchemaGenerationConflict: (error) => Effect.die(error),
-          SchemaEvolutionUnsupported: (error) => Effect.die(error),
-          SchemaEvolutionFailed: (error) => Effect.die(error),
-          StorageMigrationMismatch: (error) => Effect.die(error),
-          StorageMigrationPending: (error) => Effect.die(error),
-          SchemaKeyCollision: (error) => Effect.die(error),
-          PendingMutationEvolutionRejected: (error) => Effect.die(error),
-          ReplicaIdentityMismatch: (error) => Effect.die(error),
-          SpaceUnavailable: (error) => Effect.die(error),
-          EphemeralSessionUnavailable: (error) => Effect.die(error),
-          MutationIdentityConflict: (error) => Effect.die(error),
-          QuarantineResubmissionConflict: (error) => Effect.die(error),
-          OutOfOrderMutation: (error) => Effect.die(error),
-          CursorGap: (error) => Effect.die(error),
-          SettlementReplayTruncated: (error) => Effect.die(error),
-          StaleReplicationScope: (error) => Effect.die(error),
-          SnapshotUnavailable: (error) => Effect.die(error),
-          CapacityExceeded: (error) => Effect.die(error),
-          InvalidConfiguration: (error) => Effect.die(error),
-          UnknownCommitOutcome: (error) => Effect.die(error),
-          ProtocolInvalid: (error) => Effect.die(error),
-          UpgradeRequired: (error) => Effect.die(error),
-          ProtocolVersionRejected: (error) => Effect.die(error),
-          ServerUnavailable: (error) => Effect.die(error),
-          CredentialRejected: (error) => Effect.die(error),
-          AuthenticatorUnavailable: (error) => Effect.die(error),
-          OperationTimeout: (error) => Effect.die(error),
-          AuthorizationDenied: (error) => Effect.die(error),
-          OwnerUnavailable: (error) => Effect.die(error),
-          BuildSuperseded: (error) => Effect.die(error)
-        }),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
           return Effect.failCause(cause)
@@ -368,6 +392,17 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     }
     yield* space.reconciliation.failed(error, observedGeneration).pipe(Effect.andThen(policy))
   })
+
+  const readmit = (space: ManagedState): Effect.Effect<void> =>
+    enqueue(space).pipe(
+      Effect.catch(Effect.fnUntraced(function*(error) {
+        const transportGeneration = yield* remote.transportGeneration
+        const observedGeneration = yield* space.reconciliation.generation
+        yield* handleFailure(space, error, transportGeneration, observedGeneration).pipe(
+          Effect.catch(() => Effect.void)
+        )
+      }))
+    )
 
   const runTurn = Effect.fnUntraced(function*(space: ManagedState, epoch: number) {
     const transportGeneration = yield* remote.transportGeneration
@@ -447,7 +482,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
         dirtyEpoch: 0
       }
       spaces.set(space.spaceId, state)
-      let watchAttempt = 0
+      const watchBackoff = Configuration.makeWatchBackoff(retryTiming)
       const watch = (): Effect.Effect<void> =>
         Effect.suspend(() => {
           const authenticationGate = state.authenticationGate
@@ -455,7 +490,8 @@ export const makeManager = Effect.fnUntraced(function*(options: {
             return Deferred.await(authenticationGate).pipe(Effect.andThen(watch()))
           }
           const watchEpoch = state.authenticationEpoch
-          return remote.transportGeneration.pipe(Effect.flatMap((transportGeneration) =>
+          const subscribed = Effect.andThen(watchBackoff.opened, remote.transportGeneration)
+          return subscribed.pipe(Effect.flatMap((transportGeneration) =>
             Stream.unwrap(Effect.map(space.local.replicationState, (replication) =>
               remote.watch({
                 spaceId: space.spaceId,
@@ -465,16 +501,9 @@ export const makeManager = Effect.fnUntraced(function*(options: {
                 scopeGeneration: replication.scopeGeneration,
                 cursor: replication.cursor
               }))).pipe(
-                Stream.runForEach(() => {
-                  watchAttempt = 0
-                  return enqueue(state)
-                }),
+                Stream.runForEach(() => enqueue(state)),
                 Effect.matchEffect({
-                  onSuccess: () => {
-                    watchAttempt += 1
-                    const delay = Configuration.retryMillis(retryTiming, watchAttempt)
-                    return Effect.sleep(delay).pipe(Effect.andThen(watch()))
-                  },
+                  onSuccess: () => watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep), Effect.andThen(watch())),
                   onFailure: Effect.fnUntraced(function*(error) {
                     if (watchEpoch !== state.authenticationEpoch) return yield* watch()
                     const activeAuthenticationGate = state.authenticationGate
@@ -490,11 +519,10 @@ export const makeManager = Effect.fnUntraced(function*(options: {
                       yield* Deferred.await(admission.gate)
                       return yield* watch()
                     } else if (isTransientFailure(error)) {
-                      policy = Effect.suspend(() => {
-                        watchAttempt += 1
-                        const delay = Configuration.retryMillis(retryTiming, watchAttempt)
-                        return backoff(remote, delay, error, transportGeneration).pipe(Effect.andThen(watch()))
-                      })
+                      policy = watchBackoff.closed.pipe(
+                        Effect.flatMap((delay) => backoff(remote, delay, error, transportGeneration)),
+                        Effect.andThen(watch())
+                      )
                     } else {
                       policy = Effect.void
                     }
@@ -535,7 +563,7 @@ export const layerManager: Layer.Layer<Manager, ReplicaError.InvalidConfiguratio
   .effect(Manager, makeManager())
 
 export const layerOnePass = (
-  options: Pick<Options, "definition" | "spaceId" | "pageSize" | "onStatusChange">
+  options: Pick<Options, "definition" | "spaceId" | "pageSize" | "onStatusChange" | "onReconciled">
 ): Layer.Layer<Reconciliation, ReplicaError.InvalidConfiguration, LocalStore.Store | SyncEngine.SyncEngine> =>
   Layer.effect(
     Reconciliation,
@@ -573,23 +601,12 @@ export const layerOnePass = (
               status,
               (current): readonly [ReplicaStatus.ReplicaStatus | undefined, ReplicaStatus.ReplicaStatus] => {
                 if (syncGeneration > observedGeneration) return [undefined, current]
-                if (error._tag === "CredentialRejected") {
-                  const next = { _tag: "NeedsAuthentication", pending } as const
-                  return [next, next]
-                }
+                const next = failureStatus(error, pending)
+                if (next._tag === "NeedsAuthentication") return [next, next]
                 if (current._tag === "NeedsAuthentication" && failedSinceSyncStarted) return [undefined, current]
-                if (preserveConnecting && (current._tag === "Connecting" || syncing) && isTransientFailure(error)) {
+                if (preserveConnecting && (current._tag === "Connecting" || syncing) && next._tag === "Offline") {
                   return [undefined, current]
                 }
-                if (
-                  error._tag === "AuthenticatorUnavailable" ||
-                  error._tag === "ServerUnavailable" ||
-                  error._tag === "OperationTimeout"
-                ) {
-                  const next = { _tag: "Offline", pending } as const
-                  return [next, next]
-                }
-                const next = { _tag: "Failed", pending, message: error._tag } as const
                 return [next, next]
               }
             ).pipe(
@@ -829,6 +846,7 @@ export const layerOnePass = (
           yield* catchUp
           syncing = false
           yield* succeeded
+          yield* options.onReconciled ?? Effect.void
         }).pipe(
           Effect.ensuring(Effect.sync(() => {
             syncing = false
@@ -967,11 +985,12 @@ export const layerInMemoryScheduler = (
         Effect.forever()
       )
       const workerFiber = yield* Effect.forkScoped(Effect.provideService(worker, ConnectionLane.Priority, "Background"))
-      let watchAttempt = 0
+      const watchBackoff = Configuration.makeWatchBackoff(retryTiming)
       const watch = (): Effect.Effect<void, never, Scope.Scope> =>
         Effect.suspend(() => {
           const watchEpoch = authenticationEpoch
           return awaitAuthenticationChange.pipe(
+            Effect.andThen(watchBackoff.opened),
             Effect.andThen(remote.transportGeneration),
             Effect.flatMap((transportGeneration) =>
               Stream.unwrap(local.replicationState.pipe(
@@ -986,10 +1005,7 @@ export const layerInMemoryScheduler = (
                   })
                 )
               )).pipe(
-                Stream.runForEach(() => {
-                  watchAttempt = 0
-                  return requestAndNotify
-                }),
+                Stream.runForEach(() => requestAndNotify),
                 Effect.matchEffect({
                   onFailure: Effect.fnUntraced(function*(error) {
                     if (watchEpoch !== authenticationEpoch) return yield* watch()
@@ -999,7 +1015,7 @@ export const layerInMemoryScheduler = (
                       yield* reconciliation.watchFailed(error)
                       yield* startCredentialWait(error.credentialGeneration, admission)
                       yield* Deferred.await(admission.gate)
-                      watchAttempt = 0
+                      yield* watchBackoff.reset
                       return yield* watch()
                     }
                     const pause = yield* Ref.get(authenticationPause)
@@ -1008,19 +1024,14 @@ export const layerInMemoryScheduler = (
                       return yield* watch()
                     }
                     if (!isTransientFailure(error)) return yield* reconciliation.watchFailed(error)
-                    watchAttempt += 1
-                    const delay = Configuration.retryMillis(retryTiming, watchAttempt)
+                    const delay = yield* watchBackoff.closed
                     return yield* reconciliation.watchFailed(error).pipe(
                       Effect.andThen(Effect.logWarning("Sync watch ended", error)),
                       Effect.andThen(backoff(remote, delay, error, transportGeneration)),
                       Effect.andThen(watch())
                     )
                   }),
-                  onSuccess: () => {
-                    watchAttempt += 1
-                    const delay = Configuration.retryMillis(retryTiming, watchAttempt)
-                    return Effect.sleep(delay).pipe(Effect.andThen(watch()))
-                  }
+                  onSuccess: () => watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep), Effect.andThen(watch()))
                 })
               )
             )
