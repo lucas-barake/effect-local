@@ -3,6 +3,7 @@ import { SqliteClient } from "@effect/sql-sqlite-node"
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
@@ -1410,6 +1411,40 @@ describe("a runtime close whose pending count failed", () => {
       assert.strictEqual(status._tag, "Idle")
       assert.strictEqual(status.pending, 0)
       assert.strictEqual(aggregate.totalPending, 0)
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("a leave whose notification died after the membership row was deleted", () => {
+  it.effect.each(constructors)(
+    "leaves a space that can be joined, activated and left again with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(idleRemote)
+      let throwing = true
+      const unregister = services.reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+        if (throwing) decodeURIComponent("%")
+      })
+      const left = yield* replica.leave(spaceId).pipe(Effect.exit)
+      throwing = false
+      const rows = yield* services.sql`SELECT space_id FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
+      const afterLeave = yield* replica.status
+      const listedAfterLeave = yield* replica.spaces
+
+      const rejoined = yield* replica.join(spaceId)
+      const activation = yield* rejoined.activate.pipe(Effect.exit)
+      const leftAgain = yield* replica.leave(spaceId).pipe(Effect.exit)
+      const aggregate = yield* replica.status
+      const listed = yield* replica.spaces
+      unregister()
+
+      assert.isTrue(Exit.isFailure(left) && Cause.hasDies(left.cause), "the caller received the subscriber defect")
+      assert.strictEqual(rows.length, 0, "the membership row was deleted")
+      assert.strictEqual(afterLeave.spaces, 1)
+      assert.strictEqual(listedAfterLeave.length, 1)
+      assert.isTrue(Exit.isSuccess(activation), "the joined space could be activated")
+      assert.isTrue(Exit.isSuccess(leftAgain), "the space could be left again")
+      assert.strictEqual(aggregate.spaces, listed.length)
     }, VirtualTime.scoped)
   )
 })

@@ -380,7 +380,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             current.totalPending - entry.summaryStatus.pending,
             { ...current.counts, [category]: current.counts[category] - 1 }
           )
-        })
+        }, false)
       const modifyContribution = (
         entry: RememberedEntry,
         update: (current: ReplicaStatus.ReplicaStatus) => ReplicaStatus.ReplicaStatus
@@ -1535,6 +1535,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           current.leaving = true
           current.leaveCompletion = completion
+          let removed = false
           const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
             Effect.andThen(deactivate(current, true)),
             Effect.andThen(
@@ -1544,25 +1545,24 @@ const makeLayer = <D extends Definition.Any, R,>(
                 Effect.catchTag("SqlError", (cause) => Effect.fail(new ReplicaError.StorageUnavailable({ cause })))
               )
             ),
-            Effect.tap(() =>
-              removeContribution(current).pipe(
-                Effect.andThen(Effect.sync(() => {
-                  entries.delete(spaceId)
-                  current.backgroundGeneration += 1
-                })),
-                Effect.andThen(FiberMap.remove(credentialWaits, current.membershipIncarnation)),
-                Effect.andThen(publishSettlements(current))
+            Effect.tap(() => {
+              removed = true
+              entries.delete(spaceId)
+              current.backgroundGeneration += 1
+              const announced = Effect.ensuring(
+                invalidateAggregate,
+                reactivity.invalidate([ReactivityKey.membership(spaceId), ReactivityKey.spaces])
               )
-            ),
-            Effect.tap(() =>
-              reactivity.invalidate([
-                ReactivityKey.membership(spaceId),
-                ReactivityKey.spaces
-              ])
-            ),
+              return removeContribution(current).pipe(
+                Effect.andThen(FiberMap.remove(credentialWaits, current.membershipIncarnation)),
+                Effect.andThen(publishSettlements(current)),
+                Effect.andThen(announced)
+              )
+            }),
             Effect.asVoid,
             Effect.tapCause(() =>
               Effect.suspend(() => {
+                if (removed) return Effect.void
                 current.leaving = false
                 current.leaveCompletion = undefined
                 if (!current.dueWhileLeaving) return Effect.void
