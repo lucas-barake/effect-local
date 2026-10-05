@@ -2,7 +2,6 @@ import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
-import type * as Scope from "effect/Scope"
 import type * as SyncEngine from "../SyncEngine.js"
 import * as Errors from "./errors.js"
 
@@ -39,7 +38,6 @@ export const credentialChange = (
 }
 
 export const superviseWatch = <R,>(options: {
-  readonly scope: Scope.Scope
   readonly spaceId: Identity.SpaceId
   readonly watch: Effect.Effect<void, never, R>
   readonly closedDelay: Effect.Effect<number>
@@ -53,23 +51,16 @@ export const superviseWatch = <R,>(options: {
     if (ended === undefined) return options.watch
     const resubscribed = options.closedDelay.pipe(Effect.flatMap(Effect.sleep))
     if (Errors.causeKind(ended) !== "Defect") return Effect.andThen(resubscribed, options.watch)
-    const died = Errors.unexpectedFailure("Sync watch died", ended)
-    const reported = options.watchFailed(died).pipe(
-      Effect.catchCause((cause) => Errors.logDefect("Sync watch failure report died", cause))
-    )
-    const requested = options.resync.pipe(
-      Effect.catchCause((cause) => Errors.logDefect("Sync request after a watch failure died", cause))
-    )
+    const died = Errors.iterationFailure("Sync watch died", ended)
     return Effect.logError("Sync watch died", ended).pipe(
-      Effect.andThen(reported),
+      Effect.andThen(options.watchFailed(died)),
       Effect.andThen(resubscribed),
-      Effect.andThen(requested),
+      Effect.andThen(options.resync),
       Effect.annotateLogs({ "space.id": options.spaceId }),
       Effect.andThen(options.watch)
     )
   }).pipe(
     Effect.catchCause((cause) => {
-      if (Errors.endsLoop(options.scope, cause)) return Effect.failCause(cause)
       watchEnded = cause
       return supervised
     })

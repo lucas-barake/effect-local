@@ -21,6 +21,7 @@ import * as Queue from "effect/Queue"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Scope from "effect/Scope"
 import * as SqlClient from "effect/sql/SqlClient"
+import * as SqlError from "effect/sql/SqlError"
 import * as Stream from "effect/Stream"
 import * as ConnectionLane from "../src/ConnectionLane.js"
 import * as LocalStore from "../src/LocalStore.js"
@@ -74,7 +75,14 @@ const captureLogs = () => {
       return [Cause.squash(entry.cause)]
     })
   const errors = () => entries.filter((entry) => entry.logLevel === "Error").length
-  return { layerLogs: Logger.layer([logger]), defects, errors }
+  const errorMessages = () =>
+    entries.flatMap((entry) => {
+      if (entry.logLevel !== "Error") return []
+      let message: unknown = entry.message
+      if (Array.isArray(message)) message = message[0]
+      return [String(message)]
+    })
+  return { layerLogs: Logger.layer([logger]), defects, errors, errorMessages }
 }
 
 const eventually = (
@@ -290,16 +298,22 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
   readonly waitForCredentialChange?: Effect.Effect<void>
   readonly waitForTransportChange?: Effect.Effect<void>
   readonly transportGeneration?: Effect.Effect<number>
+  readonly everyWatch?: boolean
 }) {
   const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
   const database = yield* Layer.build(SqliteClient.layer({ filename: ":memory:", disableWAL: true }))
   const sql = Context.get(database, SqlClient.SqlClient)
   let dying: string | undefined
+  let locked: string | undefined
   const dyingSql = new Proxy(sql, {
     apply: (target, thisArg, args: Parameters<typeof sql>) => {
       const source: unknown = args[0]
-      if (dying !== undefined && Array.isArray(source) && source.join("?").includes(dying)) {
-        return Effect.die("injected statement defect")
+      if (!Array.isArray(source)) return Reflect.apply(target, thisArg, args)
+      const text = source.join("?")
+      if (dying !== undefined && text.includes(dying)) return Effect.die("injected statement defect")
+      if (locked !== undefined && text.includes(locked)) {
+        const reason = new SqlError.LockTimeoutError({ cause: "injected lock timeout" })
+        return Effect.fail(new SqlError.SqlError({ reason }))
       }
       return Reflect.apply(target, thisArg, args)
     }
@@ -324,7 +338,7 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
     bootstrap: server.bootstrap,
     watch: () => {
       subscriptions += 1
-      if (subscriptions > 1) return Stream.never
+      if (subscriptions > 1 && faults.everyWatch !== true) return Stream.never
       return Stream.fromEffect(faults.watch).pipe(Stream.drain)
     }
   })
@@ -373,6 +387,9 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
     subscriptions: () => subscriptions,
     dieOn: (statement: string | undefined) => {
       dying = statement
+    },
+    lockOn: (statement: string | undefined) => {
+      locked = statement
     }
   }
 })
@@ -444,7 +461,7 @@ describe("in-memory scheduler loops that die", () => {
 
 const membershipPendingCountStatement = "SELECT COUNT(p.mutation_id) AS count"
 
-const settle = (duration: "5 seconds" | "30 seconds" | "1 minute" | "5 minutes" | "10 minutes") =>
+const settle = (duration: "10 millis" | "5 seconds" | "30 seconds" | "1 minute" | "5 minutes" | "10 minutes") =>
   VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption(duration))
 
 describe("a background turn that dies settles like a typed failure", () => {
@@ -737,15 +754,13 @@ describe("background turns that end with a defect and an interrupt in one cause"
         }
       }))
       const space = yield* replica.space(spaceId)
+      const failed = yield* eventually(services, space, isFailed)
       yield* settle("5 seconds")
       mixed = false
-      const cycle = yield* Effect.forkChild(Effect.andThen(space.activate, space.deactivate), {
-        startImmediately: true
-      })
 
-      const drained = yield* eventually(services, space, (status) => status._tag === "Idle" && status.pending === 0)
-      yield* Fiber.interrupt(cycle)
+      const drained = yield* eventually(services, space, isDrained)
 
+      assert.strictEqual(failureMessage(failed), "UnexpectedFailure")
       assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Idle, pending 0")
     }, VirtualTime.scoped)
   )
@@ -1256,11 +1271,16 @@ describe("a leave whose notification died after the membership row was deleted",
       const services = yield* twoSpaces(constructor)
       const replica = yield* services.start(idleRemote)
       let throwing = true
+      let listChanges = 0
       const unregister = services.reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
         if (throwing) decodeURIComponent("%")
       })
+      services.reactivity.registerUnsafe([ReactivityKey.spaces], () => {
+        listChanges += 1
+      })
       const left = yield* replica.leave(spaceId).pipe(Effect.exit)
       throwing = false
+      const announced = listChanges
       const rows = yield* services.sql`SELECT space_id FROM effect_local_client_spaces WHERE space_id = ${spaceId}`
       const afterLeave = yield* replica.status
       const listedAfterLeave = yield* replica.spaces
@@ -1274,6 +1294,7 @@ describe("a leave whose notification died after the membership row was deleted",
 
       assert.isTrue(Exit.isFailure(left) && Cause.hasDies(left.cause), "the caller received the subscriber defect")
       assert.strictEqual(rows.length, 0, "the membership row was deleted")
+      assert.strictEqual(announced, 1, "the change of the space list was announced")
       assert.strictEqual(afterLeave.spaces, 1)
       assert.strictEqual(listedAfterLeave.length, 1)
       assert.isTrue(Exit.isSuccess(activation), "the joined space could be activated")
@@ -1435,19 +1456,22 @@ describe("a watch whose recovery dies", () => {
     "subscribes again after the sync requests that follow a failed in-memory watch died",
     Effect.fnUntraced(function*() {
       const watchFails = yield* Deferred.make<void>()
-      const { awaitStatus, dieOn, subscriptions } = yield* inMemoryScheduler({
+      const { awaitStatus, dieOn, forgetStatuses, subscriptions } = yield* inMemoryScheduler({
         pull: Effect.void,
         watch: Effect.andThen(Deferred.await(watchFails), storageUnavailable)
       })
       dieOn(requestReconciliationStatement)
       yield* Deferred.succeed(watchFails, undefined)
       yield* settle("1 minute")
-      const resubscribed = subscriptions()
+      const whileDying = subscriptions()
       dieOn(undefined)
+      yield* forgetStatuses
+      yield* settle("1 minute")
 
       const recovered = yield* awaitStatus((status) => status._tag === "Online")
 
-      assert.strictEqual(resubscribed, 2)
+      assert.strictEqual(whileDying, 1)
+      assert.strictEqual(subscriptions(), 2)
       assert.isTrue(Option.isSome(recovered), "the space reported online once storage healed")
     }, VirtualTime.scoped)
   )
@@ -1491,6 +1515,10 @@ describe("a failure report whose pending count could not be read", () => {
         FROM effect_local_client_pending_data WHERE space_id = ${spaceId}`
       const status = yield* space.status
 
+      const countDefects = logs.errorMessages().filter((message) =>
+        message === "Pending count for a failure report died"
+      )
+      assert.strictEqual(countDefects.length > 0, ending === "died")
       assert.strictEqual(stored[0].pending, 1)
       assert.strictEqual(whileUnreadable.totalPending, stored[0].pending)
       assert.strictEqual(whileUnreadable.counts.failed, 1)
@@ -1521,6 +1549,432 @@ describe("a failure report whose pending count could not be read", () => {
 
       assert.strictEqual(Option.getOrThrow(counted).pending, 1)
       assert.strictEqual(Option.getOrThrow(uncounted).pending, 1)
+    }, VirtualTime.scoped)
+  )
+})
+
+const failureWithDefect = Cause.combine(
+  Cause.fail(new ReplicaError.StorageUnavailable({ cause: "injected" })),
+  Cause.die("finalizer died")
+)
+
+describe("the background worker boundary", () => {
+  it.effect.each(constructors)(
+    "keeps both background workers alive after the release that follows two turns died with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* withPending(constructor, [spaceId, otherSpaceId])
+      const logs = captureLogs()
+      services.dieNext(membershipPendingCountStatement, 2)
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => emptyPage(services.crypto, request)
+      })).pipe(Effect.provide(logs.layerLogs))
+      const space = yield* replica.space(spaceId)
+      const other = yield* replica.space(otherSpaceId)
+      yield* settle("5 minutes")
+      const released = logs.defects()
+      yield* space.mutate(Domain.PutTodo, Domain.todo("later"))
+      yield* other.mutate(Domain.PutTodo, Domain.todo("later"))
+      yield* space.deactivate
+      yield* other.deactivate
+
+      const drained = yield* eventually(services, space, isDrained)
+      const otherDrained = yield* eventually(services, other, isDrained)
+
+      assert.deepStrictEqual(released, ["injected statement defect", "injected statement defect"])
+      assert.isTrue(Option.isSome(drained), "a worker drained the first space")
+      assert.isTrue(Option.isSome(otherDrained), "a worker drained the second space")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "closes the runtime, logs both defects and retries when a turn and its release both died with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* withPending(constructor, [spaceId])
+      const logs = captureLogs()
+      let dies = true
+      services.dieNext(membershipPendingCountStatement)
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (!dies) return emptyPage(services.crypto, request)
+          dies = false
+          return Effect.die("undecodable response")
+        }
+      })).pipe(Effect.provide(logs.layerLogs))
+      const space = yield* replica.space(spaceId)
+      yield* settle("10 millis")
+
+      const failed = yield* eventually(services, space, isFailed)
+      const activation = yield* space.activation
+      const drained = yield* eventually(services, space, isDrained)
+
+      assert.strictEqual(failureMessage(failed), "UnexpectedFailure")
+      assert.strictEqual(activation, "Inactive")
+      assert.deepStrictEqual(logs.defects(), ["undecodable response", "injected statement defect"])
+      assert.isTrue(Option.isSome(drained), "the retry drained the space")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "never reports a failure when the release after a successful turn died with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* withPending(constructor, [spaceId])
+      services.dieNext(membershipPendingCountStatement)
+      let failedReports = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => emptyPage(services.crypto, request)
+      }))
+      const watching = yield* Effect.forkChild(
+        Effect.gen(function*() {
+          const changes = yield* Queue.unbounded<void>()
+          services.reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+            Queue.offerUnsafe(changes, undefined)
+          })
+          while (true) {
+            yield* Queue.take(changes)
+            if ((yield* replica.status).counts.failed > 0) failedReports += 1
+          }
+        }),
+        { startImmediately: true }
+      )
+      const space = yield* replica.space(spaceId)
+      yield* settle("5 minutes")
+      yield* Fiber.interrupt(watching)
+
+      assert.strictEqual(failedReports, 0)
+      assert.strictEqual((yield* space.status)._tag, "Idle")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "reports the typed failure when a foreground sync failed and a defect came with it with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      let fails = false
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (!fails || request.spaceId !== spaceId) return emptyPage(services.crypto, request)
+            return Effect.failCause(failureWithDefect)
+          }
+        }),
+        logs.layerLogs
+      )
+      fails = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* settle("10 millis")
+
+      const status = yield* space.status
+      fails = false
+
+      const reported = Option.some(status)
+      assert.strictEqual(failureMessage(reported), "StorageUnavailable")
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("backoffs that keep dying or ending", () => {
+  it.effect(
+    "spaces the retries of a foreground sync by the backoff while its transport wait keeps dying",
+    Effect.fnUntraced(function*() {
+      const services = yield* twoSpaces("layer", "1 minute")
+      const logs = captureLogs()
+      let offline = false
+      let pulls = 0
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          waitForTransportChange: () => Effect.die("transport wait died"),
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (!offline || request.spaceId !== spaceId) return emptyPage(services.crypto, request)
+            pulls += 1
+            return serverUnavailable
+          }
+        }),
+        logs.layerLogs
+      )
+      offline = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+
+      yield* settle("10 minutes")
+
+      assert.isAtLeast(pulls, 6)
+      assert.isAtMost(pulls, 20)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "spaces the retries of an in-memory sync by the backoff while its transport wait keeps dying",
+    Effect.fnUntraced(function*() {
+      let offline = false
+      let pulls = 0
+      const { local, reconciler } = yield* inMemoryScheduler({
+        pull: Effect.suspend(() => {
+          if (!offline) return Effect.void
+          pulls += 1
+          return serverUnavailable
+        }),
+        watch: Effect.never,
+        waitForTransportChange: Effect.die("transport wait died")
+      })
+      offline = true
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* reconciler.schedule
+
+      yield* settle("10 minutes")
+
+      assert.isAtLeast(pulls, 100)
+      assert.isAtMost(pulls, 700)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "spaces the subscriptions of a foreground watch that keeps ending by interruption by the backoff with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor, "1 minute")
+      const logs = captureLogs()
+      const firstWatchEnds = yield* Deferred.make<void>()
+      let ends = false
+      let subscriptions = 0
+      yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => emptyPage(services.crypto, request),
+          watch: (request) => {
+            if (request.spaceId !== spaceId) return Stream.never
+            if (!ends) return Stream.fromEffect(Deferred.await(firstWatchEnds)).pipe(Stream.drain)
+            subscriptions += 1
+            return Stream.fromEffect(Effect.interrupt)
+          }
+        }),
+        logs.layerLogs
+      )
+      ends = true
+      yield* Deferred.succeed(firstWatchEnds, undefined)
+
+      yield* settle("10 minutes")
+
+      assert.isAtLeast(subscriptions, 6)
+      assert.isAtMost(subscriptions, 20)
+      assert.strictEqual(logs.errors(), 0)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(["died", "ended by interruption"] as const)(
+    "spaces the subscriptions of an in-memory watch that keeps having %s by the backoff",
+    Effect.fnUntraced(function*(ending) {
+      let ended: Effect.Effect<never> = Effect.die("undecodable wake")
+      if (ending !== "died") ended = Effect.interrupt
+      const { subscriptions } = yield* inMemoryScheduler({
+        pull: Effect.void,
+        watch: ended,
+        everyWatch: true
+      })
+
+      yield* settle("10 minutes")
+
+      assert.isAtLeast(subscriptions(), 100)
+      assert.isAtMost(subscriptions(), 700)
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("a credential wait that ends by interruption", () => {
+  it.effect(
+    "waits again without logging an error",
+    Effect.fnUntraced(function*() {
+      let rejected = false
+      let waits = 0
+      const { awaitStatus, local, logs, reconciler } = yield* inMemoryScheduler({
+        pull: Effect.suspend(() => {
+          if (rejected) return credentialRejected
+          return Effect.void
+        }),
+        watch: Effect.never,
+        waitForCredentialChange: Effect.suspend(() => {
+          waits += 1
+          return Effect.interrupt
+        })
+      })
+      rejected = true
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* reconciler.schedule
+      const paused = yield* awaitStatus(needsAuthentication)
+      yield* settle("5 seconds")
+
+      assert.isTrue(Option.isSome(paused), "the space asked for a new credential")
+      assert.isAbove(waits, 1)
+      assert.strictEqual(logs.errors(), 0)
+    }, VirtualTime.scoped)
+  )
+})
+
+const ownerUnavailable = Effect.fail(new ReplicaError.OwnerUnavailable({ reason: "transport" }))
+
+describe("a sync request after a watch failure that fails", () => {
+  it.effect(
+    "reports the space online again after an in-memory watch failed once and the next watch stayed open",
+    Effect.fnUntraced(function*() {
+      const watchFails = yield* Deferred.make<void>()
+      const { awaitStatus, subscriptions } = yield* inMemoryScheduler({
+        pull: Effect.void,
+        watch: Effect.andThen(Deferred.await(watchFails), storageUnavailable)
+      })
+      yield* Deferred.succeed(watchFails, undefined)
+
+      const failed = yield* awaitStatus((status) => status._tag === "Failed")
+      const recovered = yield* awaitStatus((status) => status._tag === "Online")
+
+      assert.isTrue(Option.isSome(failed), "the watch failure was reported")
+      assert.strictEqual(subscriptions(), 2)
+      assert.isTrue(Option.isSome(recovered), "the space reported online again without another trigger")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "reports the failure of the in-memory sync request that follows a failed watch",
+    Effect.fnUntraced(function*() {
+      const watchFails = yield* Deferred.make<void>()
+      const { awaitStatus, forgetStatuses, lockOn } = yield* inMemoryScheduler({
+        pull: Effect.void,
+        watch: Effect.andThen(Deferred.await(watchFails), ownerUnavailable)
+      })
+      lockOn(requestReconciliationStatement)
+      yield* forgetStatuses
+      yield* Deferred.succeed(watchFails, undefined)
+
+      const reported = yield* awaitStatus(
+        (status) => status._tag === "Failed" && status.message === "StorageUnavailable"
+      )
+
+      assert.isTrue(Option.isSome(reported), "the failed sync request was reported")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "reports the failure of the workflow sync request that follows a failed watch",
+    Effect.fnUntraced(function*() {
+      const services = yield* twoSpaces("layerWorkflow")
+      const logs = captureLogs()
+      const watchFails = yield* Deferred.make<void>()
+      let subscriptions = 0
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => emptyPage(services.crypto, request),
+          watch: (request) => {
+            if (request.spaceId !== spaceId) return Stream.never
+            subscriptions += 1
+            if (subscriptions > 1) return Stream.never
+            return Deferred.await(watchFails).pipe(Effect.andThen(ownerUnavailable), Stream.fromEffect)
+          }
+        }),
+        logs.layerLogs
+      )
+      services.lockNext(requestReconciliationStatement, 1_000_000)
+      yield* Deferred.succeed(watchFails, undefined)
+
+      const reported = yield* eventually(
+        services,
+        space,
+        (status) => status._tag === "Failed" && status.message === "StorageUnavailable"
+      )
+      services.lockNext(noStatement)
+
+      assert.isTrue(Option.isSome(reported), "the failed sync request was reported")
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("a status subscriber that throws while a failure is reported", () => {
+  it.effect.each(constructors)(
+    "still retries and drains a foreground space with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      let throwing = false
+      let unavailable = false
+      services.reactivity.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+        if (throwing) decodeURIComponent("%")
+      })
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (!unavailable || request.spaceId !== spaceId) return emptyPage(services.crypto, request)
+            unavailable = false
+            throwing = true
+            return storageUnavailable
+          }
+        }),
+        logs.layerLogs
+      )
+      unavailable = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* settle("5 seconds")
+      const notified = logs.errorMessages().filter((message) => message === "Failure status notification died")
+      throwing = false
+      yield* settle("5 minutes")
+      const status = yield* space.status
+
+      assert.isAbove(notified.length, 0)
+      assert.strictEqual(status._tag, "Online")
+      assert.strictEqual(status.pending, 0)
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("a readmission whose transport generation read died", () => {
+  it.effect(
+    "retries the managed space with the backoff",
+    Effect.fnUntraced(function*() {
+      const services = yield* twoSpaces("layer")
+      const logs = captureLogs()
+      let unavailable = false
+      let generationDies = false
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          transportGeneration: Effect.suspend(() => {
+            if (!generationDies) return Effect.succeed(0)
+            generationDies = false
+            return Effect.die("generation died")
+          }),
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (!unavailable || request.spaceId !== spaceId) return emptyPage(services.crypto, request)
+            unavailable = false
+            generationDies = true
+            return storageUnavailable
+          }
+        }),
+        logs.layerLogs
+      )
+      unavailable = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+
+      const drained = yield* eventually(services, space, isOnlineDrained)
+
+      assert.deepStrictEqual(logs.defects(), ["generation died"])
+      assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Online, pending 0")
     }, VirtualTime.scoped)
   )
 })

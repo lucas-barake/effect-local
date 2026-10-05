@@ -500,11 +500,7 @@ const layerSchedulerWithConfiguration = (
       const configuration = yield* RetryConfiguration
       const local = yield* LocalStore.Store
       const reconciliation = yield* Reconciler.Reconciliation
-      const currentScope = yield* Effect.scope
-      const schedulerScope = Option.getOrElse(
-        yield* Effect.serviceOption(RegistrationScope),
-        () => currentScope
-      )
+      const workflowOwner = Option.getOrUndefined(yield* Effect.serviceOption(RegistrationScope))
       yield* Registration
       const remote = yield* SyncEngine.SyncEngine
       const engine = yield* WorkflowEngine.WorkflowEngine
@@ -573,11 +569,10 @@ const layerSchedulerWithConfiguration = (
       const superviseTurn = Effect.gen(function*() {
         if (!readmit) yield* LosslessQueue.take(wake)
         yield* awaitAuthenticationChange
-        let observedGeneration = 0
+        let observedGeneration = yield* reconciliation.generation
         const requestFirst = readmit
         readmit = false
         const result = yield* Effect.gen(function*() {
-          observedGeneration = yield* reconciliation.generation
           if (requestFirst) yield* local.requestReconciliation
           while (true) {
             yield* awaitAuthenticationChange
@@ -603,12 +598,12 @@ const layerSchedulerWithConfiguration = (
           }
         }).pipe(
           Errors.failDiedIteration(
-            schedulerScope,
             "Reconciliation supervisor turn died",
             options.spaceId,
             Effect.map(reconciliation.generation, (generation) => {
               observedGeneration = generation
-            })
+            }),
+            workflowOwner
           ),
           Effect.result
         )
@@ -647,26 +642,7 @@ const layerSchedulerWithConfiguration = (
       })
       const supervise = Effect.gen(function*() {
         let stopped = false
-        while (!stopped) {
-          stopped = yield* superviseTurn.pipe(
-            Effect.catchCause((cause) => {
-              if (Errors.endsLoop(schedulerScope, cause)) return Effect.succeed(true)
-              if (Errors.causeKind(cause) !== "Defect") return Effect.succeed(false)
-              return Effect.logError("Reconciliation failure handling died", cause).pipe(
-                Effect.annotateLogs({ "space.id": options.spaceId }),
-                Effect.andThen(reconciliation.generation),
-                Effect.flatMap((generation) =>
-                  reconciliation.failed(
-                    Errors.unexpectedFailure("Reconciliation failure handling died", cause),
-                    generation
-                  )
-                ),
-                Effect.catchCause((reportCause) => Errors.logDefect("Reconciliation failure report died", reportCause)),
-                Effect.as(false)
-              )
-            })
-          )
-        }
+        while (!stopped) stopped = yield* superviseTurn
       })
 
       const supervisorFiber = yield* Effect.forkScoped(
@@ -727,7 +703,6 @@ const layerSchedulerWithConfiguration = (
         }
       })
       const watchFiber = yield* superviseWatch({
-        scope: schedulerScope,
         spaceId: options.spaceId,
         watch,
         closedDelay: watchBackoff.closed,

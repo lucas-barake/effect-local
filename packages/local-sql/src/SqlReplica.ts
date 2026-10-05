@@ -922,9 +922,8 @@ const makeLayer = <D extends Definition.Any, R,>(
                 )
             }),
             Effect.tapCause(() => {
-              const published = modifyContribution(entry, (current) => inactiveStatus(entry, current.pending))
-              if (!enqueuePending) return published
-              return Effect.andThen(published, enqueueBackground(entry))
+              if (enqueuePending) return enqueueBackground(entry)
+              return Effect.void
             })
           )
           yield* updateContribution(entry, inactiveStatus(entry, count.count))
@@ -1543,7 +1542,6 @@ const makeLayer = <D extends Definition.Any, R,>(
           const completion = yield* Deferred.make<void, ReplicaError.ReplicaError>()
           current.leaving = true
           current.leaveCompletion = completion
-          let removed = false
           const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
             Effect.andThen(deactivate(current, true)),
             Effect.andThen(
@@ -1554,7 +1552,6 @@ const makeLayer = <D extends Definition.Any, R,>(
               )
             ),
             Effect.tap(() => {
-              removed = true
               entries.delete(spaceId)
               current.backgroundGeneration += 1
               const announced = Effect.ensuring(
@@ -1570,7 +1567,6 @@ const makeLayer = <D extends Definition.Any, R,>(
             Effect.asVoid,
             Effect.tapCause(() =>
               Effect.suspend(() => {
-                if (removed) return Effect.void
                 current.leaving = false
                 current.leaveCompletion = undefined
                 if (!current.dueWhileLeaving) return Effect.void
@@ -1608,10 +1604,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         generation: number
       ) {
         if (work._tag === "Deactivate") {
-          const result = yield* deactivate(entry, false, work.runtime, false).pipe(
-            Errors.failDiedIteration(parentScope, "Background runtime release died", entry.spaceId),
-            Effect.result
-          )
+          const result = yield* deactivate(entry, false, work.runtime, false).pipe(Effect.result)
           if (Result.isFailure(result)) {
             yield* settleBackgroundTurn(entry, generation, result.failure, Option.none())
           }
@@ -1628,10 +1621,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           let sync = runtime.reconciler.sync
           if (workflow !== undefined) sync = backgroundWorkflowTurns.withPermit(sync)
           return Effect.raceFirst(sync, Deferred.await(runtime.preemption))
-        }).pipe(
-          Errors.failDiedIteration(parentScope, "Background sync turn died", entry.spaceId),
-          Effect.result
-        )
+        }).pipe(Effect.result)
         if (activeRuntime !== undefined) {
           if (activeRuntime.foreground) return
           const deactivation = yield* deactivate(
@@ -1639,10 +1629,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             false,
             activeRuntime,
             Result.isSuccess(result)
-          ).pipe(
-            Errors.failDiedIteration(parentScope, "Background runtime release died", entry.spaceId),
-            Effect.result
-          )
+          ).pipe(Effect.result)
           if (Result.isFailure(deactivation)) {
             yield* settleBackgroundTurn(entry, generation, deactivation.failure, Option.none())
             return
@@ -1663,9 +1650,8 @@ const makeLayer = <D extends Definition.Any, R,>(
         )
         const stranded = entry.runtime
         if (stranded !== undefined) {
-          if (stranded.foreground) return
           const closed = yield* deactivate(entry, false, stranded, false).pipe(Effect.exit)
-          if (Exit.isFailure(closed) && Errors.causeKind(closed.cause) !== "Interruption") {
+          if (Exit.isFailure(closed)) {
             yield* Effect.logError("Background runtime did not close after its turn died", closed.cause).pipe(
               Effect.annotateLogs({ "space.id": entry.spaceId })
             )
@@ -1692,16 +1678,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         const claimed = entry
         const generation = claimed.backgroundGeneration
         yield* runBackgroundWork(work, claimed, generation).pipe(
-          Effect.catchCause((cause) => {
-            if (Errors.endsLoop(parentScope, cause)) return Effect.failCause(cause)
-            return settleDiedTurn(claimed, generation, cause).pipe(
-              Effect.catchCause((settleCause) =>
-                Errors.logDefect("Background turn settlement died", settleCause).pipe(
-                  Effect.annotateLogs({ "space.id": claimed.spaceId })
-                )
-              )
-            )
-          })
+          Effect.catchCause((cause) => settleDiedTurn(claimed, generation, cause))
         )
       })
 
@@ -1716,10 +1693,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         { discard: true }
       )
       yield* retrySchedulerTurn.pipe(
-        Effect.catchCause((cause) => {
-          if (Errors.endsLoop(parentScope, cause)) return Effect.failCause(cause)
-          return rearmRetries(cause)
-        }),
+        Effect.catchCause(rearmRetries),
         Effect.forever,
         Effect.provideService(ConnectionLane.Priority, "Background"),
         Effect.forkScoped({ startImmediately: true })
