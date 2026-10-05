@@ -6,6 +6,7 @@ import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -159,6 +160,32 @@ const hangingThenDrain = (
       return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
     }
   })
+
+const activationIs = (space: Replica.Space, expected: Replica.Activation) =>
+  space.activation.pipe(
+    Effect.map((activation) => activation === expected),
+    Effect.catch(() => Effect.succeed(false))
+  )
+
+const recordAnnouncements = Effect.fnUntraced(function*(services: BackgroundReplica.Services) {
+  const clock = yield* Clock.Clock
+  const announced: Array<{ readonly key: "aggregate" | "status"; readonly at: number }> = []
+  services.reactivity.registerUnsafe([ReactivityKey.aggregateStatus], () => {
+    announced.push({ key: "aggregate", at: clock.currentTimeMillisUnsafe() })
+  })
+  services.reactivity.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+    announced.push({ key: "status", at: clock.currentTimeMillisUnsafe() })
+  })
+  const statusFollowedLastAggregate = () => {
+    let last = -1
+    for (let index = 0; index < announced.length; index++) {
+      if (announced[index].key === "aggregate") last = index
+    }
+    if (last < 0) return false
+    return announced.slice(last + 1).some((entry) => entry.key === "status" && entry.at === announced[last].at)
+  }
+  return { statusFollowedLastAggregate }
+})
 
 const installView = (services: BackgroundReplica.Services) =>
   services.sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId}, replication_view_revision = 0`
@@ -713,9 +740,13 @@ describe("a notification that is still being delivered", () => {
       yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
       assert.isTrue(Option.isSome(yield* eventually(services, space, isOfflinePending)), "the mutation was pending")
       offline = false
-      const delivery = yield* services.holdInvalidation(ReactivityKey.aggregateStatus)
-      delivery.arm(1)
-      const deactivating = yield* space.deactivate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      const caller: { fiber: number | undefined } = { fiber: undefined }
+      const delivery = yield* services.holdInvalidationWhen(
+        ReactivityKey.aggregateStatus,
+        (fiber) => Effect.succeed(fiber === caller.fiber)
+      )
+      const deactivating = yield* space.deactivate.pipe(Effect.exit, Effect.forkChild)
+      caller.fiber = deactivating.id
       yield* VirtualTime.advanceUntil(delivery.entered)
 
       yield* settle("5 minutes")
@@ -731,56 +762,42 @@ describe("a notification that is still being delivered", () => {
   )
 
   it.effect.each(constructors)(
-    "of the space status does not hold back the aggregate status of a space that came online with %s",
+    "of the space status follows the aggregate status of a space that came online with %s",
     Effect.fnUntraced(function*(constructor) {
       const services = yield* twoSpaces(constructor)
-      const delivery = yield* services.holdInvalidation(ReactivityKey.status(spaceId))
-      let pulled = false
-      const replica = yield* services.start(SyncEngine.SyncEngine.of({
-        ...idleRemote,
-        submitBatch: acceptSubmission,
-        pull: (request) => {
-          if (request.spaceId === spaceId && !pulled) {
-            pulled = true
-            delivery.arm(1)
-          }
-          return emptyPage(services.crypto, request)
-        }
-      }))
+      const announced = yield* recordAnnouncements(services)
+      const replica = yield* services.start(healthyRemote(services, () => false))
       yield* installView(services)
       const space = yield* replica.space(spaceId)
       yield* space.activate
-      yield* VirtualTime.advanceUntil(delivery.entered)
+      assert.isTrue(Option.isSome(yield* eventually(services, space, isOnlineDrained)), "the space came online")
+      yield* settle("1 second")
 
-      const aggregate = yield* replica.status
-      yield* delivery.release
-
-      assert.strictEqual(aggregate.counts.online, 1)
+      assert.strictEqual((yield* replica.status).counts.online, 1)
+      assert.isTrue(
+        announced.statusFollowedLastAggregate(),
+        "the space status was announced after the aggregate status"
+      )
     }, VirtualTime.scoped)
   )
 
   it.effect.each(constructors)(
-    "of the space status does not hold back the aggregate status of a space whose sync failed with %s",
+    "of the space status follows the aggregate status of a space whose sync failed with %s",
     Effect.fnUntraced(function*(constructor) {
       const services = yield* twoSpaces(constructor)
-      const delivery = yield* services.holdInvalidation(ReactivityKey.status(spaceId))
       let offline = false
-      const { replica, space } = yield* onlineSpace(services, () => {
-        if (offline) delivery.arm(2)
-        return offline
-      })
+      const { replica, space } = yield* onlineSpace(services, () => offline)
+      const announced = yield* recordAnnouncements(services)
       offline = true
-      const mutating = yield* space.mutate(Domain.PutTodo, firstTodo).pipe(
-        Effect.forkChild({ startImmediately: true })
+      yield* space.mutate(Domain.PutTodo, firstTodo)
+      assert.isTrue(Option.isSome(yield* eventually(services, space, isOfflinePending)), "the sync failed")
+      yield* settle("100 millis")
+
+      assert.strictEqual((yield* replica.status).counts.offline, 1)
+      assert.isTrue(
+        announced.statusFollowedLastAggregate(),
+        "the space status was announced after the aggregate status"
       )
-      yield* VirtualTime.advanceUntil(delivery.entered)
-
-      const aggregate = yield* replica.status
-      yield* delivery.release
-      const mutated = yield* within(Fiber.join(mutating))
-
-      assert.strictEqual(aggregate.counts.offline, 1)
-      assert.strictEqual(describeExit(mutated), "succeeded", "the mutation")
     }, VirtualTime.scoped)
   )
 
@@ -793,10 +810,14 @@ describe("a notification that is still being delivered", () => {
       const replica = yield* services.start(hangingThenDrain(services, attempts))
       const space = yield* replica.space(spaceId)
       yield* VirtualTime.advanceUntil(attempts.reached(1))
-      const delivery = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
-      delivery.arm(2)
+      const caller: { fiber: number | undefined } = { fiber: undefined }
+      const delivery = yield* services.holdInvalidationWhen(ReactivityKey.activation(spaceId), (fiber) => {
+        if (fiber !== caller.fiber) return Effect.succeed(false)
+        return activationIs(space, "Inactive")
+      })
       services.lockNext("SELECT desired_scope_json")
-      const activating = yield* space.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      const activating = yield* space.activate.pipe(Effect.exit, Effect.forkChild)
+      caller.fiber = activating.id
       yield* VirtualTime.advanceUntil(delivery.entered)
 
       const retried = yield* VirtualTime.advanceUntil(attempts.reached(2)).pipe(Effect.timeoutOption("5 minutes"))
@@ -830,8 +851,14 @@ describe("a notification that is still being delivered", () => {
         yield* Fiber.interrupt(mutating)
         const deactivating = yield* space.deactivate.pipe(Effect.forkChild({ startImmediately: true }))
         yield* settle("1 second")
-        const delivery = yield* services.holdInvalidation(ReactivityKey.aggregateStatus)
-        delivery.arm(1)
+        const delivery = yield* services.holdInvalidationWhen(
+          ReactivityKey.aggregateStatus,
+          () =>
+            replica.status.pipe(
+              Effect.map((aggregate) => aggregate.totalPending === 1),
+              Effect.catch(() => Effect.succeed(false))
+            )
+        )
         yield* committing.release
         yield* VirtualTime.advanceUntil(delivery.entered)
         const activation = yield* space.activation

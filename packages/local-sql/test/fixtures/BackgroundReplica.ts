@@ -186,12 +186,33 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
   let invalidationOutcome:
     | { readonly key: string; readonly outcome: Effect.Effect<void, ReplicaError.ReplicaError> }
     | undefined
+  let conditionalHold:
+    | {
+      readonly key: string
+      readonly matches: (fiberId: number) => Effect.Effect<boolean>
+      readonly entered: Deferred.Deferred<void>
+      readonly release: Deferred.Deferred<void>
+    }
+    | undefined
   const gatedReactivity = new Proxy(reactivity, {
     get: (target, property, receiver) => {
       if (property !== "invalidate") return Reflect.get(target, property, receiver)
       return (keys: Parameters<typeof reactivity.invalidate>[0]) => {
         const replaced = invalidationOutcome
         if (replaced !== undefined && Array.isArray(keys) && keys.includes(replaced.key)) return replaced.outcome
+        const conditional = conditionalHold
+        if (conditional !== undefined && Array.isArray(keys) && keys.includes(conditional.key)) {
+          return Effect.withFiber((fiber) => conditional.matches(fiber.id)).pipe(
+            Effect.flatMap((matched) => {
+              if (!matched || conditionalHold !== conditional) return target.invalidate(keys)
+              conditionalHold = undefined
+              return target.invalidate(keys).pipe(
+                Effect.andThen(Deferred.succeed(conditional.entered, undefined)),
+                Effect.andThen(Deferred.await(conditional.release))
+              )
+            })
+          )
+        }
         const held = heldInvalidation
         if (held === undefined || !Array.isArray(keys) || !keys.includes(held.key)) {
           return target.invalidate(keys)
@@ -242,6 +263,15 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     }
     return { arm, entered: Deferred.await(entered), release: Deferred.succeed(release, undefined) }
   })
+  const holdInvalidationWhen = Effect.fnUntraced(function*(
+    key: string,
+    matches: (fiberId: number) => Effect.Effect<boolean>
+  ) {
+    const entered = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    conditionalHold = { key, matches, entered, release }
+    return { entered: Deferred.await(entered), release: Deferred.succeed(release, undefined) }
+  })
   const endInvalidationsWith = (key: string, outcome: Effect.Effect<void, ReplicaError.ReplicaError>) => {
     invalidationOutcome = { key, outcome }
   }
@@ -256,6 +286,7 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     dieNext,
     holdStatement,
     holdInvalidation,
+    holdInvalidationWhen,
     endInvalidationsWith
   }
 })

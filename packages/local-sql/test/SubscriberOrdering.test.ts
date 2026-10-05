@@ -74,6 +74,12 @@ const onlineSpace = Effect.fnUntraced(function*(services: BackgroundReplica.Serv
   return { replica, space }
 })
 
+const activationIs = (space: Replica.Space, expected: Replica.Activation) =>
+  space.activation.pipe(
+    Effect.map((activation) => activation === expected),
+    Effect.catch(() => Effect.succeed(false))
+  )
+
 const count = (services: BackgroundReplica.Services, key: string) => {
   let delivered = 0
   services.reactivity.registerUnsafe([key], () => {
@@ -220,8 +226,10 @@ describe("the subscribers of an operation when its caller resumes", () => {
       const services = yield* twoSpaces(constructor)
       const { space } = yield* onlineSpace(services)
       const activation = count(services, ReactivityKey.activation(spaceId))
-      const closing = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
-      closing.arm(1)
+      const closing = yield* services.holdInvalidationWhen(
+        ReactivityKey.activation(spaceId),
+        () => activationIs(space, "Deactivating")
+      )
       const deactivating = yield* space.deactivate.pipe(Effect.forkChild({ startImmediately: true }))
       yield* VirtualTime.advanceUntil(closing.entered)
       const activationWhenResumed = 0
@@ -456,8 +464,10 @@ describe("a waiter whose completion callback throws", () => {
     Effect.fnUntraced(function*(constructor) {
       const services = yield* twoSpaces(constructor)
       const { space } = yield* onlineSpace(services)
-      const closing = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
-      closing.arm(1)
+      const closing = yield* services.holdInvalidationWhen(
+        ReactivityKey.activation(spaceId),
+        () => activationIs(space, "Deactivating")
+      )
       const first = yield* space.deactivate.pipe(Effect.forkChild({ startImmediately: true }))
       yield* VirtualTime.advanceUntil(closing.entered)
       const throwing = yield* space.deactivate.pipe(Effect.forkChild({ startImmediately: true }))
@@ -481,8 +491,10 @@ describe("a space reactivated while its deactivation was still being announced",
     Effect.fnUntraced(function*(constructor) {
       const services = yield* twoSpaces(constructor)
       const { replica, space } = yield* onlineSpace(services)
-      const delivery = yield* services.holdInvalidation(ReactivityKey.activation(spaceId))
-      delivery.arm(2)
+      const delivery = yield* services.holdInvalidationWhen(
+        ReactivityKey.activation(spaceId),
+        () => activationIs(space, "Inactive")
+      )
       const deactivating = yield* space.deactivate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
       yield* VirtualTime.advanceUntil(delivery.entered)
       yield* space.activate
