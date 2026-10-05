@@ -1548,11 +1548,9 @@ const makeLayer = <D extends Definition.Any, R,>(
             }
             entries.set(spaceId, result.value)
             yield* addContribution(result.value)
-            const announced = yield* notify([
-              ReactivityKey.aggregateStatus,
-              ReactivityKey.membership(spaceId),
-              ReactivityKey.spaces
-            ]).pipe(Effect.exit)
+            const announced = yield* restore(
+              notify([ReactivityKey.aggregateStatus, ReactivityKey.membership(spaceId), ReactivityKey.spaces])
+            ).pipe(Effect.exit)
             yield* Completion.settle(completion, Exit.void)
             yield* announced
             return result.value.handle

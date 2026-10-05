@@ -25,6 +25,7 @@ import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000f11")
 const otherSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000f12")
+const thirdSpaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000f13")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000f11")
 
 const twoSpaces = (constructor: Constructor) =>
@@ -158,6 +159,34 @@ describe("a status subscriber of a failed background turn that never returns", (
       assert.isTrue(activated !== undefined && Exit.isSuccess(activated), "the activation completed")
       assert.strictEqual(status._tag, "Online")
       assert.strictEqual(status.pending, 0)
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("a membership subscriber of a join that never returns", () => {
+  it.effect.each(constructors)(
+    "does not hold back the interruption of the join or a join that waited for it with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const replica = yield* services.start(idleRemote)
+      const delivery = yield* services.holdInvalidation(ReactivityKey.membership(thirdSpaceId))
+      delivery.arm(1)
+      const inserting = yield* services.holdStatement("INSERT INTO effect_local_client_spaces", true)
+      const joining = yield* replica.join(thirdSpaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(inserting.entered)
+      const waiting = yield* replica.join(thirdSpaceId).pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* inserting.release
+      yield* VirtualTime.advanceUntil(delivery.entered)
+
+      const interrupting = yield* Fiber.interrupt(joining).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* settle
+      const interrupted = interrupting.pollUnsafe() !== undefined
+      const waited = waiting.pollUnsafe()
+      const listed = yield* replica.spaces
+
+      assert.isTrue(interrupted, "the join was interrupted while its notification was being delivered")
+      assert.isTrue(waited !== undefined && Exit.isSuccess(waited), "the join that waited completed")
+      assert.strictEqual(listed.length, 3, "the space was joined")
     }, VirtualTime.scoped)
   )
 })
