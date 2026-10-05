@@ -8,6 +8,7 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
+import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
@@ -1575,25 +1576,19 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const status = Ref.get(aggregate)
 
-      const backgroundTurn = Effect.gen(function*() {
-        const work = yield* LosslessQueue.take(backgroundQueue)
+      const runBackgroundWork = Effect.fnUntraced(function*(work: BackgroundWork, entry: RememberedEntry) {
+        const generation = entry.backgroundGeneration
         if (work._tag === "Deactivate") {
-          const generation = work.entry.backgroundGeneration
-          const result = yield* deactivate(work.entry, false, work.runtime, false).pipe(Effect.result)
+          const result = yield* deactivate(entry, false, work.runtime, false).pipe(Effect.result)
           if (Result.isFailure(result)) {
-            yield* settleBackgroundTurn(work.entry, generation, result.failure, Option.none())
+            yield* settleBackgroundTurn(entry, generation, result.failure, Option.none())
           }
           return
         }
-        const spaceId = work.spaceId
-        backgroundQueued.delete(spaceId)
-        const entry = entries.get(spaceId)
-        if (entry === undefined) return
         if (entry.leaving) {
           entry.dueWhileLeaving = true
           return
         }
-        const generation = entry.backgroundGeneration
         let activeRuntime: ActiveRuntime | undefined
         const transportGeneration = yield* remote.transportGeneration
         const result = yield* withLease(entry, false, (runtime) => {
@@ -1618,6 +1613,48 @@ const makeLayer = <D extends Definition.Any, R,>(
         if (Result.isFailure(result) && !leaveRejections.has(result.failure)) {
           yield* settleBackgroundTurn(entry, generation, result.failure, Option.some(transportGeneration))
         }
+      })
+
+      const settleDiedTurn = Effect.fnUntraced(function*(entry: RememberedEntry, cause: Cause.Cause<never>) {
+        yield* Effect.logError("Background sync turn died", cause).pipe(
+          Effect.annotateLogs({ "space.id": entry.spaceId })
+        )
+        const stranded = entry.runtime
+        if (stranded !== undefined) {
+          const closed = yield* deactivate(entry, false, stranded, false).pipe(Effect.exit)
+          if (Exit.isFailure(closed)) {
+            const interrupts = closed.cause.reasons.filter(Cause.isInterruptReason)
+            if (interrupts.length > 0) return yield* Effect.failCause(Cause.fromReasons<never>(interrupts))
+            yield* Effect.logError("Background runtime did not close after its turn died", closed.cause).pipe(
+              Effect.annotateLogs({ "space.id": entry.spaceId })
+            )
+          }
+        }
+        return yield* settleBackgroundTurn(
+          entry,
+          entry.backgroundGeneration,
+          new ReplicaError.ProtocolInvalid({ message: "Background sync turn died", cause: Cause.squash(cause) }),
+          Option.none()
+        )
+      })
+
+      const backgroundTurn = Effect.gen(function*() {
+        const work = yield* LosslessQueue.take(backgroundQueue)
+        let entry: RememberedEntry | undefined
+        if (work._tag === "Deactivate") {
+          entry = work.entry
+        } else {
+          backgroundQueued.delete(work.spaceId)
+          entry = entries.get(work.spaceId)
+        }
+        if (entry === undefined) return
+        const claimed = entry
+        yield* runBackgroundWork(work, claimed).pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+            return settleDiedTurn(claimed, cause)
+          })
+        )
       })
 
       yield* Effect.forEach(

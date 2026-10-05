@@ -117,6 +117,7 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
   ).pipe(Layer.build)
   const sql = Context.get(databaseContext, SqlClient.SqlClient)
   let locked: { readonly statement: string; remaining: number } | undefined
+  let dying: { readonly statement: string; remaining: number } | undefined
   let heldStatement:
     | {
       readonly statement: string
@@ -142,6 +143,11 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
         const statement = Reflect.apply(target, thisArg, args)
         if (!isStatement(statement)) return statement
         return Effect.andThen(wait, statement)
+      }
+      if (dying !== undefined && text.includes(dying.statement)) {
+        dying.remaining -= 1
+        if (dying.remaining <= 0) dying = undefined
+        return Effect.die("injected statement defect")
       }
       if (locked === undefined || !text.includes(locked.statement)) return Reflect.apply(target, thisArg, args)
       locked.remaining -= 1
@@ -213,6 +219,9 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
   const lockNext = (statement: string, times = 1) => {
     locked = { statement, remaining: times }
   }
+  const dieNext = (statement: string, times = 1) => {
+    dying = { statement, remaining: times }
+  }
   const holdStatement = Effect.fnUntraced(function*(statement: string, pass = false) {
     const entered = yield* Deferred.make<void>()
     const release = yield* Deferred.make<void>()
@@ -228,7 +237,7 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     return { arm, entered: Deferred.await(entered), release: Deferred.succeed(release, undefined) }
   })
   const lockRemaining = () => locked?.remaining ?? 0
-  return { sql, crypto, reactivity, start, lockNext, lockRemaining, holdStatement, holdInvalidation }
+  return { sql, crypto, reactivity, start, lockNext, lockRemaining, dieNext, holdStatement, holdInvalidation }
 })
 
 export type Services = Effect.Success<ReturnType<typeof services>>
