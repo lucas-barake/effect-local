@@ -740,6 +740,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       ) =>
         Effect.suspend(() => {
           if (entry.backgroundGeneration !== generation) return Effect.void
+          if (entry.runtime !== undefined && entry.runtime.foreground) return Effect.void
           const published = publishBackgroundFailure(entry)
           const stopWait = FiberMap.remove(credentialWaits, entry.membershipIncarnation)
           if (Reconciler.isTransientFailure(failure)) {
@@ -1623,7 +1624,6 @@ const makeLayer = <D extends Definition.Any, R,>(
           return Effect.raceFirst(sync, Deferred.await(runtime.preemption))
         }).pipe(Effect.result)
         if (activeRuntime !== undefined) {
-          if (activeRuntime.foreground) return
           const deactivation = yield* deactivate(
             entry,
             false,
