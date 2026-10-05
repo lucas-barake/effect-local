@@ -128,11 +128,12 @@ type BaseRequirements<D extends Definition.Any,> =
 
 const operationPermits = Number.MAX_SAFE_INTEGER
 
-const CallerFiber = Context.Reference<boolean>("@lucas-barake/effect-local-sql/SqlReplica/CallerFiber", {
-  defaultValue: () => false
+const CallerFiber = Context.Reference<number | undefined>("@lucas-barake/effect-local-sql/SqlReplica/CallerFiber", {
+  defaultValue: () => undefined
 })
 
-const onCallerFiber = Effect.provideService(CallerFiber, true)
+const onCallerFiber = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
+  Effect.withFiber((fiber) => Effect.provideService(effect, CallerFiber, fiber.id))
 
 interface ActiveRuntime {
   readonly foreground: boolean
@@ -365,7 +366,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const flush = (keys: ReadonlyArray<string>) => Invalidation.flush(reactivity, keys)
       const notify = (keys: ReadonlyArray<string>) =>
         Effect.withFiber((fiber) => {
-          if (fiber.getRef(CallerFiber)) return Invalidation.notify(reactivity, keys)
+          if (fiber.getRef(CallerFiber) === fiber.id) return Invalidation.notify(reactivity, keys)
           return flush(keys)
         })
       const collectOutcomes = () => {
