@@ -12,10 +12,15 @@ contracts, tagged `ReplicaError` failures, replica status, canonical encoding, a
 `Replica.Space` addresses data, pending work, receipts, replication scope, activation, and status for one durable
 membership. Root aggregate status is a constant size count summary rather than a list of every space status.
 
-`Model.make` accepts local secondary index declarations with ordered partition and sort components. The typed
-`Transaction.Query.from` builder exposes index checked bounds, ordering, limits, opaque keyset cursors, pages, and
-streams. Index layouts stay outside the wire definition and schema identity. See the repository guide for the complete
-declaration and query examples.
+Query handlers read through the `Transaction.Query` capability. `query.get(model, key)` reads one entity and re-runs
+only when that entity changes. `query.sql(models, statement)` runs one raw SQLite statement over a CTE per declared
+model, named after the model, with a `key` column, a `value` column holding the encoded entity JSON, and one column per
+top-level field. Bounds, ordering, limits, and keyset pagination are plain SQL in that statement, and the mounted query
+re-runs when any entity of a declared model changes.
+
+`Model.make` accepts secondary index declarations with ordered partition and sort components. The server materializes
+them to back replication windows, which bound a model to the newest entities per index partition. Index layouts stay
+outside schema identity. See the repository guide for the complete declaration and query examples.
 
 This package does not persist or transport data. Use `@lucas-barake/effect-local-sql` for the local and authoritative
 logs, `@lucas-barake/effect-local-rpc` for WebSockets, and `@lucas-barake/effect-local-browser` for Effect Atom.

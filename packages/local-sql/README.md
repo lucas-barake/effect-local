@@ -44,15 +44,11 @@ receipts, a bounded accepted suffix, per space cursors, resumable snapshot stagi
 reconciliation generations. Optimistic writes, incremental reconciliation, and snapshot installation are
 transactional. Workflow storage contains execution control only.
 
-Declared model indexes are materialized as owner qualified SQLite shadow tables with typed component columns and
-covering scan indexes. A checksum catalog verifies exact DDL and resumes bounded active generation backfills only
-while the visible revision remains stable. Missing tables are rebuilt and obsolete layouts are removed after current
-layouts become ready. Query
-handlers use SQLite bounds, ordering, limits, and keyset continuation, then decode every selected row through
-`SqlSchema` and the model Schema. Portable streams paginate because the pinned Node and worker SQLite drivers do not
-provide a schema decoded statement stream. Local writes and sync replay update shadow rows in the same transaction.
-Each replica owns its mounted query footprints. Range intersection refreshes only results that can change. Publication
-is queued before transaction exit and flushed by the outer Reactivity batch after commit or rollback.
+Client SQLite stores no secondary index tables. Declared model indexes are materialized only in server storage, where
+they back replication windows. Query handlers read the visible entities through `query.get` and `query.sql`, and express
+bounds, ordering, limits, and keyset continuation as plain SQL over the generated model CTEs, decoding the raw rows with
+`SqlSchema` at the call site. A `query.sql` read is invalidated whenever any entity of a model it declared changes,
+whatever the row range, and a `query.get` read is invalidated only when its exact entity changes.
 
 The caller chooses the Workflow engine and runner. A durable single runner composition is:
 

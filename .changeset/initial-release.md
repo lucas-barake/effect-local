@@ -21,8 +21,10 @@ watermarks preserve at most once execution after private results are reclaimed. 
 are bounded without deleting rows still required by pending mutations.
 
 Effect Cluster runs both sides. `SyncServer.layer` builds the whole server from a definition and four authorization
-callbacks: the authenticated gateway, one entity per space, the durable store, the ephemeral hub, HMAC-signed
-principal assertions, write-triggered compaction, and a maintenance singleton. It runs unchanged on one runner or many.
+callbacks: the authenticated gateway, one entity per space, the durable store, the ephemeral hub, HMAC-signed principal
+assertions, write-triggered compaction, and a maintenance singleton. It runs on one runner or many. Several runners must
+share one `assertionSecret`, because each process otherwise generates its own random secret and rejects the assertions
+another runner signed.
 In the browser, `BrowserReplica.layer` turns every tab of an origin into a runner of one cluster, hosts the replica on
 the leader tab that owns SQLite, fails over when that tab closes, and `ReplicaAtom.make` exposes it as an Atom graph.
 Tabs from different deploys never share a cluster: the newest build takes the database over and every tab of an older

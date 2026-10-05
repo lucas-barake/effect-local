@@ -156,14 +156,15 @@ accepted evidence, staged entities, staged bytes, and incoming page bytes. The i
 dispatcher with independent watches and turns. Workflow generations coalesce durable requests. Streams and
 publications carry only notifications.
 
-`SpaceEntity.HandlerOptions` requires positive finite `admissionMailboxCapacity`, `readMailboxCapacity`,
-`watchMailboxCapacity`, `ephemeralJoinMailboxCapacity`, and `ephemeralCommandMailboxCapacity` values. It also requires
-`maximumConcurrentBootstrapAuthorizations`, `maximumConcurrentBootstrapPagesPerSpace`,
-`maximumConcurrentEphemeralJoinVerificationsPerSpace`, and `maximumConcurrentEphemeralRequestsPerSpace`. Join
-mailboxes bound active watchers plus pending verification. Join verification and command work use separate per space
-allowances. Bootstrap assertion verification and preparation share one fail fast Layer wide allowance. Published page
-reads use a separate per space allowance. Saturation reports `CapacityExceeded` with resource
-`bootstrap authorizations`, `bootstrap pages`, or `ephemeral join verifications`.
+Every `SpaceEntity.HandlerOptions` field is optional. One `mailboxCapacity` (a positive safe integer or `"unbounded"`)
+bounds the active requests of a space entity, open `Watch` and `JoinEphemeral` streams included. When it is omitted,
+Cluster's `ShardingConfig.entityMailboxCapacity` applies. `maximumConcurrentBootstrapAuthorizations` (64),
+`maximumConcurrentBootstrapPagesPerSpace` (4), `maximumConcurrentEphemeralJoinVerificationsPerSpace` (64), and
+`maximumConcurrentEphemeralRequestsPerSpace` (64) default to the values shown and must be positive safe integers. Join
+verification and ephemeral publish and heartbeat work use separate per space allowances. Bootstrap assertion
+verification and preparation share one fail fast Layer wide allowance. Published page reads use a separate per space
+allowance. Saturation reports `CapacityExceeded` with resource `bootstrap authorizations`, `bootstrap pages`, or
+`ephemeral join verifications`.
 
 `ServerStore.maximumWatchersPerSpace` is the active sync watcher allowance. `EphemeralHub.maximumWatchersPerSpace` is a
 separate joined-stream allowance. `ServerStore.wakeCapacity` is the sliding sync hint depth. `EphemeralHub.capacity`

@@ -191,7 +191,8 @@ component can publish or clear state without reaching for the `EphemeralClient` 
 
 The remaining graph families expose `entity`, `query`, `mutation`, `pending`, `receipt`, `settlements`, `scope`,
 `setScope`, `activation`, `activate`, `deactivate`, `status`, `spaces`, `join`, `leave`, and the constant-size
-`aggregateStatus`. Effect `Reactivity` refreshes only mounted reads whose exact space, entity, or index range changed.
+`aggregateStatus`. Effect `Reactivity` keys every read by space. An `entity` read and a `query.get` read refresh only
+when their exact entity changes, and a `query.sql` read refreshes when any entity of a model it declared changes.
 Leaving a space invalidates retained atoms for that address.
 
 Profiles passed to `ephemeral` sessions must be registered in `BrowserReplica.layer`'s `profiles` option, and
