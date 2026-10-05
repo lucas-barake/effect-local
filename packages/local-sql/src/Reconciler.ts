@@ -21,7 +21,7 @@ import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
-import { backoff, credentialChange } from "./internal/transport.js"
+import { backoff, credentialChange, superviseWatch } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as SyncEngine from "./SyncEngine.js"
 
@@ -404,15 +404,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
 
   const readmit = (space: ManagedState): Effect.Effect<void> =>
     enqueue(space).pipe(
-      Effect.catchCause((cause) => {
-        if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
-        if (Errors.endsLoop(managerScope, cause)) return Effect.failCause(cause)
-        const failure = Errors.iterationFailure("Reconciliation readmission died", cause)
-        return Errors.logDefect("Reconciliation readmission died", cause).pipe(
-          Effect.annotateLogs({ "space.id": space.spaceId }),
-          Effect.andThen(Effect.fail(failure))
-        )
-      }),
+      Errors.failDiedIteration(managerScope, "Reconciliation readmission died", space.spaceId),
       Effect.catch(Effect.fnUntraced(function*(error) {
         const transportGeneration = yield* remote.transportGeneration
         const observedGeneration = yield* space.reconciliation.generation
@@ -457,19 +449,14 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       yield* Queue.offer(queue, { spaceId: current.spaceId, generation: current.generation })
     }).pipe(Effect.uninterruptible)
     return turn.pipe(
-      Effect.catchCause((cause) => {
-        if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
-        if (Errors.endsLoop(managerScope, cause)) return Effect.failCause(cause)
-        const failure = Errors.iterationFailure("Reconciliation turn died", cause)
-        return Errors.logDefect("Reconciliation turn died", cause).pipe(
-          Effect.annotateLogs({ "space.id": space.spaceId }),
-          Effect.andThen(space.reconciliation.generation),
-          Effect.map((generation) => {
-            observedGeneration = generation
-          }),
-          Effect.andThen(Effect.fail(failure))
-        )
-      }),
+      Errors.failDiedIteration(
+        managerScope,
+        "Reconciliation turn died",
+        space.spaceId,
+        Effect.map(space.reconciliation.generation, (generation) => {
+          observedGeneration = generation
+        })
+      ),
       Effect.catch((error) =>
         handleFailure(space, error, transportGeneration, observedGeneration).pipe(Effect.catch(() => Effect.void))
       ),
@@ -576,39 +563,17 @@ export const makeManager = Effect.fnUntraced(function*(options: {
               )
           ))
         })
-      let watchEnded: Cause.Cause<never> | undefined
-      const superviseWatch = (): Effect.Effect<void> =>
-        Effect.suspend(() => {
-          const ended = watchEnded
-          watchEnded = undefined
-          if (ended === undefined) return watch()
-          const resubscribed = watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep))
-          if (Errors.causeKind(ended) !== "Defect") return Effect.andThen(resubscribed, watch())
-          const died = Errors.unexpectedFailure("Sync watch died", ended)
-          const reported = state.reconciliation.watchFailed(died).pipe(
-            Effect.catchCause((cause) => Errors.logDefect("Sync watch failure report died", cause))
-          )
-          const requested = readmit(state).pipe(
-            Effect.catchCause((cause) => Errors.logDefect("Sync request after a watch failure died", cause))
-          )
-          return Effect.logError("Sync watch died", ended).pipe(
-            Effect.andThen(reported),
-            Effect.andThen(resubscribed),
-            Effect.andThen(requested),
-            Effect.annotateLogs({ "space.id": space.spaceId }),
-            Effect.andThen(watch())
-          )
-        }).pipe(
-          Effect.catchCause((cause) => {
-            if (Errors.endsLoop(managerScope, cause)) return Effect.failCause(cause)
-            watchEnded = cause
-            return superviseWatch()
-          })
-        )
       yield* FiberMap.run(
         watches,
         managedKey(space.spaceId, space.generation),
-        superviseWatch().pipe(Effect.provideService(ConnectionLane.Priority, "Background"))
+        superviseWatch({
+          scope: managerScope,
+          spaceId: space.spaceId,
+          watch: watch(),
+          closedDelay: watchBackoff.closed,
+          watchFailed: (error) => state.reconciliation.watchFailed(error),
+          resync: readmit(state)
+        }).pipe(Effect.provideService(ConnectionLane.Priority, "Background"))
       )
       return yield* enqueue(state)
     },
@@ -1054,19 +1019,14 @@ export const layerInMemoryScheduler = (
         yield* reconciliation.succeeded
         retryAttempt = 0
       }).pipe(
-        Effect.catchCause((cause) => {
-          if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
-          if (Errors.endsLoop(schedulerScope, cause)) return Effect.failCause(cause)
-          const failure = Errors.iterationFailure("Reconciliation turn died", cause)
-          return Errors.logDefect("Reconciliation turn died", cause).pipe(
-            Effect.annotateLogs({ "space.id": options.spaceId }),
-            Effect.andThen(reconciliation.generation),
-            Effect.map((generation) => {
-              observedGeneration = generation
-            }),
-            Effect.andThen(Effect.fail(failure))
-          )
-        }),
+        Errors.failDiedIteration(
+          schedulerScope,
+          "Reconciliation turn died",
+          options.spaceId,
+          Effect.map(reconciliation.generation, (generation) => {
+            observedGeneration = generation
+          })
+        ),
         Effect.catch(Effect.fnUntraced(function*(error) {
           if (error._tag === "CredentialRejected") {
             if (error.credentialGeneration === undefined) {
@@ -1164,36 +1124,14 @@ export const layerInMemoryScheduler = (
             )
           )
         })
-      let watchEnded: Cause.Cause<never> | undefined
-      const superviseWatch = (): Effect.Effect<void, never, Scope.Scope> =>
-        Effect.suspend(() => {
-          const ended = watchEnded
-          watchEnded = undefined
-          if (ended === undefined) return watch()
-          const resubscribed = watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep))
-          if (Errors.causeKind(ended) !== "Defect") return Effect.andThen(resubscribed, watch())
-          const died = Errors.unexpectedFailure("Sync watch died", ended)
-          const reported = reconciliation.watchFailed(died).pipe(
-            Effect.catchCause((cause) => Errors.logDefect("Sync watch failure report died", cause))
-          )
-          const requested = resyncAfterWatchFailure.pipe(
-            Effect.catchCause((cause) => Errors.logDefect("Sync request after a watch failure died", cause))
-          )
-          return Effect.logError("Sync watch died", ended).pipe(
-            Effect.andThen(reported),
-            Effect.andThen(resubscribed),
-            Effect.andThen(requested),
-            Effect.annotateLogs({ "space.id": options.spaceId }),
-            Effect.andThen(watch())
-          )
-        }).pipe(
-          Effect.catchCause((cause) => {
-            if (Errors.endsLoop(schedulerScope, cause)) return Effect.failCause(cause)
-            watchEnded = cause
-            return superviseWatch()
-          })
-        )
-      const watchFiber = yield* superviseWatch().pipe(
+      const watchFiber = yield* superviseWatch({
+        scope: schedulerScope,
+        spaceId: options.spaceId,
+        watch: watch(),
+        closedDelay: watchBackoff.closed,
+        watchFailed: (error) => reconciliation.watchFailed(error),
+        resync: resyncAfterWatchFailure
+      }).pipe(
         Effect.provideService(ConnectionLane.Priority, "Background"),
         Effect.forkScoped
       )

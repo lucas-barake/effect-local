@@ -1609,15 +1609,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       ) {
         if (work._tag === "Deactivate") {
           const result = yield* deactivate(entry, false, work.runtime, false).pipe(
-            Effect.catchCause((cause) => {
-              if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
-              if (Errors.endsLoop(parentScope, cause)) return Effect.failCause(cause)
-              const failure = Errors.iterationFailure("Background runtime release died", cause)
-              return Errors.logDefect("Background runtime release died", cause).pipe(
-                Effect.annotateLogs({ "space.id": entry.spaceId }),
-                Effect.andThen(Effect.fail(failure))
-              )
-            }),
+            Errors.failDiedIteration(parentScope, "Background runtime release died", entry.spaceId),
             Effect.result
           )
           if (Result.isFailure(result)) {
@@ -1637,15 +1629,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (workflow !== undefined) sync = backgroundWorkflowTurns.withPermit(sync)
           return Effect.raceFirst(sync, Deferred.await(runtime.preemption))
         }).pipe(
-          Effect.catchCause((cause) => {
-            if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
-            if (Errors.endsLoop(parentScope, cause)) return Effect.failCause(cause)
-            const failure = Errors.iterationFailure("Background sync turn died", cause)
-            return Errors.logDefect("Background sync turn died", cause).pipe(
-              Effect.annotateLogs({ "space.id": entry.spaceId }),
-              Effect.andThen(Effect.fail(failure))
-            )
-          }),
+          Errors.failDiedIteration(parentScope, "Background sync turn died", entry.spaceId),
           Effect.result
         )
         if (activeRuntime !== undefined) {
@@ -1656,15 +1640,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             activeRuntime,
             Result.isSuccess(result)
           ).pipe(
-            Effect.catchCause((cause) => {
-              if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
-              if (Errors.endsLoop(parentScope, cause)) return Effect.failCause(cause)
-              const failure = Errors.iterationFailure("Background runtime release died", cause)
-              return Errors.logDefect("Background runtime release died", cause).pipe(
-                Effect.annotateLogs({ "space.id": entry.spaceId }),
-                Effect.andThen(Effect.fail(failure))
-              )
-            }),
+            Errors.failDiedIteration(parentScope, "Background runtime release died", entry.spaceId),
             Effect.result
           )
           if (Result.isFailure(deactivation)) {

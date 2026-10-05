@@ -1,3 +1,4 @@
+import type * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
@@ -36,3 +37,26 @@ const isStopping = (scope: Scope.Scope): boolean => {
 
 export const endsLoop = (scope: Scope.Scope, cause: Cause.Cause<unknown>): boolean =>
   causeKind(cause) === "Interruption" && isStopping(scope)
+
+export const failDiedIteration = (
+  scope: Scope.Scope,
+  message: string,
+  spaceId: Identity.SpaceId,
+  beforeFailing: Effect.Effect<void> = Effect.void
+) =>
+<A, E extends { readonly _tag: string }, R,>(
+  iteration: Effect.Effect<A, E, R>
+): Effect.Effect<A, E | ReplicaError.UnexpectedFailure | ReplicaError.ServerUnavailable, R> =>
+  Effect.catchCause(
+    iteration,
+    (cause): Effect.Effect<never, E | ReplicaError.UnexpectedFailure | ReplicaError.ServerUnavailable> => {
+      if (causeKind(cause) === "Failure") return Effect.failCause(cause)
+      if (endsLoop(scope, cause)) return Effect.failCause(cause)
+      const failure = iterationFailure(message, cause)
+      return logDefect(message, cause).pipe(
+        Effect.annotateLogs({ "space.id": spaceId }),
+        Effect.andThen(beforeFailing),
+        Effect.andThen(Effect.fail(failure))
+      )
+    }
+  )

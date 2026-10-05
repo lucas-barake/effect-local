@@ -26,7 +26,7 @@ import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
-import { credentialChange } from "./internal/transport.js"
+import { credentialChange, superviseWatch } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Reconciler from "./Reconciler.js"
 import * as SyncEngine from "./SyncEngine.js"
@@ -602,19 +602,14 @@ const layerSchedulerWithConfiguration = (
             retryAttempt = 0
           }
         }).pipe(
-          Effect.catchCause((cause) => {
-            if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
-            if (Errors.endsLoop(schedulerScope, cause)) return Effect.failCause(cause)
-            const failure = Errors.iterationFailure("Reconciliation supervisor turn died", cause)
-            return Errors.logDefect("Reconciliation supervisor turn died", cause).pipe(
-              Effect.annotateLogs({ "space.id": options.spaceId }),
-              Effect.andThen(reconciliation.generation),
-              Effect.map((generation) => {
-                observedGeneration = generation
-              }),
-              Effect.andThen(Effect.fail(failure))
-            )
-          }),
+          Errors.failDiedIteration(
+            schedulerScope,
+            "Reconciliation supervisor turn died",
+            options.spaceId,
+            Effect.map(reconciliation.generation, (generation) => {
+              observedGeneration = generation
+            })
+          ),
           Effect.result
         )
         if (Result.isSuccess(result)) return false
@@ -731,36 +726,14 @@ const layerSchedulerWithConfiguration = (
           return
         }
       })
-      let watchEnded: Cause.Cause<never> | undefined
-      const superviseWatch = (): Effect.Effect<void, never, Scope.Scope> =>
-        Effect.suspend(() => {
-          const ended = watchEnded
-          watchEnded = undefined
-          if (ended === undefined) return watch
-          const resubscribed = watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep))
-          if (Errors.causeKind(ended) !== "Defect") return Effect.andThen(resubscribed, watch)
-          const died = Errors.unexpectedFailure("Sync watch died", ended)
-          const reported = reconciliation.watchFailed(died).pipe(
-            Effect.catchCause((cause) => Errors.logDefect("Sync watch failure report died", cause))
-          )
-          const requested = resyncAfterWatchFailure.pipe(
-            Effect.catchCause((cause) => Errors.logDefect("Sync request after a watch failure died", cause))
-          )
-          return Effect.logError("Sync watch died", ended).pipe(
-            Effect.andThen(reported),
-            Effect.andThen(resubscribed),
-            Effect.andThen(requested),
-            Effect.annotateLogs({ "space.id": options.spaceId }),
-            Effect.andThen(watch)
-          )
-        }).pipe(
-          Effect.catchCause((cause) => {
-            if (Errors.endsLoop(schedulerScope, cause)) return Effect.failCause(cause)
-            watchEnded = cause
-            return superviseWatch()
-          })
-        )
-      const watchFiber = yield* superviseWatch().pipe(
+      const watchFiber = yield* superviseWatch({
+        scope: schedulerScope,
+        spaceId: options.spaceId,
+        watch,
+        closedDelay: watchBackoff.closed,
+        watchFailed: (error) => reconciliation.watchFailed(error),
+        resync: resyncAfterWatchFailure
+      }).pipe(
         Effect.provideService(ConnectionLane.Priority, "Background"),
         Effect.forkScoped
       )
