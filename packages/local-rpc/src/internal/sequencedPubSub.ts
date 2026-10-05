@@ -28,7 +28,7 @@ export const publish = <A,>(self: SequencedPubSub<A>, value: A): Effect.Effect<v
   Effect.suspend(() => {
     self.published = self.published + 1
     return PubSub.publish(self.pubsub, { sequence: self.published, value })
-  }).pipe(Effect.asVoid)
+  }).pipe(Effect.asVoid, Effect.provideService(Scheduler.PreventSchedulerYield, true))
 
 export const subscribe = <A,>(
   self: SequencedPubSub<A>
