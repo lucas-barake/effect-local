@@ -1096,3 +1096,70 @@ describe("watches that die subscribe again", () => {
     }, VirtualTime.scoped)
   )
 })
+
+const storePendingCountStatement = "SELECT COUNT(*) AS count FROM effect_local_client_pending_data"
+const noStatement = "no statement contains this text"
+
+describe("a failure report that dies", () => {
+  it.effect.each(constructors)(
+    "syncs the next mutation after a foreground turn died and its status report died too with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logs = captureLogs()
+      let undecodable = false
+      const { space } = yield* foregroundSpaces(
+        services,
+        SyncEngine.SyncEngine.of({
+          ...idleRemote,
+          submitBatch: acceptSubmission,
+          pull: (request) => {
+            if (undecodable && request.spaceId === spaceId) return Effect.die("undecodable response")
+            return emptyPage(services.crypto, request)
+          }
+        }),
+        logs.layerLogs
+      )
+      undecodable = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      services.dieNext(storePendingCountStatement, 1_000_000)
+      yield* settle("5 seconds")
+      services.dieNext(noStatement)
+      undecodable = false
+      yield* space.mutate(Domain.PutTodo, Domain.todo("second"))
+
+      const drained = yield* eventually(services, space, isOnlineDrained)
+
+      assert.deepStrictEqual(logs.defects().slice(0, 1), ["undecodable response"])
+      assert.isTrue(logs.defects().includes("injected statement defect"), "the report defect was logged")
+      assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Online, pending 0")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "reports an in-memory turn that died as failed when the pending count for the report died too",
+    Effect.fnUntraced(function*() {
+      let undecodable = false
+      const { awaitStatus, dieOn, forgetStatuses, local, logs, reconciler } = yield* inMemoryScheduler({
+        pull: Effect.suspend(() => {
+          if (undecodable) return Effect.die("undecodable response")
+          return Effect.void
+        }),
+        watch: Effect.never
+      })
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      undecodable = true
+      dieOn(storePendingCountStatement)
+      yield* forgetStatuses
+      yield* reconciler.schedule
+
+      const failed = yield* awaitStatus((status) => status._tag === "Failed")
+      dieOn(undefined)
+      undecodable = false
+      const drained = yield* awaitStatus((status) => status._tag === "Online" && status.pending === 0)
+
+      assert.strictEqual(reportedFailure(failed), "UnexpectedFailure")
+      assert.deepStrictEqual(logs.defects().slice(0, 1), ["undecodable response"])
+      assert.isTrue(Option.isSome(drained), "the retry drained the space")
+    }, VirtualTime.scoped)
+  )
+})

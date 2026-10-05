@@ -639,6 +639,12 @@ export const layerOnePass = (
       ) =>
         local.pendingCount.pipe(
           Effect.catch(() => Effect.succeed(0)),
+          Effect.catchCause((cause) =>
+            Effect.logError("Pending count for a failure report died", cause).pipe(
+              Effect.annotateLogs({ "space.id": options.spaceId }),
+              Effect.as(0)
+            )
+          ),
           Effect.flatMap((pending) =>
             Ref.modify(
               status,
