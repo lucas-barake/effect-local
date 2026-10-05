@@ -15,7 +15,7 @@ const deliver = (keys: Iterable<string>, invalidate: (key: string) => Effect.Eff
         })
       ),
     { discard: true }
-  ).pipe(Effect.uninterruptible)
+  )
 
 export const notify = (reactivity: Reactivity.Reactivity, keys: Iterable<string>): Effect.Effect<void> =>
   deliver(keys, (key) => reactivity.invalidate([key]))

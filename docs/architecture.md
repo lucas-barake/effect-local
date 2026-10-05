@@ -67,10 +67,14 @@ application data authority.
 9. Successful reconciliation advances the completed generation idempotently. A newer requested generation starts a
    new finite Workflow.
 10. Effect `Reactivity` invalidates affected models, pending inspection, receipts, and status after the SQL transaction
-    commits. Every invalidation is delivered one key at a time, after the state it announces is applied. A subscriber
-    that throws is logged at error level with its key and never fails the operation that notified it. Subscribers
-    registered after it on the same key miss that one notification, because Effect `Reactivity` stops iterating a
-    key's handlers at the first throw.
+    commits. Every invalidation is delivered one key at a time, after the state it announces is applied and before
+    the operation's waiters resume. A subscriber that throws is logged at error level with its key and never fails
+    the operation that notified it. Subscribers registered after it on the same key miss that one notification,
+    because Effect `Reactivity` stops iterating a key's handlers at the first throw. Notifications raised on the
+    caller's fiber by `join`, `leave`, `activate`, `deactivate`, and `setScope` join the caller's
+    `Reactivity.withBatch` and run when that batch ends. Notifications raised by a space's runtime, including a
+    commit's, are delivered immediately. Delivery is interruptible, so a custom `Reactivity` whose `invalidate`
+    never returns cannot hold back a deactivation, a leave, or the replica's shutdown.
 
 The local commit and server settlement contracts are separate. `mutate` returns after the optimistic SQLite commit and
 never widens its error channel with a later server outcome. Durable pending inspection exposes the decoded payload,

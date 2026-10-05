@@ -161,19 +161,15 @@ describe("Invalidation.notify", () => {
   )
 
   it.effect(
-    "notifies every key when the caller is interrupted while a notification is being delivered",
+    "stops when the caller is interrupted while a notification is being delivered",
     Effect.fnUntraced(function*() {
       const base = yield* Reactivity.make
       const reached = yield* Deferred.make<void>()
-      const resume = yield* Deferred.make<void>()
       const reactivity: Reactivity.Reactivity = {
         ...base,
         invalidate: (keys) => {
           if (!Array.isArray(keys) || !keys.includes("second")) return base.invalidate(keys)
-          return Deferred.succeed(reached, undefined).pipe(
-            Effect.andThen(Deferred.await(resume)),
-            Effect.andThen(base.invalidate(keys))
-          )
+          return Effect.andThen(Deferred.succeed(reached, undefined), Effect.never)
         }
       }
       const notified: Array<string> = []
@@ -186,11 +182,11 @@ describe("Invalidation.notify", () => {
         Effect.forkChild({ startImmediately: true })
       )
       yield* Deferred.await(reached)
-      const interrupting = yield* Fiber.interrupt(notifying).pipe(Effect.forkChild({ startImmediately: true }))
-      yield* Deferred.succeed(resume, undefined)
-      yield* Fiber.join(interrupting)
 
-      assert.deepStrictEqual(notified, ["first", "second", "third"])
+      const exit = yield* Fiber.interrupt(notifying).pipe(Effect.andThen(Fiber.await(notifying)))
+
+      assert.isTrue(Exit.hasInterrupts(exit), "the notification ended with the interruption")
+      assert.deepStrictEqual(notified, ["first"])
     })
   )
 

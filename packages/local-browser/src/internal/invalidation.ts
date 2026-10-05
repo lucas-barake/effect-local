@@ -15,4 +15,4 @@ export const notify = (reactivity: Reactivity.Reactivity, keys: Iterable<string>
         })
       ),
     { discard: true }
-  ).pipe(Effect.uninterruptible)
+  )
