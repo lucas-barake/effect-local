@@ -586,6 +586,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               Layer.provide(
                 Layer.succeed(ReconciliationWorkflow.Registration, entry.workflowRegistration)
               ),
+              Layer.provide(Layer.succeed(ReconciliationWorkflow.RegistrationScope, parentScope)),
               Layer.buildWithScope(childScope),
               Effect.provide(workflowContext),
               Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
@@ -1602,6 +1603,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           const result = yield* deactivate(entry, false, work.runtime, false).pipe(
             Effect.catchCause((cause) => {
               if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
+              if (Errors.endsLoop(parentScope, cause)) return Effect.failCause(cause)
               const failure = Errors.iterationFailure("Background runtime release died", cause)
               return Errors.logDefect("Background runtime release died", cause).pipe(
                 Effect.annotateLogs({ "space.id": entry.spaceId }),
@@ -1629,6 +1631,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         }).pipe(
           Effect.catchCause((cause) => {
             if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
+            if (Errors.endsLoop(parentScope, cause)) return Effect.failCause(cause)
             const failure = Errors.iterationFailure("Background sync turn died", cause)
             return Errors.logDefect("Background sync turn died", cause).pipe(
               Effect.annotateLogs({ "space.id": entry.spaceId }),
@@ -1647,6 +1650,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           ).pipe(
             Effect.catchCause((cause) => {
               if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
+              if (Errors.endsLoop(parentScope, cause)) return Effect.failCause(cause)
               const failure = Errors.iterationFailure("Background runtime release died", cause)
               return Errors.logDefect("Background runtime release died", cause).pipe(
                 Effect.annotateLogs({ "space.id": entry.spaceId }),
@@ -1704,7 +1708,10 @@ const makeLayer = <D extends Definition.Any, R,>(
         const claimed = entry
         const generation = claimed.backgroundGeneration
         yield* runBackgroundWork(work, claimed, generation).pipe(
-          Effect.catchCause((cause) => settleDiedTurn(claimed, generation, cause))
+          Effect.catchCause((cause) => {
+            if (Errors.endsLoop(parentScope, cause)) return Effect.failCause(cause)
+            return settleDiedTurn(claimed, generation, cause)
+          })
         )
       })
 
@@ -1719,7 +1726,10 @@ const makeLayer = <D extends Definition.Any, R,>(
         { discard: true }
       )
       yield* retrySchedulerTurn.pipe(
-        Effect.catchCause(rearmRetries),
+        Effect.catchCause((cause) => {
+          if (Errors.endsLoop(parentScope, cause)) return Effect.failCause(cause)
+          return rearmRetries(cause)
+        }),
         Effect.forever,
         Effect.provideService(ConnectionLane.Priority, "Background"),
         Effect.forkScoped({ startImmediately: true })

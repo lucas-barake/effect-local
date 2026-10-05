@@ -1281,14 +1281,18 @@ describe("inner work that ends by interruption only", () => {
     }, VirtualTime.scoped)
   )
 
-  it.effect(
-    "logs no error when the replica scope closes while a foreground workflow turn is in flight",
-    Effect.fnUntraced(function*() {
-      const services = yield* twoSpaces("layerWorkflow")
-      const logs = captureLogs()
+  it.effect.each(constructors)(
+    "reports nothing and schedules no retry when the replica scope closes while a foreground turn is in flight with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      const logged: Array<string> = []
+      const logger = Logger.make<unknown, void>((entry) => {
+        logged.push(entry.logLevel)
+      })
       const pulling = yield* Deferred.make<void>()
       const replicaScope = yield* Scope.make()
       let hangs = false
+      let notifications = 0
       const { space } = yield* foregroundSpaces(
         services,
         SyncEngine.SyncEngine.of({
@@ -1299,16 +1303,21 @@ describe("inner work that ends by interruption only", () => {
             return Effect.andThen(Deferred.succeed(pulling, undefined), Effect.never)
           }
         }),
-        logs.layerLogs
+        Logger.layer([logger])
       ).pipe(Scope.provide(replicaScope))
       hangs = true
       yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
       yield* VirtualTime.advanceUntil(Deferred.await(pulling))
+      yield* settle("5 seconds")
+      logged.length = 0
+      services.reactivity.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+        notifications += 1
+      })
 
       yield* Scope.close(replicaScope, Exit.void)
       yield* settle("5 minutes")
 
-      assert.strictEqual(logs.errors(), 0)
+      assert.deepStrictEqual({ logged, notifications }, { logged: [], notifications: 0 })
     }, VirtualTime.scoped)
   )
 })

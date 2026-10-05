@@ -247,6 +247,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
   SyncEngine.SyncEngine | Scope.Scope
 > {
   const remote = yield* SyncEngine.SyncEngine
+  const managerScope = yield* Effect.scope
   const concurrency = options.concurrency ?? 8
   if (!Number.isSafeInteger(concurrency) || concurrency <= 0) {
     return yield* new ReplicaError.InvalidConfiguration({
@@ -405,6 +406,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     enqueue(space).pipe(
       Effect.catchCause((cause) => {
         if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
+        if (Errors.endsLoop(managerScope, cause)) return Effect.failCause(cause)
         const failure = Errors.iterationFailure("Reconciliation readmission died", cause)
         return Errors.logDefect("Reconciliation readmission died", cause).pipe(
           Effect.annotateLogs({ "space.id": space.spaceId }),
@@ -457,6 +459,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     return turn.pipe(
       Effect.catchCause((cause) => {
         if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
+        if (Errors.endsLoop(managerScope, cause)) return Effect.failCause(cause)
         const failure = Errors.iterationFailure("Reconciliation turn died", cause)
         return Errors.logDefect("Reconciliation turn died", cause).pipe(
           Effect.annotateLogs({ "space.id": space.spaceId }),
@@ -576,6 +579,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       const superviseWatch = (): Effect.Effect<void> =>
         watch().pipe(
           Effect.catchCause((cause) => {
+            if (Errors.endsLoop(managerScope, cause)) return Effect.failCause(cause)
             const resubscribed = watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep))
             if (Errors.causeKind(cause) !== "Defect") return Effect.andThen(resubscribed, superviseWatch())
             const died = Errors.unexpectedFailure("Sync watch died", cause)
@@ -941,6 +945,7 @@ export const layerInMemoryScheduler = (
       const retryTiming = yield* Configuration.retryTiming(options)
       const local = yield* LocalStore.Store
       const reconciliation = yield* Reconciliation
+      const schedulerScope = yield* Effect.scope
       const remote = yield* SyncEngine.SyncEngine
       const wake = yield* Queue.sliding<void>(1)
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
@@ -1032,6 +1037,7 @@ export const layerInMemoryScheduler = (
       }).pipe(
         Effect.catchCause((cause) => {
           if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
+          if (Errors.endsLoop(schedulerScope, cause)) return Effect.failCause(cause)
           const failure = Errors.iterationFailure("Reconciliation turn died", cause)
           return Errors.logDefect("Reconciliation turn died", cause).pipe(
             Effect.annotateLogs({ "space.id": options.spaceId }),
@@ -1069,6 +1075,7 @@ export const layerInMemoryScheduler = (
       const worker = Effect.andThen(LosslessQueue.take(wake), awaitAuthenticationChange).pipe(
         Effect.andThen(turn),
         Effect.catchCause((cause) => {
+          if (Errors.endsLoop(schedulerScope, cause)) return Effect.failCause(cause)
           if (Errors.causeKind(cause) !== "Defect") return Effect.void
           return Effect.logError("Reconciliation failure handling died", cause).pipe(
             Effect.annotateLogs({ "space.id": options.spaceId }),
@@ -1140,6 +1147,7 @@ export const layerInMemoryScheduler = (
       const superviseWatch = (): Effect.Effect<void, never, Scope.Scope> =>
         watch().pipe(
           Effect.catchCause((cause) => {
+            if (Errors.endsLoop(schedulerScope, cause)) return Effect.failCause(cause)
             const resubscribed = watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep))
             if (Errors.causeKind(cause) !== "Defect") return Effect.andThen(resubscribed, superviseWatch())
             const died = Errors.unexpectedFailure("Sync watch died", cause)

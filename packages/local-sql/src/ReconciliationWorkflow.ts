@@ -500,6 +500,11 @@ const layerSchedulerWithConfiguration = (
       const configuration = yield* RetryConfiguration
       const local = yield* LocalStore.Store
       const reconciliation = yield* Reconciler.Reconciliation
+      const currentScope = yield* Effect.scope
+      const schedulerScope = Option.getOrElse(
+        yield* Effect.serviceOption(RegistrationScope),
+        () => currentScope
+      )
       yield* Registration
       const remote = yield* SyncEngine.SyncEngine
       const engine = yield* WorkflowEngine.WorkflowEngine
@@ -599,6 +604,7 @@ const layerSchedulerWithConfiguration = (
         }).pipe(
           Effect.catchCause((cause) => {
             if (Errors.causeKind(cause) === "Failure") return Effect.failCause(cause)
+            if (Errors.endsLoop(schedulerScope, cause)) return Effect.failCause(cause)
             const failure = Errors.iterationFailure("Reconciliation supervisor turn died", cause)
             return Errors.logDefect("Reconciliation supervisor turn died", cause).pipe(
               Effect.annotateLogs({ "space.id": options.spaceId }),
@@ -649,6 +655,7 @@ const layerSchedulerWithConfiguration = (
         while (!stopped) {
           stopped = yield* superviseTurn.pipe(
             Effect.catchCause((cause) => {
+              if (Errors.endsLoop(schedulerScope, cause)) return Effect.succeed(true)
               if (Errors.causeKind(cause) !== "Defect") return Effect.succeed(false)
               return Effect.logError("Reconciliation failure handling died", cause).pipe(
                 Effect.annotateLogs({ "space.id": options.spaceId }),
@@ -726,6 +733,7 @@ const layerSchedulerWithConfiguration = (
       const superviseWatch = (): Effect.Effect<void, never, Scope.Scope> =>
         watch.pipe(
           Effect.catchCause((cause) => {
+            if (Errors.endsLoop(schedulerScope, cause)) return Effect.failCause(cause)
             const resubscribed = watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep))
             if (Errors.causeKind(cause) !== "Defect") return Effect.andThen(resubscribed, superviseWatch())
             const died = Errors.unexpectedFailure("Sync watch died", cause)
