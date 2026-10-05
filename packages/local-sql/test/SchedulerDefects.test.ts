@@ -221,54 +221,6 @@ describe("background turns that die", () => {
       assert.deepStrictEqual(logs.defects(), [])
     }, VirtualTime.scoped)
   )
-
-  it.effect.each(constructors)(
-    "keeps retrying other background spaces after the retry scheduler died with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* withPending(constructor, [spaceId, otherSpaceId])
-      const attempts = yield* makeAttempts
-      const logs = captureLogs()
-      const releaseOther = yield* Deferred.make<void>()
-      let transportWaitDies = true
-      let otherPulls = 0
-      const replica = yield* services.start(SyncEngine.SyncEngine.of({
-        ...idleRemote,
-        waitForTransportChange: () => {
-          if (transportWaitDies) return Effect.die("transport wait died")
-          return Effect.never
-        },
-        submitBatch: acceptSubmission,
-        pull: (request) => {
-          if (request.spaceId === spaceId) {
-            if (attempts.count() === 0) return Effect.andThen(attempts.record, serverUnavailable)
-            return Effect.andThen(attempts.record, emptyPage(services.crypto, request))
-          }
-          otherPulls += 1
-          if (otherPulls === 1) return Effect.andThen(Deferred.await(releaseOther), serverUnavailable)
-          return emptyPage(services.crypto, request)
-        }
-      })).pipe(Effect.provide(logs.layerLogs))
-      const space = yield* replica.space(spaceId)
-      const other = yield* replica.space(otherSpaceId)
-      yield* VirtualTime.advanceUntil(attempts.reached(1))
-
-      const failed = yield* eventually(services, space, isFailed)
-      transportWaitDies = false
-      yield* Deferred.succeed(releaseOther, undefined)
-      const otherDrained = yield* eventually(services, other, isDrained)
-
-      assert.isTrue(Option.isSome(otherDrained), "the other space retried and drained")
-      assert.strictEqual(failureMessage(failed), "UnexpectedFailure")
-      assert.deepStrictEqual(logs.defects(), ["transport wait died"])
-
-      yield* space.activate
-      yield* space.deactivate
-
-      const drained = yield* eventually(services, space, isDrained)
-
-      assert.isTrue(Option.isSome(drained))
-    }, VirtualTime.scoped)
-  )
 })
 
 const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
@@ -722,6 +674,99 @@ describe("turns that die retry with the normal backoff", () => {
       assert.strictEqual(reportedFailure(failed), "UnexpectedFailure")
       assert.deepStrictEqual(logs.defects(), ["undecodable response"])
       assert.isTrue(Option.isSome(drained))
+    }, VirtualTime.scoped)
+  )
+})
+
+const describeSpaceStatus = (status: Option.Option<ReplicaStatus.SpaceStatus>, fallback: ReplicaStatus.SpaceStatus) => {
+  const current = Option.getOrElse(status, () => fallback)
+  if (current._tag === "Failed") return `Failed: ${current.message}, pending ${current.pending}`
+  return `${current._tag}, pending ${current.pending}`
+}
+
+const offlineReplica = Effect.fnUntraced(function*(constructor: Constructor, transportWaitDies: boolean) {
+  const services = yield* withPending(constructor, [spaceId, otherSpaceId])
+  const bothFailed = yield* Deferred.make<void>()
+  const trigger = yield* Deferred.make<void>()
+  let offline = true
+  let pulls = 0
+  const replica = yield* services.start(SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    waitForTransportChange: () => {
+      if (!transportWaitDies) return Effect.never
+      return Effect.andThen(Deferred.await(trigger), Effect.die("transport wait died"))
+    },
+    submitBatch: acceptSubmission,
+    pull: (request) => {
+      pulls += 1
+      if (!offline) return emptyPage(services.crypto, request)
+      let reached = Effect.void
+      if (pulls === 2) reached = Deferred.succeed(bothFailed, undefined).pipe(Effect.asVoid)
+      return Effect.andThen(reached, serverUnavailable)
+    }
+  }))
+  const space = yield* replica.space(spaceId)
+  const other = yield* replica.space(otherSpaceId)
+  yield* VirtualTime.advanceUntil(Deferred.await(bothFailed))
+  yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 millis"))
+  assert.strictEqual(pulls, 2, "each space failed one turn and is waiting in the retry schedule")
+  const reconnect = Effect.sync(() => {
+    offline = false
+  })
+  return { services, space, other, reconnect, trigger: Deferred.succeed(trigger, undefined) }
+})
+
+describe("background retries held when the retry scheduler dies", () => {
+  it.effect.each(constructors)(
+    "drains two offline spaces after the server returns when nothing died with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { other, reconnect, services, space } = yield* offlineReplica(constructor, false)
+      yield* reconnect
+
+      const drained = yield* eventually(services, space, isDrained)
+      const otherDrained = yield* eventually(services, other, isDrained)
+
+      assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Idle, pending 0")
+      assert.strictEqual(describeSpaceStatus(otherDrained, yield* other.status), "Idle, pending 0")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "drains two offline spaces after the server returns when the retry scheduler died once with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { other, reconnect, services, space, trigger } = yield* offlineReplica(constructor, true)
+      yield* reconnect
+      yield* trigger
+
+      const drained = yield* eventually(services, space, isDrained)
+      const otherDrained = yield* eventually(services, other, isDrained)
+
+      assert.strictEqual(describeSpaceStatus(drained, yield* space.status), "Idle, pending 0")
+      assert.strictEqual(describeSpaceStatus(otherDrained, yield* other.status), "Idle, pending 0")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "spaces retries by the backoff while the transport wait keeps dying with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor, "1 minute")
+      yield* BackgroundReplica.seedPending(services, [spaceId])
+      const logs = captureLogs()
+      let pulls = 0
+      yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        waitForTransportChange: () => Effect.die("transport wait died"),
+        pull: () => {
+          pulls += 1
+          return serverUnavailable
+        }
+      })).pipe(Effect.provide(logs.layerLogs))
+
+      yield* settle("10 minutes")
+
+      assert.isAtLeast(pulls, 6)
+      assert.isAtMost(pulls, 20)
+      assert.isAtMost(logs.defects().length, pulls)
     }, VirtualTime.scoped)
   )
 })
