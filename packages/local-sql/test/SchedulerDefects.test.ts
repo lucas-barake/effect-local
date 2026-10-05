@@ -507,3 +507,99 @@ describe("in-memory scheduler loops that die", () => {
     }, VirtualTime.scoped)
   )
 })
+
+const membershipPendingCountStatement = "SELECT COUNT(p.mutation_id) AS count"
+
+const settle = (duration: "5 seconds" | "5 minutes") =>
+  VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption(duration))
+
+describe("a background turn that dies settles like a typed failure", () => {
+  it.effect.each(constructors)(
+    "keeps a space idle when queued background work died against the foreground runtime after the foreground reconciled with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      let offline = false
+      let pullDies = false
+      let workerGate: Deferred.Deferred<void> | undefined
+      const workerParked = yield* Deferred.make<void>()
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        transportGeneration: Effect.suspend(() => {
+          const held = workerGate
+          if (held === undefined) return Effect.succeed(0)
+          workerGate = undefined
+          return Deferred.succeed(workerParked, undefined).pipe(Effect.andThen(Deferred.await(held)), Effect.as(0))
+        }),
+        submitBatch: (request) => {
+          if (offline) return Effect.fail(new ReplicaError.ServerUnavailable())
+          return acceptSubmission(request)
+        },
+        pull: (request) => {
+          if (request.spaceId === spaceId && pullDies) {
+            pullDies = false
+            return Effect.die("undecodable response")
+          }
+          return emptyPage(services.crypto, request)
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* services.sql`UPDATE effect_local_client_spaces
+        SET replication_view_id = ${viewId}, replication_view_revision = 0`
+      yield* space.activate
+      assert.isTrue(Option.isSome(yield* eventually(services, space, isOnlineDrained)), "the space came online")
+      offline = true
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      const parked = yield* eventually(services, space, (status) => status._tag === "Offline" && status.pending === 1)
+      assert.isTrue(Option.isSome(parked), "the mutation stayed pending while the server was unreachable")
+      const releaseWorker = yield* Deferred.make<void>()
+      workerGate = releaseWorker
+      yield* space.deactivate
+      yield* VirtualTime.advanceUntil(Deferred.await(workerParked))
+      offline = false
+      yield* space.activate
+      const reconciled = yield* eventually(services, space, isOnlineDrained)
+      assert.isTrue(Option.isSome(reconciled), "the foreground reconciled the space")
+      yield* settle("5 minutes")
+
+      pullDies = true
+      yield* Deferred.succeed(releaseWorker, undefined)
+      yield* settle("5 seconds")
+      assert.isFalse(pullDies, "the queued background work ran and died")
+      const whileActive = yield* space.status
+      yield* space.deactivate
+      yield* settle("5 minutes")
+      const afterDeactivation = yield* space.status
+      const aggregate = yield* replica.status
+
+      assert.strictEqual(whileActive._tag, "Online")
+      assert.strictEqual(whileActive.pending, 0)
+      assert.strictEqual(afterDeactivation._tag, "Idle")
+      assert.strictEqual(aggregate.counts.failed, 0)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "keeps a drained space idle when the pending count after its successful background turn died with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* twoSpaces(constructor)
+      yield* BackgroundReplica.seedPending(services, [spaceId])
+      const attempts = yield* makeAttempts
+      services.dieNext(membershipPendingCountStatement)
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => Effect.andThen(attempts.record, emptyPage(services.crypto, request))
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* VirtualTime.advanceUntil(attempts.reached(2))
+      yield* settle("5 minutes")
+
+      const status = yield* space.status
+      const aggregate = yield* replica.status
+
+      assert.strictEqual(status.pending, 0)
+      assert.strictEqual(status._tag, "Idle")
+      assert.strictEqual(aggregate.counts.failed, 0)
+    }, VirtualTime.scoped)
+  )
+})

@@ -1590,10 +1590,23 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const status = Ref.get(aggregate)
 
-      const runBackgroundWork = Effect.fnUntraced(function*(work: BackgroundWork, entry: RememberedEntry) {
-        const generation = entry.backgroundGeneration
+      const runBackgroundWork = Effect.fnUntraced(function*(
+        work: BackgroundWork,
+        entry: RememberedEntry,
+        generation: number
+      ) {
         if (work._tag === "Deactivate") {
-          const result = yield* deactivate(entry, false, work.runtime, false).pipe(Effect.result)
+          const result = yield* deactivate(entry, false, work.runtime, false).pipe(
+            Effect.catchCause((cause) => {
+              if (Cause.hasFails(cause)) return Effect.failCause(cause)
+              const died = Errors.unexpectedFailure("Background runtime release died", cause)
+              return Effect.logError("Background runtime release died", cause).pipe(
+                Effect.annotateLogs({ "space.id": entry.spaceId }),
+                Effect.andThen(Effect.fail(died))
+              )
+            }),
+            Effect.result
+          )
           if (Result.isFailure(result)) {
             yield* settleBackgroundTurn(entry, generation, result.failure, Option.none())
           }
@@ -1610,7 +1623,17 @@ const makeLayer = <D extends Definition.Any, R,>(
           let sync = runtime.reconciler.sync
           if (workflow !== undefined) sync = backgroundWorkflowTurns.withPermit(sync)
           return Effect.raceFirst(sync, Deferred.await(runtime.preemption))
-        }).pipe(Effect.result)
+        }).pipe(
+          Effect.catchCause((cause) => {
+            if (Cause.hasFails(cause)) return Effect.failCause(cause)
+            const died = Errors.unexpectedFailure("Background sync turn died", cause)
+            return Effect.logError("Background sync turn died", cause).pipe(
+              Effect.annotateLogs({ "space.id": entry.spaceId }),
+              Effect.andThen(Effect.fail(died))
+            )
+          }),
+          Effect.result
+        )
         if (activeRuntime !== undefined) {
           if (activeRuntime.foreground) return
           const deactivation = yield* deactivate(
@@ -1618,7 +1641,17 @@ const makeLayer = <D extends Definition.Any, R,>(
             false,
             activeRuntime,
             Result.isSuccess(result)
-          ).pipe(Effect.result)
+          ).pipe(
+            Effect.catchCause((cause) => {
+              if (Cause.hasFails(cause)) return Effect.failCause(cause)
+              const died = Errors.unexpectedFailure("Background runtime release died", cause)
+              return Effect.logError("Background runtime release died", cause).pipe(
+                Effect.annotateLogs({ "space.id": entry.spaceId }),
+                Effect.andThen(Effect.fail(died))
+              )
+            }),
+            Effect.result
+          )
           if (Result.isFailure(deactivation)) {
             yield* settleBackgroundTurn(entry, generation, deactivation.failure, Option.none())
             return
@@ -1629,25 +1662,28 @@ const makeLayer = <D extends Definition.Any, R,>(
         }
       })
 
-      const settleDiedTurn = Effect.fnUntraced(function*(entry: RememberedEntry, cause: Cause.Cause<never>) {
-        yield* Effect.logError("Background sync turn died", cause).pipe(
+      const settleDiedTurn = Effect.fnUntraced(function*(
+        entry: RememberedEntry,
+        generation: number,
+        cause: Cause.Cause<never>
+      ) {
+        yield* Effect.logError("Background scheduler turn died", cause).pipe(
           Effect.annotateLogs({ "space.id": entry.spaceId })
         )
         const stranded = entry.runtime
         if (stranded !== undefined) {
+          if (stranded.foreground) return
           const closed = yield* deactivate(entry, false, stranded, false).pipe(Effect.exit)
           if (Exit.isFailure(closed)) {
-            const interrupts = closed.cause.reasons.filter(Cause.isInterruptReason)
-            if (interrupts.length > 0) return yield* Effect.failCause(Cause.fromReasons<never>(interrupts))
             yield* Effect.logError("Background runtime did not close after its turn died", closed.cause).pipe(
               Effect.annotateLogs({ "space.id": entry.spaceId })
             )
           }
         }
-        return yield* settleBackgroundTurn(
+        yield* settleBackgroundTurn(
           entry,
-          entry.backgroundGeneration,
-          Errors.unexpectedFailure("Background sync turn died", cause),
+          generation,
+          Errors.unexpectedFailure("Background scheduler turn died", cause),
           Option.none()
         )
       })
@@ -1663,10 +1699,11 @@ const makeLayer = <D extends Definition.Any, R,>(
         }
         if (entry === undefined) return
         const claimed = entry
-        yield* runBackgroundWork(work, claimed).pipe(
+        const generation = claimed.backgroundGeneration
+        yield* runBackgroundWork(work, claimed, generation).pipe(
           Effect.catchCause((cause) => {
             if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
-            return settleDiedTurn(claimed, cause)
+            return settleDiedTurn(claimed, generation, cause)
           })
         )
       })
