@@ -246,7 +246,9 @@ const workflowRetryAfterRelease = Effect.fnUntraced(function*(workflowRetry: "fa
     submitBatch: acceptSubmission,
     pull: (request) => {
       if (attempts.count() === 0) {
-        return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable()))
+        return Effect.andThen(attempts.record, Effect.fail(new ReplicaError.ServerUnavailable())).pipe(
+          Effect.uninterruptible
+        )
       }
       if (attempts.count() === 1 || workflowRetry === "fails") {
         return Effect.andThen(attempts.record, Effect.fail(protocolInvalid))
@@ -1193,7 +1195,7 @@ describe("background sync terminal failures", () => {
         transportGeneration: Effect.as(Deferred.await(backgroundMayStart), 0),
         pull: () => {
           const unavailable = Effect.fail(new ReplicaError.ServerUnavailable())
-          if (attempts.count() === 0) return Effect.andThen(attempts.record, unavailable)
+          if (attempts.count() === 0) return Effect.uninterruptible(Effect.andThen(attempts.record, unavailable))
           if (attempts.count() === 1) {
             return attempts.record.pipe(Effect.andThen(Deferred.await(release)), Effect.andThen(unavailable))
           }

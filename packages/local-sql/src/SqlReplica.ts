@@ -174,6 +174,10 @@ interface RememberedEntry {
   summaryStatus: ReplicaStatus.ReplicaStatus
   synced: boolean
   retryAttempt: number
+  readonly remote: SyncEngine.Service
+  serverFailures: number
+  retryNotBefore: number
+  turnRetired: boolean
   backgroundGeneration: number
   backgroundFailure: ReplicaError.ReplicaError | undefined
 }
@@ -601,7 +605,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             layerReconciliation
           ).pipe(
             Layer.buildWithScope(childScope),
-            Effect.provide(workflowContext),
+            Effect.provide(Context.add(workflowContext, SyncEngine.SyncEngine, entry.remote)),
             Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
           )
           local = Context.get(runtime, LocalStore.Store)
@@ -646,7 +650,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             }).pipe(Layer.provide(layerLocalStore))
           ).pipe(
             Layer.buildWithScope(childScope),
-            Effect.provide(rootContext),
+            Effect.provide(Context.add(rootContext, SyncEngine.SyncEngine, entry.remote)),
             Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
           )
           local = Context.get(runtime, LocalStore.Store)
@@ -736,8 +740,22 @@ const makeLayer = <D extends Definition.Any, R,>(
           return Queue.offer(backgroundQueue, { _tag: "Sync", spaceId: entry.spaceId }).pipe(Effect.asVoid)
         })
 
+      const noteServerFailure = (entry: RememberedEntry) =>
+        Effect.map(Clock.currentTimeMillis, (now) => {
+          entry.serverFailures += 1
+          entry.retryNotBefore = now + Configuration.retryMillis(retryTiming, entry.serverFailures)
+        })
+
+      const awaitRetryAllowed = (entry: RememberedEntry) =>
+        Effect.flatMap(Clock.currentTimeMillis, (now) => {
+          if (now >= entry.retryNotBefore) return Effect.void
+          return Effect.sleep(Duration.millis(entry.retryNotBefore - now))
+        })
+
       const forgetBackgroundFailure = (entry: RememberedEntry) =>
         Effect.suspend(() => {
+          entry.serverFailures = 0
+          entry.retryNotBefore = 0
           entry.backgroundGeneration += 1
           entry.backgroundFailure = undefined
           return FiberMap.remove(credentialWaits, entry.membershipIncarnation)
@@ -1189,6 +1207,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (foreground) {
             entry.backgroundGeneration += 1
             entry.promote = false
+            entry.serverFailures = 0
+            entry.retryNotBefore = 0
           }
           yield* signalCapacity
           yield* invalidateActivation(entry.spaceId)
@@ -1334,7 +1354,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       const syncWhileLeased = (entry: RememberedEntry): Effect.Effect<void, ReplicaError.ReplicaError> =>
         withActive(entry, (runtime) => endedByRetirement(runtime, runtime.reconciler.sync)).pipe(
           Effect.flatMap(Option.match({
-            onNone: () => syncWhileLeased(entry),
+            onNone: () => Effect.andThen(awaitRetryAllowed(entry), syncWhileLeased(entry)),
             onSome: () => Effect.void
           }))
         )
@@ -1543,6 +1563,19 @@ const makeLayer = <D extends Definition.Any, R,>(
       const createEntry = Effect.fnUntraced(function*(row: typeof RememberedRow.Type) {
         yield* decodeScope(row.desired_scope_json)
         let handle: Replica.Space | undefined
+        const answered = <A,>(
+          call: Effect.Effect<A, ReplicaError.ReplicaError>
+        ): Effect.Effect<A, ReplicaError.ReplicaError> =>
+          Effect.uninterruptibleMask((restore) =>
+            restore(call).pipe(
+              Effect.result,
+              Effect.flatMap((result): Effect.Effect<A, ReplicaError.ReplicaError> => {
+                if (Result.isSuccess(result)) return Effect.succeed(result.success)
+                if (!Reconciler.isTransientFailure(result.failure)) return Effect.fail(result.failure)
+                return Effect.andThen(noteServerFailure(entry), Effect.fail(result.failure))
+              })
+            )
+          )
         const entry: RememberedEntry = {
           spaceId: row.space_id,
           membershipIncarnation: row.membership_incarnation,
@@ -1566,6 +1599,15 @@ const makeLayer = <D extends Definition.Any, R,>(
           summaryStatus: { _tag: "Idle", pending: row.count },
           synced: row.replication_view_id !== null,
           retryAttempt: 0,
+          remote: SyncEngine.SyncEngine.of({
+            ...remote,
+            pull: (request) => answered(remote.pull(request)),
+            submitBatch: (request) => answered(remote.submitBatch(request)),
+            bootstrap: (request) => answered(remote.bootstrap(request))
+          }),
+          serverFailures: 0,
+          retryNotBefore: 0,
+          turnRetired: false,
           backgroundGeneration: 0,
           backgroundFailure: undefined
         }
@@ -1578,7 +1620,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           const leasedAttempt = <A,>(
             execute: (runtime: ReconciliationWorkflow.RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>
           ): Effect.Effect<A, ReplicaError.ReplicaError> =>
-            leaseRuntime.pipe(
+            Effect.andThen(awaitRetryAllowed(entry), leaseRuntime).pipe(
               Effect.flatMap((runtime) => endedByRetirement(runtime, execute(runtime))),
               Effect.scoped,
               Effect.flatMap(Option.match({
@@ -1797,6 +1839,10 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.dueWhileLeaving = true
           return
         }
+        if (entry.turnRetired) {
+          entry.turnRetired = false
+          yield* awaitRetryAllowed(entry)
+        }
         let activeRuntime: ActiveRuntime | undefined
         const transportGeneration = yield* remote.transportGeneration
         const pendingBefore = entry.summaryStatus.pending
@@ -1806,6 +1852,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (workflow !== undefined) sync = backgroundWorkflowTurns.withPermit(sync)
           return endedByRetirement(runtime, sync)
         }).pipe(Effect.result)
+        entry.turnRetired = Result.isSuccess(result) && Option.isNone(result.success)
         const stalled = Result.isSuccess(result) && Option.isSome(result.success) &&
           entry.summaryStatus.pending > 0 && entry.summaryStatus.pending === pendingBefore
         if (activeRuntime !== undefined) {
