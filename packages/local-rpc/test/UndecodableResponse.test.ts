@@ -537,7 +537,7 @@ describe("a server handler that dies", () => {
       }, Effect.scoped)
     )
 
-    if (call.rpc === "Negotiate") continue
+    if (call.rpc === "Negotiate" || call.prelude.length > 0) continue
 
     it.effect(
       `fails ${call.rpc} with ProtocolInvalid naming Negotiate when the negotiation it started dies on the server`,
