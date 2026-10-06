@@ -8,7 +8,7 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
-import type * as Cause from "effect/Cause"
+import * as Cause from "effect/Cause"
 import * as Clock from "effect/Clock"
 import * as Context from "effect/Context"
 import type * as Crypto from "effect/Crypto"
@@ -1437,6 +1437,29 @@ const makeLayer = <D extends Definition.Any, R,>(
           Effect.flatMap((changed) => Effect.ensuring(runtime.reconciler.notify, announceContribution(changed)))
         )
 
+      const recountAfterQuarantine = <A, E extends { readonly _tag: string },>(
+        entry: RememberedEntry,
+        exit: Exit.Exit<A, E>
+      ): Effect.Effect<A, E> =>
+        Effect.suspend(() => {
+          if (entries.get(entry.spaceId) !== entry || entry.leaving) return exit
+          return withActive(entry, (runtime) => recountPending(entry, runtime)).pipe(
+            Effect.catchTag("SpaceUnavailable", () => Effect.void),
+            Effect.catch((error) =>
+              Effect.logError("Pending recount after a quarantine operation failed", error).pipe(
+                Effect.annotateLogs({ "space.id": entry.spaceId })
+              )
+            ),
+            Effect.matchCauseEffect({
+              onSuccess: () => exit,
+              onFailure: (cause): Effect.Effect<A, E> => {
+                if (Exit.isSuccess(exit)) return Effect.failCause(cause)
+                return Effect.failCause(Cause.combine(exit.cause, cause))
+              }
+            })
+          )
+        })
+
       const findReceipt = (runtime: ActiveRuntime, mutationId: Identity.MutationId) =>
         runtime.local.receipt(mutationId).pipe(
           Effect.flatMap(Option.match({
@@ -1531,9 +1554,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               return receipt
             })).pipe(
               Effect.exit,
-              Effect.flatMap((exit) =>
-                Effect.andThen(withActive(entry, (runtime) => recountPending(entry, runtime)), exit)
-              )
+              Effect.flatMap((exit) => recountAfterQuarantine(entry, exit))
             ),
           resubmitQuarantined: <M extends Mutation.Any,>(
             mutationId: Identity.MutationId,
@@ -1577,9 +1598,7 @@ const makeLayer = <D extends Definition.Any, R,>(
               return Quarantine.Resubmitted.make({ pending })
             })).pipe(
               Effect.exit,
-              Effect.flatMap((exit) =>
-                Effect.andThen(withActive(entry, (runtime) => recountPending(entry, runtime)), exit)
-              )
+              Effect.flatMap((exit) => recountAfterQuarantine(entry, exit))
             ),
           status: Effect.suspend(() => {
             const runtime = entry.runtime

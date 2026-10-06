@@ -8,6 +8,7 @@ import * as Model from "@lucas-barake/effect-local/Model"
 import * as Mutation from "@lucas-barake/effect-local/Mutation"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as Replica from "@lucas-barake/effect-local/Replica"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -236,7 +237,7 @@ const waitingOnTheServer = Effect.fnUntraced(function*(row: Row) {
   yield* buildStore(definitionV2, layerRejectingHandlersV2, evolution)
   const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 0 })
   const entered = yield* Deferred.make<void>()
-  const answered = yield* Deferred.make<void>()
+  const answered = yield* Deferred.make<void, ReplicaError.ServerUnavailable>()
   let credentialGeneration = 0
   let discards = 0
   const remote = SyncEngine.SyncEngine.of({
@@ -294,6 +295,8 @@ const waitingOnTheServer = Effect.fnUntraced(function*(row: Row) {
     other,
     finished: Fiber.join(waiting).pipe(within),
     serverAnswers: Deferred.succeed(answered, undefined),
+    serverDies: Deferred.die(answered, "the discard call died"),
+    serverFails: Deferred.fail(answered, new ReplicaError.ServerUnavailable()),
     replaceCredential: Effect.sync(() => {
       credentialGeneration += 1
     }),
@@ -316,6 +319,31 @@ describe("a quarantine operation whose credential is replaced while the server c
 
       assert.strictEqual(outcome, "succeeded")
       assert.strictEqual(discards(), 2, "server calls for the one quarantined mutation")
+    }, harness)
+  )
+})
+
+const answers = ["dies", "fails", "succeeds"] as const
+
+const departedRows = rows.flatMap((row) =>
+  answers.map((answer) => ({ constructor: row.constructor, operation: row.operation, answer }))
+)
+
+describe("a quarantine operation whose space is left while the server call is in flight", () => {
+  it.effect.each(departedRows)(
+    "keeps the outcome of the call when the server $answer ($operation, $constructor)",
+    Effect.fnUntraced(function*(row) {
+      const controls = yield* waitingOnTheServer(row)
+
+      const left = yield* within(controls.replica.leave(spaceId))
+      if (row.answer === "dies") yield* controls.serverDies
+      if (row.answer === "fails") yield* controls.serverFails
+      if (row.answer === "succeeds") yield* controls.serverAnswers
+      const outcome = outcomeOf(yield* controls.finished)
+
+      const expected = { dies: "died", fails: "ServerUnavailable", succeeds: "SpaceUnavailable" } as const
+      assert.strictEqual(describeExit(left), "succeeded")
+      assert.strictEqual(outcome, expected[row.answer])
     }, harness)
   )
 })
