@@ -751,6 +751,7 @@ describe("background sync terminal failures", () => {
       assert.strictEqual(aggregate.totalPending, 0)
 
       yield* space.deactivate
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
       assert.strictEqual((yield* space.status)._tag, "Idle")
       assert.strictEqual((yield* replica.status).counts.idle, 1)
     }, VirtualTime.scoped)
