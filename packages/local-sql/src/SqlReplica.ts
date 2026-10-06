@@ -40,7 +40,7 @@ import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
 import * as SqliteIdentifier from "./internal/sqliteIdentifier.js"
-import { credentialChange, isTransportFailure } from "./internal/transport.js"
+import { answeredUnderCredential, credentialChange, isTransportFailure } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Migrations from "./Migrations.js"
 import * as MutationRuntime from "./MutationRuntime.js"
@@ -1376,6 +1376,31 @@ const makeLayer = <D extends Definition.Any, R,>(
           }))
         )
 
+      const discardAnswered = (request: Protocol.DiscardRequest) =>
+        remote.credentialGeneration.pipe(
+          Effect.flatMap((generation) => answeredUnderCredential(remote, generation, remote.discard(request)))
+        )
+
+      const discardUnderOneCredential = (
+        request: Protocol.DiscardRequest
+      ): Effect.Effect<Protocol.Receipt, ReplicaError.ReplicaError> =>
+        discardAnswered(request).pipe(
+          Effect.flatMap(Option.match({
+            onNone: () => discardAnswered(request),
+            onSome: (receipt) => Effect.succeed(Option.some(receipt))
+          })),
+          Effect.flatMap(Option.match({
+            onNone: () =>
+              Effect.fail(
+                new ReplicaError.UnexpectedFailure({
+                  message: "The credential generation changed again while the discard was sent again",
+                  cause: { mutationId: request.envelope.mutationId }
+                })
+              ),
+            onSome: Effect.succeed
+          }))
+        )
+
       const continueCancellation = Effect.fnUntraced(function*(
         entry: RememberedEntry,
         initial: Option.Option<Quarantine.QuarantinedMutation>
@@ -1383,7 +1408,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         let canceled = initial
         while (Option.isSome(canceled)) {
           yield* syncWhileLeased(entry)
-          const canceledReceipt = yield* remote.discard({
+          const canceledReceipt = yield* discardUnderOneCredential({
             envelope: canceled.value.envelope,
             schema: options.definition.schemaIdentity
           })
@@ -1479,7 +1504,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                 yield* continueCancellation(entry, continuation)
                 return yield* withActive(entry, (runtime) => findReceipt(runtime, mutationId))
               }
-              const receipt = yield* remote.discard({
+              const receipt = yield* discardUnderOneCredential({
                 envelope: found.value.envelope,
                 schema: options.definition.schemaIdentity
               })
@@ -1522,7 +1547,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                 entry,
                 (runtime) => runtime.local.ensureQuarantineResubmission(mutationId, mutation, payload)
               )
-              const receipt = yield* remote.discard({
+              const receipt = yield* discardUnderOneCredential({
                 envelope: item.envelope,
                 schema: options.definition.schemaIdentity
               })

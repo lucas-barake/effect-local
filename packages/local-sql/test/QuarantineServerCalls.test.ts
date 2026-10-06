@@ -237,14 +237,19 @@ const waitingOnTheServer = Effect.fnUntraced(function*(row: Row) {
   const server = yield* buildServer(definitionV2, layerHandlersV2, evolution, { acceptedSchemaVersions: 0 })
   const entered = yield* Deferred.make<void>()
   const answered = yield* Deferred.make<void>()
+  let credentialGeneration = 0
+  let discards = 0
   const remote = SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
-    credentialGeneration: Effect.succeed(0),
+    credentialGeneration: Effect.sync(() => credentialGeneration),
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Effect.never,
     submitBatch: (request) => server.admitBatch(request, null),
     discard: (request) =>
-      Deferred.succeed(entered, undefined).pipe(
+      Effect.suspend(() => {
+        discards += 1
+        return Deferred.succeed(entered, undefined)
+      }).pipe(
         Effect.andThen(Deferred.await(answered)),
         Effect.andThen(server.discard(request, null))
       ),
@@ -288,12 +293,32 @@ const waitingOnTheServer = Effect.fnUntraced(function*(row: Row) {
     space,
     other,
     finished: Fiber.join(waiting).pipe(within),
-    serverAnswers: Deferred.succeed(answered, undefined)
+    serverAnswers: Deferred.succeed(answered, undefined),
+    replaceCredential: Effect.sync(() => {
+      credentialGeneration += 1
+    }),
+    discards: () => discards
   }
 })
 
 const harness = <A, E extends { readonly _tag: string }, R,>(effect: Effect.Effect<A, E, R>) =>
   VirtualTime.scoped(effect).pipe(provideDatabase)
+
+describe("a quarantine operation whose credential is replaced while the server call is in flight", () => {
+  it.effect.each(rows)(
+    "sends the call again under the new credential instead of applying the answer ($operation, $constructor)",
+    Effect.fnUntraced(function*(row) {
+      const { discards, finished, replaceCredential, serverAnswers } = yield* waitingOnTheServer(row)
+
+      yield* replaceCredential
+      yield* serverAnswers
+      const outcome = outcomeOf(yield* finished)
+
+      assert.strictEqual(outcome, "succeeded")
+      assert.strictEqual(discards(), 2, "server calls for the one quarantined mutation")
+    }, harness)
+  )
+})
 
 describe("a quarantine operation that waits on a server that does not answer", () => {
   it.effect.each(rows)(
