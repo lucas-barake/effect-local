@@ -4,6 +4,7 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
+import * as Scheduler from "effect/Scheduler"
 import * as Scope from "effect/Scope"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
@@ -112,5 +113,80 @@ describe("a workflow attempt that waits for its space to be activated again", ()
 
       assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 0)
     }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "finishes and records its completion when the space is activated again",
+    Effect.fnUntraced(function*() {
+      const { answer, replica, services } = yield* parkedAttempt()
+      const space = yield* replica.space(parked)
+
+      yield* answer
+      yield* VirtualTime.advanceUntil(space.activate)
+      const online = yield* eventually(services, space, isOnlineDrained)
+      yield* quiet
+      const generations = yield* services.sql<{ readonly completed: number; readonly requested: number }>`
+        SELECT completed_generation AS completed, requested_generation AS requested
+        FROM effect_local_client_spaces WHERE space_id = ${parked}`
+
+      assert.isTrue(Option.isSome(online))
+      assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 0, "no execution is left running")
+      assert.strictEqual(generations[0].completed, generations[0].requested, "the requested generation is completed")
+    }, VirtualTime.scoped)
+  )
+})
+
+const budgets = [2048, 200, 97, 64, 63, 48, 31, 17].map((budget) => ({ budget }))
+
+const atBudget = <A, E extends { readonly _tag: string }, R,>(
+  effect: Effect.Effect<A, E, R>,
+  row: { readonly budget: number }
+) => VirtualTime.scoped(effect).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, row.budget))
+
+describe("a workflow whose sync drained its space in the background", () => {
+  it.effect.each(budgets)(
+    "records its completion and ends without another activation at a budget of $budget",
+    Effect.fnUntraced(function*(_row) {
+      const services = yield* BackgroundReplica.services({
+        constructor: "layerWorkflow",
+        clientId,
+        initialSpaces: [parked, other],
+        maximumActiveSpaces: 3,
+        foregroundActiveSpaces: 1,
+        retryDelay: "1 second",
+        maximumRetryDelay: "1 minute"
+      })
+      const calling = yield* Deferred.make<void>()
+      const answered = yield* Deferred.make<void>()
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          const page = emptyPage(services.crypto, request)
+          if (request.spaceId !== parked) return page
+          return Deferred.succeed(calling, undefined).pipe(
+            Effect.andThen(Deferred.await(answered)),
+            Effect.andThen(page)
+          )
+        }
+      }))
+      yield* installView(services)
+      const evicted = yield* replica.space(parked)
+      const current = yield* replica.space(other)
+      yield* evicted.mutate(Domain.PutTodo, Domain.todo("held")).pipe(VirtualTime.advanceUntil)
+      yield* VirtualTime.advanceUntil(Deferred.await(calling))
+      yield* current.mutate(Domain.PutTodo, Domain.todo("after")).pipe(VirtualTime.advanceUntil)
+
+      yield* Deferred.succeed(answered, undefined)
+      const drained = yield* eventually(services, evicted, (status) => status.pending === 0)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("10 minutes"))
+      const generations = yield* services.sql<{ readonly completed: number }>`
+        SELECT completed_generation AS completed FROM effect_local_client_spaces WHERE space_id = ${parked}`
+
+      assert.isTrue(Option.isSome(drained))
+      assert.strictEqual(yield* evicted.activation, "Inactive", "the space was not activated again")
+      assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 0, "no execution is left running")
+      assert.isAbove(generations[0].completed, 0, "the generation the workflow synced is recorded as completed")
+    }, atBudget)
   )
 })

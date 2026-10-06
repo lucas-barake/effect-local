@@ -1675,25 +1675,29 @@ const makeLayer = <D extends Definition.Any, R,>(
               Effect.tap(() => Effect.addFinalizer(() => release(entry, "WorkflowAttempt")))
             )
           )
-          const leaseActiveRuntime = Effect.uninterruptibleMask((restore) =>
+          const leaseRuntimeWithPendingWork = Effect.uninterruptibleMask((restore) =>
             transition(entry, false, true, false, { retiring: undefined }, restore).pipe(
               Effect.tap(() => Effect.addFinalizer(() => release(entry, "WorkflowAttempt")))
             )
           )
           const leasedAttempt = <A,>(
-            execute: (runtime: ReconciliationWorkflow.RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>
-          ): Effect.Effect<A, ReplicaError.ReplicaError> =>
-            Effect.andThen(awaitRetryAllowed(entry), leaseActiveRuntime).pipe(
+            execute: (runtime: ReconciliationWorkflow.RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>,
+            need: ReconciliationWorkflow.RuntimeNeed
+          ): Effect.Effect<A, ReplicaError.ReplicaError> => {
+            let leased = leaseRuntimeWithPendingWork
+            if (need === "Always") leased = leaseRuntime
+            return Effect.andThen(awaitRetryAllowed(entry), leased).pipe(
               Effect.flatMap((runtime) => {
                 const turn = withWorkflowTurn(runtime, execute(runtime))
                 return endedByRetirement(runtime, turn)
               }),
               Effect.scoped,
               Effect.flatMap(Option.match({
-                onNone: () => leasedAttempt(execute),
+                onNone: () => leasedAttempt(execute, need),
                 onSome: Effect.succeed
               }))
             )
+          }
           const lease = ReconciliationWorkflow.RuntimeLease.of({ acquire: leaseRuntime, attempt: leasedAttempt })
           const registrationContext = Context.add(
             Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow),

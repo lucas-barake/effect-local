@@ -163,9 +163,12 @@ export interface RuntimeServices {
 export interface RuntimeLeaseService {
   readonly acquire: Effect.Effect<RuntimeServices, ReplicaError.ReplicaError, Scope.Scope>
   readonly attempt: <A,>(
-    execute: (runtime: RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>
+    execute: (runtime: RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>,
+    runtime: RuntimeNeed
   ) => Effect.Effect<A, ReplicaError.ReplicaError>
 }
+
+export type RuntimeNeed = "WhenThereIsPendingWork" | "Always"
 
 export class RuntimeLease extends Context.Service<RuntimeLease, RuntimeLeaseService>()(
   "@lucas-barake/effect-local-sql/ReconciliationWorkflow/RuntimeLease"
@@ -295,6 +298,7 @@ const handler = (
     })
     const runActivity = Effect.fnUntraced(function*(
       name: string,
+      need: RuntimeNeed,
       execute: (runtime: RuntimeServices) => Effect.Effect<void, ReplicaError.ReplicaError>
     ) {
       let attempt = 1
@@ -303,13 +307,16 @@ const handler = (
         const result = yield* Activity.make({
           name: `${name}/${attempt}`,
           error: ReplicaError.ReplicaError,
-          execute: lease.attempt(Effect.fnUntraced(function*(runtime) {
-            if (runtime.local.membershipIncarnation !== membershipIncarnation) {
-              return yield* new ReplicaError.SpaceUnavailable({ spaceId: payload.spaceId })
-            }
-            observedGeneration = yield* runtime.reconciliation.generation
-            return yield* execute(runtime)
-          }))
+          execute: lease.attempt(
+            Effect.fnUntraced(function*(runtime) {
+              if (runtime.local.membershipIncarnation !== membershipIncarnation) {
+                return yield* new ReplicaError.SpaceUnavailable({ spaceId: payload.spaceId })
+              }
+              observedGeneration = yield* runtime.reconciliation.generation
+              return yield* execute(runtime)
+            }),
+            need
+          )
         }).pipe(Effect.result)
         if (Result.isSuccess(result)) return
         if (result.failure._tag === "StaleReplicationScope") {
@@ -334,8 +341,12 @@ const handler = (
       }
     })
 
-    yield* runActivity("sync", ({ local, reconciliation }) => Effect.andThen(validateScope(local), reconciliation.sync))
-    yield* runActivity("complete", ({ local }) =>
+    yield* runActivity(
+      "sync",
+      "WhenThereIsPendingWork",
+      ({ local, reconciliation }) => Effect.andThen(validateScope(local), reconciliation.sync)
+    )
+    yield* runActivity("complete", "Always", ({ local }) =>
       Effect.andThen(validateScope(local), local.completeReconciliation(payload.generation)))
     yield* Effect.scoped(Effect.gen(function*() {
       const runtime = yield* lease.acquire
