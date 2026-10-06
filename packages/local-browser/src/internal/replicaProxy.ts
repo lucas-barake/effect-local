@@ -12,6 +12,7 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import type * as ClusterError from "effect/cluster/ClusterError"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
@@ -51,6 +52,7 @@ export interface ProxyOptions {
   readonly reactivity: Reactivity.Reactivity
   readonly crypto: Crypto.Crypto
   readonly retryDelayMillis: number
+  readonly maximumRetryDelayMillis: number
   readonly eventCapacity: number
   readonly awaitRouted: Effect.Effect<boolean>
   readonly superseded: Deferred.Deferred<never, ReplicaError.BuildSuperseded>
@@ -169,6 +171,12 @@ function decodeSettlement(
 const streamFrom = <A, E extends { readonly _tag: string },>(
   queue: Effect.Effect<Queue.Dequeue<A, E>, never, Scope.Scope>
 ): Stream.Stream<A, Exclude<E, Cause.Done>> => Stream.unwrap(Effect.map(queue, LosslessQueue.stream))
+
+const isRetryableSessionFailure = (error: ReplicaError.ReplicaError) =>
+  error._tag === "ServerUnavailable" ||
+  error._tag === "OperationTimeout" ||
+  error._tag === "AuthenticatorUnavailable" ||
+  error._tag === "OwnerUnavailable"
 
 const failureOutsideHandover = <A, E extends Tagged,>(exit: Exit.Exit<A, E>): Cause.Cause<E> | undefined => {
   if (Exit.isSuccess(exit) || Cause.hasInterruptsOnly(exit.cause)) return undefined
@@ -644,13 +652,58 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
         ).pipe(Effect.tap((created) => Effect.sync(() => states.set(stateName, created))))
       })
     const events = yield* Effect.acquireRelease(
-      SequencedPubSub.sliding<Extract<replicaWire.EphemeralSessionFrame, { readonly _tag: "Event" }>>(
+      SequencedPubSub.sliding<
+        Extract<replicaWire.EphemeralSessionFrame, { readonly _tag: "Event" }> | ReplicaError.CapacityExceeded
+      >(
         "ephemeral events",
         options.eventCapacity
       ),
       SequencedPubSub.shutdown
     )
     const opened = yield* Deferred.make<void, ReplicaError.ReplicaError | Ephemeral.EncodeError>()
+    const failure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
+    const awaitEnded = Effect.raceFirst(awaitSuperseded, Deferred.await(failure))
+
+    let reopenAttempt = 0
+    let reopenDelayMillis = 0
+    let openedAtMillis = Option.none<number>()
+    const markOpened = Effect.map(Clock.currentTimeMillis, (now) => {
+      openedAtMillis = Option.some(now)
+    })
+    const reopenDelay = Effect.flatMap(Clock.currentTimeMillis, (now) => {
+      if (Option.isSome(openedAtMillis) && now - openedAtMillis.value > reopenDelayMillis) reopenAttempt = 0
+      openedAtMillis = Option.none()
+      reopenAttempt += 1
+      reopenDelayMillis = Math.min(
+        options.maximumRetryDelayMillis,
+        options.retryDelayMillis * 2 ** Math.min(reopenAttempt - 1, 52)
+      )
+      return Effect.sleep(reopenDelayMillis)
+    })
+
+    const presentEmpty = <A,>(ref: SubscriptionRef.SubscriptionRef<Option.Option<ReadonlyArray<A>>>) =>
+      SubscriptionRef.get(ref).pipe(
+        Effect.flatMap((current) => {
+          if (Option.isSome(current) && current.value.length === 0) return Effect.void
+          return SubscriptionRef.set(ref, Option.some<ReadonlyArray<A>>([]))
+        })
+      )
+    const presentUnknown = Effect.suspend(() =>
+      Effect.forEach(states.values(), presentEmpty, { discard: true }).pipe(Effect.andThen(presentEmpty(members)))
+    )
+
+    const afterFailure = (cause: Cause.Cause<ReplicaError.ReplicaError>) => {
+      const failed = Cause.findErrorOption(cause)
+      if (Option.isNone(failed)) return Deferred.failCause(failure, cause).pipe(Effect.as(true))
+      const error = failed.value
+      if (error._tag === "CapacityExceeded" && error.resource === "ephemeral events") {
+        return SequencedPubSub.publish(events, error).pipe(Effect.andThen(reopenDelay), Effect.as(false))
+      }
+      if (isRetryableSessionFailure(error)) {
+        return presentUnknown.pipe(Effect.andThen(reopenDelay), Effect.as(false))
+      }
+      return Deferred.failCause(failure, cause).pipe(Effect.as(true))
+    }
 
     const updateRemote = (value: Json) =>
       ensureCurrent.pipe(
@@ -670,6 +723,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     const onFrame = (frame: replicaWire.EphemeralSessionFrame): Effect.Effect<void, ReplicaError.ReplicaError> => {
       if (frame._tag === "Opened") {
         return SubscriptionRef.set(handle, Option.some(frame.handle)).pipe(
+          Effect.andThen(markOpened),
           Effect.andThen(Deferred.succeed(opened, undefined)),
           Effect.andThen(Effect.suspend(() => {
             if (latestValue === openedValue) return Effect.void
@@ -711,14 +765,17 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
           return options.awaitRouted.pipe(
             Effect.flatMap((routed) => {
               if (routed) return Effect.succeed(false)
-              return Deferred.fail(opened, ownerUnavailable).pipe(Effect.as(true))
+              return Deferred.fail(opened, ownerUnavailable).pipe(
+                Effect.andThen(Deferred.fail(failure, ownerUnavailable)),
+                Effect.as(true)
+              )
             })
           )
         }
         return Deferred.failCause(opened, cause).pipe(
           Effect.flatMap((openFailed) => {
             if (openFailed) return Effect.succeed(true)
-            return Effect.sleep(options.retryDelayMillis).pipe(Effect.as(false))
+            return afterFailure(cause)
           })
         )
       }),
@@ -738,13 +795,17 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       Ephemeral.DecodeError | ReplicaError.ReplicaError
     > {
       return Stream.unwrap(SequencedPubSub.subscribe(events)).pipe(
+        Stream.mapEffect((delivery) => {
+          if (delivery._tag === "CapacityExceeded") return Effect.fail(delivery)
+          return Effect.succeed(delivery)
+        }),
         Stream.filter((frame) => frame.name === definitionArg.name),
         Stream.mapEffect((frame) =>
           decodeWith(definitionArg.payloadSchema, frame.payload).pipe(
             Effect.map((payload) => ({ member: frame.member, payload }))
           )
         ),
-        Stream.interruptWhen(awaitSuperseded)
+        Stream.interruptWhen(awaitEnded)
       )
     }
 
@@ -773,9 +834,22 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
             }))
           )
         )),
-        Stream.interruptWhen(awaitSuperseded)
+        Stream.interruptWhen(awaitEnded)
       )
     }
+
+    const ensureOpen = Deferred.isDone(failure).pipe(
+      Effect.flatMap((failed) => {
+        if (!failed) return Effect.void
+        return Effect.fail(
+          new ReplicaError.EphemeralSessionUnavailable({
+            spaceId: sessionOptions.spaceId,
+            clientId: sessionOptions.member.clientId,
+            membershipIncarnation: sessionOptions.member.membershipIncarnation
+          })
+        )
+      })
+    )
 
     const result: EphemeralClient.Session<Ephemeral.AnyMember> = {
       spaceId: sessionOptions.spaceId,
@@ -790,10 +864,11 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
             Effect.map((value) => ({ member: frame.member, value, expiresAtMillis: frame.expiresAtMillis }))
           )
         )),
-        Stream.interruptWhen(awaitSuperseded)
+        Stream.interruptWhen(awaitEnded)
       ),
       updateMember: (value) =>
         encodeJson(profile.payloadSchema, value).pipe(
+          Effect.tap(() => ensureOpen),
           Effect.tap((encoded) =>
             Effect.sync(() => {
               latestValue = encoded

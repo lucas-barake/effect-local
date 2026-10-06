@@ -3,7 +3,8 @@ import * as Ephemeral from "@lucas-barake/effect-local/Ephemeral"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import type * as Cause from "effect/Cause"
+import * as Cause from "effect/Cause"
+import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Equal from "effect/Equal"
@@ -1255,6 +1256,211 @@ describe("EphemeralClient projection work", () => {
       })
       yield* program.pipe(Effect.provide(harness.layerClient))
     })
+  )
+})
+
+const sessionFailures: {
+  readonly [Tag in ReplicaError.ReplicaError["_tag"]]: Extract<ReplicaError.ReplicaError, { readonly _tag: Tag }>
+} = {
+  StorageUnavailable: new ReplicaError.StorageUnavailable({ cause: "disk" }),
+  StorageCorrupt: new ReplicaError.StorageCorrupt({ message: "corrupt" }),
+  CanonicalEncodeError: new ReplicaError.CanonicalEncodeError({ cause: "cycle" }),
+  DefinitionMismatch: new ReplicaError.DefinitionMismatch({ expected: "a", actual: "b" }),
+  StaleSchema: new ReplicaError.StaleSchema({
+    expectedVersion: 2,
+    expectedHash: "b",
+    actualVersion: 1,
+    actualHash: "a"
+  }),
+  SchemaGenerationConflict: new ReplicaError.SchemaGenerationConflict({ expected: 2, actual: 1 }),
+  SchemaEvolutionUnsupported: new ReplicaError.SchemaEvolutionUnsupported({
+    sourceVersion: 1,
+    sourceHash: "a",
+    targetVersion: 2,
+    targetHash: "b"
+  }),
+  SchemaEvolutionFailed: new ReplicaError.SchemaEvolutionFailed({
+    stepId: null,
+    componentKind: "Model",
+    componentName: "Todo",
+    part: "Value",
+    fromVersion: 1,
+    toVersion: 2,
+    cause: "step"
+  }),
+  StorageMigrationMismatch: new ReplicaError.StorageMigrationMismatch({ catalog: "replica", message: "mismatch" }),
+  StorageMigrationPending: new ReplicaError.StorageMigrationPending({ catalog: "replica", message: "pending" }),
+  SchemaKeyCollision: new ReplicaError.SchemaKeyCollision({ model: "Todo", key: "1" }),
+  PendingMutationEvolutionRejected: new ReplicaError.PendingMutationEvolutionRejected({
+    mutationId: "mut_00000000-0000-4000-8000-000000000001",
+    rejection: null
+  }),
+  ReplicaIdentityMismatch: new ReplicaError.ReplicaIdentityMismatch({
+    expectedClientId: "a",
+    actualClientId: "b"
+  }),
+  SpaceNotJoined: new ReplicaError.SpaceNotJoined({ spaceId }),
+  SpaceUnavailable: new ReplicaError.SpaceUnavailable({ spaceId }),
+  EphemeralSessionUnavailable: new ReplicaError.EphemeralSessionUnavailable({
+    spaceId,
+    clientId: member.clientId,
+    membershipIncarnation: member.membershipIncarnation
+  }),
+  MutationIdentityConflict: new ReplicaError.MutationIdentityConflict({
+    mutationId: "mut_00000000-0000-4000-8000-000000000001"
+  }),
+  QuarantineResubmissionConflict: new ReplicaError.QuarantineResubmissionConflict({
+    mutationId: "mut_00000000-0000-4000-8000-000000000001"
+  }),
+  OutOfOrderMutation: new ReplicaError.OutOfOrderMutation({ expected: 1, actual: 2 }),
+  CursorGap: new ReplicaError.CursorGap({ expected: 1, actual: 2 }),
+  SettlementReplayTruncated: new ReplicaError.SettlementReplayTruncated({ requested: 1, oldestAvailable: 2 }),
+  StaleReplicationScope: new ReplicaError.StaleReplicationScope({ expected: 2, actual: 1 }),
+  CapacityExceeded: new ReplicaError.CapacityExceeded({ resource: "ephemeral payload bytes", limit: 8 }),
+  InvalidConfiguration: new ReplicaError.InvalidConfiguration({ option: "ttl", message: "invalid" }),
+  UnknownCommitOutcome: new ReplicaError.UnknownCommitOutcome({
+    mutationId: "mut_00000000-0000-4000-8000-000000000001",
+    cause: "lost"
+  }),
+  ProtocolInvalid: new ReplicaError.ProtocolInvalid({ message: "The JoinEphemeral RPC failed on the server" }),
+  UpgradeRequired: new ReplicaError.UpgradeRequired({ clientVersions: [1], serverVersions: [2] }),
+  ProtocolVersionRejected: new ReplicaError.ProtocolVersionRejected({ version: 1, serverVersions: [2] }),
+  ServerUnavailable: new ReplicaError.ServerUnavailable(),
+  CredentialRejected: new ReplicaError.CredentialRejected({}),
+  AuthenticatorUnavailable: new ReplicaError.AuthenticatorUnavailable(),
+  OperationTimeout: new ReplicaError.OperationTimeout({ operation: "JoinEphemeral", timeoutMillis: 10_000 }),
+  AuthorizationDenied: new ReplicaError.AuthorizationDenied({ reason: "forbidden" }),
+  OwnerUnavailable: new ReplicaError.OwnerUnavailable({ reason: "transport" }),
+  BuildSuperseded: new ReplicaError.BuildSuperseded({ version: 1, supersedingVersion: 2 }),
+  UnexpectedFailure: new ReplicaError.UnexpectedFailure({ message: "unexpected", cause: "bug" })
+}
+
+const rejoinedSessionFailures: ReadonlyArray<ReplicaError.ReplicaError> = [
+  sessionFailures.ServerUnavailable,
+  sessionFailures.OperationTimeout,
+  sessionFailures.AuthenticatorUnavailable
+]
+
+const endedSessionFailures: ReadonlyArray<ReplicaError.ReplicaError> = [
+  ...Object.values(sessionFailures).filter((error) =>
+    !rejoinedSessionFailures.includes(error) && error._tag !== "ProtocolVersionRejected"
+  ),
+  new ReplicaError.CapacityExceeded({ resource: "ephemeral watchers", limit: 8 }),
+  new ReplicaError.CapacityExceeded({ resource: "ephemeral events", limit: 8 })
+]
+
+const describeSessionFailure = (error: ReplicaError.ReplicaError | Ephemeral.DecodeError) => {
+  if (error._tag === "CapacityExceeded") return `CapacityExceeded ${error.resource} ${error.limit}`
+  return error._tag
+}
+
+const describeSubscriber = <A,>(fiber: Fiber.Fiber<A, ReplicaError.ReplicaError | Ephemeral.DecodeError>) => {
+  const exit = fiber.pollUnsafe()
+  if (exit === undefined) return "pending"
+  if (Exit.isSuccess(exit)) return "ended"
+  const error = Cause.findErrorOption(exit.cause)
+  if (Option.isSome(error)) return describeSessionFailure(error.value)
+  return "died"
+}
+
+const positioned = snapshot(spaceId, 1, {
+  states: [{
+    member,
+    channel: Protocol.EphemeralChannel.make("Position"),
+    key: Protocol.EphemeralKey.make("pointer"),
+    value: { x: 1 },
+    expiresAtMillis: 60_000
+  }]
+})
+
+const openFailingSession = Effect.fnUntraced(function*() {
+  const joined = yield* Queue.unbounded<Queue.Queue<Protocol.EphemeralJoinMessage, ReplicaError.ReplicaError>>()
+  const fakeClient = {
+    JoinEphemeral: Effect.fnUntraced(function*() {
+      const messages = yield* Queue.unbounded<Protocol.EphemeralJoinMessage, ReplicaError.ReplicaError>()
+      yield* Queue.offerAll(messages, [sessionStarted(spaceId, member), positioned])
+      yield* Queue.offer(joined, messages)
+      return messages
+    }),
+    HeartbeatEphemeral: () => Effect.succeed(null),
+    PublishEphemeral: () => Effect.succeed(null)
+  }
+  const context = yield* Layer.build(layerFromFakeClient(fakeClient))
+  const client = Context.get(context, EphemeralClient.EphemeralClient)
+  const session = yield* client.session(Profile, sessionOptions)
+  const names = yield* Queue.unbounded<ReadonlyArray<string>>()
+  const pointers = yield* Queue.unbounded<ReadonlyArray<number>>()
+  const members = yield* session.members.pipe(
+    Stream.runForEach((entries) => Queue.offer(names, entries.map((entry) => entry.value.displayName))),
+    Effect.forkChild({ startImmediately: true })
+  )
+  const events = yield* session.events(Pings).pipe(Stream.runDrain, Effect.forkChild({ startImmediately: true }))
+  const state = yield* session.state(Position).pipe(
+    Stream.runForEach((entries) => Queue.offer(pointers, entries.map((entry) => entry.value.x))),
+    Effect.forkChild({ startImmediately: true })
+  )
+  assert.deepStrictEqual(yield* Queue.take(names), ["Ada"])
+  assert.deepStrictEqual(yield* Queue.take(pointers), [1])
+  const first = yield* Queue.take(joined)
+  const outcomes = () => ({
+    members: describeSubscriber(members),
+    events: describeSubscriber(events),
+    state: describeSubscriber(state)
+  })
+  const failWith = (error: ReplicaError.ReplicaError) =>
+    Queue.fail(first, error).pipe(Effect.andThen(TestClock.adjust("1 minute")))
+  return { failWith, outcomes, names, pointers, joined, rejoins: Queue.size(joined) }
+})
+
+describe("EphemeralClient session failures", () => {
+  for (const error of endedSessionFailures) {
+    const label = describeSessionFailure(error)
+
+    it.effect(
+      `fails members, events and state with ${label} and does not rejoin when the server fails the session with it`,
+      Effect.fnUntraced(function*() {
+        const session = yield* openFailingSession()
+        yield* session.failWith(error)
+        assert.deepStrictEqual(session.outcomes(), { members: label, events: label, state: label })
+        assert.strictEqual(yield* session.rejoins, 0)
+      }, Effect.scoped)
+    )
+  }
+
+  for (const error of rejoinedSessionFailures) {
+    const label = describeSessionFailure(error)
+
+    it.effect(
+      `keeps its subscribers, empties what they see and rejoins when the server fails the session with ${label}`,
+      Effect.fnUntraced(function*() {
+        const session = yield* openFailingSession()
+        yield* session.failWith(error)
+        assert.deepStrictEqual(session.outcomes(), { members: "pending", events: "pending", state: "pending" })
+        assert.strictEqual(yield* session.rejoins, 1)
+        assert.deepStrictEqual(yield* Queue.clear(session.names), [[], ["Ada"]])
+        assert.deepStrictEqual(yield* Queue.clear(session.pointers), [[], [1]])
+      }, Effect.scoped)
+    )
+  }
+})
+
+describe("EphemeralClient protocol version rejection", () => {
+  it.effect(
+    "rejoins once at the renegotiated version and fails its subscribers when the server rejects that one too",
+    Effect.fnUntraced(function*() {
+      const session = yield* openFailingSession()
+      yield* session.failWith(sessionFailures.ProtocolVersionRejected)
+      assert.deepStrictEqual(session.outcomes(), { members: "pending", events: "pending", state: "pending" })
+      const renegotiated = yield* Queue.take(session.joined)
+      yield* Queue.fail(renegotiated, sessionFailures.ProtocolVersionRejected)
+      yield* TestClock.adjust("1 minute")
+      assert.deepStrictEqual(session.outcomes(), {
+        members: "ProtocolVersionRejected",
+        events: "ProtocolVersionRejected",
+        state: "ProtocolVersionRejected"
+      })
+      assert.strictEqual(yield* session.rejoins, 0)
+    }, Effect.scoped)
   )
 })
 

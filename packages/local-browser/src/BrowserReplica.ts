@@ -25,6 +25,7 @@ import { BrowserStorageError } from "./BrowserStorageError.js"
 import * as BuildGate from "./internal/buildGate.js"
 import * as BuildIdentity from "./internal/buildIdentity.js"
 import * as configuration from "./internal/configuration.js"
+import { invalidConfiguration } from "./internal/errors.js"
 import * as lockNames from "./internal/lockNames.js"
 import * as platform from "./internal/platform.js"
 import * as replicaHost from "./internal/replicaHost.js"
@@ -45,6 +46,7 @@ export interface Options<D extends Definition.Any,> {
   readonly profiles?: Readonly<Record<string, Ephemeral.AnyMember>> | undefined
   readonly requestPersistence?: boolean | undefined
   readonly retryDelay?: Duration.Input | undefined
+  readonly maximumRetryDelay?: Duration.Input | undefined
   readonly eventCapacity?: number | undefined
   readonly sharding?: Partial<ShardingConfig.ShardingConfig["Service"]> | undefined
 }
@@ -118,9 +120,19 @@ export const layer = <D extends Definition.Any, E extends Tagged, R,>(
       "retryDelay",
       options.retryDelay ?? Duration.seconds(1)
     )
+    const maximumRetryDelayMillis = yield* configuration.positiveFiniteDurationMillis(
+      "maximumRetryDelay",
+      options.maximumRetryDelay ?? Duration.minutes(1)
+    )
+    if (maximumRetryDelayMillis < retryDelayMillis) {
+      return yield* invalidConfiguration(
+        "maximumRetryDelay",
+        "maximumRetryDelay must be greater than or equal to retryDelay"
+      )
+    }
     const eventCapacity = yield* configuration.positiveSafeInteger("eventCapacity", options.eventCapacity ?? 1_024)
     const scheduler = yield* TabScheduler.make
-    return yield* build(layerOwner, options, retryDelayMillis, eventCapacity).pipe(
+    return yield* build(layerOwner, options, retryDelayMillis, maximumRetryDelayMillis, eventCapacity).pipe(
       Effect.provideService(Scheduler.Scheduler, scheduler)
     )
   }))
@@ -129,6 +141,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, E extends Ta
   layerOwner: Layer.Layer<SqlClient.SqlClient | SyncEngine.SyncEngine | EphemeralClient.EphemeralClient, E, R>,
   options: Options<D>,
   retryDelayMillis: number,
+  maximumRetryDelayMillis: number,
   eventCapacity: number
 ) {
   const reactivity = yield* Reactivity.Reactivity
@@ -217,6 +230,7 @@ const build = Effect.fnUntraced(function*<D extends Definition.Any, E extends Ta
     reactivity,
     crypto,
     retryDelayMillis,
+    maximumRetryDelayMillis,
     eventCapacity,
     awaitRouted: cluster.awaitRouted,
     superseded: gate.superseded
