@@ -959,10 +959,15 @@ export const layerOnePass = (
         yield* recordSynced(generation)
         yield* options.onReconciled ?? Effect.void
       })
-      const underCurrentCredential: Effect.Effect<void, ReplicaError.ReplicaError> = Effect.catchTag(
-        pass,
-        "CredentialChanged",
-        () => underCurrentCredential
+      const underCurrentCredential = pass.pipe(
+        Effect.catchTag("CredentialChanged", () => pass),
+        Effect.catchTag("CredentialChanged", (cause) =>
+          Effect.fail(
+            new ReplicaError.UnexpectedFailure({
+              message: "The credential generation changed again while the pass was starting over",
+              cause
+            })
+          ))
       )
       const sync = gate.withPermit(
         underCurrentCredential.pipe(
