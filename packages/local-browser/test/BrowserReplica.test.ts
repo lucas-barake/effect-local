@@ -950,6 +950,396 @@ describe("BrowserReplica ephemeral event buffer", () => {
   }
 })
 
+type SessionFailure = ReplicaError.ReplicaError | Ephemeral.DecodeError
+
+const sessionFailures: {
+  readonly [Tag in ReplicaError.ReplicaError["_tag"]]: Extract<ReplicaError.ReplicaError, { readonly _tag: Tag }>
+} = {
+  StorageUnavailable: new ReplicaError.StorageUnavailable({ cause: "disk" }),
+  StorageCorrupt: new ReplicaError.StorageCorrupt({ message: "corrupt" }),
+  CanonicalEncodeError: new ReplicaError.CanonicalEncodeError({ cause: "cycle" }),
+  DefinitionMismatch: new ReplicaError.DefinitionMismatch({ expected: "a", actual: "b" }),
+  StaleSchema: new ReplicaError.StaleSchema({
+    expectedVersion: 2,
+    expectedHash: "b",
+    actualVersion: 1,
+    actualHash: "a"
+  }),
+  SchemaGenerationConflict: new ReplicaError.SchemaGenerationConflict({ expected: 2, actual: 1 }),
+  SchemaEvolutionUnsupported: new ReplicaError.SchemaEvolutionUnsupported({
+    sourceVersion: 1,
+    sourceHash: "a",
+    targetVersion: 2,
+    targetHash: "b"
+  }),
+  SchemaEvolutionFailed: new ReplicaError.SchemaEvolutionFailed({
+    stepId: null,
+    componentKind: "Model",
+    componentName: "Todo",
+    part: "Value",
+    fromVersion: 1,
+    toVersion: 2,
+    cause: "step"
+  }),
+  StorageMigrationMismatch: new ReplicaError.StorageMigrationMismatch({ catalog: "replica", message: "mismatch" }),
+  StorageMigrationPending: new ReplicaError.StorageMigrationPending({ catalog: "replica", message: "pending" }),
+  SchemaKeyCollision: new ReplicaError.SchemaKeyCollision({ model: "Todo", key: "1" }),
+  PendingMutationEvolutionRejected: new ReplicaError.PendingMutationEvolutionRejected({
+    mutationId,
+    rejection: null
+  }),
+  ReplicaIdentityMismatch: new ReplicaError.ReplicaIdentityMismatch({
+    expectedClientId: "a",
+    actualClientId: "b"
+  }),
+  SpaceNotJoined: new ReplicaError.SpaceNotJoined({ spaceId }),
+  SpaceUnavailable: new ReplicaError.SpaceUnavailable({ spaceId }),
+  EphemeralSessionUnavailable: new ReplicaError.EphemeralSessionUnavailable({
+    spaceId,
+    clientId: member.clientId,
+    membershipIncarnation: member.membershipIncarnation
+  }),
+  MutationIdentityConflict: new ReplicaError.MutationIdentityConflict({ mutationId }),
+  QuarantineResubmissionConflict: new ReplicaError.QuarantineResubmissionConflict({ mutationId }),
+  OutOfOrderMutation: new ReplicaError.OutOfOrderMutation({ expected: 1, actual: 2 }),
+  CursorGap: new ReplicaError.CursorGap({ expected: 1, actual: 2 }),
+  SettlementReplayTruncated: new ReplicaError.SettlementReplayTruncated({ requested: 1, oldestAvailable: 2 }),
+  StaleReplicationScope: new ReplicaError.StaleReplicationScope({ expected: 2, actual: 1 }),
+  CapacityExceeded: new ReplicaError.CapacityExceeded({ resource: "ephemeral payload bytes", limit: 8 }),
+  InvalidConfiguration: new ReplicaError.InvalidConfiguration({ option: "ttl", message: "invalid" }),
+  UnknownCommitOutcome: new ReplicaError.UnknownCommitOutcome({ mutationId, cause: "lost" }),
+  ProtocolInvalid: new ReplicaError.ProtocolInvalid({ message: "The JoinEphemeral RPC failed on the server" }),
+  UpgradeRequired: new ReplicaError.UpgradeRequired({ clientVersions: [1], serverVersions: [2] }),
+  ProtocolVersionRejected: new ReplicaError.ProtocolVersionRejected({ version: 1, serverVersions: [2] }),
+  ServerUnavailable: new ReplicaError.ServerUnavailable(),
+  CredentialRejected: new ReplicaError.CredentialRejected({}),
+  AuthenticatorUnavailable: new ReplicaError.AuthenticatorUnavailable(),
+  OperationTimeout: new ReplicaError.OperationTimeout({ operation: "JoinEphemeral", timeoutMillis: 10_000 }),
+  AuthorizationDenied: new ReplicaError.AuthorizationDenied({ reason: "forbidden" }),
+  OwnerUnavailable: new ReplicaError.OwnerUnavailable({ reason: "transport" }),
+  BuildSuperseded: new ReplicaError.BuildSuperseded({ version: 1, supersedingVersion: 2 }),
+  UnexpectedFailure: new ReplicaError.UnexpectedFailure({ message: "unexpected", cause: "bug" })
+}
+
+const retriedSessionFailures = new Set<ReplicaError.ReplicaError>([
+  sessionFailures.ServerUnavailable,
+  sessionFailures.OperationTimeout,
+  sessionFailures.AuthenticatorUnavailable,
+  sessionFailures.OwnerUnavailable
+])
+
+const surfacedSessionFailures: ReadonlyArray<ReplicaError.ReplicaError> = [
+  ...Object.values(sessionFailures).filter((error) => !retriedSessionFailures.has(error)),
+  new ReplicaError.CapacityExceeded({ resource: "ephemeral watchers", limit: 8 })
+]
+
+const describeSessionFailure = (error: SessionFailure) => {
+  if (error._tag === "CapacityExceeded") return `CapacityExceeded ${error.resource} ${error.limit}`
+  return error._tag
+}
+
+const describeSubscriber = <A,>(fiber: Fiber.Fiber<A, SessionFailure>) => {
+  const exit = fiber.pollUnsafe()
+  if (exit === undefined) return "pending"
+  if (Exit.isSuccess(exit)) return "ended"
+  const error = Cause.findErrorOption(exit.cause)
+  if (Option.isSome(error)) return describeSessionFailure(error.value)
+  if (Cause.hasDies(exit.cause)) return "died"
+  return "interrupted"
+}
+
+const makeLeaderSessions = Effect.gen(function*() {
+  const opens = yield* Queue.unbounded<void>()
+  const openFailures = yield* Queue.unbounded<ReplicaError.ReplicaError>()
+  const memberSignals = yield* Queue.unbounded<Cause.Cause<SessionFailure>>()
+  const reactions = yield* Queue.unbounded<string | ReplicaError.ReplicaError>()
+  const failMembers = Queue.take(memberSignals).pipe(Effect.flatMap(Effect.failCause))
+
+  function members<M extends Ephemeral.AnyMember,>(
+    sessionMember: Protocol.EphemeralMember
+  ): Stream.Stream<ReadonlyArray<EphemeralClient.MemberEntry<M>>, SessionFailure>
+  function members(
+    sessionMember: Protocol.EphemeralMember
+  ): Stream.Stream<ReadonlyArray<EphemeralClient.MemberEntry<typeof StatusProfile>>, SessionFailure> {
+    return Stream.concat(
+      Stream.succeed([{ member: sessionMember, value: { status: "online" }, expiresAtMillis: 60_000 }]),
+      Stream.fromEffect(failMembers)
+    )
+  }
+
+  function events<D extends Ephemeral.AnyEvent,>(
+    sessionMember: Protocol.EphemeralMember
+  ): Stream.Stream<EphemeralClient.EventEnvelope<D>, ReplicaError.ReplicaError>
+  function events(
+    sessionMember: Protocol.EphemeralMember
+  ): Stream.Stream<EphemeralClient.EventEnvelope<typeof Reaction>, ReplicaError.ReplicaError> {
+    return Stream.fromQueue(reactions).pipe(
+      Stream.mapEffect((signal) => {
+        if (typeof signal !== "string") return Effect.fail(signal)
+        return Effect.succeed({ member: sessionMember, payload: { emoji: signal } })
+      })
+    )
+  }
+
+  function state<D extends Ephemeral.AnyState,>(
+    sessionMember: Protocol.EphemeralMember
+  ): Stream.Stream<ReadonlyArray<EphemeralClient.StateEntry<D>>>
+  function state(
+    sessionMember: Protocol.EphemeralMember
+  ): Stream.Stream<ReadonlyArray<EphemeralClient.StateEntry<typeof Cursor>>> {
+    return Stream.concat(
+      Stream.succeed([{ member: sessionMember, key: "pointer", value: { x: 1 }, expiresAtMillis: 60_000 }]),
+      Stream.never
+    )
+  }
+
+  const open = Queue.offer(opens, undefined).pipe(
+    Effect.andThen(Queue.poll(openFailures)),
+    Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: (error) => Effect.fail(error) }))
+  )
+
+  const layer = Layer.succeed(EphemeralClient.EphemeralClient, {
+    session: (_profile, options) =>
+      open.pipe(Effect.as({
+        spaceId: options.spaceId,
+        member: options.member,
+        events: () => events(options.member),
+        state: () => state(options.member),
+        members: members(options.member),
+        updateMember: () => Effect.void
+      })),
+    publish: () => Effect.void,
+    clear: () => Effect.void,
+    remove: () => Effect.void
+  })
+
+  const reopens = Effect.map(Queue.clear(opens), (taken) => taken.length)
+  return { layer, reopens, openFailures, memberSignals, reactions }
+})
+
+const watchSession = Effect.fnUntraced(function*(session: EphemeralClient.Session<typeof StatusProfile>) {
+  const statuses = yield* Queue.unbounded<ReadonlyArray<string>>()
+  const emojis = yield* Queue.unbounded<string>()
+  const pointers = yield* Queue.unbounded<ReadonlyArray<number>>()
+  const members = yield* session.members.pipe(
+    Stream.runForEach((entries) => Queue.offer(statuses, entries.map((entry) => entry.value.status))),
+    Effect.forkChild
+  )
+  const events = yield* session.events(Reaction).pipe(
+    Stream.runForEach((envelope) => Queue.offer(emojis, envelope.payload.emoji)),
+    Effect.forkChild
+  )
+  const state = yield* session.state(Cursor).pipe(
+    Stream.runForEach((entries) => Queue.offer(pointers, entries.map((entry) => entry.value.x))),
+    Effect.forkChild
+  )
+  yield* settle(Effect.void)
+  const outcomes = () => ({
+    members: describeSubscriber(members),
+    events: describeSubscriber(events),
+    state: describeSubscriber(state)
+  })
+  return { statuses, emojis, pointers, outcomes }
+})
+
+const idle = Effect.gen(function*() {
+  for (let step = 0; step < 100; step++) yield* TestClock.adjust(0)
+})
+
+const openFollowerSession = Effect.fnUntraced(function*(timing: Pick<EnvironmentOptions, "retryDelay">) {
+  const leaderSessions = yield* makeLeaderSessions
+  const environment = yield* makeEnvironmentWith({ ...timing, layerEphemeral: leaderSessions.layer })
+  const leader = yield* environment.openTabWith(true, ttlBuild)
+  const follower = yield* environment.openTabWith(false, ttlBuild)
+  const session = yield* settle(openStatusSession(follower.context).pipe(Scope.provide(yield* Effect.scope)))
+  const watching = yield* watchSession(session)
+  yield* leaderSessions.reopens
+  const reopensAfter = Effect.fnUntraced(function*(delayMillis: number) {
+    yield* idle
+    yield* TestClock.adjust(delayMillis - 1)
+    yield* idle
+    const early = yield* leaderSessions.reopens
+    yield* TestClock.adjust(1)
+    yield* idle
+    return { early, onTime: yield* leaderSessions.reopens }
+  })
+  return { ...leaderSessions, ...watching, environment, leader, follower, session, reopensAfter }
+})
+
+const serverUnavailable = Cause.fail(sessionFailures.ServerUnavailable)
+const eventsLost = new ReplicaError.CapacityExceeded({ resource: "ephemeral events", limit: 4 })
+
+describe("BrowserReplica follower ephemeral session failures", () => {
+  for (const error of surfacedSessionFailures) {
+    const label = describeSessionFailure(error)
+
+    it.effect(
+      `fails a follower's members, events and state with ${label} when the leader's session fails with it`,
+      Effect.fnUntraced(
+        function*() {
+          const tabs = yield* openFollowerSession({})
+          yield* Queue.offer(tabs.memberSignals, Cause.fail(error))
+          yield* settle(Effect.void)
+          assert.deepStrictEqual(tabs.outcomes(), { members: label, events: label, state: label })
+          assert.strictEqual(yield* tabs.reopens, 0, "the follower reopened a session that had failed for good")
+        },
+        Effect.scoped,
+        provideFileSystem
+      )
+    )
+  }
+
+  it.effect(
+    "surfaces a failure the leader answers a reopen with instead of retrying it",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({})
+        yield* Queue.offer(tabs.openFailures, sessionFailures.AuthorizationDenied)
+        yield* Queue.offer(tabs.memberSignals, serverUnavailable)
+        yield* settle(Effect.void)
+        assert.deepStrictEqual(tabs.outcomes(), {
+          members: "AuthorizationDenied",
+          events: "AuthorizationDenied",
+          state: "AuthorizationDenied"
+        })
+        assert.strictEqual(yield* tabs.reopens, 1)
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "fails only a follower's events subscribers when the leader reports that it lost events, and reopens",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({})
+        yield* Queue.offerAll(tabs.reactions, ["before", eventsLost])
+        yield* idle
+        assert.deepStrictEqual(yield* Queue.clear(tabs.emojis), ["before"])
+        assert.deepStrictEqual(tabs.outcomes(), {
+          members: "pending",
+          events: "CapacityExceeded ephemeral events 4",
+          state: "pending"
+        })
+        assert.deepStrictEqual(yield* Queue.clear(tabs.statuses), [["online"]])
+        assert.deepStrictEqual(yield* tabs.reopensAfter(100), { early: 0, onTime: 1 })
+        assert.deepStrictEqual(yield* Queue.clear(tabs.statuses), [["online"]])
+        const resubscribed = yield* watchSession(tabs.session)
+        yield* Queue.offer(tabs.reactions, "after")
+        yield* idle
+        assert.deepStrictEqual(yield* Queue.clear(resubscribed.emojis), ["after"])
+        assert.strictEqual(resubscribed.outcomes().events, "pending")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "ends a follower's members, events and state with a defect when the leader cannot decode its session",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({})
+        const undecodable = new Ephemeral.DecodeError({ definition: "member", cause: "not a status" })
+        yield* Queue.offer(tabs.memberSignals, Cause.fail(undecodable))
+        yield* settle(Effect.void)
+        assert.deepStrictEqual(tabs.outcomes(), { members: "died", events: "died", state: "died" })
+        assert.strictEqual(yield* tabs.reopens, 0, "the follower reopened a session that had died")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "keeps a follower's subscribers while the cluster restarts the leader's entity after its session died",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({})
+        yield* Queue.offer(tabs.memberSignals, Cause.die("the leader's session crashed"))
+        yield* settle(Effect.void)
+        assert.deepStrictEqual(tabs.outcomes(), { members: "pending", events: "pending", state: "pending" })
+        assert.strictEqual(yield* tabs.reopens, 1)
+        assert.deepStrictEqual(yield* Queue.clear(tabs.statuses), [["online"], ["online"]])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "rejects a member update and a new subscription after the leader's session failed for good",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({})
+        yield* Queue.offer(tabs.memberSignals, Cause.fail(sessionFailures.AuthorizationDenied))
+        yield* settle(Effect.void)
+        const updated = yield* settle(tabs.session.updateMember({ status: "away" }).pipe(Effect.exit))
+        assert.strictEqual(failureTag(updated), "EphemeralSessionUnavailable")
+        const resubscribed = yield* watchSession(tabs.session)
+        assert.deepStrictEqual(resubscribed.outcomes(), {
+          members: "AuthorizationDenied",
+          events: "AuthorizationDenied",
+          state: "AuthorizationDenied"
+        })
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "keeps a follower's subscribers and reopens on the new leader without waiting when the leader tab closes",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({ retryDelay: "1 hour" })
+        yield* settle(Scope.close(tabs.leader.scope, Exit.void))
+        assert.deepStrictEqual(tabs.outcomes(), { members: "pending", events: "pending", state: "pending" })
+        assert.strictEqual(yield* tabs.reopens, 1)
+        assert.deepStrictEqual(yield* Queue.clear(tabs.statuses), [["online"], ["online"]])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "fails a follower's members, events and state with BuildSuperseded when a newer build takes over",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({})
+        yield* tabs.environment.openBuild(nextVersionBuild)
+        yield* settle(Effect.void)
+        assert.deepStrictEqual(tabs.outcomes(), {
+          members: "BuildSuperseded",
+          events: "BuildSuperseded",
+          state: "BuildSuperseded"
+        })
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "fails a tab's members, events and state with OwnerUnavailable when the tab closes under an open session",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({})
+        yield* settle(Scope.close(tabs.follower.scope, Exit.void))
+        assert.deepStrictEqual(tabs.outcomes(), {
+          members: "OwnerUnavailable",
+          events: "OwnerUnavailable",
+          state: "OwnerUnavailable"
+        })
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+})
+
 describe("BrowserReplica", () => {
   it.effect(
     "reports the leader replica's first sync to a follower tab through the synced status",
