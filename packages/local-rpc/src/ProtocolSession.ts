@@ -13,6 +13,7 @@ import * as Semaphore from "effect/Semaphore"
 import type * as Authentication from "./Authentication.js"
 import { positiveFiniteDurationMillis } from "./internal/configuration.js"
 import { invalidConfiguration } from "./internal/errors.js"
+import { hasRemoteDefect } from "./internal/remoteDefect.js"
 import { findDecodeDefect } from "./internal/responseDecoding.js"
 import * as SyncRpc from "./SyncRpc.js"
 
@@ -106,6 +107,15 @@ export const layerWithOptions = (options?: Options): Layer.Layer<
               new ReplicaError.ProtocolInvalid({
                 message: "The Negotiate RPC response could not be decoded",
                 cause: undecodable
+              })
+            )
+          }),
+          Effect.catchCause((cause) => {
+            if (!hasRemoteDefect(cause)) return Effect.failCause(cause)
+            return Effect.fail(
+              new ReplicaError.ProtocolInvalid({
+                message: "The Negotiate RPC failed on the server",
+                cause: Cause.squash(cause)
               })
             )
           }),

@@ -46,6 +46,7 @@ const cursor = Protocol.ReplicationCursor.make({
 
 const Presence = Ephemeral.member({ status: Schema.String })
 const Reaction = Ephemeral.make("reaction", { kind: "event", payload: { emoji: Schema.String } })
+const Cursor = Ephemeral.make("cursor", { kind: "state", key: Schema.String, payload: { x: Schema.Number } })
 
 const envelope = Effect.gen(function*() {
   const identity = {
@@ -81,6 +82,13 @@ const unknownSuccessReply = succeedWith(unknownSuccess)
 const unknownChunkReply = chunksOf([unknownSuccess])
 const unknownErrorReply = failWith({ _tag: "CapacityExceeded", resource: "tenant storage quota", limit: 1 })
 const malformedFrame: Reply = (requestId) => [`{"_tag":"Exit","requestId":${requestId},"exit":{"_tag":"Maybe"}}`]
+const remoteDefect = { _tag: "RemoteDefect" }
+const remoteDefectExit: Reply = (requestId) => [
+  { _tag: "Exit", requestId, exit: { _tag: "Failure", cause: [{ _tag: "Die", defect: remoteDefect }] } }
+]
+const remoteDefectFrame: Reply = () => [{ _tag: "Defect", defect: remoteDefect }]
+const thenRemoteDefect = (reply: Reply): Reply => (requestId) => [...reply(requestId), ...remoteDefectExit(requestId)]
+const isRemoteDefect = Schema.is(Schema.Struct({ _tag: Schema.Literal("RemoteDefect") }))
 
 const sessionStarted = Protocol.EphemeralSessionStarted.make({
   spaceId,
@@ -222,6 +230,7 @@ const outcome = <A, E extends { readonly _tag: string },>(exit: Exit.Exit<A, E>)
   const defect = Cause.findDefect(exit.cause)
   if (Result.isSuccess(defect)) {
     if (Schema.isSchemaError(defect.success)) return "defect: SchemaError"
+    if (isRemoteDefect(defect.success)) return "defect: RemoteDefect"
     return `defect: ${String(defect.success)}`
   }
   const failure = Cause.findError(exit.cause)
@@ -512,6 +521,128 @@ describe("a server reply that this client cannot decode", () => {
     Effect.fnUntraced(function*() {
       const clients = yield* connect(new Map(), layerCredentialDying)
       assert.strictEqual(yield* exitOutcome(clients.engine.pull(pullRequest)), "defect: credential store crashed")
+    }, Effect.scoped)
+  )
+})
+
+describe("a server handler that dies", () => {
+  for (const call of calls) {
+    const failedOnServer = `ProtocolInvalid: The ${call.rpc} RPC failed on the server`
+
+    it.effect(
+      `fails ${call.rpc} with ProtocolInvalid naming it when its exit carries a remote defect`,
+      Effect.fnUntraced(function*() {
+        const clients = yield* connect(replies(call, remoteDefectExit), layerCredentialStatic)
+        assert.strictEqual(yield* call.run(clients), failedOnServer)
+      }, Effect.scoped)
+    )
+
+    if (call.rpc === "Negotiate" || call.prelude.length > 0) continue
+
+    it.effect(
+      `fails ${call.rpc} with ProtocolInvalid naming Negotiate when the negotiation it started dies on the server`,
+      Effect.fnUntraced(function*() {
+        const clients = yield* connect(
+          new Map<string, Reply>([...call.prelude, ["Negotiate", remoteDefectExit]]),
+          layerCredentialStatic
+        )
+        assert.strictEqual(yield* call.run(clients), "ProtocolInvalid: The Negotiate RPC failed on the server")
+        assert.notInclude(clients.written, call.rpc)
+      }, Effect.scoped)
+    )
+  }
+
+  for (const call of calls) {
+    if (call.rpc === "HeartbeatEphemeral") continue
+
+    it.effect(
+      `fails ${call.rpc} with ProtocolInvalid naming it when the server answers it with a remote defect frame`,
+      Effect.fnUntraced(function*() {
+        const clients = yield* connect(replies(call, remoteDefectFrame), layerCredentialStatic)
+        assert.strictEqual(yield* call.run(clients), `ProtocolInvalid: The ${call.rpc} RPC failed on the server`)
+      }, Effect.scoped)
+    )
+  }
+
+  it.effect(
+    "ends an open ephemeral session naming JoinEphemeral when a remote defect frame answers its heartbeat",
+    Effect.fnUntraced(function*() {
+      const clients = yield* connect(
+        new Map([["JoinEphemeral", joined], ["HeartbeatEphemeral", remoteDefectFrame]]),
+        layerCredentialStatic
+      )
+      const session = yield* openSession(clients)
+      const members = yield* session.members.pipe(Stream.runDrain, Effect.forkChild({ startImmediately: true }))
+      yield* TestClock.adjust("1 second")
+      assert.strictEqual(
+        yield* Fiber.join(members).pipe(exitOutcome),
+        "ProtocolInvalid: The JoinEphemeral RPC failed on the server"
+      )
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "ends a watch with ProtocolInvalid when the server dies after a wake and keeps the wakes before it",
+    Effect.fnUntraced(function*() {
+      const clients = yield* connect(
+        new Map([["Watch", thenRemoteDefect(chunksOf([{ spaceId }]))]]),
+        layerCredentialStatic
+      )
+      const wakes = yield* Queue.unbounded<Protocol.Wake>()
+      const ended = yield* clients.engine.watch(watchRequest).pipe(
+        Stream.runForEach((wake) => Queue.offer(wakes, wake)),
+        exitOutcome
+      )
+      assert.deepStrictEqual(yield* Queue.clear(wakes), [{ spaceId }])
+      assert.strictEqual(ended, "ProtocolInvalid: The Watch RPC failed on the server")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "ends every subscription of an open ephemeral session with ProtocolInvalid when the server dies mid stream",
+    Effect.fnUntraced(function*() {
+      const clients = yield* connect(
+        new Map([["JoinEphemeral", thenRemoteDefect(joined)]]),
+        layerCredentialStatic
+      )
+      const session = yield* openSession(clients)
+      const failedOnServer = "ProtocolInvalid: The JoinEphemeral RPC failed on the server"
+      assert.strictEqual(yield* session.members.pipe(Stream.runDrain, exitOutcome), failedOnServer)
+      assert.strictEqual(yield* session.events(Reaction).pipe(Stream.runDrain, exitOutcome), failedOnServer)
+      assert.strictEqual(yield* session.state(Cursor).pipe(Stream.runDrain, exitOutcome), failedOnServer)
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "does not rejoin an ephemeral session whose stream died on the server",
+    Effect.fnUntraced(function*() {
+      const clients = yield* connect(
+        new Map([["JoinEphemeral", thenRemoteDefect(joined)]]),
+        layerCredentialStatic
+      )
+      const session = yield* openSession(clients)
+      yield* session.members.pipe(Stream.runDrain, Effect.exit)
+      yield* TestClock.adjust("1 hour")
+      assert.deepStrictEqual(clients.written, ["Negotiate", "JoinEphemeral"])
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "does not rejoin an ephemeral session whose heartbeat died on the server",
+    Effect.fnUntraced(function*() {
+      const clients = yield* connect(
+        new Map([["JoinEphemeral", joined], ["HeartbeatEphemeral", remoteDefectExit]]),
+        layerCredentialStatic
+      )
+      const session = yield* openSession(clients)
+      const members = yield* session.members.pipe(Stream.runDrain, Effect.forkChild({ startImmediately: true }))
+      yield* TestClock.adjust("1 second")
+      assert.strictEqual(
+        yield* Fiber.join(members).pipe(exitOutcome),
+        "ProtocolInvalid: The HeartbeatEphemeral RPC failed on the server"
+      )
+      yield* TestClock.adjust("1 hour")
+      assert.deepStrictEqual(clients.written, ["Negotiate", "JoinEphemeral", "HeartbeatEphemeral"])
     }, Effect.scoped)
   )
 })

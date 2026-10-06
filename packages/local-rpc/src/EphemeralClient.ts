@@ -29,6 +29,7 @@ import * as EphemeralView from "./internal/ephemeralView.js"
 import { invalidConfiguration } from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as ProtocolSessionRetry from "./internal/protocolSession.js"
+import { hasRemoteDefect } from "./internal/remoteDefect.js"
 import { findDecodeDefect } from "./internal/responseDecoding.js"
 import * as SequencedPubSub from "./internal/sequencedPubSub.js"
 import * as ProtocolSession from "./ProtocolSession.js"
@@ -311,6 +312,15 @@ export const layerFromSession = (
                 )
             )
           ),
+          Effect.catchCause((cause) => {
+            if (!hasRemoteDefect(cause)) return Effect.failCause(cause)
+            return Effect.fail(
+              new ReplicaError.ProtocolInvalid({
+                message: "The PublishEphemeral RPC failed on the server",
+                cause: Cause.squash(cause)
+              })
+            )
+          }),
           Effect.asVoid,
           Effect.withSpan("EphemeralClient.publish", {
             attributes: {
@@ -388,6 +398,15 @@ export const layerFromSession = (
                 )
             )
           ),
+          Effect.catchCause((cause) => {
+            if (!hasRemoteDefect(cause)) return Effect.failCause(cause)
+            return Effect.fail(
+              new ReplicaError.ProtocolInvalid({
+                message: "The HeartbeatEphemeral RPC failed on the server",
+                cause: Cause.squash(cause)
+              })
+            )
+          }),
           Effect.asVoid,
           Effect.withSpan("EphemeralClient.heartbeat", {
             attributes: {
@@ -522,6 +541,15 @@ export const layerFromSession = (
               )
             }))
         ).pipe(
+          Stream.catchCause((cause) => {
+            if (!hasRemoteDefect(cause)) return Stream.failCause(cause)
+            return Stream.fail(
+              new ReplicaError.ProtocolInvalid({
+                message: "The JoinEphemeral RPC failed on the server",
+                cause: Cause.squash(cause)
+              })
+            )
+          }),
           Stream.withSpan("EphemeralClient.join", {
             attributes: {
               "space.id": request.spaceId,
