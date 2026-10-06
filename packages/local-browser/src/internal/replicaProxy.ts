@@ -241,6 +241,8 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     return keys
   }
 
+  const refreshEverything = Effect.suspend(() => notify(fullRefreshKeys()))
+
   const dropMemberships = () => {
     membershipEpoch += 1
     joined.clear()
@@ -280,12 +282,12 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
       }
       if (frame._tag === "Overflow") {
         dropMemberships()
-        return notify(fullRefreshKeys())
+        return refreshEverything
       }
       invalidationsLive = true
       if (resubscribing) {
         dropMemberships()
-        return notify(fullRefreshKeys())
+        return refreshEverything
       }
       resubscribing = true
       return Deferred.succeed(subscribed, undefined)
@@ -298,7 +300,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
   yield* supersededSignal.pipe(
     Effect.andThen(Effect.suspend(() => {
       forgetMemberships()
-      return notify(fullRefreshKeys())
+      return refreshEverything
     })),
     Effect.forkIn(proxyScope)
   )
