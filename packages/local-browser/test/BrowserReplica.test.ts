@@ -217,6 +217,7 @@ interface EnvironmentOptions {
   readonly name?: string
   readonly kit?: testKit.MemoryPlatform
   readonly retryDelay?: BrowserReplica.Options<typeof definition>["retryDelay"]
+  readonly maximumRetryDelay?: BrowserReplica.Options<typeof definition>["maximumRetryDelay"]
   readonly eventCapacity?: BrowserReplica.Options<typeof definition>["eventCapacity"]
   readonly pullGate?: Effect.Effect<void>
   readonly layerOwnerProbe?: Layer.Layer<never, OwnerProbeError>
@@ -276,6 +277,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
       ephemerals: build.ephemerals,
       requestPersistence: false,
       retryDelay: environmentOptions.retryDelay ?? "100 millis",
+      maximumRetryDelay: environmentOptions.maximumRetryDelay,
       eventCapacity: environmentOptions.eventCapacity,
       sharding: environmentOptions.sharding
     }).pipe(
@@ -1146,7 +1148,9 @@ const idle = Effect.gen(function*() {
   for (let step = 0; step < 100; step++) yield* TestClock.adjust(0)
 })
 
-const openFollowerSession = Effect.fnUntraced(function*(timing: Pick<EnvironmentOptions, "retryDelay">) {
+const openFollowerSession = Effect.fnUntraced(function*(
+  timing: Pick<EnvironmentOptions, "retryDelay" | "maximumRetryDelay">
+) {
   const leaderSessions = yield* makeLeaderSessions
   const environment = yield* makeEnvironmentWith({ ...timing, layerEphemeral: leaderSessions.layer })
   const leader = yield* environment.openTabWith(true, ttlBuild)
@@ -1189,6 +1193,66 @@ describe("BrowserReplica follower ephemeral session failures", () => {
     )
   }
 
+  for (const error of retriedSessionFailures) {
+    const label = describeSessionFailure(error)
+
+    it.effect(
+      `keeps a follower's subscribers, empties what they see and reopens when the leader's session fails with ${label}`,
+      Effect.fnUntraced(
+        function*() {
+          const tabs = yield* openFollowerSession({ retryDelay: "1 second" })
+          yield* Queue.offer(tabs.memberSignals, Cause.fail(error))
+          yield* idle
+          assert.deepStrictEqual(yield* Queue.clear(tabs.statuses), [["online"], []])
+          assert.deepStrictEqual(yield* Queue.clear(tabs.pointers), [[1], []])
+          assert.deepStrictEqual(yield* tabs.reopensAfter(1_000), { early: 0, onTime: 1 })
+          assert.deepStrictEqual(yield* Queue.clear(tabs.statuses), [["online"]])
+          assert.deepStrictEqual(yield* Queue.clear(tabs.pointers), [[1]])
+          assert.deepStrictEqual(tabs.outcomes(), { members: "pending", events: "pending", state: "pending" })
+        },
+        Effect.scoped,
+        provideFileSystem
+      )
+    )
+  }
+
+  it.effect(
+    "doubles the delay before each reopen up to maximumRetryDelay while the leader's session keeps failing",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({ retryDelay: "100 millis", maximumRetryDelay: "1 second" })
+        for (const delayMillis of [100, 200, 400, 800, 1_000, 1_000]) {
+          yield* Queue.offer(tabs.memberSignals, serverUnavailable)
+          assert.deepStrictEqual(yield* tabs.reopensAfter(delayMillis), { early: 0, onTime: 1 }, `${delayMillis}`)
+        }
+        assert.deepStrictEqual(tabs.outcomes(), { members: "pending", events: "pending", state: "pending" })
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "returns to retryDelay once a reopened session has stayed open longer than the delay before it",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({ retryDelay: "100 millis", maximumRetryDelay: "1 second" })
+        for (const delayMillis of [100, 200, 400]) {
+          yield* Queue.offer(tabs.memberSignals, serverUnavailable)
+          assert.deepStrictEqual(yield* tabs.reopensAfter(delayMillis), { early: 0, onTime: 1 }, `${delayMillis}`)
+        }
+        yield* TestClock.adjust(400)
+        yield* Queue.offer(tabs.memberSignals, serverUnavailable)
+        assert.deepStrictEqual(yield* tabs.reopensAfter(800), { early: 0, onTime: 1 }, "open for the delay")
+        yield* TestClock.adjust(801)
+        yield* Queue.offer(tabs.memberSignals, serverUnavailable)
+        assert.deepStrictEqual(yield* tabs.reopensAfter(100), { early: 0, onTime: 1 }, "open for longer")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
   it.effect(
     "surfaces a failure the leader answers a reopen with instead of retrying it",
     Effect.fnUntraced(
@@ -1230,6 +1294,26 @@ describe("BrowserReplica follower ephemeral session failures", () => {
         yield* idle
         assert.deepStrictEqual(yield* Queue.clear(resubscribed.emojis), ["after"])
         assert.strictEqual(resubscribed.outcomes().events, "pending")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "doubles the delay before each reopen while the leader keeps losing events",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({ retryDelay: "100 millis", maximumRetryDelay: "1 second" })
+        for (const delayMillis of [100, 200, 400, 800, 1_000, 1_000]) {
+          yield* Queue.offer(tabs.reactions, eventsLost)
+          assert.deepStrictEqual(yield* tabs.reopensAfter(delayMillis), { early: 0, onTime: 1 }, `${delayMillis}`)
+        }
+        assert.deepStrictEqual(tabs.outcomes(), {
+          members: "pending",
+          events: "CapacityExceeded ephemeral events 4",
+          state: "pending"
+        })
       },
       Effect.scoped,
       provideFileSystem
@@ -1293,7 +1377,7 @@ describe("BrowserReplica follower ephemeral session failures", () => {
     "keeps a follower's subscribers and reopens on the new leader without waiting when the leader tab closes",
     Effect.fnUntraced(
       function*() {
-        const tabs = yield* openFollowerSession({ retryDelay: "1 hour" })
+        const tabs = yield* openFollowerSession({ retryDelay: "1 hour", maximumRetryDelay: "1 hour" })
         yield* settle(Scope.close(tabs.leader.scope, Exit.void))
         assert.deepStrictEqual(tabs.outcomes(), { members: "pending", events: "pending", state: "pending" })
         assert.strictEqual(yield* tabs.reopens, 1)
@@ -1338,6 +1422,40 @@ describe("BrowserReplica follower ephemeral session failures", () => {
       provideFileSystem
     )
   )
+})
+
+describe("BrowserReplica maximumRetryDelay", () => {
+  const rejected: ReadonlyArray<readonly [string, Pick<EnvironmentOptions, "retryDelay" | "maximumRetryDelay">]> = [
+    ["zero", { maximumRetryDelay: 0 }],
+    ["an infinite duration", { maximumRetryDelay: Duration.infinity }],
+    ["a duration shorter than retryDelay", { retryDelay: "2 seconds", maximumRetryDelay: "1 second" }],
+    ["a default shorter than retryDelay", { retryDelay: "2 minutes" }]
+  ]
+
+  for (const [label, timing] of rejected) {
+    it.effect(
+      `rejects ${label} with InvalidConfiguration`,
+      Effect.fnUntraced(
+        function*() {
+          const environment = yield* makeEnvironmentWith(timing)
+          const visibility = yield* testKit.makeMemoryVisibility(true)
+          const layerTab = environment.layerReplicaWith(visibility.service).pipe(
+            Layer.provideMerge(Layer.fresh(Reactivity.layer))
+          )
+          const outcome = yield* settle(
+            Layer.build(layerTab).pipe(
+              Effect.as("built"),
+              Effect.catchTag("InvalidConfiguration", (error) => Effect.succeed(error.option)),
+              Effect.scoped
+            )
+          )
+          assert.strictEqual(outcome, "maximumRetryDelay")
+        },
+        Effect.scoped,
+        provideFileSystem
+      )
+    )
+  }
 })
 
 describe("BrowserReplica", () => {
@@ -1678,7 +1796,7 @@ describe("BrowserReplica", () => {
     "resubscribes a follower's live query as soon as a handover completes",
     Effect.fnUntraced(
       function*() {
-        const environment = yield* makeEnvironmentWith({ retryDelay: "1 hour" })
+        const environment = yield* makeEnvironmentWith({ retryDelay: "1 hour", maximumRetryDelay: "1 hour" })
         const leader = yield* environment.openTabWith(true)
         const next = yield* environment.openTabWith(false)
         const hidden = yield* testKit.makeMemoryVisibility(false)
@@ -1715,7 +1833,7 @@ describe("BrowserReplica", () => {
           if (entry.logLevel === "Error") logged.push(String(message))
         })
         const result = yield* Effect.gen(function*() {
-          const environment = yield* makeEnvironmentWith({ retryDelay: "1 hour" })
+          const environment = yield* makeEnvironmentWith({ retryDelay: "1 hour", maximumRetryDelay: "1 hour" })
           const leader = yield* environment.openTabWith(true)
           const next = yield* environment.openTabWith(false)
           const hidden = yield* testKit.makeMemoryVisibility(false)

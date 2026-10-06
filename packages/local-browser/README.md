@@ -51,9 +51,13 @@ An ephemeral session reports a failure of the leader's session the way `Ephemera
 from the server. Any failure outside the four below fails the session's `events`, `state`, and `members` streams with
 it, later subscriptions fail the same way, `updateMember` fails with `EphemeralSessionUnavailable`, and the tab does
 not reopen the session. `ServerUnavailable`, `OperationTimeout`, `AuthenticatorUnavailable`, and an unreachable leader
-(`OwnerUnavailable`) keep the subscribers and reopen it. `CapacityExceeded` for `"ephemeral events"` from the leader means the leader's own subscription lost events. It
+(`OwnerUnavailable`) keep the subscribers, show them empty `members` and `state` until the session is back, and reopen
+it. `CapacityExceeded` for `"ephemeral events"` from the leader means the leader's own subscription lost events. It
 fails the tab's `events` subscribers with that error, leaves `state` and `members` running, and reopens the session.
-Each reopen waits `retryDelay`. A leader handover reopens on the new leader without that delay.
+The delay before a reopen starts at `retryDelay` and doubles up to `maximumRetryDelay` (1 minute) while sessions keep
+closing early. It returns to `retryDelay` once a session has stayed open longer than the previous delay. A leader
+handover reopens on the new leader without that delay. `maximumRetryDelay` must be a positive finite duration greater
+than or equal to `retryDelay`, or the layer fails with `InvalidConfiguration`.
 `eventCapacity` (1,024) bounds the ephemeral events each tab buffers per session, the same contract as
 `EphemeralClient`'s option of that name. A subscriber of `session.events` that falls more than `eventCapacity` events
 behind fails with `CapacityExceeded` for the `"ephemeral events"` resource instead of growing the tab's memory, and

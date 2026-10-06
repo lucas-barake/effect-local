@@ -12,6 +12,7 @@ import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
+import * as Clock from "effect/Clock"
 import type * as ClusterError from "effect/cluster/ClusterError"
 import * as Crypto from "effect/Crypto"
 import * as Deferred from "effect/Deferred"
@@ -51,6 +52,7 @@ export interface ProxyOptions {
   readonly reactivity: Reactivity.Reactivity
   readonly crypto: Crypto.Crypto
   readonly retryDelayMillis: number
+  readonly maximumRetryDelayMillis: number
   readonly eventCapacity: number
   readonly awaitRouted: Effect.Effect<boolean>
   readonly superseded: Deferred.Deferred<never, ReplicaError.BuildSuperseded>
@@ -662,17 +664,44 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     const failure = yield* Deferred.make<never, ReplicaError.ReplicaError>()
     const awaitEnded = Effect.raceFirst(awaitSuperseded, Deferred.await(failure))
 
+    let reopenAttempt = 0
+    let reopenDelayMillis = 0
+    let openedAtMillis = Option.none<number>()
+    const markOpened = Effect.map(Clock.currentTimeMillis, (now) => {
+      openedAtMillis = Option.some(now)
+    })
+    const reopenDelay = Effect.flatMap(Clock.currentTimeMillis, (now) => {
+      if (Option.isSome(openedAtMillis) && now - openedAtMillis.value > reopenDelayMillis) reopenAttempt = 0
+      openedAtMillis = Option.none()
+      reopenAttempt += 1
+      reopenDelayMillis = Math.min(
+        options.maximumRetryDelayMillis,
+        options.retryDelayMillis * 2 ** Math.min(reopenAttempt - 1, 52)
+      )
+      return Effect.sleep(reopenDelayMillis)
+    })
+
+    const presentEmpty = <A,>(ref: SubscriptionRef.SubscriptionRef<Option.Option<ReadonlyArray<A>>>) =>
+      SubscriptionRef.get(ref).pipe(
+        Effect.flatMap((current) => {
+          if (Option.isSome(current) && current.value.length === 0) return Effect.void
+          return SubscriptionRef.set(ref, Option.some<ReadonlyArray<A>>([]))
+        })
+      )
+    const presentUnknown = Effect.suspend(() =>
+      Effect.forEach(states.values(), presentEmpty, { discard: true }).pipe(Effect.andThen(presentEmpty(members)))
+    )
+
     const afterFailure = (cause: Cause.Cause<ReplicaError.ReplicaError>) => {
       const failed = Cause.findErrorOption(cause)
       if (Option.isNone(failed)) return Deferred.failCause(failure, cause).pipe(Effect.as(true))
       const error = failed.value
       if (error._tag === "CapacityExceeded" && error.resource === "ephemeral events") {
-        return SequencedPubSub.publish(events, error).pipe(
-          Effect.andThen(Effect.sleep(options.retryDelayMillis)),
-          Effect.as(false)
-        )
+        return SequencedPubSub.publish(events, error).pipe(Effect.andThen(reopenDelay), Effect.as(false))
       }
-      if (isRetryableSessionFailure(error)) return Effect.sleep(options.retryDelayMillis).pipe(Effect.as(false))
+      if (isRetryableSessionFailure(error)) {
+        return presentUnknown.pipe(Effect.andThen(reopenDelay), Effect.as(false))
+      }
       return Deferred.failCause(failure, cause).pipe(Effect.as(true))
     }
 
@@ -694,6 +723,7 @@ export const makeProxy = Effect.fnUntraced(function*(options: ProxyOptions) {
     const onFrame = (frame: replicaWire.EphemeralSessionFrame): Effect.Effect<void, ReplicaError.ReplicaError> => {
       if (frame._tag === "Opened") {
         return SubscriptionRef.set(handle, Option.some(frame.handle)).pipe(
+          Effect.andThen(markOpened),
           Effect.andThen(Deferred.succeed(opened, undefined)),
           Effect.andThen(Effect.suspend(() => {
             if (latestValue === openedValue) return Effect.void
