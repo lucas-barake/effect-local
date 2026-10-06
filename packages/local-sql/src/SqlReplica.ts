@@ -141,6 +141,7 @@ interface ActiveRuntime {
   readonly foreground: boolean
   readonly scope: Scope.Closeable
   readonly operationGate: Semaphore.Semaphore
+  readonly workflowTurn: Semaphore.Semaphore
   pendingRetirements: number
   requestedRetirements: number
   readonly local: LocalStore.Service
@@ -347,6 +348,14 @@ const makeLayer = <D extends Definition.Any, R,>(
       const backgroundWorkflowTurns = yield* Semaphore.make(
         reconciliationConcurrency - foregroundReconciliationConcurrency
       )
+      const withWorkflowTurn = <A, E extends { readonly _tag: string },>(
+        runtime: ActiveRuntime,
+        turn: Effect.Effect<A, E>
+      ): Effect.Effect<A, E> => {
+        let turns = backgroundWorkflowTurns
+        if (runtime.foreground) turns = foregroundWorkflowTurns
+        return runtime.workflowTurn.withPermit(turns.withPermit(turn))
+      }
       const retryTiming = yield* Configuration.retryTiming(options)
       const backgroundQueue = yield* Effect.acquireRelease(
         Queue.unbounded<BackgroundWork>(),
@@ -694,10 +703,12 @@ const makeLayer = <D extends Definition.Any, R,>(
         }
         yield* Deferred.succeed(reconcilerReady, reconciler)
         const operationGate = yield* Semaphore.make(operationPermits)
+        const workflowTurn = yield* Semaphore.make(1)
         return {
           foreground,
           scope: childScope,
           operationGate,
+          workflowTurn,
           pendingRetirements: 0,
           requestedRetirements: 0,
           local,
@@ -1082,6 +1093,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         entry: RememberedEntry,
         foreground: boolean,
         leased: boolean,
+        buildsWithoutPendingWork: boolean,
         waiter: Waiter,
         restore: Restore
       ): Effect.fn.Return<ActiveRuntime, ReplicaError.ReplicaError> {
@@ -1156,6 +1168,10 @@ const makeLayer = <D extends Definition.Any, R,>(
               yield* signalCapacity
               continue
             }
+            yield* restore(Completion.wait(capacityChanged))
+            continue
+          }
+          if (!buildsWithoutPendingWork && entry.summaryStatus.pending === 0) {
             yield* restore(Completion.wait(capacityChanged))
             continue
           }
@@ -1238,9 +1254,9 @@ const makeLayer = <D extends Definition.Any, R,>(
       ): Effect.Effect<ActiveRuntime, ReplicaError.ReplicaError> =>
         Effect.suspend(() => {
           const waiter: Waiter = { retiring: undefined }
-          if (!foreground) return transition(entry, false, leased, waiter, restore)
+          if (!foreground) return transition(entry, false, leased, true, waiter, restore)
           entry.foregroundDemand += 1
-          return transition(entry, true, leased, waiter, restore).pipe(
+          return transition(entry, true, leased, true, waiter, restore).pipe(
             Effect.onExit(() => {
               entry.foregroundDemand -= 1
               const waited = foregroundQueue.delete(waiter) || waiter.retiring !== undefined
@@ -1659,26 +1675,26 @@ const makeLayer = <D extends Definition.Any, R,>(
               Effect.tap(() => Effect.addFinalizer(() => release(entry, "WorkflowAttempt")))
             )
           )
+          const leaseActiveRuntime = Effect.uninterruptibleMask((restore) =>
+            transition(entry, false, true, false, { retiring: undefined }, restore).pipe(
+              Effect.tap(() => Effect.addFinalizer(() => release(entry, "WorkflowAttempt")))
+            )
+          )
           const leasedAttempt = <A,>(
             execute: (runtime: ReconciliationWorkflow.RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>
           ): Effect.Effect<A, ReplicaError.ReplicaError> =>
-            Effect.andThen(awaitRetryAllowed(entry), leaseRuntime).pipe(
-              Effect.flatMap((runtime) => endedByRetirement(runtime, execute(runtime))),
+            Effect.andThen(awaitRetryAllowed(entry), leaseActiveRuntime).pipe(
+              Effect.flatMap((runtime) => {
+                const turn = withWorkflowTurn(runtime, execute(runtime))
+                return endedByRetirement(runtime, turn)
+              }),
               Effect.scoped,
               Effect.flatMap(Option.match({
                 onNone: () => leasedAttempt(execute),
                 onSome: Effect.succeed
               }))
             )
-          const attempt = <A,>(
-            execute: (runtime: ReconciliationWorkflow.RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>
-          ): Effect.Effect<A, ReplicaError.ReplicaError> =>
-            Effect.suspend(() => {
-              let turns = backgroundWorkflowTurns
-              if (entry.foreground) turns = foregroundWorkflowTurns
-              return turns.withPermit(leasedAttempt(execute))
-            })
-          const lease = ReconciliationWorkflow.RuntimeLease.of({ acquire: leaseRuntime, attempt })
+          const lease = ReconciliationWorkflow.RuntimeLease.of({ acquire: leaseRuntime, attempt: leasedAttempt })
           const registrationContext = Context.add(
             Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow),
             ReconciliationWorkflow.RuntimeLease,
@@ -1892,7 +1908,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         const result = yield* withLease(entry, false, (runtime) => {
           activeRuntime = runtime
           let sync = runtime.reconciler.sync
-          if (workflow !== undefined) sync = backgroundWorkflowTurns.withPermit(sync)
+          if (workflow !== undefined) sync = withWorkflowTurn(runtime, sync)
           return endedByRetirement(runtime, sync)
         }).pipe(Effect.result)
         entry.turnRetired = Result.isSuccess(result) && Option.isNone(result.success)

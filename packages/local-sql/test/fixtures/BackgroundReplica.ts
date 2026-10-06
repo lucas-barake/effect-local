@@ -399,6 +399,45 @@ export const eventually = (
 export const within = <A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) =>
   effect.pipe(Effect.exit, Effect.timeoutOption("5 minutes"), VirtualTime.advanceUntil)
 
+export const makeCapacityProbe = Effect.fnUntraced(function*(spaceIds: ReadonlyArray<Identity.SpaceId>) {
+  const release = yield* Deferred.make<void>()
+  let armed = false
+  let inFlight = 0
+  const held = <A, E extends { readonly _tag: string },>(spaceId: Identity.SpaceId, answer: Effect.Effect<A, E>) =>
+    Effect.suspend(() => {
+      if (!armed || !spaceIds.includes(spaceId)) return answer
+      inFlight += 1
+      return Deferred.await(release).pipe(
+        Effect.ensuring(Effect.sync(() => {
+          inFlight -= 1
+        })),
+        Effect.andThen(answer)
+      )
+    })
+  const fill = Effect.fnUntraced(
+    function*(background: Services, replica: Replica.Replica["Service"], home: Identity.SpaceId) {
+      armed = true
+      for (const spaceId of spaceIds) {
+        const space = yield* replica.space(spaceId)
+        yield* space.mutate(Domain.PutTodo, Domain.todo("probe")).pipe(VirtualTime.advanceUntil)
+      }
+      const current = yield* replica.space(home)
+      yield* current.mutate(Domain.PutTodo, Domain.todo("probe")).pipe(VirtualTime.advanceUntil)
+      const foregroundSynced = yield* eventually(background, current, isOnlineDrained)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+      const backgroundCallsAtOnce = inFlight
+      yield* Deferred.succeed(release, undefined)
+      let drained = 0
+      for (const spaceId of spaceIds) {
+        const space = yield* replica.space(spaceId)
+        if (Option.isSome(yield* eventually(background, space, (status) => status.pending === 0))) drained += 1
+      }
+      return { foregroundSynced: Option.isSome(foregroundSynced), backgroundCallsAtOnce, drained }
+    }
+  )
+  return { held, fill }
+})
+
 export const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
 
 export const healthyRemote = (background: Services) =>
