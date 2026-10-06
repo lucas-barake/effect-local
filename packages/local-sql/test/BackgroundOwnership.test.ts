@@ -9,6 +9,7 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
+import * as Scheduler from "effect/Scheduler"
 import * as Scope from "effect/Scope"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
@@ -182,6 +183,7 @@ const turnTakenDuringLeave = Effect.fnUntraced(function*() {
   const leave = Effect.result(replica.leave(spaceId))
   const leaving = yield* space.deactivate.pipe(
     Effect.andThen(leave),
+    Effect.provideService(Scheduler.PreventSchedulerYield, true),
     Effect.forkChild({ startImmediately: true })
   )
   yield* removal.entered

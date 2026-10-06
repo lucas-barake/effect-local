@@ -301,6 +301,7 @@ describe("scheduler failure reports", () => {
           Layer.provide(WorkflowEngine.layerMemory)
         )
       )
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 second"))
       yield* controls.failWhen(failAfter(completeStatement, (statement) => statement.includes(countStatement)))
       yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
       yield* Queue.take(controls.injected)

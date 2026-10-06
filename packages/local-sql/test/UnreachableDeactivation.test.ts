@@ -1,7 +1,10 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Clock from "effect/Clock"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
+import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
 import * as Scheduler from "effect/Scheduler"
 import * as SyncEngine from "../src/SyncEngine.js"
@@ -15,6 +18,7 @@ import {
   eventually,
   idleRemote,
   installView,
+  makeAttempts,
   within
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
@@ -89,5 +93,93 @@ describe("a foreground space whose server is unreachable", () => {
       const drained = yield* eventually(services, space, (status) => status.pending === 0)
       assert.isTrue(Option.isSome(drained), "the evicted space was drained once the server returned")
     }, atBudget)
+  )
+})
+
+describe("a deactivation that lands on a workflow attempt whose server call fails", () => {
+  it.effect.each(budgets)(
+    "leaves the retry schedule of the workflow as it was at a budget of %s",
+    Effect.fnUntraced(function*(budget) {
+      const services = yield* BackgroundReplica.services({
+        constructor: "layerWorkflow",
+        clientId,
+        initialSpaces: [spaceId],
+        maximumActiveSpaces: 4,
+        foregroundActiveSpaces: 2,
+        retryDelay: "1 second",
+        maximumRetryDelay: "1 minute"
+      })
+      const attempts = yield* makeAttempts
+      const times: Array<number> = []
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        transportGeneration: Effect.never,
+        pull: () =>
+          Clock.currentTimeMillis.pipe(
+            Effect.tap((now) => Effect.sync(() => times.push(now))),
+            Effect.andThen(attempts.record),
+            Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
+          )
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* space.mutate(Domain.PutTodo, Domain.todo("pending"))
+      yield* attempts.reached(1)
+
+      const deactivated = yield* within(space.deactivate)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("20 seconds"))
+
+      assert.strictEqual(describeExit(deactivated), "succeeded")
+      assert.deepStrictEqual(
+        times.map((time) => time - times[0]),
+        [0, 1000, 3000, 7000, 15000],
+        `pulls at a budget of ${budget}`
+      )
+    }, (effect, budget) => atBudget(effect, { budget }))
+  )
+})
+
+describe("a background server call that fails after the foreground took its space over", () => {
+  it.effect.each(constructors)(
+    "is not answered to the foreground sync with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* BackgroundReplica.services({
+        constructor,
+        clientId,
+        initialSpaces: [spaceId],
+        maximumActiveSpaces: 4,
+        foregroundActiveSpaces: 2,
+        retryDelay: "1 second",
+        maximumRetryDelay: "1 minute"
+      })
+      yield* BackgroundReplica.seedPending(services, [spaceId])
+      const held = yield* Deferred.make<void>()
+      const answered = yield* Deferred.make<void>()
+      let pulls = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          pulls += 1
+          if (pulls > 1) return emptyPage(services.crypto, request)
+          return Deferred.succeed(held, undefined).pipe(
+            Effect.andThen(Deferred.await(answered)),
+            Effect.andThen(Effect.fail(new ReplicaError.ProtocolInvalid({ message: "rejected in the background" })))
+          )
+        }
+      }))
+      const space = yield* replica.space(spaceId)
+      yield* VirtualTime.advanceUntil(Deferred.await(held))
+      const admission = yield* services.holdStatement("SET requested_generation", true)
+      const activation = yield* Effect.forkChild(space.activate, { startImmediately: true })
+      yield* VirtualTime.advanceUntil(admission.entered)
+
+      yield* Deferred.succeed(answered, undefined)
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 millis"))
+      yield* admission.release
+      yield* VirtualTime.advanceUntil(Fiber.join(activation))
+      const online = yield* eventually(services, space, (status) => status._tag === "Online" && status.pending === 0)
+
+      assert.isTrue(Option.isSome(online), "the foreground sync ran against the server and drained the space")
+    }, VirtualTime.scoped)
   )
 })
