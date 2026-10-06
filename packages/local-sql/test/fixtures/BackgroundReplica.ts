@@ -354,6 +354,20 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     }
     return running
   })
+  const unfinishedWorkflowExecutions = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
+    let unfinished = 0
+    for (const [name, ids] of executions) {
+      if (!name.includes(spaceId)) continue
+      for (const executionId of ids) {
+        const workflow = workflows.get(name)
+        if (!isPollable(workflow)) continue
+        const exit = yield* Effect.exit(engine.poll(workflow, executionId))
+        if (!Exit.isSuccess(exit)) continue
+        if (Option.isNone(exit.value) || exit.value.value._tag === "Suspended") unfinished += 1
+      }
+    }
+    return unfinished
+  })
   return {
     sql,
     crypto,
@@ -369,6 +383,7 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     endInvalidationsWith,
     workflowExecutions,
     runningWorkflowExecutions,
+    unfinishedWorkflowExecutions,
     workflowInterrupts: () => workflowInterrupts,
     setWorkflowStorageDown: (down: "No" | "Polls" | "PollsAndInterrupts") => {
       workflowStorageDown = down

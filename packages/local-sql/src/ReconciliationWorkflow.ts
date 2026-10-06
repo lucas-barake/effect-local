@@ -607,8 +607,11 @@ const layerSchedulerWithConfiguration = (
         const adopted = yield* Ref.get(activeExecution)
         if (Option.isNone(adopted)) return adopted
         const running = adopted.value
-        const finished = yield* engine.poll(running.workflow, running.executionId)
-        if (Option.isSome(finished)) return Option.none<ActiveExecution>()
+        const polled = yield* engine.poll(running.workflow, running.executionId)
+        if (Option.isSome(polled) && polled.value._tag === "Complete") {
+          yield* Ref.set(activeExecution, Option.none())
+          return Option.none<ActiveExecution>()
+        }
         const state = yield* local.replicationState
         if (running.payload.scopeGeneration === state.scopeGeneration) return adopted
         yield* engine.interruptUnsafe(running.workflow, running.executionId)

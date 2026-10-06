@@ -2,6 +2,7 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
@@ -308,6 +309,109 @@ describe("a foreground scheduler that starts while an execution of its space is 
       assert.strictEqual(services.workflowExecutions(parked), 2)
       assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 1)
       assert.notInclude(reported, "Failed")
+    }, VirtualTime.scoped)
+  )
+})
+
+const asleepAfterAFailure = Effect.fnUntraced(function*(later: "answered" | "held") {
+  const services = yield* BackgroundReplica.services({
+    constructor: "layerWorkflow",
+    clientId,
+    initialSpaces: [parked, other],
+    maximumActiveSpaces: 3,
+    foregroundActiveSpaces: 1,
+    retryDelay: "10 minutes",
+    maximumRetryDelay: "10 minutes"
+  })
+  const held = yield* Deferred.make<void>()
+  let pulls = 0
+  const replica = yield* services.start(SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    submitBatch: acceptSubmission,
+    pull: (request) => {
+      const page = emptyPage(services.crypto, request)
+      if (request.spaceId !== parked) return page
+      pulls += 1
+      if (pulls === 1) return Effect.fail(new ReplicaError.ServerUnavailable())
+      if (later === "answered") return page
+      return Effect.andThen(Deferred.await(held), page)
+    }
+  }))
+  yield* installView(services)
+  const space = yield* replica.space(parked)
+  return { services, replica, space, pulls: () => pulls, answer: Deferred.succeed(held, undefined) }
+})
+
+describe("a workflow that sleeps before it retries a failed sync", () => {
+  it.effect(
+    "is joined by the scheduler of a reactivated space instead of being doubled",
+    Effect.fnUntraced(function*() {
+      const { pulls, services, space } = yield* asleepAfterAFailure("answered")
+      yield* VirtualTime.advanceUntil(space.activate)
+      yield* VirtualTime.quiet("1 second")
+      const asleep = [yield* services.unfinishedWorkflowExecutions(parked), pulls()]
+
+      yield* VirtualTime.advanceUntil(space.deactivate)
+      yield* VirtualTime.advanceUntil(space.activate)
+      yield* VirtualTime.quiet("1 second")
+      const reactivated = [
+        services.workflowExecutions(parked),
+        yield* services.unfinishedWorkflowExecutions(parked),
+        pulls()
+      ]
+      yield* VirtualTime.quiet("11 minutes")
+
+      assert.deepStrictEqual(asleep, [1, 1], "one execution sleeps after its first pull failed")
+      assert.deepStrictEqual(reactivated, [1, 1, 1], "executions started, unfinished, and pulls after the reactivation")
+      assert.strictEqual(yield* services.unfinishedWorkflowExecutions(parked), 0)
+      assert.strictEqual((yield* space.status)._tag, "Online")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "is neither doubled nor forgotten while the engine cannot say whether it still runs",
+    Effect.fnUntraced(function*() {
+      const { services, space } = yield* asleepAfterAFailure("answered")
+      yield* VirtualTime.advanceUntil(space.activate)
+      yield* VirtualTime.quiet("1 second")
+      yield* VirtualTime.advanceUntil(space.deactivate)
+
+      services.setWorkflowStorageDown("Polls")
+      yield* VirtualTime.advanceUntil(space.activate)
+      yield* VirtualTime.quiet("1 second")
+      const whileUnknown = [services.workflowExecutions(parked), (yield* space.status)._tag]
+      services.setWorkflowStorageDown("No")
+      yield* VirtualTime.quiet("21 minutes")
+
+      assert.deepStrictEqual(whileUnknown, [1, "Failed"], "no second execution, and the defect is reported")
+      assert.strictEqual(yield* services.unfinishedWorkflowExecutions(parked), 0)
+      assert.strictEqual((yield* space.status)._tag, "Online")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "is joined by the scheduler of a space that takes over its background runtime",
+    Effect.fnUntraced(function*() {
+      const { answer, pulls, replica, services, space } = yield* asleepAfterAFailure("held")
+      yield* space.mutate(Domain.PutTodo, Domain.todo("pending")).pipe(VirtualTime.advanceUntil)
+      yield* VirtualTime.quiet("1 second")
+      const asleep = yield* services.unfinishedWorkflowExecutions(parked)
+      const elsewhere = yield* replica.space(other)
+      yield* elsewhere.get(Domain.Todo, "x").pipe(VirtualTime.advanceUntil)
+      yield* VirtualTime.quiet("1 second")
+      const inTheBackground = [yield* space.activation, pulls()]
+
+      yield* VirtualTime.advanceUntil(space.activate)
+      yield* VirtualTime.quiet("1 second")
+      const takenOver = [services.workflowExecutions(parked), yield* services.unfinishedWorkflowExecutions(parked)]
+      yield* answer
+      yield* VirtualTime.quiet("11 minutes")
+
+      assert.strictEqual(asleep, 1)
+      assert.deepStrictEqual(inTheBackground, ["Active", 2], "a background turn waits on the server")
+      assert.deepStrictEqual(takenOver, [1, 1], "executions started and unfinished after the takeover")
+      assert.strictEqual(yield* services.unfinishedWorkflowExecutions(parked), 0)
+      assert.strictEqual((yield* space.status).pending, 0)
     }, VirtualTime.scoped)
   )
 })
