@@ -61,7 +61,6 @@ export interface Options {
   readonly maximumRetryDelay?: Duration.Input
   readonly onStatusChange?: (status: ReplicaStatus.ReplicaStatus, pendingCounted: boolean) => Effect.Effect<void>
   readonly onReconciled?: Effect.Effect<void>
-  readonly pulledFresh?: Effect.Effect<boolean>
 }
 
 export interface ManagedSpace {
@@ -602,7 +601,7 @@ export const layerManager: Layer.Layer<Manager, ReplicaError.InvalidConfiguratio
   .effect(Manager, makeManager())
 
 export const layerOnePass = (
-  options: Pick<Options, "definition" | "spaceId" | "pageSize" | "onStatusChange" | "onReconciled" | "pulledFresh">
+  options: Pick<Options, "definition" | "spaceId" | "pageSize" | "onStatusChange" | "onReconciled">
 ): Layer.Layer<Reconciliation, ReplicaError.InvalidConfiguration, LocalStore.Store | SyncEngine.SyncEngine> =>
   Layer.effect(
     Reconciliation,
@@ -616,7 +615,6 @@ export const layerOnePass = (
       }
       const local = yield* LocalStore.Store
       const remote = yield* SyncEngine.SyncEngine
-      const pulledFresh = options.pulledFresh ?? Effect.succeed(true)
       const gate = yield* Semaphore.make(1)
       const status = yield* Ref.make<ReplicaStatus.ReplicaStatus>({ _tag: "Connecting", pending: 0 })
       let syncAttempted = false
@@ -859,7 +857,6 @@ export const layerOnePass = (
       }
 
       const submitPending = Effect.gen(function*() {
-        let submitted = false
         while (true) {
           let installedExpiredSnapshot = false
           let after = 0
@@ -870,7 +867,6 @@ export const layerOnePass = (
             through = claim.through
             const envelopes = claim.envelopes
             if (envelopes.length === 0) break
-            submitted = true
             const mutationIds = envelopes.map((envelope) => envelope.mutationId)
             const receipts = yield* Effect.gen(function*() {
               const result = yield* remote.submitBatch({ envelopes, schema: options.definition.schemaIdentity })
@@ -897,7 +893,7 @@ export const layerOnePass = (
           }
           if (installedExpiredSnapshot) continue
           yield* local.settleReceipts
-          return submitted
+          return
         }
       })
 
@@ -909,9 +905,8 @@ export const layerOnePass = (
           syncing = true
           failedSinceSyncStarted = false
           yield* catchUp
-          const submitted = yield* submitPending
-          if (submitted) yield* catchUp
-          while (!(yield* pulledFresh)) yield* catchUp
+          yield* submitPending
+          yield* catchUp
           syncing = false
           yield* succeeded
           yield* recordSynced(generation)

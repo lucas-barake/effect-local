@@ -91,29 +91,6 @@ const switching = Effect.fnUntraced(function*(
 })
 
 describe("a user who keeps moving between two spaces that share one foreground place", () => {
-  it.effect.each(constructors)(
-    "drains the pending mutation while the visits continue and the server answers in 300 millis with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const result = yield* switching(constructor, 60, false)
-
-      assert.strictEqual(result.visited, "succeeded")
-      assert.strictEqual(result.pendingAtStop, 0)
-    }, VirtualTime.scoped),
-    120_000
-  )
-
-  it.effect.each(constructors)(
-    "finishes a whole sync while the visits continue when each stay outlasts one server call with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const result = yield* switching(constructor, 60, false, "400 millis")
-
-      assert.strictEqual(result.visited, "succeeded")
-      assert.strictEqual(result.pendingAtStop, 0)
-      assert.isAbove(result.completedAtStop, 0, "a pass ended on a pull it had requested itself")
-    }, VirtualTime.scoped),
-    120_000
-  )
-
   it.effect.each(rows)(
     "leaves a bounded amount of server work behind after $visits visits with $constructor",
     Effect.fnUntraced(function*(row) {

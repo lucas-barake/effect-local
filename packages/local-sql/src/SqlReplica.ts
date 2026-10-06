@@ -39,7 +39,6 @@ import * as Invalidation from "./internal/invalidation.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
-import * as SharedCall from "./internal/sharedCall.js"
 import * as SqliteIdentifier from "./internal/sqliteIdentifier.js"
 import { credentialChange, isTransportFailure } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
@@ -158,11 +157,6 @@ interface Waiter {
 interface RememberedEntry {
   readonly spaceId: Identity.SpaceId
   readonly membershipIncarnation: Identity.MembershipIncarnation
-  readonly remote: SyncEngine.Service
-  readonly cancelServerCalls: Effect.Effect<void>
-  readonly forgetServerAnswers: () => void
-  readonly disownServerFailures: () => void
-  pulledFresh: boolean
   readonly quarantineGate: Semaphore.Semaphore
   handle: Replica.Space
   activation: Replica.Activation
@@ -182,15 +176,6 @@ interface RememberedEntry {
   backgroundGeneration: number
   backgroundFailure: ReplicaError.ReplicaError | undefined
 }
-
-interface SyncTurn {
-  failure: ReplicaError.ReplicaError | undefined
-}
-
-const CurrentSyncTurn = Context.Reference<SyncTurn | undefined>(
-  "@lucas-barake/effect-local-sql/SqlReplica/CurrentSyncTurn",
-  { defaultValue: () => undefined }
-)
 
 type BackgroundWork =
   | { readonly _tag: "Sync"; readonly spaceId: Identity.SpaceId }
@@ -281,10 +266,6 @@ const makeLayer = <D extends Definition.Any, R,>(
       const reactivity = yield* Reactivity.Reactivity
       const remote = yield* SyncEngine.SyncEngine
       const parentScope = yield* Effect.scope
-      const serverCallScope = yield* Effect.acquireRelease(
-        Scope.fork(parentScope),
-        (scope) => Scope.close(scope, Exit.void)
-      )
       const rootContext = Context.add(
         yield* Effect.context<BaseRequirements<D> | QueryReactivity.QueryReactivity | R>(),
         ConnectionLane.ConnectionLane,
@@ -361,7 +342,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         reconciliationConcurrency - foregroundReconciliationConcurrency
       )
       const retryTiming = yield* Configuration.retryTiming(options)
-      const serverCallLimiter = SharedCall.makeLimiter(reconciliationConcurrency)
       const backgroundQueue = yield* Effect.acquireRelease(
         Queue.unbounded<BackgroundWork>(),
         Queue.shutdown
@@ -610,8 +590,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             ...options,
             spaceId,
             onStatusChange: (status, pendingCounted) => publishRuntimeStatus(entry, status, pendingCounted),
-            onReconciled: forgetBackgroundFailure(entry),
-            pulledFresh: Effect.sync(() => entry.pulledFresh)
+            onReconciled: forgetBackgroundFailure(entry)
           }).pipe(
             Layer.provide(layerLocalStore)
           )
@@ -621,7 +600,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             layerReconciliation
           ).pipe(
             Layer.buildWithScope(childScope),
-            Effect.provide(Context.add(workflowContext, SyncEngine.SyncEngine, entry.remote)),
+            Effect.provide(workflowContext),
             Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
           )
           local = Context.get(runtime, LocalStore.Store)
@@ -662,12 +641,11 @@ const makeLayer = <D extends Definition.Any, R,>(
               ...options,
               spaceId,
               onStatusChange: (status, pendingCounted) => publishRuntimeStatus(entry, status, pendingCounted),
-              onReconciled: forgetBackgroundFailure(entry),
-              pulledFresh: Effect.sync(() => entry.pulledFresh)
+              onReconciled: forgetBackgroundFailure(entry)
             }).pipe(Layer.provide(layerLocalStore))
           ).pipe(
             Layer.buildWithScope(childScope),
-            Effect.provide(Context.add(rootContext, SyncEngine.SyncEngine, entry.remote)),
+            Effect.provide(rootContext),
             Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
           )
           local = Context.get(runtime, LocalStore.Store)
@@ -810,7 +788,6 @@ const makeLayer = <D extends Definition.Any, R,>(
             retryTiming.maximumRetryDelayMillis
           ).pipe(
             Effect.annotateLogs({ "space.id": entry.spaceId }),
-            Effect.tap(() => Effect.sync(entry.forgetServerAnswers)),
             Effect.andThen(enqueueBackground(entry))
           )
           return FiberMap.run(credentialWaits, entry.membershipIncarnation, wait).pipe(Effect.andThen(published))
@@ -937,20 +914,6 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const awaitRetirement = (runtime: ActiveRuntime) => awaitRetirementAfter(runtime, runtime.requestedRetirements)
 
-      const answeredTo = <A,>(
-        forgetAnswers: () => void,
-        call: Effect.Effect<SharedCall.Answer<A>, ReplicaError.ReplicaError>
-      ) =>
-        Effect.withFiber((fiber) => {
-          const turn = fiber.getRef(CurrentSyncTurn)
-          if (turn !== undefined) turn.failure = undefined
-          return Effect.tapError(call, (failure) =>
-            Effect.sync(() => {
-              if (turn !== undefined) turn.failure = failure
-              if (failure._tag === "CredentialRejected") forgetAnswers()
-            }))
-        })
-
       const deactivating = Effect.fnUntraced(function*(
         entry: RememberedEntry,
         explicit: boolean,
@@ -964,10 +927,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (entries.get(entry.spaceId) !== entry) {
             return yield* new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId })
           }
-          if (entry.activation === "Inactive") {
-            if (explicit) yield* entry.cancelServerCalls
-            return false
-          }
+          if (entry.activation === "Inactive") return false
           if (entry.activation === "Activating" || entry.activation === "Deactivating") {
             const pending = entry.transition
             if (pending !== undefined) yield* restore(Completion.wait(pending))
@@ -1002,7 +962,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         yield* invalidateActivation(entry.spaceId)
         const shutdown = Scope.close(runtime.scope, Exit.void)
         const result = yield* runtime.operationGate.withPermits(operationPermits)(shutdown).pipe(Effect.exit)
-        if (explicit) yield* entry.cancelServerCalls
         entry.runtime = undefined
         entry.activation = "Inactive"
         entry.transition = undefined
@@ -1040,7 +999,6 @@ const makeLayer = <D extends Definition.Any, R,>(
           changed = yield* applyContribution(entry, () => inactiveStatus(entry, count.count))
         }
         if (enqueuePending && count.count > 0) yield* enqueueBackground(entry)
-        else yield* entry.cancelServerCalls
         yield* announceContribution(changed)
         return true
       })
@@ -1183,7 +1141,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         entry.activation = "Activating"
         entry.transition = completion
         entry.runtime = undefined
-        if (foreground) entry.disownServerFailures()
         yield* modifyContribution(entry, (current) => ({ _tag: "Connecting", pending: current.pending }))
         yield* invalidateActivation(entry.spaceId)
         const startRuntime = restore(initialize(entry, generation, foreground))
@@ -1278,24 +1235,12 @@ const makeLayer = <D extends Definition.Any, R,>(
         }).pipe(Effect.andThen(signalCapacity))
 
       const endedByRetirement = <A, E extends { readonly _tag: string },>(
-        entry: RememberedEntry,
         runtime: ActiveRuntime,
         turn: Effect.Effect<A, E>
-      ): Effect.Effect<Option.Option<A>, E | ReplicaError.ReplicaError> =>
-        Effect.suspend(() => {
-          const current: SyncTurn = { failure: undefined }
-          const retired = awaitRetirement(runtime).pipe(
-            Effect.flatMap(() => {
-              if (current.failure !== undefined && !entry.leaving) return Effect.fail(current.failure)
-              return Effect.succeed(Option.none<A>())
-            })
-          )
-          return turn.pipe(
-            Effect.provideService(CurrentSyncTurn, current),
-            Effect.map(Option.some),
-            Effect.raceFirst(retired)
-          )
-        })
+      ): Effect.Effect<Option.Option<A>, E> => {
+        const retired = Effect.as(awaitRetirement(runtime), Option.none<A>())
+        return turn.pipe(Effect.map(Option.some), Effect.raceFirst(retired))
+      }
 
       const withLease = <A, E extends { readonly _tag: string },>(
         entry: RememberedEntry,
@@ -1369,7 +1314,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         )
 
       const syncWhileLeased = (entry: RememberedEntry): Effect.Effect<void, ReplicaError.ReplicaError> =>
-        withActive(entry, (runtime) => endedByRetirement(entry, runtime, runtime.reconciler.sync)).pipe(
+        withActive(entry, (runtime) => endedByRetirement(runtime, runtime.reconciler.sync)).pipe(
           Effect.flatMap(Option.match({
             onNone: () => syncWhileLeased(entry),
             onSome: () => Effect.void
@@ -1580,40 +1525,9 @@ const makeLayer = <D extends Definition.Any, R,>(
       const createEntry = Effect.fnUntraced(function*(row: typeof RememberedRow.Type) {
         yield* decodeScope(row.desired_scope_json)
         let handle: Replica.Space | undefined
-        const kept = retryTiming.retryDelayMillis
-        const pulls = SharedCall.make(remote.pull, serverCallScope, kept, serverCallLimiter)
-        const submissions = SharedCall.make(remote.submitBatch, serverCallScope, kept, serverCallLimiter)
-        const bootstraps = SharedCall.make(remote.bootstrap, serverCallScope, kept, serverCallLimiter)
-        const forgetServerAnswers = () => {
-          pulls.forget()
-          submissions.forget()
-          bootstraps.forget()
-        }
         const entry: RememberedEntry = {
           spaceId: row.space_id,
           membershipIncarnation: row.membership_incarnation,
-          remote: SyncEngine.SyncEngine.of({
-            ...remote,
-            pull: (request) =>
-              answeredTo(forgetServerAnswers, pulls.run(request)).pipe(
-                Effect.map((answer) => {
-                  entry.pulledFresh = answer.fresh
-                  return answer.value
-                })
-              ),
-            submitBatch: (request) =>
-              answeredTo(forgetServerAnswers, submissions.run(request)).pipe(Effect.map((answer) => answer.value)),
-            bootstrap: (request) =>
-              answeredTo(forgetServerAnswers, bootstraps.run(request)).pipe(Effect.map((answer) => answer.value))
-          }),
-          cancelServerCalls: Effect.all([pulls.cancel, submissions.cancel, bootstraps.cancel], { discard: true }),
-          forgetServerAnswers,
-          disownServerFailures: () => {
-            pulls.disownFailure()
-            submissions.disownFailure()
-            bootstraps.disownFailure()
-          },
-          pulledFresh: true,
           quarantineGate: yield* Semaphore.make(1),
           get handle() {
             if (handle === undefined) handle = makeHandle(entry)
@@ -1657,7 +1571,7 @@ const makeLayer = <D extends Definition.Any, R,>(
                 let turns = backgroundWorkflowTurns
                 if (entry.foreground) turns = foregroundWorkflowTurns
                 const admitted = turns.withPermit(execute(runtime))
-                return endedByRetirement(entry, runtime, admitted)
+                return endedByRetirement(runtime, admitted)
               }),
               Effect.scoped,
               Effect.flatMap(Option.match({
@@ -1863,7 +1777,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           activeRuntime = runtime
           let sync = runtime.reconciler.sync
           if (workflow !== undefined) sync = backgroundWorkflowTurns.withPermit(sync)
-          return endedByRetirement(entry, runtime, sync)
+          return endedByRetirement(runtime, sync)
         }).pipe(Effect.result)
         const stalled = Result.isSuccess(result) && Option.isSome(result.success) &&
           entry.summaryStatus.pending > 0 && entry.summaryStatus.pending === pendingBefore

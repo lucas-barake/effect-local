@@ -1,7 +1,6 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import * as Clock from "effect/Clock"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
@@ -18,7 +17,6 @@ import {
   eventually,
   idleRemote,
   installView,
-  makeAttempts,
   within
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
@@ -93,48 +91,6 @@ describe("a foreground space whose server is unreachable", () => {
       const drained = yield* eventually(services, space, (status) => status.pending === 0)
       assert.isTrue(Option.isSome(drained), "the evicted space was drained once the server returned")
     }, atBudget)
-  )
-})
-
-describe("a deactivation that lands on a workflow attempt whose server call fails", () => {
-  it.effect.each(budgets)(
-    "leaves the retry schedule of the workflow as it was at a budget of %s",
-    Effect.fnUntraced(function*(budget) {
-      const services = yield* BackgroundReplica.services({
-        constructor: "layerWorkflow",
-        clientId,
-        initialSpaces: [spaceId],
-        maximumActiveSpaces: 4,
-        foregroundActiveSpaces: 2,
-        retryDelay: "1 second",
-        maximumRetryDelay: "1 minute"
-      })
-      const attempts = yield* makeAttempts
-      const times: Array<number> = []
-      const replica = yield* services.start(SyncEngine.SyncEngine.of({
-        ...idleRemote,
-        transportGeneration: Effect.never,
-        pull: () =>
-          Clock.currentTimeMillis.pipe(
-            Effect.tap((now) => Effect.sync(() => times.push(now))),
-            Effect.andThen(attempts.record),
-            Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
-          )
-      }))
-      const space = yield* replica.space(spaceId)
-      yield* space.mutate(Domain.PutTodo, Domain.todo("pending"))
-      yield* attempts.reached(1)
-
-      const deactivated = yield* within(space.deactivate)
-      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("20 seconds"))
-
-      assert.strictEqual(describeExit(deactivated), "succeeded")
-      assert.deepStrictEqual(
-        times.map((time) => time - times[0]),
-        [0, 1000, 3000, 7000, 15000],
-        `pulls at a budget of ${budget}`
-      )
-    }, (effect, budget) => atBudget(effect, { budget }))
   )
 })
 
