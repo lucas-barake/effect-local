@@ -157,6 +157,41 @@ describe("a caller operation on a space whose background turn is in flight", () 
   )
 
   it.effect.each(constructors)(
+    "queues an operation that arrives after the turn for a foreground place and forgets the turn with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { current, endTurn, inFlight, replica, services } = yield* heldBackgroundTurns(constructor)
+      const used = yield* replica.space(inFlight)
+      const delivery = yield* services.holdInvalidationsOf([callerKey(inFlight)])
+      const writing = yield* used.mutate(Domain.PutTodo, Domain.todo("caller")).pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* quiet
+      yield* endTurn(inFlight)
+      yield* quiet
+      const late = yield* used.get(Domain.Todo, "caller").pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* quiet
+      const lateWhileTheWriteIsHeld = late.pollUnsafe() === undefined
+
+      yield* delivery.release
+      yield* VirtualTime.advanceUntil(Fiber.awaitAll([writing, late]))
+      yield* quiet
+      const whileUsed = [yield* current.activation, yield* used.activation]
+      const returned = yield* within(current.get(Domain.Todo, "here"))
+      yield* VirtualTime.quiet("11 minutes")
+
+      assert.strictEqual(delivery.entered(), 1)
+      assert.isTrue(lateWhileTheWriteIsHeld, "the later read did not join a runtime that only callers still hold")
+      assert.deepStrictEqual(whileUsed, ["Inactive", "Active"])
+      assert.strictEqual(describeExit(returned), "succeeded")
+      assert.strictEqual(yield* current.activation, "Active", "a later background turn did not take the place back")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
     "keeps the spaces in use by callers at once within the foreground places plus the background turns with %s",
     Effect.fnUntraced(function*(constructor) {
       const { capacity, endTurn, inFlight, replica, services } = yield* heldBackgroundTurns(constructor)

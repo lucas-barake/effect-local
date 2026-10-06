@@ -63,7 +63,7 @@ const countStatement = "SELECT COUNT(*) AS count FROM effect_local_client_pendin
 const claimStatement = "AND attempt_count >= "
 const admissionStatement = "SET requested_generation = ?"
 
-type PullMode = "Pass" | "Hold" | "Interrupt" | "Reject"
+type PullMode = "Pass" | "Hold" | "Interrupt" | "Reject" | "FailWhenReleased"
 
 const harness = Effect.fnUntraced(function*() {
   const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
@@ -95,6 +95,7 @@ const harness = Effect.fnUntraced(function*() {
   let pullMode: PullMode = "Pass"
   let pullFailure: ReplicaError.ReplicaError | undefined
   const heldPulls = yield* Queue.unbounded<void>()
+  const heldPullReleased = yield* Deferred.make<void>()
   const transportWaits = yield* Queue.unbounded<void>()
   const watchStarts = yield* Queue.unbounded<void>()
   const watchTimes: Array<number> = []
@@ -140,6 +141,13 @@ const harness = Effect.fnUntraced(function*() {
           return Effect.fail(new ReplicaError.CredentialRejected({ credentialGeneration: 1 }))
         }
         if (pullMode === "Hold") return Queue.offer(heldPulls, undefined).pipe(Effect.andThen(Effect.never))
+        if (pullMode === "FailWhenReleased") {
+          pullMode = "Pass"
+          return Queue.offer(heldPulls, undefined).pipe(
+            Effect.andThen(Deferred.await(heldPullReleased)),
+            Effect.andThen(Effect.fail(new ReplicaError.ServerUnavailable()))
+          )
+        }
         return server.pull(request)
       }),
     bootstrap: server.bootstrap,
@@ -179,6 +187,7 @@ const harness = Effect.fnUntraced(function*() {
     }),
     endWatch: Deferred.succeed(watchEnd, undefined),
     changeCredential: Deferred.succeed(credentialChange, undefined),
+    releaseHeldPull: Deferred.succeed(heldPullReleased, undefined),
     failNextPull: (error: ReplicaError.ReplicaError) =>
       Effect.sync(() => {
         pullFailure = error
@@ -863,6 +872,55 @@ describe("a sync that left accepted work pending and then failed terminally", ()
       assert.deepStrictEqual([stalled._tag, stalled.pending], ["Online", 1], "the first sync left its mutation pending")
       assert.strictEqual(controls.pulls(), pullsWhenFailed, "server calls after the terminal failure")
       assert.strictEqual((yield* running.status)._tag, "Failed")
+    }, VirtualTime.provide)
+  )
+})
+
+describe("a new credential for a foreground space of the manager", () => {
+  it.effect(
+    "is used at once when a failure backoff was pending before the credential was rejected",
+    Effect.fnUntraced(function*() {
+      const controls = yield* harness()
+      const space = yield* activeSpace(controls, schedulerLayer("layer"))
+      yield* controls.failNextPull(new ReplicaError.ServerUnavailable())
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* VirtualTime.quiet("1 second")
+      const failed = (yield* space.status)._tag
+      yield* controls.acceptLaterWatches
+      yield* controls.failWatch(new ReplicaError.CredentialRejected({ credentialGeneration: 1 }))
+      yield* VirtualTime.quiet("1 second")
+      const paused = (yield* space.status)._tag
+
+      yield* controls.changeCredential
+      yield* VirtualTime.quiet("900 millis")
+      const status = yield* space.status
+
+      assert.deepStrictEqual([failed, paused], ["Offline", "NeedsAuthentication"])
+      assert.deepStrictEqual([status._tag, status.pending], ["Online", 0], "synced within a second of the credential")
+    }, VirtualTime.provide)
+  )
+
+  it.effect(
+    "is used at once when a call failed while the space waited for it",
+    Effect.fnUntraced(function*() {
+      const controls = yield* harness()
+      const space = yield* activeSpace(controls, schedulerLayer("layer"))
+      yield* controls.setPullMode("FailWhenReleased")
+      yield* space.mutate(Domain.PutTodo, Domain.todo("first"))
+      yield* VirtualTime.advanceUntil(Queue.take(controls.heldPulls))
+      yield* controls.acceptLaterWatches
+      yield* controls.failWatch(new ReplicaError.CredentialRejected({ credentialGeneration: 1 }))
+      yield* VirtualTime.quiet("1 second")
+      const paused = (yield* space.status)._tag
+      yield* controls.releaseHeldPull
+      yield* VirtualTime.quiet("1 second")
+
+      yield* controls.changeCredential
+      yield* VirtualTime.quiet("900 millis")
+      const status = yield* space.status
+
+      assert.strictEqual(paused, "NeedsAuthentication")
+      assert.deepStrictEqual([status._tag, status.pending], ["Online", 0], "synced within a second of the credential")
     }, VirtualTime.provide)
   )
 })

@@ -1,10 +1,13 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
+import * as Protocol from "@lucas-barake/effect-local/Protocol"
+import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
 import * as Scope from "effect/Scope"
+import * as Stream from "effect/Stream"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
@@ -141,12 +144,12 @@ describe("a leave while the workflow engine cannot be polled", () => {
     Effect.fnUntraced(function*() {
       const { replica, services } = yield* parkedAttempt()
 
-      services.setWorkflowStorageDown(true)
+      services.setWorkflowStorageDown("PollsAndInterrupts")
       const failed = yield* within(replica.leave(parked))
       yield* quiet
       const runningAfterFailure = yield* services.runningWorkflowExecutions(parked)
       const stillJoined = yield* Effect.exit(replica.space(parked))
-      services.setWorkflowStorageDown(false)
+      services.setWorkflowStorageDown("No")
       const left = yield* within(replica.leave(parked))
       yield* quiet
 
@@ -185,11 +188,11 @@ describe("a leave while the workflow engine cannot be polled", () => {
       yield* VirtualTime.advanceUntil(space.activate)
       yield* VirtualTime.advanceUntil(Deferred.await(calling))
 
-      services.setWorkflowStorageDown(true)
+      services.setWorkflowStorageDown("PollsAndInterrupts")
       const failed = yield* within(replica.leave(parked))
       yield* quiet
       const runningAfterFailure = yield* services.runningWorkflowExecutions(parked)
-      services.setWorkflowStorageDown(false)
+      services.setWorkflowStorageDown("No")
       const left = yield* within(replica.leave(parked))
       yield* quiet
 
@@ -197,6 +200,90 @@ describe("a leave while the workflow engine cannot be polled", () => {
       assert.strictEqual(runningAfterFailure, 1, "the execution could not be cancelled yet")
       assert.strictEqual(describeExit(left), "succeeded")
       assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 0, "the retry cancelled the execution")
+    }, VirtualTime.scoped)
+  )
+})
+
+const workflowSpace = Effect.fnUntraced(function*() {
+  const services = yield* BackgroundReplica.services({
+    constructor: "layerWorkflow",
+    clientId,
+    initialSpaces: [parked, other],
+    maximumActiveSpaces: 3,
+    foregroundActiveSpaces: 1,
+    retryDelay: "10 minutes",
+    maximumRetryDelay: "10 minutes"
+  })
+  const calling = yield* Deferred.make<void>()
+  const replica = yield* services.start(SyncEngine.SyncEngine.of({
+    ...idleRemote,
+    submitBatch: acceptSubmission,
+    pull: (request) => {
+      if (request.spaceId !== parked) return emptyPage(services.crypto, request)
+      return Effect.andThen(Deferred.succeed(calling, undefined), Effect.never)
+    }
+  }))
+  yield* installView(services)
+  const space = yield* replica.space(parked)
+  yield* space.mutate(Domain.PutTodo, Domain.todo("pending")).pipe(VirtualTime.advanceUntil)
+  yield* VirtualTime.advanceUntil(Deferred.await(calling))
+  yield* VirtualTime.quiet("1 second")
+  return { services, replica, space }
+})
+
+describe("a leave while the workflow engine can interrupt but cannot be polled", () => {
+  it.effect(
+    "still interrupts the waiting attempt and lets the next leave succeed",
+    Effect.fnUntraced(function*() {
+      const { replica, services } = yield* parkedAttempt()
+
+      services.setWorkflowStorageDown("Polls")
+      const failed = yield* within(replica.leave(parked))
+      yield* quiet
+      const runningAfterFailure = yield* services.runningWorkflowExecutions(parked)
+      const left = yield* within(replica.leave(parked))
+
+      assert.strictEqual(describeExit(failed), "died", "the polling defect reached the caller")
+      assert.strictEqual(runningAfterFailure, 0, "the interrupt was still sent")
+      assert.strictEqual(describeExit(left), "succeeded", "nothing was left to poll for the retry")
+    }, VirtualTime.scoped)
+  )
+})
+
+describe("a foreground scheduler that starts while an execution of its space is running", () => {
+  it.effect(
+    "joins it when the scope is the one it was started for",
+    Effect.fnUntraced(function*() {
+      const { services, space } = yield* workflowSpace()
+
+      yield* VirtualTime.advanceUntil(space.deactivate)
+      yield* VirtualTime.advanceUntil(space.activate)
+      yield* VirtualTime.quiet("1 second")
+
+      assert.strictEqual(services.workflowInterrupts(), 0)
+      assert.strictEqual(services.workflowExecutions(parked), 1)
+      assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 1)
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "starts its own when the scope changed, without reporting the stale scope",
+    Effect.fnUntraced(function*() {
+      const { services, space } = yield* workflowSpace()
+      const reported: Array<string> = []
+      yield* services.reactivity.stream([ReactivityKey.status(parked)], space.status).pipe(
+        Stream.runForEach((status) => Effect.sync(() => reported.push(status._tag))),
+        Effect.forkScoped
+      )
+      const wide = Protocol.ReplicationScope.make({ models: [Domain.Todo.name, Domain.Message.name] })
+
+      const changed = yield* within(space.setScope(wide))
+      yield* VirtualTime.quiet("1 second")
+
+      assert.strictEqual(describeExit(changed), "succeeded")
+      assert.strictEqual(services.workflowExecutions(parked), 2)
+      assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 1)
+      assert.notInclude(reported, "Failed")
     }, VirtualTime.scoped)
   )
 })

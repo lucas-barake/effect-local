@@ -2003,6 +2003,10 @@ describe("client schema evolution", () => {
           row.requestDies,
           "only a request that died ends the resubmission with a defect"
         )
+        assert.isTrue(
+          Exit.isFailure(outcome) && Cause.hasFails(outcome.cause),
+          "the failure of the server discard is kept next to a defect of the recount"
+        )
         assert.deepStrictEqual({ before, after }, { before: 0, after: 1 })
         assert.strictEqual(announced, 1, "the aggregate status was announced once")
       },

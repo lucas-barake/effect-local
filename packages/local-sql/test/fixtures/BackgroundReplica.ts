@@ -244,11 +244,19 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
   const engine = Context.get(databaseContext, WorkflowEngine.WorkflowEngine)
   const executions = new Map<string, Set<string>>()
   const workflows = new Map<string, unknown>()
-  let workflowStorageDown = false
+  let workflowStorageDown: "No" | "Polls" | "PollsAndInterrupts" = "No"
+  let workflowInterrupts = 0
   const countingEngine = new Proxy(engine, {
     get: (target, property, receiver) => {
-      if (workflowStorageDown && (property === "poll" || property === "interruptUnsafe")) {
+      if (workflowStorageDown !== "No" && property === "poll") {
         return () => Effect.die("workflow storage unavailable")
+      }
+      if (property === "interruptUnsafe") {
+        if (workflowStorageDown === "PollsAndInterrupts") return () => Effect.die("workflow storage unavailable")
+        return (...args: ReadonlyArray<unknown>): unknown => {
+          workflowInterrupts += 1
+          return Reflect.apply(target.interruptUnsafe, target, args)
+        }
       }
       if (property !== "execute") return Reflect.get(target, property, receiver)
       return (...args: ReadonlyArray<unknown>): unknown => {
@@ -361,7 +369,8 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     endInvalidationsWith,
     workflowExecutions,
     runningWorkflowExecutions,
-    setWorkflowStorageDown: (down: boolean) => {
+    workflowInterrupts: () => workflowInterrupts,
+    setWorkflowStorageDown: (down: "No" | "Polls" | "PollsAndInterrupts") => {
       workflowStorageDown = down
     }
   }

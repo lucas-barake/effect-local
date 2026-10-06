@@ -29,7 +29,7 @@ import * as QueryReactivity from "../src/QueryReactivity.js"
 import * as ServerStore from "../src/ServerStore.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 import * as SyncEngine from "../src/SyncEngine.js"
-import { constructors, describeExit, within } from "./fixtures/BackgroundReplica.js"
+import { captureErrors, constructors, describeExit, within } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
 const spaceId = Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000d001")
@@ -294,6 +294,7 @@ const waitingOnTheServer = Effect.fnUntraced(function*(row: Row) {
     space,
     other,
     finished: Fiber.join(waiting).pipe(within),
+    again: operation,
     serverAnswers: Deferred.succeed(answered, undefined),
     serverDies: Deferred.die(answered, "the discard call died"),
     serverFails: Deferred.fail(answered, new ReplicaError.ServerUnavailable()),
@@ -325,7 +326,12 @@ describe("a quarantine operation whose credential is replaced while the server c
 
 const answers = ["dies", "fails", "succeeds"] as const
 
-const departedRows = rows.flatMap((row) =>
+const pairedRows = [
+  { constructor: "layer", operation: "discard" },
+  { constructor: "layerWorkflow", operation: "resubmit" }
+] as const
+
+const departedRows = pairedRows.flatMap((row) =>
   answers.map((answer) => ({ constructor: row.constructor, operation: row.operation, answer }))
 )
 
@@ -333,7 +339,8 @@ describe("a quarantine operation whose space is left while the server call is in
   it.effect.each(departedRows)(
     "keeps the outcome of the call when the server $answer ($operation, $constructor)",
     Effect.fnUntraced(function*(row) {
-      const controls = yield* waitingOnTheServer(row)
+      const logs = captureErrors()
+      const controls = yield* waitingOnTheServer(row).pipe(Effect.provide(logs.layerLogs))
 
       const left = yield* within(controls.replica.leave(spaceId))
       if (row.answer === "dies") yield* controls.serverDies
@@ -344,12 +351,31 @@ describe("a quarantine operation whose space is left while the server call is in
       const expected = { dies: "died", fails: "ServerUnavailable", succeeds: "SpaceUnavailable" } as const
       assert.strictEqual(describeExit(left), "succeeded")
       assert.strictEqual(outcome, expected[row.answer])
+      assert.deepStrictEqual(logs.messages(), [], "a recount that found the space gone is not an error")
+    }, harness)
+  )
+})
+
+describe("a second quarantine operation on a space whose first one waits on the server", () => {
+  it.effect.each(rows)(
+    "waits for the first instead of calling the server as well ($operation, $constructor)",
+    Effect.fnUntraced(function*(row) {
+      const { again, discards, finished, serverAnswers } = yield* waitingOnTheServer(row)
+
+      const second = yield* again.pipe(Effect.result, Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.quiet("1 second")
+      const callsWhileTheFirstWaits = discards()
+      yield* serverAnswers
+      const outcomes = [outcomeOf(yield* finished), outcomeOf(yield* Fiber.join(second).pipe(within))]
+
+      assert.strictEqual(callsWhileTheFirstWaits, 1)
+      assert.strictEqual(outcomes[0], "succeeded")
     }, harness)
   )
 })
 
 describe("a quarantine operation that waits on a server that does not answer", () => {
-  it.effect.each(rows)(
+  it.effect.each(pairedRows)(
     "does not stop a local read or write on its own space ($operation, $constructor)",
     Effect.fnUntraced(function*(row) {
       const { space } = yield* waitingOnTheServer(row)
@@ -403,7 +429,7 @@ describe("a quarantine operation that waits on a server that does not answer", (
     }, harness)
   )
 
-  it.effect.each(rows)(
+  it.effect.each(pairedRows)(
     "lets its space be left and then fails with SpaceUnavailable ($operation, $constructor)",
     Effect.fnUntraced(function*(row) {
       const { finished, replica, serverAnswers } = yield* waitingOnTheServer(row)
@@ -417,7 +443,7 @@ describe("a quarantine operation that waits on a server that does not answer", (
     }, harness)
   )
 
-  it.effect.each(rows)(
+  it.effect.each(pairedRows)(
     "lets the replica scope close ($operation, $constructor)",
     Effect.fnUntraced(function*(row) {
       const { replicaScope } = yield* waitingOnTheServer(row)

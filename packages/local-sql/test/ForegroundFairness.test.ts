@@ -65,6 +65,31 @@ const oneForegroundPlace = Effect.fnUntraced(function*(
 
 const settle = VirtualTime.quiet("1 minute")
 
+const busyKey = (spaceId: Identity.SpaceId) => ReactivityKey.entity(spaceId, Domain.Todo.name, "busy")
+
+const twoForegroundPlaces = Effect.fnUntraced(function*(constructor: Constructor) {
+  const services = yield* BackgroundReplica.services({
+    constructor,
+    clientId,
+    initialSpaces: [first, second, third, fourth],
+    maximumActiveSpaces: 5,
+    foregroundActiveSpaces: 2,
+    retryDelay: "1 second",
+    maximumRetryDelay: "1 minute"
+  })
+  const replica = yield* services.start(healthyRemote(services))
+  yield* installView(services)
+  const spaces = yield* Effect.forEach([first, second, third, fourth], (spaceId) => replica.space(spaceId))
+  const hold = (space: Replica.Space) => space.mutate(Domain.PutTodo, Domain.todo("busy")).pipe(Effect.exit)
+  return { services, spaces, hold }
+})
+
+const settled = <A, E extends { readonly _tag: string },>(fiber: Fiber.Fiber<Exit.Exit<A, E>>) => {
+  const polled = fiber.pollUnsafe()
+  if (polled === undefined || !Exit.isSuccess(polled)) return "never completed"
+  return describeExit(Option.some(polled.value))
+}
+
 const outcome = <A, E extends { readonly _tag: string },>(fiber: Fiber.Fiber<A, E>) => {
   const exit = fiber.pollUnsafe()
   if (exit === undefined) return "never completed"
@@ -168,6 +193,229 @@ describe("operations that compete for one foreground place", () => {
       yield* Effect.raceFirst(Fiber.awaitAll([resident, waiter]), runaway)
 
       assert.deepStrictEqual(finished, ["waiter", "resident"])
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "serves three waiting spaces in the order they arrived with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { runaway, services, spaces } = yield* oneForegroundPlace(constructor, [first, second, third, fourth])
+      const [resident, ...waiting] = spaces
+      yield* VirtualTime.advanceUntil(resident.activate)
+      yield* settle
+      const finished: Array<number> = []
+      const reading = yield* services.holdStatement("effect_local_client_pending_data", true)
+      const operation = yield* Effect.forkChild(resident.pending, { startImmediately: true })
+      yield* VirtualTime.advanceUntil(reading.entered)
+      const waiters = yield* Effect.forEach(
+        waiting,
+        (space, index) =>
+          space.mutate(Domain.PutTodo, Domain.todo("waited")).pipe(
+            Effect.andThen(Effect.sync(() => finished.push(index))),
+            Effect.forkChild({ startImmediately: true })
+          )
+      )
+
+      yield* reading.release
+      yield* Effect.raceFirst(Fiber.awaitAll([operation, ...waiters]), runaway)
+
+      assert.deepStrictEqual(finished, [0, 1, 2])
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "does not let a later space take the place the first waiter is still freeing with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { runaway, services, spaces } = yield* oneForegroundPlace(constructor, [first, second, third])
+      const [resident, head, later] = spaces
+      yield* VirtualTime.advanceUntil(resident.activate)
+      yield* settle
+      const finished: Array<string> = []
+      const record = (name: string) =>
+        Effect.sync(() => {
+          finished.push(name)
+        })
+      const freeing = yield* services.holdStatement("effect_local_client_pending_data", true)
+      const leading = yield* head.mutate(Domain.PutTodo, Domain.todo("head")).pipe(
+        Effect.andThen(record("head")),
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* VirtualTime.advanceUntil(freeing.entered)
+      const residentWhileFreed = yield* resident.activation
+      const following = yield* later.mutate(Domain.PutTodo, Domain.todo("later")).pipe(
+        Effect.andThen(record("later")),
+        Effect.forkChild({ startImmediately: true })
+      )
+
+      yield* freeing.release
+      yield* Effect.raceFirst(Fiber.awaitAll([leading, following]), runaway)
+
+      assert.strictEqual(
+        residentWhileFreed,
+        "Inactive",
+        "the place was free while the first waiter counted pending work"
+      )
+      assert.deepStrictEqual(finished, ["head", "later"])
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "lets the next space take a free place while an earlier space with two waiters is still activating with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { hold, services, spaces } = yield* twoForegroundPlaces(constructor)
+      const [a, b, x, y] = spaces
+      const busy = yield* services.holdInvalidationsOf([busyKey(first), busyKey(second)])
+      const residents = yield* Effect.forEach(
+        [a, b],
+        (space) => Effect.forkChild(hold(space), { startImmediately: true })
+      )
+      yield* settle
+      const activating = yield* services.holdInvalidation(ReactivityKey.activation(third))
+      activating.arm(1)
+      const firstWaiter = yield* x.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      const secondWaiter = yield* x.get(Domain.Todo, "x").pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      const next = yield* y.get(Domain.Todo, "y").pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* settle
+
+      yield* busy.release
+      yield* VirtualTime.advanceUntil(activating.entered)
+      yield* settle
+      const nextWhileActivating = settled(next)
+      yield* activating.release
+      yield* VirtualTime.advanceUntil(Fiber.awaitAll([...residents, firstWaiter, secondWaiter, next]))
+
+      assert.strictEqual(busy.entered(), 2)
+      assert.strictEqual(
+        nextWhileActivating,
+        "succeeded",
+        "the later space did not wait behind a waiter that needed no place"
+      )
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "wakes the next waiter when the first one takes a freed place with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { hold, services, spaces } = yield* twoForegroundPlaces(constructor)
+      const [a, b, x, y] = spaces
+      const busy = yield* services.holdInvalidationsOf([busyKey(first), busyKey(second)])
+      const residents = yield* Effect.forEach(
+        [a, b],
+        (space) => Effect.forkChild(hold(space), { startImmediately: true })
+      )
+      yield* settle
+      const activating = yield* services.holdInvalidation(ReactivityKey.activation(third))
+      activating.arm(1)
+      const head = yield* x.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      const next = yield* y.get(Domain.Todo, "y").pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* settle
+
+      yield* busy.release
+      yield* VirtualTime.advanceUntil(activating.entered)
+      yield* settle
+      const nextWhileActivating = settled(next)
+      yield* activating.release
+      yield* VirtualTime.advanceUntil(Fiber.awaitAll([...residents, head, next]))
+
+      assert.strictEqual(nextWhileActivating, "succeeded", "the second place went to the next waiter at once")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "stops asking a busy resident to go once the waiter got the other place with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { hold, services, spaces } = yield* twoForegroundPlaces(constructor)
+      const [a, b, x] = spaces
+      const other = yield* services.holdInvalidation(busyKey(second))
+      other.arm(1)
+      yield* VirtualTime.advanceUntil(a.activate)
+      const otherResident = yield* Effect.forkChild(hold(b), { startImmediately: true })
+      yield* VirtualTime.advanceUntil(other.entered)
+      const asked = yield* services.holdInvalidationsOf([busyKey(first)])
+      const askedResident = yield* Effect.forkChild(hold(a), { startImmediately: true })
+      yield* settle
+      const activating = yield* services.holdInvalidation(ReactivityKey.activation(third))
+      activating.arm(1)
+      const waiter = yield* x.activate.pipe(Effect.exit, Effect.forkChild({ startImmediately: true }))
+      yield* settle
+
+      yield* other.release
+      yield* VirtualTime.advanceUntil(activating.entered)
+      const read = yield* within(a.get(Domain.Todo, "busy"))
+      yield* activating.release
+      yield* asked.release
+      yield* VirtualTime.advanceUntil(Fiber.awaitAll([otherResident, askedResident, waiter]))
+
+      assert.strictEqual(asked.entered(), 1)
+      assert.strictEqual(describeExit(read), "succeeded", "the resident that kept its place takes new operations again")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "takes operations again on a busy space whose deactivation was interrupted with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { services, spaces } = yield* oneForegroundPlace(constructor, [first, second])
+      const [resident] = spaces
+      const busy = yield* services.holdInvalidationsOf([busyKey(first)])
+      const operation = yield* resident.mutate(Domain.PutTodo, Domain.todo("busy")).pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* settle
+      const deactivating = yield* Effect.forkChild(resident.deactivate, { startImmediately: true })
+      yield* settle
+      const blocked = yield* resident.get(Domain.Todo, "busy").pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* settle
+      const blockedWhileDeactivating = settled(blocked)
+
+      yield* Fiber.interrupt(deactivating)
+      yield* settle
+      const afterInterruption = settled(blocked)
+      yield* busy.release
+      yield* VirtualTime.advanceUntil(Fiber.awaitAll([operation, blocked]))
+
+      assert.strictEqual(blockedWhileDeactivating, "never completed", "a pending deactivation admits no new operation")
+      assert.strictEqual(afterInterruption, "succeeded", "the withdrawn deactivation admitted the waiting operation")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "holds back later operations of the resident for the second waiter after the first waiter left with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { runaway, services, spaces } = yield* oneForegroundPlace(constructor, [first, second, third])
+      const [resident, leaving, staying] = spaces
+      const busy = yield* services.holdInvalidationsOf([busyKey(first)])
+      const operation = yield* resident.mutate(Domain.PutTodo, Domain.todo("busy")).pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* settle
+      const head = yield* Effect.forkChild(leaving.get(Domain.Todo, "x"), { startImmediately: true })
+      const waiter = yield* staying.mutate(Domain.PutTodo, Domain.todo("waiter")).pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* settle
+      yield* Fiber.interrupt(head)
+      yield* settle
+      const later = yield* resident.mutate(Domain.PutTodo, Domain.todo("later")).pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* settle
+      const laterWhileWaiting = settled(later)
+
+      yield* busy.release
+      yield* Effect.raceFirst(Fiber.awaitAll([operation, waiter, later]), runaway)
+
+      assert.strictEqual(laterWhileWaiting, "never completed", "the second waiter asked the resident to go")
+      assert.deepStrictEqual([settled(waiter), settled(later)], ["succeeded", "succeeded"])
     }, VirtualTime.scoped)
   )
 

@@ -139,3 +139,56 @@ describe("a background sync that is in flight when its space is made foreground"
     }, VirtualTime.scoped)
   )
 })
+
+describe("background reconciliation permits shared by worker turns and evicted syncs", () => {
+  it.effect.each(constructors)(
+    "never run more server calls at once than there are permits with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const permits = 2
+      const services = yield* BackgroundReplica.services({
+        constructor,
+        clientId,
+        initialSpaces: [evicted, current, ...probes.slice(0, permits)],
+        maximumActiveSpaces: 2 + permits,
+        foregroundActiveSpaces: 1,
+        reconciliationConcurrency: 1 + permits,
+        retryDelay: "1 second",
+        maximumRetryDelay: "1 minute"
+      })
+      yield* BackgroundReplica.seedPending(services, probes.slice(0, permits))
+      const calling = yield* Deferred.make<void>()
+      let inFlight = 0
+      let most = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          if (request.spaceId === current) return emptyPage(services.crypto, request)
+          return Effect.suspend(() => {
+            inFlight += 1
+            most = Math.max(most, inFlight)
+            if (request.spaceId !== evicted) return Effect.never
+            return Effect.andThen(Deferred.succeed(calling, undefined), Effect.never)
+          }).pipe(Effect.ensuring(Effect.sync(() => {
+            inFlight -= 1
+          })))
+        }
+      }))
+      yield* quiet
+      const backgroundCalls = inFlight
+      const a = yield* replica.space(evicted)
+      const b = yield* replica.space(current)
+      yield* a.mutate(Domain.PutTodo, Domain.todo("held")).pipe(VirtualTime.advanceUntil)
+      yield* VirtualTime.advanceUntil(Deferred.await(calling))
+      const withTheForegroundCall = inFlight
+
+      yield* b.mutate(Domain.PutTodo, Domain.todo("after")).pipe(VirtualTime.advanceUntil)
+      yield* quiet
+
+      assert.strictEqual(backgroundCalls, permits)
+      assert.strictEqual(withTheForegroundCall, permits + 1, "the foreground sync has its own permit")
+      assert.strictEqual(inFlight, permits, "the evicted sync waits for a background permit")
+      assert.strictEqual(most, permits + 1)
+    }, VirtualTime.scoped)
+  )
+})

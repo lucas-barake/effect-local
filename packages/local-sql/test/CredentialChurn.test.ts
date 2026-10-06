@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
+import * as Clock from "effect/Clock"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as SyncEngine from "../src/SyncEngine.js"
@@ -101,6 +102,38 @@ describe("a credential generation that changes while a server call is in flight"
 
       assert.isAtMost(callsWhileRotating, 50, "server calls in five minutes of a generation that never settles")
       assert.isTrue(Option.isSome(drained), "the space drained once the generation settled")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "starts the pass again without a delay after one replacement with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* oneSpace(constructor)
+      let generation = 0
+      const pulledAt: Array<number> = []
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        credentialGeneration: Effect.sync(() => generation),
+        submitBatch: acceptSubmission,
+        pull: (request) =>
+          Clock.currentTimeMillis.pipe(
+            Effect.tap((now) =>
+              Effect.sync(() => {
+                pulledAt.push(now)
+                if (pulledAt.length === 1) generation += 1
+              })
+            ),
+            Effect.andThen(emptyPage(services.crypto, request))
+          )
+      }))
+      yield* installView(services)
+      const space = yield* replica.space(spaceId)
+      yield* space.mutate(Domain.PutTodo, Domain.todo("pending")).pipe(VirtualTime.advanceUntil)
+
+      const drained = yield* eventually(services, space, (status) => status._tag === "Online" && status.pending === 0)
+
+      assert.isTrue(Option.isSome(drained))
+      assert.strictEqual(pulledAt[1], pulledAt[0], "the pull after the discarded one ran at the same time")
     }, VirtualTime.scoped)
   )
 })
