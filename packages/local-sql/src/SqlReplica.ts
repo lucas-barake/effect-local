@@ -142,7 +142,6 @@ interface ActiveRuntime {
   readonly foreground: boolean
   readonly scope: Scope.Closeable
   readonly operationGate: Semaphore.Semaphore
-  readonly quarantineGate: Semaphore.Semaphore
   pendingRetirements: number
   requestedRetirements: number
   readonly local: LocalStore.Service
@@ -161,6 +160,7 @@ interface RememberedEntry {
   readonly membershipIncarnation: Identity.MembershipIncarnation
   readonly remote: SyncEngine.Service
   readonly cancelServerCalls: Effect.Effect<void>
+  readonly quarantineGate: Semaphore.Semaphore
   handle: Replica.Space
   activation: Replica.Activation
   runtime: ActiveRuntime | undefined
@@ -695,12 +695,10 @@ const makeLayer = <D extends Definition.Any, R,>(
         }
         yield* Deferred.succeed(reconcilerReady, reconciler)
         const operationGate = yield* Semaphore.make(operationPermits)
-        const quarantineGate = yield* Semaphore.make(1)
         return {
           foreground,
           scope: childScope,
           operationGate,
-          quarantineGate,
           pendingRetirements: 0,
           requestedRetirements: 0,
           local,
@@ -1231,6 +1229,14 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.leases = Math.max(0, entry.leases - 1)
         }).pipe(Effect.andThen(signalCapacity))
 
+      const endedByRetirement = <A, E extends { readonly _tag: string },>(
+        runtime: ActiveRuntime,
+        turn: Effect.Effect<A, E>
+      ): Effect.Effect<Option.Option<A>, E> => {
+        const retired = Effect.as(awaitRetirement(runtime), Option.none<A>())
+        return turn.pipe(Effect.map(Option.some), Effect.raceFirst(retired))
+      }
+
       const withLease = <A, E extends { readonly _tag: string },>(
         entry: RememberedEntry,
         foreground: boolean,
@@ -1302,18 +1308,26 @@ const makeLayer = <D extends Definition.Any, R,>(
           )
         )
 
+      const syncWhileLeased = (entry: RememberedEntry): Effect.Effect<void, ReplicaError.ReplicaError> =>
+        withActive(entry, (runtime) => endedByRetirement(runtime, runtime.reconciler.sync)).pipe(
+          Effect.flatMap(Option.match({
+            onNone: () => syncWhileLeased(entry),
+            onSome: () => Effect.void
+          }))
+        )
+
       const continueCancellation = Effect.fnUntraced(function*(
-        runtime: ActiveRuntime,
+        entry: RememberedEntry,
         initial: Option.Option<Quarantine.QuarantinedMutation>
       ) {
         let canceled = initial
         while (Option.isSome(canceled)) {
-          yield* runtime.reconciler.sync
+          yield* syncWhileLeased(entry)
           const canceledReceipt = yield* remote.discard({
             envelope: canceled.value.envelope,
-            schema: runtime.local.schema
+            schema: options.definition.schemaIdentity
           })
-          canceled = yield* runtime.local.resolveQuarantine(canceledReceipt, "Discard")
+          canceled = yield* withActive(entry, (runtime) => runtime.local.resolveQuarantine(canceledReceipt, "Discard"))
         }
       })
 
@@ -1395,61 +1409,78 @@ const makeLayer = <D extends Definition.Any, R,>(
             withActive(entry, (runtime) => runtime.local.acknowledgeSettlements(sequence)),
           quarantine: withActive(entry, (runtime) => runtime.local.quarantine),
           discardQuarantined: (mutationId) =>
-            withActive(entry, (runtime) =>
-              runtime.quarantineGate.withPermit(
-                Effect.fnUntraced(function*() {
-                  const found = yield* runtime.local.quarantineByMutation(mutationId)
-                  if (Option.isNone(found)) {
-                    const continuation = yield* runtime.local.quarantineCancellation(mutationId)
-                    yield* continueCancellation(runtime, continuation)
-                    return yield* findReceipt(runtime, mutationId)
-                  }
-                  const receipt = yield* remote.discard({
-                    envelope: found.value.envelope,
-                    schema: runtime.local.schema
-                  })
-                  const canceled = yield* runtime.local.resolveQuarantine(receipt, "Discard")
-                  yield* continueCancellation(runtime, canceled)
-                  return receipt
-                })()
-              ).pipe(
-                Effect.exit,
-                Effect.flatMap((exit) => Effect.andThen(recountPending(entry, runtime), exit))
-              )),
+            entry.quarantineGate.withPermit(Effect.gen(function*() {
+              const found = yield* withActive(entry, (runtime) => runtime.local.quarantineByMutation(mutationId))
+              if (Option.isNone(found)) {
+                const continuation = yield* withActive(
+                  entry,
+                  (runtime) => runtime.local.quarantineCancellation(mutationId)
+                )
+                yield* continueCancellation(entry, continuation)
+                return yield* withActive(entry, (runtime) => findReceipt(runtime, mutationId))
+              }
+              const receipt = yield* remote.discard({
+                envelope: found.value.envelope,
+                schema: options.definition.schemaIdentity
+              })
+              const canceled = yield* withActive(
+                entry,
+                (runtime) => runtime.local.resolveQuarantine(receipt, "Discard")
+              )
+              yield* continueCancellation(entry, canceled)
+              return receipt
+            })).pipe(
+              Effect.exit,
+              Effect.flatMap((exit) =>
+                Effect.andThen(withActive(entry, (runtime) => recountPending(entry, runtime)), exit)
+              )
+            ),
           resubmitQuarantined: <M extends Mutation.Any,>(
             mutationId: Identity.MutationId,
             mutation: M,
             payload: Mutation.Payload<M>
           ) =>
-            withActive(entry, (runtime) =>
-              runtime.quarantineGate.withPermit(
-                Effect.fnUntraced(function*() {
-                  yield* MutationDescriptor.validate(options.definition, mutation)
-                  const found = yield* runtime.local.quarantineByMutation(mutationId)
-                  if (Option.isNone(found)) {
-                    const continuation = yield* runtime.local.quarantineCancellation(mutationId)
-                    yield* continueCancellation(runtime, continuation)
-                    return Quarantine.AlreadyResolved.make({ receipt: yield* findReceipt(runtime, mutationId) })
-                  }
-                  const item = found.value
-                  if (mutation.name !== item.envelope.name) {
-                    return yield* new ReplicaError.ProtocolInvalid({
-                      message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
-                    })
-                  }
-                  const pending = yield* runtime.local.ensureQuarantineResubmission(mutationId, mutation, payload)
-                  const receipt = yield* remote.discard({ envelope: item.envelope, schema: runtime.local.schema })
-                  const canceled = yield* runtime.local.resolveQuarantine(receipt, "Resubmit")
-                  yield* continueCancellation(runtime, canceled)
-                  if (receipt._tag !== "Rejected" || receipt.origin !== "Quarantine") {
-                    return Quarantine.AlreadyResolved.make({ receipt })
-                  }
-                  return Quarantine.Resubmitted.make({ pending })
-                })()
-              ).pipe(
-                Effect.exit,
-                Effect.flatMap((exit) => Effect.andThen(recountPending(entry, runtime), exit))
-              )),
+            entry.quarantineGate.withPermit(Effect.gen(function*() {
+              yield* MutationDescriptor.validate(options.definition, mutation)
+              const found = yield* withActive(entry, (runtime) => runtime.local.quarantineByMutation(mutationId))
+              if (Option.isNone(found)) {
+                const continuation = yield* withActive(
+                  entry,
+                  (runtime) => runtime.local.quarantineCancellation(mutationId)
+                )
+                yield* continueCancellation(entry, continuation)
+                const resolved = yield* withActive(entry, (runtime) => findReceipt(runtime, mutationId))
+                return Quarantine.AlreadyResolved.make({ receipt: resolved })
+              }
+              const item = found.value
+              if (mutation.name !== item.envelope.name) {
+                return yield* new ReplicaError.ProtocolInvalid({
+                  message: `Resubmission mutation ${mutation.name} does not match ${item.envelope.name}`
+                })
+              }
+              const pending = yield* withActive(
+                entry,
+                (runtime) => runtime.local.ensureQuarantineResubmission(mutationId, mutation, payload)
+              )
+              const receipt = yield* remote.discard({
+                envelope: item.envelope,
+                schema: options.definition.schemaIdentity
+              })
+              const canceled = yield* withActive(
+                entry,
+                (runtime) => runtime.local.resolveQuarantine(receipt, "Resubmit")
+              )
+              yield* continueCancellation(entry, canceled)
+              if (receipt._tag !== "Rejected" || receipt.origin !== "Quarantine") {
+                return Quarantine.AlreadyResolved.make({ receipt })
+              }
+              return Quarantine.Resubmitted.make({ pending })
+            })).pipe(
+              Effect.exit,
+              Effect.flatMap((exit) =>
+                Effect.andThen(withActive(entry, (runtime) => recountPending(entry, runtime)), exit)
+              )
+            ),
           status: Effect.suspend(() => {
             const runtime = entry.runtime
             if (entry.activation === "Active" && runtime !== undefined) {
@@ -1502,6 +1533,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             bootstrap: bootstraps.run
           }),
           cancelServerCalls: Effect.all([pulls.cancel, submissions.cancel, bootstraps.cancel], { discard: true }),
+          quarantineGate: yield* Semaphore.make(1),
           get handle() {
             if (handle === undefined) handle = makeHandle(entry)
             return handle
@@ -1543,9 +1575,8 @@ const makeLayer = <D extends Definition.Any, R,>(
               Effect.flatMap((runtime) => {
                 let turns = backgroundWorkflowTurns
                 if (entry.foreground) turns = foregroundWorkflowTurns
-                const retired = Effect.as(awaitRetirement(runtime), Option.none<A>())
                 const admitted = turns.withPermit(execute(runtime))
-                return admitted.pipe(Effect.map(Option.some), Effect.raceFirst(retired))
+                return endedByRetirement(runtime, admitted)
               }),
               Effect.scoped,
               Effect.flatMap(Option.match({
@@ -1746,18 +1777,21 @@ const makeLayer = <D extends Definition.Any, R,>(
         }
         let activeRuntime: ActiveRuntime | undefined
         const transportGeneration = yield* remote.transportGeneration
+        const pendingBefore = entry.summaryStatus.pending
         const result = yield* withLease(entry, false, (runtime) => {
           activeRuntime = runtime
           let sync = runtime.reconciler.sync
           if (workflow !== undefined) sync = backgroundWorkflowTurns.withPermit(sync)
-          return Effect.raceFirst(sync, awaitRetirement(runtime))
+          return endedByRetirement(runtime, sync)
         }).pipe(Effect.result)
+        const stalled = Result.isSuccess(result) && Option.isSome(result.success) &&
+          entry.summaryStatus.pending > 0 && entry.summaryStatus.pending === pendingBefore
         if (activeRuntime !== undefined) {
           const deactivation = yield* deactivate(
             entry,
             false,
             activeRuntime,
-            Result.isSuccess(result)
+            Result.isSuccess(result) && !stalled
           ).pipe(Effect.result)
           if (Result.isFailure(deactivation)) {
             yield* settleBackgroundTurn(entry, generation, deactivation.failure, Option.none())
