@@ -152,9 +152,9 @@ export interface RuntimeServices {
 
 export interface RuntimeLeaseService {
   readonly acquire: Effect.Effect<RuntimeServices, ReplicaError.ReplicaError, Scope.Scope>
-  readonly admit: <A, E extends { readonly _tag: string }, R,>(
-    effect: Effect.Effect<A, E, R>
-  ) => Effect.Effect<A, E, R>
+  readonly attempt: <A,>(
+    execute: (runtime: RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>
+  ) => Effect.Effect<A, ReplicaError.ReplicaError>
 }
 
 export class RuntimeLease extends Context.Service<RuntimeLease, RuntimeLeaseService>()(
@@ -293,13 +293,12 @@ const handler = (
         const result = yield* Activity.make({
           name: `${name}/${attempt}`,
           error: ReplicaError.ReplicaError,
-          execute: Effect.scoped(Effect.gen(function*() {
-            const runtime = yield* lease.acquire
+          execute: lease.attempt(Effect.fnUntraced(function*(runtime) {
             if (runtime.local.membershipIncarnation !== membershipIncarnation) {
               return yield* new ReplicaError.SpaceUnavailable({ spaceId: payload.spaceId })
             }
             observedGeneration = yield* runtime.reconciliation.generation
-            return yield* lease.admit(execute(runtime))
+            return yield* execute(runtime)
           }))
         }).pipe(Effect.result)
         if (Result.isSuccess(result)) return
@@ -425,7 +424,7 @@ const layerRegistrationWithConfiguration = (
     )
     const lease = RuntimeLease.of({
       acquire: Effect.succeed({ local, reconciliation }),
-      admit: (effect) => effect
+      attempt: (execute) => execute({ local, reconciliation })
     })
     return Layer.succeed(
       Registration,

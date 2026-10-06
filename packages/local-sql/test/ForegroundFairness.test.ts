@@ -6,10 +6,19 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
+import * as Option from "effect/Option"
 import * as Scheduler from "effect/Scheduler"
+import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
-import { type Constructor, constructors, healthyRemote, installView } from "./fixtures/BackgroundReplica.js"
+import {
+  type Constructor,
+  constructors,
+  emptyPage,
+  eventually,
+  healthyRemote,
+  installView
+} from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
 const first = Identity.SpaceId.make("spc_00000000-0000-4000-8000-000000000f61")
@@ -161,6 +170,109 @@ describe("operations that compete for one foreground place", () => {
       yield* Effect.raceFirst(Fiber.awaitAll([resident, waiter]), runaway)
 
       assert.deepStrictEqual(finished, ["waiter", "resident"])
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "interrupts a get that waits for a place held by an operation in flight with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { services, spaces } = yield* oneForegroundPlace(constructor, [first, second])
+      const [resident, waiting] = spaces
+      yield* VirtualTime.advanceUntil(resident.activate)
+      yield* settle
+      const reading = yield* services.holdStatement("effect_local_client_pending_data", true)
+      const operation = yield* Effect.forkChild(resident.pending, { startImmediately: true })
+      yield* VirtualTime.advanceUntil(reading.entered)
+
+      const blocked = yield* Effect.forkChild(waiting.get(Domain.Todo, "blocked"), { startImmediately: true })
+      assert.strictEqual(yield* waiting.activation, "Inactive")
+      yield* Fiber.interrupt(blocked)
+      assert.isTrue(Exit.hasInterrupts(yield* Fiber.await(blocked)))
+
+      yield* reading.release
+      yield* Fiber.join(operation)
+      assert.isTrue(Option.isNone(yield* VirtualTime.advanceUntil(resident.get(Domain.Todo, "resident"))))
+      assert.isTrue(Option.isNone(yield* VirtualTime.advanceUntil(waiting.get(Domain.Todo, "after"))))
+      assert.strictEqual(yield* resident.activation, "Inactive")
+      assert.strictEqual(yield* waiting.activation, "Active")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "wakes a get waiting for a place after later waiters withdraw with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const { services, spaces } = yield* oneForegroundPlace(constructor, [first, second, third, fourth])
+      const [resident, waiting, ...later] = spaces
+      yield* VirtualTime.advanceUntil(resident.activate)
+      yield* settle
+      const reading = yield* services.holdStatement("effect_local_client_pending_data", true)
+      const operation = yield* Effect.forkChild(resident.pending, { startImmediately: true })
+      yield* VirtualTime.advanceUntil(reading.entered)
+
+      const blocked = yield* Effect.forkChild(waiting.get(Domain.Todo, "waiting"), { startImmediately: true })
+      const withdrawn = yield* Effect.forEach(
+        later,
+        (space) => Effect.forkChild(space.activate, { startImmediately: true })
+      )
+      yield* Fiber.interruptAll(withdrawn)
+      yield* reading.release
+      yield* Fiber.join(operation)
+
+      assert.isTrue(Option.isNone(yield* VirtualTime.advanceUntil(Fiber.join(blocked))))
+    }, (effect) => VirtualTime.scoped(effect).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, 4)))
+  )
+
+  it.effect.each(constructors)(
+    "releases the foreground reservation of an interrupted promotion from background with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* BackgroundReplica.services({
+        constructor,
+        clientId,
+        initialSpaces: [first, second],
+        maximumActiveSpaces: 3,
+        foregroundActiveSpaces: 1,
+        retryDelay: "1 second",
+        maximumRetryDelay: "1 minute"
+      })
+      yield* BackgroundReplica.seedPending(services, [second])
+      const pulling = yield* Deferred.make<void>()
+      const answered = yield* Deferred.make<void>()
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...healthyRemote(services),
+        pull: (request) => {
+          const page = emptyPage(services.crypto, request)
+          if (request.spaceId !== second) return page
+          return Deferred.succeed(pulling, undefined).pipe(
+            Effect.andThen(Deferred.await(answered)),
+            Effect.andThen(page)
+          )
+        }
+      }))
+      const resident = yield* replica.space(first)
+      const background = yield* replica.space(second)
+      yield* VirtualTime.advanceUntil(Deferred.await(pulling))
+      yield* VirtualTime.advanceUntil(resident.activate)
+      yield* settle
+      const reading = yield* services.holdStatement("effect_local_client_pending_data", true)
+      const operation = yield* Effect.forkChild(resident.pending, { startImmediately: true })
+      yield* VirtualTime.advanceUntil(reading.entered)
+
+      const promotion = yield* Effect.forkChild(background.activate, { startImmediately: true })
+      assert.strictEqual(yield* background.activation, "Active")
+      yield* Fiber.interrupt(promotion)
+      assert.isTrue(Exit.hasInterrupts(yield* Fiber.await(promotion)))
+
+      yield* reading.release
+      yield* Fiber.join(operation)
+      yield* Deferred.succeed(answered, undefined)
+      const drained = yield* eventually(
+        services,
+        background,
+        (status) => status._tag === "Idle" && status.pending === 0
+      )
+      assert.isTrue(Option.isSome(drained), "the background turn finished and closed its runtime")
+      assert.strictEqual(yield* background.activation, "Inactive")
+      assert.strictEqual(yield* resident.activation, "Active")
     }, VirtualTime.scoped)
   )
 })
