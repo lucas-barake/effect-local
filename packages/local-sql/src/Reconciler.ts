@@ -33,6 +33,7 @@ export interface ReconciliationService {
   readonly failed: (error: ReplicaError.ReplicaError, observedGeneration: number) => Effect.Effect<void>
   readonly watchFailed: (error: ReplicaError.ReplicaError) => Effect.Effect<void>
   readonly succeeded: Effect.Effect<void, ReplicaError.ReplicaError>
+  readonly syncedAfter: (generation: number) => Effect.Effect<void>
   readonly status: Effect.Effect<ReplicaStatus.ReplicaStatus>
 }
 
@@ -537,9 +538,14 @@ export const makeManager = Effect.fnUntraced(function*(options: {
                     }
                     let policy: Effect.Effect<void>
                     if (error._tag === "CredentialRejected") {
+                      const rejectedAt = yield* state.reconciliation.generation
                       const admission = yield* admitCredentialPause(state, error)
                       yield* state.reconciliation.watchFailed(error)
-                      if (admission === undefined) return yield* Effect.void
+                      if (admission === undefined) {
+                        yield* state.reconciliation.syncedAfter(rejectedAt)
+                        yield* Effect.sleep(yield* watchBackoff.closed)
+                        return yield* watch()
+                      }
                       yield* startCredentialWait(state, admission)
                       yield* Deferred.await(admission.gate)
                       return yield* watch()
@@ -615,6 +621,20 @@ export const layerOnePass = (
       let syncing = false
       let failedSinceSyncStarted = false
       let syncGeneration = 0
+      let syncedGeneration = 0
+      let synced = Completion.make<void>()
+      const recordSynced = (generation: number) =>
+        Effect.suspend(() => {
+          syncedGeneration = Math.max(syncedGeneration, generation)
+          const previous = synced
+          synced = Completion.make<void>()
+          return Completion.settle(previous, Exit.void)
+        })
+      const syncedAfter = (generation: number): Effect.Effect<void> =>
+        Effect.suspend(() => {
+          if (syncedGeneration > generation) return Effect.void
+          return Completion.wait(synced).pipe(Effect.andThen(syncedAfter(generation)))
+        })
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
       const reportFailure = (
         error: ReplicaError.ReplicaError,
@@ -882,6 +902,7 @@ export const layerOnePass = (
       const sync = gate.withPermit(
         Effect.gen(function*() {
           syncGeneration += 1
+          const generation = syncGeneration
           syncAttempted = true
           syncing = true
           failedSinceSyncStarted = false
@@ -890,6 +911,7 @@ export const layerOnePass = (
           if (submitted) yield* catchUp
           syncing = false
           yield* succeeded
+          yield* recordSynced(generation)
           yield* options.onReconciled ?? Effect.void
         }).pipe(
           Effect.ensuring(Effect.sync(() => {
@@ -905,6 +927,7 @@ export const layerOnePass = (
         failed,
         watchFailed,
         succeeded,
+        syncedAfter,
         status: Ref.get(status)
       })
     })
@@ -1075,7 +1098,13 @@ export const layerInMemoryScheduler = (
                   onFailure: Effect.fnUntraced(function*(error) {
                     if (watchEpoch !== authenticationEpoch) return yield* watch()
                     if (error._tag === "CredentialRejected") {
-                      if (error.credentialGeneration === undefined) return yield* reconciliation.watchFailed(error)
+                      if (error.credentialGeneration === undefined) {
+                        const rejectedAt = yield* reconciliation.generation
+                        yield* reconciliation.watchFailed(error)
+                        yield* reconciliation.syncedAfter(rejectedAt)
+                        yield* Effect.sleep(yield* watchBackoff.closed)
+                        return yield* watch()
+                      }
                       const admission = yield* admitCredentialPause
                       yield* reconciliation.watchFailed(error)
                       yield* startCredentialWait(error.credentialGeneration, admission)

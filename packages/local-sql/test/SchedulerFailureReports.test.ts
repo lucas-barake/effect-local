@@ -99,6 +99,9 @@ const harness = Effect.fnUntraced(function*() {
   const watchStarts = yield* Queue.unbounded<void>()
   const watchTimes: Array<number> = []
   let watchWakes = false
+  let watchAccepted = false
+  let pulls = 0
+  const liveWakes = yield* Queue.unbounded<Protocol.Wake>()
   const watchFailed = Effect.flip(Deferred.await(watchFailure))
   const watchOutcome = Effect.raceFirst(watchFailed, Deferred.await(watchEnd))
   const remote = SyncEngine.SyncEngine.of({
@@ -109,6 +112,7 @@ const harness = Effect.fnUntraced(function*() {
     discard: (request) => server.discard(request, null),
     pull: (request) =>
       Effect.suspend(() => {
+        pulls += 1
         if (pullMode === "Interrupt") {
           pullMode = "Pass"
           return Effect.interrupt
@@ -131,6 +135,8 @@ const harness = Effect.fnUntraced(function*() {
         Effect.tap((now) => Effect.sync(() => watchTimes.push(now))),
         Effect.andThen(Queue.offer(watchStarts, undefined))
       )
+      const opened = Stream.fromEffect(started).pipe(Stream.drain)
+      if (watchAccepted) return Stream.concat(opened, Stream.fromQueue(liveWakes))
       const outcome = Stream.fromEffect(Effect.andThen(started, watchOutcome)).pipe(Stream.drain)
       if (!watchWakes) return outcome
       const wake = Protocol.Wake.make({ spaceId: request.spaceId })
@@ -150,6 +156,11 @@ const harness = Effect.fnUntraced(function*() {
     injected,
     paused: gate.pauses,
     failWatch: (error: ReplicaError.ReplicaError) => Deferred.succeed(watchFailure, error),
+    acceptLaterWatches: Effect.sync(() => {
+      watchAccepted = true
+    }),
+    wake: Queue.offer(liveWakes, Protocol.Wake.make({ spaceId })),
+    pulls: () => pulls,
     endWatch: Deferred.succeed(watchEnd, undefined),
     changeCredential: Deferred.succeed(credentialChange, undefined),
     failNextPull: (error: ReplicaError.ReplicaError) =>
@@ -728,6 +739,87 @@ describe("in-memory scheduler failure reports", () => {
 
       yield* Fiber.join(later)
       assert.strictEqual((yield* reconciler.status)._tag, "NeedsAuthentication")
+    }, VirtualTime.provide)
+  )
+})
+
+const schedulers = ["layer", "layerWorkflow", "in-memory"] as const
+
+const onlineScheduler = Effect.fnUntraced(function*(
+  controls: Effect.Success<ReturnType<typeof harness>>,
+  scheduler: typeof schedulers[number]
+) {
+  if (scheduler === "in-memory") {
+    const { local, reconciler } = yield* inMemory(controls)
+    return {
+      status: reconciler.status,
+      mutate: local.mutate(Domain.PutTodo, Domain.todo("later")).pipe(Effect.andThen(reconciler.notify))
+    }
+  }
+  let layerReplica = SqlReplica.layer(replicaOptions).pipe(Layer.provide(Domain.layerHandlers))
+  if (scheduler === "layerWorkflow") {
+    layerReplica = SqlReplica.layerWorkflow(replicaOptions).pipe(
+      Layer.provide(Domain.layerHandlers),
+      Layer.provide(WorkflowEngine.layerMemory)
+    )
+  }
+  const space = yield* activeSpace(controls, layerReplica)
+  return { status: space.status, mutate: space.mutate(Domain.PutTodo, Domain.todo("later")) }
+})
+
+const statusBecomes = <E extends { readonly _tag: string },>(
+  status: Effect.Effect<ReplicaStatus.ReplicaStatus, E>,
+  tag: ReplicaStatus.ReplicaStatus["_tag"]
+) =>
+  status.pipe(
+    Effect.repeat({ until: (current) => current._tag === tag }),
+    Effect.timeoutOption("1 hour"),
+    VirtualTime.advanceUntil
+  )
+
+describe("a watch whose credential was rejected without a generation", () => {
+  it.effect.each(schedulers)(
+    "is subscribed again once a later sync succeeds, and live updates resume with %s",
+    Effect.fnUntraced(function*(scheduler) {
+      const controls = yield* harness()
+      const running = yield* onlineScheduler(controls, scheduler)
+      yield* Queue.takeAll(controls.watchStarts)
+      yield* controls.acceptLaterWatches
+      yield* controls.failWatch(new ReplicaError.CredentialRejected({}))
+      const rejected = yield* statusBecomes(running.status, "NeedsAuthentication")
+
+      yield* running.mutate
+      const resubscribed = yield* Queue.take(controls.watchStarts).pipe(
+        Effect.timeoutOption("1 hour"),
+        VirtualTime.advanceUntil
+      )
+      const online = yield* statusBecomes(running.status, "Online")
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+      const pullsBefore = controls.pulls()
+      yield* controls.wake
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+
+      assert.isTrue(Option.isSome(rejected), "the rejection was reported")
+      assert.isTrue(Option.isSome(resubscribed), "the watch was subscribed again")
+      assert.isTrue(Option.isSome(online), "the space is online with its watch back")
+      assert.isAbove(controls.pulls(), pullsBefore, "a change announced by the server was pulled")
+    }, VirtualTime.provide)
+  )
+
+  it.effect.each(schedulers)(
+    "stays reported while no sync has succeeded since with %s",
+    Effect.fnUntraced(function*(scheduler) {
+      const controls = yield* harness()
+      const running = yield* onlineScheduler(controls, scheduler)
+      yield* Queue.takeAll(controls.watchStarts)
+      yield* controls.failWatch(new ReplicaError.CredentialRejected({}))
+      yield* statusBecomes(running.status, "NeedsAuthentication")
+      const watchesBefore = controls.watchTimes.length
+
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 hour"))
+
+      assert.strictEqual((yield* running.status)._tag, "NeedsAuthentication")
+      assert.strictEqual(controls.watchTimes.length, watchesBefore)
     }, VirtualTime.provide)
   )
 })

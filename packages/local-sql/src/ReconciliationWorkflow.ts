@@ -702,9 +702,12 @@ const layerSchedulerWithConfiguration = (
           }
           if (error._tag === "CredentialRejected") {
             if (error.credentialGeneration === undefined) {
+              const rejectedAt = yield* reconciliation.generation
               yield* reconciliation.watchFailed(error)
               yield* Effect.logWarning("Rejected watch credential did not include its generation")
-              return
+              yield* reconciliation.syncedAfter(rejectedAt)
+              yield* Effect.sleep(yield* watchBackoff.closed)
+              continue
             }
             const admission = yield* admitCredentialPause
             yield* reconciliation.watchFailed(error)

@@ -2288,6 +2288,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
         generation: Effect.succeed(0),
         failed: () => Effect.void,
         watchFailed: () => Effect.void,
+        syncedAfter: () => Effect.never,
         succeeded: Effect.void,
         status: Effect.succeed({ _tag: "Offline", pending: 0 })
       })

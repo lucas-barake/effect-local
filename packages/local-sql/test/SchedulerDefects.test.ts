@@ -2220,6 +2220,7 @@ const managedSpace = Effect.fnUntraced(function*(readmission: {
       generation: Effect.succeed(0),
       failed: () => Effect.void,
       watchFailed: () => Effect.void,
+      syncedAfter: () => Effect.never,
       succeeded: Effect.void,
       status: Effect.succeed({ _tag: "Connecting", pending: 0 })
     }
@@ -2260,6 +2261,7 @@ describe("a caller that shares a reconciliation request and whose completion cal
           generation: Effect.succeed(0),
           failed: () => Effect.void,
           watchFailed: () => Effect.void,
+          syncedAfter: () => Effect.never,
           succeeded: Effect.void,
           status: Effect.succeed({ _tag: "Connecting", pending: 0 })
         }
