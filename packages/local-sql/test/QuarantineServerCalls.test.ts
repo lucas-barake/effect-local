@@ -239,6 +239,7 @@ const waitingOnTheServer = Effect.fnUntraced(function*(row: Row) {
   const answered = yield* Deferred.make<void>()
   const remote = SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Effect.never,
+    credentialGeneration: Effect.succeed(0),
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Effect.never,
     submitBatch: (request) => server.admitBatch(request, null),

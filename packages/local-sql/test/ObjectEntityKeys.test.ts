@@ -52,6 +52,7 @@ const replicaSpace = (server: ServerStore.Service, clientId: Identity.ClientId) 
   SqlReplica.layer({ definition, clientId, initialSpaces: [spaceId], retryDelay: "10 millis" }).pipe(
     Layer.provide(Layer.succeed(SyncEngine.SyncEngine, {
       waitForCredentialChange: () => Effect.never,
+      credentialGeneration: Effect.succeed(0),
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
       submitBatch: (request) => server.admitBatch(request, null),

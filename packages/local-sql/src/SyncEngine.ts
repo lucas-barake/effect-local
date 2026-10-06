@@ -8,6 +8,7 @@ export interface Service {
   readonly waitForCredentialChange: (
     rejectedGeneration: number
   ) => Effect.Effect<void>
+  readonly credentialGeneration: Effect.Effect<number>
   readonly transportGeneration: Effect.Effect<number>
   readonly waitForTransportChange: (
     observedGeneration: number

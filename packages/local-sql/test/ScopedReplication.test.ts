@@ -2142,6 +2142,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
       const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          credentialGeneration: Effect.succeed(0),
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, "reader"),
@@ -2231,6 +2232,7 @@ describe.each(serverDatabases)("scoped replication ($dialect)", (database) => {
       const layerRemote = pipe(
         SyncEngine.SyncEngine.of({
           waitForCredentialChange: () => Effect.never,
+          credentialGeneration: Effect.succeed(0),
           transportGeneration: Effect.succeed(0),
           waitForTransportChange: () => Effect.never,
           discard: (request) => server.discard(request, "reader"),

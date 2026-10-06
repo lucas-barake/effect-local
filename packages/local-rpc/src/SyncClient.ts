@@ -107,6 +107,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
       return SyncEngine.SyncEngine.of({
         waitForCredentialChange: (rejectedGeneration) =>
           credentialProvider.awaitChange(rejectedGeneration).pipe(Effect.asVoid),
+        credentialGeneration: Effect.map(credentialProvider.acquire, (credential) => credential.generation),
         transportGeneration: transport.generation,
         waitForTransportChange: transport.waitForChange,
         submitBatch: (request) =>

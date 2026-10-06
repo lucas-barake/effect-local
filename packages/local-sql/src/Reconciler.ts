@@ -15,6 +15,7 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
 import * as Stream from "effect/Stream"
@@ -26,6 +27,10 @@ import * as LosslessQueue from "./internal/losslessQueue.js"
 import { backoff, credentialChange, superviseWatch } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as SyncEngine from "./SyncEngine.js"
+
+class CredentialChanged extends Schema.TaggedError<CredentialChanged>(
+  "@lucas-barake/effect-local-sql/Reconciler/CredentialChanged"
+)("CredentialChanged", {}) {}
 
 export interface ReconciliationService {
   readonly sync: Effect.Effect<void, ReplicaError.ReplicaError>
@@ -616,6 +621,22 @@ export const layerOnePass = (
       const local = yield* LocalStore.Store
       const remote = yield* SyncEngine.SyncEngine
       const gate = yield* Semaphore.make(1)
+      let passCredential = 0
+      const answeredUnderPassCredential = <A,>(
+        call: Effect.Effect<A, ReplicaError.ReplicaError>
+      ): Effect.Effect<A, ReplicaError.ReplicaError | CredentialChanged> =>
+        Effect.exit(call).pipe(
+          Effect.zip(remote.credentialGeneration),
+          Effect.flatMap(([exit, current]): Effect.Effect<A, ReplicaError.ReplicaError | CredentialChanged> => {
+            if (current !== passCredential) return Effect.fail(new CredentialChanged())
+            return exit
+          })
+        )
+      const server = {
+        pull: (request: Protocol.PullRequest) => answeredUnderPassCredential(remote.pull(request)),
+        submitBatch: (request: Protocol.SubmitBatchRequest) => answeredUnderPassCredential(remote.submitBatch(request)),
+        bootstrap: (request: Protocol.BootstrapRequest) => answeredUnderPassCredential(remote.bootstrap(request))
+      }
       const status = yield* Ref.make<ReplicaStatus.ReplicaStatus>({ _tag: "Connecting", pending: 0 })
       let syncAttempted = false
       let syncing = false
@@ -729,11 +750,11 @@ export const layerOnePass = (
       const continueBootstrap = Effect.fnUntraced(function*(
         manifest: Protocol.SnapshotManifest,
         initialAfterOrdinal: number
-      ): Effect.fn.Return<void, ReplicaError.ReplicaError> {
+      ): Effect.fn.Return<void, ReplicaError.ReplicaError | CredentialChanged> {
         let afterOrdinal = initialAfterOrdinal
         while (true) {
           const state = yield* local.replicationState
-          const page = yield* remote.bootstrap({
+          const page = yield* server.bootstrap({
             spaceId: options.spaceId,
             clientId: state.clientId,
             membershipIncarnation: local.membershipIncarnation,
@@ -762,7 +783,7 @@ export const layerOnePass = (
 
       const bootstrap = (
         manifest: Protocol.SnapshotManifest
-      ): Effect.Effect<void, ReplicaError.ReplicaError> =>
+      ): Effect.Effect<void, ReplicaError.ReplicaError | CredentialChanged> =>
         local.prepareBootstrap(manifest).pipe(
           Effect.flatMap((afterOrdinal) => continueBootstrap(manifest, afterOrdinal))
         )
@@ -775,7 +796,7 @@ export const layerOnePass = (
               message: "Expired receipt recovery requires an installed replication view"
             })
           }
-          const firstPage = yield* remote.bootstrap({
+          const firstPage = yield* server.bootstrap({
             spaceId: options.spaceId,
             clientId: state.clientId,
             membershipIncarnation: local.membershipIncarnation,
@@ -813,7 +834,7 @@ export const layerOnePass = (
       const catchUp = Effect.gen(function*() {
         while (true) {
           const state = yield* local.replicationState
-          const result = yield* remote.pull({
+          const result = yield* server.pull({
             spaceId: options.spaceId,
             clientId: state.clientId,
             membershipIncarnation: local.membershipIncarnation,
@@ -869,7 +890,7 @@ export const layerOnePass = (
             if (envelopes.length === 0) break
             const mutationIds = envelopes.map((envelope) => envelope.mutationId)
             const receipts = yield* Effect.gen(function*() {
-              const result = yield* remote.submitBatch({ envelopes, schema: options.definition.schemaIdentity })
+              const result = yield* server.submitBatch({ envelopes, schema: options.definition.schemaIdentity })
               yield* validateBatchReceipts(envelopes, result.receipts)
               yield* local.persistReceipts(result.receipts)
               if (result.receipts.length < mutationIds.length) {
@@ -897,21 +918,28 @@ export const layerOnePass = (
         }
       })
 
+      const pass = Effect.gen(function*() {
+        passCredential = yield* remote.credentialGeneration
+        syncGeneration += 1
+        const generation = syncGeneration
+        syncAttempted = true
+        syncing = true
+        failedSinceSyncStarted = false
+        yield* catchUp
+        yield* submitPending
+        yield* catchUp
+        syncing = false
+        yield* succeeded
+        yield* recordSynced(generation)
+        yield* options.onReconciled ?? Effect.void
+      })
+      const underCurrentCredential: Effect.Effect<void, ReplicaError.ReplicaError> = Effect.catchTag(
+        pass,
+        "CredentialChanged",
+        () => underCurrentCredential
+      )
       const sync = gate.withPermit(
-        Effect.gen(function*() {
-          syncGeneration += 1
-          const generation = syncGeneration
-          syncAttempted = true
-          syncing = true
-          failedSinceSyncStarted = false
-          yield* catchUp
-          yield* submitPending
-          yield* catchUp
-          syncing = false
-          yield* succeeded
-          yield* recordSynced(generation)
-          yield* options.onReconciled ?? Effect.void
-        }).pipe(
+        underCurrentCredential.pipe(
           Effect.ensuring(Effect.sync(() => {
             syncing = false
           })),

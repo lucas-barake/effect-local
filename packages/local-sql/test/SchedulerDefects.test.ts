@@ -323,6 +323,7 @@ const inMemoryScheduler = Effect.fnUntraced(function*(faults: {
     ...idleRemote,
     waitForCredentialChange: () => faults.waitForCredentialChange ?? Effect.never,
     waitForTransportChange: () => faults.waitForTransportChange ?? Effect.never,
+    credentialGeneration: Effect.succeed(0),
     transportGeneration: faults.transportGeneration ?? Effect.succeed(0),
     submitBatch: (request) => server.admitBatch(request, null),
     pull: (request) => Effect.andThen(faults.pull, server.pull(request)),

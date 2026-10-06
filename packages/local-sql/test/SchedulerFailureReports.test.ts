@@ -106,6 +106,7 @@ const harness = Effect.fnUntraced(function*() {
   const watchOutcome = Effect.raceFirst(watchFailed, Deferred.await(watchEnd))
   const remote = SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Deferred.await(credentialChange),
+    credentialGeneration: Effect.succeed(0),
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Queue.offer(transportWaits, undefined).pipe(Effect.andThen(Effect.never)),
     submitBatch: (request) => server.admitBatch(request, null),

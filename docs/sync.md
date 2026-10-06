@@ -138,6 +138,12 @@ watches from retrying it. `CredentialProvider.awaitChange(rejectedGeneration)` m
 return a different generation. Completion requests a new reconciliation generation, so synchronization resumes on the
 same replica and WebSocket. Rotating a bearer credential does not require rebuilding either Layer.
 
+A reconciliation pass records the generation it starts under. An answer to a pull, a submit or a bootstrap request that
+arrives after the generation changed is discarded, and the pass starts again under the new credential. A credential
+for a different principal must therefore carry a new generation. The replica cannot observe a change of principal that
+keeps the generation, and it would apply that answer. A new generation does not remove what the previous principal
+already replicated. On sign out, leave the spaces of the previous principal or build the replica on another database.
+
 Authentication and authorization failures remain distinct:
 
 | Failure                    | Meaning                                                         | Reconciliation status and policy                 |

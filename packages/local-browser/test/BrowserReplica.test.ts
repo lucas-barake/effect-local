@@ -141,6 +141,7 @@ const layerEphemeralInactive = Layer.succeed(EphemeralClient.EphemeralClient, {
 
 const layerSyncIdle = Layer.succeed(SyncEngine.SyncEngine, {
   waitForCredentialChange: () => Effect.never,
+  credentialGeneration: Effect.succeed(0),
   transportGeneration: Effect.succeed(0),
   waitForTransportChange: () => Effect.never,
   submitBatch: () => Effect.never,
@@ -237,6 +238,7 @@ const makeEnvironmentWith = Effect.fnUntraced(function*(environmentOptions: Envi
   const layerSync = Layer.merge(
     Layer.succeed(SyncEngine.SyncEngine, {
       waitForCredentialChange: () => Effect.never,
+      credentialGeneration: Effect.succeed(0),
       transportGeneration: Effect.succeed(0),
       waitForTransportChange: () => Effect.never,
       submitBatch: (request) =>
