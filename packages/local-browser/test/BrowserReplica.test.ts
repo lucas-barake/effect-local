@@ -1052,7 +1052,7 @@ const describeSubscriber = <A,>(fiber: Fiber.Fiber<A, SessionFailure>) => {
 
 const makeLeaderSessions = Effect.gen(function*() {
   const opens = yield* Queue.unbounded<void>()
-  const openFailures = yield* Queue.unbounded<ReplicaError.ReplicaError>()
+  const openFailures = yield* Queue.unbounded<Effect.Effect<never, ReplicaError.ReplicaError>>()
   const memberSignals = yield* Queue.unbounded<Cause.Cause<SessionFailure>>()
   const reactions = yield* Queue.unbounded<string | ReplicaError.ReplicaError>()
   const failMembers = Queue.take(memberSignals).pipe(Effect.flatMap(Effect.failCause))
@@ -1097,7 +1097,7 @@ const makeLeaderSessions = Effect.gen(function*() {
 
   const open = Queue.offer(opens, undefined).pipe(
     Effect.andThen(Queue.poll(openFailures)),
-    Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: (error) => Effect.fail(error) }))
+    Effect.flatMap(Option.match({ onNone: () => Effect.void, onSome: (failing) => failing }))
   )
 
   const layer = Layer.succeed(EphemeralClient.EphemeralClient, {
@@ -1254,11 +1254,67 @@ describe("BrowserReplica follower ephemeral session failures", () => {
   )
 
   it.effect(
+    "keeps doubling the delay while every reopen fails before the leader opens the session",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({ retryDelay: "100 millis", maximumRetryDelay: "1 minute" })
+        const refused = Effect.fail(sessionFailures.ServerUnavailable)
+        yield* Queue.offerAll(tabs.openFailures, [refused, refused, refused, refused])
+        yield* Queue.offer(tabs.memberSignals, serverUnavailable)
+        for (const delayMillis of [100, 200, 400, 800, 1_600]) {
+          assert.deepStrictEqual(yield* tabs.reopensAfter(delayMillis), { early: 0, onTime: 1 }, `${delayMillis}`)
+        }
+        assert.deepStrictEqual(tabs.outcomes(), { members: "pending", events: "pending", state: "pending" })
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "keeps the grown delay after a reopen that took longer than it and never opened the session",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({ retryDelay: "100 millis", maximumRetryDelay: "1 minute" })
+        for (const delayMillis of [100, 200, 400]) {
+          yield* Queue.offer(tabs.memberSignals, serverUnavailable)
+          assert.deepStrictEqual(yield* tabs.reopensAfter(delayMillis), { early: 0, onTime: 1 }, `${delayMillis}`)
+        }
+        const refusedLate = Effect.sleep(2_000).pipe(Effect.andThen(Effect.fail(sessionFailures.ServerUnavailable)))
+        yield* Queue.offer(tabs.openFailures, refusedLate)
+        yield* Queue.offer(tabs.memberSignals, serverUnavailable)
+        assert.deepStrictEqual(yield* tabs.reopensAfter(800), { early: 0, onTime: 1 }, "800")
+        yield* TestClock.adjust(2_000)
+        assert.deepStrictEqual(yield* tabs.reopensAfter(1_600), { early: 0, onTime: 1 }, "1600")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
+    "reopens at once on the new leader when a leader that stays open hands over to a visible tab",
+    Effect.fnUntraced(
+      function*() {
+        const tabs = yield* openFollowerSession({ retryDelay: "1 hour", maximumRetryDelay: "1 hour" })
+        yield* tabs.follower.visibility.set(true)
+        yield* tabs.leader.visibility.set(false)
+        yield* settle(Effect.void)
+        assert.deepStrictEqual(tabs.outcomes(), { members: "pending", events: "pending", state: "pending" })
+        assert.strictEqual(yield* tabs.reopens, 1)
+        assert.deepStrictEqual(yield* Queue.clear(tabs.statuses), [["online"], ["online"]])
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
     "surfaces a failure the leader answers a reopen with instead of retrying it",
     Effect.fnUntraced(
       function*() {
         const tabs = yield* openFollowerSession({})
-        yield* Queue.offer(tabs.openFailures, sessionFailures.AuthorizationDenied)
+        yield* Queue.offer(tabs.openFailures, Effect.fail(sessionFailures.AuthorizationDenied))
         yield* Queue.offer(tabs.memberSignals, serverUnavailable)
         yield* settle(Effect.void)
         assert.deepStrictEqual(tabs.outcomes(), {
@@ -1426,7 +1482,6 @@ describe("BrowserReplica follower ephemeral session failures", () => {
 
 describe("BrowserReplica maximumRetryDelay", () => {
   const rejected: ReadonlyArray<readonly [string, Pick<EnvironmentOptions, "retryDelay" | "maximumRetryDelay">]> = [
-    ["zero", { maximumRetryDelay: 0 }],
     ["an infinite duration", { maximumRetryDelay: Duration.infinity }],
     ["a duration shorter than retryDelay", { retryDelay: "2 seconds", maximumRetryDelay: "1 second" }],
     ["a default shorter than retryDelay", { retryDelay: "2 minutes" }]
