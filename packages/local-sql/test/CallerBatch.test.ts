@@ -1,24 +1,22 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
-import type * as Replica from "@lucas-barake/effect-local/Replica"
-import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
 import * as Reactivity from "effect/reactivity/Reactivity"
-import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
-  acceptSubmission,
-  awaitSpaceStatusWhere,
   type Constructor,
   constructors,
-  emptyPage,
+  count,
+  eventually,
+  healthyRemote,
   idleRemote,
-  viewId
+  installView,
+  isOnlineDrained
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
@@ -37,29 +35,6 @@ const twoSpaces = (constructor: Constructor) =>
     maximumRetryDelay: "1 minute"
   })
 
-const eventually = (
-  services: BackgroundReplica.Services,
-  space: Replica.Space,
-  matches: (status: ReplicaStatus.SpaceStatus) => boolean
-) =>
-  awaitSpaceStatusWhere(space, services.reactivity, matches).pipe(
-    Effect.scoped,
-    VirtualTime.advanceUntil,
-    Effect.timeoutOption("5 minutes")
-  )
-
-const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
-
-const healthyRemote = (services: BackgroundReplica.Services) =>
-  SyncEngine.SyncEngine.of({
-    ...idleRemote,
-    submitBatch: acceptSubmission,
-    pull: (request) => emptyPage(services.crypto, request)
-  })
-
-const installView = (services: BackgroundReplica.Services) =>
-  services.sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId}, replication_view_revision = 0`
-
 const onlineSpace = Effect.fnUntraced(function*(services: BackgroundReplica.Services) {
   const replica = yield* services.start(healthyRemote(services))
   yield* installView(services)
@@ -68,14 +43,6 @@ const onlineSpace = Effect.fnUntraced(function*(services: BackgroundReplica.Serv
   assert.isTrue(Option.isSome(yield* eventually(services, space, isOnlineDrained)), "the space came online")
   return { replica, space }
 })
-
-const count = (services: BackgroundReplica.Services, key: string) => {
-  let delivered = 0
-  services.reactivity.registerUnsafe([key], () => {
-    delivered += 1
-  })
-  return () => delivered
-}
 
 describe("notifications raised inside a batch of the caller", () => {
   it.effect.each(constructors)(

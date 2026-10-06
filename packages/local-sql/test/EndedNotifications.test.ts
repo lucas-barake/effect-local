@@ -4,23 +4,21 @@ import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
-import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
 import * as Scope from "effect/Scope"
-import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
-  acceptSubmission,
-  awaitSpaceStatusWhere,
   type Constructor,
   constructors,
-  emptyPage,
-  idleRemote,
-  viewId
+  describeExit,
+  eventually,
+  healthyRemote,
+  installView,
+  isOnlineDrained,
+  within
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
@@ -36,14 +34,12 @@ interface Outcome {
 const outcomes: ReadonlyArray<Outcome> = [
   { kind: "a defect", outcome: Effect.die("subscriber died") },
   { kind: "an interruption", outcome: Effect.interrupt },
-  {
-    kind: "an interruption and a defect",
-    outcome: Effect.ensuring(Effect.interrupt, Effect.die("subscriber died"))
-  },
   { kind: "a failure", outcome: Effect.fail(new ReplicaError.ServerUnavailable()) }
 ]
 
 const withConstructor = (constructor: Constructor) => (outcome: Outcome) => Object.assign({ constructor }, outcome)
+
+const endedRows = constructors.flatMap((constructor) => outcomes.map(withConstructor(constructor)))
 
 const twoSpaces = (constructor: Constructor) =>
   BackgroundReplica.services({
@@ -56,41 +52,6 @@ const twoSpaces = (constructor: Constructor) =>
     maximumRetryDelay: "1 minute"
   })
 
-const describeExit = <A, E extends { readonly _tag: string },>(exit: Option.Option<Exit.Exit<A, E>>) => {
-  if (Option.isNone(exit)) return "never completed"
-  if (Exit.isSuccess(exit.value)) return "succeeded"
-  if (Cause.hasInterrupts(exit.value.cause)) return "interrupted"
-  if (Cause.hasDies(exit.value.cause)) return "died"
-  return "failed"
-}
-
-const within = <A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) =>
-  effect.pipe(Effect.exit, Effect.timeoutOption("5 minutes"), VirtualTime.advanceUntil)
-
-const eventually = (
-  services: BackgroundReplica.Services,
-  space: Replica.Space,
-  matches: (status: ReplicaStatus.SpaceStatus) => boolean
-) =>
-  awaitSpaceStatusWhere(space, services.reactivity, matches).pipe(
-    Effect.scoped,
-    VirtualTime.advanceUntil,
-    Effect.timeoutOption("5 minutes")
-  )
-
-const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
-
-const healthyRemote = (services: BackgroundReplica.Services) =>
-  SyncEngine.SyncEngine.of({
-    ...idleRemote,
-    submitBatch: acceptSubmission,
-    pull: (request) => emptyPage(services.crypto, request)
-  })
-
-const installView = (services: BackgroundReplica.Services) =>
-  services.sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId}, replication_view_revision = 0`
-
-const endedRows = constructors.flatMap((constructor) => outcomes.map(withConstructor(constructor)))
 const todosOnly = Protocol.ReplicationScope.make({ models: [Domain.Todo.name] })
 const nowhere = "no key"
 

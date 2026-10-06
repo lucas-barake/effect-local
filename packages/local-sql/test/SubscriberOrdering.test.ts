@@ -2,23 +2,22 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
 import type * as Replica from "@lucas-barake/effect-local/Replica"
-import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
-import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
-import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
-  acceptSubmission,
-  awaitSpaceStatusWhere,
+  captureErrors,
   type Constructor,
   constructors,
-  emptyPage,
+  count,
+  eventually,
+  healthyRemote,
   idleRemote,
-  viewId
+  installView,
+  isOnlineDrained
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
@@ -38,32 +37,9 @@ const twoSpaces = (constructor: Constructor) =>
     maximumRetryDelay: "1 minute"
   })
 
-const eventually = (
-  services: BackgroundReplica.Services,
-  space: Replica.Space,
-  matches: (status: ReplicaStatus.SpaceStatus) => boolean
-) =>
-  awaitSpaceStatusWhere(space, services.reactivity, matches).pipe(
-    Effect.scoped,
-    VirtualTime.advanceUntil,
-    Effect.timeoutOption("5 minutes")
-  )
-
 const firstTodo = Domain.todo("first")
 
 const settle = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 second"))
-
-const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
-
-const healthyRemote = (services: BackgroundReplica.Services) =>
-  SyncEngine.SyncEngine.of({
-    ...idleRemote,
-    submitBatch: acceptSubmission,
-    pull: (request) => emptyPage(services.crypto, request)
-  })
-
-const installView = (services: BackgroundReplica.Services) =>
-  services.sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId}, replication_view_revision = 0`
 
 const onlineSpace = Effect.fnUntraced(function*(services: BackgroundReplica.Services) {
   const replica = yield* services.start(healthyRemote(services))
@@ -79,25 +55,6 @@ const activationIs = (space: Replica.Space, expected: Replica.Activation) =>
     Effect.map((activation) => activation === expected),
     Effect.catch(() => Effect.succeed(false))
   )
-
-const count = (services: BackgroundReplica.Services, key: string) => {
-  let delivered = 0
-  services.reactivity.registerUnsafe([key], () => {
-    delivered += 1
-  })
-  return () => delivered
-}
-
-const captureErrors = () => {
-  const messages: Array<string> = []
-  const logger = Logger.make<unknown, void>((entry) => {
-    if (entry.logLevel !== "Error") return
-    let message: unknown = entry.message
-    if (Array.isArray(message)) message = message[0]
-    messages.push(String(message))
-  })
-  return { layerLogs: Logger.layer([logger]), messages: () => messages }
-}
 
 const throwingObserver = () => {
   let completed = 0
@@ -232,7 +189,6 @@ describe("the subscribers of an operation when its caller resumes", () => {
       )
       const deactivating = yield* space.deactivate.pipe(Effect.forkChild({ startImmediately: true }))
       yield* VirtualTime.advanceUntil(closing.entered)
-      const activationWhenResumed = 0
       const waiting = yield* space.deactivate.pipe(
         Effect.map(() => activation()),
         Effect.forkChild({ startImmediately: true })
@@ -241,7 +197,7 @@ describe("the subscribers of an operation when its caller resumes", () => {
       const observed = yield* VirtualTime.advanceUntil(Fiber.join(waiting))
       yield* Fiber.join(deactivating)
 
-      assert.strictEqual(observed - activationWhenResumed, 2)
+      assert.strictEqual(observed, 2)
     }, VirtualTime.scoped)
   )
 

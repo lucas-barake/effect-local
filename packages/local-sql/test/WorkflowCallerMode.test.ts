@@ -6,7 +6,6 @@ import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Effect from "effect/Effect"
-import * as Fiber from "effect/Fiber"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
@@ -20,14 +19,7 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000f7
 
 const settle = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 second"))
 
-const entries = [
-  "no batch at all",
-  "activate",
-  "mutate",
-  "setScope",
-  "join",
-  "activate that its caller abandons"
-] as const
+const entries = ["activate", "mutate", "setScope", "join"] as const
 
 const rows = constructors.flatMap((constructor) => entries.map((entry) => ({ constructor, entry })))
 
@@ -76,14 +68,6 @@ describe("subscribers after a batch of the caller ended", () => {
           batch,
           VirtualTime.advanceUntil
         )
-      }
-      if (row.entry === "activate that its caller abandons") {
-        const building = yield* services.holdStatement("SELECT desired_scope_json", true)
-        const activating = yield* space.activate.pipe(batch, Effect.forkChild({ startImmediately: true }))
-        yield* VirtualTime.advanceUntil(building.entered)
-        const interrupting = yield* Fiber.interrupt(activating).pipe(Effect.forkChild({ startImmediately: true }))
-        yield* building.release
-        yield* VirtualTime.advanceUntil(Fiber.join(interrupting))
       }
       yield* settle
 

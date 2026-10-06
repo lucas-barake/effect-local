@@ -1,9 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
-import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
@@ -14,12 +12,13 @@ import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
   acceptSubmission,
-  awaitSpaceStatusWhere,
   type Constructor,
   constructors,
   emptyPage,
+  eventually,
   idleRemote,
-  viewId
+  installView,
+  isOnlineDrained
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
@@ -39,23 +38,7 @@ const twoSpaces = (constructor: Constructor) =>
     maximumRetryDelay: "1 minute"
   })
 
-const eventually = (
-  services: BackgroundReplica.Services,
-  space: Replica.Space,
-  matches: (status: ReplicaStatus.SpaceStatus) => boolean
-) =>
-  awaitSpaceStatusWhere(space, services.reactivity, matches).pipe(
-    Effect.scoped,
-    VirtualTime.advanceUntil,
-    Effect.timeoutOption("5 minutes")
-  )
-
 const settle = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("5 minutes"))
-
-const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
-
-const installView = (services: BackgroundReplica.Services) =>
-  services.sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId}, replication_view_revision = 0`
 
 const heldFailureReport = Effect.fnUntraced(function*(constructor: Constructor) {
   const services = yield* twoSpaces(constructor)

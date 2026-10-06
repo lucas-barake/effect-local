@@ -4,7 +4,6 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
-import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Cause from "effect/Cause"
@@ -37,11 +36,12 @@ import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
   acceptSubmission,
-  awaitSpaceStatusWhere,
   type Constructor,
   constructors,
   emptyPage,
+  eventually,
   idleRemote,
+  isOnlineDrained,
   makeAttempts,
   viewId
 } from "./fixtures/BackgroundReplica.js"
@@ -87,17 +87,6 @@ const captureLogs = () => {
     })
   return { layerLogs: Logger.layer([logger]), defects, errors, errorMessages }
 }
-
-const eventually = (
-  services: BackgroundReplica.Services,
-  space: Replica.Space,
-  matches: (status: ReplicaStatus.SpaceStatus) => boolean
-) =>
-  awaitSpaceStatusWhere(space, services.reactivity, matches).pipe(
-    Effect.scoped,
-    VirtualTime.advanceUntil,
-    Effect.timeoutOption("5 minutes")
-  )
 
 const isDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Idle" && status.pending === 0
 
@@ -185,8 +174,6 @@ describe("background turns that die", () => {
     }, VirtualTime.scoped)
   )
 })
-
-const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
 
 const foregroundSpaces = Effect.fnUntraced(
   function*(

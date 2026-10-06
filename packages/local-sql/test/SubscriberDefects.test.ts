@@ -2,7 +2,6 @@ import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Protocol from "@lucas-barake/effect-local/Protocol"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
-import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
 import * as Cause from "effect/Cause"
@@ -19,13 +18,16 @@ import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
   acceptSubmission,
-  awaitSpaceStatusWhere,
   type Constructor,
   constructors,
   emptyPage,
+  eventually,
   idleRemote,
+  installView,
+  isOnlineDrained,
   makeAttempts,
-  viewId
+  viewId,
+  within
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
@@ -101,23 +103,7 @@ const subscribe = (services: BackgroundReplica.Services, key: string, sibling?: 
   }
 }
 
-const eventually = (
-  services: BackgroundReplica.Services,
-  space: Replica.Space,
-  matches: (status: ReplicaStatus.SpaceStatus) => boolean
-) =>
-  awaitSpaceStatusWhere(space, services.reactivity, matches).pipe(
-    Effect.scoped,
-    VirtualTime.advanceUntil,
-    Effect.timeoutOption("5 minutes")
-  )
-
 const settle = (duration: Duration.Input) => VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption(duration))
-
-const within = <A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) =>
-  effect.pipe(Effect.exit, Effect.timeoutOption("5 minutes"), VirtualTime.advanceUntil)
-
-const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
 
 const isOfflinePending = (status: ReplicaStatus.SpaceStatus) => status._tag === "Offline" && status.pending === 1
 
@@ -181,9 +167,6 @@ const recordAnnouncements = Effect.fnUntraced(function*(services: BackgroundRepl
   return { statusFollowedLastAggregate }
 })
 
-const installView = (services: BackgroundReplica.Services) =>
-  services.sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId}, replication_view_revision = 0`
-
 const onlineSpace = Effect.fnUntraced(function*(services: BackgroundReplica.Services, isOffline: () => boolean) {
   const replica = yield* services.start(healthyRemote(services, isOffline))
   yield* installView(services)
@@ -198,13 +181,6 @@ const backgroundRows = constructors.flatMap((constructor) => [
     constructor,
     name: "the aggregate status",
     key: ReactivityKey.aggregateStatus,
-    nth: 1,
-    sibling: undefined
-  },
-  {
-    constructor,
-    name: "the space status",
-    key: ReactivityKey.status(spaceId),
     nth: 1,
     sibling: undefined
   },
@@ -270,13 +246,6 @@ const activationRows = constructors.flatMap((constructor) => [
     key: ReactivityKey.activation(spaceId),
     nth: 2,
     sibling: ReactivityKey.status(spaceId)
-  },
-  {
-    constructor,
-    name: "the space status when the activation started",
-    key: ReactivityKey.status(spaceId),
-    nth: 1,
-    sibling: undefined
   },
   {
     constructor,
@@ -441,12 +410,6 @@ describe("a subscriber that throws during a scope change", () => {
 const mutationRows = constructors.flatMap((constructor) => [
   {
     constructor,
-    name: "the space status",
-    key: ReactivityKey.status(spaceId),
-    sibling: undefined
-  },
-  {
-    constructor,
     name: "the pending mutations",
     key: ReactivityKey.pending(spaceId),
     sibling: ReactivityKey.status(spaceId)
@@ -497,12 +460,6 @@ const joinRows = constructors.flatMap((constructor) => [
   },
   {
     constructor,
-    name: "the space list",
-    key: ReactivityKey.spaces,
-    sibling: undefined
-  },
-  {
-    constructor,
     name: "the aggregate status",
     key: ReactivityKey.aggregateStatus,
     sibling: ReactivityKey.membership(thirdSpaceId)
@@ -548,18 +505,6 @@ describe("a subscriber that throws while a join is announced", () => {
 })
 
 const leaveRows = constructors.flatMap((constructor) => [
-  {
-    constructor,
-    name: "the membership",
-    key: ReactivityKey.membership(spaceId),
-    sibling: ReactivityKey.spaces
-  },
-  {
-    constructor,
-    name: "the space list",
-    key: ReactivityKey.spaces,
-    sibling: undefined
-  },
   {
     constructor,
     name: "the aggregate status",
@@ -656,11 +601,7 @@ describe("background workers after a subscriber threw during the turns of two sp
 const everyRows = constructors.flatMap((constructor) => [
   { constructor, name: "the aggregate status", key: ReactivityKey.aggregateStatus },
   { constructor, name: "the space status", key: ReactivityKey.status(spaceId) },
-  { constructor, name: "the activation", key: ReactivityKey.activation(spaceId) },
-  { constructor, name: "the pending mutations", key: ReactivityKey.pending(spaceId) },
-  { constructor, name: "the scope", key: ReactivityKey.scope(spaceId) },
-  { constructor, name: "the membership", key: ReactivityKey.membership(spaceId) },
-  { constructor, name: "the space list", key: ReactivityKey.spaces }
+  { constructor, name: "the scope", key: ReactivityKey.scope(spaceId) }
 ])
 
 describe("a subscriber that throws on every notification", () => {

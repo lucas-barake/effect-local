@@ -1,26 +1,23 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as ReactivityKey from "@lucas-barake/effect-local/ReactivityKey"
-import type * as Replica from "@lucas-barake/effect-local/Replica"
 import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
-import type * as ReplicaStatus from "@lucas-barake/effect-local/ReplicaStatus"
-import * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
-import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
-import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
-import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
-  acceptSubmission,
-  awaitSpaceStatusWhere,
+  captureErrors,
   type Constructor,
   constructors,
-  emptyPage,
+  describeExit,
+  eventually,
+  healthyRemote,
   idleRemote,
-  viewId
+  installView,
+  isOnlineDrained,
+  within
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
@@ -64,51 +61,6 @@ const twoSpaces = (constructor: Constructor) =>
     retryDelay: "1 second",
     maximumRetryDelay: "1 minute"
   })
-
-const captureErrors = () => {
-  const messages: Array<string> = []
-  const logger = Logger.make<unknown, void>((entry) => {
-    if (entry.logLevel !== "Error") return
-    let message: unknown = entry.message
-    if (Array.isArray(message)) message = message[0]
-    messages.push(String(message))
-  })
-  return { layerLogs: Logger.layer([logger]), messages: () => messages }
-}
-
-const describeExit = <A, E extends { readonly _tag: string },>(exit: Option.Option<Exit.Exit<A, E>>) => {
-  if (Option.isNone(exit)) return "never completed"
-  if (Exit.isSuccess(exit.value)) return "succeeded"
-  if (Cause.hasInterrupts(exit.value.cause)) return "interrupted"
-  if (Cause.hasDies(exit.value.cause)) return "died"
-  return "failed"
-}
-
-const within = <A, E extends { readonly _tag: string },>(effect: Effect.Effect<A, E>) =>
-  effect.pipe(Effect.exit, Effect.timeoutOption("5 minutes"), VirtualTime.advanceUntil)
-
-const eventually = (
-  services: BackgroundReplica.Services,
-  space: Replica.Space,
-  matches: (status: ReplicaStatus.SpaceStatus) => boolean
-) =>
-  awaitSpaceStatusWhere(space, services.reactivity, matches).pipe(
-    Effect.scoped,
-    VirtualTime.advanceUntil,
-    Effect.timeoutOption("5 minutes")
-  )
-
-const isOnlineDrained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
-
-const healthyRemote = (services: BackgroundReplica.Services) =>
-  SyncEngine.SyncEngine.of({
-    ...idleRemote,
-    submitBatch: acceptSubmission,
-    pull: (request) => emptyPage(services.crypto, request)
-  })
-
-const installView = (services: BackgroundReplica.Services) =>
-  services.sql`UPDATE effect_local_client_spaces SET replication_view_id = ${viewId}, replication_view_revision = 0`
 
 describe("a notification that a Reactivity service ends with", () => {
   it.effect.each(rows)(
