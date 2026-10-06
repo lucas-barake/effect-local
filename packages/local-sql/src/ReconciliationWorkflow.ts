@@ -310,6 +310,10 @@ const handler = (
           }))
         }).pipe(Effect.result)
         if (Result.isSuccess(result)) return
+        if (result.failure._tag === "StaleReplicationScope") {
+          yield* result.failure
+          return
+        }
         yield* Effect.scoped(Effect.gen(function*() {
           const runtime = yield* lease.acquire
           const generation = observedGeneration ?? (yield* runtime.reconciliation.generation)
@@ -571,8 +575,22 @@ const layerSchedulerWithConfiguration = (
       const liveExecution = Effect.gen(function*() {
         const adopted = yield* Ref.get(activeExecution)
         if (Option.isNone(adopted)) return adopted
-        const finished = yield* engine.poll(adopted.value.workflow, adopted.value.executionId)
-        if (Option.isNone(finished)) return adopted
+        const running = adopted.value
+        const finished = yield* engine.poll(running.workflow, running.executionId)
+        if (Option.isSome(finished)) return Option.none<ActiveExecution>()
+        const state = yield* local.replicationState
+        const payload = running.payload
+        if (
+          payload.schemaIdentity === schemaIdentityKey(options.definition) &&
+          payload.spaceId === options.spaceId &&
+          payload.clientId === options.clientId &&
+          payload.membershipIncarnation === local.membershipIncarnation &&
+          payload.scopeGeneration === state.scopeGeneration &&
+          payload.scope.models.length === state.scope.models.length &&
+          payload.scope.models.every((model, index) => model === state.scope.models[index])
+        ) return adopted
+        yield* engine.interruptUnsafe(running.workflow, running.executionId)
+        yield* Ref.set(activeExecution, Option.none())
         return Option.none<ActiveExecution>()
       })
       let retryAttempt = 0
@@ -631,6 +649,10 @@ const layerSchedulerWithConfiguration = (
         )
         if (Result.isSuccess(result)) return false
         const error = result.failure
+        if (error._tag === "StaleReplicationScope") {
+          readmit = true
+          return false
+        }
         if (error._tag === "CredentialRejected") {
           if (error.credentialGeneration === undefined) {
             yield* reconciliation.failed(error, observedGeneration)
