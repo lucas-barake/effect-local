@@ -15,6 +15,7 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
+import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
@@ -649,11 +650,12 @@ export const layerOnePass = (
       const answeredUnderPassCredential = <A,>(
         call: Effect.Effect<A, ReplicaError.ReplicaError>
       ): Effect.Effect<A, ReplicaError.ReplicaError | CredentialChanged> =>
-        Effect.exit(call).pipe(
+        Effect.result(call).pipe(
           Effect.zip(remote.credentialGeneration),
-          Effect.flatMap(([exit, current]): Effect.Effect<A, ReplicaError.ReplicaError | CredentialChanged> => {
+          Effect.flatMap(([answer, current]): Effect.Effect<A, ReplicaError.ReplicaError | CredentialChanged> => {
             if (current !== passCredential) return Effect.fail(new CredentialChanged())
-            return exit
+            if (Result.isFailure(answer)) return Effect.fail(answer.failure)
+            return Effect.succeed(answer.success)
           })
         )
       const server = {
