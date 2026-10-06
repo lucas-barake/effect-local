@@ -247,7 +247,10 @@ open, and for a stream the client sends the server an interrupt for it.
 
 Clients and servers support protocol version 1 by default. Pending mutations are submitted with `SubmitBatch`, which
 carries up to `Protocol.maximumSubmitBatchEntries` envelopes of one space. A remote defect is a server failure. Every
-sync operation reports it as typed `ProtocolInvalid`, so reconciliation shows `Failed` instead of losing its worker.
+sync and ephemeral operation reports it as typed `ProtocolInvalid` naming the RPC whose handler died, so reconciliation
+shows `Failed` instead of losing its worker. A negotiation that dies on the server names `Negotiate` whichever
+operation started it. An ephemeral session whose join stream or heartbeat dies on the server fails its `events`,
+`state`, and `members` streams with that `ProtocolInvalid` and does not rejoin.
 
 `sessionAcquisitionTimeout` bounds negotiation and renegotiation. `rpcTimeout` bounds every unary sync and ephemeral
 RPC plus stream acquisition. Both accept `Duration.Input` and default to 10 seconds. Expiry interrupts the operation
