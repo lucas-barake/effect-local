@@ -1813,6 +1813,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           current.leaving = true
           current.leaveCompletion = completion
           const cleanup = Effect.suspend(() => current.runtime?.cancelReconciliation ?? Effect.void).pipe(
+            Effect.andThen(current.workflowRegistration?.cancelExecution ?? Effect.void),
+            Effect.andThen(signalCapacity),
             Effect.andThen(deactivate(current, true)),
             Effect.andThen(
               lane.withTransaction(

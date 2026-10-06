@@ -25,6 +25,7 @@ import * as SqlError from "effect/sql/SqlError"
 import * as Statement from "effect/sql/Statement"
 import * as Stream from "effect/Stream"
 import * as WorkflowEngine from "effect/workflow/WorkflowEngine"
+import type * as ReconciliationWorkflow from "../../src/ReconciliationWorkflow.js"
 import * as SqlReplica from "../../src/SqlReplica.js"
 import * as SyncEngine from "../../src/SyncEngine.js"
 import * as Domain from "../Domain.js"
@@ -112,6 +113,10 @@ export interface Settings {
   readonly maximumRetryDelay: Duration.Input
   readonly reconciliationConcurrency?: number
 }
+
+const isPollable = (
+  value: unknown
+): value is ReturnType<typeof ReconciliationWorkflow.make> => Predicate.hasProperty(value, "_tag")
 
 const isStatement = (value: unknown): value is Statement.Statement<unknown> =>
   Statement.isFragment(value) && Effect.isEffect(value)
@@ -238,6 +243,7 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
   })
   const engine = Context.get(databaseContext, WorkflowEngine.WorkflowEngine)
   const executions = new Map<string, Set<string>>()
+  const workflows = new Map<string, unknown>()
   const countingEngine = new Proxy(engine, {
     get: (target, property, receiver) => {
       if (property !== "execute") return Reflect.get(target, property, receiver)
@@ -248,6 +254,7 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
           const started = executions.get(tag) ?? new Set<string>()
           started.add(String(execution.executionId))
           executions.set(tag, started)
+          workflows.set(tag, workflow)
         }
         return Reflect.apply(target.execute, target, args)
       }
@@ -322,6 +329,19 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     }
     return started
   }
+  const runningWorkflowExecutions = Effect.fnUntraced(function*(spaceId: Identity.SpaceId) {
+    let running = 0
+    for (const [name, ids] of executions) {
+      if (!name.includes(spaceId)) continue
+      for (const executionId of ids) {
+        const workflow = workflows.get(name)
+        if (!isPollable(workflow)) continue
+        const exit = yield* Effect.exit(engine.poll(workflow, executionId))
+        if (Exit.isSuccess(exit) && Option.isNone(exit.value)) running += 1
+      }
+    }
+    return running
+  })
   return {
     sql,
     crypto,
@@ -335,7 +355,8 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     holdInvalidationWhen,
     holdInvalidationsOf,
     endInvalidationsWith,
-    workflowExecutions
+    workflowExecutions,
+    runningWorkflowExecutions
   }
 })
 

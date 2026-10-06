@@ -144,6 +144,7 @@ export interface ActiveExecution {
 export interface RegistrationService {
   readonly registered: true
   readonly activeExecution: Ref.Ref<Option.Option<ActiveExecution>>
+  readonly cancelExecution: Effect.Effect<void>
 }
 
 export class Registration extends Context.Service<Registration, RegistrationService>()(
@@ -415,7 +416,17 @@ const register = Effect.fnUntraced(function*(
       })
     ).pipe(Scope.provide(registrationScope))
   }
-  return Registration.of({ registered: true, activeExecution: yield* Ref.make(Option.none<ActiveExecution>()) })
+  const activeExecution = yield* Ref.make(Option.none<ActiveExecution>())
+  const cancelExecution = Effect.gen(function*() {
+    const active = yield* Ref.get(activeExecution)
+    if (Option.isNone(active)) return
+    const polled = yield* Effect.exit(engine.poll(active.value.workflow, active.value.executionId))
+    if (Exit.isSuccess(polled) && Option.isNone(polled.value)) {
+      yield* engine.interruptUnsafe(active.value.workflow, active.value.executionId)
+    }
+    yield* Ref.set(activeExecution, Option.none())
+  })
+  return Registration.of({ registered: true, activeExecution, cancelExecution })
 })
 
 const layerRegistrationWithConfiguration = (
@@ -794,16 +805,10 @@ const layerSchedulerWithConfiguration = (
       })
 
       const shutdown = Effect.gen(function*() {
-        const active = yield* Ref.get(activeExecution)
         const supervisorInterruption = yield* Effect.forkChild(Fiber.interrupt(supervisorFiber), {
           startImmediately: true
         })
-        if (Option.isSome(active)) {
-          const result = yield* engine.poll(active.value.workflow, active.value.executionId)
-          if (Option.isNone(result)) {
-            yield* engine.interruptUnsafe(active.value.workflow, active.value.executionId)
-          }
-        }
+        yield* registration.cancelExecution
         yield* Fiber.join(supervisorInterruption)
       })
       return Reconciler.Reconciler.of({
