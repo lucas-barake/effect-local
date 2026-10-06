@@ -837,6 +837,7 @@ export const layerOnePass = (
       }
 
       const submitPending = Effect.gen(function*() {
+        let submitted = false
         while (true) {
           let installedExpiredSnapshot = false
           let after = 0
@@ -847,6 +848,7 @@ export const layerOnePass = (
             through = claim.through
             const envelopes = claim.envelopes
             if (envelopes.length === 0) break
+            submitted = true
             const mutationIds = envelopes.map((envelope) => envelope.mutationId)
             const receipts = yield* Effect.gen(function*() {
               const result = yield* remote.submitBatch({ envelopes, schema: options.definition.schemaIdentity })
@@ -873,7 +875,7 @@ export const layerOnePass = (
           }
           if (installedExpiredSnapshot) continue
           yield* local.settleReceipts
-          return
+          return submitted
         }
       })
 
@@ -884,8 +886,8 @@ export const layerOnePass = (
           syncing = true
           failedSinceSyncStarted = false
           yield* catchUp
-          yield* submitPending
-          yield* catchUp
+          const submitted = yield* submitPending
+          if (submitted) yield* catchUp
           syncing = false
           yield* succeeded
           yield* options.onReconciled ?? Effect.void

@@ -39,6 +39,7 @@ import * as Invalidation from "./internal/invalidation.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
 import * as MutationDescriptor from "./internal/mutationDescriptor.js"
 import * as Rows from "./internal/rows.js"
+import * as SharedCall from "./internal/sharedCall.js"
 import * as SqliteIdentifier from "./internal/sqliteIdentifier.js"
 import { credentialChange, isTransportFailure } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
@@ -158,6 +159,8 @@ interface Waiter {
 interface RememberedEntry {
   readonly spaceId: Identity.SpaceId
   readonly membershipIncarnation: Identity.MembershipIncarnation
+  readonly remote: SyncEngine.Service
+  readonly cancelServerCalls: Effect.Effect<void>
   handle: Replica.Space
   activation: Replica.Activation
   runtime: ActiveRuntime | undefined
@@ -266,6 +269,10 @@ const makeLayer = <D extends Definition.Any, R,>(
       const reactivity = yield* Reactivity.Reactivity
       const remote = yield* SyncEngine.SyncEngine
       const parentScope = yield* Effect.scope
+      const serverCallScope = yield* Effect.acquireRelease(
+        Scope.fork(parentScope),
+        (scope) => Scope.close(scope, Exit.void)
+      )
       const rootContext = Context.add(
         yield* Effect.context<BaseRequirements<D> | QueryReactivity.QueryReactivity | R>(),
         ConnectionLane.ConnectionLane,
@@ -600,7 +607,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             layerReconciliation
           ).pipe(
             Layer.buildWithScope(childScope),
-            Effect.provide(workflowContext),
+            Effect.provide(Context.add(workflowContext, SyncEngine.SyncEngine, entry.remote)),
             Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
           )
           local = Context.get(runtime, LocalStore.Store)
@@ -645,7 +652,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             }).pipe(Layer.provide(layerLocalStore))
           ).pipe(
             Layer.buildWithScope(childScope),
-            Effect.provide(rootContext),
+            Effect.provide(Context.add(rootContext, SyncEngine.SyncEngine, entry.remote)),
             Effect.tapError((error) => Scope.close(childScope, Exit.fail(error)))
           )
           local = Context.get(runtime, LocalStore.Store)
@@ -913,7 +920,10 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (entries.get(entry.spaceId) !== entry) {
             return yield* new ReplicaError.SpaceUnavailable({ spaceId: entry.spaceId })
           }
-          if (entry.activation === "Inactive") return false
+          if (entry.activation === "Inactive") {
+            if (explicit) yield* entry.cancelServerCalls
+            return false
+          }
           if (entry.activation === "Activating" || entry.activation === "Deactivating") {
             const pending = entry.transition
             if (pending !== undefined) yield* restore(Completion.wait(pending))
@@ -948,6 +958,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         yield* invalidateActivation(entry.spaceId)
         const shutdown = Scope.close(runtime.scope, Exit.void)
         const result = yield* runtime.operationGate.withPermits(operationPermits)(shutdown).pipe(Effect.exit)
+        if (explicit) yield* entry.cancelServerCalls
         entry.runtime = undefined
         entry.activation = "Inactive"
         entry.transition = undefined
@@ -1478,9 +1489,19 @@ const makeLayer = <D extends Definition.Any, R,>(
       const createEntry = Effect.fnUntraced(function*(row: typeof RememberedRow.Type) {
         yield* decodeScope(row.desired_scope_json)
         let handle: Replica.Space | undefined
+        const pulls = SharedCall.make(remote.pull, serverCallScope)
+        const submissions = SharedCall.make(remote.submitBatch, serverCallScope)
+        const bootstraps = SharedCall.make(remote.bootstrap, serverCallScope)
         const entry: RememberedEntry = {
           spaceId: row.space_id,
           membershipIncarnation: row.membership_incarnation,
+          remote: SyncEngine.SyncEngine.of({
+            ...remote,
+            pull: pulls.run,
+            submitBatch: submissions.run,
+            bootstrap: bootstraps.run
+          }),
+          cancelServerCalls: Effect.all([pulls.cancel, submissions.cancel, bootstraps.cancel], { discard: true }),
           get handle() {
             if (handle === undefined) handle = makeHandle(entry)
             return handle

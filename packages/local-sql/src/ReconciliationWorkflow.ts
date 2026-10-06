@@ -8,6 +8,7 @@ import * as Context from "effect/Context"
 import * as Deferred from "effect/Deferred"
 import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
+import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
@@ -133,8 +134,15 @@ export const Execution = Schema.Struct({
 })
 export type Execution = typeof Execution.Type
 
+export interface ActiveExecution {
+  readonly workflow: ReturnType<typeof make>
+  readonly payload: Payload
+  readonly executionId: string
+}
+
 export interface RegistrationService {
   readonly registered: true
+  readonly activeExecution: Ref.Ref<Option.Option<ActiveExecution>>
 }
 
 export class Registration extends Context.Service<Registration, RegistrationService>()(
@@ -402,7 +410,7 @@ const register = Effect.fnUntraced(function*(
       })
     ).pipe(Scope.provide(registrationScope))
   }
-  return Registration.of({ registered: true })
+  return Registration.of({ registered: true, activeExecution: yield* Ref.make(Option.none<ActiveExecution>()) })
 })
 
 const layerRegistrationWithConfiguration = (
@@ -500,16 +508,11 @@ const layerSchedulerWithConfiguration = (
       const local = yield* LocalStore.Store
       const reconciliation = yield* Reconciler.Reconciliation
       const workflowOwner = Option.getOrUndefined(yield* Effect.serviceOption(RegistrationScope))
-      yield* Registration
+      const registration = yield* Registration
+      const activeExecution = registration.activeExecution
       const remote = yield* SyncEngine.SyncEngine
       const engine = yield* WorkflowEngine.WorkflowEngine
       const wake = yield* Queue.sliding<void>(1)
-      const activeExecution = yield* Ref.make<
-        Option.Option<{
-          readonly workflow: ReturnType<typeof make>
-          readonly executionId: string
-        }>
-      >(Option.none())
       const notify = Queue.offer(wake, undefined).pipe(Effect.asVoid)
       const requestAndNotify = local.requestReconciliation.pipe(Effect.andThen(notify))
       let resyncRequested = false
@@ -565,6 +568,13 @@ const layerSchedulerWithConfiguration = (
         )
       }
 
+      const liveExecution = Effect.gen(function*() {
+        const adopted = yield* Ref.get(activeExecution)
+        if (Option.isNone(adopted)) return adopted
+        const finished = yield* engine.poll(adopted.value.workflow, adopted.value.executionId)
+        if (Option.isNone(finished)) return adopted
+        return Option.none<ActiveExecution>()
+      })
       let retryAttempt = 0
       let readmit = false
       const superviseTurn = Effect.gen(function*() {
@@ -579,23 +589,33 @@ const layerSchedulerWithConfiguration = (
           while (true) {
             yield* awaitAuthenticationChange
             observedGeneration = yield* reconciliation.generation
-            const generations = yield* local.reconciliationGenerations
-            if (generations.completed >= generations.requested) return
-            const state = yield* local.replicationState
-            const payload = Payload.make({
-              schemaIdentity: schemaIdentityKey(options.definition),
-              spaceId: options.spaceId,
-              clientId: options.clientId,
-              membershipIncarnation: local.membershipIncarnation,
-              scope: state.scope,
-              scopeGeneration: state.scopeGeneration,
-              generation: generations.requested
-            })
-            const workflow = make(payload)
-            const activeExecutionId = yield* workflow.executionId(payload)
-            yield* Ref.set(activeExecution, Option.some({ workflow, executionId: activeExecutionId }))
-            const clearExecution = Ref.set(activeExecution, Option.none())
-            yield* workflow.execute(payload).pipe(Effect.ensuring(clearExecution))
+            const live = yield* liveExecution
+            let running: ActiveExecution
+            if (Option.isSome(live)) {
+              running = live.value
+            } else {
+              const generations = yield* local.reconciliationGenerations
+              if (generations.completed >= generations.requested) return
+              const state = yield* local.replicationState
+              const payload = Payload.make({
+                schemaIdentity: schemaIdentityKey(options.definition),
+                spaceId: options.spaceId,
+                clientId: options.clientId,
+                membershipIncarnation: local.membershipIncarnation,
+                scope: state.scope,
+                scopeGeneration: state.scopeGeneration,
+                generation: generations.requested
+              })
+              const workflow = make(payload)
+              running = { workflow, payload, executionId: yield* workflow.executionId(payload) }
+              yield* Ref.set(activeExecution, Option.some(running))
+            }
+            yield* running.workflow.execute(running.payload).pipe(
+              Effect.onExit((exit) => {
+                if (Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)) return Effect.void
+                return Ref.set(activeExecution, Option.none())
+              })
+            )
             retryAttempt = 0
           }
         }).pipe(

@@ -16,6 +16,7 @@ import * as Exit from "effect/Exit"
 import * as Layer from "effect/Layer"
 import * as Logger from "effect/Logger"
 import * as Option from "effect/Option"
+import * as Predicate from "effect/Predicate"
 import * as Queue from "effect/Queue"
 import * as Reactivity from "effect/reactivity/Reactivity"
 import * as Scope from "effect/Scope"
@@ -213,9 +214,27 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
       }
     }
   })
+  const engine = Context.get(databaseContext, WorkflowEngine.WorkflowEngine)
+  const executions = new Map<string, Set<string>>()
+  const countingEngine = new Proxy(engine, {
+    get: (target, property, receiver) => {
+      if (property !== "execute") return Reflect.get(target, property, receiver)
+      return (...args: ReadonlyArray<unknown>): unknown => {
+        const [workflow, execution] = args
+        if (Predicate.hasProperty(workflow, "_tag") && Predicate.hasProperty(execution, "executionId")) {
+          const tag = String(workflow._tag)
+          const started = executions.get(tag) ?? new Set<string>()
+          started.add(String(execution.executionId))
+          executions.set(tag, started)
+        }
+        return Reflect.apply(target.execute, target, args)
+      }
+    }
+  })
   const lockingContext = databaseContext.pipe(
     Context.add(SqlClient.SqlClient, lockingSql),
-    Context.add(Reactivity.Reactivity, gatedReactivity)
+    Context.add(Reactivity.Reactivity, gatedReactivity),
+    Context.add(WorkflowEngine.WorkflowEngine, countingEngine)
   )
   const start = (remote: Remote) => {
     const layerServices = Layer.mergeAll(
@@ -268,6 +287,13 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     invalidationOutcome = { key, outcome }
   }
   const lockRemaining = () => locked?.remaining ?? 0
+  const workflowExecutions = (spaceId: Identity.SpaceId) => {
+    let started = 0
+    for (const [name, ids] of executions) {
+      if (name.includes(spaceId)) started += ids.size
+    }
+    return started
+  }
   return {
     sql,
     crypto,
@@ -279,7 +305,8 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     holdStatement,
     holdInvalidation,
     holdInvalidationWhen,
-    endInvalidationsWith
+    endInvalidationsWith,
+    workflowExecutions
   }
 })
 
