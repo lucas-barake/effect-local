@@ -127,7 +127,7 @@ describe("a foreground sync that ends before the server view covers what the ser
       yield* installView(services)
       const space = yield* replica.space(spaceId)
       yield* space.mutate(Domain.PutTodo, Domain.todo("pending")).pipe(VirtualTime.advanceUntil)
-      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("20 seconds"))
+      yield* VirtualTime.quiet("20 seconds")
       const retriedAt = Array.from(new Set(pulls.map((time) => time - pulls[0])))
 
       covered = true

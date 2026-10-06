@@ -57,7 +57,7 @@ const rows: ReadonlyArray<Row> = [
   }
 ]
 
-const tenSeconds = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("10 seconds"))
+const tenSeconds = VirtualTime.quiet("10 seconds")
 
 const loaded = Effect.fnUntraced(function*(row: Row) {
   const services = yield* BackgroundReplica.services({

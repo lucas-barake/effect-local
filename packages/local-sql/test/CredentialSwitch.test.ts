@@ -20,7 +20,13 @@ import * as ServerStore from "../src/ServerStore.js"
 import * as SqlReplica from "../src/SqlReplica.js"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
-import { awaitSpaceStatusWhere, constructors, describeExit, within } from "./fixtures/BackgroundReplica.js"
+import {
+  awaitSpaceStatusWhere,
+  constructors,
+  describeExit,
+  isOnlineDrained,
+  within
+} from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
 const first = Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000f501")
@@ -156,7 +162,6 @@ const client = Effect.fnUntraced(function*(
       VirtualTime.advanceUntil,
       Effect.timeoutOption("10 minutes")
     )
-  const drained = (status: ReplicaStatus.SpaceStatus) => status._tag === "Online" && status.pending === 0
   const read = (id: string) =>
     VirtualTime.advanceUntil(a.get(Domain.Todo, id)).pipe(
       Effect.map(Option.map((todo) => todo.title)),
@@ -173,26 +178,23 @@ const client = Effect.fnUntraced(function*(
     controls.principal = "Q"
     controls.generation += 1
   }
-  return { a, b, controls, until, drained, read, applied, signInAsSecond }
+  return { a, b, controls, until, read, applied, signInAsSecond }
 })
-
-const quiet = (duration: "1 millis" | "500 millis" | "1 minute" | "10 minutes") =>
-  VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption(duration))
 
 const world = Effect.fnUntraced(function*(constructor: typeof constructors[number]) {
   const server = Context.get(yield* Layer.build(layerServer), ServerStore.ServerStore)
   const own = yield* client(server, constructor, ownClient, false)
   const other = yield* client(server, "layer", otherClient, true)
   yield* VirtualTime.advanceUntil(own.a.activate)
-  assert.isTrue(Option.isSome(yield* own.until(own.a, own.drained)), "the client under test came online")
+  assert.isTrue(Option.isSome(yield* own.until(own.a, isOnlineDrained)), "the client under test came online")
   yield* VirtualTime.advanceUntil(other.a.activate)
-  assert.isTrue(Option.isSome(yield* other.until(other.a, other.drained)), "the other client came online")
+  assert.isTrue(Option.isSome(yield* other.until(other.a, isOnlineDrained)), "the other client came online")
   const otherWrites = Effect.fnUntraced(function*(ids: ReadonlyArray<string>) {
     for (const id of ids) {
       yield* other.a.mutate(Domain.PutTodo, Domain.todo(id, `other-${id}`)).pipe(VirtualTime.advanceUntil)
     }
     assert.isTrue(
-      Option.isSome(yield* other.until(other.a, other.drained)),
+      Option.isSome(yield* other.until(other.a, isOnlineDrained)),
       "the other client's writes reached the server"
     )
   })
@@ -220,12 +222,12 @@ describe("a server answer obtained for one principal after another signed in", (
 
       own.signInAsSecond()
       if (row.turn === "evicted") yield* evict
-      yield* quiet("1 millis")
+      yield* VirtualTime.quiet("1 millis")
       yield* Deferred.succeed(hold.release, undefined)
-      yield* quiet("500 millis")
+      yield* VirtualTime.quiet("500 millis")
       const appliedForSecond = applied()
       yield* Deferred.succeed(own.controls.denials, undefined)
-      yield* quiet("1 minute")
+      yield* VirtualTime.quiet("1 minute")
 
       assert.strictEqual(appliedForSecond, 0, "the first principal's row reached the local store")
       assert.strictEqual(yield* own.read("secret"), null)
@@ -244,7 +246,7 @@ describe("a server answer obtained for one principal after another signed in", (
 
       own.signInAsSecond()
       yield* Deferred.succeed(hold.release, undefined)
-      yield* quiet("500 millis")
+      yield* VirtualTime.quiet("500 millis")
       const receipt = yield* own.a.receipt(Domain.PutTodo, committed.envelope.mutationId).pipe(VirtualTime.advanceUntil)
 
       assert.isTrue(Option.isNone(receipt), "the receipt obtained for the first principal was not stored")
@@ -256,7 +258,7 @@ describe("a server answer obtained for one principal after another signed in", (
     Effect.fnUntraced(function*(constructor) {
       const { other, own } = yield* world(constructor)
       yield* other.b.mutate(Domain.PutTodo, Domain.todo("secret", "other-secret")).pipe(VirtualTime.advanceUntil)
-      yield* other.until(other.b, other.drained)
+      yield* other.until(other.b, isOnlineDrained)
       const hold = yield* makeHold()
       own.controls.bootstraps = hold
       own.controls.denials = yield* Deferred.make<void>()
@@ -266,7 +268,7 @@ describe("a server answer obtained for one principal after another signed in", (
 
       own.signInAsSecond()
       yield* Deferred.succeed(hold.release, undefined)
-      yield* quiet("500 millis")
+      yield* VirtualTime.quiet("500 millis")
       const status = yield* own.b.status
 
       assert.isAbove(own.controls.bootstrapped, before, "the space was bootstrapping")

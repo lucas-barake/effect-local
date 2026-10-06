@@ -14,7 +14,8 @@ import {
   emptyPage,
   eventually,
   idleRemote,
-  installView
+  installView,
+  isOnlineDrained
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
@@ -32,7 +33,7 @@ const oneSpace = (constructor: Constructor) =>
     maximumRetryDelay: "1 minute"
   })
 
-const fiveMinutes = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("5 minutes"))
+const fiveMinutes = VirtualTime.quiet("5 minutes")
 
 describe("a credential generation that changes while a server call is in flight", () => {
   it.effect.each(constructors)(
@@ -96,7 +97,7 @@ describe("a credential generation that changes while a server call is in flight"
       const callsWhileRotating = calls
 
       rotating = false
-      const drained = yield* eventually(services, space, (status) => status._tag === "Online" && status.pending === 0)
+      const drained = yield* eventually(services, space, isOnlineDrained)
 
       assert.isAtMost(callsWhileRotating, 50, "server calls in five minutes of a generation that never settles")
       assert.isTrue(Option.isSome(drained), "the space drained once the generation settled")

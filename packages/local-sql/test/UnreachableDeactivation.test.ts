@@ -6,7 +6,6 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
-import * as Scheduler from "effect/Scheduler"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
@@ -18,6 +17,7 @@ import {
   eventually,
   idleRemote,
   installView,
+  isOnlineDrained,
   makeAttempts,
   within
 } from "./fixtures/BackgroundReplica.js"
@@ -30,11 +30,6 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000f9
 const budgets = [2048, 200, 100, 64, 31] as const
 
 const rows = constructors.flatMap((constructor) => budgets.map((budget) => ({ constructor, budget })))
-
-const atBudget = <A, E extends { readonly _tag: string }, R,>(
-  effect: Effect.Effect<A, E, R>,
-  row: { readonly budget: number }
-) => VirtualTime.scoped(effect).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, row.budget))
 
 const unreachableServer = Effect.fnUntraced(function*(
   row: typeof rows[number],
@@ -77,7 +72,7 @@ describe("a foreground space whose server is unreachable", () => {
       yield* serverReturns
       const drained = yield* eventually(services, space, (status) => status.pending === 0)
       assert.isTrue(Option.isSome(drained), "the pending mutation was drained once the server returned")
-    }, atBudget)
+    }, VirtualTime.atBudget)
   )
 
   it.effect.each(rows)(
@@ -92,7 +87,7 @@ describe("a foreground space whose server is unreachable", () => {
       yield* serverReturns
       const drained = yield* eventually(services, space, (status) => status.pending === 0)
       assert.isTrue(Option.isSome(drained), "the evicted space was drained once the server returned")
-    }, atBudget)
+    }, VirtualTime.atBudget)
   )
 })
 
@@ -127,7 +122,7 @@ describe("a deactivation that lands on a workflow attempt whose server call fail
       yield* attempts.reached(1)
 
       const deactivated = yield* within(space.deactivate)
-      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("20 seconds"))
+      yield* VirtualTime.quiet("20 seconds")
 
       assert.strictEqual(describeExit(deactivated), "succeeded")
       assert.deepStrictEqual(
@@ -135,7 +130,7 @@ describe("a deactivation that lands on a workflow attempt whose server call fail
         [0, 1000, 3000, 7000, 15000],
         `pulls at a budget of ${budget}`
       )
-    }, (effect, budget) => atBudget(effect, { budget }))
+    }, (effect, budget) => VirtualTime.atBudget(effect, { budget }))
   )
 })
 
@@ -175,10 +170,10 @@ describe("a background server call that fails after the foreground took its spac
       yield* VirtualTime.advanceUntil(admission.entered)
 
       yield* Deferred.succeed(answered, undefined)
-      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 millis"))
+      yield* VirtualTime.quiet("1 millis")
       yield* admission.release
       yield* VirtualTime.advanceUntil(Fiber.join(activation))
-      const online = yield* eventually(services, space, (status) => status._tag === "Online" && status.pending === 0)
+      const online = yield* eventually(services, space, isOnlineDrained)
 
       assert.isTrue(Option.isSome(online), "the foreground sync ran against the server and drained the space")
     }, VirtualTime.scoped)

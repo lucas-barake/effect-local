@@ -452,7 +452,7 @@ export const makeCapacityProbe = Effect.fnUntraced(function*(spaceIds: ReadonlyA
       const current = yield* replica.space(home)
       yield* current.mutate(Domain.PutTodo, Domain.todo("probe")).pipe(VirtualTime.advanceUntil)
       const foregroundSynced = yield* eventually(background, current, isOnlineDrained)
-      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+      yield* VirtualTime.quiet("1 minute")
       const backgroundCallsAtOnce = inFlight
       yield* Deferred.succeed(release, undefined)
       let drained = 0

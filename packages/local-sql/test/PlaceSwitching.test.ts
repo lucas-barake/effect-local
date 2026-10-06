@@ -23,7 +23,7 @@ const first = Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000c001")
 const second = Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000c002")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000c001")
 
-const quiet = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("10 minutes"))
+const quiet = VirtualTime.quiet("10 minutes")
 
 const visitCounts = [20, 80, 320] as const
 

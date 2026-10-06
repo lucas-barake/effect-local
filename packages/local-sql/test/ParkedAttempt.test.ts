@@ -4,7 +4,6 @@ import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Option from "effect/Option"
-import * as Scheduler from "effect/Scheduler"
 import * as Scope from "effect/Scope"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
@@ -25,7 +24,7 @@ const parked = Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000fa01")
 const other = Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000fa02")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000fa01")
 
-const quiet = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+const quiet = VirtualTime.quiet("1 minute")
 
 const parkedAttempt = Effect.fnUntraced(function*() {
   const services = yield* BackgroundReplica.services({
@@ -204,11 +203,6 @@ describe("a leave while the workflow engine cannot be polled", () => {
 
 const budgets = [2048, 200, 97, 64, 63, 48, 31, 17].map((budget) => ({ budget }))
 
-const atBudget = <A, E extends { readonly _tag: string }, R,>(
-  effect: Effect.Effect<A, E, R>,
-  row: { readonly budget: number }
-) => VirtualTime.scoped(effect).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, row.budget))
-
 describe("a workflow whose sync drained its space in the background", () => {
   it.effect.each(budgets)(
     "records its completion and ends without another activation at a budget of $budget",
@@ -245,7 +239,7 @@ describe("a workflow whose sync drained its space in the background", () => {
 
       yield* Deferred.succeed(answered, undefined)
       const drained = yield* eventually(services, evicted, (status) => status.pending === 0)
-      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("10 minutes"))
+      yield* VirtualTime.quiet("10 minutes")
       const generations = yield* services.sql<{ readonly completed: number }>`
         SELECT completed_generation AS completed FROM effect_local_client_spaces WHERE space_id = ${parked}`
 
@@ -253,6 +247,6 @@ describe("a workflow whose sync drained its space in the background", () => {
       assert.strictEqual(yield* evicted.activation, "Inactive", "the space was not activated again")
       assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 0, "no execution is left running")
       assert.isAbove(generations[0].completed, 0, "the generation the workflow synced is recorded as completed")
-    }, atBudget)
+    }, VirtualTime.atBudget)
   )
 })

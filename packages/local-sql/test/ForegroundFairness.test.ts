@@ -63,7 +63,7 @@ const oneForegroundPlace = Effect.fnUntraced(function*(
   return { services, spaces, runaway: Deferred.await(runaway), activations: () => activations }
 })
 
-const settle = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+const settle = VirtualTime.quiet("1 minute")
 
 const outcome = <A, E extends { readonly _tag: string },>(fiber: Fiber.Fiber<A, E>) => {
   const exit = fiber.pollUnsafe()
@@ -71,11 +71,6 @@ const outcome = <A, E extends { readonly _tag: string },>(fiber: Fiber.Fiber<A, 
   if (Exit.isSuccess(exit)) return "succeeded"
   return "failed"
 }
-
-const atBudget = <A, E extends { readonly _tag: string }, R,>(
-  effect: Effect.Effect<A, E, R>,
-  row: { readonly budget: number }
-) => VirtualTime.scoped(effect).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, row.budget))
 
 describe("operations that compete for one foreground place", () => {
   it.effect.each(rows)(
@@ -115,7 +110,7 @@ describe("operations that compete for one foreground place", () => {
         `every competing operation finished within ${used} activation changes`
       )
       assert.isBelow(used, activationLimit, "the spaces did not keep taking the foreground place from each other")
-    }, atBudget)
+    }, VirtualTime.atBudget)
   )
 
   it.effect.each(rows)(
@@ -140,7 +135,7 @@ describe("operations that compete for one foreground place", () => {
         `every contender finished within ${activations()} activation changes`
       )
       assert.isBelow(activations(), activationLimit, "each operation took the place at most once")
-    }, atBudget)
+    }, VirtualTime.atBudget)
   )
 
   it.effect.each(constructors)(

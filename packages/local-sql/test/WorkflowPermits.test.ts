@@ -14,6 +14,7 @@ import {
   eventually,
   idleRemote,
   installView,
+  isOnlineDrained,
   makeCapacityProbe,
   within
 } from "./fixtures/BackgroundReplica.js"
@@ -35,7 +36,7 @@ const settings = (constructor: BackgroundReplica.Constructor) => ({
   maximumRetryDelay: "1 minute"
 } as const)
 
-const quiet = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+const quiet = VirtualTime.quiet("1 minute")
 
 describe("a sync that is in flight when its space loses the only foreground place", () => {
   it.effect.each(constructors)(
@@ -66,7 +67,7 @@ describe("a sync that is in flight when its space loses the only foreground plac
       yield* VirtualTime.advanceUntil(Deferred.await(calling))
 
       const written = yield* b.mutate(Domain.PutTodo, Domain.todo("after")).pipe(within)
-      const synced = yield* eventually(services, b, (status) => status._tag === "Online" && status.pending === 0)
+      const synced = yield* eventually(services, b, isOnlineDrained)
       const pendingWhileHeld = (yield* a.status).pending
       yield* Deferred.succeed(answered, undefined)
       const drained = yield* eventually(services, a, (status) => status.pending === 0)

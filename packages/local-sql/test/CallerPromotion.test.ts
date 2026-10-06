@@ -38,7 +38,7 @@ const probes = [
   Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000f713")
 ]
 
-const quiet = VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 minute"))
+const quiet = VirtualTime.quiet("1 minute")
 
 const callerKey = (spaceId: Identity.SpaceId) => ReactivityKey.entity(spaceId, Domain.Todo.name, "caller")
 
@@ -225,7 +225,7 @@ describe("a caller operation on a space whose background turn is in flight", () 
         Effect.exit,
         Effect.forkChild({ startImmediately: true })
       )
-      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 second"))
+      yield* VirtualTime.quiet("1 second")
       const waitedForTheBuild = reading.pollUnsafe() === undefined
 
       yield* building.release
