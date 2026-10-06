@@ -13,6 +13,7 @@ import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
   acceptSubmission,
+  captureErrors,
   describeExit,
   emptyPage,
   eventually,
@@ -229,6 +230,29 @@ const workflowSpace = Effect.fnUntraced(function*() {
   yield* VirtualTime.advanceUntil(Deferred.await(calling))
   yield* VirtualTime.quiet("1 second")
   return { services, replica, space }
+})
+
+describe("a leave that fails after it cancelled the waiting attempt", () => {
+  it.effect(
+    "leaves a space that reconciles again with an execution of its own",
+    Effect.fnUntraced(function*() {
+      const { answer, replica, services } = yield* parkedAttempt()
+      const logs = captureErrors()
+      const space = yield* replica.space(parked)
+
+      services.lockNext("DELETE FROM effect_local_client_spaces")
+      const failed = yield* within(replica.leave(parked))
+      yield* answer
+      yield* space.activate.pipe(Effect.provide(logs.layerLogs), VirtualTime.advanceUntil)
+      const online = yield* eventually(services, space, isOnlineDrained)
+      yield* quiet
+
+      assert.strictEqual(describeExit(failed), "failed")
+      assert.isTrue(Option.isSome(online), "the space came online again")
+      assert.deepStrictEqual(logs.messages(), [])
+      assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 0)
+    }, VirtualTime.scoped)
+  )
 })
 
 describe("a leave while the workflow engine can interrupt but cannot be polled", () => {
