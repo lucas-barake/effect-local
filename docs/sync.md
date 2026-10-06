@@ -151,6 +151,12 @@ makes every answer look stale. The first change during a pass restarts the pass 
 restart fails the pass with `UnexpectedFailure`, which is retried with the normal backoff, so a generation that never
 settles costs two server calls per retry delay and the space reports `Failed` until it does.
 
+The same comparison guards the discard of a quarantined mutation. Its answer is dropped when the generation changed
+while the call was in flight, and the call is sent once more. A watch keeps the credential it was opened with, so the
+replica closes it when `awaitChange` completes and `acquire` reports a generation other than the one the watch was
+opened under. It then waits the closed watch delay, requests a sync and opens the watch again. A completion of
+`awaitChange` that leaves the generation as it was does not close the watch.
+
 Authentication and authorization failures remain distinct:
 
 | Failure                    | Meaning                                                         | Reconciliation status and policy                 |
