@@ -820,6 +820,22 @@ const makeLayer = <D extends Definition.Any, R,>(
           Effect.flatMap((now) => settleBackgroundTurnAt(now, entry, generation, failure, transportGeneration))
         )
 
+      const retryStalledTurnAt = (now: number, entry: RememberedEntry) =>
+        Effect.suspend(() => {
+          if (entries.get(entry.spaceId) !== entry || entry.leaving || hasForegroundRuntime(entry)) return Effect.void
+          entry.retryAttempt += 1
+          entry.backgroundGeneration += 1
+          return Queue.offer(retryQueue, {
+            entry,
+            version: entry.backgroundGeneration,
+            readyAt: now + Configuration.retryMillis(retryTiming, entry.retryAttempt),
+            transportGeneration: Option.none()
+          }).pipe(Effect.asVoid)
+        })
+
+      const retryStalledTurn = (entry: RememberedEntry) =>
+        Effect.flatMap(Clock.currentTimeMillis, (now) => retryStalledTurnAt(now, entry))
+
       const releaseTransportRetries = Effect.gen(function*() {
         const current = yield* remote.transportGeneration
         const now = yield* Clock.currentTimeMillis
@@ -1840,6 +1856,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         if (Result.isFailure(result) && !leaveRejections.has(result.failure)) {
           yield* settleBackgroundTurn(entry, generation, result.failure, Option.some(transportGeneration))
         }
+        if (stalled) yield* retryStalledTurn(entry)
       })
 
       const settleDiedTurn = Effect.fnUntraced(function*(
