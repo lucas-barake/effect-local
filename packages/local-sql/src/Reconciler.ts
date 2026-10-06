@@ -24,13 +24,7 @@ import * as Completion from "./internal/completion.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
-import {
-  answeredUnderCredential,
-  backoff,
-  credentialChange,
-  credentialReplaced,
-  superviseWatch
-} from "./internal/transport.js"
+import { answeredUnderCredential, backoff, credentialChange, superviseWatch } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as SyncEngine from "./SyncEngine.js"
 
@@ -555,10 +549,8 @@ export const makeManager = Effect.fnUntraced(function*(options: {
             return Deferred.await(authenticationGate).pipe(Effect.andThen(watch()))
           }
           const watchEpoch = state.authenticationEpoch
-          const subscribed = watchBackoff.opened.pipe(
-            Effect.andThen(Effect.all([remote.transportGeneration, remote.credentialGeneration]))
-          )
-          return subscribed.pipe(Effect.flatMap(([transportGeneration, credentialGeneration]) =>
+          const subscribed = Effect.andThen(watchBackoff.opened, remote.transportGeneration)
+          return subscribed.pipe(Effect.flatMap((transportGeneration) =>
             Stream.unwrap(Effect.map(space.local.replicationState, (replication) =>
               remote.watch({
                 spaceId: space.spaceId,
@@ -569,14 +561,8 @@ export const makeManager = Effect.fnUntraced(function*(options: {
                 cursor: replication.cursor
               }))).pipe(
                 Stream.runForEach(() => enqueue(state)),
-                Effect.as(false),
-                Effect.raceFirst(credentialReplaced(remote, credentialGeneration, state.maximumRetryDelayMillis)),
                 Effect.matchEffect({
-                  onSuccess: (replaced) => {
-                    const closed = watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep))
-                    if (!replaced) return Effect.andThen(closed, watch())
-                    return closed.pipe(Effect.andThen(readmit(state)), Effect.andThen(watch()))
-                  },
+                  onSuccess: () => watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep), Effect.andThen(watch())),
                   onFailure: Effect.fnUntraced(function*(error) {
                     if (watchEpoch !== state.authenticationEpoch) return yield* watch()
                     const activeAuthenticationGate = state.authenticationGate
@@ -1174,8 +1160,8 @@ export const layerInMemoryScheduler = (
           const watchEpoch = authenticationEpoch
           return awaitAuthenticationChange.pipe(
             Effect.andThen(watchBackoff.opened),
-            Effect.andThen(Effect.all([remote.transportGeneration, remote.credentialGeneration])),
-            Effect.flatMap(([transportGeneration, credentialGeneration]) =>
+            Effect.andThen(remote.transportGeneration),
+            Effect.flatMap((transportGeneration) =>
               Stream.unwrap(local.replicationState.pipe(
                 Effect.map((state) =>
                   remote.watch({
@@ -1189,10 +1175,6 @@ export const layerInMemoryScheduler = (
                 )
               )).pipe(
                 Stream.runForEach(() => requestAndNotify),
-                Effect.as(false),
-                Effect.raceFirst(
-                  credentialReplaced(remote, credentialGeneration, retryTiming.maximumRetryDelayMillis)
-                ),
                 Effect.matchEffect({
                   onFailure: Effect.fnUntraced(function*(error) {
                     if (watchEpoch !== authenticationEpoch) return yield* watch()
@@ -1225,11 +1207,7 @@ export const layerInMemoryScheduler = (
                       Effect.andThen(watch())
                     )
                   }),
-                  onSuccess: (replaced) => {
-                    const closed = watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep))
-                    if (!replaced) return Effect.andThen(closed, watch())
-                    return closed.pipe(Effect.andThen(resyncAfterWatchFailure), Effect.andThen(watch()))
-                  }
+                  onSuccess: () => watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep), Effect.andThen(watch()))
                 })
               )
             )

@@ -104,6 +104,10 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
               )
           })
         )
+      const credentialReplaced = Effect.flatMap(
+        credentialProvider.acquire,
+        (opened) => credentialProvider.awaitChange(opened.generation)
+      )
       return SyncEngine.SyncEngine.of({
         waitForCredentialChange: (rejectedGeneration) =>
           credentialProvider.awaitChange(rejectedGeneration).pipe(Effect.asVoid),
@@ -422,6 +426,7 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
                 })
               )
           ).pipe(
+            Stream.interruptWhen(credentialReplaced),
             Stream.catchCause((cause) => {
               if (!hasRemoteDefect(cause)) return Stream.failCause(cause)
               return Stream.fail(

@@ -28,7 +28,7 @@ import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
-import { credentialChange, credentialReplaced, superviseWatch } from "./internal/transport.js"
+import { credentialChange, superviseWatch } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Reconciler from "./Reconciler.js"
 import * as SyncEngine from "./SyncEngine.js"
@@ -724,8 +724,6 @@ const layerSchedulerWithConfiguration = (
           yield* awaitAuthenticationChange
           yield* watchBackoff.opened
           const watchEpoch = authenticationEpoch
-          const credentialGeneration = yield* remote.credentialGeneration
-          const replaced = credentialReplaced(remote, credentialGeneration, configuration.maximumRetryDelayMillis)
           const result = yield* Stream.unwrap(Effect.map(local.replicationState, (state) =>
             remote.watch({
               spaceId: options.spaceId,
@@ -736,7 +734,6 @@ const layerSchedulerWithConfiguration = (
               cursor: state.cursor
             }))).pipe(
               Stream.runForEach(() => requestAndNotify),
-              Effect.raceFirst(replaced),
               Effect.andThen(requestAndNotify),
               Effect.result
             )

@@ -681,6 +681,35 @@ describe("WebSocket synchronization", () => {
   )
 
   it.effect(
+    "opens the watch again under a credential the application replaced while the space was idle",
+    Effect.fnUntraced(function*() {
+      const harness = yield* makeLifecycleHarness()
+      const replicaContext = yield* Layer.build(harness.replicaLayer("4 seconds"))
+      const replica = Context.get(replicaContext, Replica.Replica)
+      const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
+      const space = yield* replica.space(spaceId)
+      yield* space.activate
+      yield* Effect.all([
+        awaitStatus(reactivity, space, "Online"),
+        Deferred.await(harness.watchStarted)
+      ], { discard: true, concurrency: "unbounded" })
+      yield* TestClock.adjust("1 minute")
+      yield* Queue.takeAll(harness.attempts)
+
+      yield* SubscriptionRef.set(harness.credentials, {
+        generation: 1,
+        bearer: Redacted.make("refreshed")
+      })
+      yield* TestClock.adjust("1 minute")
+      const afterReplacement = yield* Queue.takeAll(harness.attempts)
+
+      assert.include(afterReplacement.map((attempt) => attempt.rpc), "Watch")
+      assert.strictEqual((yield* space.status)._tag, "Online")
+      assert.strictEqual(MutableRef.get(harness.webSocketConstructions), 1)
+    })
+  )
+
+  it.effect(
     "backs off an unavailable authenticator and recovers",
     Effect.fnUntraced(function*() {
       const harness = yield* makeLifecycleHarness()

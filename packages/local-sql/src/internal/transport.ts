@@ -39,19 +39,6 @@ export const credentialChange = (
   return wait
 }
 
-export const credentialReplaced = (
-  remote: SyncEngine.Service,
-  openedGeneration: number,
-  retryDelayMillis: number
-): Effect.Effect<true> =>
-  credentialChange(remote, openedGeneration, retryDelayMillis).pipe(
-    Effect.andThen(remote.credentialGeneration),
-    Effect.flatMap((current) => {
-      if (current === openedGeneration) return Effect.never
-      return Effect.succeed(true)
-    })
-  )
-
 export const answeredUnderCredential = <A,>(
   remote: SyncEngine.Service,
   generation: number,

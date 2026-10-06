@@ -152,10 +152,10 @@ restart fails the pass with `UnexpectedFailure`, which is retried with the norma
 settles costs two server calls per retry delay and the space reports `Failed` until it does.
 
 The same comparison guards the discard of a quarantined mutation. Its answer is dropped when the generation changed
-while the call was in flight, and the call is sent once more. A watch keeps the credential it was opened with, so the
-replica closes it when `awaitChange` completes and `acquire` reports a generation other than the one the watch was
-opened under. It then waits the closed watch delay, requests a sync and opens the watch again. A completion of
-`awaitChange` that leaves the generation as it was does not close the watch.
+while the call was in flight, and the call is sent once more. A watch keeps the credential it was opened with, so
+`SyncClient` ends the watch stream when `awaitChange` completes for the generation that `acquire` returned when the
+watch started. The replica handles that like any watch the server closed: it waits the closed watch delay and opens the
+watch again under the new credential.
 
 Authentication and authorization failures remain distinct:
 
