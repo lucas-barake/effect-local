@@ -17,6 +17,7 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Reactivity from "effect/reactivity/Reactivity"
+import * as Scheduler from "effect/Scheduler"
 import * as SqlClient from "effect/sql/SqlClient"
 import * as SqlError from "effect/sql/SqlError"
 import * as Stream from "effect/Stream"
@@ -695,6 +696,23 @@ describe("in-memory scheduler failure reports", () => {
 
       assert.strictEqual((yield* reconciler.status)._tag, "Offline")
     }, VirtualTime.provide)
+  )
+
+  it.effect.each([22, 40, 42, 54, 55, 59, 60])(
+    "keeps a rejected watch credential reported during a successful sync at a budget of %s",
+    Effect.fnUntraced(function*(budget: number) {
+      const controls = yield* harness()
+      const { reconciler } = yield* inMemory(controls)
+      yield* controls.pauseWhen(failOnce((statement) => statement.includes(countStatement)))
+      yield* controls.failWatch(new ReplicaError.CredentialRejected({}))
+      const reporting = yield* Queue.take(controls.paused)
+      const syncing = yield* reconciler.sync.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.succeed(reporting.release, undefined)
+
+      yield* Fiber.join(syncing)
+      const status = yield* reconciler.status
+      assert.strictEqual(status._tag, "NeedsAuthentication", `the report survived at a budget of ${budget}`)
+    }, (effect, budget) => VirtualTime.provide(effect).pipe(Effect.provideService(Scheduler.MaxOpsBeforeYield, budget)))
   )
 
   it.effect(

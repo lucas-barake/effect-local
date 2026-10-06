@@ -616,11 +616,6 @@ export const layerOnePass = (
       let failedSinceSyncStarted = false
       let syncGeneration = 0
       const updateAvailable = yield* Ref.make<Identity.SchemaIdentity | undefined>(undefined)
-      const setStatus = (value: ReplicaStatus.ReplicaStatus) =>
-        Ref.set(status, value).pipe(
-          Effect.andThen(options.onStatusChange?.(value, true) ?? Effect.void),
-          Effect.andThen(local.invalidateStatus)
-        )
       const reportFailure = (
         error: ReplicaError.ReplicaError,
         preserveConnecting: boolean,
@@ -677,23 +672,31 @@ export const layerOnePass = (
         if (!syncAttempted || failedSinceSyncStarted) return
         const { cursor, pending } = yield* local.progress
         const serverSchema = yield* Ref.get(updateAvailable)
-        const current = yield* Ref.get(status)
-        if (serverSchema !== undefined) {
-          if (
-            current._tag === "SchemaUpdateAvailable" && current.pending === pending && current.cursor === cursor &&
-            current.serverSchema.version === serverSchema.version && current.serverSchema.hash === serverSchema.hash
-          ) {
-            yield* options.onStatusChange?.(current, true) ?? Effect.void
-            return
+        const published = yield* Ref.modify(
+          status,
+          (current): readonly [
+            { readonly status: ReplicaStatus.ReplicaStatus; readonly changed: boolean } | undefined,
+            ReplicaStatus.ReplicaStatus
+          ] => {
+            if (failedSinceSyncStarted) return [undefined, current]
+            if (serverSchema !== undefined) {
+              if (
+                current._tag === "SchemaUpdateAvailable" && current.pending === pending && current.cursor === cursor &&
+                current.serverSchema.version === serverSchema.version && current.serverSchema.hash === serverSchema.hash
+              ) return [{ status: current, changed: false }, current]
+              const next: ReplicaStatus.ReplicaStatus = { _tag: "SchemaUpdateAvailable", pending, cursor, serverSchema }
+              return [{ status: next, changed: true }, next]
+            }
+            if (current._tag === "Online" && current.pending === pending && current.cursor === cursor) {
+              return [{ status: current, changed: false }, current]
+            }
+            const next: ReplicaStatus.ReplicaStatus = { _tag: "Online", pending, cursor }
+            return [{ status: next, changed: true }, next]
           }
-          yield* setStatus({ _tag: "SchemaUpdateAvailable", pending, cursor, serverSchema })
-        } else {
-          if (current._tag === "Online" && current.pending === pending && current.cursor === cursor) {
-            yield* options.onStatusChange?.(current, true) ?? Effect.void
-            return
-          }
-          yield* setStatus({ _tag: "Online", pending, cursor })
-        }
+        )
+        if (published === undefined) return
+        yield* options.onStatusChange?.(published.status, true) ?? Effect.void
+        if (published.changed) yield* local.invalidateStatus
       })
       const observeServerSchema = (serverSchema: Identity.SchemaIdentity) => {
         if (
