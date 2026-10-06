@@ -249,6 +249,57 @@ describe("local commit", () => {
   )
 
   it.effect(
+    "lets the caller of a status notification be interrupted while a subscriber is still running",
+    Effect.fnUntraced(function*() {
+      const probe = yield* makeInvalidationProbe(ReactivityKey.status(spaceId))
+      const { local } = yield* localStore(Layer.succeed(Reactivity.Reactivity, probe.service))
+      const notifying = yield* local.invalidateStatus.pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.await(probe.entered)
+
+      const interrupting = yield* Fiber.interrupt(notifying).pipe(Effect.forkChild({ startImmediately: true }))
+      for (let step = 0; step < 20; step++) yield* Effect.yieldNow
+
+      assert.isTrue(interrupting.pollUnsafe() !== undefined, "the interruption completed while the subscriber ran")
+    }, Effect.scoped)
+  )
+
+  it.effect(
+    "delivers the keys an interrupted sync step did not reach",
+    Effect.fnUntraced(function*() {
+      const base = Context.get(yield* Layer.build(Reactivity.layer), Reactivity.Reactivity)
+      const entered = yield* Deferred.make<void>()
+      let holding = false
+      let status = 0
+      base.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+        status += 1
+      })
+      const service = Reactivity.Reactivity.of({
+        ...base,
+        invalidate: (keys) => {
+          if (!holding || !Array.isArray(keys) || !keys.includes(ReactivityKey.pending(spaceId))) {
+            return base.invalidate(keys)
+          }
+          holding = false
+          return Effect.andThen(Deferred.succeed(entered, undefined), Effect.never)
+        }
+      })
+      const { local } = yield* localStore(Layer.succeed(Reactivity.Reactivity, service))
+      yield* local.mutate(Domain.PutTodo, Domain.todo("first"))
+      const statusWhenCommitted = status
+      holding = true
+      const claiming = yield* local.claimSubmitBatch({ after: 0, through: undefined }).pipe(
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* Deferred.await(entered)
+
+      yield* Fiber.interrupt(claiming)
+      for (let step = 0; step < 20; step++) yield* Effect.yieldNow
+
+      assert.strictEqual(status, statusWhenCommitted + 1, "the space status the step did not reach was delivered")
+    }, Effect.scoped)
+  )
+
+  it.effect(
     "runs a sync step only after the local mutations admitted before it have committed",
     Effect.fnUntraced(function*() {
       const probe = yield* makeRecordingProbe(ReactivityKey.entity(spaceId, Domain.Todo.name, "first"))
