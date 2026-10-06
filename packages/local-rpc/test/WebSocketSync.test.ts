@@ -455,7 +455,10 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const attempts = yield* Queue.unbounded<{
     readonly mode: AuthenticatorMode
     readonly rpc: string
+    readonly authorization: string | undefined
   }>()
+  const rotateAfterAcquisition = MutableRef.make<number | undefined>(undefined)
+  let acquisitionsSinceArmed = 0
   const applications = yield* Queue.unbounded<string>()
   const watchStarted = yield* Deferred.make<void>()
   const pullEntered = yield* Deferred.make<void>()
@@ -466,8 +469,15 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   const lifecycleWebSocketConstructions = MutableRef.make(0)
 
   const credentialProvider = Authentication.makeCredentialProvider(credentials)
+  const rotateWhenDue = Effect.suspend(() => {
+    const due = MutableRef.get(rotateAfterAcquisition)
+    if (due === undefined) return Effect.void
+    acquisitionsSinceArmed += 1
+    if (acquisitionsSinceArmed !== due) return Effect.void
+    return SubscriptionRef.set(credentials, { generation: 1, bearer: Redacted.make("refreshed") })
+  })
   const provider = Authentication.CredentialProvider.of({
-    acquire: credentialProvider.acquire,
+    acquire: Effect.tap(credentialProvider.acquire, () => rotateWhenDue),
     awaitChange: (generation) =>
       Deferred.succeed(refreshWaitStarted, generation).pipe(
         Effect.andThen(credentialProvider.awaitChange(generation))
@@ -495,7 +505,8 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     return Authentication.Authentication.of((effect, request) =>
       Queue.offer(attempts, {
         mode: MutableRef.get(mode),
-        rpc: request.rpc._tag
+        rpc: request.rpc._tag,
+        authorization: request.headers.authorization
       }).pipe(
         Effect.andThen(Effect.suspend(() => {
           if (request.rpc._tag === "Watch") return Deferred.succeed(watchStarted, undefined)
@@ -607,6 +618,7 @@ const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
     pullRelease,
     replicaLayer,
     refreshWaitStarted,
+    rotateAfterAcquisition,
     watchStarted
   }
 })
@@ -693,20 +705,54 @@ describe("WebSocket synchronization", () => {
         awaitStatus(reactivity, space, "Online"),
         Deferred.await(harness.watchStarted)
       ], { discard: true, concurrency: "unbounded" })
-      yield* TestClock.adjust("1 minute")
+      yield* TestClock.adjust("2 seconds")
       yield* Queue.takeAll(harness.attempts)
 
       yield* SubscriptionRef.set(harness.credentials, {
         generation: 1,
         bearer: Redacted.make("refreshed")
       })
-      yield* TestClock.adjust("1 minute")
+      yield* TestClock.adjust("2 seconds")
       const afterReplacement = yield* Queue.takeAll(harness.attempts)
 
       assert.include(afterReplacement.map((attempt) => attempt.rpc), "Watch")
       assert.strictEqual((yield* space.status)._tag, "Online")
       assert.strictEqual(MutableRef.get(harness.webSocketConstructions), 1)
     })
+  )
+
+  it.effect.each([1, 2])(
+    "does not leave a watch open under a credential replaced after acquisition %s of the watch",
+    Effect.fnUntraced(
+      function*(acquisition) {
+        const harness = yield* makeLifecycleHarness()
+        const context = yield* Layer.build(harness.layerLive)
+        const remote = Context.get(context, SyncEngine.SyncEngine)
+        const watch = remote.watch({
+          spaceId,
+          clientId,
+          schema: definition.schemaIdentity,
+          scope,
+          scopeGeneration,
+          cursor: null
+        })
+        yield* watch.pipe(Stream.take(1), Stream.runDrain)
+        yield* Queue.takeAll(harness.attempts)
+        MutableRef.set(harness.rotateAfterAcquisition, acquisition)
+
+        const ended = yield* watch.pipe(Stream.runDrain, Effect.timeoutOption("2 seconds"))
+        const watches = (yield* Queue.takeAll(harness.attempts)).filter((attempt) => attempt.rpc === "Watch")
+        const openUnderTheNewCredential = watches.length > 0 &&
+          watches[watches.length - 1].authorization === "Bearer refreshed"
+
+        assert.isTrue(
+          Option.isSome(ended) || openUnderTheNewCredential,
+          "the watch either ended to be opened again or authenticated with the new credential"
+        )
+      },
+      TestClock.withLive,
+      provideNodeCrypto
+    )
   )
 
   it.effect(

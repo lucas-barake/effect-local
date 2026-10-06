@@ -104,10 +104,6 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
               )
           })
         )
-      const credentialReplaced = Effect.flatMap(
-        credentialProvider.acquire,
-        (opened) => credentialProvider.awaitChange(opened.generation)
-      )
       return SyncEngine.SyncEngine.of({
         waitForCredentialChange: (rejectedGeneration) =>
           credentialProvider.awaitChange(rejectedGeneration).pipe(Effect.asVoid),
@@ -354,92 +350,93 @@ export const layerFromSession = (options?: Pick<Options, "rpcTimeout">): Layer.L
               })
             ),
         watch: (request) =>
-          ProtocolSessionRetry.runStream(
-            session,
-            (version) =>
-              Stream.unwrap(
-                Effect.gen(function*() {
-                  // Acquire eagerly so the first event cannot race the subscription.
-                  const acquisition = yield* client.Watch(
-                    { ...request, protocolVersion: version },
-                    { asQueue: true }
-                  ).pipe(Effect.forkScoped({ startImmediately: true }))
-                  const queue = yield* Fiber.join(acquisition).pipe(
-                    Effect.timeoutOrElse({
-                      duration: rpcTimeoutMillis,
-                      orElse: () =>
-                        Effect.fail(
-                          new ReplicaError.OperationTimeout({
-                            operation: "Watch",
-                            timeoutMillis: rpcTimeoutMillis
+          Stream.unwrap(Effect.map(credentialProvider.acquire, (opened) =>
+            ProtocolSessionRetry.runStream(
+              session,
+              (version) =>
+                Stream.unwrap(
+                  Effect.gen(function*() {
+                    // Acquire eagerly so the first event cannot race the subscription.
+                    const acquisition = yield* client.Watch(
+                      { ...request, protocolVersion: version },
+                      { asQueue: true }
+                    ).pipe(Effect.forkScoped({ startImmediately: true }))
+                    const queue = yield* Fiber.join(acquisition).pipe(
+                      Effect.timeoutOrElse({
+                        duration: rpcTimeoutMillis,
+                        orElse: () =>
+                          Effect.fail(
+                            new ReplicaError.OperationTimeout({
+                              operation: "Watch",
+                              timeoutMillis: rpcTimeoutMillis
+                            })
+                          )
+                      }),
+                      Effect.ensuring(Fiber.interrupt(acquisition))
+                    )
+                    return LosslessQueue.stream(queue).pipe(
+                      Stream.catchReasons(
+                        "RpcClientError",
+                        {
+                          WorkerSpawnError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                          WorkerSendError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                          WorkerReceiveError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                          WorkerUnknownError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                          SocketReadError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                          SocketWriteError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                          SocketOpenError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                          SocketCloseError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                          SocketUpgradeError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
+                          HttpError: (reason, error) => {
+                            if (reason.kind === "TransportError") {
+                              return Stream.fail(new ReplicaError.ServerUnavailable())
+                            }
+                            return Stream.fail(
+                              new ReplicaError.ProtocolInvalid({
+                                message: "The Watch RPC failed",
+                                cause: error
+                              })
+                            )
+                          },
+                          RpcClientDefect: (_, error) =>
+                            Stream.fail(
+                              new ReplicaError.ProtocolInvalid({
+                                message: "The Watch RPC failed",
+                                cause: error
+                              })
+                            )
+                        },
+                        (_, error) => Stream.die(error)
+                      ),
+                      Stream.catchCause((cause) => {
+                        if (Cause.hasInterruptsOnly(cause)) return Stream.fail(new ReplicaError.ServerUnavailable())
+                        const undecodable = findDecodeDefect(cause)
+                        if (undecodable === undefined) return Stream.failCause(cause)
+                        return Stream.fail(
+                          new ReplicaError.ProtocolInvalid({
+                            message: "The Watch RPC response could not be decoded",
+                            cause: undecodable
                           })
                         )
-                    }),
-                    Effect.ensuring(Fiber.interrupt(acquisition))
-                  )
-                  return LosslessQueue.stream(queue).pipe(
-                    Stream.catchReasons(
-                      "RpcClientError",
-                      {
-                        WorkerSpawnError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                        WorkerSendError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                        WorkerReceiveError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                        WorkerUnknownError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                        SocketReadError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                        SocketWriteError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                        SocketOpenError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                        SocketCloseError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                        SocketUpgradeError: () => Stream.fail(new ReplicaError.ServerUnavailable()),
-                        HttpError: (reason, error) => {
-                          if (reason.kind === "TransportError") {
-                            return Stream.fail(new ReplicaError.ServerUnavailable())
-                          }
-                          return Stream.fail(
-                            new ReplicaError.ProtocolInvalid({
-                              message: "The Watch RPC failed",
-                              cause: error
-                            })
-                          )
-                        },
-                        RpcClientDefect: (_, error) =>
-                          Stream.fail(
-                            new ReplicaError.ProtocolInvalid({
-                              message: "The Watch RPC failed",
-                              cause: error
-                            })
-                          )
-                      },
-                      (_, error) => Stream.die(error)
-                    ),
-                    Stream.catchCause((cause) => {
-                      if (Cause.hasInterruptsOnly(cause)) return Stream.fail(new ReplicaError.ServerUnavailable())
-                      const undecodable = findDecodeDefect(cause)
-                      if (undecodable === undefined) return Stream.failCause(cause)
-                      return Stream.fail(
-                        new ReplicaError.ProtocolInvalid({
-                          message: "The Watch RPC response could not be decoded",
-                          cause: undecodable
-                        })
-                      )
-                    })
-                  )
-                })
-              )
-          ).pipe(
-            Stream.interruptWhen(credentialReplaced),
-            Stream.catchCause((cause) => {
-              if (!hasRemoteDefect(cause)) return Stream.failCause(cause)
-              return Stream.fail(
-                new ReplicaError.ProtocolInvalid({
-                  message: "The Watch RPC failed on the server",
-                  cause: Cause.squash(cause)
-                })
-              )
-            }),
-            Stream.withSpan("SyncClient.watch", {
-              attributes: { "space.id": request.spaceId }
-            })
-          )
+                      })
+                    )
+                  })
+                )
+            ).pipe(
+              Stream.interruptWhen(credentialProvider.awaitChange(opened.generation)),
+              Stream.catchCause((cause) => {
+                if (!hasRemoteDefect(cause)) return Stream.failCause(cause)
+                return Stream.fail(
+                  new ReplicaError.ProtocolInvalid({
+                    message: "The Watch RPC failed on the server",
+                    cause: Cause.squash(cause)
+                  })
+                )
+              }),
+              Stream.withSpan("SyncClient.watch", {
+                attributes: { "space.id": request.spaceId }
+              })
+            )))
       })
     })
   )
