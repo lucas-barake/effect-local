@@ -136,6 +136,72 @@ describe("a workflow attempt that waits for its space to be activated again", ()
   )
 })
 
+describe("a leave while the workflow engine cannot be polled", () => {
+  it.effect(
+    "fails with the defect, keeps the space, and finishes once the engine answers for a waiting attempt",
+    Effect.fnUntraced(function*() {
+      const { replica, services } = yield* parkedAttempt()
+
+      services.setWorkflowStorageDown(true)
+      const failed = yield* within(replica.leave(parked))
+      yield* quiet
+      const runningAfterFailure = yield* services.runningWorkflowExecutions(parked)
+      const stillJoined = yield* Effect.exit(replica.space(parked))
+      services.setWorkflowStorageDown(false)
+      const left = yield* within(replica.leave(parked))
+      yield* quiet
+
+      assert.strictEqual(describeExit(failed), "died", "the polling defect reached the caller")
+      assert.isTrue(Exit.isSuccess(stillJoined), "the space was not removed")
+      assert.strictEqual(runningAfterFailure, 1, "the execution could not be cancelled yet")
+      assert.strictEqual(describeExit(left), "succeeded")
+      assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 0, "the retry cancelled the execution")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect(
+    "fails with the defect and finishes once the engine answers for a foreground scheduler",
+    Effect.fnUntraced(function*() {
+      const services = yield* BackgroundReplica.services({
+        constructor: "layerWorkflow",
+        clientId,
+        initialSpaces: [parked, other],
+        maximumActiveSpaces: 3,
+        foregroundActiveSpaces: 1,
+        retryDelay: "1 second",
+        maximumRetryDelay: "1 minute"
+      })
+      const calling = yield* Deferred.make<void>()
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          const page = emptyPage(services.crypto, request)
+          if (request.spaceId !== parked) return page
+          return Deferred.succeed(calling, undefined).pipe(Effect.andThen(Effect.never))
+        }
+      }))
+      yield* installView(services)
+      const space = yield* replica.space(parked)
+      yield* VirtualTime.advanceUntil(space.activate)
+      yield* VirtualTime.advanceUntil(Deferred.await(calling))
+
+      services.setWorkflowStorageDown(true)
+      const failed = yield* within(replica.leave(parked))
+      yield* quiet
+      const runningAfterFailure = yield* services.runningWorkflowExecutions(parked)
+      services.setWorkflowStorageDown(false)
+      const left = yield* within(replica.leave(parked))
+      yield* quiet
+
+      assert.strictEqual(describeExit(failed), "died", "the polling defect reached the caller")
+      assert.strictEqual(runningAfterFailure, 1, "the execution could not be cancelled yet")
+      assert.strictEqual(describeExit(left), "succeeded")
+      assert.strictEqual(yield* services.runningWorkflowExecutions(parked), 0, "the retry cancelled the execution")
+    }, VirtualTime.scoped)
+  )
+})
+
 const budgets = [2048, 200, 97, 64, 63, 48, 31, 17].map((budget) => ({ budget }))
 
 const atBudget = <A, E extends { readonly _tag: string }, R,>(

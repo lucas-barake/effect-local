@@ -431,11 +431,20 @@ const register = Effect.fnUntraced(function*(
   const cancelExecution = Effect.gen(function*() {
     const active = yield* Ref.get(activeExecution)
     if (Option.isNone(active)) return
-    const polled = yield* Effect.exit(engine.poll(active.value.workflow, active.value.executionId))
-    if (Exit.isSuccess(polled) && Option.isNone(polled.value)) {
-      yield* engine.interruptUnsafe(active.value.workflow, active.value.executionId)
-    }
-    yield* Ref.set(activeExecution, Option.none())
+    const tracked = active.value
+    const interruptTracked = engine.interruptUnsafe(tracked.workflow, tracked.executionId)
+    const forget = Ref.update(activeExecution, Option.filter((current) => current !== tracked))
+    yield* engine.poll(tracked.workflow, tracked.executionId).pipe(
+      Effect.onError((cause) => {
+        if (Cause.hasInterruptsOnly(cause)) return Effect.void
+        return Effect.andThen(interruptTracked, forget)
+      }),
+      Effect.flatMap(Option.match({
+        onNone: () => interruptTracked,
+        onSome: () => Effect.void
+      })),
+      Effect.andThen(forget)
+    )
   })
   return Registration.of({ registered: true, activeExecution, cancelExecution })
 })

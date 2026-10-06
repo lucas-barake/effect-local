@@ -244,8 +244,12 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
   const engine = Context.get(databaseContext, WorkflowEngine.WorkflowEngine)
   const executions = new Map<string, Set<string>>()
   const workflows = new Map<string, unknown>()
+  let workflowStorageDown = false
   const countingEngine = new Proxy(engine, {
     get: (target, property, receiver) => {
+      if (workflowStorageDown && (property === "poll" || property === "interruptUnsafe")) {
+        return () => Effect.die("workflow storage unavailable")
+      }
       if (property !== "execute") return Reflect.get(target, property, receiver)
       return (...args: ReadonlyArray<unknown>): unknown => {
         const [workflow, execution] = args
@@ -356,7 +360,10 @@ export const services = Effect.fnUntraced(function*(settings: Settings) {
     holdInvalidationsOf,
     endInvalidationsWith,
     workflowExecutions,
-    runningWorkflowExecutions
+    runningWorkflowExecutions,
+    setWorkflowStorageDown: (down: boolean) => {
+      workflowStorageDown = down
+    }
   }
 })
 
