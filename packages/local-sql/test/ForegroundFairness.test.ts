@@ -8,16 +8,19 @@ import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
 import * as Scheduler from "effect/Scheduler"
+import * as Stream from "effect/Stream"
 import * as SyncEngine from "../src/SyncEngine.js"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
   type Constructor,
   constructors,
+  describeExit,
   emptyPage,
   eventually,
   healthyRemote,
-  installView
+  installView,
+  within
 } from "./fixtures/BackgroundReplica.js"
 import * as VirtualTime from "./fixtures/DeterministicTime.js"
 
@@ -273,6 +276,62 @@ describe("operations that compete for one foreground place", () => {
       assert.isTrue(Option.isSome(drained), "the background turn finished and closed its runtime")
       assert.strictEqual(yield* background.activation, "Inactive")
       assert.strictEqual(yield* resident.activation, "Active")
+    }, VirtualTime.scoped)
+  )
+
+  it.effect.each(constructors)(
+    "runs an operation on a space whose background turn is in flight, lets the turn finish, then opens its watch with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const services = yield* BackgroundReplica.services({
+        constructor,
+        clientId,
+        initialSpaces: [first, second],
+        maximumActiveSpaces: 3,
+        foregroundActiveSpaces: 1,
+        retryDelay: "1 second",
+        maximumRetryDelay: "1 minute"
+      })
+      yield* BackgroundReplica.seedPending(services, [first])
+      const pulling = yield* Deferred.make<void>()
+      const answered = yield* Deferred.make<void>()
+      let pulls = 0
+      let interrupted = false
+      let watches = 0
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...healthyRemote(services),
+        watch: (request) => {
+          if (request.spaceId === first) watches += 1
+          return Stream.never
+        },
+        pull: (request) => {
+          const page = emptyPage(services.crypto, request)
+          pulls += 1
+          if (pulls > 1) return page
+          return Deferred.succeed(pulling, undefined).pipe(
+            Effect.andThen(Deferred.await(answered)),
+            Effect.andThen(page),
+            Effect.onInterrupt(() =>
+              Effect.sync(() => {
+                interrupted = true
+              })
+            )
+          )
+        }
+      }))
+      const space = yield* replica.space(first)
+      yield* VirtualTime.advanceUntil(Deferred.await(pulling))
+
+      const read = yield* within(space.get(Domain.Todo, "pending"))
+      const watchesDuringTheTurn = watches
+      yield* Deferred.succeed(answered, undefined)
+      const drained = yield* eventually(services, space, (status) => status.pending === 0)
+      yield* settle
+
+      assert.strictEqual(describeExit(read), "succeeded")
+      assert.isFalse(interrupted, "the background turn kept its server call")
+      assert.strictEqual(watchesDuringTheTurn, 0)
+      assert.isTrue(Option.isSome(drained), "the turn drained the space")
+      assert.isAbove(watches, 0, "the space was made foreground once the turn had finished")
     }, VirtualTime.scoped)
   )
 })

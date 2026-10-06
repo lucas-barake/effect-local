@@ -1476,7 +1476,7 @@ describe("multi space Replica", () => {
       const replica = Context.get(yield* Layer.build(replicaLayer(remote)), Replica.Replica)
       yield* Deferred.await(secondPullEntered)
       const space = yield* replica.space(spaceA)
-      yield* space.get(Domain.Todo, "local")
+      yield* space.activate
 
       yield* awaitNoPending(replica, services.reactivity)
       const synced = yield* space.get(Domain.Todo, "remote")

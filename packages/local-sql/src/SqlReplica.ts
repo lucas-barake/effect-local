@@ -164,6 +164,7 @@ interface RememberedEntry {
   transition: Completion.Completion<void, ReplicaError.ReplicaError> | undefined
   foreground: boolean
   foregroundDemand: number
+  promote: boolean
   settlementsRecorded: Completion.Completion<void>
   leases: number
   leaving: boolean
@@ -625,8 +626,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           } else {
             reconciler = Reconciler.Reconciler.of({
               sync: reconciliation.sync,
-              notify: local.requestReconciliation.pipe(Effect.asVoid),
-              schedule: Effect.void,
+              notify: local.requestReconciliation.pipe(Effect.andThen(enqueueBackground(entry))),
+              schedule: enqueueBackground(entry),
               status: reconciliation.status,
               shutdown: Effect.void
             })
@@ -679,8 +680,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           } else {
             reconciler = Reconciler.Reconciler.of({
               sync: reconciliation.sync,
-              notify: local.requestReconciliation.pipe(Effect.asVoid),
-              schedule: Effect.void,
+              notify: local.requestReconciliation.pipe(Effect.andThen(enqueueBackground(entry))),
+              schedule: enqueueBackground(entry),
               status: reconciliation.status,
               shutdown: Effect.void
             })
@@ -957,6 +958,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         const completion = Completion.make<void, ReplicaError.ReplicaError>()
         entry.activation = "Deactivating"
         entry.transition = completion
+        if (explicit) entry.promote = false
         dropForegroundReservation(entry)
         yield* signalCapacity
         yield* invalidateActivation(entry.spaceId)
@@ -1075,13 +1077,17 @@ const makeLayer = <D extends Definition.Any, R,>(
             return yield* rejection
           }
           const current = entry.runtime
-          if (entry.activation === "Active" && current !== undefined && (!foreground || current.foreground)) {
+          if (
+            entry.activation === "Active" && current !== undefined &&
+            (!foreground || current.foreground || (leased && entry.leases > 0))
+          ) {
             if (leased && current.pendingRetirements > 0) {
               yield* restore(Completion.wait(capacityChanged))
               continue
             }
             if (leased) entry.leases += 1
-            if (foreground) touchForegroundResident(entry)
+            if (foreground && current.foreground) touchForegroundResident(entry)
+            if (foreground && !current.foreground) entry.promote = true
             return current
           }
           if (foreground && !foregroundResidents.has(entry.spaceId)) {
@@ -1180,7 +1186,10 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.activation = "Active"
           entry.transition = undefined
           if (leased) entry.leases += 1
-          if (foreground) entry.backgroundGeneration += 1
+          if (foreground) {
+            entry.backgroundGeneration += 1
+            entry.promote = false
+          }
           yield* signalCapacity
           yield* invalidateActivation(entry.spaceId)
           yield* Completion.settle(completion, Exit.void)
@@ -1229,10 +1238,19 @@ const makeLayer = <D extends Definition.Any, R,>(
       const activateForeground = (entry: RememberedEntry) =>
         Effect.uninterruptibleMask((restore) => activate(entry, true, false, restore))
 
-      const release = (entry: RememberedEntry) =>
-        Effect.sync(() => {
+      const release = (entry: RememberedEntry, closesIdleRuntime: boolean) =>
+        Effect.suspend(() => {
           entry.leases = Math.max(0, entry.leases - 1)
-        }).pipe(Effect.andThen(signalCapacity))
+          const runtime = entry.runtime
+          if (
+            !closesIdleRuntime || entry.leases > 0 || entry.activation !== "Active" || runtime === undefined ||
+            runtime.foreground
+          ) return signalCapacity
+          return signalCapacity.pipe(
+            Effect.andThen(Queue.offer(backgroundQueue, { _tag: "Deactivate", entry, runtime })),
+            Effect.asVoid
+          )
+        })
 
       const endedByRetirement = <A, E extends { readonly _tag: string },>(
         runtime: ActiveRuntime,
@@ -1249,7 +1267,7 @@ const makeLayer = <D extends Definition.Any, R,>(
       ): Effect.Effect<A, E | ReplicaError.ReplicaError> =>
         Effect.uninterruptibleMask((restore) =>
           activate(entry, foreground, true, restore).pipe(
-            Effect.flatMap((runtime) => restore(use(runtime)).pipe(Effect.ensuring(release(entry))))
+            Effect.flatMap((runtime) => restore(use(runtime)).pipe(Effect.ensuring(release(entry, foreground))))
           )
         )
 
@@ -1538,6 +1556,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           transition: undefined,
           foreground: false,
           foregroundDemand: 0,
+          promote: false,
           settlementsRecorded: Completion.make<void>(),
           leases: 0,
           leaving: false,
@@ -1553,32 +1572,28 @@ const makeLayer = <D extends Definition.Any, R,>(
         if (workflow !== undefined) {
           const leaseRuntime = Effect.uninterruptibleMask((restore) =>
             activate(entry, false, true, restore).pipe(
-              Effect.tap((runtime) =>
-                Effect.addFinalizer(() =>
-                  release(entry).pipe(
-                    Effect.andThen(Queue.offer(backgroundQueue, { _tag: "Deactivate", entry, runtime })),
-                    Effect.asVoid
-                  )
-                )
-              )
+              Effect.tap(() => Effect.addFinalizer(() => release(entry, true)))
             )
           )
-          const attempt = <A,>(
+          const leasedAttempt = <A,>(
             execute: (runtime: ReconciliationWorkflow.RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>
           ): Effect.Effect<A, ReplicaError.ReplicaError> =>
             leaseRuntime.pipe(
-              Effect.flatMap((runtime) => {
-                let turns = backgroundWorkflowTurns
-                if (entry.foreground) turns = foregroundWorkflowTurns
-                const admitted = turns.withPermit(execute(runtime))
-                return endedByRetirement(runtime, admitted)
-              }),
+              Effect.flatMap((runtime) => endedByRetirement(runtime, execute(runtime))),
               Effect.scoped,
               Effect.flatMap(Option.match({
-                onNone: () => attempt(execute),
+                onNone: () => leasedAttempt(execute),
                 onSome: Effect.succeed
               }))
             )
+          const attempt = <A,>(
+            execute: (runtime: ReconciliationWorkflow.RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>
+          ): Effect.Effect<A, ReplicaError.ReplicaError> =>
+            Effect.suspend(() => {
+              let turns = backgroundWorkflowTurns
+              if (entry.foreground) turns = foregroundWorkflowTurns
+              return turns.withPermit(leasedAttempt(execute))
+            })
           const lease = ReconciliationWorkflow.RuntimeLease.of({ acquire: leaseRuntime, attempt })
           const registrationContext = Context.add(
             Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow),
@@ -1754,13 +1769,25 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const status = Ref.get(aggregate)
 
+      const awaitsPromotion = (entry: RememberedEntry) =>
+        entry.promote && entries.get(entry.spaceId) === entry && !entry.leaving && entry.activation === "Active" &&
+        entry.runtime !== undefined && !entry.runtime.foreground && entry.leases === 0
+
+      const promote = (entry: RememberedEntry) =>
+        Effect.suspend(() => {
+          entry.promote = false
+          return activateForeground(entry)
+        })
+
       const runBackgroundWork = Effect.fnUntraced(function*(
         work: BackgroundWork,
         entry: RememberedEntry,
         generation: number
       ) {
         if (work._tag === "Deactivate") {
-          const result = yield* deactivate(entry, false, work.runtime, false).pipe(Effect.result)
+          let closing: Effect.Effect<unknown, ReplicaError.ReplicaError> = deactivate(entry, false, work.runtime, false)
+          if (awaitsPromotion(entry)) closing = promote(entry)
+          const result = yield* Effect.result(closing)
           if (Result.isFailure(result)) {
             yield* settleBackgroundTurn(entry, generation, result.failure, Option.none())
           }
@@ -1782,12 +1809,14 @@ const makeLayer = <D extends Definition.Any, R,>(
         const stalled = Result.isSuccess(result) && Option.isSome(result.success) &&
           entry.summaryStatus.pending > 0 && entry.summaryStatus.pending === pendingBefore
         if (activeRuntime !== undefined) {
-          const deactivation = yield* deactivate(
+          let closing: Effect.Effect<unknown, ReplicaError.ReplicaError> = deactivate(
             entry,
             false,
             activeRuntime,
             Result.isSuccess(result) && !stalled
-          ).pipe(Effect.result)
+          )
+          if (awaitsPromotion(entry)) closing = promote(entry)
+          const deactivation = yield* Effect.result(closing)
           if (Result.isFailure(deactivation)) {
             yield* settleBackgroundTurn(entry, generation, deactivation.failure, Option.none())
             return
