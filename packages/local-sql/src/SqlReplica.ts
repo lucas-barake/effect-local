@@ -428,10 +428,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         entry: RememberedEntry,
         update: (current: ReplicaStatus.ReplicaStatus) => ReplicaStatus.ReplicaStatus
       ) => applyContribution(entry, update).pipe(Effect.flatMap(announceContribution), Effect.uninterruptible)
-      const updateContribution = (
-        entry: RememberedEntry,
-        next: ReplicaStatus.ReplicaStatus
-      ) => modifyContribution(entry, () => next)
       const publishContribution = (changed: boolean) => {
         if (changed) return flush([ReactivityKey.aggregateStatus])
         return Effect.void
@@ -1060,7 +1056,9 @@ const makeLayer = <D extends Definition.Any, R,>(
                         })
                       )
                   }),
-                  Effect.flatMap((count) => updateContribution(entry, { _tag: "Connecting", pending: count.count }))
+                  Effect.flatMap((count) =>
+                    modifyContribution(entry, () => ({ _tag: "Connecting", pending: count.count }))
+                  )
                 )
               )),
               Effect.andThen(startRuntime)
