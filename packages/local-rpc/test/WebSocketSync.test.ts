@@ -443,6 +443,13 @@ const awaitStatus = (
     Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: Effect.succeed }))
   )
 
+const watchUnderRefreshedCredential = <A extends { readonly rpc: string; readonly authorization: string | undefined },>(
+  attempts: Queue.Dequeue<A>
+) =>
+  LosslessQueue.take(attempts).pipe(
+    Effect.repeat({ until: (attempt) => attempt.rpc === "Watch" && attempt.authorization === "Bearer refreshed" })
+  )
+
 const makeLifecycleHarness = Effect.fnUntraced(function*(options?: {
   readonly rpcTimeout?: Duration.Input
   readonly sessionAcquisitionTimeout?: Duration.Input
@@ -696,27 +703,30 @@ describe("WebSocket synchronization", () => {
     "opens the watch again under a credential the application replaced while the space was idle",
     Effect.fnUntraced(function*() {
       const harness = yield* makeLifecycleHarness()
-      const replicaContext = yield* Layer.build(harness.replicaLayer("4 seconds"))
+      const recording = yield* RecordingClock.make
+      const layerRecordingClock = Layer.succeed(Clock.Clock, recording.clock)
+      const replicaContext = yield* Layer.build(harness.replicaLayer("4 seconds", layerRecordingClock))
       const replica = Context.get(replicaContext, Replica.Replica)
       const reactivity = Context.get(replicaContext, Reactivity.Reactivity)
       const space = yield* replica.space(spaceId)
-      yield* space.activate
+      yield* Effect.provideService(space.activate, Clock.Clock, recording.clock)
       yield* Effect.all([
         awaitStatus(reactivity, space, "Online"),
         Deferred.await(harness.watchStarted)
       ], { discard: true, concurrency: "unbounded" })
-      yield* TestClock.adjust("2 seconds")
-      yield* Queue.takeAll(harness.attempts)
 
       yield* SubscriptionRef.set(harness.credentials, {
         generation: 1,
         bearer: Redacted.make("refreshed")
       })
-      yield* TestClock.adjust("2 seconds")
-      const afterReplacement = yield* Queue.takeAll(harness.attempts)
+      const closedWatchDelays = recording.nextSleep((request) => request.millis === 1_000).pipe(
+        Effect.flatMap((delay) => recording.advanceTo(delay.deadline)),
+        Effect.forever
+      )
+      const reopened = yield* Effect.raceFirst(watchUnderRefreshedCredential(harness.attempts), closedWatchDelays)
 
-      assert.include(afterReplacement.map((attempt) => attempt.rpc), "Watch")
-      assert.strictEqual((yield* space.status)._tag, "Online")
+      assert.strictEqual(reopened.authorization, "Bearer refreshed")
+      assert.strictEqual((yield* awaitStatus(reactivity, space, "Online"))._tag, "Online")
       assert.strictEqual(MutableRef.get(harness.webSocketConstructions), 1)
     })
   )
@@ -737,20 +747,17 @@ describe("WebSocket synchronization", () => {
           cursor: null
         })
         yield* watch.pipe(Stream.take(1), Stream.runDrain)
-        yield* Queue.takeAll(harness.attempts)
         MutableRef.set(harness.rotateAfterAcquisition, acquisition)
 
-        const ended = yield* watch.pipe(Stream.runDrain, Effect.timeoutOption("2 seconds"))
-        const watches = (yield* Queue.takeAll(harness.attempts)).filter((attempt) => attempt.rpc === "Watch")
-        const openUnderTheNewCredential = watches.length > 0 &&
-          watches[watches.length - 1].authorization === "Bearer refreshed"
-
-        assert.isTrue(
-          Option.isSome(ended) || openUnderTheNewCredential,
-          "the watch either ended to be opened again or authenticated with the new credential"
+        const watching = yield* watch.pipe(Stream.runDrain, Effect.forkChild({ startImmediately: true }))
+        const ended = Fiber.join(watching).pipe(Effect.as("ended to be opened again"))
+        const authenticated = watchUnderRefreshedCredential(harness.attempts).pipe(
+          Effect.as("authenticated with the new credential")
         )
+        const outcome = yield* Effect.raceFirst(ended, authenticated)
+
+        assert.include(["ended to be opened again", "authenticated with the new credential"], outcome)
       },
-      TestClock.withLive,
       provideNodeCrypto
     )
   )
