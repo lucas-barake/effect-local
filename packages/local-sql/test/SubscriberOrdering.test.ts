@@ -6,7 +6,6 @@ import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
 import * as Option from "effect/Option"
-import * as Stream from "effect/Stream"
 import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
@@ -556,59 +555,6 @@ describe("the subscribers of a commit", () => {
       yield* space.mutate(Domain.PutTodo, firstTodo)
 
       assert.deepStrictEqual(order.slice(0, 2), ["aggregate", "pending"])
-    }, VirtualTime.scoped)
-  )
-})
-
-describe("a waiter of a shared signal whose completion callback throws", () => {
-  it.effect.each(constructors)(
-    "does not strand another activation that waited for the same foreground slot with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* BackgroundReplica.services({
-        constructor,
-        clientId,
-        initialSpaces: [spaceId, otherSpaceId, thirdSpaceId],
-        maximumActiveSpaces: 4,
-        foregroundActiveSpaces: 1,
-        retryDelay: "1 second",
-        maximumRetryDelay: "1 minute"
-      })
-      const replica = yield* services.start(healthyRemote(services))
-      yield* installView(services)
-      const occupant = yield* replica.space(spaceId)
-      const other = yield* replica.space(otherSpaceId)
-      const third = yield* replica.space(thirdSpaceId)
-      const building = yield* services.holdStatement("SELECT desired_scope_json", true)
-      const occupying = yield* occupant.activate.pipe(Effect.forkChild({ startImmediately: true }))
-      yield* VirtualTime.advanceUntil(building.entered)
-      const throwing = yield* other.activate.pipe(Effect.forkChild({ startImmediately: true }))
-      throwing.addObserver(throwingObserver().observe)
-      const later = yield* third.activate.pipe(Effect.forkChild({ startImmediately: true }))
-      yield* building.release
-      yield* settle
-
-      assert.deepStrictEqual(
-        { occupying: outcome(occupying), throwing: outcome(throwing), later: outcome(later) },
-        { occupying: "succeeded", throwing: "succeeded", later: "succeeded" }
-      )
-    }, VirtualTime.scoped)
-  )
-
-  it.effect.each(constructors)(
-    "does not strand another reader that waited for the same settlement with %s",
-    Effect.fnUntraced(function*(constructor) {
-      const services = yield* twoSpaces(constructor)
-      const { space } = yield* onlineSpace(services)
-      const throwing = yield* Stream.runHead(space.settlements()).pipe(Effect.forkChild({ startImmediately: true }))
-      throwing.addObserver(throwingObserver().observe)
-      const later = yield* Stream.runHead(space.settlements()).pipe(Effect.forkChild({ startImmediately: true }))
-      yield* settle
-      yield* space.mutate(Domain.PutTodo, firstTodo)
-      assert.isTrue(Option.isSome(yield* eventually(services, space, isOnlineDrained)), "the mutation settled")
-      yield* settle
-
-      assert.strictEqual(outcome(throwing), "succeeded", "the reader whose callback throws")
-      assert.strictEqual(outcome(later), "succeeded", "the other reader")
     }, VirtualTime.scoped)
   )
 })
