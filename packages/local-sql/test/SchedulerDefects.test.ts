@@ -2227,6 +2227,62 @@ const managedSpace = Effect.fnUntraced(function*(readmission: {
   return { waits, synced }
 })
 
+describe("a caller that shares a reconciliation request and whose completion callback throws", () => {
+  it.effect(
+    "does not strand another caller that shared the same request",
+    Effect.fnUntraced(function*() {
+      const release = yield* Deferred.make<void>()
+      const requesting = yield* Deferred.make<void>()
+      let requested = 0
+      const manager = yield* Reconciler.makeManager({ concurrency: 1 }).pipe(
+        Effect.provideService(SyncEngine.SyncEngine, idleRemote)
+      )
+      yield* manager.register({
+        spaceId,
+        generation: 1,
+        definition: Domain.definition,
+        local: {
+          requestReconciliation: Effect.suspend(() => {
+            requested += 1
+            const generation = requested
+            if (generation === 1) return Effect.succeed(generation)
+            return Deferred.succeed(requesting, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as(generation)
+            )
+          }),
+          reconciliationGenerations: Effect.sync(() => ({ requested, completed: requested })),
+          completeReconciliation: () => Effect.void,
+          replicationState: Effect.never
+        },
+        reconciliation: {
+          sync: Effect.void,
+          generation: Effect.succeed(0),
+          failed: () => Effect.void,
+          watchFailed: () => Effect.void,
+          succeeded: Effect.void,
+          status: Effect.succeed({ _tag: "Connecting", pending: 0 })
+        }
+      })
+      yield* settle("10 millis")
+      const owner = yield* manager.notify(spaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* VirtualTime.advanceUntil(Deferred.await(requesting))
+      const throwing = yield* manager.notify(spaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      throwing.addObserver(() => {
+        decodeURIComponent("%")
+      })
+      const later = yield* manager.notify(spaceId).pipe(Effect.forkChild({ startImmediately: true }))
+      yield* Deferred.succeed(release, undefined)
+      yield* settle("10 millis")
+
+      assert.deepStrictEqual(
+        [owner.pollUnsafe() !== undefined, throwing.pollUnsafe() !== undefined, later.pollUnsafe() !== undefined],
+        [true, true, true]
+      )
+    }, VirtualTime.scoped)
+  )
+})
+
 describe("the transport generation a managed readmission reads", () => {
   it.effect(
     "is the generation the retry of a readmission that could not reach the server waits on",
