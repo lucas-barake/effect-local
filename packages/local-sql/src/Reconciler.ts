@@ -61,6 +61,7 @@ export interface Options {
   readonly maximumRetryDelay?: Duration.Input
   readonly onStatusChange?: (status: ReplicaStatus.ReplicaStatus, pendingCounted: boolean) => Effect.Effect<void>
   readonly onReconciled?: Effect.Effect<void>
+  readonly pulledFresh?: Effect.Effect<boolean>
 }
 
 export interface ManagedSpace {
@@ -601,7 +602,7 @@ export const layerManager: Layer.Layer<Manager, ReplicaError.InvalidConfiguratio
   .effect(Manager, makeManager())
 
 export const layerOnePass = (
-  options: Pick<Options, "definition" | "spaceId" | "pageSize" | "onStatusChange" | "onReconciled">
+  options: Pick<Options, "definition" | "spaceId" | "pageSize" | "onStatusChange" | "onReconciled" | "pulledFresh">
 ): Layer.Layer<Reconciliation, ReplicaError.InvalidConfiguration, LocalStore.Store | SyncEngine.SyncEngine> =>
   Layer.effect(
     Reconciliation,
@@ -615,6 +616,7 @@ export const layerOnePass = (
       }
       const local = yield* LocalStore.Store
       const remote = yield* SyncEngine.SyncEngine
+      const pulledFresh = options.pulledFresh ?? Effect.succeed(true)
       const gate = yield* Semaphore.make(1)
       const status = yield* Ref.make<ReplicaStatus.ReplicaStatus>({ _tag: "Connecting", pending: 0 })
       let syncAttempted = false
@@ -909,6 +911,7 @@ export const layerOnePass = (
           yield* catchUp
           const submitted = yield* submitPending
           if (submitted) yield* catchUp
+          while (!(yield* pulledFresh)) yield* catchUp
           syncing = false
           yield* succeeded
           yield* recordSynced(generation)

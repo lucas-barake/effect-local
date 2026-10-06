@@ -160,7 +160,9 @@ interface RememberedEntry {
   readonly membershipIncarnation: Identity.MembershipIncarnation
   readonly remote: SyncEngine.Service
   readonly cancelServerCalls: Effect.Effect<void>
+  readonly forgetServerAnswers: () => void
   readonly disownServerFailures: () => void
+  pulledFresh: boolean
   readonly quarantineGate: Semaphore.Semaphore
   handle: Replica.Space
   activation: Replica.Activation
@@ -607,7 +609,8 @@ const makeLayer = <D extends Definition.Any, R,>(
             ...options,
             spaceId,
             onStatusChange: (status, pendingCounted) => publishRuntimeStatus(entry, status, pendingCounted),
-            onReconciled: forgetBackgroundFailure(entry)
+            onReconciled: forgetBackgroundFailure(entry),
+            pulledFresh: Effect.sync(() => entry.pulledFresh)
           }).pipe(
             Layer.provide(layerLocalStore)
           )
@@ -658,7 +661,8 @@ const makeLayer = <D extends Definition.Any, R,>(
               ...options,
               spaceId,
               onStatusChange: (status, pendingCounted) => publishRuntimeStatus(entry, status, pendingCounted),
-              onReconciled: forgetBackgroundFailure(entry)
+              onReconciled: forgetBackgroundFailure(entry),
+              pulledFresh: Effect.sync(() => entry.pulledFresh)
             }).pipe(Layer.provide(layerLocalStore))
           ).pipe(
             Layer.buildWithScope(childScope),
@@ -805,6 +809,7 @@ const makeLayer = <D extends Definition.Any, R,>(
             retryTiming.maximumRetryDelayMillis
           ).pipe(
             Effect.annotateLogs({ "space.id": entry.spaceId }),
+            Effect.tap(() => Effect.sync(entry.forgetServerAnswers)),
             Effect.andThen(enqueueBackground(entry))
           )
           return FiberMap.run(credentialWaits, entry.membershipIncarnation, wait).pipe(Effect.andThen(published))
@@ -931,14 +936,17 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const awaitRetirement = (runtime: ActiveRuntime) => awaitRetirementAfter(runtime, runtime.requestedRetirements)
 
-      const answeredTo = <A,>(call: Effect.Effect<A, ReplicaError.ReplicaError>) =>
+      const answeredTo = <A,>(
+        forgetAnswers: () => void,
+        call: Effect.Effect<SharedCall.Answer<A>, ReplicaError.ReplicaError>
+      ) =>
         Effect.withFiber((fiber) => {
           const turn = fiber.getRef(CurrentSyncTurn)
-          if (turn === undefined) return call
-          turn.failure = undefined
+          if (turn !== undefined) turn.failure = undefined
           return Effect.tapError(call, (failure) =>
             Effect.sync(() => {
-              turn.failure = failure
+              if (turn !== undefined) turn.failure = failure
+              if (failure._tag === "CredentialRejected") forgetAnswers()
             }))
         })
 
@@ -1031,6 +1039,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           changed = yield* applyContribution(entry, () => inactiveStatus(entry, count.count))
         }
         if (enqueuePending && count.count > 0) yield* enqueueBackground(entry)
+        else yield* entry.cancelServerCalls
         yield* announceContribution(changed)
         return true
       })
@@ -1573,21 +1582,36 @@ const makeLayer = <D extends Definition.Any, R,>(
         const pulls = SharedCall.make(remote.pull, serverCallScope, retryTiming.retryDelayMillis)
         const submissions = SharedCall.make(remote.submitBatch, serverCallScope, retryTiming.retryDelayMillis)
         const bootstraps = SharedCall.make(remote.bootstrap, serverCallScope, retryTiming.retryDelayMillis)
+        const forgetServerAnswers = () => {
+          pulls.forget()
+          submissions.forget()
+          bootstraps.forget()
+        }
         const entry: RememberedEntry = {
           spaceId: row.space_id,
           membershipIncarnation: row.membership_incarnation,
           remote: SyncEngine.SyncEngine.of({
             ...remote,
-            pull: (request) => answeredTo(pulls.run(request)),
-            submitBatch: (request) => answeredTo(submissions.run(request)),
-            bootstrap: (request) => answeredTo(bootstraps.run(request))
+            pull: (request) =>
+              answeredTo(forgetServerAnswers, pulls.run(request)).pipe(
+                Effect.map((answer) => {
+                  entry.pulledFresh = answer.fresh
+                  return answer.value
+                })
+              ),
+            submitBatch: (request) =>
+              answeredTo(forgetServerAnswers, submissions.run(request)).pipe(Effect.map((answer) => answer.value)),
+            bootstrap: (request) =>
+              answeredTo(forgetServerAnswers, bootstraps.run(request)).pipe(Effect.map((answer) => answer.value))
           }),
           cancelServerCalls: Effect.all([pulls.cancel, submissions.cancel, bootstraps.cancel], { discard: true }),
+          forgetServerAnswers,
           disownServerFailures: () => {
             pulls.disownFailure()
             submissions.disownFailure()
             bootstraps.disownFailure()
           },
+          pulledFresh: true,
           quarantineGate: yield* Semaphore.make(1),
           get handle() {
             if (handle === undefined) handle = makeHandle(entry)

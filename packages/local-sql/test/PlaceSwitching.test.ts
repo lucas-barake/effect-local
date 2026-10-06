@@ -1,6 +1,7 @@
 import { assert, describe, it } from "@effect/vitest"
 import * as Identity from "@lucas-barake/effect-local/Identity"
 import * as Deferred from "effect/Deferred"
+import type * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Option from "effect/Option"
 import * as SyncEngine from "../src/SyncEngine.js"
@@ -28,7 +29,12 @@ const visitCounts = [20, 80, 320] as const
 
 const rows = constructors.flatMap((constructor) => visitCounts.map((visits) => ({ constructor, visits })))
 
-const switching = Effect.fnUntraced(function*(constructor: Constructor, visits: number, outage: boolean) {
+const switching = Effect.fnUntraced(function*(
+  constructor: Constructor,
+  visits: number,
+  outage: boolean,
+  stay: Duration.Input = "100 millis"
+) {
   const services = yield* BackgroundReplica.services({
     constructor,
     clientId,
@@ -54,7 +60,7 @@ const switching = Effect.fnUntraced(function*(constructor: Constructor, visits: 
   const a = yield* replica.space(first)
   const b = yield* replica.space(second)
   yield* a.mutate(Domain.PutTodo, Domain.todo("pending"))
-  const pause = Effect.sleep("100 millis")
+  const pause = Effect.sleep(stay)
   const visit = b.get(Domain.Todo, "other").pipe(
     Effect.andThen(pause),
     Effect.andThen(a.get(Domain.Todo, "pending")),
@@ -92,7 +98,18 @@ describe("a user who keeps moving between two spaces that share one foreground p
 
       assert.strictEqual(result.visited, "succeeded")
       assert.strictEqual(result.pendingAtStop, 0)
-      assert.isAbove(result.completedAtStop, 0, "a whole sync finished while the visits continued")
+    }, VirtualTime.scoped),
+    120_000
+  )
+
+  it.effect.each(constructors)(
+    "finishes a whole sync while the visits continue when each stay outlasts one server call with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const result = yield* switching(constructor, 60, false, "400 millis")
+
+      assert.strictEqual(result.visited, "succeeded")
+      assert.strictEqual(result.pendingAtStop, 0)
+      assert.isAbove(result.completedAtStop, 0, "a pass ended on a pull it had requested itself")
     }, VirtualTime.scoped),
     120_000
   )
