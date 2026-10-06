@@ -15,7 +15,6 @@ import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
 import * as Queue from "effect/Queue"
 import * as Ref from "effect/Ref"
-import * as Result from "effect/Result"
 import * as Schema from "effect/Schema"
 import type * as Scope from "effect/Scope"
 import * as Semaphore from "effect/Semaphore"
@@ -25,7 +24,13 @@ import * as Completion from "./internal/completion.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
-import { backoff, credentialChange, superviseWatch } from "./internal/transport.js"
+import {
+  answeredUnderCredential,
+  backoff,
+  credentialChange,
+  credentialReplaced,
+  superviseWatch
+} from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as SyncEngine from "./SyncEngine.js"
 
@@ -550,8 +555,10 @@ export const makeManager = Effect.fnUntraced(function*(options: {
             return Deferred.await(authenticationGate).pipe(Effect.andThen(watch()))
           }
           const watchEpoch = state.authenticationEpoch
-          const subscribed = Effect.andThen(watchBackoff.opened, remote.transportGeneration)
-          return subscribed.pipe(Effect.flatMap((transportGeneration) =>
+          const subscribed = watchBackoff.opened.pipe(
+            Effect.andThen(Effect.all([remote.transportGeneration, remote.credentialGeneration]))
+          )
+          return subscribed.pipe(Effect.flatMap(([transportGeneration, credentialGeneration]) =>
             Stream.unwrap(Effect.map(space.local.replicationState, (replication) =>
               remote.watch({
                 spaceId: space.spaceId,
@@ -562,8 +569,14 @@ export const makeManager = Effect.fnUntraced(function*(options: {
                 cursor: replication.cursor
               }))).pipe(
                 Stream.runForEach(() => enqueue(state)),
+                Effect.as(false),
+                Effect.raceFirst(credentialReplaced(remote, credentialGeneration, state.maximumRetryDelayMillis)),
                 Effect.matchEffect({
-                  onSuccess: () => watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep), Effect.andThen(watch())),
+                  onSuccess: (replaced) => {
+                    const closed = watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep))
+                    if (!replaced) return Effect.andThen(closed, watch())
+                    return closed.pipe(Effect.andThen(readmit(state)), Effect.andThen(watch()))
+                  },
                   onFailure: Effect.fnUntraced(function*(error) {
                     if (watchEpoch !== state.authenticationEpoch) return yield* watch()
                     const activeAuthenticationGate = state.authenticationGate
@@ -654,13 +667,11 @@ export const layerOnePass = (
       const answeredUnderPassCredential = <A,>(
         call: Effect.Effect<A, ReplicaError.ReplicaError>
       ): Effect.Effect<A, ReplicaError.ReplicaError | CredentialChanged> =>
-        Effect.result(call).pipe(
-          Effect.zip(remote.credentialGeneration),
-          Effect.flatMap(([answer, current]): Effect.Effect<A, ReplicaError.ReplicaError | CredentialChanged> => {
-            if (current !== passCredential) return Effect.fail(new CredentialChanged())
-            if (Result.isFailure(answer)) return Effect.fail(answer.failure)
-            return Effect.succeed(answer.success)
-          })
+        Effect.suspend(() => answeredUnderCredential(remote, passCredential, call)).pipe(
+          Effect.flatMap(Option.match({
+            onNone: () => Effect.fail(new CredentialChanged()),
+            onSome: Effect.succeed
+          }))
         )
       const server = {
         pull: (request: Protocol.PullRequest) => answeredUnderPassCredential(remote.pull(request)),
@@ -1163,8 +1174,8 @@ export const layerInMemoryScheduler = (
           const watchEpoch = authenticationEpoch
           return awaitAuthenticationChange.pipe(
             Effect.andThen(watchBackoff.opened),
-            Effect.andThen(remote.transportGeneration),
-            Effect.flatMap((transportGeneration) =>
+            Effect.andThen(Effect.all([remote.transportGeneration, remote.credentialGeneration])),
+            Effect.flatMap(([transportGeneration, credentialGeneration]) =>
               Stream.unwrap(local.replicationState.pipe(
                 Effect.map((state) =>
                   remote.watch({
@@ -1178,6 +1189,10 @@ export const layerInMemoryScheduler = (
                 )
               )).pipe(
                 Stream.runForEach(() => requestAndNotify),
+                Effect.as(false),
+                Effect.raceFirst(
+                  credentialReplaced(remote, credentialGeneration, retryTiming.maximumRetryDelayMillis)
+                ),
                 Effect.matchEffect({
                   onFailure: Effect.fnUntraced(function*(error) {
                     if (watchEpoch !== authenticationEpoch) return yield* watch()
@@ -1210,7 +1225,11 @@ export const layerInMemoryScheduler = (
                       Effect.andThen(watch())
                     )
                   }),
-                  onSuccess: () => watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep), Effect.andThen(watch()))
+                  onSuccess: (replaced) => {
+                    const closed = watchBackoff.closed.pipe(Effect.flatMap(Effect.sleep))
+                    if (!replaced) return Effect.andThen(closed, watch())
+                    return closed.pipe(Effect.andThen(resyncAfterWatchFailure), Effect.andThen(watch()))
+                  }
                 })
               )
             )

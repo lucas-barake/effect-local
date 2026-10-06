@@ -102,12 +102,13 @@ const harness = Effect.fnUntraced(function*() {
   let watchAccepted = false
   let pulls = 0
   let acceptedAhead = false
+  let credentialGeneration = 0
   const liveWakes = yield* Queue.unbounded<Protocol.Wake>()
   const watchFailed = Effect.flip(Deferred.await(watchFailure))
   const watchOutcome = Effect.raceFirst(watchFailed, Deferred.await(watchEnd))
   const remote = SyncEngine.SyncEngine.of({
     waitForCredentialChange: () => Deferred.await(credentialChange),
-    credentialGeneration: Effect.succeed(0),
+    credentialGeneration: Effect.sync(() => credentialGeneration),
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Queue.offer(transportWaits, undefined).pipe(Effect.andThen(Effect.never)),
     submitBatch: (request) => {
@@ -179,6 +180,10 @@ const harness = Effect.fnUntraced(function*() {
     }),
     endWatch: Deferred.succeed(watchEnd, undefined),
     changeCredential: Deferred.succeed(credentialChange, undefined),
+    replaceCredential: Effect.suspend(() => {
+      credentialGeneration += 1
+      return Deferred.succeed(credentialChange, undefined)
+    }),
     failNextPull: (error: ReplicaError.ReplicaError) =>
       Effect.sync(() => {
         pullFailure = error
@@ -863,6 +868,42 @@ describe("a sync that left accepted work pending and then failed terminally", ()
       assert.deepStrictEqual([stalled._tag, stalled.pending], ["Online", 1], "the first sync left its mutation pending")
       assert.strictEqual(controls.pulls(), pullsWhenFailed, "server calls after the terminal failure")
       assert.strictEqual((yield* running.status)._tag, "Failed")
+    }, VirtualTime.provide)
+  )
+})
+
+describe("a watch that was opened before the application replaced the credential", () => {
+  it.effect.each(schedulers)(
+    "is opened again once under the new credential and the space is synced with %s",
+    Effect.fnUntraced(function*(scheduler) {
+      const controls = yield* harness()
+      const running = yield* onlineScheduler(controls, scheduler)
+      yield* quiet("1 minute")
+      const watchesBefore = controls.watchTimes.length
+      const pullsBefore = controls.pulls()
+
+      yield* controls.replaceCredential
+      yield* quiet("1 hour")
+
+      assert.strictEqual(controls.watchTimes.length, watchesBefore + 1, "watches opened after the replacement")
+      assert.isAbove(controls.pulls(), pullsBefore, "the space was pulled under the new credential")
+      assert.strictEqual((yield* running.status)._tag, "Online")
+    }, VirtualTime.provide)
+  )
+
+  it.effect.each(schedulers)(
+    "stays open when the provider reports a change that left the generation as it was with %s",
+    Effect.fnUntraced(function*(scheduler) {
+      const controls = yield* harness()
+      const running = yield* onlineScheduler(controls, scheduler)
+      yield* quiet("1 minute")
+      const watchesBefore = controls.watchTimes.length
+
+      yield* controls.changeCredential
+      yield* quiet("1 hour")
+
+      assert.strictEqual(controls.watchTimes.length, watchesBefore)
+      assert.strictEqual((yield* running.status)._tag, "Online")
     }, VirtualTime.provide)
   )
 })

@@ -2,6 +2,8 @@ import type * as Identity from "@lucas-barake/effect-local/Identity"
 import type * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import type * as Cause from "effect/Cause"
 import * as Effect from "effect/Effect"
+import * as Option from "effect/Option"
+import * as Result from "effect/Result"
 import type * as SyncEngine from "../SyncEngine.js"
 import * as Errors from "./errors.js"
 
@@ -36,6 +38,33 @@ export const credentialChange = (
   )
   return wait
 }
+
+export const credentialReplaced = (
+  remote: SyncEngine.Service,
+  openedGeneration: number,
+  retryDelayMillis: number
+): Effect.Effect<true> =>
+  credentialChange(remote, openedGeneration, retryDelayMillis).pipe(
+    Effect.andThen(remote.credentialGeneration),
+    Effect.flatMap((current) => {
+      if (current === openedGeneration) return Effect.never
+      return Effect.succeed(true)
+    })
+  )
+
+export const answeredUnderCredential = <A,>(
+  remote: SyncEngine.Service,
+  generation: number,
+  call: Effect.Effect<A, ReplicaError.ReplicaError>
+): Effect.Effect<Option.Option<A>, ReplicaError.ReplicaError> =>
+  Effect.result(call).pipe(
+    Effect.zip(remote.credentialGeneration),
+    Effect.flatMap(([answer, current]): Effect.Effect<Option.Option<A>, ReplicaError.ReplicaError> => {
+      if (current !== generation) return Effect.succeed(Option.none())
+      if (Result.isFailure(answer)) return Effect.fail(answer.failure)
+      return Effect.succeed(Option.some(answer.success))
+    })
+  )
 
 export const superviseWatch = <R,>(options: {
   readonly spaceId: Identity.SpaceId
