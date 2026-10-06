@@ -598,6 +598,10 @@ const layerSchedulerWithConfiguration = (
       let stalledPending = 0
       let stallTimed = false
       const stalls = yield* FiberMap.make<"stalled", void, never>()
+      const cancelStalledRetry = Effect.suspend(() => {
+        stallTimed = false
+        return FiberMap.remove(stalls, "stalled")
+      })
       let readmit = false
       const superviseTurn = Effect.gen(function*() {
         if (!readmit) yield* LosslessQueue.take(wake)
@@ -654,7 +658,11 @@ const layerSchedulerWithConfiguration = (
           const left = (yield* reconciliation.status).pending
           if (left === 0 || left < stalledPending) retryAttempt = 0
           stalledPending = left
-          if (left === 0 || stallTimed) return false
+          if (left === 0) {
+            yield* cancelStalledRetry
+            return false
+          }
+          if (stallTimed) return false
           retryAttempt += 1
           stallTimed = true
           const delay = Configuration.retryMillis(configuration, retryAttempt)
@@ -666,6 +674,7 @@ const layerSchedulerWithConfiguration = (
           return false
         }
         const error = result.failure
+        yield* cancelStalledRetry
         if (error._tag === "StaleReplicationScope") {
           readmit = true
           return false

@@ -97,6 +97,10 @@ export class Manager extends Context.Service<Manager, ManagerService>()(
   "@lucas-barake/effect-local-sql/Reconciler/Manager"
 ) {}
 
+interface NextAttempt {
+  readonly reason: "Failure" | "Stalled"
+}
+
 interface ManagedState extends ManagedSpace {
   readonly requests: ReturnType<typeof makeReconciliationRequests>
   readonly retryDelayMillis: number
@@ -105,8 +109,7 @@ interface ManagedState extends ManagedSpace {
   running: boolean
   retryAttempt: number
   stalledPending: number
-  stallTimed: boolean
-  retrying: boolean
+  nextAttempt: NextAttempt | undefined
   halted: boolean
   authenticationGate: Deferred.Deferred<void> | undefined
   authenticationEpoch: number
@@ -268,8 +271,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
   const queue = yield* Effect.acquireRelease(Queue.unbounded<Work>(), Queue.shutdown)
   const turns = yield* FiberMap.make<string, void, never>()
   const watches = yield* FiberMap.make<string, void, never>()
-  const retries = yield* FiberMap.make<string, void, never>()
-  const stalls = yield* FiberMap.make<string, void, never>()
+  const nextAttempts = yield* FiberMap.make<string, void, never>()
   const authenticationWaiters = yield* FiberMap.make<string, void, never>()
   const spaces = new Map<Identity.SpaceId, ManagedState>()
 
@@ -289,7 +291,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       if (
         admitted.queued ||
         admitted.running ||
-        admitted.retrying ||
+        admitted.nextAttempt?.reason === "Failure" ||
         admitted.authenticationGate !== undefined
       ) return Effect.void
       admitted.queued = true
@@ -314,6 +316,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     space: ManagedState,
     error: ReplicaError.CredentialRejected
   ) {
+    space.nextAttempt = undefined
     if (error.credentialGeneration === undefined) {
       space.halted = true
       return undefined
@@ -356,56 +359,58 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     )
   })
 
-  const scheduleRetry = Effect.fnUntraced(function*(
-    space: ManagedState,
-    failure: ReplicaError.ReplicaError,
-    transportGeneration: number
-  ) {
-    space.retryAttempt += 1
-    const delay = Configuration.retryMillis(space, space.retryAttempt)
-    space.retrying = true
-    const key = managedKey(space.spaceId, space.generation)
-    const finishRetry = Effect.gen(function*() {
-      const current = spaces.get(space.spaceId)
-      if (current !== space) return
-      current.retrying = false
-      yield* readmit(current)
+  const armNextAttempt = (space: ManagedState, reason: NextAttempt["reason"], wait: Effect.Effect<void>) => {
+    const attempt: NextAttempt = { reason }
+    space.nextAttempt = attempt
+    const attemptWhenStillDue = Effect.suspend(() => {
+      if (spaces.get(space.spaceId) !== space || space.nextAttempt !== attempt) return Effect.void
+      space.nextAttempt = undefined
+      return readmit(space)
     }).pipe(Effect.uninterruptible)
-    yield* FiberMap.run(
-      retries,
-      key,
-      backoff(remote, delay, failure, transportGeneration).pipe(
-        Effect.catchCause((cause) =>
-          Errors.logDefect("Retry backoff died", cause).pipe(
-            Effect.annotateLogs({ "space.id": space.spaceId }),
-            Effect.andThen(Effect.sleep(delay))
-          )
-        ),
-        Effect.andThen(finishRetry),
+    return FiberMap.run(
+      nextAttempts,
+      managedKey(space.spaceId, space.generation),
+      wait.pipe(
+        Effect.andThen(attemptWhenStillDue),
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.void
           return Effect.failCause(cause)
         })
       )
     )
+  }
+
+  const scheduleRetry = Effect.fnUntraced(function*(
+    space: ManagedState,
+    failure: ReplicaError.ReplicaError,
+    transportGeneration: number
+  ) {
+    if (space.authenticationGate !== undefined) return
+    space.retryAttempt += 1
+    const delay = Configuration.retryMillis(space, space.retryAttempt)
+    const waited = backoff(remote, delay, failure, transportGeneration).pipe(
+      Effect.catchCause((cause) =>
+        Errors.logDefect("Retry backoff died", cause).pipe(
+          Effect.annotateLogs({ "space.id": space.spaceId }),
+          Effect.andThen(Effect.sleep(delay))
+        )
+      )
+    )
+    yield* armNextAttempt(space, "Failure", waited)
   })
 
   const retryUnfinished = Effect.fnUntraced(function*(space: ManagedState) {
     const left = (yield* space.reconciliation.status).pending
     if (left === 0 || left < space.stalledPending) space.retryAttempt = 0
     space.stalledPending = left
-    if (left === 0 || space.stallTimed) return
+    if (left === 0) {
+      if (space.nextAttempt?.reason === "Stalled") space.nextAttempt = undefined
+      return
+    }
+    if (space.nextAttempt !== undefined || space.authenticationGate !== undefined) return
     space.retryAttempt += 1
-    space.stallTimed = true
     const delay = Configuration.retryMillis(space, space.retryAttempt)
-    const elapsed = Effect.sync(() => {
-      space.stallTimed = false
-    })
-    yield* FiberMap.run(
-      stalls,
-      managedKey(space.spaceId, space.generation),
-      Effect.sleep(delay).pipe(Effect.andThen(elapsed), Effect.andThen(readmit(space)))
-    )
+    yield* armNextAttempt(space, "Stalled", Effect.sleep(delay))
   })
 
   const handleFailure = Effect.fnUntraced(function*(
@@ -426,6 +431,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     } else {
       policy = Effect.sync(() => {
         space.halted = true
+        space.nextAttempt = undefined
       })
     }
     yield* space.reconciliation.failed(error, observedGeneration).pipe(Effect.andThen(policy))
@@ -470,7 +476,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
       if (
         current.dirtyEpoch <= epoch ||
         current.queued ||
-        current.retrying ||
+        current.nextAttempt?.reason === "Failure" ||
         current.halted ||
         current.authenticationGate !== undefined
       ) return
@@ -529,8 +535,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
         running: false,
         retryAttempt: 0,
         stalledPending: 0,
-        stallTimed: false,
-        retrying: false,
+        nextAttempt: undefined,
         halted: false,
         authenticationGate: undefined,
         authenticationEpoch: 0,
@@ -615,8 +620,7 @@ export const makeManager = Effect.fnUntraced(function*(options: {
     const key = managedKey(spaceId, generation)
     yield* FiberMap.remove(watches, key)
     yield* FiberMap.remove(turns, key)
-    yield* FiberMap.remove(retries, key)
-    yield* FiberMap.remove(stalls, key)
+    yield* FiberMap.remove(nextAttempts, key)
     yield* FiberMap.remove(authenticationWaiters, key)
   })
 
@@ -1061,6 +1065,10 @@ export const layerInMemoryScheduler = (
       let stalledPending = 0
       let stallTimed = false
       const stalls = yield* FiberMap.make<"stalled", void, never>()
+      const cancelStalledRetry = Effect.suspend(() => {
+        stallTimed = false
+        return FiberMap.remove(stalls, "stalled")
+      })
       const retryAfterBackoff = (error: ReplicaError.ReplicaError, transportGeneration: number) =>
         Effect.suspend(() => {
           retryAttempt += 1
@@ -1098,7 +1106,11 @@ export const layerInMemoryScheduler = (
         const left = (yield* reconciliation.status).pending
         if (left === 0 || left < stalledPending) retryAttempt = 0
         stalledPending = left
-        if (left === 0 || stallTimed) return
+        if (left === 0) {
+          yield* cancelStalledRetry
+          return
+        }
+        if (stallTimed) return
         retryAttempt += 1
         stallTimed = true
         const delay = Configuration.retryMillis(retryTiming, retryAttempt)
@@ -1116,6 +1128,7 @@ export const layerInMemoryScheduler = (
           })
         ),
         Effect.catch(Effect.fnUntraced(function*(error) {
+          yield* cancelStalledRetry
           if (error._tag === "CredentialRejected") {
             if (error.credentialGeneration === undefined) {
               return yield* reconciliation.failed(error, observedGeneration)

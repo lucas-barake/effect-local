@@ -101,6 +101,7 @@ const harness = Effect.fnUntraced(function*() {
   let watchWakes = false
   let watchAccepted = false
   let pulls = 0
+  let acceptedAhead = false
   const liveWakes = yield* Queue.unbounded<Protocol.Wake>()
   const watchFailed = Effect.flip(Deferred.await(watchFailure))
   const watchOutcome = Effect.raceFirst(watchFailed, Deferred.await(watchEnd))
@@ -109,7 +110,18 @@ const harness = Effect.fnUntraced(function*() {
     credentialGeneration: Effect.succeed(0),
     transportGeneration: Effect.succeed(0),
     waitForTransportChange: () => Queue.offer(transportWaits, undefined).pipe(Effect.andThen(Effect.never)),
-    submitBatch: (request) => server.admitBatch(request, null),
+    submitBatch: (request) => {
+      if (!acceptedAhead) return server.admitBatch(request, null)
+      return Effect.succeed(Protocol.SubmitBatchResult.make({
+        receipts: request.envelopes.map((envelope) =>
+          Protocol.AcceptedReceipt.make({
+            ...envelope,
+            serverSequence: Identity.ServerSequence.make(1_000),
+            result: Domain.todo(envelope.mutationId, "accepted")
+          })
+        )
+      }))
+    },
     discard: (request) => server.discard(request, null),
     pull: (request) =>
       Effect.suspend(() => {
@@ -162,6 +174,9 @@ const harness = Effect.fnUntraced(function*() {
     }),
     wake: Queue.offer(liveWakes, Protocol.Wake.make({ spaceId })),
     pulls: () => pulls,
+    acceptAheadOfTheView: Effect.sync(() => {
+      acceptedAhead = true
+    }),
     endWatch: Deferred.succeed(watchEnd, undefined),
     changeCredential: Deferred.succeed(credentialChange, undefined),
     failNextPull: (error: ReplicaError.ReplicaError) =>
@@ -822,6 +837,32 @@ describe("a watch whose credential was rejected without a generation", () => {
 
       assert.strictEqual((yield* running.status)._tag, "NeedsAuthentication")
       assert.strictEqual(controls.watchTimes.length, watchesBefore)
+    }, VirtualTime.provide)
+  )
+})
+
+const quiet = (duration: Duration.Input) => VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption(duration))
+
+describe("a sync that left accepted work pending and then failed terminally", () => {
+  it.effect.each(schedulers)(
+    "is not run again when the retry delay of the stalled sync elapses with %s",
+    Effect.fnUntraced(function*(scheduler) {
+      const controls = yield* harness()
+      const running = yield* onlineScheduler(controls, scheduler)
+      yield* controls.acceptAheadOfTheView
+      yield* running.mutate
+      yield* quiet("30 seconds")
+      const stalled = yield* running.status
+      yield* controls.failNextPull(new ReplicaError.ProtocolInvalid({ message: "injected" }))
+      yield* running.mutate
+      yield* statusBecomes(running.status, "Failed")
+      const pullsWhenFailed = controls.pulls()
+
+      yield* quiet("10 minutes")
+
+      assert.deepStrictEqual([stalled._tag, stalled.pending], ["Online", 1], "the first sync left its mutation pending")
+      assert.strictEqual(controls.pulls(), pullsWhenFailed, "server calls after the terminal failure")
+      assert.strictEqual((yield* running.status)._tag, "Failed")
     }, VirtualTime.provide)
   )
 })
