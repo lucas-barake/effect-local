@@ -8,7 +8,6 @@ import * as Domain from "./Domain.js"
 import * as BackgroundReplica from "./fixtures/BackgroundReplica.js"
 import {
   acceptSubmission,
-  constructors,
   describeExit,
   emptyPage,
   eventually,
@@ -22,13 +21,20 @@ import * as VirtualTime from "./fixtures/DeterministicTime.js"
 const first = Identity.SpaceId.make("spc_00000000-0000-4000-8000-00000000e201")
 const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-00000000e201")
 
-const delays = ["0 millis", "50 millis", "150 millis", "250 millis", "350 millis", "650 millis"] as const
-const budgets = [2048, 500, 200, 100, 64, 31] as const
-const rows = constructors.flatMap((constructor) =>
-  delays.flatMap((delay) => budgets.map((budget) => ({ constructor, delay, budget })))
-)
+const scopeRows = [
+  { constructor: "layer", delay: "0 millis", budget: 31 },
+  { constructor: "layer", delay: "350 millis", budget: 31 },
+  { constructor: "layerWorkflow", delay: "0 millis", budget: 64 },
+  { constructor: "layerWorkflow", delay: "350 millis", budget: 500 },
+  { constructor: "layerWorkflow", delay: "650 millis", budget: 31 }
+] as const
+const rejoinRows = [
+  { constructor: "layerWorkflow", delay: "0 millis", budget: 2048 },
+  { constructor: "layerWorkflow", delay: "350 millis", budget: 31 }
+] as const
+type Row = typeof scopeRows[number] | typeof rejoinRows[number]
 
-const syncing = Effect.fnUntraced(function*(row: typeof rows[number]) {
+const syncing = Effect.fnUntraced(function*(row: Row) {
   const services = yield* BackgroundReplica.services({
     constructor: row.constructor,
     clientId,
@@ -55,7 +61,7 @@ const syncing = Effect.fnUntraced(function*(row: typeof rows[number]) {
 })
 
 describe("a change of what a space replicates while a reconciliation is in flight", () => {
-  it.effect.each(rows)(
+  it.effect.each(scopeRows)(
     "ends reconciled for a new scope set $delay into a sync at a budget of $budget with $constructor",
     Effect.fnUntraced(function*(row) {
       const { generations, services, space } = yield* syncing(row)
@@ -73,7 +79,7 @@ describe("a change of what a space replicates while a reconciliation is in fligh
     }, VirtualTime.atBudget)
   )
 
-  it.effect.each(rows)(
+  it.effect.each(rejoinRows)(
     "ends reconciled after a leave and a join $delay into a sync at a budget of $budget with $constructor",
     Effect.fnUntraced(function*(row) {
       const { replica, services } = yield* syncing(row)

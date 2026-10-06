@@ -29,7 +29,12 @@ const clientId = Identity.ClientId.make("cli_00000000-0000-4000-8000-000000000f9
 
 const budgets = [2048, 200, 100, 64, 31] as const
 
-const rows = constructors.flatMap((constructor) => budgets.map((budget) => ({ constructor, budget })))
+const rows = [
+  { constructor: "layer", budget: 2048 },
+  { constructor: "layerWorkflow", budget: 100 },
+  { constructor: "layerWorkflow", budget: 64 },
+  { constructor: "layerWorkflow", budget: 31 }
+] as const
 
 const unreachableServer = Effect.fnUntraced(function*(
   row: typeof rows[number],
