@@ -834,8 +834,8 @@ const makeLayer = <D extends Definition.Any, R,>(
           Effect.flatMap((now) => settleBackgroundTurnAt(now, entry, generation, failure, transportGeneration))
         )
 
-      const retryStalledTurnAt = (now: number, entry: RememberedEntry) =>
-        Effect.suspend(() => {
+      const retryStalledTurn = (entry: RememberedEntry) =>
+        Effect.flatMap(Clock.currentTimeMillis, (now) => {
           if (entries.get(entry.spaceId) !== entry || entry.leaving || hasForegroundRuntime(entry)) return Effect.void
           entry.retryAttempt += 1
           entry.backgroundGeneration += 1
@@ -846,9 +846,6 @@ const makeLayer = <D extends Definition.Any, R,>(
             transportGeneration: Option.none()
           }).pipe(Effect.asVoid)
         })
-
-      const retryStalledTurn = (entry: RememberedEntry) =>
-        Effect.flatMap(Clock.currentTimeMillis, (now) => retryStalledTurnAt(now, entry))
 
       const releaseTransportRetries = Effect.gen(function*() {
         const current = yield* remote.transportGeneration
@@ -988,7 +985,6 @@ const makeLayer = <D extends Definition.Any, R,>(
         const completion = Completion.make<void, ReplicaError.ReplicaError>()
         entry.activation = "Deactivating"
         entry.transition = completion
-        if (explicit) entry.promote = false
         dropForegroundReservation(entry)
         yield* signalCapacity
         yield* invalidateActivation(entry.spaceId)
@@ -1689,23 +1685,17 @@ const makeLayer = <D extends Definition.Any, R,>(
           backgroundFailure: undefined
         }
         if (workflow !== undefined) {
-          const leaseRuntime = Effect.uninterruptibleMask((restore) =>
-            activate(entry, false, true, restore).pipe(
-              Effect.tap(() => Effect.addFinalizer(() => release(entry, "WorkflowAttempt")))
+          const leaseRuntime = (need: ReconciliationWorkflow.RuntimeNeed) =>
+            Effect.uninterruptibleMask((restore) =>
+              transition(entry, false, true, need === "Always", { retiring: undefined }, restore).pipe(
+                Effect.tap(() => Effect.addFinalizer(() => release(entry, "WorkflowAttempt")))
+              )
             )
-          )
-          const leaseRuntimeWithPendingWork = Effect.uninterruptibleMask((restore) =>
-            transition(entry, false, true, false, { retiring: undefined }, restore).pipe(
-              Effect.tap(() => Effect.addFinalizer(() => release(entry, "WorkflowAttempt")))
-            )
-          )
           const leasedAttempt = <A,>(
             execute: (runtime: ReconciliationWorkflow.RuntimeServices) => Effect.Effect<A, ReplicaError.ReplicaError>,
             need: ReconciliationWorkflow.RuntimeNeed
-          ): Effect.Effect<A, ReplicaError.ReplicaError> => {
-            let leased = leaseRuntimeWithPendingWork
-            if (need === "Always") leased = leaseRuntime
-            return Effect.andThen(awaitRetryAllowed(entry), leased).pipe(
+          ): Effect.Effect<A, ReplicaError.ReplicaError> =>
+            Effect.andThen(awaitRetryAllowed(entry), leaseRuntime(need)).pipe(
               Effect.flatMap((runtime) => {
                 const turn = withWorkflowTurn(runtime, execute(runtime))
                 return endedByRetirement(runtime, turn)
@@ -1716,8 +1706,10 @@ const makeLayer = <D extends Definition.Any, R,>(
                 onSome: Effect.succeed
               }))
             )
-          }
-          const lease = ReconciliationWorkflow.RuntimeLease.of({ acquire: leaseRuntime, attempt: leasedAttempt })
+          const lease = ReconciliationWorkflow.RuntimeLease.of({
+            acquire: leaseRuntime("Always"),
+            attempt: leasedAttempt
+          })
           const registrationContext = Context.add(
             Context.add(rootContext, WorkflowEngine.WorkflowEngine, workflow),
             ReconciliationWorkflow.RuntimeLease,
