@@ -166,7 +166,6 @@ interface RememberedEntry {
   foreground: boolean
   foregroundDemand: number
   callerLeases: number
-  promote: boolean
   settlementsRecorded: Completion.Completion<void>
   leases: number
   leaving: boolean
@@ -640,7 +639,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           } else {
             reconciler = Reconciler.Reconciler.of({
               sync: reconciliation.sync,
-              notify: local.requestReconciliation.pipe(Effect.andThen(enqueueBackground(entry))),
+              notify: local.requestReconciliation.pipe(Effect.asVoid),
               schedule: enqueueBackground(entry),
               status: reconciliation.status,
               shutdown: Effect.void
@@ -694,7 +693,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           } else {
             reconciler = Reconciler.Reconciler.of({
               sync: reconciliation.sync,
-              notify: local.requestReconciliation.pipe(Effect.andThen(enqueueBackground(entry))),
+              notify: local.requestReconciliation.pipe(Effect.asVoid),
               schedule: enqueueBackground(entry),
               status: reconciliation.status,
               shutdown: Effect.void
@@ -1218,7 +1217,6 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.transition = undefined
           if (leased) entry.leases += 1
           if (leased && foreground) entry.callerLeases += 1
-          entry.promote = false
           if (foreground) {
             entry.backgroundGeneration += 1
             entry.serverFailures = 0
@@ -1276,11 +1274,7 @@ const makeLayer = <D extends Definition.Any, R,>(
           entry.leases = Math.max(0, entry.leases - 1)
           const runtime = entry.runtime
           const background = entry.activation === "Active" && runtime !== undefined && !runtime.foreground
-          if (holder === "Caller") {
-            entry.callerLeases = Math.max(0, entry.callerLeases - 1)
-            if (entry.callerLeases === 0 && entry.leases > 0) entry.promote = false
-          }
-          if (holder !== "Caller" && background && entry.callerLeases > 0) entry.promote = true
+          if (holder === "Caller") entry.callerLeases = Math.max(0, entry.callerLeases - 1)
           if (holder === "BackgroundTurn" || entry.leases > 0 || !background || runtime === undefined) {
             return signalCapacity
           }
@@ -1290,12 +1284,10 @@ const makeLayer = <D extends Definition.Any, R,>(
           )
         })
 
-      const callersReleased = (entry: RememberedEntry, runtime: ActiveRuntime): Effect.Effect<void> =>
+      const callersReleased = (entry: RememberedEntry): Effect.Effect<void> =>
         Effect.suspend(() => {
-          if (entry.runtime !== runtime || entry.activation !== "Active" || entry.callerLeases === 0) {
-            return Effect.void
-          }
-          return Completion.wait(capacityChanged).pipe(Effect.andThen(callersReleased(entry, runtime)))
+          if (entry.callerLeases === 0) return Effect.void
+          return Completion.wait(capacityChanged).pipe(Effect.andThen(callersReleased(entry)))
         })
 
       const endedByRetirement = <A, E extends { readonly _tag: string },>(
@@ -1659,7 +1651,6 @@ const makeLayer = <D extends Definition.Any, R,>(
           foreground: false,
           foregroundDemand: 0,
           callerLeases: 0,
-          promote: false,
           settlementsRecorded: Completion.make<void>(),
           leases: 0,
           leaving: false,
@@ -1882,15 +1873,9 @@ const makeLayer = <D extends Definition.Any, R,>(
 
       const status = Ref.get(aggregate)
 
-      const awaitsPromotion = (entry: RememberedEntry) =>
-        entry.promote && entries.get(entry.spaceId) === entry && !entry.leaving && entry.activation === "Active" &&
+      const freeForPromotion = (entry: RememberedEntry) =>
+        entries.get(entry.spaceId) === entry && !entry.leaving && entry.activation === "Active" &&
         entry.runtime !== undefined && !entry.runtime.foreground && entry.leases === 0
-
-      const promote = (entry: RememberedEntry) =>
-        Effect.suspend(() => {
-          entry.promote = false
-          return activateForeground(entry)
-        })
 
       const runBackgroundWork = Effect.fnUntraced(function*(
         work: BackgroundWork,
@@ -1898,10 +1883,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         generation: number
       ) {
         if (work._tag === "Deactivate") {
-          let closing: Effect.Effect<unknown, ReplicaError.ReplicaError> = deactivate(entry, false, work.runtime, false)
-          if (awaitsPromotion(entry)) closing = promote(entry)
-          entry.promote = false
-          const result = yield* Effect.result(closing)
+          const result = yield* Effect.result(deactivate(entry, false, work.runtime, false))
           if (Result.isFailure(result)) {
             yield* settleBackgroundTurn(entry, generation, result.failure, Option.none())
           }
@@ -1928,14 +1910,15 @@ const makeLayer = <D extends Definition.Any, R,>(
         const stalled = Result.isSuccess(result) && Option.isSome(result.success) &&
           entry.summaryStatus.pending > 0 && entry.summaryStatus.pending === pendingBefore
         if (activeRuntime !== undefined) {
-          yield* callersReleased(entry, activeRuntime)
+          const usedByCallers = entry.callerLeases > 0
+          yield* callersReleased(entry)
           let closing: Effect.Effect<unknown, ReplicaError.ReplicaError> = deactivate(
             entry,
             false,
             activeRuntime,
             Result.isSuccess(result) && !stalled
           )
-          if (awaitsPromotion(entry)) closing = promote(entry)
+          if (usedByCallers && freeForPromotion(entry)) closing = activateForeground(entry)
           const deactivation = yield* Effect.result(closing)
           if (Result.isFailure(deactivation)) {
             yield* settleBackgroundTurn(entry, generation, deactivation.failure, Option.none())
