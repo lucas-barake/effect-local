@@ -1020,6 +1020,36 @@ describe("BrowserReplica", () => {
   )
 
   it.effect(
+    "notifies the subscribers of a follower tab that was opened inside a batch",
+    Effect.fnUntraced(
+      function*() {
+        const environment = yield* makeEnvironment
+        yield* environment.openTab
+        const outer = yield* Reactivity.make
+        const follower = yield* outer.withBatch(environment.openTab)
+        const space = yield* settle(follower.replica.space(spaceId))
+        yield* settle(space.activate)
+        const reactivity = Context.get(follower.context, Reactivity.Reactivity)
+        let pending = 0
+        let status = 0
+        reactivity.registerUnsafe([ReactivityKey.pending(spaceId)], () => {
+          pending += 1
+        })
+        reactivity.registerUnsafe([ReactivityKey.status(spaceId)], () => {
+          status += 1
+        })
+
+        yield* settle(space.mutate(PutTodo, { id: "1", title: "first" }))
+
+        assert.isAbove(pending, 0, "the pending subscriber was notified of the mutation")
+        assert.isAbove(status, 0, "the status subscriber was notified of the mutation")
+      },
+      Effect.scoped,
+      provideFileSystem
+    )
+  )
+
+  it.effect(
     "serves a follower tab's mutations and queries from the leader tab's replica",
     Effect.fnUntraced(
       function*() {

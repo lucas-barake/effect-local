@@ -15,7 +15,7 @@ export const notify = (reactivity: Reactivity.Reactivity, keys: Iterable<string>
   Effect.forEach(
     new Set(keys),
     (key) =>
-      reactivity.invalidate([key]).pipe(
+      reactivity.withBatch(reactivity.invalidate([key])).pipe(
         Effect.catchCause((cause) => {
           const kind = causeKind(cause)
           const logged = Effect.logError(messages[kind], cause).pipe(Effect.annotateLogs({ "reactivity.key": key }))

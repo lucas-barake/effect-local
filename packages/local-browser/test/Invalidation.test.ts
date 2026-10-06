@@ -1,4 +1,5 @@
 import { assert, describe, it } from "@effect/vitest"
+import * as ReplicaError from "@lucas-barake/effect-local/ReplicaError"
 import * as Cause from "effect/Cause"
 import * as Deferred from "effect/Deferred"
 import * as Effect from "effect/Effect"
@@ -57,7 +58,7 @@ describe("Invalidation.notify", () => {
   )
 
   it.effect(
-    "delivers each key once when a batch of the caller ends",
+    "delivers before a batch of the caller ends",
     Effect.fnUntraced(function*() {
       const reactivity = yield* Reactivity.Reactivity
       let notifications = 0
@@ -66,42 +67,13 @@ describe("Invalidation.notify", () => {
       })
 
       const insideBatch = yield* Invalidation.notify(reactivity, ["key"]).pipe(
-        Effect.andThen(Invalidation.notify(reactivity, ["key"])),
-        Effect.andThen(reactivity.invalidate(["key"])),
         Effect.map(() => notifications),
         reactivity.withBatch
       )
 
-      assert.strictEqual(insideBatch, 0)
+      assert.strictEqual(insideBatch, 1)
       assert.strictEqual(notifications, 1)
     }, provideReactivity)
-  )
-
-  it.effect(
-    "leaves the defect of a subscriber to the batch of the caller that delivers it",
-    Effect.fnUntraced(function*() {
-      const logs = captureLogs()
-      const outcome = yield* Effect.gen(function*() {
-        const reactivity = yield* Reactivity.Reactivity
-        reactivity.registerUnsafe(["key"], () => {
-          decodeURIComponent("%")
-        })
-        let notified: Exit.Exit<void> | undefined
-        const batch = yield* Invalidation.notify(reactivity, ["key"]).pipe(
-          Effect.exit,
-          Effect.map((exit) => {
-            notified = exit
-          }),
-          reactivity.withBatch,
-          Effect.exit
-        )
-        return { notified, batch }
-      }).pipe(Effect.provide(Layer.merge(Reactivity.layer, logs.layerLogs)))
-
-      assert.isTrue(outcome.notified !== undefined && Exit.isSuccess(outcome.notified), "the notification completed")
-      assert.isTrue(Exit.isFailure(outcome.batch), "the batch of the caller ended with the defect")
-      assert.deepStrictEqual(logs.errors(), [])
-    })
   )
 
   it.effect(
@@ -212,6 +184,26 @@ describe("Invalidation.notify", () => {
         key: "interrupted",
         defect: false
       }])
+    })
+  )
+
+  it.effect(
+    "completes and logs the failure with its key when the Reactivity service fails a notification",
+    Effect.fnUntraced(function*() {
+      const logs = captureLogs()
+      const base = yield* Reactivity.make
+      const failing: Effect.Effect<void, ReplicaError.ReplicaError> = Effect.fail(new ReplicaError.ServerUnavailable())
+      const reactivity = new Proxy(base, {
+        get: (target, property, receiver) => {
+          if (property === "invalidate") return () => failing
+          return Reflect.get(target, property, receiver)
+        }
+      })
+
+      const exit = yield* Invalidation.notify(reactivity, ["key"]).pipe(Effect.exit, Effect.provide(logs.layerLogs))
+
+      assert.isTrue(Exit.isSuccess(exit), "the notification completed")
+      assert.deepStrictEqual(logs.errors(), [{ message: "Reactivity notification failed", key: "key", defect: false }])
     })
   )
 
