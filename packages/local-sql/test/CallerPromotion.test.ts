@@ -162,4 +162,57 @@ describe("a caller operation on a space whose background turn is in flight", () 
       assert.isTrue(Option.isSome(written), "every write completed once the held ones were released")
     }, VirtualTime.scoped)
   )
+
+  it.effect.each(constructors)(
+    "gives back the foreground place it had reserved when it ran on the background runtime instead with %s",
+    Effect.fnUntraced(function*(constructor) {
+      const used = others[0]
+      const services = yield* BackgroundReplica.services({
+        constructor,
+        clientId,
+        initialSpaces: [home, used],
+        maximumActiveSpaces: 3,
+        foregroundActiveSpaces: 1,
+        retryDelay: "10 minutes",
+        maximumRetryDelay: "10 minutes"
+      })
+      yield* BackgroundReplica.seedPending(services, [used])
+      const pulling = yield* Deferred.make<void>()
+      const answered = yield* Deferred.make<void>()
+      const building = yield* services.holdStatement("SELECT desired_scope_json", true)
+      const replica = yield* services.start(SyncEngine.SyncEngine.of({
+        ...idleRemote,
+        submitBatch: acceptSubmission,
+        pull: (request) => {
+          const page = emptyPage(services.crypto, request)
+          if (request.spaceId !== used) return page
+          return Deferred.succeed(pulling, undefined).pipe(
+            Effect.andThen(Deferred.await(answered)),
+            Effect.andThen(page)
+          )
+        }
+      }))
+      yield* VirtualTime.advanceUntil(building.entered)
+      const space = yield* replica.space(used)
+      const reading = yield* space.get(Domain.Todo, "pending").pipe(
+        Effect.exit,
+        Effect.forkChild({ startImmediately: true })
+      )
+      yield* VirtualTime.advanceUntil(Effect.never).pipe(Effect.timeoutOption("1 second"))
+      const waitedForTheBuild = reading.pollUnsafe() === undefined
+
+      yield* building.release
+      yield* VirtualTime.advanceUntil(Deferred.await(pulling))
+      const read = yield* VirtualTime.advanceUntil(Fiber.join(reading).pipe(Effect.timeoutOption("1 minute")))
+      yield* Deferred.succeed(answered, undefined)
+      yield* quiet
+      const elsewhere = yield* within((yield* replica.space(home)).get(Domain.Todo, "here"))
+      yield* quiet
+
+      assert.isTrue(waitedForTheBuild, "the read asked for the foreground place while the background runtime was built")
+      assert.strictEqual(describeExit(read), "succeeded")
+      assert.strictEqual(describeExit(elsewhere), "succeeded", "another space could take the foreground place")
+      assert.strictEqual(yield* space.activation, "Inactive", "the background runtime was closed after its turn")
+    }, VirtualTime.scoped)
+  )
 })

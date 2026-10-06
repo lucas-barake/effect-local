@@ -1241,12 +1241,11 @@ const makeLayer = <D extends Definition.Any, R,>(
           if (!foreground) return transition(entry, false, leased, waiter, restore)
           entry.foregroundDemand += 1
           return transition(entry, true, leased, waiter, restore).pipe(
-            Effect.onExit((exit) => {
+            Effect.onExit(() => {
               entry.foregroundDemand -= 1
               const waited = foregroundQueue.delete(waiter) || waiter.retiring !== undefined
               requestRetirement(waiter, undefined)
               if (
-                !Exit.isSuccess(exit) &&
                 entry.foregroundDemand === 0 &&
                 entry.foreground &&
                 !hasForegroundRuntime(entry)
