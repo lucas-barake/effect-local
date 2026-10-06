@@ -361,6 +361,7 @@ const makeLayer = <D extends Definition.Any, R,>(
         reconciliationConcurrency - foregroundReconciliationConcurrency
       )
       const retryTiming = yield* Configuration.retryTiming(options)
+      const serverCallLimiter = SharedCall.makeLimiter(reconciliationConcurrency)
       const backgroundQueue = yield* Effect.acquireRelease(
         Queue.unbounded<BackgroundWork>(),
         Queue.shutdown
@@ -1579,9 +1580,10 @@ const makeLayer = <D extends Definition.Any, R,>(
       const createEntry = Effect.fnUntraced(function*(row: typeof RememberedRow.Type) {
         yield* decodeScope(row.desired_scope_json)
         let handle: Replica.Space | undefined
-        const pulls = SharedCall.make(remote.pull, serverCallScope, retryTiming.retryDelayMillis)
-        const submissions = SharedCall.make(remote.submitBatch, serverCallScope, retryTiming.retryDelayMillis)
-        const bootstraps = SharedCall.make(remote.bootstrap, serverCallScope, retryTiming.retryDelayMillis)
+        const kept = retryTiming.retryDelayMillis
+        const pulls = SharedCall.make(remote.pull, serverCallScope, kept, serverCallLimiter)
+        const submissions = SharedCall.make(remote.submitBatch, serverCallScope, kept, serverCallLimiter)
+        const bootstraps = SharedCall.make(remote.bootstrap, serverCallScope, kept, serverCallLimiter)
         const forgetServerAnswers = () => {
           pulls.forget()
           submissions.forget()
