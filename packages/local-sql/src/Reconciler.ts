@@ -24,7 +24,13 @@ import * as Completion from "./internal/completion.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
-import { answeredUnderCredential, backoff, credentialChange, superviseWatch } from "./internal/transport.js"
+import {
+  answeredUnderCredential,
+  backoff,
+  credentialChange,
+  makeRetryPosition,
+  superviseWatch
+} from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as SyncEngine from "./SyncEngine.js"
 
@@ -1058,18 +1064,14 @@ export const layerInMemoryScheduler = (
           Effect.asVoid
         )
       })
-      let retryAttempt = 0
-      let stalledPending = 0
-      let stallTimed = false
-      const stalls = yield* FiberMap.make<"stalled", void, never>()
-      const cancelStalledRetry = Effect.suspend(() => {
-        stallTimed = false
-        return FiberMap.remove(stalls, "stalled")
+      const position = yield* makeRetryPosition({
+        timing: retryTiming,
+        pending: Effect.map(reconciliation.status, (current) => current.pending),
+        retry: resyncAfterWatchFailure
       })
       const retryAfterBackoff = (error: ReplicaError.ReplicaError, transportGeneration: number) =>
         Effect.suspend(() => {
-          retryAttempt += 1
-          const delay = Configuration.retryMillis(retryTiming, retryAttempt)
+          const delay = position.nextDelay()
           return backoff(remote, delay, error, transportGeneration).pipe(
             Effect.catchCause((cause) =>
               Errors.logDefect("Retry backoff died", cause).pipe(
@@ -1100,22 +1102,7 @@ export const layerInMemoryScheduler = (
         observedGeneration = yield* reconciliation.generation
         yield* local.completeReconciliation(generations.requested)
         yield* reconciliation.succeeded
-        const left = (yield* reconciliation.status).pending
-        if (left === 0 || left < stalledPending) retryAttempt = 0
-        stalledPending = left
-        if (left === 0) {
-          yield* cancelStalledRetry
-          return
-        }
-        if (stallTimed) return
-        retryAttempt += 1
-        stallTimed = true
-        const delay = Configuration.retryMillis(retryTiming, retryAttempt)
-        const elapsed = Effect.sync(() => {
-          stallTimed = false
-        })
-        const retried = Effect.sleep(delay).pipe(Effect.andThen(elapsed), Effect.andThen(resyncAfterWatchFailure))
-        yield* FiberMap.run(stalls, "stalled", retried)
+        yield* position.retryUnfinished
       }).pipe(
         Errors.failDiedIteration(
           "Reconciliation turn died",
@@ -1125,7 +1112,7 @@ export const layerInMemoryScheduler = (
           })
         ),
         Effect.catch(Effect.fnUntraced(function*(error) {
-          yield* cancelStalledRetry
+          yield* position.cancelStalledRetry
           if (error._tag === "CredentialRejected") {
             if (error.credentialGeneration === undefined) {
               return yield* reconciliation.failed(error, observedGeneration)
@@ -1134,7 +1121,7 @@ export const layerInMemoryScheduler = (
             yield* reconciliation.failed(error, observedGeneration)
             yield* startCredentialWait(error.credentialGeneration, admission)
             yield* Deferred.await(admission.gate)
-            retryAttempt = 0
+            position.reset()
             return yield* notify
           }
           const pause = yield* Ref.get(authenticationPause)

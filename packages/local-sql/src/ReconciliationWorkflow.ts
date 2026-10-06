@@ -10,7 +10,6 @@ import * as Duration from "effect/Duration"
 import * as Effect from "effect/Effect"
 import * as Exit from "effect/Exit"
 import * as Fiber from "effect/Fiber"
-import * as FiberMap from "effect/FiberMap"
 import { pipe } from "effect/Function"
 import * as Layer from "effect/Layer"
 import * as Option from "effect/Option"
@@ -28,7 +27,7 @@ import * as ConnectionLane from "./ConnectionLane.js"
 import * as Configuration from "./internal/configuration.js"
 import * as Errors from "./internal/errors.js"
 import * as LosslessQueue from "./internal/losslessQueue.js"
-import { credentialChange, superviseWatch } from "./internal/transport.js"
+import { credentialChange, makeRetryPosition, superviseWatch } from "./internal/transport.js"
 import * as LocalStore from "./LocalStore.js"
 import * as Reconciler from "./Reconciler.js"
 import * as SyncEngine from "./SyncEngine.js"
@@ -625,13 +624,10 @@ const layerSchedulerWithConfiguration = (
         yield* Ref.set(activeExecution, Option.none())
         return Option.none<ActiveExecution>()
       })
-      let retryAttempt = 0
-      let stalledPending = 0
-      let stallTimed = false
-      const stalls = yield* FiberMap.make<"stalled", void, never>()
-      const cancelStalledRetry = Effect.suspend(() => {
-        stallTimed = false
-        return FiberMap.remove(stalls, "stalled")
+      const position = yield* makeRetryPosition({
+        timing: configuration,
+        pending: Effect.map(reconciliation.status, (current) => current.pending),
+        retry: resyncAfterWatchFailure
       })
       let readmit = false
       const superviseTurn = Effect.gen(function*() {
@@ -686,26 +682,11 @@ const layerSchedulerWithConfiguration = (
           Effect.result
         )
         if (Result.isSuccess(result)) {
-          const left = (yield* reconciliation.status).pending
-          if (left === 0 || left < stalledPending) retryAttempt = 0
-          stalledPending = left
-          if (left === 0) {
-            yield* cancelStalledRetry
-            return false
-          }
-          if (stallTimed) return false
-          retryAttempt += 1
-          stallTimed = true
-          const delay = Configuration.retryMillis(configuration, retryAttempt)
-          const elapsed = Effect.sync(() => {
-            stallTimed = false
-          })
-          const retried = Effect.sleep(delay).pipe(Effect.andThen(elapsed), Effect.andThen(resyncAfterWatchFailure))
-          yield* FiberMap.run(stalls, "stalled", retried)
+          yield* position.retryUnfinished
           return false
         }
         const error = result.failure
-        yield* cancelStalledRetry
+        yield* position.cancelStalledRetry
         if (error._tag === "StaleReplicationScope") {
           readmit = true
           return false
@@ -720,7 +701,7 @@ const layerSchedulerWithConfiguration = (
           yield* reconciliation.failed(error, observedGeneration)
           yield* startCredentialWait(error.credentialGeneration, admission)
           yield* Deferred.await(admission.gate)
-          retryAttempt = 0
+          position.reset()
           readmit = true
           return false
         }
@@ -732,9 +713,8 @@ const layerSchedulerWithConfiguration = (
         }
         yield* reconciliation.failed(error, observedGeneration)
         if (Reconciler.isTransientFailure(error)) {
-          retryAttempt += 1
           yield* Effect.logWarning("Reconciliation supervisor will retry", error)
-          yield* Effect.sleep(Configuration.retryMillis(configuration, retryAttempt))
+          yield* Effect.sleep(position.nextDelay())
           readmit = true
           return false
         }
